@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-sqlalchemy
+sqlalchemy>=1.4
 alembic
 pydantic
 passlib[bcrypt]
