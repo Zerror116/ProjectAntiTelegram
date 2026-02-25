@@ -16,7 +16,7 @@ import app.models.order
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AntiTelegram")
+app = FastAPI(title="Тапка")
 
 def try_create_tables(retries: int = 5, delay: int = 2):
     """
