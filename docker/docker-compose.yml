@@ -1,16 +1,39 @@
-version: "3.8"
+# PycharmProjects/ProjectAntiTelegram/docker/docker-compose.yml
 services:
   db:
     image: postgres:15
     restart: unless-stopped
     environment:
-      POSTGRES_USER: antitelegram_user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: antitelegram_db
+      POSTGRES_USER: antitelegram
+      POSTGRES_PASSWORD: antitelegram
+      POSTGRES_DB: antitelegram
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - db-data:/var/lib/postgresql/data
+      - ../server/migrations:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
 
+  server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://antitelegram:antitelegram@db:5432/antitelegram
+      JWT_SECRET: change_me_long_secret
+      PORT: "3000"
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../server:/app
+      - /app/node_modules
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
-  db_data:
+  db-data:
