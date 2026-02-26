@@ -18,6 +18,9 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _loading = true;
   StreamSubscription? _chatSub;
 
+  // ✅ ИСПРАВЛЕНИЕ: Отслеживаем ID сообщений, чтобы избежать дублирования
+  final Set<String> _messageIds = {};
+
   @override
   void initState() {
     super.initState();
@@ -30,11 +33,24 @@ class _ChatScreenState extends State<ChatScreen> {
       if (type == 'chat:message' && data is Map) {
         final msg = data['message'] ?? data;
         final chatId = data['chatId'] ?? msg['chat_id'] ?? msg['chatId'];
+        final msgId = msg['id']?.toString();
+
+        // ✅ ИСПРАВЛЕНИЕ: Проверяем, есть ли уже такое сообщение
         if (chatId != null && chatId.toString() == widget.chatId) {
-          // append message
-          setState(() {
-            _messages.add(Map<String, dynamic>.from(msg));
-          });
+          if (msgId != null && !_messageIds.contains(msgId)) {
+            setState(() {
+              _messages.add(Map<String, dynamic>.from(msg));
+              _messageIds.add(msgId);
+            });
+            debugPrint('✅ Message added via Socket: $msgId');
+          } else if (msgId == null) {
+            // Если нет ID, добавляем (старый формат)
+            setState(() {
+              _messages.add(Map<String, dynamic>.from(msg));
+            });
+          } else {
+            debugPrint('⚠️ Message already exists (duplicate): $msgId');
+          }
         }
       }
     });
@@ -75,10 +91,22 @@ class _ChatScreenState extends State<ChatScreen> {
       final resp = await authService.dio.get('/api/chats/${widget.chatId}/messages');
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
-        setState(() => _messages = List<Map<String, dynamic>>.from(data['data']));
+        final messages = List<Map<String, dynamic>>.from(data['data']);
+        setState(() {
+          _messages = messages;
+          // ✅ Заполняем Set с ID существующих сообщений
+          _messageIds.clear();
+          for (final msg in messages) {
+            final msgId = msg['id']?.toString();
+            if (msgId != null) {
+              _messageIds.add(msgId);
+            }
+          }
+        });
+        debugPrint('✅ Loaded ${messages.length} messages');
       }
     } catch (e) {
-      // игнорируем, оставляем пустой список
+      debugPrint('❌ Error loading messages: $e');
     } finally {
       setState(() => _loading = false);
     }
@@ -87,22 +115,35 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
+
     try {
       final resp = await authService.dio.post('/api/chats/${widget.chatId}/messages', data: {'text': text});
       if (resp.statusCode == 200 || resp.statusCode == 201) {
         _controller.clear();
-        // optimistic: append message if server returned it
+
+        // ✅ ИСПРАВЛЕНИЕ: Добавляем сообщение только если оно пришло от сервера
         final data = resp.data;
         if (data is Map && data['ok'] == true && data['data'] is Map) {
-          setState(() {
-            _messages.add(Map<String, dynamic>.from(data['data']));
-          });
+          final msg = Map<String, dynamic>.from(data['data']);
+          final msgId = msg['id']?.toString();
+
+          if (msgId != null && !_messageIds.contains(msgId)) {
+            setState(() {
+              _messages.add(msg);
+              _messageIds.add(msgId);
+            });
+            debugPrint('✅ Message sent and added: $msgId');
+          } else {
+            debugPrint('⚠️ Message already exists, skipping add');
+          }
         } else {
+          // Если сервер не вернул сообщение, загружаем заново
           await _loadMessages();
         }
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Ошибка отправки сообщения')));
+      debugPrint('❌ Error sending message: $e');
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Ошибка от��равки сообщения')));
     }
   }
 
@@ -115,28 +156,47 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
-                : ListView.builder(
-                    reverse: false,
-                    itemCount: _messages.length,
-                    itemBuilder: (_, i) {
-                      final m = _messages[i];
-                      final fromMe = (m['from_me'] == true) || (m['sender_id'] == authService.currentUser?.id);
-                      return Align(
-                        alignment: fromMe ? Alignment.centerRight : Alignment.centerLeft,
-                        child: Container(
-                          margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(color: fromMe ? Colors.blue : Colors.grey[300], borderRadius: BorderRadius.circular(8)),
-                          child: Text(m['text'] ?? '', style: TextStyle(color: fromMe ? Colors.white : Colors.black)),
-                        ),
-                      );
-                    },
-                  ),
+                : _messages.isEmpty
+                    ? const Center(child: Text('Нет сообщений'))
+                    : ListView.builder(
+                        reverse: false,
+                        itemCount: _messages.length,
+                        itemBuilder: (_, i) {
+                          final m = _messages[i];
+                          final fromMe = (m['from_me'] == true) || (m['sender_id'] == authService.currentUser?.id);
+                          return Align(
+                            alignment: fromMe ? Alignment.centerRight : Alignment.centerLeft,
+                            child: Container(
+                              margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: fromMe ? Colors.blue : Colors.grey[300],
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                m['text'] ?? '',
+                                style: TextStyle(color: fromMe ? Colors.white : Colors.black),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
           ),
           SafeArea(
             child: Row(
               children: [
-                Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: TextField(controller: _controller))),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: TextField(
+                      controller: _controller,
+                      decoration: const InputDecoration(
+                        hintText: 'Сообщение...',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                ),
                 IconButton(icon: const Icon(Icons.send), onPressed: _send),
               ],
             ),

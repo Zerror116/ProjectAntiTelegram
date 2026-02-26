@@ -69,30 +69,14 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
     super.dispose();
   }
 
-  String _extractDioMessage(dynamic e) {
+  String? _extractDioMessage(dynamic e) {
     try {
-      // Dio v5: DioException, v4: DioError
-      final resp = (e is DioException) ? e.response : (e is DioError ? e.response : null);
-      if (resp != null && resp.data != null) return resp.data.toString();
-    } catch (_) {}
-    return e?.toString() ?? 'Неизвестная ошибка';
-  }
-
-  Future<void> _saveTokenFlexible(String token) async {
-    // Поддерживаем разные реализации authService: setToken или saveToken
-    try {
-      if ((authService).setToken is Function) {
-        await authService.setToken(token);
-        return;
+      if (e is DioException && e.response != null && e.response?.data is Map) {
+        final data = e.response!.data as Map<String, dynamic>?;
+        return data?['error']?.toString() ?? data?['message']?.toString();
       }
     } catch (_) {}
-    try {
-      if ((authService).saveToken is Function) {
-        await authService.saveToken(token);
-        return;
-      }
-    } catch (_) {}
-    // fallback: просто сохраняем в SharedPreferences через authService API, если нет — игнорируем
+    return null;
   }
 
   Future<void> _submit() async {
@@ -147,38 +131,19 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
         final resp = await authService.dio.post('/api/auth/register', data: data);
 
-        final respData = resp.data as Map<String, dynamic>?;
-        final token = respData != null ? (respData['token'] ?? respData['access']) : null;
+        // ✅ ИСПРАВЛЕНИЕ: Cast правильно
+        final respData = (resp.data as Map<dynamic, dynamic>).cast<String, dynamic>();
+        final token = respData['token'] ?? respData['access'];
         if (token == null) {
           setState(() => _message = 'Регистрация прошла, но токен не получен от сервера.');
           return;
         }
 
         // Сохраняем токен гибко (поддержка разных authService)
-        await _saveTokenFlexible(token as String);
+        await authService.applyLoginResponse(token as String, respData['user'] as Map<String, dynamic>?);
 
         // Очистим pending
         try { authService.pendingEmail = null; authService.pendingPassword = null; } catch (_) {}
-
-        // Попробуем обновить currentUser через профиль (если сервер не вернул user)
-        try {
-          if ((authService).setAuthHeaderFromStorage is Function) {
-            await authService.setAuthHeaderFromStorage();
-          } else {
-            // Попытка получить профиль напрямую
-            try {
-              final profileResp = await authService.dio.get('/api/profile');
-              if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
-                final userMap = Map<String, dynamic>.from(profileResp.data['user']);
-                try {
-                  if ((authService).applyLoginResponse is Function) {
-                    await authService.applyLoginResponse(token as String, userMap);
-                  }
-                } catch (_) {}
-              }
-            } catch (_) {}
-          }
-        } catch (_) {}
 
         if (!mounted) return;
         Navigator.of(context).pushReplacementNamed('/main');
@@ -197,21 +162,9 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
         if (ok1 && ok2) {
           try {
-            if ((authService).setAuthHeaderFromStorage is Function) {
-              await authService.setAuthHeaderFromStorage();
-            } else {
-              // Попробуем получить профиль вручную
-              final profileResp = await authService.dio.get('/api/profile');
-              if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
-                final userMap = Map<String, dynamic>.from(profileResp.data['user']);
-                try {
-                  if ((authService).applyLoginResponse is Function) {
-                    await authService.applyLoginResponse(await authService.getToken() ?? '', userMap);
-                  }
-                } catch (_) {}
-              }
-            }
+            await authService.setAuthHeaderFromStorage();
           } catch (_) {}
+
           if (!mounted) return;
           Navigator.of(context).pop();
           return;
@@ -219,9 +172,11 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           setState(() => _message = 'Ошибка обновления профиля');
         }
       }
-    } catch (e) {
-      final errMsg = _extractDioMessage(e);
+    } on DioException catch (e) {
+      final errMsg = _extractDioMessage(e) ?? 'Ошибка: ${e.message}';
       setState(() => _message = errMsg);
+    } catch (e) {
+      setState(() => _message = 'Ошибка: $e');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -232,12 +187,12 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Введите имя и номер'),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
-        ),
+        leading: widget.isRegisterFlow
+            ? null
+            : IconButton(
+                icon: const Icon(Icons.arrow_back),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
       ),
       body: SafeArea(
         child: Padding(
@@ -263,24 +218,16 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
               if (_shouldShowSecretField) ...[
                 TextField(
                   controller: _secretCtrl,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Секретное слово (для создателя)',
-                    hintText: 'Введите секретное слово',
-                  ),
+                  decoration: const InputDecoration(labelText: 'Секретное слово'),
                   textInputAction: TextInputAction.done,
                 ),
                 const SizedBox(height: 12),
               ],
-              const SizedBox(height: 16),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: _loading ? null : _submit,
-                  child: _loading
-                      ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                      : const Text('Сохранить'),
-                ),
+              ElevatedButton(
+                onPressed: _loading ? null : _submit,
+                child: _loading
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    : Text(widget.isRegisterFlow ? 'Завершить регистрацию' : 'Сохранить'),
               ),
               const SizedBox(height: 12),
               if (_message.isNotEmpty) Text(_message, style: const TextStyle(color: Colors.red)),

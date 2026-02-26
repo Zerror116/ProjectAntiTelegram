@@ -135,24 +135,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           padding: const EdgeInsets.only(bottom: 12),
                           child: Text(_message, style: const TextStyle(color: Colors.red)),
                         ),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: () async {
-                            try {
-                              if ((_auth).clearToken is Function) {
-                                await _auth.clearToken();
-                              } else if ((_auth).logout is Function) {
-                                await _auth.logout();
-                              }
-                            } catch (_) {}
-                            if (!mounted) return;
-                            Navigator.pushReplacementNamed(context, '/');
-                          },
-                          child: const Text('Выйти'),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                        ),
-                      ),
                       if (_loading) const Padding(padding: EdgeInsets.only(top: 12), child: Center(child: CircularProgressIndicator())),
                     ],
                   ),

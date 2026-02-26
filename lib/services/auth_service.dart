@@ -65,37 +65,47 @@ class AuthService {
   void _setAuthHeader(String? token) {
     if (token != null && token.isNotEmpty) {
       dio.options.headers['Authorization'] = 'Bearer $token';
+      debugPrint('✅ Auth header set with token');
     } else {
       dio.options.headers.remove('Authorization');
+      debugPrint('❌ Auth header removed');
     }
   }
 
   /// Публичный: установить токен и (опционально) user, уведомить слушателей
   Future<void> setToken(String token, [User? user]) async {
+    debugPrint('🔐 setToken called with token: ${token.substring(0, 20)}..., user: ${user?.email}');
     await _saveToken(token);
     _setAuthHeader(token);
     if (user != null) _currentUser = user;
     try {
       _authController.add(_currentUser);
     } catch (_) {}
-    debugPrint('AuthService.setToken -> token set, user=${_currentUser?.email}');
+    debugPrint('✅ AuthService.setToken -> token set, user=${_currentUser?.email}');
   }
 
   /// Публичный: очистить токен и user (logout)
   Future<void> clearToken() async {
-    if (_isLoggingOut) return;
+    debugPrint('🗑️ clearToken called');
+    if (_isLoggingOut) {
+      debugPrint('⚠️ clearToken already in progress, skipping');
+      return;
+    }
     _isLoggingOut = true;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_tokenKey);
+      debugPrint('✅ Token removed from SharedPreferences');
+
       _setAuthHeader(null);
       pendingEmail = null;
       pendingPassword = null;
       _currentUser = null;
+
       try {
         _authController.add(null);
       } catch (_) {}
-      debugPrint('AuthService.clearToken -> logged out');
+      debugPrint('✅ AuthService.clearToken -> logged out');
     } finally {
       _isLoggingOut = false;
     }
@@ -103,38 +113,61 @@ class AuthService {
 
   /// Приватный: сохранить токен в SharedPreferences
   Future<void> _saveToken(String token) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_tokenKey, token);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_tokenKey, token);
+      debugPrint('✅ Token saved to SharedPreferences: ${token.substring(0, 20)}...');
+    } catch (e) {
+      debugPrint('❌ Error saving token: $e');
+    }
   }
 
   /// Получение токена из SharedPreferences
   Future<String?> getToken() async {
-    final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString(_tokenKey);
-    debugPrint('AuthService.getToken -> $token');
-    return token;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString(_tokenKey);
+      debugPrint('🔑 getToken -> ${token != null ? '${token.substring(0, 20)}...' : 'null'}');
+      return token;
+    } catch (e) {
+      debugPrint('❌ Error getting token: $e');
+      return null;
+    }
   }
 
   /// Обработать ответ от /auth (вытянуть токен и user), использовать setToken
   Future<void> _processAuthResponse(Response resp) async {
-    final data = resp.data as Map<String, dynamic>;
+    debugPrint('📝 _processAuthResponse: status=${resp.statusCode}');
+    // ✅ ИСПРАВЛЕНИЕ: Cast правильно
+    final data = (resp.data as Map<dynamic, dynamic>).cast<String, dynamic>();
     final token = data['token'] ?? data['access'];
     final userMap = data['user'] as Map<String, dynamic>?;
+
     if (token == null) throw Exception('No token in response');
+
+    debugPrint('🔐 Token extracted: ${(token as String).substring(0, 20)}...');
+
     if (userMap != null) {
-      _currentUser = User.fromMap(Map<String, dynamic>.from(userMap));
+      _currentUser = User.fromMap(userMap);
+      debugPrint('👤 User extracted: ${_currentUser?.email}');
     } else {
       // Попробуем подтянуть профиль, если сервер не вернул user
       try {
+        debugPrint('📡 Fetching profile...');
         final profileResp = await dio.get('/api/profile');
         if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
-          _currentUser = User.fromMap(Map<String, dynamic>.from(profileResp.data['user']));
+          final profileMap = (profileResp.data['user'] as Map<dynamic, dynamic>).cast<String, dynamic>();
+          _currentUser = User.fromMap(profileMap);
+          debugPrint('👤 Profile fetched: ${_currentUser?.email}');
         }
-      } catch (_) {
-        // ignore
+      } catch (e) {
+        debugPrint('⚠️ Failed to fetch profile: $e');
       }
     }
+
+    // ✅ Сохраняем токен ПЕРЕД установкой заголовка
     await setToken(token as String, _currentUser);
+    debugPrint('✅ _processAuthResponse complete');
   }
 
   /// Вход
@@ -142,10 +175,15 @@ class AuthService {
     required String email,
     required String password,
   }) async {
+    debugPrint('🔓 login called with email: $email');
     final resp = await dio.post('/api/auth/login', data: {'email': email, 'password': password});
+    debugPrint('📬 login response received, status: ${resp.statusCode}');
+
     await _processAuthResponse(resp);
+
     pendingEmail = null;
     pendingPassword = null;
+    debugPrint('✅ login complete');
     return {'access': resp.data['token'] ?? resp.data['access'], 'user': _currentUser?.toMap()};
   }
 
@@ -157,6 +195,7 @@ class AuthService {
     String? phone,
     String? secret, // для special creator email
   }) async {
+    debugPrint('✍️ register called with email: $email');
     final resp = await dio.post('/api/auth/register', data: {
       'email': email,
       'password': password,
@@ -164,9 +203,13 @@ class AuthService {
       if (phone != null) 'phone': phone,
       if (secret != null) 'secret': secret,
     });
+    debugPrint('📬 register response received, status: ${resp.statusCode}');
+
     await _processAuthResponse(resp);
+
     pendingEmail = null;
     pendingPassword = null;
+    debugPrint('✅ register complete');
     return {'access': resp.data['token'] ?? resp.data['access'], 'user': _currentUser?.toMap()};
   }
 
@@ -174,7 +217,7 @@ class AuthService {
   void setPendingCredentials({required String email, required String password}) {
     pendingEmail = email;
     pendingPassword = password;
-    debugPrint('AuthService.setPendingCredentials -> email saved');
+    debugPrint('📋 AuthService.setPendingCredentials -> email saved');
   }
 
   /// Завершение регистрации: используем pendingEmail/pendingPassword + name + phone + optional secret
@@ -189,69 +232,89 @@ class AuthService {
       'phone': phone,
       if (secret != null) 'secret': secret,
     });
-    final data = resp.data as Map<String, dynamic>?;
-    final token = data != null ? (data['token'] ?? data['access']) : null;
-    if (token == null) {
-      throw Exception('Registration failed: token not returned');
-    }
-    // Обновляем currentUser и сохраняем токен
+
     await _processAuthResponse(resp);
     pendingEmail = null;
     pendingPassword = null;
   }
 
-  /// Попытка автоматического входа при старте приложения.
-  /// Устанавливает заголовок и проверяет /api/profile.
+  bool hasAnyRole(List<String> roles) => _currentUser != null && roles.contains(_currentUser!.role);
+
+  /// Применить ответ логина/регистрации (если вызывается извне)
+  Future<void> applyLoginResponse(String token, Map<String, dynamic>? userMap) async {
+    debugPrint('🔐 applyLoginResponse called');
+    User? user;
+    if (userMap != null) user = User.fromMap(userMap);
+    await setToken(token, user);
+  }
+
+  /// Попытка обновить токен при старте (восстановить сессию)
   Future<bool> tryRefreshOnStartup() async {
-    final token = await getToken();
-    if (token == null) return false;
     try {
+      debugPrint('🔄 tryRefreshOnStartup called');
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        debugPrint('❌ No token in storage');
+        return false;
+      }
+
+      debugPrint('✅ Token found in storage, setting auth header');
       _setAuthHeader(token);
+
+      // Проверяем, валиден ли токен, запрашивая профиль
       final resp = await dio.get('/api/profile');
-      if (resp.statusCode == 200 && resp.data is Map && resp.data['user'] is Map) {
-        _currentUser = User.fromMap(Map<String, dynamic>.from(resp.data['user']));
-        // уведомляем слушателей, что пользователь восстановлен
-        try { _authController.add(_currentUser); } catch (_) {}
-        debugPrint('AuthService.tryRefreshOnStartup -> user restored: ${_currentUser?.email}');
-        return true;
+      debugPrint('📡 Profile check: status=${resp.statusCode}');
+
+      if (resp.statusCode == 200 && resp.data is Map) {
+        final user = resp.data['user'];
+        if (user is Map) {
+          // ✅ ИСПРАВЛЕНИЕ: Cast правильно
+          final userMap = (user as Map<dynamic, dynamic>).cast<String, dynamic>();
+          _currentUser = User.fromMap(userMap);
+          try {
+            _authController.add(_currentUser);
+          } catch (_) {}
+          debugPrint('✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}');
+          return true;
+        }
       }
       return false;
     } catch (e) {
-      debugPrint('tryRefreshOnStartup failed: $e');
+      debugPrint('❌ tryRefreshOnStartup error: $e');
       await clearToken();
       return false;
     }
   }
 
-  /// Отправка номера телефона на сервер.
-  Future<Map<String, dynamic>> submitPhone(String phone) async {
-    final token = await getToken();
-    if (token != null) {
-      dio.options.headers['Authorization'] = 'Bearer $token';
-    } else {
-      throw Exception('No auth token available');
+  /// Логаут
+  Future<void> logout() async {
+    try {
+      debugPrint('🚪 AuthService.logout -> starting logout');
+
+      // ✅ ИСПРАВЛЕНИЕ: Уведомляем слушателей ПЕРЕД logout
+      _currentUser = null;
+      try {
+        _authController.add(null);
+        debugPrint('📢 authStream notified about logout');
+      } catch (_) {}
+
+      // Потом выполняем логаут на сервере
+      try {
+        await dio.post('/api/auth/logout');
+        debugPrint('✅ Logout API call succeeded');
+      } catch (e) {
+        debugPrint('⚠️ logout API call failed (ignoring): $e');
+      }
+
+      // И очищаем токен локально
+      await clearToken();
+
+      debugPrint('✅ AuthService.logout -> logout complete');
+    } catch (e) {
+      debugPrint('❌ logout error: $e');
+      await clearToken();
+      rethrow;
     }
-    final resp = await dio.post('/api/phones/request', data: {'phone': phone});
-    return resp.data as Map<String, dynamic>;
-  }
-
-  /// Подтверждение кода телефона (заглушка)
-  Future<Map<String, dynamic>> verifyPhoneCode(String code) async {
-    final token = await getToken();
-    if (token != null) dio.options.headers['Authorization'] = 'Bearer $token';
-    final resp = await dio.post('/api/phones/admin/verify', data: {'code': code});
-    return resp.data as Map<String, dynamic>;
-  }
-
-  /// Утилиты по ролям
-  bool hasRole(String role) => _currentUser?.role == role;
-  bool hasAnyRole(List<String> roles) => _currentUser != null && roles.contains(_currentUser!.role);
-
-  /// Применить ответ логина/регистрации (если вызывается извне)
-  Future<void> applyLoginResponse(String token, Map<String, dynamic>? userMap) async {
-    User? user;
-    if (userMap != null) user = User.fromMap(Map<String, dynamic>.from(userMap));
-    await setToken(token, user);
   }
 
   /// Закрыть контроллер при завершении
@@ -273,10 +336,5 @@ class AuthService {
   /// Старые вызовы могли использовать `setAuthHeaderFromStorage` — оставляем обёртку.
   Future<void> setAuthHeaderFromStorage() async {
     await tryRefreshOnStartup();
-  }
-
-  /// Старые вызовы могли использовать `logout` — оставляем обёртку.
-  Future<void> logout() async {
-    await clearToken();
   }
 }
