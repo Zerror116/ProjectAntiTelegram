@@ -150,6 +150,11 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/logout', (req, res) => {
+  // Здесь можно делать audit, удалять refresh-токены и т.д.
+  res.json({ ok: true, message: 'Logged out (stateless JWT)' });
+});
+
 /**
  * POST /api/auth/change_password (защищённый)
  */

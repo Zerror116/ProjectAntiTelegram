@@ -1,4 +1,3 @@
-// lib/screens/profile_screen.dart
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -10,6 +9,7 @@ import '../services/auth_service.dart';
 import '../utils/phone_utils.dart';
 import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
+import 'auth_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -65,113 +65,51 @@ class _ProfileScreenState extends State<ProfileScreen> {
         });
       } else {
         if (!mounted) return;
-        setState(() => _message = 'Невозможно загрузить профиль');
+        setState(() => _message = 'Ошибка загрузки профиля');
       }
     } catch (e) {
-      debugPrint('Profile load error: $e');
       if (!mounted) return;
-      setState(() => _message = 'Ошибка загрузки профиля: ${_extractDioMessage(e)}');
+      setState(() => _message = _extractDioMessage(e));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
+  Future<void> _logout() async {
+    await authService.logout();
+    if (mounted) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const AuthScreen()),
+        (route) => false,
+      );
+    }
+  }
+
   Widget _buildAvatar() {
-    const double size = 92;
+    final name = (_name.isNotEmpty ? _name : _email);
+    final initials = name.isNotEmpty
+        ? name.trim().split(' ').map((s) => s.isNotEmpty ? s[0] : '').take(2).join().toUpperCase()
+        : '?';
+
     if (_avatarUrl != null && _avatarUrl!.isNotEmpty) {
       return CircleAvatar(
-        radius: size / 2,
-        backgroundColor: Colors.grey[200],
+        radius: 40,
         backgroundImage: NetworkImage(_avatarUrl!),
+        backgroundColor: Colors.grey[300],
+      );
+    } else {
+      return CircleAvatar(
+        radius: 40,
+        backgroundColor: Colors.grey[400],
+        child: Text(initials, style: const TextStyle(fontSize: 32, color: Colors.white)),
       );
     }
-    return const CircleAvatar(
-      radius: 46,
-      backgroundColor: Color(0xFFE0E0E0),
-      child: Icon(Icons.person, size: 48, color: Color(0xFF757575)),
-    );
-  }
-
-  Future<void> _pickAndUploadAvatar() async {
-    setState(() => _message = '');
-    try {
-      final XFile? picked = await _picker.pickImage(
-        source: ImageSource.gallery,
-        maxWidth: 1200,
-        maxHeight: 1200,
-        imageQuality: 85,
-      );
-      if (picked == null) return;
-
-      final file = File(picked.path);
-      setState(() => _uploading = true);
-
-      final fileName = picked.name.isNotEmpty ? picked.name : file.path.split('/').last;
-      final multipart = await MultipartFile.fromFile(file.path, filename: fileName);
-
-      final formData = FormData.fromMap({'avatar': multipart});
-
-      final resp = await _auth.dio.post(
-        '/api/profile/avatar',
-        data: formData,
-        options: Options(
-          headers: {'Content-Type': 'multipart/form-data'},
-        ),
-      );
-
-      final data = resp.data as Map<String, dynamic>?;
-      final newUrl = data != null ? (data['avatar_url'] ?? data['avatar'] ?? null) : null;
-
-      if (newUrl != null) {
-        if (!mounted) return;
-        setState(() {
-          _avatarUrl = newUrl.toString();
-          _message = 'Аватар обновлён';
-        });
-      } else {
-        await _load();
-        if (!mounted) return;
-        setState(() => _message = 'Аватар обновлён');
-      }
-    } catch (e) {
-      debugPrint('Avatar upload error: $e');
-      if (!mounted) return;
-      setState(() => _message = 'Ошибка загрузки аватара: ${_extractDioMessage(e)}');
-    } finally {
-      if (mounted) setState(() => _uploading = false);
-    }
-  }
-
-  Future<void> _logout() async {
-    // Поддерживаем разные реализации logout/clearToken
-    try {
-      if ((_auth).clearToken is Function) {
-        await _auth.clearToken();
-      } else if ((_auth).logout is Function) {
-        await _auth.logout();
-      }
-    } catch (_) {
-      try {
-        if ((_auth).logout is Function) await _auth.logout();
-      } catch (_) {}
-    }
-    if (!mounted) return;
-    Navigator.pushReplacementNamed(context, '/');
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Профиль'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _load,
-            tooltip: 'Обновить',
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Профиль')),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -185,22 +123,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         alignment: Alignment.bottomRight,
                         children: [
                           _buildAvatar(),
-                          Positioned(
-                            right: 0,
-                            bottom: 0,
-                            child: InkWell(
-                              onTap: _uploading ? null : _pickAndUploadAvatar,
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color: Colors.blue,
-                                  shape: BoxShape.circle,
-                                  border: Border.all(color: Colors.white, width: 2),
-                                ),
-                                padding: const EdgeInsets.all(6),
-                                child: Icon(_uploading ? Icons.hourglass_top : Icons.camera_alt, color: Colors.white, size: 18),
-                              ),
-                            ),
-                          ),
+                          // Можно добавить загрузку аватара через ImagePicker, если нужно
                         ],
                       ),
                     ),
@@ -230,7 +153,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
                       ),
                     ),
-                    if (_message.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 12), child: Text(_message, style: const TextStyle(color: Colors.red))),
+                    if (_message.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Text(_message, style: const TextStyle(color: Colors.red)),
+                      ),
                   ],
                 ),
         ),

@@ -18,6 +18,20 @@ late final AuthService authService;
 IO.Socket? socket;
 final StreamController<Map<String, dynamic>> chatEventsController = StreamController.broadcast();
 
+// ✅ Функция для безопасного отключения socket
+Future<void> disconnectSocket() async {
+  try {
+    if (socket != null && socket!.connected) {
+      debugPrint('🔌 Disconnecting socket...');
+      socket!.disconnect();
+      socket = null;
+      debugPrint('✅ Socket disconnected');
+    }
+  } catch (e) {
+    debugPrint('❌ Error disconnecting socket: $e');
+  }
+}
+
 Future<bool> ensureDatabaseExists() async {
   try {
     debugPrint('ensureDatabaseExists: calling /api/setup');
@@ -25,12 +39,13 @@ Future<bool> ensureDatabaseExists() async {
     debugPrint('ensureDatabaseExists: status=${resp.statusCode}, data=${resp.data}');
     if (resp.statusCode == 200) {
       final data = resp.data;
-      if (data is Map && data['ok'] == true) return true;
-      return false;
+      if (data is Map && data['ok'] == true) {
+        return true;
+      }
     }
     return false;
-  } catch (e, st) {
-    debugPrint('ensureDatabaseExists error: $e\n$st');
+  } catch (e) {
+    debugPrint('ensureDatabaseExists error: $e');
     return false;
   }
 }
@@ -46,7 +61,7 @@ bool _isAuthEndpoint(RequestOptions options) {
       path.contains('/register');
 }
 
-Future<void> _attachAuthInterceptor() async {
+void _attachAuthInterceptor() {
   debugPrint('_attachAuthInterceptor: attaching');
   dio.interceptors.add(InterceptorsWrapper(
     onRequest: (options, handler) async {
@@ -58,34 +73,18 @@ Future<void> _attachAuthInterceptor() async {
         } else {
           options.headers.remove('Authorization');
         }
+        return handler.next(options);
       } catch (e, st) {
-        debugPrint('_attachAuthInterceptor onRequest error: $e\n$st');
+        debugPrint('onRequest interceptor error: $e\n$st');
+        return handler.next(options);
       }
-      handler.next(options);
     },
     onError: (err, handler) async {
-      final status = err.response?.statusCode;
-      debugPrint('Interceptor onError: status=$status path=${err.requestOptions.path}');
-      if (status == 401 && !_isAuthEndpoint(err.requestOptions)) {
-        debugPrint('Interceptor: 401 on non-auth endpoint -> performing logout and redirect');
+      if (err.response?.statusCode == 401 || err.response?.statusCode == 403) {
+        debugPrint('_attachAuthInterceptor: got 401/403, clearing token');
         try {
-          final token = await authService.getToken();
-          if (token == null) {
-            // no token — nothing to do
-            return handler.next(err);
-          }
-          // if logout already in progress — skip
-          if ((authService as dynamic)._isLoggingOut == true) {
-            return handler.next(err);
-          }
-          await authService.logout();
-          // navigate to auth screen if navigator available
-          if (navigatorKey.currentState != null) {
-            navigatorKey.currentState!.pushAndRemoveUntil(
-              MaterialPageRoute(builder: (_) => const AuthScreen()),
-              (route) => false,
-            );
-          }
+          await authService.clearToken();
+          navigatorKey.currentState?.pushNamedAndRemoveUntil('/', (route) => false);
         } catch (e, st) {
           debugPrint('Error during logout in interceptor: $e\n$st');
         }
@@ -96,65 +95,68 @@ Future<void> _attachAuthInterceptor() async {
   debugPrint('_attachAuthInterceptor: done');
 }
 
+// ✅ ИСПРАВЛЕННАЯ инициализация Socket
 Future<void> _initSocket() async {
   try {
-    // Close existing socket if any
+    debugPrint('🚀 Initializing socket...');
+
+    // ✅ Закрой старое соединение, если оно есть
     try {
-      socket?.disconnect();
-      socket?.destroy();
-    } catch (_) {}
+      if (socket != null && socket!.connected) {
+        debugPrint('🔌 Closing old socket connection...');
+        socket!.disconnect();
+      }
+      socket = null;
+    } catch (_) {
+      socket = null;
+    }
 
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('auth_token');
 
     // Build options
-    final opts = <String, dynamic>{
-      'transports': ['websocket'],
-      'autoConnect': false,
-      'reconnection': true,
-    };
-    if (token != null && token.isNotEmpty) {
-      opts['auth'] = {'token': token};
-      opts['query'] = {'token': token};
-    }
-
-    socket = IO.io('http://127.0.0.1:3000', IO.OptionBuilder()
-        .setTransports(['websocket'])
-        .enableAutoConnect()
-        .setQuery({'token': token ?? ''})
-        .build());
+    socket = IO.io(
+      'http://127.0.0.1:3000',
+      IO.OptionBuilder()
+          .setTransports(['websocket'])
+          .enableAutoConnect()
+          .setQuery({'token': token ?? ''})
+          .setAuth({'token': token ?? ''})
+          .build(),
+    );
 
     socket?.on('connect', (_) {
-      debugPrint('Socket connected: ${socket?.id}');
+      debugPrint('✅ Socket connected: ${socket?.id}');
     });
 
     socket?.on('disconnect', (reason) {
-      debugPrint('Socket disconnected: $reason');
+      debugPrint('📡 Socket disconnected: $reason');
     });
 
     socket?.on('connect_error', (err) {
-      debugPrint('Socket connect_error: $err');
+      debugPrint('❌ Socket connect_error: $err');
     });
 
     // Chat created -> notify listeners to reload chats
     socket?.on('chat:created', (data) {
-      debugPrint('Socket event chat:created -> $data');
+      debugPrint('📬 Socket event chat:created -> $data');
       chatEventsController.add({'type': 'chat:created', 'data': data});
     });
 
     // New message -> notify listeners
     socket?.on('chat:message', (data) {
-      debugPrint('Socket event chat:message -> $data');
+      debugPrint('📬 Socket event chat:message -> $data');
       chatEventsController.add({'type': 'chat:message', 'data': data});
     });
 
     // Global message event (optional)
     socket?.on('chat:message:global', (data) {
-      debugPrint('Socket event chat:message:global -> $data');
+      debugPrint('📬 Socket event chat:message:global -> $data');
       chatEventsController.add({'type': 'chat:message:global', 'data': data});
     });
 
     socket?.connect();
+    debugPrint('🔗 Socket connecting...');
   } catch (e, st) {
     debugPrint('_initSocket error: $e\n$st');
   }
@@ -164,8 +166,7 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
   if (!dbReady) return const SetupFailedScreen();
 
-  await authService.setAuthHeaderFromStorage();
-
+  // ✅ ИСПРАВЛЕНИЕ: Используй tryRefreshOnStartup вместо setAuthHeaderFromStorage
   final logged = await authService.tryRefreshOnStartup();
   debugPrint('determineInitialScreen: tryRefreshOnStartup -> $logged');
 
@@ -252,7 +253,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
 
   @override
   void dispose() {
-    try { _authSub?.cancel(); } catch (_) {}
+    try {
+      _authSub?.cancel();
+    } catch (_) {}
     super.dispose();
   }
 
@@ -260,21 +263,23 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     setState(() => _status = 'Инициализация: attaching interceptor');
     try {
       authService = AuthService(dio: dio);
-      await _attachAuthInterceptor();
+      _attachAuthInterceptor();
 
-      // Подписка на изменения аутентификации: управляем socket и (при необходимости) навигацией
+      // ✅ ИСПРАВЛЕНИЕ: Подписка на изменения аутентификации
+      // При logout (user == null) отключаем socket
+      // При login (user != null) инициализируем socket
       _authSub = authService.authStream.listen((user) async {
+        debugPrint('Auth stream event: user=${user?.email}');
         if (user == null) {
-          // пользователь вышел — отключаем socket
-          try {
-            socket?.disconnect();
-            socket?.destroy();
-          } catch (_) {}
+          // Пользователь вышел — отключаем socket
+          await disconnectSocket();
         } else {
-          // пользователь вошёл — инициализируем socket
+          // Пользователь вошёл — инициализируем socket
           try {
             await _initSocket();
-          } catch (_) {}
+          } catch (e) {
+            debugPrint('Failed to init socket after login: $e');
+          }
         }
       });
     } catch (e, st) {
@@ -354,7 +359,7 @@ class SetupFailedScreen extends StatelessWidget {
                   );
                 } else {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Повторная попытка не удалась')),
+                    const SnackBar(content: Text('Попытка подключения провалилась')),
                   );
                 }
               },

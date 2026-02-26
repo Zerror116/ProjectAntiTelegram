@@ -14,7 +14,7 @@ const validator = require('validator');
 
 const db = require('./db');
 
-// ✅ ИСПРАВЛЕНИЕ: Сначала создаём app, потом используем его!
+// ✅ Сначала создаём app, потом использу��м его
 const app = express();
 
 // Импортируем роуты и middleware ПОСЛЕ создания app
@@ -47,7 +47,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Лимитер для маршруто�� аутентификации (защита от brute-force)
+// Лимитер для маршрутов аутентифика��ии (защита от brute-force)
 const authLimiter = rateLimit({
   windowMs: 2 * 1000,      // 2 секунды
   max: 6,                   // максимум 6 запросов в окне
@@ -285,6 +285,25 @@ async function ensureCreator() {
       const uid = socket.user?.id;
       console.log(`📡 Socket connected: ${sid} (user=${uid || 'anonymous'})`);
 
+      // ✅ ИСПРАВЛЕНИЕ: Если юзер залогинился, очисти его старые сокеты
+      if (uid) {
+        // Получи все сокеты этого юзера
+        const userSockets = io.sockets.sockets;
+        let socketCount = 0;
+
+        for (const [existingSid, existingSocket] of userSockets) {
+          if (existingSocket.user?.id === uid && existingSid !== sid) {
+            console.log(`🔌 Disconnecting old socket ${existingSid} for user ${uid}`);
+            existingSocket.disconnect(true); // true = отправи клиенту disconnect событие
+            socketCount++;
+          }
+        }
+
+        if (socketCount > 0) {
+          console.log(`✅ Cleaned up ${socketCount} old socket(s) for user ${uid}`);
+        }
+      }
+
       // Присоединение к комнате чата
       socket.on('join_chat', (chatId) => {
         try {
@@ -292,6 +311,20 @@ async function ensureCreator() {
             console.warn(`Socket ${sid}: join_chat called with empty chatId`);
             return;
           }
+
+          // ✅ ИСПРАВЛЕНИЕ: Сначала выйди из всех чатов, потом присоединись к новому
+          // Получи текущие ком��аты сокета
+          const currentRooms = socket.rooms;
+
+          // Выйди из всех chat:* комнат
+          for (const room of currentRooms) {
+            if (room.startsWith('chat:')) {
+              socket.leave(room);
+              console.log(`Socket ${sid} left room ${room}`);
+            }
+          }
+
+          // Присоединись к новой комнате
           socket.join(`chat:${chatId}`);
           console.log(`Socket ${sid} joined chat:${chatId}`);
         } catch (err) {
@@ -313,14 +346,25 @@ async function ensureCreator() {
         }
       });
 
-      // Отключение
+      // ✅ ИСПРАВЛЕНИЕ: Обработка отключения с логированием
       socket.on('disconnect', (reason) => {
-        console.log(`📡 Socket disconnected: ${sid} (reason: ${reason})`);
+        console.log(`📡 Socket disconnected: ${sid} (user=${uid || 'anonymous'}, reason: ${reason})`);
+
+        // Все комнаты автоматически очищаются при disconnect
+        const roomsBeforeDisconnect = Array.from(socket.rooms);
+        console.log(`   Rooms cleared: ${roomsBeforeDisconnect.join(', ')}`);
       });
 
       // Обработчик ошибок сокета
       socket.on('error', (error) => {
         console.error(`Socket ${sid} error:`, error);
+      });
+
+      // ✅ Логирование всех событий для отладки (опционально)
+      socket.onAny((eventName, ...args) => {
+        if (!['ping', 'pong'].includes(eventName)) {
+          console.log(`Socket ${sid} event: ${eventName}`, args.length > 0 ? args[0] : '');
+        }
       });
     });
 
