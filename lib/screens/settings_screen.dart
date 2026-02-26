@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../main.dart';
 import '../services/auth_service.dart';
 import 'change_password_screen.dart';
+import 'package:dio/dio.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -17,7 +18,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _loading = false;
   String _message = '';
 
-  // Заглушки: в будущем сохранять в persistent storage / сервер
+  String _extractDioMessage(dynamic e) {
+    try {
+      final resp = (e is DioException) ? e.response : (e is DioError ? e.response : null);
+      if (resp != null && resp.data != null) return resp.data.toString();
+    } catch (_) {}
+    return e?.toString() ?? 'Неизвестная ошибка';
+  }
+
   Future<void> _toggleNotifications(bool v) async {
     setState(() => _notifications = v);
     // TODO: persist preference
@@ -48,30 +56,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
 
     try {
-      // Заглушка: endpoint для удаления аккаунта
       final resp = await _auth.dio.post('/api/auth/delete_account');
       if (resp.statusCode == 200) {
-        await _auth.logout();
+        // Поддерживаем разные реализации logout/clearToken
+        try {
+          if ((_auth).clearToken is Function) {
+            await _auth.clearToken();
+          } else if ((_auth).logout is Function) {
+            await _auth.logout();
+          }
+        } catch (_) {}
         if (!mounted) return;
         Navigator.pushReplacementNamed(context, '/');
       } else {
+        if (!mounted) return;
         setState(() => _message = 'Ошибка удаления аккаунта');
       }
     } catch (e) {
-      setState(() => _message = 'Ошибка: $e');
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка: ${_extractDioMessage(e)}');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
   Future<void> _openSupport() async {
-    // Заглушка: открыть экран поддержки / отправить письмо
     setState(() => _message = 'Функция поддержки пока не реализована');
   }
 
   @override
   Widget build(BuildContext context) {
-    // Используем SingleChildScrollView + ConstrainedBox чтобы избежать overflow
     return Scaffold(
       appBar: AppBar(
         title: const Text('Настройки'),
@@ -115,23 +129,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         title: const Text('Удалить аккаунт', style: TextStyle(color: Colors.red)),
                         onTap: _deleteAccount,
                       ),
-
-                      // Заполнитель, чтобы кнопка выхода была внизу при большом экране,
-                      // но не вызывал overflow на маленьких — используем SizedBox вместо Spacer.
                       const SizedBox(height: 16),
-
                       if (_message.isNotEmpty)
                         Padding(
                           padding: const EdgeInsets.only(bottom: 12),
                           child: Text(_message, style: const TextStyle(color: Colors.red)),
                         ),
-
-                      // Кнопка выхода внизу
                       SizedBox(
                         width: double.infinity,
                         child: ElevatedButton(
                           onPressed: () async {
-                            await _auth.logout();
+                            try {
+                              if ((_auth).clearToken is Function) {
+                                await _auth.clearToken();
+                              } else if ((_auth).logout is Function) {
+                                await _auth.logout();
+                              }
+                            } catch (_) {}
                             if (!mounted) return;
                             Navigator.pushReplacementNamed(context, '/');
                           },
@@ -139,7 +153,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
                         ),
                       ),
-
                       if (_loading) const Padding(padding: EdgeInsets.only(top: 12), child: Center(child: CircularProgressIndicator())),
                     ],
                   ),

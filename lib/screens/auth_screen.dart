@@ -117,22 +117,16 @@ class _AuthScreenState extends State<AuthScreen> {
         _authService.setPendingCredentials(email: email, password: password);
         if (!mounted) return;
 
-        final result = await Navigator.push(
-          context,
+        // Вариант B: сброс всего стека и переход на PhoneNameScreen
+        // Это удалит экран регистрации из стека, поэтому кнопки "назад" не будет.
+        setState(() => _loading = false);
+        await Navigator.of(context).pushAndRemoveUntil(
           MaterialPageRoute(builder: (_) => const PhoneNameScreen(isRegisterFlow: true)),
+          (Route<dynamic> route) => false,
         );
 
-        if (result is Map && result['error'] != null) {
-          setState(() {
-            _message = result['error'].toString();
-            _loading = false;
-            _isRegister = true;
-          });
-          return;
-        }
-
-        if (!mounted) return;
-        setState(() => _loading = false);
+        // После pushAndRemoveUntil управление обычно не вернётся сюда,
+        // но на всякий случай завершаем метод.
         return;
       } else {
         // Обычный логин

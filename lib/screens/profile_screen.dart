@@ -1,6 +1,5 @@
 // lib/screens/profile_screen.dart
 import 'dart:io';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
@@ -37,6 +36,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _load();
   }
 
+  String _extractDioMessage(dynamic e) {
+    try {
+      final resp = (e is DioException) ? e.response : (e is DioError ? e.response : null);
+      if (resp != null && resp.data != null) return resp.data.toString();
+    } catch (_) {}
+    return e?.toString() ?? 'Неизвестная ошибка';
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -49,6 +56,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (data is Map && data['user'] is Map) {
         final u = Map<String, dynamic>.from(data['user']);
         final rawPhone = u['phone'] ?? '';
+        if (!mounted) return;
         setState(() {
           _name = (u['name'] ?? '') as String;
           _email = (u['email'] ?? '') as String;
@@ -56,29 +64,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _avatarUrl = (u['avatar_url'] ?? u['avatar'] ?? null)?.toString();
         });
       } else {
+        if (!mounted) return;
         setState(() => _message = 'Невозможно загрузить профиль');
       }
-    } on DioException catch (e) {
-      debugPrint('Profile load DioException: $e');
-      setState(() => _message = 'Ошибка загрузки профиля: ${_extractDioMessage(e)}');
     } catch (e) {
       debugPrint('Profile load error: $e');
-      setState(() => _message = 'Ошибка: $e');
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка загрузки профиля: ${_extractDioMessage(e)}');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
-  }
-
-  String _extractDioMessage(DioException e) {
-    final resp = e.response;
-    if (resp != null && resp.data != null) {
-      try {
-        return resp.data.toString();
-      } catch (_) {
-        return e.message ?? e.toString();
-      }
-    }
-    return e.message ?? e.toString();
   }
 
   Widget _buildAvatar() {
@@ -128,28 +123,38 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final newUrl = data != null ? (data['avatar_url'] ?? data['avatar'] ?? null) : null;
 
       if (newUrl != null) {
+        if (!mounted) return;
         setState(() {
           _avatarUrl = newUrl.toString();
           _message = 'Аватар обновлён';
         });
       } else {
-        // Если сервер не вернул URL, перезагрузим профиль
         await _load();
+        if (!mounted) return;
         setState(() => _message = 'Аватар обновлён');
       }
-    } on DioException catch (e) {
-      debugPrint('Avatar upload DioException: $e');
-      setState(() => _message = 'Ошибка загрузки аватара: ${_extractDioMessage(e)}');
     } catch (e) {
       debugPrint('Avatar upload error: $e');
-      setState(() => _message = 'Ошибка: $e');
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка загрузки аватара: ${_extractDioMessage(e)}');
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
   }
 
   Future<void> _logout() async {
-    await _auth.logout();
+    // Поддерживаем разные реализации logout/clearToken
+    try {
+      if ((_auth).clearToken is Function) {
+        await _auth.clearToken();
+      } else if ((_auth).logout is Function) {
+        await _auth.logout();
+      }
+    } catch (_) {
+      try {
+        if ((_auth).logout is Function) await _auth.logout();
+      } catch (_) {}
+    }
     if (!mounted) return;
     Navigator.pushReplacementNamed(context, '/');
   }
