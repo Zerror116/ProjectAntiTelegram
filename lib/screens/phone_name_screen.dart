@@ -18,7 +18,6 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   final _phoneCtrl = TextEditingController();
   final _secretCtrl = TextEditingController();
 
-  // listeners references so we can remove them in dispose
   late final VoidCallback _nameListener;
   late final VoidCallback _phoneListener;
   late final VoidCallback _secretListener;
@@ -26,7 +25,6 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   bool _loading = false;
   String _message = '';
 
-  // Жёстко захардкоженный email создателя
   static const String _creatorEmail = 'zerotwo02166@gmail.com';
 
   bool get _isCreatorPending {
@@ -44,14 +42,12 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   @override
   void initState() {
     super.initState();
-    // Попробуем предзаполнить поля из currentUser, если есть
     final u = authService.currentUser;
     if (u != null) {
       _nameCtrl.text = u.name ?? '';
       _phoneCtrl.text = u.phone ?? '';
     }
 
-    // Инициализируем слушатели, чтобы гарантировать немедленную перерисовку при вводе
     _nameListener = () => setState(() {});
     _phoneListener = () => setState(() {});
     _secretListener = () => setState(() {});
@@ -63,21 +59,40 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
   @override
   void dispose() {
-    // Удаляем слушатели и освобождаем контроллеры
-    try {
-      _nameCtrl.removeListener(_nameListener);
-    } catch (_) {}
-    try {
-      _phoneCtrl.removeListener(_phoneListener);
-    } catch (_) {}
-    try {
-      _secretCtrl.removeListener(_secretListener);
-    } catch (_) {}
+    try { _nameCtrl.removeListener(_nameListener); } catch (_) {}
+    try { _phoneCtrl.removeListener(_phoneListener); } catch (_) {}
+    try { _secretCtrl.removeListener(_secretListener); } catch (_) {}
 
     _nameCtrl.dispose();
     _phoneCtrl.dispose();
     _secretCtrl.dispose();
     super.dispose();
+  }
+
+  String _extractDioMessage(dynamic e) {
+    try {
+      // Dio v5: DioException, v4: DioError
+      final resp = (e is DioException) ? e.response : (e is DioError ? e.response : null);
+      if (resp != null && resp.data != null) return resp.data.toString();
+    } catch (_) {}
+    return e?.toString() ?? 'Неизвестная ошибка';
+  }
+
+  Future<void> _saveTokenFlexible(String token) async {
+    // Поддерживаем разные реализации authService: setToken или saveToken
+    try {
+      if ((authService).setToken is Function) {
+        await authService.setToken(token);
+        return;
+      }
+    } catch (_) {}
+    try {
+      if ((authService).saveToken is Function) {
+        await authService.saveToken(token);
+        return;
+      }
+    } catch (_) {}
+    // fallback: просто сохраняем в SharedPreferences через authService API, если нет — игнорируем
   }
 
   Future<void> _submit() async {
@@ -139,20 +154,36 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           return;
         }
 
-        await authService.saveToken(token as String);
-        authService.pendingEmail = null;
-        authService.pendingPassword = null;
+        // Сохраняем токен гибко (поддержка разных authService)
+        await _saveTokenFlexible(token as String);
 
-        // Обновим currentUser из профиля, если сервер не вернул user
+        // Очистим pending
+        try { authService.pendingEmail = null; authService.pendingPassword = null; } catch (_) {}
+
+        // Попробуем обновить currentUser через профиль (если сервер не вернул user)
         try {
-          await authService.setAuthHeaderFromStorage();
+          if ((authService).setAuthHeaderFromStorage is Function) {
+            await authService.setAuthHeaderFromStorage();
+          } else {
+            // Попытка получить профиль напрямую
+            try {
+              final profileResp = await authService.dio.get('/api/profile');
+              if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
+                final userMap = Map<String, dynamic>.from(profileResp.data['user']);
+                try {
+                  if ((authService).applyLoginResponse is Function) {
+                    await authService.applyLoginResponse(token as String, userMap);
+                  }
+                } catch (_) {}
+              }
+            } catch (_) {}
+          }
         } catch (_) {}
 
         if (!mounted) return;
         Navigator.of(context).pushReplacementNamed('/main');
         return;
       } else {
-        // Обновление профиля: отправляем name, возможно secret, и запрос на верификацию телефона
         final profileData = {'name': name};
         if (_isCreatorCurrentUser) profileData['secret'] = secret;
 
@@ -165,9 +196,21 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         final ok2 = (results[1].statusCode == 200) || (results[1].data is Map && results[1].data['ok'] == true);
 
         if (ok1 && ok2) {
-          // Обновим локальный currentUser, если сервер вернул user
           try {
-            await authService.setAuthHeaderFromStorage();
+            if ((authService).setAuthHeaderFromStorage is Function) {
+              await authService.setAuthHeaderFromStorage();
+            } else {
+              // Попробуем получить профиль вручную
+              final profileResp = await authService.dio.get('/api/profile');
+              if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
+                final userMap = Map<String, dynamic>.from(profileResp.data['user']);
+                try {
+                  if ((authService).applyLoginResponse is Function) {
+                    await authService.applyLoginResponse(await authService.getToken() ?? '', userMap);
+                  }
+                } catch (_) {}
+              }
+            }
           } catch (_) {}
           if (!mounted) return;
           Navigator.of(context).pop();
@@ -176,22 +219,9 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           setState(() => _message = 'Ошибка обновления профиля');
         }
       }
-    } on DioException catch (e) {
-      final status = e.response?.statusCode;
-      // Если email уже зарегистрирован — возвращаемся назад и передаём ошибку в AuthScreen
-      if (status == 409) {
-        if (mounted) {
-          Navigator.of(context).pop({'error': 'Email already registered'});
-        }
-        return;
-      }
-
-      final serverData = e.response?.data;
-      final serverMsg = serverData != null ? serverData.toString() : null;
-      final errMsg = serverMsg ?? (e.message?.toString() ?? e.toString());
-      setState(() => _message = errMsg);
     } catch (e) {
-      setState(() => _message = e.toString());
+      final errMsg = _extractDioMessage(e);
+      setState(() => _message = errMsg);
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -230,7 +260,6 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
                 textInputAction: TextInputAction.done,
               ),
               const SizedBox(height: 12),
-              // Поле секретного слова показываем только в нужном случае
               if (_shouldShowSecretField) ...[
                 TextField(
                   controller: _secretCtrl,

@@ -11,7 +11,8 @@ const rateLimit = require('express-rate-limit');
 const validator = require('validator');
 
 const db = require('./db');
-
+const profileUpdateRoutes = require('./routes/profileUpdate');
+app.use('/api/profile', profileUpdateRoutes);
 // Роуты и middleware (не должны импортировать index.js)
 const setupRouter = require('./routes/setup');
 const phonesRouter = require('./routes/phones');

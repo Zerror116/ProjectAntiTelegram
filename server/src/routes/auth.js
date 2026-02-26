@@ -19,8 +19,10 @@ function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 }
 
-// POST /api/auth/check_email
-// body: { email }
+/**
+ * POST /api/auth/check_email
+ * body: { email }
+ */
 router.post('/check_email', async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -39,8 +41,14 @@ router.post('/check_email', async (req, res) => {
   }
 });
 
-// POST /api/auth/register
-// body: { email, password, name?, phone?, secret? }
+/**
+ * POST /api/auth/register
+ * body: { email, password, name?, phone?, secret? }
+ *
+ * Notes:
+ * - If email equals CREATOR_EMAIL and correct secret provided, role becomes 'creator'
+ * - Returns { token, user: { id, email, name, role } }
+ */
 router.post('/register', async (req, res) => {
   try {
     const { email, password, name, phone, secret } = req.body || {};
@@ -54,7 +62,6 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
 
-    // Начинаем транзакцию
     await db.query('BEGIN');
 
     const existing = await db.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
@@ -63,10 +70,8 @@ router.post('/register', async (req, res) => {
       return res.status(409).json({ error: 'Email already registered' });
     }
 
-    // Определяем роль: по умолчанию client
     let role = 'client';
     if (normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase()) {
-      // Для creator требуем секрет
       if (typeof secret === 'string' && secret === CREATOR_SECRET) {
         role = 'creator';
       } else {
@@ -88,7 +93,6 @@ router.post('/register', async (req, res) => {
         await db.query('ROLLBACK');
         return res.status(400).json({ error: 'Invalid phone format' });
       }
-      // Вставляем/обновляем phones; предполагается, что есть уникальный индекс по user_id
       await db.query(
         `INSERT INTO phones (user_id, phone, status, created_at)
          VALUES ($1, $2, 'pending_verification', now())
@@ -99,9 +103,12 @@ router.post('/register', async (req, res) => {
 
     await db.query('COMMIT');
 
-    // Включаем роль в токен
     const token = signToken({ id: user.id, email: user.email, role: user.role });
-    return res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+
+    return res.status(201).json({
+      token,
+      user: { id: user.id, email: user.email, name: user.name, role: user.role }
+    });
   } catch (err) {
     try { await db.query('ROLLBACK'); } catch (_) {}
     console.error('auth.register error', err);
@@ -109,8 +116,12 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login
-// body: { email, password }
+/**
+ * POST /api/auth/login
+ * body: { email, password }
+ *
+ * Returns { token, user: { id, email, role } }
+ */
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -121,7 +132,6 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Неверный логин или пароль' });
     }
 
-    // Получаем роль и хеш пароля
     const userRes = await db.query('SELECT id, email, password_hash, role FROM users WHERE email = $1', [normalizedEmail]);
     const user = userRes.rows[0];
     if (!user) return res.status(401).json({ error: 'Неверные данные' });
@@ -129,16 +139,20 @@ router.post('/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Неверные данные' });
 
-    // Включаем роль в токен и возвращаем роль в ответе
     const token = signToken({ id: user.id, email: user.email, role: user.role });
-    return res.json({ token, user: { id: user.id, email: user.email, role: user.role } });
+    return res.json({
+      token,
+      user: { id: user.id, email: user.email, role: user.role }
+    });
   } catch (err) {
     console.error('auth.login error', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// POST /api/auth/change_password (защищённый)
+/**
+ * POST /api/auth/change_password (защищённый)
+ */
 router.post('/change_password', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;

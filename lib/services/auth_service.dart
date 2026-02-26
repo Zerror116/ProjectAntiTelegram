@@ -1,4 +1,5 @@
 // lib/services/auth_service.dart
+import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
@@ -51,50 +52,70 @@ class AuthService {
   User? _currentUser;
   User? get currentUser => _currentUser;
 
+  // Stream controller to notify listeners about auth changes (user or logout)
+  final StreamController<User?> _authController = StreamController<User?>.broadcast();
+  Stream<User?> get authStream => _authController.stream;
+
+  // Prevent re-entrant or duplicate logout/clear operations
+  bool _isLoggingOut = false;
+
   AuthService({required this.dio});
 
-  /// Устанавливает заголовок Authorization для текущего Dio-инстанса
-  void setAuthHeader(String token) {
-    dio.options.headers['Authorization'] = 'Bearer $token';
-  }
-
-  /// Попытка установить заголовок из сохранённого токена (если есть)
-  /// и подтянуть профиль пользователя, чтобы заполнить currentUser.
-  Future<void> setAuthHeaderFromStorage() async {
-    final token = await getToken();
-    if (token != null) {
-      setAuthHeader(token);
-      try {
-        final resp = await dio.get('/api/profile');
-        if (resp.statusCode == 200 && resp.data is Map && resp.data['user'] is Map) {
-          _currentUser = User.fromMap(Map<String, dynamic>.from(resp.data['user']));
-          debugPrint('AuthService.setAuthHeaderFromStorage -> user loaded: ${_currentUser?.email} role=${_currentUser?.role}');
-        }
-      } catch (e) {
-        debugPrint('AuthService.setAuthHeaderFromStorage: failed to fetch profile: $e');
-      }
+  /// Приватный: установить/удалить заголовок Authorization
+  void _setAuthHeader(String? token) {
+    if (token != null && token.isNotEmpty) {
+      dio.options.headers['Authorization'] = 'Bearer $token';
+    } else {
+      dio.options.headers.remove('Authorization');
     }
   }
 
-  /// Сохраняет токен публично и устанавливает заголовок
-  Future<void> saveToken(String token) async {
+  /// Публичный: установить токен и (опционально) user, уведомить слушателей
+  Future<void> setToken(String token, [User? user]) async {
     await _saveToken(token);
-    setAuthHeader(token);
-    debugPrint('AuthService.saveToken -> saved and set header: ${dio.options.headers['Authorization']}');
+    _setAuthHeader(token);
+    if (user != null) _currentUser = user;
+    try {
+      _authController.add(_currentUser);
+    } catch (_) {}
+    debugPrint('AuthService.setToken -> token set, user=${_currentUser?.email}');
   }
 
-  /// Удаляет токен (logout)
-  Future<void> logout() async {
+  /// Публичный: очистить токен и user (logout)
+  Future<void> clearToken() async {
+    if (_isLoggingOut) return;
+    _isLoggingOut = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_tokenKey);
+      _setAuthHeader(null);
+      pendingEmail = null;
+      pendingPassword = null;
+      _currentUser = null;
+      try {
+        _authController.add(null);
+      } catch (_) {}
+      debugPrint('AuthService.clearToken -> logged out');
+    } finally {
+      _isLoggingOut = false;
+    }
+  }
+
+  /// Приватный: сохранить токен в SharedPreferences
+  Future<void> _saveToken(String token) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_tokenKey);
-    dio.options.headers.remove('Authorization');
-    pendingEmail = null;
-    pendingPassword = null;
-    _currentUser = null;
-    debugPrint('AuthService.logout -> token removed and user cleared');
+    await prefs.setString(_tokenKey, token);
   }
 
-  /// Вспомогательный метод: обработать ответ от /auth (вытянуть токен и user)
+  /// Получение токена из SharedPreferences
+  Future<String?> getToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString(_tokenKey);
+    debugPrint('AuthService.getToken -> $token');
+    return token;
+  }
+
+  /// Обработать ответ от /auth (вытянуть токен и user), использовать setToken
   Future<void> _processAuthResponse(Response resp) async {
     final data = resp.data as Map<String, dynamic>;
     final token = data['token'] ?? data['access'];
@@ -109,9 +130,11 @@ class AuthService {
         if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
           _currentUser = User.fromMap(Map<String, dynamic>.from(profileResp.data['user']));
         }
-      } catch (_) {}
+      } catch (_) {
+        // ignore
+      }
     }
-    await saveToken(token as String);
+    await setToken(token as String, _currentUser);
   }
 
   /// Вход
@@ -183,16 +206,19 @@ class AuthService {
     final token = await getToken();
     if (token == null) return false;
     try {
-      setAuthHeader(token);
+      _setAuthHeader(token);
       final resp = await dio.get('/api/profile');
       if (resp.statusCode == 200 && resp.data is Map && resp.data['user'] is Map) {
         _currentUser = User.fromMap(Map<String, dynamic>.from(resp.data['user']));
+        // уведомляем слушателей, что пользователь восстановлен
+        try { _authController.add(_currentUser); } catch (_) {}
+        debugPrint('AuthService.tryRefreshOnStartup -> user restored: ${_currentUser?.email}');
         return true;
       }
       return false;
     } catch (e) {
       debugPrint('tryRefreshOnStartup failed: $e');
-      await logout();
+      await clearToken();
       return false;
     }
   }
@@ -217,21 +243,40 @@ class AuthService {
     return resp.data as Map<String, dynamic>;
   }
 
-  /// Сохранение токена в SharedPreferences (приватный)
-  Future<void> _saveToken(String token) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_tokenKey, token);
-  }
-
-  /// Получение токена из SharedPreferences
-  Future<String?> getToken() async {
-    final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString(_tokenKey);
-    debugPrint('AuthService.getToken -> $token');
-    return token;
-  }
-
   /// Утилиты по ролям
   bool hasRole(String role) => _currentUser?.role == role;
   bool hasAnyRole(List<String> roles) => _currentUser != null && roles.contains(_currentUser!.role);
+
+  /// Применить ответ логина/регистрации (если вызывается извне)
+  Future<void> applyLoginResponse(String token, Map<String, dynamic>? userMap) async {
+    User? user;
+    if (userMap != null) user = User.fromMap(Map<String, dynamic>.from(userMap));
+    await setToken(token, user);
+  }
+
+  /// Закрыть контроллер при завершении
+  void dispose() {
+    try {
+      _authController.close();
+    } catch (_) {}
+  }
+
+  // -------------------------
+  // Совместимость с существующим кодом (обёртки)
+  // -------------------------
+
+  /// Старые вызовы в проекте могли использовать `saveToken` — оставляем обёртку.
+  Future<void> saveToken(String token) async {
+    await setToken(token);
+  }
+
+  /// Старые вызовы могли использовать `setAuthHeaderFromStorage` — оставляем обёртку.
+  Future<void> setAuthHeaderFromStorage() async {
+    await tryRefreshOnStartup();
+  }
+
+  /// Старые вызовы могли использовать `logout` — оставляем обёртку.
+  Future<void> logout() async {
+    await clearToken();
+  }
 }

@@ -51,8 +51,8 @@ Future<void> _attachAuthInterceptor() async {
   dio.interceptors.add(InterceptorsWrapper(
     onRequest: (options, handler) async {
       try {
-        final prefs = await SharedPreferences.getInstance();
-        final token = prefs.getString('auth_token');
+        // Use AuthService as single source of truth for token
+        final token = await authService.getToken();
         if (token != null && token.isNotEmpty) {
           options.headers['Authorization'] = 'Bearer $token';
         } else {
@@ -69,15 +69,25 @@ Future<void> _attachAuthInterceptor() async {
       if (status == 401 && !_isAuthEndpoint(err.requestOptions)) {
         debugPrint('Interceptor: 401 on non-auth endpoint -> performing logout and redirect');
         try {
+          final token = await authService.getToken();
+          if (token == null) {
+            // no token — nothing to do
+            return handler.next(err);
+          }
+          // if logout already in progress — skip
+          if ((authService as dynamic)._isLoggingOut == true) {
+            return handler.next(err);
+          }
           await authService.logout();
+          // navigate to auth screen if navigator available
+          if (navigatorKey.currentState != null) {
+            navigatorKey.currentState!.pushAndRemoveUntil(
+              MaterialPageRoute(builder: (_) => const AuthScreen()),
+              (route) => false,
+            );
+          }
         } catch (e, st) {
           debugPrint('Error during logout in interceptor: $e\n$st');
-        }
-        if (navigatorKey.currentState != null) {
-          navigatorKey.currentState!.pushAndRemoveUntil(
-            MaterialPageRoute(builder: (_) => const AuthScreen()),
-            (route) => false,
-          );
         }
       }
       handler.next(err);
@@ -232,6 +242,7 @@ class DiagnosticBootstrap extends StatefulWidget {
 class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Widget? _home;
   String? _status;
+  StreamSubscription<User?>? _authSub;
 
   @override
   void initState() {
@@ -239,11 +250,33 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     _startInit();
   }
 
+  @override
+  void dispose() {
+    try { _authSub?.cancel(); } catch (_) {}
+    super.dispose();
+  }
+
   Future<void> _startInit() async {
     setState(() => _status = 'Инициализация: attaching interceptor');
     try {
       authService = AuthService(dio: dio);
       await _attachAuthInterceptor();
+
+      // Подписка на изменения аутентификации: управляем socket и (при необходимости) навигацией
+      _authSub = authService.authStream.listen((user) async {
+        if (user == null) {
+          // пользователь вышел — отключаем socket
+          try {
+            socket?.disconnect();
+            socket?.destroy();
+          } catch (_) {}
+        } else {
+          // пользователь вошёл — инициализируем socket
+          try {
+            await _initSocket();
+          } catch (_) {}
+        }
+      });
     } catch (e, st) {
       debugPrint('Error attaching interceptor: $e\n$st');
     }

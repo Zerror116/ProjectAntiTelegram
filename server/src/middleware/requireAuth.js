@@ -1,15 +1,49 @@
-// server/src/middleware/requireAuth.js
 const jwt = require('jsonwebtoken');
 
 module.exports = function requireAuth(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
-  const token = auth.slice(7);
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = { id: payload.sub, role: payload.role };
-    return next();
+    const authHeader = req.headers.authorization;
+
+    console.log('AUTH HEADER:', authHeader);
+
+    if (!authHeader) {
+      return res.status(401).json({
+        ok: false,
+        error: 'No token provided'
+      });
+    }
+
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Invalid token format'
+      });
+    }
+
+    const token = authHeader.substring(7);
+
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET || 'dev_secret'
+    );
+
+    console.log('JWT DECODED:', decoded);
+
+    // КРИТИЧЕСКИЙ FIX
+    req.user = {
+      id: decoded.id,
+      email: decoded.email,
+      role: decoded.role
+    };
+
+    next();
+
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid token' });
+    console.error('AUTH ERROR:', err.message);
+
+    return res.status(401).json({
+      ok: false,
+      error: 'Invalid token'
+    });
   }
 };
