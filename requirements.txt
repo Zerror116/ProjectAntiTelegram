@@ -1,10 +1,42 @@
-fastapi
-uvicorn[standard]
-sqlalchemy>=1.4
-alembic
-pydantic
-passlib[bcrypt]
-python-jose[cryptography]
-python-multipart
-python-dotenv
-psycopg2-binary
+# API Framework
+FastAPI==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database
+SQLAlchemy==2.0.23
+alembic==1.13.0
+psycopg2-binary==2.9.9
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.0
+PyJWT==2.8.1
+
+# Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+email-validator==2.1.0
+
+# HTTP Client
+httpx==0.25.2
+requests==2.31.0
+
+# Utilities
+typing-extensions==4.8.0
+
+# Development & Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.12.0
+flake8==6.1.0
+pylint==3.0.3
+mypy==1.7.1
+
+# Logging
+python-json-logger==2.0.7
+
+# Optional: API Documentation extras
+# mkdocs==1.5.3
+# mkdocs-material==9.5.3
