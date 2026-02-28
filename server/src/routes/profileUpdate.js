@@ -15,13 +15,21 @@ router.post('/update', requireAuth, async (req, res) => {
       });
     }
 
-    await pool.query(
-      `UPDATE users SET name = $1 WHERE id = $2`,
+    const updated = await pool.query(
+      `UPDATE users
+       SET name = $1,
+           updated_at = now()
+       WHERE id = $2
+       RETURNING id, email, name, role, avatar_url,
+                 COALESCE(avatar_focus_x, 0) AS avatar_focus_x,
+                 COALESCE(avatar_focus_y, 0) AS avatar_focus_y,
+                 COALESCE(avatar_zoom, 1) AS avatar_zoom`,
       [name.trim(), userId]
     );
 
     return res.json({
-      ok: true
+      ok: true,
+      user: updated.rows[0] || null,
     });
 
   } catch (err) {

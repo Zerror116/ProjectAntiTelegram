@@ -43,6 +43,7 @@ class User {
 class AuthService {
   final Dio dio;
   static const _tokenKey = 'auth_token';
+  static const _viewRoleKey = 'creator_view_role';
 
   // Temporary storage for multi-step registration
   String? pendingEmail;
@@ -51,6 +52,15 @@ class AuthService {
   // Current authenticated user (populated after login / profile fetch)
   User? _currentUser;
   User? get currentUser => _currentUser;
+  String? _viewRole;
+  String? get viewRole => _viewRole;
+  String get effectiveRole {
+    final base = (_currentUser?.role ?? 'client').toLowerCase().trim();
+    if (base == 'creator' && _viewRole != null && _viewRole!.isNotEmpty) {
+      return _viewRole!;
+    }
+    return base;
+  }
 
   // Stream controller to notify listeners about auth changes (user or logout)
   final StreamController<User?> _authController = StreamController<User?>.broadcast();
@@ -60,6 +70,12 @@ class AuthService {
   bool _isLoggingOut = false;
 
   AuthService({required this.dio});
+
+  String _shortToken(String token) {
+    if (token.isEmpty) return '';
+    final n = token.length < 20 ? token.length : 20;
+    return token.substring(0, n);
+  }
 
   /// Приватный: установить/удалить заголовок Authorization
   void _setAuthHeader(String? token) {
@@ -74,10 +90,19 @@ class AuthService {
 
   /// Публичный: установить токен и (опционально) user, уведомить слушателей
   Future<void> setToken(String token, [User? user]) async {
-    debugPrint('🔐 setToken called with token: ${token.substring(0, 20)}..., user: ${user?.email}');
+    debugPrint('🔐 setToken called with token: ${_shortToken(token)}..., user: ${user?.email}');
     await _saveToken(token);
     _setAuthHeader(token);
     if (user != null) _currentUser = user;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_currentUser?.role.toLowerCase().trim() == 'creator') {
+        _viewRole = prefs.getString(_viewRoleKey);
+      } else {
+        _viewRole = null;
+        await prefs.remove(_viewRoleKey);
+      }
+    } catch (_) {}
     try {
       _authController.add(_currentUser);
     } catch (_) {}
@@ -95,12 +120,14 @@ class AuthService {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_tokenKey);
+      await prefs.remove(_viewRoleKey);
       debugPrint('✅ Token removed from SharedPreferences');
 
       _setAuthHeader(null);
       pendingEmail = null;
       pendingPassword = null;
       _currentUser = null;
+      _viewRole = null;
 
       try {
         _authController.add(null);
@@ -116,7 +143,7 @@ class AuthService {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_tokenKey, token);
-      debugPrint('✅ Token saved to SharedPreferences: ${token.substring(0, 20)}...');
+      debugPrint('✅ Token saved to SharedPreferences: ${_shortToken(token)}...');
     } catch (e) {
       debugPrint('❌ Error saving token: $e');
     }
@@ -127,7 +154,7 @@ class AuthService {
     try {
       final prefs = await SharedPreferences.getInstance();
       final token = prefs.getString(_tokenKey);
-      debugPrint('🔑 getToken -> ${token != null ? '${token.substring(0, 20)}...' : 'null'}');
+      debugPrint('🔑 getToken -> ${token != null ? '${_shortToken(token)}...' : 'null'}');
       return token;
     } catch (e) {
       debugPrint('❌ Error getting token: $e');
@@ -144,8 +171,9 @@ class AuthService {
     final userMap = data['user'] as Map<String, dynamic>?;
 
     if (token == null) throw Exception('No token in response');
+    final tokenStr = token.toString();
 
-    debugPrint('🔐 Token extracted: ${(token as String).substring(0, 20)}...');
+    debugPrint('🔐 Token extracted: ${_shortToken(tokenStr)}...');
 
     if (userMap != null) {
       _currentUser = User.fromMap(userMap);
@@ -166,7 +194,7 @@ class AuthService {
     }
 
     // ✅ Сохраняем токен ПЕРЕД установкой заголовка
-    await setToken(token as String, _currentUser);
+    await setToken(tokenStr, _currentUser);
     debugPrint('✅ _processAuthResponse complete');
   }
 
@@ -240,6 +268,24 @@ class AuthService {
 
   bool hasAnyRole(List<String> roles) => _currentUser != null && roles.contains(_currentUser!.role);
 
+  bool get canSwitchViewRole => _currentUser?.role.toLowerCase().trim() == 'creator';
+
+  Future<void> setViewRole(String? role) async {
+    if (!canSwitchViewRole) return;
+    final normalized = role?.toLowerCase().trim();
+    final prefs = await SharedPreferences.getInstance();
+    if (normalized == null || normalized.isEmpty || normalized == 'creator') {
+      _viewRole = null;
+      await prefs.remove(_viewRoleKey);
+    } else {
+      _viewRole = normalized;
+      await prefs.setString(_viewRoleKey, normalized);
+    }
+    try {
+      _authController.add(_currentUser);
+    } catch (_) {}
+  }
+
   /// Применить ответ логина/регистрации (если вызывается извне)
   Future<void> applyLoginResponse(String token, Map<String, dynamic>? userMap) async {
     debugPrint('🔐 applyLoginResponse called');
@@ -269,8 +315,10 @@ class AuthService {
         final user = resp.data['user'];
         if (user is Map) {
           // ✅ ИСПРАВЛЕНИЕ: Cast правильно
-          final userMap = (user as Map<dynamic, dynamic>).cast<String, dynamic>();
+          final userMap = Map<String, dynamic>.from(user);
           _currentUser = User.fromMap(userMap);
+          final prefs = await SharedPreferences.getInstance();
+          _viewRole = prefs.getString(_viewRoleKey);
           try {
             _authController.add(_currentUser);
           } catch (_) {}

@@ -1,15 +1,20 @@
 // lib/screens/main_shell.dart
 import 'dart:async';
+
 import 'package:flutter/material.dart';
+
 import '../main.dart';
 import '../services/auth_service.dart';
+import 'admin_panel.dart';
+import 'cart_screen.dart';
 import 'chats_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
-import 'admin_panel.dart';
+import 'worker_panel.dart';
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
+
   @override
   State<MainShell> createState() => _MainShellState();
 }
@@ -22,50 +27,39 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
-
-    // Подписка для побочных эффектов (корректировка индекса, логирование)
-    _authSub = authService.authStream.listen((user) {
-      debugPrint('MainShell: authStream emitted user=${user?.email} role=${user?.role}');
-      final pagesCount = _computePagesCount(user);
-      if (_index >= pagesCount) {
-        setState(() => _index = pagesCount - 1);
+    _authSub = authService.authStream.listen((_) {
+      if (_loading) {
+        setState(() => _loading = false);
+      } else {
+        setState(() {});
       }
-      if (_loading) setState(() => _loading = false);
     });
 
-    // Если currentUser уже есть — убираем индикатор загрузки
-    final u = authService.currentUser;
-    if (u != null) {
-      debugPrint('MainShell.initState: currentUser present ${u.email} role=${u.role}');
+    if (authService.currentUser != null) {
       _loading = false;
     } else {
-      // Снять индикатор через короткую задержку, если authStream не придёт
       Future.delayed(const Duration(milliseconds: 800), () {
         if (mounted && _loading) setState(() => _loading = false);
       });
     }
   }
 
-  int _computePagesCount(User? user) {
-    final role = _normalizeRole(user);
-    final isAdmin = role == 'admin' || role == 'creator' || role == 'superadmin';
-    return isAdmin ? 4 : 3;
-  }
-
-  String _normalizeRole(User? user) {
-    final raw = user?.role ?? authService.currentUser?.role ?? 'client';
-    return raw.toString().toLowerCase().trim();
-  }
-
-  bool _isAdminRoleFrom(User? user) {
-    final role = _normalizeRole(user);
-    return role == 'admin' || role == 'creator' || role == 'superadmin';
-  }
-
   @override
   void dispose() {
-    try { _authSub?.cancel(); } catch (_) {}
+    _authSub?.cancel();
     super.dispose();
+  }
+
+  String _effectiveRole() => authService.effectiveRole;
+
+  bool _hasAdminTab() {
+    const roles = {'admin', 'creator'};
+    return roles.contains(_effectiveRole());
+  }
+
+  bool _hasWorkerTab() {
+    const roles = {'worker', 'creator'};
+    return roles.contains(_effectiveRole());
   }
 
   @override
@@ -73,35 +67,43 @@ class _MainShellState extends State<MainShell> {
     return StreamBuilder<User?>(
       stream: authService.authStream,
       initialData: authService.currentUser,
-      builder: (context, snap) {
-        final user = snap.data;
-        final role = _normalizeRole(user);
-        final isAdmin = _isAdminRoleFrom(user);
-
-        debugPrint('MainShell.build: role=$role isAdmin=$isAdmin loading=$_loading');
-
+      builder: (context, _) {
         if (_loading) {
-          return const Scaffold(body: SafeArea(child: Center(child: CircularProgressIndicator())));
+          return const Scaffold(
+            body: SafeArea(child: Center(child: CircularProgressIndicator())),
+          );
         }
 
-        final pages = <Widget>[const ChatsScreen()];
-        if (isAdmin) pages.add(const AdminPanel());
-        pages.add(const ProfileScreen());
-        pages.add(const SettingsScreen());
+        final showAdmin = _hasAdminTab();
+        final showWorker = _hasWorkerTab();
+
+        final pages = <Widget>[
+          const ChatsScreen(),
+          const CartScreen(),
+          if (showAdmin) const AdminPanel(),
+          if (showWorker) const WorkerPanel(),
+          const ProfileScreen(),
+          const SettingsScreen(),
+        ];
 
         final navItems = <BottomNavigationBarItem>[
           const BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Чаты'),
+          const BottomNavigationBarItem(icon: Icon(Icons.shopping_cart), label: 'Корзина'),
+          if (showAdmin) const BottomNavigationBarItem(icon: Icon(Icons.admin_panel_settings), label: 'Админ'),
+          if (showWorker) const BottomNavigationBarItem(icon: Icon(Icons.work), label: 'Worker'),
+          const BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Профиль'),
+          const BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Настройки'),
         ];
-        if (isAdmin) {
-          navItems.add(const BottomNavigationBarItem(icon: Icon(Icons.admin_panel_settings), label: 'Админ'));
-        }
-        navItems.add(const BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Профиль'));
-        navItems.add(const BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Настройки'));
 
         if (_index >= pages.length) _index = pages.length - 1;
 
         return Scaffold(
-          body: SafeArea(child: IndexedStack(index: _index, children: pages)),
+          body: SafeArea(
+            child: IndexedStack(
+              index: _index,
+              children: pages,
+            ),
+          ),
           bottomNavigationBar: BottomNavigationBar(
             currentIndex: _index,
             onTap: (i) => setState(() => _index = i),

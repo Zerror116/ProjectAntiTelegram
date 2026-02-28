@@ -1,0 +1,39 @@
+name: projectantitelegram
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  image_picker: ^0.8.7+5
+  file_picker: ^8.1.2
+
+  # Сеть
+  dio: ^5.2.2
+
+  # Хранение токена
+  shared_preferences: ^2.1.1
+  flutter_secure_storage: ^10.0.0
+
+  # Socket.io клиент для realtime чатов
+  socket_io_client: ^2.0.0
+
+  # UI / утилиты
+  cupertino_icons: ^1.0.8
+  device_info_plus: ^12.3.0
+  crypto: ^3.0.7
+  image: ^4.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

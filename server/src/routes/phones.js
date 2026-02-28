@@ -96,7 +96,7 @@ router.post('/change', requireAuth, async (req, res) => {
 });
 
 // Admin: получить список pending номеров
-router.get('/admin/pending', requireAdmin, async (req, res) => {
+router.get('/admin/pending', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT p.id, p.user_id, p.phone, p.created_at, u.email
@@ -113,7 +113,7 @@ router.get('/admin/pending', requireAdmin, async (req, res) => {
 });
 
 // Admin: подтвердить номер (пометить verified)
-router.post('/admin/verify', requireAdmin, async (req, res) => {
+router.post('/admin/verify', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { phoneId } = req.body;
     if (!phoneId) return res.status(400).json({ error: 'phoneId required' });
@@ -139,7 +139,7 @@ router.post('/admin/verify', requireAdmin, async (req, res) => {
 });
 
 // Admin: удалить номер и аккаунт пользователя
-router.post('/admin/delete', requireAdmin, async (req, res) => {
+router.post('/admin/delete', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { phoneId } = req.body;
     if (!phoneId) return res.status(400).json({ error: 'phoneId required' });
