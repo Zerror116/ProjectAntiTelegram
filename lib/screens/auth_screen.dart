@@ -59,15 +59,18 @@ class _AuthScreenState extends State<AuthScreen> {
 
   Future<void> _tryAutoLogin() async {
     setState(() => _loading = true);
-    final ok = await _auth_service_tryRefresh();
+    final ok = await _authServiceTryRefresh();
     setState(() => _loading = false);
     if (ok) {
       if (!mounted) return;
-      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainShell()));
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const MainShell()),
+      );
     }
   }
 
-  Future<bool> _auth_service_tryRefresh() async {
+  Future<bool> _authServiceTryRefresh() async {
     try {
       return await _authService.tryRefreshOnStartup();
     } catch (_) {
@@ -78,7 +81,10 @@ class _AuthScreenState extends State<AuthScreen> {
   /// Проверяем занятость email на сервере
   Future<bool> _checkEmailExists(String email) async {
     try {
-      final resp = await _authService.dio.post('/api/auth/check_email', data: {'email': email});
+      final resp = await _authService.dio.post(
+        '/api/auth/check_email',
+        data: {'email': email},
+      );
       // ожидаем { exists: true/false } или {exists:1/0}
       final data = resp.data;
       if (data is Map && data['exists'] != null) {
@@ -121,7 +127,9 @@ class _AuthScreenState extends State<AuthScreen> {
         // Это удалит экран регистрации из стека, поэтому кнопки "назад" не будет.
         setState(() => _loading = false);
         await Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const PhoneNameScreen(isRegisterFlow: true)),
+          MaterialPageRoute(
+            builder: (_) => const PhoneNameScreen(isRegisterFlow: true),
+          ),
           (Route<dynamic> route) => false,
         );
 
@@ -138,29 +146,46 @@ class _AuthScreenState extends State<AuthScreen> {
         final resp = await _authService.dio.get('/api/profile');
         final data = resp.data as Map<String, dynamic>? ?? {};
         final user = data['user'] as Map<String, dynamic>? ?? {};
-        final phone = user['phone'] as String?;
-        final phoneStatus = data['phone_status'] as String? ?? data['phoneStatus'] as String?;
-        final hasPhone = phone != null && phone.trim().isNotEmpty;
+        final name = (user['name'] ?? '').toString().trim();
+        final phone = (user['phone'] ?? '').toString().trim();
+        final hasName = name.isNotEmpty;
+        final hasPhone = phone.isNotEmpty;
 
-        if (!hasPhone || phoneStatus == 'pending_verification') {
+        // Экран добора данных нужен только если имя/номер действительно отсутствуют.
+        if (!hasName || !hasPhone) {
           if (!mounted) return;
-          Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const PhoneNameScreen(isRegisterFlow: false)));
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => const PhoneNameScreen(isRegisterFlow: false),
+            ),
+          );
           return;
         }
 
         if (!mounted) return;
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainShell()));
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const MainShell()),
+        );
         return;
-      } catch (_) {
+      } catch (e) {
+        debugPrint(
+          'auth.login: profile check failed, continue to MainShell: $e',
+        );
         if (!mounted) return;
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const PhoneNameScreen(isRegisterFlow: false)));
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const MainShell()),
+        );
         return;
       }
     } on DioException catch (e) {
       String friendly = 'Ошибка';
       final status = e.response?.statusCode;
       if (status == 401 || status == 403) {
-        friendly = 'Пупупу, ошибочка — что-то не так с email или паролем. Пытаетесь кого-то взломать? 😉';
+        friendly =
+            'Пупупу, ошибочка — что-то не так с email или паролем. Пытаетесь кого-то взломать? 😉';
       } else if (e.type == DioExceptionType.connectionTimeout ||
           e.type == DioExceptionType.sendTimeout ||
           e.type == DioExceptionType.receiveTimeout) {
@@ -193,39 +218,49 @@ class _AuthScreenState extends State<AuthScreen> {
           children: [
             Form(
               key: _formKey,
-              child: Column(children: [
-                TextFormField(
-                  controller: _emailController,
-                  decoration: const InputDecoration(labelText: 'Email'),
-                  keyboardType: TextInputType.emailAddress,
-                  validator: (v) {
-                    if (v == null || v.isEmpty) return 'Введите email';
-                    if (!v.contains('@')) return 'Неверный формат email';
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _passwordController,
-                  decoration: const InputDecoration(labelText: 'Пароль'),
-                  obscureText: true,
-                  validator: (v) {
-                    if (v == null || v.isEmpty) return 'Введите пароль';
-                    if (v.length < 8) return 'Пароль должен быть не менее 8 символов';
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 16),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _loading ? null : _onSubmitPressed,
-                    child: _loading
-                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : Text(_isRegister ? 'Далее' : 'Войти'),
+              child: Column(
+                children: [
+                  TextFormField(
+                    controller: _emailController,
+                    decoration: const InputDecoration(labelText: 'Email'),
+                    keyboardType: TextInputType.emailAddress,
+                    validator: (v) {
+                      if (v == null || v.isEmpty) return 'Введите email';
+                      if (!v.contains('@')) return 'Неверный формат email';
+                      return null;
+                    },
                   ),
-                ),
-              ]),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _passwordController,
+                    decoration: const InputDecoration(labelText: 'Пароль'),
+                    obscureText: true,
+                    validator: (v) {
+                      if (v == null || v.isEmpty) return 'Введите пароль';
+                      if (v.length < 8)
+                        return 'Пароль должен быть не менее 8 символов';
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: _loading ? null : _onSubmitPressed,
+                      child: _loading
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : Text(_isRegister ? 'Далее' : 'Войти'),
+                    ),
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 12),
             Row(
@@ -242,7 +277,8 @@ class _AuthScreenState extends State<AuthScreen> {
               ],
             ),
             const SizedBox(height: 8),
-            if (_message.isNotEmpty) Text(_message, style: const TextStyle(color: Colors.red)),
+            if (_message.isNotEmpty)
+              Text(_message, style: const TextStyle(color: Colors.red)),
           ],
         ),
       ),

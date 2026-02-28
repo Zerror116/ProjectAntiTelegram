@@ -156,6 +156,24 @@ router.post('/logout', (req, res) => {
 });
 
 /**
+ * POST /api/auth/delete_account (защищённый)
+ * Удаляет текущий аккаунт пользователя.
+ */
+router.post('/delete_account', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const result = await db.query('DELETE FROM users WHERE id = $1 RETURNING id', [userId]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('auth.delete_account error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+/**
  * POST /api/auth/change_password (защищённый)
  */
 router.post('/change_password', authMiddleware, async (req, res) => {

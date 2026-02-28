@@ -2,7 +2,6 @@
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
 import '../main.dart';
-import '../services/auth_service.dart';
 import '../utils/phone_utils.dart';
 
 class PhoneNameScreen extends StatefulWidget {
@@ -166,7 +165,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           } catch (_) {}
 
           if (!mounted) return;
-          Navigator.of(context).pop();
+          Navigator.of(context).pushReplacementNamed('/main');
           return;
         } else {
           setState(() => _message = 'Ошибка обновления профиля');
