@@ -1,0 +1,34 @@
+Empty Python files:
+app/api/__init__.py
+app/api/admin.py
+app/api/cart.py
+app/api/channel.py
+app/api/deps.py
+app/api/products.py
+app/api/users.py
+app/core/logging.py
+app/crud/__init__.py
+app/crud/order_crud.py
+app/crud/product_crud.py
+app/crud/user_crud.py
+app/models/__init__.py
+app/schemas/__init__.py
+app/schemas/order.py
+app/schemas/product.py
+app/schemas/user.py
+app/services/__init__.py
+app/services/file_storage.py
+app/services/notifications.py
+app/services/order_processing.py
+app/tests/conftest.py
+app/tests/test_auth.py
+app/tests/test_products.py
+app/utils/__init__.py
+app/utils/helpers.py
+app/utils/validators.py
+scripts/create_admin.py
+scripts/import_from_excel.py
+
+Empty JS files:
+
+Empty Dart files:
