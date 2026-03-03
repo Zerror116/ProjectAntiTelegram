@@ -63,12 +63,27 @@ function authMiddleware(req, res, next) {
   }
 
   // Normalize req.user to include common fields and default role
+  const baseRole = (payload.role || 'client').toString().toLowerCase().trim() || 'client';
+  const rawViewRole = String(req.headers['x-view-role'] || '').toLowerCase().trim();
+  const allowedViewRoles = new Set(['client', 'worker', 'admin', 'creator']);
+  const effectiveRole =
+    baseRole === 'creator' && allowedViewRoles.has(rawViewRole) && rawViewRole
+      ? rawViewRole
+      : baseRole;
+
   req.user = {
     id: payload.id || payload.userId || null,
     email: payload.email || payload.sub || null,
-    role: payload.role || 'client',
-    ...payload
+    role: effectiveRole,
+    base_role: baseRole,
+    effective_role: effectiveRole,
+    view_role: effectiveRole !== baseRole ? effectiveRole : null,
+    ...payload,
   };
+  req.user.role = effectiveRole;
+  req.user.base_role = baseRole;
+  req.user.effective_role = effectiveRole;
+  req.user.view_role = effectiveRole !== baseRole ? effectiveRole : null;
 
   return next();
 }

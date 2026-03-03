@@ -15,6 +15,22 @@ import 'settings_screen.dart';
 import 'system_tests_screen.dart';
 import 'worker_panel.dart';
 
+class _ShellDestination {
+  const _ShellDestination({
+    required this.id,
+    required this.label,
+    required this.icon,
+    required this.page,
+    this.priority = 0,
+  });
+
+  final String id;
+  final String label;
+  final IconData icon;
+  final Widget page;
+  final int priority;
+}
+
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
 
@@ -70,6 +86,136 @@ class _MainShellState extends State<MainShell> {
         'creator';
   }
 
+  bool _useCompactNavigation(BuildContext context) {
+    final width = MediaQuery.sizeOf(context).width;
+    final platform = Theme.of(context).platform;
+    final isIosLike =
+        platform == TargetPlatform.iOS || platform == TargetPlatform.macOS;
+    return isIosLike && width < 700;
+  }
+
+  List<_ShellDestination> _buildDestinations({
+    required bool showAdmin,
+    required bool showWorker,
+    required bool showTests,
+  }) {
+    return <_ShellDestination>[
+      const _ShellDestination(
+        id: 'chats',
+        label: 'Чаты',
+        icon: Icons.chat_bubble_outline_rounded,
+        page: ChatsScreen(),
+        priority: 100,
+      ),
+      const _ShellDestination(
+        id: 'cart',
+        label: 'Корзина',
+        icon: Icons.shopping_bag_outlined,
+        page: CartScreen(),
+        priority: 95,
+      ),
+      if (showAdmin)
+        const _ShellDestination(
+          id: 'admin',
+          label: 'Админ',
+          icon: Icons.admin_panel_settings_outlined,
+          page: AdminPanel(),
+          priority: 85,
+        ),
+      if (showWorker)
+        const _ShellDestination(
+          id: 'worker',
+          label: 'Рабочий',
+          icon: Icons.inventory_2_outlined,
+          page: WorkerPanel(),
+          priority: 70,
+        ),
+      const _ShellDestination(
+        id: 'profile',
+        label: 'Профиль',
+        icon: Icons.person_outline_rounded,
+        page: ProfileScreen(),
+        priority: 90,
+      ),
+      const _ShellDestination(
+        id: 'settings',
+        label: 'Настройки',
+        icon: Icons.tune_rounded,
+        page: SettingsScreen(),
+        priority: 40,
+      ),
+      if (showTests)
+        const _ShellDestination(
+          id: 'tests',
+          label: 'Тесты',
+          icon: Icons.science_outlined,
+          page: SystemTestsScreen(),
+          priority: 20,
+        ),
+    ];
+  }
+
+  Future<void> _openMoreSheet(
+    BuildContext context,
+    List<_ShellDestination> hiddenDestinations,
+    List<_ShellDestination> allDestinations,
+  ) async {
+    if (hiddenDestinations.isEmpty) return;
+    final selectedId = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      builder: (sheetContext) {
+        final theme = Theme.of(sheetContext);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                  child: Row(
+                    children: [
+                      Text(
+                        'Еще',
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                ...hiddenDestinations.map((destination) {
+                  final isSelected =
+                      allDestinations[_index].id == destination.id;
+                  return ListTile(
+                    leading: Icon(destination.icon),
+                    title: Text(destination.label),
+                    trailing: isSelected
+                        ? Icon(
+                            Icons.check_circle,
+                            color: theme.colorScheme.primary,
+                          )
+                        : null,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    onTap: () => Navigator.of(sheetContext).pop(destination.id),
+                  );
+                }),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (!mounted || selectedId == null) return;
+    final nextIndex = allDestinations.indexWhere((d) => d.id == selectedId);
+    if (nextIndex < 0) return;
+    setState(() => _index = nextIndex);
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
@@ -95,58 +241,95 @@ class _MainShellState extends State<MainShell> {
         final showWorker = _hasWorkerTab();
         final showTests = _hasTestsTab();
 
-        final pages = <Widget>[
-          const ChatsScreen(),
-          const CartScreen(),
-          if (showAdmin) const AdminPanel(),
-          if (showWorker) const WorkerPanel(),
-          if (showTests) const SystemTestsScreen(),
-          const ProfileScreen(),
-          const SettingsScreen(),
-        ];
+        final destinations = _buildDestinations(
+          showAdmin: showAdmin,
+          showWorker: showWorker,
+          showTests: showTests,
+        );
 
-        final navItems = <BottomNavigationBarItem>[
-          const BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Чаты'),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.shopping_cart),
-            label: 'Корзина',
-          ),
-          if (showAdmin)
-            const BottomNavigationBarItem(
-              icon: Icon(Icons.admin_panel_settings),
-              label: 'Админ',
-            ),
-          if (showWorker)
-            const BottomNavigationBarItem(
-              icon: Icon(Icons.work),
-              label: 'Рабочий',
-            ),
-          if (showTests)
-            const BottomNavigationBarItem(
-              icon: Icon(Icons.science_outlined),
-              label: 'Тесты',
-            ),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.person),
-            label: 'Профиль',
-          ),
-          const BottomNavigationBarItem(
-            icon: Icon(Icons.settings),
-            label: 'Настройки',
-          ),
-        ];
+        if (_index >= destinations.length) _index = destinations.length - 1;
 
-        if (_index >= pages.length) _index = pages.length - 1;
+        final compactNavigation = _useCompactNavigation(context);
+        final primaryDestinations = compactNavigation
+            ? (destinations.toList()
+                    ..sort((a, b) => b.priority.compareTo(a.priority)))
+                  .take(4)
+                  .toList()
+            : destinations;
+        final hiddenDestinations = compactNavigation
+            ? destinations
+                  .where(
+                    (destination) => !primaryDestinations.any(
+                      (primary) => primary.id == destination.id,
+                    ),
+                  )
+                  .toList()
+            : const <_ShellDestination>[];
+
+        final visibleDestinations =
+            compactNavigation && hiddenDestinations.isNotEmpty
+            ? [
+                ...primaryDestinations,
+                const _ShellDestination(
+                  id: 'more',
+                  label: 'Еще',
+                  icon: Icons.grid_view_rounded,
+                  page: SizedBox.shrink(),
+                ),
+              ]
+            : compactNavigation
+            ? primaryDestinations
+            : destinations;
+
+        final currentDestination = destinations[_index];
+        final currentNavIndex = compactNavigation
+            ? (() {
+                final visibleIndex = visibleDestinations.indexWhere(
+                  (destination) => destination.id == currentDestination.id,
+                );
+                if (visibleIndex >= 0) return visibleIndex;
+                return visibleDestinations.length - 1;
+              })()
+            : _index;
 
         return Scaffold(
           body: SafeArea(
-            child: IndexedStack(index: _index, children: pages),
+            child: IndexedStack(
+              index: _index,
+              children: destinations
+                  .map((destination) => destination.page)
+                  .toList(),
+            ),
           ),
           bottomNavigationBar: BottomNavigationBar(
-            currentIndex: _index,
-            onTap: (i) => setState(() => _index = i),
-            items: navItems,
-            type: BottomNavigationBarType.fixed,
+            currentIndex: currentNavIndex,
+            onTap: (i) async {
+              final tapped = visibleDestinations[i];
+              if (tapped.id == 'more') {
+                await _openMoreSheet(context, hiddenDestinations, destinations);
+                return;
+              }
+              final nextIndex = destinations.indexWhere(
+                (destination) => destination.id == tapped.id,
+              );
+              if (nextIndex < 0) return;
+              setState(() => _index = nextIndex);
+            },
+            items: visibleDestinations
+                .map(
+                  (destination) => BottomNavigationBarItem(
+                    icon: Icon(destination.icon),
+                    label: destination.label,
+                  ),
+                )
+                .toList(),
+            type: visibleDestinations.length > 3
+                ? BottomNavigationBarType.fixed
+                : BottomNavigationBarType.shifting,
+            iconSize: compactNavigation ? 24 : 22,
+            selectedFontSize: compactNavigation ? 12 : 11,
+            unselectedFontSize: compactNavigation ? 11 : 10,
+            showUnselectedLabels: !compactNavigation,
           ),
         );
       },

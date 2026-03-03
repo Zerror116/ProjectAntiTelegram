@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
+import '../src/utils/device_utils.dart';
 
 class User {
   final String id;
@@ -68,6 +69,7 @@ class AuthService {
 
   // Prevent re-entrant or duplicate logout/clear operations
   bool _isLoggingOut = false;
+  String? _deviceFingerprintCache;
 
   AuthService({required this.dio});
 
@@ -198,13 +200,34 @@ class AuthService {
     debugPrint('✅ _processAuthResponse complete');
   }
 
+  Future<String?> _getDeviceFingerprintSafe() async {
+    if (_deviceFingerprintCache != null && _deviceFingerprintCache!.isNotEmpty) {
+      return _deviceFingerprintCache;
+    }
+    try {
+      final fingerprint = await generateDeviceFingerprint();
+      final normalized = fingerprint.trim();
+      if (normalized.isEmpty) return null;
+      _deviceFingerprintCache = normalized;
+      return normalized;
+    } catch (e) {
+      debugPrint('⚠️ Failed to generate device fingerprint: $e');
+      return null;
+    }
+  }
+
   /// Вход
   Future<Map<String, dynamic>> login({
     required String email,
     required String password,
   }) async {
     debugPrint('🔓 login called with email: $email');
-    final resp = await dio.post('/api/auth/login', data: {'email': email, 'password': password});
+    final fingerprint = await _getDeviceFingerprintSafe();
+    final resp = await dio.post('/api/auth/login', data: {
+      'email': email,
+      'password': password,
+      if (fingerprint != null) 'device_fingerprint': fingerprint,
+    });
     debugPrint('📬 login response received, status: ${resp.statusCode}');
 
     await _processAuthResponse(resp);
@@ -224,12 +247,14 @@ class AuthService {
     String? secret, // для special creator email
   }) async {
     debugPrint('✍️ register called with email: $email');
+    final fingerprint = await _getDeviceFingerprintSafe();
     final resp = await dio.post('/api/auth/register', data: {
       'email': email,
       'password': password,
       if (name != null) 'name': name,
       if (phone != null) 'phone': phone,
       if (secret != null) 'secret': secret,
+      if (fingerprint != null) 'device_fingerprint': fingerprint,
     });
     debugPrint('📬 register response received, status: ${resp.statusCode}');
 
@@ -253,12 +278,14 @@ class AuthService {
     if (pendingEmail == null || pendingPassword == null) {
       throw Exception('No pending credentials');
     }
+    final fingerprint = await _getDeviceFingerprintSafe();
     final resp = await dio.post('/api/auth/register', data: {
       'email': pendingEmail,
       'password': pendingPassword,
       'name': name,
       'phone': phone,
       if (secret != null) 'secret': secret,
+      if (fingerprint != null) 'device_fingerprint': fingerprint,
     });
 
     await _processAuthResponse(resp);

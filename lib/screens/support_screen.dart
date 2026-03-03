@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import '../main.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/submit_on_enter.dart';
 
 class SupportScreen extends StatefulWidget {
   final String? initialMessage;
@@ -38,23 +39,6 @@ class _SupportScreenState extends State<SupportScreen> {
     _controller.dispose();
     _inputFocusNode.dispose();
     super.dispose();
-  }
-
-  KeyEventResult _onInputKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    final isEnter =
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.numpadEnter;
-    if (!isEnter) return KeyEventResult.ignored;
-
-    final isShiftPressed = HardwareKeyboard.instance.isShiftPressed;
-    if (isShiftPressed) {
-      return KeyEventResult.ignored;
-    }
-
-    _ask();
-    return KeyEventResult.handled;
   }
 
   Future<void> _copyText(String text) async {
@@ -162,8 +146,10 @@ class _SupportScreenState extends State<SupportScreen> {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Expanded(
-                    child: Focus(
-                      onKeyEvent: _onInputKey,
+                    child: SubmitOnEnter(
+                      controller: _controller,
+                      enabled: !_loading,
+                      onSubmit: _ask,
                       child: TextField(
                         focusNode: _inputFocusNode,
                         controller: _controller,

@@ -1,0 +1,12 @@
+ALTER TABLE delivery_batches
+ADD COLUMN IF NOT EXISTS route_origin_label TEXT,
+ADD COLUMN IF NOT EXISTS route_origin_address TEXT,
+ADD COLUMN IF NOT EXISTS route_origin_lat DOUBLE PRECISION,
+ADD COLUMN IF NOT EXISTS route_origin_lng DOUBLE PRECISION;
+
+ALTER TABLE delivery_batch_customers
+ADD COLUMN IF NOT EXISTS preferred_time_from TIME,
+ADD COLUMN IF NOT EXISTS preferred_time_to TIME,
+ADD COLUMN IF NOT EXISTS preferred_time_note TEXT,
+ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS agreed_sum NUMERIC(12,2) NOT NULL DEFAULT 0;

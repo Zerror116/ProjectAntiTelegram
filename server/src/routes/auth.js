@@ -14,9 +14,53 @@ const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 // Настройки для Creator
 const CREATOR_EMAIL = 'zerotwo02166@gmail.com';
 const CREATOR_SECRET = process.env.CREATOR_SECRET || 'Макарова Лиза';
+const MAX_ACCOUNTS_PER_DEVICE = 2;
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+}
+
+function normalizeDeviceFingerprint(value) {
+  const normalized = String(value || '').trim();
+  return normalized ? normalized.slice(0, 255) : null;
+}
+
+async function assertDeviceAccountLimit(queryable, deviceFingerprint, userId = null) {
+  const fingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+  if (!fingerprint) return;
+
+  const usage = await queryable.query(
+    `SELECT user_id::text AS user_id
+     FROM devices
+     WHERE device_fingerprint = $1
+     GROUP BY user_id`,
+    [fingerprint],
+  );
+  const userIds = usage.rows
+    .map((row) => String(row.user_id || '').trim())
+    .filter(Boolean);
+  const uniqueUsers = new Set(userIds);
+  if (userId) uniqueUsers.delete(String(userId));
+  if (uniqueUsers.size >= MAX_ACCOUNTS_PER_DEVICE) {
+    const error = new Error('На одном устройстве можно использовать максимум 2 аккаунта');
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+async function upsertDevice(queryable, userId, deviceFingerprint) {
+  const fingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+  if (!userId || !fingerprint) return null;
+  const result = await queryable.query(
+    `INSERT INTO devices (id, user_id, device_fingerprint, trusted, created_at, last_seen)
+     VALUES (gen_random_uuid(), $1, $2, true, now(), now())
+     ON CONFLICT (user_id, device_fingerprint) DO UPDATE
+       SET trusted = true,
+           last_seen = now()
+     RETURNING id`,
+    [userId, fingerprint],
+  );
+  return result.rows[0]?.id || null;
 }
 
 /**
@@ -50,8 +94,9 @@ router.post('/check_email', async (req, res) => {
  * - Returns { token, user: { id, email, name, role } }
  */
 router.post('/register', async (req, res) => {
+  const client = await db.pool.connect();
   try {
-    const { email, password, name, phone, secret } = req.body || {};
+    const { email, password, name, phone, secret, device_fingerprint } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const normalizedEmail = validator.normalizeEmail(email);
@@ -62,11 +107,11 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
 
-    await db.query('BEGIN');
+    await client.query('BEGIN');
 
-    const existing = await db.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
+    const existing = await client.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
     if (existing.rowCount > 0) {
-      await db.query('ROLLBACK');
+      await client.query('ROLLBACK');
       return res.status(409).json({ error: 'Email already registered' });
     }
 
@@ -75,13 +120,15 @@ router.post('/register', async (req, res) => {
       if (typeof secret === 'string' && secret === CREATOR_SECRET) {
         role = 'creator';
       } else {
-        await db.query('ROLLBACK');
+        await client.query('ROLLBACK');
         return res.status(403).json({ error: 'Invalid secret for this email' });
       }
     }
 
+    await assertDeviceAccountLimit(client, device_fingerprint);
+
     const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
-    const insertUser = await db.query(
+    const insertUser = await client.query(
       'INSERT INTO users (email, password_hash, name, role, created_at) VALUES ($1, $2, $3, $4, now()) RETURNING id, email, name, role',
       [normalizedEmail, password_hash, name || null, role]
     );
@@ -93,7 +140,7 @@ router.post('/register', async (req, res) => {
         await db.query('ROLLBACK');
         return res.status(400).json({ error: 'Invalid phone format' });
       }
-      await db.query(
+      await client.query(
         `INSERT INTO phones (user_id, phone, status, created_at)
          VALUES ($1, $2, 'pending_verification', now())
          ON CONFLICT (user_id) DO UPDATE SET phone = $2, status = 'pending_verification', created_at = now()`,
@@ -101,7 +148,9 @@ router.post('/register', async (req, res) => {
       );
     }
 
-    await db.query('COMMIT');
+    await upsertDevice(client, user.id, device_fingerprint);
+
+    await client.query('COMMIT');
 
     const token = signToken({ id: user.id, email: user.email, role: user.role });
 
@@ -110,9 +159,11 @@ router.post('/register', async (req, res) => {
       user: { id: user.id, email: user.email, name: user.name, role: user.role }
     });
   } catch (err) {
-    try { await db.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('auth.register error', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -123,8 +174,9 @@ router.post('/register', async (req, res) => {
  * Returns { token, user: { id, email, role } }
  */
 router.post('/login', async (req, res) => {
+  const client = await db.pool.connect();
   try {
-    const { email, password } = req.body || {};
+    const { email, password, device_fingerprint } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const normalizedEmail = validator.normalizeEmail(email);
@@ -132,12 +184,25 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Неверный логин или пароль' });
     }
 
-    const userRes = await db.query('SELECT id, email, password_hash, role FROM users WHERE email = $1', [normalizedEmail]);
+    await client.query('BEGIN');
+
+    const userRes = await client.query('SELECT id, email, password_hash, role FROM users WHERE email = $1', [normalizedEmail]);
     const user = userRes.rows[0];
-    if (!user) return res.status(401).json({ error: 'Неверные данные' });
+    if (!user) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: 'Неверные данные' });
+    }
 
     const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Неверные данные' });
+    if (!ok) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ error: 'Неверные данные' });
+    }
+
+    await assertDeviceAccountLimit(client, device_fingerprint, user.id);
+    await upsertDevice(client, user.id, device_fingerprint);
+
+    await client.query('COMMIT');
 
     const token = signToken({ id: user.id, email: user.email, role: user.role });
     return res.json({
@@ -145,8 +210,11 @@ router.post('/login', async (req, res) => {
       user: { id: user.id, email: user.email, role: user.role }
     });
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('auth.login error', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 

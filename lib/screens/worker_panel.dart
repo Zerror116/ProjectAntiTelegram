@@ -49,6 +49,18 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool _posting = false;
   bool _searching = false;
   String _message = '';
+
+  double _toDoubleValue(dynamic value, [double fallback = 0]) {
+    if (value is num) return value.toDouble();
+    final parsed = double.tryParse(value?.toString().replaceAll(',', '.') ?? '');
+    return parsed ?? fallback;
+  }
+
+  int _toIntValue(dynamic value, [int fallback = 0]) {
+    if (value is num) return value.toInt();
+    final parsed = int.tryParse(value?.toString() ?? '');
+    return parsed ?? fallback;
+  }
   List<Map<String, dynamic>> _channels = [];
   String? _selectedChannelId;
   List<Map<String, dynamic>> _searchResults = [];
@@ -582,9 +594,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _message = 'Введите корректную цену');
       return;
     }
-    final fallbackPrice = (product['price'] is num)
-        ? (product['price'] as num).toDouble()
-        : 0.0;
+    final fallbackPrice = _toDoubleValue(product['price'], 0);
     final price = editedPrice ?? fallbackPrice;
 
     final rawQtyInput = _quantityCtrl.text.trim();
@@ -593,9 +603,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _message = 'Количество должно быть больше нуля');
       return;
     }
-    final fallbackQty = (product['quantity'] is num)
-        ? (product['quantity'] as num).toInt()
-        : 1;
+    final fallbackQty = _toIntValue(product['quantity'], 1);
     final quantity = editedQty ?? fallbackQty;
     final existingImage = (product['image_url'] ?? '').toString().trim();
     final hasImage =

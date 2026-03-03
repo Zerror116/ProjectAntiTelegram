@@ -323,6 +323,14 @@ void _attachAuthInterceptor() {
           } else {
             options.headers.remove('Authorization');
           }
+          final viewRole = authService.viewRole?.trim();
+          if ((authService.currentUser?.role.toLowerCase().trim() ?? '') == 'creator' &&
+              viewRole != null &&
+              viewRole.isNotEmpty) {
+            options.headers['X-View-Role'] = viewRole;
+          } else {
+            options.headers.remove('X-View-Role');
+          }
           return handler.next(options);
         } catch (e, st) {
           debugPrint('onRequest interceptor error: $e\n$st');
