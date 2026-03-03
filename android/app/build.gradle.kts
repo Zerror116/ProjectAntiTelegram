@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.Тапка"
+    namespace = "com.example.projectantitelegram"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 

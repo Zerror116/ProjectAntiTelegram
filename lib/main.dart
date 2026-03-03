@@ -1,8 +1,11 @@
 // lib/main.dart
 import 'dart:async';
+
+import 'package:audioplayers/audioplayers.dart';
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
@@ -10,6 +13,9 @@ import 'screens/auth_screen.dart';
 import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
+import 'services/input_language_service.dart';
+import 'theme/app_theme.dart';
+import 'widgets/phoenix_loader.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 final Dio dio = Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3000'));
@@ -23,11 +29,20 @@ final ValueNotifier<bool> notificationsEnabledNotifier = ValueNotifier(true);
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(
   ThemeMode.light,
 );
+final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
+  null,
+);
 
 const _notificationsPrefPrefix = 'notifications_enabled_';
 const _themePrefPrefix = 'theme_mode_dark_';
 String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
+final AudioPlayer _appSoundPlayer = AudioPlayer();
+bool _appSoundPlayerPrepared = false;
+
+enum AppNoticeTone { info, success, warning, error }
+
+enum AppUiSound { tap, sent, incoming, success, warning }
 
 String _settingsScopeUserId() {
   final id = authService.currentUser?.id;
@@ -60,6 +75,151 @@ Future<void> setDarkModeEnabled(bool value) async {
   themeModeNotifier.value = value ? ThemeMode.dark : ThemeMode.light;
 }
 
+Future<void> _prepareAppSoundPlayer() async {
+  if (_appSoundPlayerPrepared) return;
+  _appSoundPlayerPrepared = true;
+  try {
+    try {
+      await _appSoundPlayer.setPlayerMode(PlayerMode.lowLatency);
+    } catch (_) {}
+    await _appSoundPlayer.setReleaseMode(ReleaseMode.stop);
+  } catch (_) {
+    _appSoundPlayerPrepared = false;
+  }
+}
+
+Future<void> playAppSound(AppUiSound sound) async {
+  if (sound == AppUiSound.incoming && !notificationsEnabledNotifier.value) {
+    return;
+  }
+
+  final assetPath = switch (sound) {
+    AppUiSound.tap => 'sounds/tap.wav',
+    AppUiSound.sent => 'sounds/sent.wav',
+    AppUiSound.incoming => 'sounds/incoming.wav',
+    AppUiSound.success => 'sounds/success.wav',
+    AppUiSound.warning => 'sounds/warning.wav',
+  };
+
+  try {
+    await _prepareAppSoundPlayer();
+    await _appSoundPlayer.stop();
+    await _appSoundPlayer.setReleaseMode(ReleaseMode.stop);
+    await _appSoundPlayer.play(AssetSource(assetPath), volume: 1.0);
+  } catch (_) {}
+}
+
+void showAppNotice(
+  BuildContext context,
+  String message, {
+  String? title,
+  AppNoticeTone tone = AppNoticeTone.info,
+  Duration duration = const Duration(milliseconds: 1600),
+}) {
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  if (messenger == null) return;
+
+  final theme = Theme.of(context);
+  final scheme = theme.colorScheme;
+  final (icon, accent) = switch (tone) {
+    AppNoticeTone.success => (
+      Icons.check_circle_outline,
+      theme.brightness == Brightness.dark
+          ? const Color(0xFF8BCF9B)
+          : const Color(0xFF2E7D32),
+    ),
+    AppNoticeTone.warning => (
+      Icons.notifications_active_outlined,
+      theme.brightness == Brightness.dark
+          ? const Color(0xFFFFC870)
+          : const Color(0xFFB26A00),
+    ),
+    AppNoticeTone.error => (
+      Icons.error_outline,
+      theme.brightness == Brightness.dark
+          ? const Color(0xFFFF9C92)
+          : const Color(0xFFB3261E),
+    ),
+    AppNoticeTone.info => (
+      Icons.mark_chat_unread_outlined,
+      theme.brightness == Brightness.dark
+          ? const Color(0xFF9CCBFF)
+          : const Color(0xFF215EA6),
+    ),
+  };
+
+  messenger
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        duration: duration,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        backgroundColor: scheme.surfaceContainerHigh,
+        content: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 1),
+              child: Icon(icon, color: accent, size: 20),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (title != null && title.trim().isNotEmpty)
+                    Text(
+                      title,
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        color: scheme.onSurface,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  Text(
+                    message,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: scheme.onSurface,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+}
+
+void showGlobalAppNotice(
+  String message, {
+  String? title,
+  AppNoticeTone tone = AppNoticeTone.info,
+  Duration duration = const Duration(milliseconds: 1600),
+}) {
+  final context = navigatorKey.currentContext;
+  if (context == null) return;
+  showAppNotice(context, message, title: title, tone: tone, duration: duration);
+}
+
+String _incomingMessagePreview(Map<String, dynamic>? message) {
+  if (message == null) return 'Откройте чат, чтобы посмотреть сообщение';
+  final text = (message['text'] ?? '').toString().trim();
+  if (text.isNotEmpty) {
+    final singleLine = text.replaceAll('\n', ' ');
+    return singleLine.length > 90
+        ? '${singleLine.substring(0, 90)}...'
+        : singleLine;
+  }
+  final meta = message['meta'];
+  if (meta is Map) {
+    final title = (meta['title'] ?? '').toString().trim();
+    if (title.isNotEmpty) return title;
+  }
+  return 'Новое сообщение';
+}
+
 Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
   if (!notificationsEnabledNotifier.value) return;
   Map<String, dynamic>? message;
@@ -84,7 +244,25 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
     _lastPlayedMessageId = messageId;
   }
 
-  await SystemSound.play(SystemSoundType.click);
+  await playAppSound(AppUiSound.incoming);
+
+  final chatId =
+      (data is Map
+              ? (data['chatId'] ?? message?['chat_id'] ?? message?['chatId'])
+              : null)
+          ?.toString();
+  if ((chatId?.isNotEmpty ?? false) && activeChatIdNotifier.value == chatId) {
+    return;
+  }
+
+  final senderName = (message?['sender_name'] ?? '').toString().trim();
+  final sender = senderName.isNotEmpty ? senderName : 'Новое сообщение';
+  showGlobalAppNotice(
+    _incomingMessagePreview(message),
+    title: sender,
+    tone: AppNoticeTone.info,
+    duration: const Duration(seconds: 2),
+  );
 }
 
 // ✅ Функция для безопасного отключения socket
@@ -261,6 +439,21 @@ Future<void> _initSocket() async {
       chatEventsController.add({'type': 'chat:message:deleted', 'data': data});
     });
 
+    socket?.on('chat:message:read', (data) {
+      debugPrint('📬 Socket event chat:message:read -> $data');
+      chatEventsController.add({'type': 'chat:message:read', 'data': data});
+    });
+
+    socket?.on('cart:updated', (data) {
+      debugPrint('📬 Socket event cart:updated -> $data');
+      chatEventsController.add({'type': 'cart:updated', 'data': data});
+    });
+
+    socket?.on('delivery:updated', (data) {
+      debugPrint('📬 Socket event delivery:updated -> $data');
+      chatEventsController.add({'type': 'delivery:updated', 'data': data});
+    });
+
     // Global message event (optional)
     socket?.on('chat:message:global', (data) {
       debugPrint('📬 Socket event chat:message:global -> $data');
@@ -318,7 +511,15 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
 }
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await inputLanguageService.initialize();
+  if (kIsWeb) {
+    try {
+      await BrowserContextMenu.disableContextMenu();
+    } catch (_) {}
+  }
+
   FlutterError.onError = (FlutterErrorDetails details) {
     FlutterError.presentError(details);
     debugPrint(
@@ -329,6 +530,9 @@ void main() {
   ErrorWidget.builder = (FlutterErrorDetails details) {
     final exception = details.exception;
     final stack = details.stack;
+    final errorTheme = themeModeNotifier.value == ThemeMode.dark
+        ? AppTheme.dark()
+        : AppTheme.light();
     return MaterialApp(
       home: Scaffold(
         body: Center(
@@ -337,7 +541,11 @@ void main() {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.error, color: Colors.red, size: 64),
+                Icon(
+                  Icons.error_outline,
+                  color: errorTheme.colorScheme.error,
+                  size: 64,
+                ),
                 const SizedBox(height: 12),
                 const Text(
                   'Произошла ошибка',
@@ -346,12 +554,15 @@ void main() {
                 const SizedBox(height: 8),
                 Text(
                   exception.toString(),
-                  style: const TextStyle(color: Colors.black87),
+                  style: TextStyle(color: errorTheme.colorScheme.onSurface),
                 ),
                 const SizedBox(height: 12),
                 Text(
                   stack?.toString() ?? '',
-                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: errorTheme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ],
             ),
@@ -359,9 +570,9 @@ void main() {
         ),
       ),
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(useMaterial3: true, brightness: Brightness.light),
-      darkTheme: ThemeData(useMaterial3: true, brightness: Brightness.dark),
-      themeMode: ThemeMode.light,
+      theme: AppTheme.light(),
+      darkTheme: AppTheme.dark(),
+      themeMode: themeModeNotifier.value,
       builder: (context, child) {
         return ScaffoldMessenger(child: child ?? const SizedBox.shrink());
       },
@@ -381,6 +592,19 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Widget? _home;
   String? _status;
   StreamSubscription<User?>? _authSub;
+
+  void _showAuthScreen() {
+    if (!mounted) return;
+    setState(() {
+      _home = const AuthScreen();
+      _status = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final navigator = navigatorKey.currentState;
+      if (navigator == null || !navigator.mounted) return;
+      navigator.pushNamedAndRemoveUntil('/auth', (route) => false);
+    });
+  }
 
   @override
   void initState() {
@@ -411,7 +635,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           // Пользователь вышел — отключаем socket
           await disconnectSocket();
           _lastPlayedMessageId = null;
+          activeChatIdNotifier.value = null;
           await refreshUserPreferences();
+          _showAuthScreen();
         } else {
           _handlingAuthFailure = false;
           // Пользователь вошёл — инициализируем socket
@@ -425,6 +651,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       });
 
       await refreshUserPreferences();
+      unawaited(_prepareAppSoundPlayer());
     } catch (e, st) {
       debugPrint('Error attaching interceptor: $e\n$st');
     }
@@ -454,24 +681,15 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
         builder: (context, mode, _) {
           return MaterialApp(
             navigatorKey: navigatorKey,
-            title: 'Тапка (diag)',
+            title: 'Проект Феникс (diag)',
             themeMode: mode,
-            theme: ThemeData(useMaterial3: true, brightness: Brightness.light),
-            darkTheme: ThemeData(
-              useMaterial3: true,
-              brightness: Brightness.dark,
-            ),
+            theme: AppTheme.light(),
+            darkTheme: AppTheme.dark(),
             home: Scaffold(
               appBar: AppBar(title: const Text('Загрузка...')),
-              body: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const CircularProgressIndicator(),
-                    const SizedBox(height: 12),
-                    Text(_status ?? 'Запуск...'),
-                  ],
-                ),
+              body: PhoenixLoadingView(
+                title: 'Проект Феникс запускается',
+                subtitle: _status ?? 'Подготавливаем приложение',
               ),
             ),
           );
@@ -484,10 +702,10 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       builder: (context, mode, _) {
         return MaterialApp(
           navigatorKey: navigatorKey,
-          title: 'Тапка',
+          title: 'Проект Феникс',
           themeMode: mode,
-          theme: ThemeData(useMaterial3: true, brightness: Brightness.light),
-          darkTheme: ThemeData(useMaterial3: true, brightness: Brightness.dark),
+          theme: AppTheme.light(),
+          darkTheme: AppTheme.dark(),
           home: _home,
           routes: {
             '/auth': (_) => const AuthScreen(),
@@ -520,6 +738,7 @@ class SetupFailedScreen extends StatelessWidget {
               ElevatedButton(
                 onPressed: () async {
                   final ok = await ensureDatabaseExists();
+                  if (!context.mounted) return;
                   if (ok) {
                     Navigator.of(context).pushReplacement(
                       MaterialPageRoute(builder: (_) => const AuthScreen()),

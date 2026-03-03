@@ -27,6 +27,7 @@ const chatsRouter = require("./routes/chats");
 const profileRouter = require("./routes/profile");
 const authRouter = require("./routes/auth");
 const adminRoutes = require("./routes/admin");
+const deliveryRoutes = require("./routes/delivery");
 const workerRoutes = require("./routes/worker");
 const cartRoutes = require("./routes/cart");
 const supportRoutes = require("./routes/support");
@@ -86,6 +87,8 @@ app.use("/api/phones", phonesRouter);
 app.use("/api/profile", [profileUpdateRoutes, profileRouter]);
 app.use("/api/chats", chatsRouter);
 app.use("/api/admin", adminRoutes);
+app.use("/api/admin/delivery", deliveryRoutes);
+app.use("/api/delivery", deliveryRoutes);
 app.use("/api/worker", workerRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/support", supportRoutes);
@@ -397,6 +400,11 @@ async function canUserAccessChat(user, chatId) {
       const sid = socket.id;
       const uid = socket.user?.id;
       console.log(`📡 Socket connected: ${sid} (user=${uid || "anonymous"})`);
+
+      if (uid) {
+        socket.join(`user:${uid}`);
+        console.log(`Socket ${sid} joined user:${uid}`);
+      }
 
       // ✅ ИСПРАВЛЕНИЕ: Если юзер залогинился, очисти его старые сокеты
       if (uid) {

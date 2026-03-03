@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
 
 class BugReportScreen extends StatefulWidget {
   const BugReportScreen({super.key});
@@ -16,6 +17,26 @@ class _BugReportScreenState extends State<BugReportScreen> {
   final _focusNode = FocusNode();
   bool _sending = false;
   String _message = '';
+  String? _selectedTemplate;
+
+  static const List<Map<String, String>> _templates = [
+    {
+      'title': 'Не открывается чат',
+      'body': 'Что не открывается:\nШаги:\nЧто должно было произойти:\nЧто произошло:',
+    },
+    {
+      'title': 'Ошибка корзины',
+      'body': 'Какой товар:\nЧто пытались сделать:\nЧто ожидали:\nЧто получили:',
+    },
+    {
+      'title': 'Проблема с уведомлением',
+      'body': 'На каком устройстве:\nЧто ожидали:\nЧто произошло по факту:',
+    },
+    {
+      'title': 'Другая проблема',
+      'body': 'Опишите проблему:\nШаги для повторения:\nОжидаемый результат:\nФактический результат:',
+    },
+  ];
 
   @override
   void dispose() {
@@ -54,7 +75,7 @@ class _BugReportScreenState extends State<BugReportScreen> {
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty) {
-      setState(() => _message = 'Опишите баг перед отправкой');
+      setState(() => _message = 'Опишите проблему перед отправкой');
       return;
     }
 
@@ -73,11 +94,16 @@ class _BugReportScreenState extends State<BugReportScreen> {
         if (!mounted) return;
         setState(
           () => _message =
-              'Баг-репорт отправлен. Он попал в отдельный приватный канал для admin/creator.',
+              'Сообщение отправлено. Его увидят администратор и создатель в отдельном служебном канале.',
+        );
+        showAppNotice(
+          context,
+          'Проблема отправлена',
+          tone: AppNoticeTone.success,
         );
       } else {
         if (!mounted) return;
-        setState(() => _message = 'Не удалось отправить баг-репорт');
+        setState(() => _message = 'Не удалось отправить сообщение о проблеме');
       }
     } catch (e) {
       if (!mounted) return;
@@ -87,18 +113,67 @@ class _BugReportScreenState extends State<BugReportScreen> {
     }
   }
 
+  void _applyTemplate(Map<String, String> template) {
+    final body = template['body'] ?? '';
+    setState(() {
+      _selectedTemplate = template['title'];
+      _message = '';
+      _controller.text = body;
+      _controller.selection = TextSelection.fromPosition(
+        TextPosition(offset: _controller.text.length),
+      );
+    });
+    _focusNode.requestFocus();
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final success = _message.startsWith('Сообщение отправлено');
     return Scaffold(
-      appBar: AppBar(title: const Text('Сообщить о баге')),
+      appBar: AppBar(title: const Text('Сообщить о проблеме')),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            Text(
-              'Опишите проблему, шаги для повторения и ожидаемый результат.\n'
-              'Сообщение отправится в отдельный закрытый канал баг-репортов.',
-              style: TextStyle(color: Colors.grey[700]),
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerLow,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Опишите, что сломалось',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Сообщение попадёт в отдельный закрытый служебный канал. Клиенты этот канал не видят.',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _templates.map((template) {
+                final selected = _selectedTemplate == template['title'];
+                return ChoiceChip(
+                  label: Text(template['title'] ?? 'Шаблон'),
+                  selected: selected,
+                  onSelected: (_) => _applyTemplate(template),
+                );
+              }).toList(),
             ),
             const SizedBox(height: 12),
             Focus(
@@ -110,10 +185,13 @@ class _BugReportScreenState extends State<BugReportScreen> {
                 maxLines: 12,
                 keyboardType: TextInputType.multiline,
                 textInputAction: TextInputAction.newline,
-                decoration: const InputDecoration(
-                  hintText:
-                      'Что случилось?\n1) Шаги\n2) Что ожидали\n3) Что получили',
-                  border: OutlineInputBorder(),
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    hintText:
+                        'Что случилось?\n1) Шаги\n2) Что ожидали\n3) Что получили',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: _controller,
                 ),
               ),
             ),
@@ -131,18 +209,27 @@ class _BugReportScreenState extends State<BugReportScreen> {
                           color: Colors.white,
                         ),
                       )
-                    : const Icon(Icons.bug_report_outlined),
-                label: Text(_sending ? 'Отправка...' : 'Отправить баг-репорт'),
+                    : const Icon(Icons.report_problem_outlined),
+                label: Text(_sending ? 'Отправка...' : 'Отправить сообщение'),
               ),
             ),
             if (_message.isNotEmpty) ...[
               const SizedBox(height: 12),
-              Text(
-                _message,
-                style: TextStyle(
-                  color: _message.startsWith('Баг-репорт отправлен')
-                      ? Colors.green[700]
-                      : Colors.red,
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: success
+                      ? theme.colorScheme.secondaryContainer
+                      : theme.colorScheme.errorContainer,
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Text(
+                  _message,
+                  style: TextStyle(
+                    color: success
+                        ? theme.colorScheme.onSecondaryContainer
+                        : theme.colorScheme.onErrorContainer,
+                  ),
                 ),
               ),
             ],

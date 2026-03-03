@@ -1,6 +1,7 @@
 // lib/screens/create_chat_screen.dart
 import 'package:flutter/material.dart';
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
 
 class CreateChatScreen extends StatefulWidget {
   const CreateChatScreen({super.key});
@@ -77,9 +78,12 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
         child: Column(children: [
           TextField(
             controller: _titleCtrl,
-            decoration: const InputDecoration(
-              labelText: 'Название чата',
-              hintText: 'Введите название',
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Название чата',
+                hintText: 'Введите название',
+              ),
+              controller: _titleCtrl,
             ),
             textInputAction: TextInputAction.done,
             onSubmitted: (_) => _create(),

@@ -2,15 +2,19 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:image/image.dart' as img;
+import 'package:latlong2/latlong.dart';
 
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
 
 class AdminPanel extends StatefulWidget {
   const AdminPanel({super.key});
@@ -24,21 +28,29 @@ class _AdminPanelState extends State<AdminPanel>
   late final TabController _tabController;
   final _channelTitleCtrl = TextEditingController();
   final _channelDescriptionCtrl = TextEditingController();
+  final _deliveryThresholdCtrl = TextEditingController();
+  final _courierNamesCtrl = TextEditingController();
 
   bool _loading = true;
   bool _saving = false;
   bool _publishing = false;
   bool _dispatchingOrders = false;
   bool _avatarUpdating = false;
+  bool _deliveryLoading = false;
+  bool _deliverySaving = false;
+  StreamSubscription? _eventsSub;
 
   String _message = '';
   String _newChannelVisibility = 'public';
+  String _deliveryViewMode = 'list';
   String? _pendingFilterChannelId;
 
   List<Map<String, dynamic>> _channels = [];
   List<Map<String, dynamic>> _pendingPosts = [];
   List<Map<String, dynamic>> _lastPublished = [];
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
+  List<Map<String, dynamic>> _deliveryBatches = [];
+  Map<String, dynamic>? _deliveryActiveBatch;
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
   final Set<String> _overviewLoading = <String>{};
@@ -47,15 +59,24 @@ class _AdminPanelState extends State<AdminPanel>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _reloadAll();
+    _eventsSub = chatEventsController.stream.listen((event) {
+      final type = event['type']?.toString() ?? '';
+      if (type == 'delivery:updated') {
+        unawaited(_loadDeliveryDashboard());
+      }
+    });
   }
 
   @override
   void dispose() {
     _tabController.dispose();
+    _eventsSub?.cancel();
     _channelTitleCtrl.dispose();
     _channelDescriptionCtrl.dispose();
+    _deliveryThresholdCtrl.dispose();
+    _courierNamesCtrl.dispose();
     super.dispose();
   }
 
@@ -93,6 +114,12 @@ class _AdminPanelState extends State<AdminPanel>
     final parsed = double.tryParse('${value ?? ''}');
     if (parsed == null || !parsed.isFinite) return 1;
     return parsed.clamp(1.0, 4.0).toDouble();
+  }
+
+  double? _toNullableDouble(dynamic value) {
+    final parsed = double.tryParse('${value ?? ''}');
+    if (parsed == null || !parsed.isFinite) return null;
+    return parsed;
   }
 
   Offset _clampAvatarOffset({
@@ -217,6 +244,7 @@ class _AdminPanelState extends State<AdminPanel>
   Future<void> _reloadAll() async {
     await _loadChannels();
     await _loadPendingPosts();
+    await _loadDeliveryDashboard();
   }
 
   Future<void> _loadChannels() async {
@@ -330,6 +358,575 @@ class _AdminPanelState extends State<AdminPanel>
         setState(
           () => _message = 'Ошибка загрузки очереди: ${_extractDioError(e)}',
         );
+      }
+    }
+  }
+
+  String _formatMoney(dynamic value) {
+    final n = (value is num) ? value.toDouble() : double.tryParse('$value') ?? 0;
+    return '${n.toStringAsFixed(2)} RUB';
+  }
+
+  String _formatDateTimeLabel(dynamic raw) {
+    final value = raw?.toString().trim() ?? '';
+    if (value.isEmpty) return '';
+    final parsed = DateTime.tryParse(value);
+    if (parsed == null) return value;
+    String pad(int number) => number.toString().padLeft(2, '0');
+    return '${pad(parsed.day)}.${pad(parsed.month)}.${parsed.year} ${pad(parsed.hour)}:${pad(parsed.minute)}';
+  }
+
+  Color _deliveryRouteColor(ThemeData theme, int index) {
+    const palette = [
+      Color(0xFFEF5350),
+      Color(0xFF42A5F5),
+      Color(0xFF66BB6A),
+      Color(0xFFFFA726),
+      Color(0xFFAB47BC),
+      Color(0xFF26A69A),
+    ];
+    return palette[index % palette.length];
+  }
+
+  Widget _buildDeliveryMapView(
+    Map<String, dynamic> activeBatch,
+    List<Map<String, dynamic>> customers,
+  ) {
+    final theme = Theme.of(context);
+    const samaraCenter = LatLng(53.195878, 50.100202);
+    final points = <LatLng>[samaraCenter];
+    final markers = <Marker>[];
+    final routes = <String, List<Map<String, dynamic>>>{};
+
+    for (final customer in customers) {
+      final lat = _toNullableDouble(customer['lat']);
+      final lng = _toNullableDouble(customer['lng']);
+      if (lat == null || lng == null) continue;
+      final point = LatLng(lat, lng);
+      points.add(point);
+      final courierKey = (customer['courier_name'] ?? '').toString().trim();
+      final routeKey = courierKey.isEmpty ? '_pending' : courierKey;
+      routes.putIfAbsent(routeKey, () => <Map<String, dynamic>>[]).add(customer);
+    }
+
+    final polylines = <Polyline>[];
+    final routeEntries = routes.entries.where((entry) => entry.key != '_pending').toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+
+    for (var index = 0; index < routeEntries.length; index += 1) {
+      final entry = routeEntries[index];
+      final routeColor = _deliveryRouteColor(theme, index);
+      final ordered = [...entry.value]
+        ..sort((a, b) {
+          final left = _toInt(a['route_order'], fallback: 9999);
+          final right = _toInt(b['route_order'], fallback: 9999);
+          return left.compareTo(right);
+        });
+      final routePoints = <LatLng>[samaraCenter];
+      for (final customer in ordered) {
+        final lat = _toNullableDouble(customer['lat']);
+        final lng = _toNullableDouble(customer['lng']);
+        if (lat == null || lng == null) continue;
+        routePoints.add(LatLng(lat, lng));
+      }
+      if (routePoints.length > 1) {
+        polylines.add(
+          Polyline(
+            points: routePoints,
+            strokeWidth: 4,
+            color: routeColor.withValues(alpha: 0.88),
+          ),
+        );
+      }
+    }
+
+    for (var index = 0; index < customers.length; index += 1) {
+      final customer = customers[index];
+      final lat = _toNullableDouble(customer['lat']);
+      final lng = _toNullableDouble(customer['lng']);
+      if (lat == null || lng == null) continue;
+      final routeOrder = _toInt(customer['route_order'], fallback: index + 1);
+      final courierName = (customer['courier_name'] ?? '').toString().trim();
+      final routeColor = courierName.isEmpty
+          ? theme.colorScheme.outline
+          : _deliveryRouteColor(
+              theme,
+              routeEntries.indexWhere((entry) => entry.key == courierName).clamp(
+                    0,
+                    routeEntries.isEmpty ? 0 : routeEntries.length - 1,
+                  ),
+            );
+      markers.add(
+        Marker(
+          point: LatLng(lat, lng),
+          width: 104,
+          height: 58,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 30,
+                height: 30,
+                decoration: BoxDecoration(
+                  color: routeColor,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.white, width: 2),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  courierName.isEmpty ? '?' : '$routeOrder',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface.withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                child: Text(
+                  (customer['customer_name'] ?? 'Клиент').toString(),
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          height: 480,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: theme.colorScheme.outlineVariant),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: points.length <= 1
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'На карте пока нечего показывать.\n'
+                      'Нужны координаты адресов клиентов.',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyLarge?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                )
+              : FlutterMap(
+                  options: const MapOptions(
+                    initialCenter: samaraCenter,
+                    initialZoom: 10,
+                  ),
+                  children: [
+                    TileLayer(
+                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                      userAgentPackageName: 'projectantitelegram',
+                    ),
+                    RichAttributionWidget(
+                      attributions: [
+                        TextSourceAttribution(
+                          'OpenStreetMap contributors',
+                          textStyle: theme.textTheme.labelSmall,
+                        ),
+                      ],
+                    ),
+                    if (polylines.isNotEmpty)
+                      PolylineLayer(polylines: polylines),
+                    MarkerLayer(markers: markers),
+                  ],
+                ),
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (var index = 0; index < routeEntries.length; index += 1)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: _deliveryRouteColor(theme, index).withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: _deliveryRouteColor(theme, index).withValues(alpha: 0.45),
+                  ),
+                ),
+                child: Text(
+                  '${routeEntries[index].key}: ${routeEntries[index].value.length} адресов',
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            if (routes.containsKey('_pending'))
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'Без маршрута: ${routes['_pending']!.length}',
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Карта Самарской области для текущего листа доставки. Линии показывают автоматическую раскладку адресов по курьерам.',
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _deliveryBatchStatusLabel(String raw) {
+    switch (raw) {
+      case 'calling':
+        return 'Ожидаем ответы по рассылке';
+      case 'couriers_assigned':
+        return 'Маршрут собран';
+      case 'handed_off':
+        return 'Передано курьерам';
+      case 'completed':
+        return 'Завершено';
+      case 'cancelled':
+        return 'Отменено';
+      default:
+        return raw.isEmpty ? 'Черновик' : raw;
+    }
+  }
+
+  String _deliveryCustomerStatusLabel(String raw) {
+    switch (raw) {
+      case 'offer_sent':
+        return 'Рассылка отправлена, ждем ответ';
+      case 'awaiting_call':
+        return 'Готов к рассылке';
+      case 'accepted':
+        return 'Согласен на доставку';
+      case 'declined':
+        return 'Отказался';
+      case 'preparing_delivery':
+        return 'Идет подготовка';
+      case 'handing_to_courier':
+        return 'Передается курьеру';
+      case 'in_delivery':
+        return 'У курьера';
+      case 'pending':
+      default:
+        return 'Еще не отправлено';
+    }
+  }
+
+  Future<void> _loadDeliveryDashboard() async {
+    if (mounted) {
+      setState(() {
+        _deliveryLoading = true;
+      });
+    }
+    try {
+      final resp = await authService.dio.get('/api/admin/delivery/dashboard');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final payload = Map<String, dynamic>.from(data['data']);
+        final settings = _asMap(payload['settings']);
+        final threshold = settings['threshold_amount'];
+        _deliveryThresholdCtrl.text = _toInt(threshold, fallback: 1500).toString();
+        if (mounted) {
+          setState(() {
+            _deliveryBatches = _asMapList(payload['batches']);
+            _deliveryActiveBatch = payload['active_batch'] is Map
+                ? Map<String, dynamic>.from(payload['active_batch'])
+                : null;
+          });
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка доставки: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliveryLoading = false);
+      }
+    }
+  }
+
+  Future<void> _saveDeliverySettings() async {
+    final threshold = int.tryParse(_deliveryThresholdCtrl.text.trim());
+    if (threshold == null || threshold < 0) {
+      setState(() => _message = 'Введите корректную сумму для доставки');
+      return;
+    }
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/delivery/settings',
+        data: {'threshold_amount': threshold},
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Порог доставки сохранен');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка порога: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _generateDeliveryBatch() async {
+    final threshold = int.tryParse(_deliveryThresholdCtrl.text.trim());
+    if (threshold == null || threshold < 0) {
+      setState(() => _message = 'Введите корректную сумму для доставки');
+      return;
+    }
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/delivery/broadcast',
+        data: {'threshold_amount': threshold},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true) {
+        final payload = data['data'] is Map
+            ? Map<String, dynamic>.from(data['data'])
+            : <String, dynamic>{};
+        await _loadDeliveryDashboard();
+        if (mounted) {
+          final sentTotal = payload['sent_total'] is num
+              ? (payload['sent_total'] as num).toInt()
+              : 0;
+          final addedTotal = payload['added_to_existing_batch'] is num
+              ? (payload['added_to_existing_batch'] as num).toInt()
+              : 0;
+          setState(
+            () => _message = sentTotal > 0 || addedTotal > 0
+                ? 'Рассылка отправлена: $sentTotal${addedTotal > 0 ? ' (добавлено в лист: $addedTotal)' : ''}'
+                : (payload['message']?.toString() ??
+                    'Нет клиентов для рассылки'),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка рассылки: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _resetDeliveryTesting() async {
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post('/api/admin/delivery/reset');
+      final data = resp.data;
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        final payload = data is Map && data['data'] is Map
+            ? Map<String, dynamic>.from(data['data'])
+            : <String, dynamic>{};
+        setState(
+          () => _message =
+              'Доставка очищена. Чатов: ${payload['cleared_chats'] ?? 0}, пользователей: ${payload['affected_users'] ?? 0}',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка очистки доставки: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<String?> _askDeliveryAddress({
+    required String initialValue,
+    required String title,
+  }) async {
+    final controller = TextEditingController(text: initialValue);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 2,
+          maxLines: 4,
+          decoration: withInputLanguageBadge(
+            const InputDecoration(
+              hintText: 'Самара, улица, дом, подъезд',
+              border: OutlineInputBorder(),
+            ),
+            controller: controller,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+    return result?.trim();
+  }
+
+  Future<void> _setDeliveryDecision(
+    String batchId,
+    Map<String, dynamic> customer, {
+    required bool accepted,
+  }) async {
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (customerId.isEmpty) return;
+
+    String addressText = '';
+    if (accepted) {
+      final result = await _askDeliveryAddress(
+        initialValue: (customer['address_text'] ?? '').toString(),
+        title: 'Адрес доставки',
+      );
+      if (result == null || result.isEmpty) return;
+      addressText = result;
+    }
+
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/decision',
+        data: {
+          'accepted': accepted,
+          if (accepted) 'address_text': addressText,
+        },
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(
+          () => _message = accepted
+              ? 'Доставка подтверждена вручную'
+              : 'Отказ от доставки сохранен',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _message = accepted
+              ? 'Ошибка подтверждения доставки: ${_extractDioError(e)}'
+              : 'Ошибка отказа от доставки: ${_extractDioError(e)}';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _assignCouriers(String batchId) async {
+    final courierNames = _courierNamesCtrl.text
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+    if (courierNames.isEmpty) {
+      setState(() => _message = 'Введите имена курьеров, каждое с новой строки');
+      return;
+    }
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/assign-couriers',
+        data: {'courier_names': courierNames},
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Курьеры назначены');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка курьеров: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _confirmDeliveryHandoff(String batchId) async {
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/confirm-handoff',
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Лист доставки передан курьерам');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка передачи: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
       }
     }
   }
@@ -1094,9 +1691,12 @@ class _AdminPanelState extends State<AdminPanel>
                       const SizedBox(height: 12),
                       TextField(
                         controller: titleCtrl,
-                        decoration: const InputDecoration(
-                          labelText: 'Название канала',
-                          border: OutlineInputBorder(),
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Название канала',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: titleCtrl,
                         ),
                         onChanged: (_) => setModalState(() {}),
                       ),
@@ -1105,9 +1705,12 @@ class _AdminPanelState extends State<AdminPanel>
                         controller: descCtrl,
                         minLines: 2,
                         maxLines: 4,
-                        decoration: const InputDecoration(
-                          labelText: 'Описание',
-                          border: OutlineInputBorder(),
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Описание',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: descCtrl,
                         ),
                       ),
                       const SizedBox(height: 10),
@@ -1494,13 +2097,29 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Widget _buildStatChip(String label, String value) {
+    final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.grey.shade100,
+        color: theme.colorScheme.surfaceContainerHighest,
+        border: Border.all(color: theme.colorScheme.outlineVariant),
         borderRadius: BorderRadius.circular(999),
       ),
-      child: Text('$label: $value'),
+      child: RichText(
+        text: TextSpan(
+          style: theme.textTheme.labelLarge?.copyWith(
+            color: theme.colorScheme.onSurface,
+            fontWeight: FontWeight.w700,
+          ),
+          children: [
+            TextSpan(
+              text: '$label: ',
+              style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            TextSpan(text: value),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1568,9 +2187,12 @@ class _AdminPanelState extends State<AdminPanel>
       children: [
         TextField(
           controller: _channelTitleCtrl,
-          decoration: const InputDecoration(
-            labelText: 'Название канала',
-            border: OutlineInputBorder(),
+          decoration: withInputLanguageBadge(
+            const InputDecoration(
+              labelText: 'Название канала',
+              border: OutlineInputBorder(),
+            ),
+            controller: _channelTitleCtrl,
           ),
         ),
         const SizedBox(height: 12),
@@ -1578,9 +2200,12 @@ class _AdminPanelState extends State<AdminPanel>
           controller: _channelDescriptionCtrl,
           minLines: 3,
           maxLines: 5,
-          decoration: const InputDecoration(
-            labelText: 'Описание канала (опционально)',
-            border: OutlineInputBorder(),
+          decoration: withInputLanguageBadge(
+            const InputDecoration(
+              labelText: 'Описание канала (опционально)',
+              border: OutlineInputBorder(),
+            ),
+            controller: _channelDescriptionCtrl,
           ),
         ),
         const SizedBox(height: 12),
@@ -1683,7 +2308,7 @@ class _AdminPanelState extends State<AdminPanel>
                 alignment: Alignment.centerLeft,
                 child: Text(
                   description,
-                  style: TextStyle(color: Colors.grey.shade700),
+                  style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
                 ),
               ),
             ),
@@ -1989,12 +2614,13 @@ class _AdminPanelState extends State<AdminPanel>
               final price = p['product_price']?.toString() ?? '0';
               final qty = p['product_quantity']?.toString() ?? '0';
               final channel = (p['channel_title'] ?? 'Канал').toString();
-              final workerEmail = (p['queued_by_email'] ?? 'worker').toString();
+              final workerEmail = (p['queued_by_email'] ?? 'работник')
+                  .toString();
               return Card(
                 child: ListTile(
                   title: Text(title),
                   subtitle: Text(
-                    'Канал: $channel\nWorker: $workerEmail\nЦена: $price RUB, Кол-во: $qty',
+                    'Канал: $channel\nРаботник: $workerEmail\nЦена: $price RUB, Кол-во: $qty',
                   ),
                   isThreeLine: true,
                 ),
@@ -2050,6 +2676,310 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  Widget _buildDeliveryCustomerCard(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) {
+    final theme = Theme.of(context);
+    final name = (customer['customer_name'] ?? 'Клиент').toString();
+    final phone = (customer['customer_phone'] ?? '—').toString();
+    final sum = _formatMoney(customer['processed_sum']);
+    final shelf = (customer['shelf_number'] ?? 'не назначена').toString();
+    final address = (customer['address_text'] ?? '').toString().trim();
+    final status = _deliveryCustomerStatusLabel(
+      (customer['delivery_status'] ?? customer['call_status'] ?? '').toString(),
+    );
+    final courierName = (customer['courier_name'] ?? '').toString().trim();
+    final routeOrder = (customer['route_order'] ?? '').toString().trim();
+    final etaFrom = _formatDateTimeLabel(customer['eta_from']);
+    final etaTo = _formatDateTimeLabel(customer['eta_to']);
+    final items = _asMapList(customer['items']);
+
+    final callStatus = (customer['call_status'] ?? '').toString().trim();
+    final canManualDecide = callStatus == 'pending';
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              name,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text('Телефон: $phone'),
+            Text('Сумма обработанного: $sum'),
+            Text('Полка: $shelf'),
+            Text('Статус доставки: $status'),
+            Text(
+              'Ответ в личке: ${callStatus == 'accepted' ? 'Согласен' : callStatus == 'declined' ? 'Отказался' : callStatus == 'pending' ? 'Ожидаем ответ' : '—'}',
+            ),
+            if (address.isNotEmpty) Text('Адрес: $address'),
+            if (courierName.isNotEmpty) Text('Курьер: $courierName'),
+            if (routeOrder.isNotEmpty) Text('Порядок по маршруту: $routeOrder'),
+            if (etaFrom.isNotEmpty || etaTo.isNotEmpty)
+              Text('Окно доставки: $etaFrom - $etaTo'),
+            if (items.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Товары: ${items.length}',
+                style: theme.textTheme.labelLarge?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+            if (canManualDecide) ...[
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _deliverySaving
+                        ? null
+                        : () => _setDeliveryDecision(
+                            batchId,
+                            customer,
+                            accepted: true,
+                          ),
+                    icon: const Icon(Icons.check_circle_outline),
+                    label: const Text('Подтвердить за клиента'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving
+                        ? null
+                        : () => _setDeliveryDecision(
+                            batchId,
+                            customer,
+                            accepted: false,
+                          ),
+                    icon: const Icon(Icons.cancel_outlined),
+                    label: const Text('Отказать за клиента'),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeliveryTab() {
+    final activeBatch = _deliveryActiveBatch;
+    final customers = _asMapList(activeBatch?['customers']);
+
+    return RefreshIndicator(
+      onRefresh: _loadDeliveryDashboard,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextField(
+            controller: _deliveryThresholdCtrl,
+            keyboardType: TextInputType.number,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Сумма для попадания в доставку',
+                border: OutlineInputBorder(),
+                helperText: 'Сумма в RUB',
+              ),
+              controller: _deliveryThresholdCtrl,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: const [
+                  Text(
+                    'Как это работает',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    '1. Сохрани порог суммы для доставки.\n'
+                    '2. Нажми "Отправить рассылку" — система сама напишет клиентам в личные сообщения.\n'
+                    '3. Клиент ответит Да или Нет. Если Да, он сразу отправит адрес.\n'
+                    '4. Здесь появится его ответ, адрес и готовность к передаче курьеру.',
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _deliverySaving ? null : _saveDeliverySettings,
+                  icon: const Icon(Icons.save_outlined),
+                  label: Text(_deliverySaving ? 'Сохранение...' : 'Сохранить порог'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _deliverySaving ? null : _generateDeliveryBatch,
+                  icon: const Icon(Icons.campaign_outlined),
+                  label: const Text('Отправить рассылку'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              onPressed: _deliverySaving ? null : _resetDeliveryTesting,
+              icon: const Icon(Icons.delete_sweep_outlined),
+              label: const Text('Очистить доставку'),
+            ),
+          ),
+          const SizedBox(height: 16),
+          if (_deliveryLoading && activeBatch == null)
+            const Center(child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: CircularProgressIndicator(),
+            ))
+          else if (activeBatch == null)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'Активного листа доставки пока нет.\nСистема возьмет клиентов, у которых сумма обработанных товаров достигла порога.',
+                ),
+              ),
+            )
+          else ...[
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      (activeBatch['delivery_label'] ?? 'Лист доставки').toString(),
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text('Дата: ${(activeBatch['delivery_date'] ?? '').toString()}'),
+                    Text(
+                      'Статус: ${_deliveryBatchStatusLabel((activeBatch['status'] ?? '').toString())}',
+                    ),
+                    Text(
+                      'Клиентов: ${activeBatch['customers_total'] ?? customers.length}',
+                    ),
+                    Text(
+                      'Подтвердили: ${activeBatch['accepted_total'] ?? 0}',
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _courierNamesCtrl,
+                      minLines: 2,
+                      maxLines: 5,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Курьеры (каждое имя с новой строки)',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _courierNamesCtrl,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _deliverySaving
+                              ? null
+                              : () => _assignCouriers(
+                                  (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.route_outlined),
+                          label: const Text('Распределить по курьерам'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _deliverySaving
+                              ? null
+                              : () => _confirmDeliveryHandoff(
+                                  (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.done_all_outlined),
+                          label: const Text('Передать курьерам'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment<String>(
+                  value: 'list',
+                  icon: Icon(Icons.view_agenda_outlined),
+                  label: Text('Список'),
+                ),
+                ButtonSegment<String>(
+                  value: 'map',
+                  icon: Icon(Icons.map_outlined),
+                  label: Text('Карта'),
+                ),
+              ],
+              selected: {_deliveryViewMode},
+              onSelectionChanged: (selection) {
+                setState(() => _deliveryViewMode = selection.first);
+              },
+            ),
+            const SizedBox(height: 12),
+            if (_deliveryViewMode == 'map')
+              _buildDeliveryMapView(activeBatch, customers)
+            else
+              ...customers.map(
+                (customer) => _buildDeliveryCustomerCard(
+                  (activeBatch['id'] ?? '').toString(),
+                  customer,
+                ),
+              ),
+          ],
+          if (_deliveryBatches.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            const Text(
+              'Последние листы доставки',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            ..._deliveryBatches.map((batch) {
+              return Card(
+                child: ListTile(
+                  title: Text(
+                    (batch['delivery_label'] ?? 'Лист доставки').toString(),
+                  ),
+                  subtitle: Text(
+                    'Дата: ${(batch['delivery_date'] ?? '').toString()}\n'
+                    'Статус: ${_deliveryBatchStatusLabel((batch['status'] ?? '').toString())}\n'
+                    'Клиентов: ${(batch['customers_total'] ?? 0).toString()}',
+                  ),
+                  isThreeLine: true,
+                ),
+              );
+            }),
+          ],
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -2061,6 +2991,7 @@ class _AdminPanelState extends State<AdminPanel>
             Tab(text: 'Создание'),
             Tab(text: 'Каналы'),
             Tab(text: 'Модерация'),
+            Tab(text: 'Доставка'),
           ],
         ),
       ),
@@ -2082,6 +3013,7 @@ class _AdminPanelState extends State<AdminPanel>
                   _buildCreateTab(),
                   _buildSettingsTab(),
                   _buildModerationTab(),
+                  _buildDeliveryTab(),
                 ],
               ),
             ),
@@ -2106,8 +3038,8 @@ class _CircleCutoutPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final overlayPath = Path()
-      ..fillType = PathFillType.evenOdd
+    final overlayPath = ui.Path()
+      ..fillType = ui.PathFillType.evenOdd
       ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
       ..addOval(Rect.fromCircle(center: center, radius: cutoutRadius));
 

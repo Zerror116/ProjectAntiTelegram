@@ -1,6 +1,7 @@
 // lib/screens/change_password_screen.dart
 import 'package:flutter/material.dart';
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
   const ChangePasswordScreen({super.key});
@@ -53,9 +54,23 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(children: [
-          TextField(controller: _oldController, obscureText: true, decoration: const InputDecoration(labelText: 'Старый пароль')),
+          TextField(
+            controller: _oldController,
+            obscureText: true,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(labelText: 'Старый пароль'),
+              controller: _oldController,
+            ),
+          ),
           const SizedBox(height: 12),
-          TextField(controller: _newController, obscureText: true, decoration: const InputDecoration(labelText: 'Новый пароль')),
+          TextField(
+            controller: _newController,
+            obscureText: true,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(labelText: 'Новый пароль'),
+              controller: _newController,
+            ),
+          ),
           const SizedBox(height: 12),
           ElevatedButton(onPressed: _loading ? null : _change, child: _loading ? const CircularProgressIndicator() : const Text('Сменить пароль')),
           const SizedBox(height: 12),

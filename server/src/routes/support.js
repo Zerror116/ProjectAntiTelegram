@@ -137,7 +137,12 @@ router.post("/ask", authMiddleware, async (req, res) => {
     for (const row of result.rows) {
       const line = Number(row.price) * Number(row.quantity);
       total += line;
-      if (row.status === "processed" || row.status === "in_delivery") {
+      if (
+        row.status === "processed" ||
+        row.status === "preparing_delivery" ||
+        row.status === "handing_to_courier" ||
+        row.status === "in_delivery"
+      ) {
         processed += line;
       }
     }
@@ -156,16 +161,6 @@ router.post("/ask", authMiddleware, async (req, res) => {
 
 // Отправить баг-репорт в отдельный приватный канал для admin/creator
 router.post("/bug-report", authMiddleware, async (req, res) => {
-  const role = String(req.user?.role || "")
-    .toLowerCase()
-    .trim();
-  if (role !== "admin" && role !== "creator") {
-    return res.status(403).json({
-      ok: false,
-      error: "Баг-репорты доступны только admin и creator",
-    });
-  }
-
   const message = String(req.body?.message || "").trim();
   if (!message) {
     return res
@@ -241,6 +236,7 @@ router.post("/bug-report", authMiddleware, async (req, res) => {
       if (created) {
         io.emit("chat:created", { chatId: channel.id });
       }
+      io.emit("chat:updated", { chatId: channel.id });
       io.to(`chat:${channel.id}`).emit("chat:message", {
         chatId: channel.id,
         message: messageInsert.rows[0],

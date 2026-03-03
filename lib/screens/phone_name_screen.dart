@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
 import '../main.dart';
 import '../utils/phone_utils.dart';
+import '../widgets/input_language_badge.dart';
 
 class PhoneNameScreen extends StatefulWidget {
   final bool isRegisterFlow;
@@ -200,16 +201,22 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
             children: [
               TextField(
                 controller: _nameCtrl,
-                decoration: const InputDecoration(labelText: 'Имя'),
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(labelText: 'Имя'),
+                  controller: _nameCtrl,
+                ),
                 textInputAction: TextInputAction.next,
               ),
               const SizedBox(height: 12),
               TextField(
                 controller: _phoneCtrl,
                 keyboardType: TextInputType.phone,
-                decoration: const InputDecoration(
-                  labelText: 'Номер телефона',
-                  hintText: 'Например: +7 (999) 171-45-51 или 89991714551',
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Номер телефона',
+                    hintText: 'Например: +7 (999) 171-45-51 или 89991714551',
+                  ),
+                  controller: _phoneCtrl,
                 ),
                 textInputAction: TextInputAction.done,
               ),
@@ -217,7 +224,10 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
               if (_shouldShowSecretField) ...[
                 TextField(
                   controller: _secretCtrl,
-                  decoration: const InputDecoration(labelText: 'Секретное слово'),
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(labelText: 'Секретное слово'),
+                    controller: _secretCtrl,
+                  ),
                   textInputAction: TextInputAction.done,
                 ),
                 const SizedBox(height: 12),

@@ -1,8 +1,11 @@
 // lib/screens/cart_screen.dart
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import '../widgets/phoenix_loader.dart';
 
 class CartScreen extends StatefulWidget {
   const CartScreen({super.key});
@@ -14,20 +17,68 @@ class CartScreen extends StatefulWidget {
 class _CartScreenState extends State<CartScreen> {
   bool _loading = true;
   bool _cancelling = false;
+  bool _reloading = false;
+  bool _reloadQueued = false;
   String _error = '';
   List<Map<String, dynamic>> _items = [];
   double _total = 0;
   double _processed = 0;
+  StreamSubscription? _eventsSub;
+  Timer? _reloadDebounceTimer;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _eventsSub = chatEventsController.stream.listen((event) {
+      final type = event['type']?.toString() ?? '';
+      if (type != 'cart:updated') return;
+      final data = event['data'];
+      if (data is! Map) return;
+      final currentUserId = authService.currentUser?.id.trim() ?? '';
+      final targetUserId = data['userId']?.toString().trim() ?? '';
+      if (currentUserId.isEmpty || currentUserId != targetUserId) return;
+      _scheduleReload();
+    });
   }
 
-  Future<void> _load() async {
+  @override
+  void dispose() {
+    _eventsSub?.cancel();
+    _reloadDebounceTimer?.cancel();
+    super.dispose();
+  }
+
+  void _applyPayload(Map<String, dynamic> payload) {
+    _items = payload['items'] is List
+        ? List<Map<String, dynamic>>.from(payload['items'])
+        : [];
+    _total = (payload['total_sum'] is num)
+        ? (payload['total_sum'] as num).toDouble()
+        : double.tryParse('${payload['total_sum'] ?? 0}') ?? 0;
+    _processed = (payload['processed_sum'] is num)
+        ? (payload['processed_sum'] as num).toDouble()
+        : double.tryParse('${payload['processed_sum'] ?? 0}') ?? 0;
+  }
+
+  void _scheduleReload({Duration delay = const Duration(milliseconds: 350)}) {
+    _reloadDebounceTimer?.cancel();
+    _reloadDebounceTimer = Timer(delay, () {
+      unawaited(_load(showLoader: false));
+    });
+  }
+
+  Future<void> _load({bool showLoader = true}) async {
+    if (_reloading) {
+      _reloadQueued = true;
+      return;
+    }
+    _reloading = true;
+    final shouldShowLoader = showLoader && _items.isEmpty;
     setState(() {
-      _loading = true;
+      if (shouldShowLoader) {
+        _loading = true;
+      }
       _error = '';
     });
     try {
@@ -36,15 +87,7 @@ class _CartScreenState extends State<CartScreen> {
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final payload = Map<String, dynamic>.from(data['data']);
         setState(() {
-          _items = payload['items'] is List
-              ? List<Map<String, dynamic>>.from(payload['items'])
-              : [];
-          _total = (payload['total_sum'] is num)
-              ? (payload['total_sum'] as num).toDouble()
-              : 0;
-          _processed = (payload['processed_sum'] is num)
-              ? (payload['processed_sum'] as num).toDouble()
-              : 0;
+          _applyPayload(payload);
         });
       } else {
         setState(() => _error = 'Неверный ответ сервера');
@@ -54,7 +97,14 @@ class _CartScreenState extends State<CartScreen> {
         () => _error = 'Ошибка загрузки корзины: ${_extractDioError(e)}',
       );
     } finally {
-      if (mounted) setState(() => _loading = false);
+      _reloading = false;
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+      if (_reloadQueued) {
+        _reloadQueued = false;
+        _scheduleReload(delay: const Duration(milliseconds: 120));
+      }
     }
   }
 
@@ -72,6 +122,10 @@ class _CartScreenState extends State<CartScreen> {
 
   String _statusText(String raw) {
     switch (raw) {
+      case 'preparing_delivery':
+        return 'Идет подготовка к отправке';
+      case 'handing_to_courier':
+        return 'Передается курьеру';
       case 'processed':
         return 'Обработан';
       case 'in_delivery':
@@ -84,6 +138,10 @@ class _CartScreenState extends State<CartScreen> {
 
   Color _statusColor(String raw) {
     switch (raw) {
+      case 'preparing_delivery':
+        return const Color(0xFF7B5CFA);
+      case 'handing_to_courier':
+        return const Color(0xFF00897B);
       case 'processed':
         return const Color(0xFF2E7D32);
       case 'in_delivery':
@@ -104,6 +162,45 @@ class _CartScreenState extends State<CartScreen> {
         : double.tryParse('$value') ?? 0;
     final fixed = n.toStringAsFixed(2);
     return '$fixed RUB';
+  }
+
+  String _formatDeliveryEta(DateTime dateTime) {
+    const months = [
+      'января',
+      'февраля',
+      'марта',
+      'апреля',
+      'мая',
+      'июня',
+      'июля',
+      'августа',
+      'сентября',
+      'октября',
+      'ноября',
+      'декабря',
+    ];
+    final day = dateTime.day.toString().padLeft(2, '0');
+    final month = months[dateTime.month - 1];
+    final hour = dateTime.hour.toString().padLeft(2, '0');
+    final minute = dateTime.minute.toString().padLeft(2, '0');
+    return '$day $month, $hour:$minute';
+  }
+
+  DateTime? _extractDeliveryEta() {
+    DateTime? best;
+    for (final item in _items) {
+      final etaRaw = (item['eta_from'] ?? '').toString().trim();
+      final dateRaw = (item['delivery_date'] ?? '').toString().trim();
+      DateTime? candidate = DateTime.tryParse(etaRaw);
+      if (candidate == null && dateRaw.isNotEmpty) {
+        candidate = DateTime.tryParse(dateRaw);
+      }
+      if (candidate == null) continue;
+      if (best == null || candidate.isBefore(best)) {
+        best = candidate;
+      }
+    }
+    return best;
   }
 
   String? _resolveImageUrl(String? raw) {
@@ -128,8 +225,11 @@ class _CartScreenState extends State<CartScreen> {
   Future<void> _cancelItem(Map<String, dynamic> item) async {
     final status = (item['status'] ?? '').toString();
     if (!_canCancel(status)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Отказ невозможен: товар уже обработан')),
+      showAppNotice(
+        context,
+        'Отказ невозможен: товар уже обработан',
+        tone: AppNoticeTone.warning,
+        duration: const Duration(seconds: 2),
       );
       return;
     }
@@ -163,14 +263,20 @@ class _CartScreenState extends State<CartScreen> {
     try {
       await authService.dio.delete('/api/cart/items/$itemId');
       if (!mounted) return;
-      ScaffoldMessenger.of(
+      showAppNotice(
         context,
-      ).showSnackBar(const SnackBar(content: Text('Товар удален из корзины')));
-      await _load();
+        'Товар удален из корзины',
+        tone: AppNoticeTone.success,
+      );
+      await playAppSound(AppUiSound.success);
+      _scheduleReload(delay: const Duration(milliseconds: 120));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Ошибка отказа: ${_extractDioError(e)}')),
+      showAppNotice(
+        context,
+        'Ошибка отказа: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
       );
     } finally {
       if (mounted) setState(() => _cancelling = false);
@@ -178,27 +284,79 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   Widget _buildSummary() {
+    final theme = Theme.of(context);
+    final eta = _extractDeliveryEta();
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         gradient: LinearGradient(
-          colors: [Colors.blueGrey.shade700, Colors.blueGrey.shade500],
+          colors: [theme.colorScheme.primary, theme.colorScheme.tertiary],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
         borderRadius: BorderRadius.circular(18),
+        boxShadow: [
+          BoxShadow(
+            color: theme.colorScheme.primary.withValues(alpha: 0.22),
+            blurRadius: 24,
+            offset: const Offset(0, 14),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'Ваша корзина',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.w700,
-            ),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Expanded(
+                child: Text(
+                  'Ваша корзина',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              if (eta != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.16),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      const Text(
+                        'Предварительное время доставки',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        textAlign: TextAlign.right,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _formatDeliveryEta(eta),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w800,
+                        ),
+                        textAlign: TextAlign.right,
+                      ),
+                    ],
+                  ),
+                ),
+            ],
           ),
           const SizedBox(height: 10),
           Text(
@@ -216,15 +374,19 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   Widget _buildImage(String? imageUrl) {
+    final theme = Theme.of(context);
     if (imageUrl == null || imageUrl.isEmpty) {
       return Container(
         width: 86,
         height: 86,
         decoration: BoxDecoration(
-          color: Colors.grey.shade200,
+          color: theme.colorScheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(12),
         ),
-        child: const Icon(Icons.image_not_supported_outlined),
+        child: Icon(
+          Icons.image_not_supported_outlined,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
       );
     }
 
@@ -237,8 +399,11 @@ class _CartScreenState extends State<CartScreen> {
           imageUrl,
           fit: BoxFit.cover,
           errorBuilder: (_, error, stackTrace) => Container(
-            color: Colors.grey.shade200,
-            child: const Icon(Icons.broken_image_outlined),
+            color: theme.colorScheme.surfaceContainerHighest,
+            child: Icon(
+              Icons.broken_image_outlined,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ),
         ),
       ),
@@ -246,20 +411,24 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   Widget _buildItemCard(Map<String, dynamic> item) {
+    final theme = Theme.of(context);
     final title = (item['title'] ?? 'Товар').toString();
     final statusRaw = (item['status'] ?? '').toString();
     final quantity = (item['quantity'] is num)
         ? (item['quantity'] as num).toInt()
         : int.tryParse('${item['quantity']}') ?? 0;
-    final unitPrice = (item['price'] is num) ? item['price'] : 0;
-    final lineTotal = (item['line_total'] is num) ? item['line_total'] : 0;
+    final unitPrice = (item['price'] is num)
+        ? (item['price'] as num).toDouble()
+        : double.tryParse('${item['price'] ?? 0}') ?? 0;
+    final lineTotal = (item['line_total'] is num)
+        ? (item['line_total'] as num).toDouble()
+        : double.tryParse('${item['line_total'] ?? 0}') ?? 0;
     final imageUrl = _resolveImageUrl((item['image_url'] ?? '').toString());
     final statusColor = _statusColor(statusRaw);
     final canCancel = _canCancel(statusRaw);
-
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
-      elevation: 2,
+      color: theme.colorScheme.surfaceContainerLow,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -279,9 +448,10 @@ class _CartScreenState extends State<CartScreen> {
                         title,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w700,
+                          color: theme.colorScheme.onSurface,
                         ),
                       ),
                       const SizedBox(height: 8),
@@ -329,7 +499,10 @@ class _CartScreenState extends State<CartScreen> {
                 else
                   Text(
                     'Отказ недоступен',
-                    style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                    style: TextStyle(
+                      color: theme.colorScheme.onSurfaceVariant,
+                      fontSize: 12,
+                    ),
                   ),
               ],
             ),
@@ -340,15 +513,20 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   Widget _infoChip(String label, String value) {
+    final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
       decoration: BoxDecoration(
-        color: Colors.blueGrey.withValues(alpha: 0.08),
+        color: theme.colorScheme.secondaryContainer.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(10),
       ),
       child: Text(
         '$label: $value',
-        style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+        style: TextStyle(
+          fontSize: 12.5,
+          fontWeight: FontWeight.w600,
+          color: theme.colorScheme.onSecondaryContainer,
+        ),
       ),
     );
   }
@@ -359,14 +537,23 @@ class _CartScreenState extends State<CartScreen> {
       appBar: AppBar(title: const Text('Корзина')),
       body: SafeArea(
         child: RefreshIndicator(
-          onRefresh: _load,
+          onRefresh: () => _load(showLoader: false),
           child: _loading
-              ? const Center(child: CircularProgressIndicator())
+              ? const PhoenixLoadingView(
+                  title: 'Загружаем корзину',
+                  subtitle: 'Собираем ваши товары и статусы',
+                  size: 52,
+                )
               : _error.isNotEmpty
               ? ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
-                    Text(_error, style: const TextStyle(color: Colors.red)),
+                    Text(
+                      _error,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
                     const SizedBox(height: 12),
                     FilledButton(
                       onPressed: _load,
@@ -380,13 +567,38 @@ class _CartScreenState extends State<CartScreen> {
                     _buildSummary(),
                     const SizedBox(height: 14),
                     if (_items.isEmpty)
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade100,
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: const Text('Корзина пока пустая'),
+                      Builder(
+                        builder: (context) {
+                          final theme = Theme.of(context);
+                          return Container(
+                            padding: const EdgeInsets.all(18),
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.surfaceContainerLow,
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(
+                                color: theme.colorScheme.outlineVariant,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.shopping_basket_outlined,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    'Корзина пока пустая',
+                                    style: theme.textTheme.bodyLarge?.copyWith(
+                                      color: theme.colorScheme.onSurface,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
                       )
                     else
                       ..._items.map(_buildItemCard),

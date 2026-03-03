@@ -1,5 +1,8 @@
 // server/src/routes/chats.js
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
 
 const router = express.Router();
@@ -7,6 +10,87 @@ const db = require("../db");
 const { authMiddleware: requireAuth } = require("../utils/auth");
 const { requireRole } = require("../utils/roles");
 const { requireChatPermission } = require("../utils/permissions");
+
+const chatImageUploadsDir = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "uploads",
+  "chat_media",
+  "images",
+);
+const chatVoiceUploadsDir = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "uploads",
+  "chat_media",
+  "voice",
+);
+fs.mkdirSync(chatImageUploadsDir, { recursive: true });
+fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
+
+const chatMediaUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, file, cb) => {
+      if (file.fieldname === "image") {
+        cb(null, chatImageUploadsDir);
+        return;
+      }
+      if (file.fieldname === "voice") {
+        cb(null, chatVoiceUploadsDir);
+        return;
+      }
+      cb(new Error("Некорректный тип вложения"));
+    },
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || "").toLowerCase();
+      const fallbackExt = file.fieldname === "voice" ? ".m4a" : ".jpg";
+      const safeExt = ext && ext.length <= 10 ? ext : fallbackExt;
+      cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
+    },
+  }),
+  limits: { fileSize: 16 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || "").toLowerCase().trim();
+    if (file.fieldname === "image") {
+      if (mime.startsWith("image/")) {
+        cb(null, true);
+        return;
+      }
+      cb(new Error("Можно загружать только изображения"));
+      return;
+    }
+    if (file.fieldname === "voice") {
+      if (mime.startsWith("audio/") || mime === "application/octet-stream") {
+        cb(null, true);
+        return;
+      }
+      cb(new Error("Можно загружать только аудиофайлы"));
+      return;
+    }
+    cb(new Error("Некорректный тип вложения"));
+  },
+});
+
+function uploadChatMedia(req, res, next) {
+  chatMediaUpload.fields([
+    { name: "image", maxCount: 1 },
+    { name: "voice", maxCount: 1 },
+  ])(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        ok: false,
+        error: "Размер вложения не должен превышать 16MB",
+      });
+    }
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Некорректный файл",
+    });
+  });
+}
 
 function normalizeSettings(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
@@ -201,6 +285,55 @@ function isSystemMessage(meta) {
   return kind.length > 0;
 }
 
+function toChatMediaUrl(req, file) {
+  if (!file || !file.filename) return null;
+  if (file.fieldname === "image") {
+    return `${req.protocol}://${req.get("host")}/uploads/chat_media/images/${file.filename}`;
+  }
+  if (file.fieldname === "voice") {
+    return `${req.protocol}://${req.get("host")}/uploads/chat_media/voice/${file.filename}`;
+  }
+  return null;
+}
+
+function removeUploadedFile(file) {
+  if (!file || !file.path) return;
+  fs.unlink(file.path, () => {});
+}
+
+function removeUploadedFiles(files) {
+  for (const file of files) {
+    removeUploadedFile(file);
+  }
+}
+
+function removeChatMediaByUrl(raw) {
+  const url = String(raw || "").trim();
+  if (!url) return;
+
+  const mappings = [
+    {
+      marker: "/uploads/chat_media/images/",
+      baseDir: chatImageUploadsDir,
+    },
+    {
+      marker: "/uploads/chat_media/voice/",
+      baseDir: chatVoiceUploadsDir,
+    },
+  ];
+
+  for (const { marker, baseDir } of mappings) {
+    const idx = url.indexOf(marker);
+    if (idx === -1) continue;
+    const filename = url.slice(idx + marker.length).split(/[?#]/)[0].trim();
+    if (!filename) return;
+    const fullPath = path.join(baseDir, filename);
+    if (!fullPath.startsWith(baseDir)) return;
+    fs.unlink(fullPath, () => {});
+    return;
+  }
+}
+
 async function getHydratedMessageById(messageId, currentUserId) {
   const result = await db.query(
     `SELECT m.id,
@@ -210,7 +343,25 @@ async function getHydratedMessageById(messageId, currentUserId) {
             m.text,
             m.meta,
             m.created_at,
-            (m.sender_id::text = $2::text) AS from_me,
+            COALESCE((m.sender_id::text = $2::text), false) AS from_me,
+            EXISTS(
+              SELECT 1
+              FROM message_reads mr
+              WHERE mr.message_id = m.id
+                AND mr.user_id = $2::uuid
+            ) AS is_read_by_me,
+            EXISTS(
+              SELECT 1
+              FROM message_reads mr
+              WHERE mr.message_id = m.id
+                AND mr.user_id <> m.sender_id
+            ) AS read_by_others,
+            (
+              SELECT COUNT(*)
+              FROM message_reads mr
+              WHERE mr.message_id = m.id
+                AND mr.user_id <> m.sender_id
+            )::int AS read_count,
             COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
             u.email AS sender_email,
             u.avatar_url AS sender_avatar_url,
@@ -221,9 +372,64 @@ async function getHydratedMessageById(messageId, currentUserId) {
      LEFT JOIN users u ON u.id = m.sender_id
      WHERE m.id = $1
      LIMIT 1`,
-    [messageId, String(currentUserId || "")],
+    [messageId, currentUserId ? String(currentUserId) : null],
   );
   return result.rows[0] || null;
+}
+
+async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
+  const responseMessage = await getHydratedMessageById(messageId, currentUserId);
+  if (!responseMessage) {
+    throw new Error("Не удалось загрузить сообщение");
+  }
+  const broadcastMessage = await getHydratedMessageById(messageId, null);
+  if (!broadcastMessage) {
+    throw new Error("Не удалось подготовить событие сообщения");
+  }
+
+  await db.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
+
+  const io = req.app.get("io");
+  if (io) {
+    io.to(`chat:${chatId}`).emit("chat:message", {
+      chatId,
+      message: broadcastMessage,
+    });
+    io.emit("chat:updated", { chatId });
+  }
+
+  return responseMessage;
+}
+
+async function markChatMessagesRead(chatId, userId) {
+  const result = await db.query(
+    `WITH unread AS (
+       SELECT m.id, m.sender_id
+       FROM messages m
+       WHERE m.chat_id = $1
+         AND m.sender_id IS NOT NULL
+         AND m.sender_id <> $2
+         AND NOT EXISTS (
+           SELECT 1
+           FROM message_reads mr
+           WHERE mr.message_id = m.id
+             AND mr.user_id = $2
+         )
+     ),
+     inserted AS (
+       INSERT INTO message_reads (message_id, user_id, chat_id, read_at)
+       SELECT unread.id, $2, $1, now()
+       FROM unread
+       ON CONFLICT (message_id, user_id) DO NOTHING
+       RETURNING message_id
+     )
+     SELECT unread.id::text AS message_id,
+            unread.sender_id::text AS sender_id
+     FROM inserted i
+     JOIN unread ON unread.id = i.message_id`,
+    [chatId, userId],
+  );
+  return result.rows;
 }
 
 router.get("/", requireAuth, async (req, res) => {
@@ -242,6 +448,7 @@ router.get("/", requireAuth, async (req, res) => {
               c.settings,
               last_msg.text AS last_message,
               last_msg.created_at AS updated_at,
+              COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
               last_msg.sender_id AS last_message_sender_id,
               COALESCE(NULLIF(BTRIM(last_user.name), ''), NULLIF(BTRIM(last_user.email), ''), 'Система') AS last_message_sender_name,
               last_user.avatar_url AS last_message_sender_avatar_url,
@@ -257,6 +464,20 @@ router.get("/", requireAuth, async (req, res) => {
          ORDER BY m.created_at DESC
          LIMIT 1
        ) AS last_msg ON true
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) AS unread_count
+         FROM messages um
+         WHERE um.chat_id = c.id
+           AND um.sender_id IS NOT NULL
+           AND um.sender_id <> $1
+           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
+           AND NOT EXISTS (
+             SELECT 1
+             FROM message_reads mr
+             WHERE mr.message_id = um.id
+               AND mr.user_id = $1
+           )
+       ) AS unread_stats ON true
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE (
          (
@@ -318,6 +539,7 @@ router.get("/", requireAuth, async (req, res) => {
               c.settings,
               last_msg.text AS last_message,
               last_msg.created_at AS updated_at,
+              COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
               last_msg.sender_id AS last_message_sender_id,
               COALESCE(NULLIF(BTRIM(last_user.name), ''), NULLIF(BTRIM(last_user.email), ''), 'Система') AS last_message_sender_name,
               last_user.avatar_url AS last_message_sender_avatar_url,
@@ -334,6 +556,20 @@ router.get("/", requireAuth, async (req, res) => {
          ORDER BY m.created_at DESC
          LIMIT 1
        ) AS last_msg ON true
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) AS unread_count
+         FROM messages um
+         WHERE um.chat_id = c.id
+           AND um.sender_id IS NOT NULL
+           AND um.sender_id <> $1
+           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+           AND NOT EXISTS (
+             SELECT 1
+             FROM message_reads mr
+             WHERE mr.message_id = um.id
+               AND mr.user_id = $1
+           )
+       ) AS unread_stats ON true
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE c.type <> 'channel' AND cm.user_id = $1
        ORDER BY updated_at DESC NULLS LAST
@@ -432,10 +668,29 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
     const { rows } = await db.query(
       `SELECT m.id,
               m.sender_id,
+              m.client_msg_id,
               m.text,
               m.meta,
               m.created_at,
               (m.sender_id::text = $2::text) AS from_me,
+              EXISTS(
+                SELECT 1
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id = $2::uuid
+              ) AS is_read_by_me,
+              EXISTS(
+                SELECT 1
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              ) AS read_by_others,
+              (
+                SELECT COUNT(*)
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              )::int AS read_count,
               COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
               u.email AS sender_email,
               u.avatar_url AS sender_avatar_url,
@@ -453,6 +708,58 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
     return res.json({ ok: true, data: rows });
   } catch (err) {
     console.error("chats.messages error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.post("/:chatId/read", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId);
+    if (!context)
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const readRows = await markChatMessagesRead(chatId, userId);
+    const messageIds = readRows
+      .map((row) => row.message_id)
+      .filter(Boolean);
+
+    const io = req.app.get("io");
+    if (io && messageIds.length > 0) {
+      const bySender = new Map();
+      for (const row of readRows) {
+        const senderId = String(row.sender_id || "").trim();
+        const messageId = String(row.message_id || "").trim();
+        if (!senderId || !messageId) continue;
+        if (!bySender.has(senderId)) {
+          bySender.set(senderId, []);
+        }
+        bySender.get(senderId).push(messageId);
+      }
+      for (const [senderId, senderMessageIds] of bySender.entries()) {
+        io.to(`user:${senderId}`).emit("chat:message:read", {
+          chatId,
+          readerId: String(userId),
+          messageIds: senderMessageIds,
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        chat_id: chatId,
+        message_ids: messageIds,
+      },
+    });
+  } catch (err) {
+    console.error("chats.markRead error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
@@ -488,7 +795,7 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
       insert = await db.query(
         `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, created_at)
          VALUES ($1, $2, $3, $4, $5, now())
-         ON CONFLICT (client_msg_id) DO NOTHING
+         ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
          RETURNING id`,
         [uuidv4(), client_msg_id, chatId, userId, text],
       );
@@ -513,25 +820,143 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     if (!messageId) {
       return res.status(500).json({ ok: false, error: "Не удалось создать сообщение" });
     }
-    const message = await getHydratedMessageById(messageId, userId);
-    if (!message) {
-      return res.status(500).json({ ok: false, error: "Не удалось загрузить сообщение" });
-    }
-    await db.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+    const responseMessage = await finalizeCreatedMessage(
+      req,
       chatId,
-    ]);
-
-    const io = req.app.get("io");
-    if (io) {
-      io.to(`chat:${chatId}`).emit("chat:message", { chatId, message });
-    }
-
-    return res.status(201).json({ ok: true, data: message });
+      messageId,
+      userId,
+    );
+    return res.status(201).json({ ok: true, data: responseMessage });
   } catch (err) {
     console.error("chats.postMessage error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
+
+router.post(
+  "/:chatId/messages/media",
+  requireAuth,
+  uploadChatMedia,
+  async (req, res) => {
+    const uploadedFiles = [
+      ...((req.files?.image || []).map((file) => file)),
+      ...((req.files?.voice || []).map((file) => file)),
+    ];
+    try {
+      const userId = req.user.id;
+      const role = req.user.role;
+      const { chatId } = req.params;
+      const caption = String(req.body?.text || "").trim();
+      const clientMsgId = String(req.body?.client_msg_id || "").trim();
+      const durationMsRaw = Math.floor(Number(req.body?.duration_ms || 0));
+      const imageFile = req.files?.image?.[0] || null;
+      const voiceFile = req.files?.voice?.[0] || null;
+
+      if ((imageFile && voiceFile) || (!imageFile && !voiceFile)) {
+        removeUploadedFiles(uploadedFiles);
+        return res.status(400).json({
+          ok: false,
+          error: "Нужно передать либо изображение, либо голосовое сообщение",
+        });
+      }
+
+      const attachmentType = imageFile ? "image" : "voice";
+      const uploadedFile = imageFile || voiceFile;
+      const mediaUrl = toChatMediaUrl(req, uploadedFile);
+      if (!mediaUrl) {
+        removeUploadedFiles(uploadedFiles);
+        return res.status(400).json({
+          ok: false,
+          error: "Не удалось обработать вложение",
+        });
+      }
+
+      const context = await getChatAccessContext(chatId, userId);
+      if (!context) {
+        removeUploadedFiles(uploadedFiles);
+        return res.status(404).json({ ok: false, error: "Chat not found" });
+      }
+      if (!canPostChat(context, role)) {
+        removeUploadedFiles(uploadedFiles);
+        return res.status(403).json({
+          ok: false,
+          error: "Нет прав на отправку сообщения в этот чат",
+        });
+      }
+
+      const durationMs = Number.isFinite(durationMsRaw) && durationMsRaw > 0
+        ? durationMsRaw
+        : 0;
+      const text = attachmentType === "image"
+        ? (caption.isNotEmpty ? caption : "Фото")
+        : "Голосовое сообщение";
+      const meta = {
+        attachment_type: attachmentType,
+        ...(caption.isNotEmpty ? { caption } : {}),
+        ...(attachmentType === "image"
+          ? {
+              image_url: mediaUrl,
+            }
+          : {
+              voice_url: mediaUrl,
+              voice_duration_ms: durationMs,
+              voice_mime_type: String(uploadedFile.mimetype || "").trim(),
+              voice_file_name: String(
+                uploadedFile.originalname || uploadedFile.filename || "",
+              ).trim(),
+            }),
+      };
+
+      let insert;
+      if (clientMsgId) {
+        insert = await db.query(
+          `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())
+           ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [uuidv4(), clientMsgId, chatId, userId, text, JSON.stringify(meta)],
+        );
+        if (insert.rowCount === 0) {
+          removeUploadedFiles(uploadedFiles);
+          insert = await db.query(
+            `SELECT id
+             FROM messages
+             WHERE client_msg_id = $1`,
+            [clientMsgId],
+          );
+        }
+      } else {
+        insert = await db.query(
+          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, $3, $4, $5::jsonb, now())
+           RETURNING id`,
+          [uuidv4(), chatId, userId, text, JSON.stringify(meta)],
+        );
+      }
+
+      const messageId = insert.rows[0]?.id;
+      if (!messageId) {
+        removeUploadedFiles(uploadedFiles);
+        return res.status(500).json({
+          ok: false,
+          error: "Не удалось создать сообщение",
+        });
+      }
+
+      const responseMessage = await finalizeCreatedMessage(
+        req,
+        chatId,
+        messageId,
+        userId,
+      );
+      return res.status(201).json({ ok: true, data: responseMessage });
+    } catch (err) {
+      removeUploadedFiles(uploadedFiles);
+      console.error("chats.postMediaMessage error", err);
+      return res.status(500).json({ ok: false, error: "Server error" });
+    }
+  },
+);
 
 /**
  * PATCH /api/chats/:chatId/messages/:messageId
@@ -602,6 +1027,7 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:message", { chatId, message: updated });
+      io.emit("chat:updated", { chatId });
     }
 
     return res.json({ ok: true, data: updated });
@@ -720,12 +1146,16 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       return res.status(404).json({ ok: false, error: "Сообщение не найдено" });
     }
 
+    removeChatMediaByUrl(meta?.image_url);
+    removeChatMediaByUrl(meta?.voice_url);
+
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:message:deleted", {
         chatId,
         messageId,
       });
+      io.emit("chat:updated", { chatId });
     }
 
     return res.json({

@@ -9,6 +9,8 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
+import '../widgets/phoenix_loader.dart';
 
 class WorkerPanel extends StatefulWidget {
   const WorkerPanel({super.key});
@@ -110,6 +112,78 @@ class _WorkerPanelState extends State<WorkerPanel>
     _pickedImage = null;
     _existingImageUrl = null;
     _removeImageOnSubmit = false;
+  }
+
+  Color _messageColor(ThemeData theme) {
+    final normalized = _message.toLowerCase();
+    final isError =
+        normalized.contains('ошибка') ||
+        normalized.contains('не удалось') ||
+        normalized.contains('добавьте') ||
+        normalized.contains('введите') ||
+        normalized.contains('выберите');
+    return isError ? theme.colorScheme.error : theme.colorScheme.primary;
+  }
+
+  int _countLetterRunes(String text) {
+    var count = 0;
+    for (final rune in text.runes) {
+      final isLatin =
+          (rune >= 0x0041 && rune <= 0x005A) ||
+          (rune >= 0x0061 && rune <= 0x007A) ||
+          (rune >= 0x00C0 && rune <= 0x024F);
+      final isCyrillic =
+          (rune >= 0x0400 && rune <= 0x04FF) ||
+          (rune >= 0x0500 && rune <= 0x052F);
+      final isArmenian = rune >= 0x0530 && rune <= 0x058F;
+      final isGreek = rune >= 0x0370 && rune <= 0x03FF;
+      final isGeorgian =
+          (rune >= 0x10A0 && rune <= 0x10FF) ||
+          (rune >= 0x1C90 && rune <= 0x1CBF);
+      final isHebrew = rune >= 0x0590 && rune <= 0x05FF;
+      final isArabic =
+          (rune >= 0x0600 && rune <= 0x06FF) ||
+          (rune >= 0x0750 && rune <= 0x077F) ||
+          (rune >= 0x08A0 && rune <= 0x08FF);
+      if (isLatin ||
+          isCyrillic ||
+          isArmenian ||
+          isGreek ||
+          isGeorgian ||
+          isHebrew ||
+          isArabic) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  String? _validateProductFields({
+    required String title,
+    required String description,
+    required double? price,
+    required int quantity,
+    required bool hasImage,
+  }) {
+    if (title.isEmpty) {
+      return 'Введите название товара';
+    }
+    if (!hasImage) {
+      return 'Добавьте фото товара';
+    }
+    if (description.isEmpty) {
+      return 'Введите описание товара';
+    }
+    if (_countLetterRunes(description) < 2) {
+      return 'Описание должно содержать минимум 2 буквы, а не только цифры';
+    }
+    if (price == null || price <= 0) {
+      return 'Цена должна быть больше нуля';
+    }
+    if (quantity <= 0) {
+      return 'Количество должно быть больше нуля';
+    }
+    return null;
   }
 
   Future<void> _openImagePickerSheet() async {
@@ -233,6 +307,13 @@ class _WorkerPanelState extends State<WorkerPanel>
         _removeImageOnSubmit = false;
         _message = '';
       });
+      showAppNotice(
+        context,
+        'Фото добавлено',
+        tone: AppNoticeTone.success,
+        duration: const Duration(milliseconds: 900),
+      );
+      await playAppSound(AppUiSound.tap);
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = 'Не удалось выбрать фото: $e');
@@ -356,20 +437,17 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _message = 'Введите название товара');
       return;
     }
-    if (!hasImage) {
-      setState(() => _message = 'Добавьте фото товара');
-      return;
-    }
-
     final price = double.tryParse(priceText);
-    if (price == null || price < 0) {
-      setState(() => _message = 'Введите корректную цену');
-      return;
-    }
-
     final quantity = int.tryParse(qtyText) ?? 1;
-    if (quantity <= 0) {
-      setState(() => _message = 'Количество должно быть больше нуля');
+    final validationError = _validateProductFields(
+      title: title,
+      description: description,
+      price: price,
+      quantity: quantity,
+      hasImage: hasImage,
+    );
+    if (validationError != null) {
+      setState(() => _message = validationError);
       return;
     }
 
@@ -382,7 +460,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       final payload = await _buildCreateProductPayload(
         title: title,
         description: description,
-        price: price,
+        price: price!,
         quantity: quantity,
       );
 
@@ -415,6 +493,17 @@ class _WorkerPanelState extends State<WorkerPanel>
           }
         });
         _resetProductForm();
+        if (mounted) {
+          showAppNotice(
+            context,
+            productCode != null && productCode.isNotEmpty
+                ? 'Товар отправлен в очередь. ID: $productCode'
+                : 'Товар отправлен в очередь',
+            tone: AppNoticeTone.success,
+            duration: const Duration(milliseconds: 1400),
+          );
+        }
+        await playAppSound(AppUiSound.success);
       } else {
         setState(() => _message = 'Не удалось отправить товар в очередь');
       }
@@ -514,8 +603,15 @@ class _WorkerPanelState extends State<WorkerPanel>
         ((_existingImageUrl?.trim().isNotEmpty ?? false) &&
             !_removeImageOnSubmit) ||
         (existingImage.isNotEmpty && !_removeImageOnSubmit);
-    if (!hasImage) {
-      setState(() => _message = 'Добавьте фото товара');
+    final validationError = _validateProductFields(
+      title: title,
+      description: description,
+      price: price,
+      quantity: quantity,
+      hasImage: hasImage,
+    );
+    if (validationError != null) {
+      setState(() => _message = validationError);
       return;
     }
 
@@ -553,6 +649,16 @@ class _WorkerPanelState extends State<WorkerPanel>
               : 'Старый товар отправлен в очередь повторно';
           _removeImageOnSubmit = false;
         });
+        if (mounted) {
+          showAppNotice(
+            context,
+            productCode != null && productCode.isNotEmpty
+                ? 'Товар снова в очереди. ID: $productCode'
+                : 'Товар снова отправлен в очередь',
+            tone: AppNoticeTone.success,
+          );
+        }
+        await playAppSound(AppUiSound.success);
       } else {
         setState(() => _message = 'Не удалось отправить товар в очередь');
       }
@@ -564,6 +670,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Widget _buildPhotoPicker() {
+    final theme = Theme.of(context);
     final localPath = _pickedImage?.path;
     final remoteUrl = _resolveImageUrl(_existingImageUrl);
     final hasImage = localPath != null || remoteUrl != null;
@@ -592,9 +699,12 @@ class _WorkerPanelState extends State<WorkerPanel>
                           remoteUrl!,
                           fit: BoxFit.cover,
                           errorBuilder: (_, error, stackTrace) => Container(
-                            color: Colors.grey[200],
+                            color: theme.colorScheme.surfaceContainerHighest,
                             alignment: Alignment.center,
-                            child: const Icon(Icons.broken_image_outlined),
+                            child: Icon(
+                              Icons.broken_image_outlined,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
                           ),
                         ),
                 ),
@@ -611,17 +721,26 @@ class _WorkerPanelState extends State<WorkerPanel>
                 child: Container(
                   width: double.infinity,
                   decoration: BoxDecoration(
-                    color: Colors.grey[100],
+                    color: theme.colorScheme.surfaceContainerLow,
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.grey.shade300),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
                   ),
                   alignment: Alignment.center,
-                  child: const Column(
+                  child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.photo_outlined, size: 28),
-                      SizedBox(height: 6),
-                      Text('Фото не выбрано'),
+                      Icon(
+                        Icons.photo_outlined,
+                        size: 28,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Фото не выбрано',
+                        style: TextStyle(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -659,7 +778,11 @@ class _WorkerPanelState extends State<WorkerPanel>
         if (_loadingChannels)
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 24),
-            child: Center(child: CircularProgressIndicator()),
+            child: PhoenixLoadingView(
+              title: 'Загружаем каналы',
+              subtitle: 'Получаем доступные каналы для публикации',
+              size: 50,
+            ),
           )
         else if (_channels.isEmpty)
           const Padding(
@@ -688,9 +811,12 @@ class _WorkerPanelState extends State<WorkerPanel>
         const SizedBox(height: 16),
         TextField(
           controller: _titleCtrl,
-          decoration: const InputDecoration(
-            labelText: 'Название товара',
-            border: OutlineInputBorder(),
+          decoration: withInputLanguageBadge(
+            const InputDecoration(
+              labelText: 'Название товара',
+              border: OutlineInputBorder(),
+            ),
+            controller: _titleCtrl,
           ),
         ),
         const SizedBox(height: 12),
@@ -698,9 +824,12 @@ class _WorkerPanelState extends State<WorkerPanel>
           controller: _descriptionCtrl,
           minLines: 3,
           maxLines: 5,
-          decoration: const InputDecoration(
-            labelText: 'Описание',
-            border: OutlineInputBorder(),
+          decoration: withInputLanguageBadge(
+            const InputDecoration(
+              labelText: 'Описание',
+              border: OutlineInputBorder(),
+            ),
+            controller: _descriptionCtrl,
           ),
         ),
         const SizedBox(height: 12),
@@ -712,9 +841,12 @@ class _WorkerPanelState extends State<WorkerPanel>
                 keyboardType: const TextInputType.numberWithOptions(
                   decimal: true,
                 ),
-                decoration: const InputDecoration(
-                  labelText: 'Цена',
-                  border: OutlineInputBorder(),
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Цена',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: _priceCtrl,
                 ),
               ),
             ),
@@ -724,9 +856,12 @@ class _WorkerPanelState extends State<WorkerPanel>
               child: TextField(
                 controller: _quantityCtrl,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  labelText: 'Кол-во',
-                  border: OutlineInputBorder(),
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Кол-во',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: _quantityCtrl,
                 ),
               ),
             ),
@@ -765,9 +900,12 @@ class _WorkerPanelState extends State<WorkerPanel>
             Expanded(
               child: TextField(
                 controller: _searchCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Поиск старого товара по описанию',
-                  border: OutlineInputBorder(),
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Поиск старого товара по описанию',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: _searchCtrl,
                 ),
                 onSubmitted: (_) => _searchOldProducts(),
               ),
@@ -780,7 +918,15 @@ class _WorkerPanelState extends State<WorkerPanel>
           ],
         ),
         const SizedBox(height: 12),
-        if (_searching) const Center(child: CircularProgressIndicator()),
+        if (_searching)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: PhoenixLoadingView(
+              title: 'Ищем товары',
+              subtitle: 'Подбираем похожие позиции по описанию',
+              size: 46,
+            ),
+          ),
         if (!_searching && _searchResults.isEmpty)
           const Text('Результаты появятся здесь'),
         ..._searchResults.map((p) {
@@ -799,10 +945,15 @@ class _WorkerPanelState extends State<WorkerPanel>
                         errorBuilder: (_, error, stackTrace) => Container(
                           width: 52,
                           height: 52,
-                          color: Colors.grey[200],
-                          child: const Icon(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.surfaceContainerHighest,
+                          child: Icon(
                             Icons.image_not_supported_outlined,
                             size: 18,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
                           ),
                         ),
                       ),
@@ -845,7 +996,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Панель worker'),
+        title: const Text('Панель работника'),
         bottom: TabBar(
           controller: _tabController,
           tabs: const [
@@ -862,7 +1013,10 @@ class _WorkerPanelState extends State<WorkerPanel>
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
                 child: Text(
                   _message,
-                  style: const TextStyle(color: Colors.red),
+                  style: TextStyle(
+                    color: _messageColor(Theme.of(context)),
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
             Expanded(

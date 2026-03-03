@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import '../widgets/app_avatar.dart';
+import '../widgets/phoenix_loader.dart';
 import 'chat_screen.dart';
 
 class ChatsScreen extends StatefulWidget {
@@ -18,8 +19,25 @@ class _ChatsScreenState extends State<ChatsScreen> {
   bool _loading = true;
   String _error = '';
   StreamSubscription? _chatEventsSub;
+  Timer? _refreshDebounceTimer;
+  bool _refreshInFlight = false;
+  bool _refreshQueued = false;
+  bool _loadedOnce = false;
 
   String _chatIdOf(Map<String, dynamic> chat) => (chat['id'] ?? '').toString();
+
+  int _compareChats(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final ad = _parseDate(a['updated_at'] ?? a['time']);
+    final bd = _parseDate(b['updated_at'] ?? b['time']);
+    if (ad == null && bd == null) return 0;
+    if (ad == null) return 1;
+    if (bd == null) return -1;
+    return bd.compareTo(ad);
+  }
+
+  void _sortChats() {
+    _chats.sort(_compareChats);
+  }
 
   void _upsertChatLocally(Map<String, dynamic> chat) {
     final chatId = _chatIdOf(chat);
@@ -32,6 +50,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       } else {
         _chats.insert(0, normalized);
       }
+      _sortChats();
     });
   }
 
@@ -39,6 +58,63 @@ class _ChatsScreenState extends State<ChatsScreen> {
     if (chatId.isEmpty) return;
     setState(() {
       _chats = _chats.where((c) => _chatIdOf(c) != chatId).toList();
+    });
+  }
+
+  void _applyIncomingMessagePreview(String chatId, Map<String, dynamic> message) {
+    if (chatId.isEmpty) return;
+    final text = (message['text'] ?? '').toString();
+    final senderId = (message['sender_id'] ?? '').toString();
+    final senderName = (message['sender_name'] ?? '').toString();
+    final createdAt =
+        (message['created_at'] ?? DateTime.now().toIso8601String()).toString();
+    final currentUserId = authService.currentUser?.id.trim() ?? '';
+    final fromCurrentUser =
+        senderId.isNotEmpty &&
+        currentUserId.isNotEmpty &&
+        senderId == currentUserId;
+    final isActiveChat = activeChatIdNotifier.value == chatId;
+    final patch = <String, dynamic>{
+      'id': chatId,
+      'last_message': text,
+      'updated_at': createdAt,
+      'last_message_sender_id': senderId,
+      'last_message_sender_name': senderName,
+      'last_message_sender_avatar_url': message['sender_avatar_url'],
+      'last_message_sender_avatar_focus_x': message['sender_avatar_focus_x'],
+      'last_message_sender_avatar_focus_y': message['sender_avatar_focus_y'],
+      'last_message_sender_avatar_zoom': message['sender_avatar_zoom'],
+    };
+    setState(() {
+      final index = _chats.indexWhere((c) => _chatIdOf(c) == chatId);
+      final previousUnread = index >= 0
+          ? int.tryParse('${_chats[index]['unread_count'] ?? 0}') ?? 0
+          : 0;
+      patch['unread_count'] = (!fromCurrentUser && !isActiveChat)
+          ? previousUnread + 1
+          : 0;
+      if (index >= 0) {
+        _chats[index] = {..._chats[index], ...patch};
+      } else {
+        _chats.insert(0, patch);
+      }
+      _sortChats();
+    });
+  }
+
+  void _markChatReadLocally(String chatId) {
+    if (chatId.isEmpty) return;
+    setState(() {
+      final index = _chats.indexWhere((c) => _chatIdOf(c) == chatId);
+      if (index < 0) return;
+      _chats[index] = {..._chats[index], 'unread_count': 0};
+    });
+  }
+
+  void _scheduleChatsRefresh({Duration delay = const Duration(seconds: 1)}) {
+    _refreshDebounceTimer?.cancel();
+    _refreshDebounceTimer = Timer(delay, () {
+      unawaited(_loadChats());
     });
   }
 
@@ -113,17 +189,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final senderName = (chat['last_message_sender_name'] ?? '')
         .toString()
         .trim();
+    if (senderId.isEmpty || senderName == 'Система') {
+      return text;
+    }
     final currentUserId = authService.currentUser?.id ?? '';
     final prefix = senderId.isNotEmpty && senderId == currentUserId
         ? 'Вы'
-        : (senderName.isNotEmpty ? senderName : 'Система');
+        : senderName;
     return '$prefix: $text';
   }
 
   @override
   void initState() {
     super.initState();
-    _loadChats();
+    _loadChats(showLoader: true);
     _chatEventsSub = chatEventsController.stream.listen((event) {
       final type = event['type'] as String? ?? '';
       final data = event['data'];
@@ -131,18 +210,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
       if (type == 'chat:created') {
         if (data is Map && data['chat'] is Map) {
           _upsertChatLocally(Map<String, dynamic>.from(data['chat']));
-        } else {
-          _loadChats();
         }
+        _scheduleChatsRefresh();
         return;
       }
 
       if (type == 'chat:updated') {
         if (data is Map && data['chat'] is Map) {
           _upsertChatLocally(Map<String, dynamic>.from(data['chat']));
-        } else {
-          _loadChats();
         }
+        _scheduleChatsRefresh();
         return;
       }
 
@@ -154,9 +231,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
       }
 
       if (type == 'chat:message' ||
-          type == 'chat:message:global' ||
-          type == 'chat:message:deleted') {
-        _loadChats();
+          type == 'chat:message:global') {
+        if (data is Map) {
+          final msg = data['message'];
+          final chatId = (data['chatId'] ?? msg?['chat_id'] ?? msg?['chatId'])
+              ?.toString();
+          if (chatId != null && msg is Map) {
+            _applyIncomingMessagePreview(chatId, Map<String, dynamic>.from(msg));
+          }
+        }
+        _scheduleChatsRefresh();
+      }
+
+      if (type == 'chat:message:deleted') {
+        _scheduleChatsRefresh();
       }
     });
   }
@@ -164,27 +252,61 @@ class _ChatsScreenState extends State<ChatsScreen> {
   @override
   void dispose() {
     _chatEventsSub?.cancel();
+    _refreshDebounceTimer?.cancel();
     super.dispose();
   }
 
-  Future<void> _loadChats() async {
-    setState(() {
-      _loading = true;
-      _error = '';
-    });
+  Future<void> _loadChats({bool showLoader = false}) async {
+    if (_refreshInFlight) {
+      _refreshQueued = true;
+      return;
+    }
+
+    _refreshInFlight = true;
+    final shouldShowLoader = showLoader && !_loadedOnce && _chats.isEmpty;
+
+    if (shouldShowLoader && mounted) {
+      setState(() {
+        _loading = true;
+        _error = '';
+      });
+    } else if (mounted && _error.isNotEmpty) {
+      setState(() => _error = '');
+    }
 
     try {
       final resp = await authService.dio.get('/api/chats');
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
-        setState(() => _chats = List<Map<String, dynamic>>.from(data['data']));
+        final nextChats = List<Map<String, dynamic>>.from(data['data'])
+          ..sort(_compareChats);
+        if (!mounted) return;
+        setState(() {
+          _chats = nextChats;
+          _loadedOnce = true;
+        });
       } else {
-        setState(() => _error = 'Неверный ответ сервера');
+        if (!mounted) return;
+        if (_chats.isEmpty) {
+          setState(() => _error = 'Неверный ответ сервера');
+        }
       }
     } catch (e) {
-      setState(() => _error = 'Ошибка загрузки чатов: $e');
+      if (!mounted) return;
+      if (_chats.isEmpty) {
+        setState(() => _error = 'Ошибка загрузки чатов: $e');
+      }
     } finally {
-      if (mounted) setState(() => _loading = false);
+      _refreshInFlight = false;
+      if (mounted && shouldShowLoader) {
+        setState(() => _loading = false);
+      } else {
+        _loading = false;
+      }
+      if (_refreshQueued) {
+        _refreshQueued = false;
+        _scheduleChatsRefresh(delay: const Duration(milliseconds: 250));
+      }
     }
   }
 
@@ -200,6 +322,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final avatarFocusY = _toAvatarFocus(settings['avatar_focus_y']);
     final avatarZoom = _toAvatarZoom(settings['avatar_zoom']);
     final preview = _lastMessagePreview(chat);
+    final unreadCount = int.tryParse('${chat['unread_count'] ?? 0}') ?? 0;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
@@ -210,6 +333,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
           borderRadius: BorderRadius.circular(22),
           onTap: () {
             final chatId = chat['id']?.toString() ?? '';
+            _markChatReadLocally(chatId);
             final chatType = (chat['type'] ?? '').toString();
             final chatSettings = chat['settings'] is Map
                 ? Map<String, dynamic>.from(chat['settings'])
@@ -224,7 +348,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   chatSettings: chatSettings,
                 ),
               ),
-            );
+            ).then((_) {
+              _scheduleChatsRefresh(
+                delay: const Duration(milliseconds: 150),
+              );
+            });
           },
           child: Ink(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
@@ -266,6 +394,31 @@ class _ChatsScreenState extends State<ChatsScreen> {
                               time,
                               style: theme.textTheme.labelMedium?.copyWith(
                                 color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                          if (unreadCount > 0) ...[
+                            const SizedBox(width: 10),
+                            Container(
+                              constraints: const BoxConstraints(
+                                minWidth: 22,
+                                minHeight: 22,
+                              ),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: theme.colorScheme.primary,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(
+                                unreadCount > 99 ? '99+' : '$unreadCount',
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                  color: theme.colorScheme.onPrimary,
+                                  fontWeight: FontWeight.w800,
+                                ),
                               ),
                             ),
                           ],
@@ -313,7 +466,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
               ),
             ),
             child: _loading
-                ? const Center(child: CircularProgressIndicator())
+                ? const PhoenixLoadingView(
+                    title: 'Загружаем чаты',
+                    subtitle: 'Получаем каналы и личные переписки',
+                    size: 52,
+                  )
                 : _error.isNotEmpty
                 ? ListView(
                     children: [
@@ -321,7 +478,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                         padding: const EdgeInsets.all(16),
                         child: Text(
                           _error,
-                          style: const TextStyle(color: Colors.red),
+                          style: TextStyle(color: theme.colorScheme.error),
                         ),
                       ),
                       Padding(
