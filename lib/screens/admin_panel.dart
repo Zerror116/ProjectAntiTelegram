@@ -750,6 +750,17 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _loadDeliveryDashboard() async {
+    final effectiveRole = authService.effectiveRole.toLowerCase().trim();
+    if (effectiveRole != 'admin' && effectiveRole != 'creator') {
+      if (mounted) {
+        setState(() {
+          _deliveryLoading = false;
+          _deliveryActiveBatch = null;
+          _deliveryBatches = [];
+        });
+      }
+      return;
+    }
     if (mounted) {
       setState(() {
         _deliveryLoading = true;
@@ -788,6 +799,15 @@ class _AdminPanelState extends State<AdminPanel>
         }
       }
     } catch (e) {
+      if (e is DioException && e.response?.statusCode == 403) {
+        if (mounted) {
+          setState(() {
+            _deliveryActiveBatch = null;
+            _deliveryBatches = [];
+          });
+        }
+        return;
+      }
       if (mounted) {
         setState(() => _message = 'Ошибка доставки: ${_extractDioError(e)}');
       }

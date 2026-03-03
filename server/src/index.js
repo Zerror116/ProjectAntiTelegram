@@ -378,9 +378,36 @@ async function canUserAccessChat(user, chatId) {
           const payload = jwt.verify(token, JWT_SECRET);
           const userId = payload.id || payload.userId || payload.sub;
           if (!userId) return next(new Error("Unauthorized"));
-          socket.user = { ...payload, id: userId }; // { id, email, role, ... }
+          const baseRole = String(payload.role || "client")
+            .toLowerCase()
+            .trim();
+          const requestedViewRole = String(
+            socket.handshake.auth?.view_role || "",
+          )
+            .toLowerCase()
+            .trim();
+          const allowedViewRoles = new Set([
+            "client",
+            "worker",
+            "admin",
+            "creator",
+          ]);
+          const effectiveRole =
+            baseRole === "creator" &&
+            allowedViewRoles.has(requestedViewRole) &&
+            requestedViewRole
+              ? requestedViewRole
+              : baseRole;
+          socket.user = {
+            ...payload,
+            id: userId,
+            role: effectiveRole,
+            base_role: baseRole,
+            effective_role: effectiveRole,
+            view_role: effectiveRole !== baseRole ? effectiveRole : null,
+          };
           console.log(
-            `Socket ${socket.id} authenticated as user ${payload.id}`,
+            `Socket ${socket.id} authenticated as user ${payload.id} (role=${effectiveRole})`,
           );
         } catch (err) {
           console.warn(

@@ -395,6 +395,12 @@ Future<void> _initSocket() async {
 
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('auth_token');
+    final currentRole = authService.currentUser?.role.toLowerCase().trim() ?? '';
+    final viewRole = authService.viewRole?.trim();
+    final socketAuth = <String, dynamic>{'token': token ?? ''};
+    if (currentRole == 'creator' && viewRole != null && viewRole.isNotEmpty) {
+      socketAuth['view_role'] = viewRole;
+    }
 
     // Build options
     socket = IO.io(
@@ -402,8 +408,7 @@ Future<void> _initSocket() async {
       IO.OptionBuilder()
           .setTransports(['websocket'])
           .enableAutoConnect()
-          .setQuery({'token': token ?? ''})
-          .setAuth({'token': token ?? ''})
+          .setAuth(socketAuth)
           .build(),
     );
 
