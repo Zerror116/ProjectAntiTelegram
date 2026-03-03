@@ -22,7 +22,7 @@ dependencies:
   flutter_secure_storage: ^10.0.0
 
   # Socket.io клиент для realtime чатов
-  socket_io_client: ^2.0.0
+  socket_io_client: ^3.1.4
 
   # UI / утилиты
   cupertino_icons: ^1.0.8

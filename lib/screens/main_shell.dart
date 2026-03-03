@@ -20,14 +20,14 @@ class _ShellDestination {
     required this.id,
     required this.label,
     required this.icon,
-    required this.page,
+    required this.builder,
     this.priority = 0,
   });
 
   final String id;
   final String label;
   final IconData icon;
-  final Widget page;
+  final WidgetBuilder builder;
   final int priority;
 }
 
@@ -42,15 +42,30 @@ class _MainShellState extends State<MainShell> {
   int _index = 0;
   bool _loading = true;
   StreamSubscription<User?>? _authSub;
+  String _lastEffectiveRole = '';
+  final Set<String> _activatedDestinations = <String>{};
 
   @override
   void initState() {
     super.initState();
+    _lastEffectiveRole = authService.effectiveRole;
     _authSub = authService.authStream.listen((_) {
+      final nextRole = authService.effectiveRole;
       if (_loading) {
-        setState(() => _loading = false);
+        setState(() {
+          _loading = false;
+          _lastEffectiveRole = nextRole;
+          _index = 0;
+          _activatedDestinations.clear();
+        });
       } else {
-        setState(() {});
+        setState(() {
+          if (_lastEffectiveRole != nextRole) {
+            _lastEffectiveRole = nextRole;
+            _index = 0;
+            _activatedDestinations.clear();
+          }
+        });
       }
     });
 
@@ -104,14 +119,14 @@ class _MainShellState extends State<MainShell> {
         id: 'chats',
         label: 'Чаты',
         icon: Icons.chat_bubble_outline_rounded,
-        page: ChatsScreen(),
+        builder: _buildChatsScreen,
         priority: 100,
       ),
       const _ShellDestination(
         id: 'cart',
         label: 'Корзина',
         icon: Icons.shopping_bag_outlined,
-        page: CartScreen(),
+        builder: _buildCartScreen,
         priority: 95,
       ),
       if (showAdmin)
@@ -119,7 +134,7 @@ class _MainShellState extends State<MainShell> {
           id: 'admin',
           label: 'Админ',
           icon: Icons.admin_panel_settings_outlined,
-          page: AdminPanel(),
+          builder: _buildAdminScreen,
           priority: 85,
         ),
       if (showWorker)
@@ -127,21 +142,21 @@ class _MainShellState extends State<MainShell> {
           id: 'worker',
           label: 'Рабочий',
           icon: Icons.inventory_2_outlined,
-          page: WorkerPanel(),
+          builder: _buildWorkerScreen,
           priority: 70,
         ),
       const _ShellDestination(
         id: 'profile',
         label: 'Профиль',
         icon: Icons.person_outline_rounded,
-        page: ProfileScreen(),
+        builder: _buildProfileScreen,
         priority: 90,
       ),
       const _ShellDestination(
         id: 'settings',
         label: 'Настройки',
         icon: Icons.tune_rounded,
-        page: SettingsScreen(),
+        builder: _buildSettingsScreen,
         priority: 40,
       ),
       if (showTests)
@@ -149,11 +164,24 @@ class _MainShellState extends State<MainShell> {
           id: 'tests',
           label: 'Тесты',
           icon: Icons.science_outlined,
-          page: SystemTestsScreen(),
+          builder: _buildTestsScreen,
           priority: 20,
         ),
     ];
   }
+
+  static Widget _buildChatsScreen(BuildContext context) => const ChatsScreen();
+  static Widget _buildCartScreen(BuildContext context) => const CartScreen();
+  static Widget _buildAdminScreen(BuildContext context) => const AdminPanel();
+  static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
+  static Widget _buildProfileScreen(BuildContext context) =>
+      const ProfileScreen();
+  static Widget _buildSettingsScreen(BuildContext context) =>
+      const SettingsScreen();
+  static Widget _buildTestsScreen(BuildContext context) =>
+      const SystemTestsScreen();
+  static Widget _buildEmptyScreen(BuildContext context) =>
+      const SizedBox.shrink();
 
   Future<void> _openMoreSheet(
     BuildContext context,
@@ -213,7 +241,10 @@ class _MainShellState extends State<MainShell> {
     if (!mounted || selectedId == null) return;
     final nextIndex = allDestinations.indexWhere((d) => d.id == selectedId);
     if (nextIndex < 0) return;
-    setState(() => _index = nextIndex);
+    setState(() {
+      _index = nextIndex;
+      _activatedDestinations.add(allDestinations[nextIndex].id);
+    });
   }
 
   @override
@@ -240,14 +271,18 @@ class _MainShellState extends State<MainShell> {
         final showAdmin = _hasAdminTab();
         final showWorker = _hasWorkerTab();
         final showTests = _hasTestsTab();
+        final effectiveRole = _effectiveRole();
 
         final destinations = _buildDestinations(
           showAdmin: showAdmin,
           showWorker: showWorker,
           showTests: showTests,
         );
-
         if (_index >= destinations.length) _index = destinations.length - 1;
+        if (destinations.isNotEmpty) {
+          final safeIndex = _index.clamp(0, destinations.length - 1);
+          _activatedDestinations.add(destinations[safeIndex].id);
+        }
 
         final compactNavigation = _useCompactNavigation(context);
         final primaryDestinations = compactNavigation
@@ -274,7 +309,7 @@ class _MainShellState extends State<MainShell> {
                   id: 'more',
                   label: 'Еще',
                   icon: Icons.grid_view_rounded,
-                  page: SizedBox.shrink(),
+                  builder: _buildEmptyScreen,
                 ),
               ]
             : compactNavigation
@@ -295,10 +330,17 @@ class _MainShellState extends State<MainShell> {
         return Scaffold(
           body: SafeArea(
             child: IndexedStack(
+              key: ValueKey('shell-$effectiveRole'),
               index: _index,
-              children: destinations
-                  .map((destination) => destination.page)
-                  .toList(),
+              children: destinations.map((destination) {
+                if (!_activatedDestinations.contains(destination.id)) {
+                  return const SizedBox.shrink();
+                }
+                return KeyedSubtree(
+                  key: ValueKey('page-${destination.id}-$effectiveRole'),
+                  child: destination.builder(context),
+                );
+              }).toList(),
             ),
           ),
           bottomNavigationBar: BottomNavigationBar(
@@ -313,7 +355,10 @@ class _MainShellState extends State<MainShell> {
                 (destination) => destination.id == tapped.id,
               );
               if (nextIndex < 0) return;
-              setState(() => _index = nextIndex);
+              setState(() {
+                _index = nextIndex;
+                _activatedDestinations.add(destinations[nextIndex].id);
+              });
             },
             items: visibleDestinations
                 .map(
