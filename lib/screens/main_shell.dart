@@ -5,11 +5,14 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
+import '../widgets/phoenix_loader.dart';
 import 'admin_panel.dart';
+import 'auth_screen.dart';
 import 'cart_screen.dart';
 import 'chats_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
+import 'system_tests_screen.dart';
 import 'worker_panel.dart';
 
 class MainShell extends StatefulWidget {
@@ -62,6 +65,11 @@ class _MainShellState extends State<MainShell> {
     return roles.contains(_effectiveRole());
   }
 
+  bool _hasTestsTab() {
+    return (authService.currentUser?.role ?? '').toLowerCase().trim() ==
+        'creator';
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
@@ -70,39 +78,69 @@ class _MainShellState extends State<MainShell> {
       builder: (context, _) {
         if (_loading) {
           return const Scaffold(
-            body: SafeArea(child: Center(child: CircularProgressIndicator())),
+            body: SafeArea(
+              child: PhoenixLoadingView(
+                title: 'Открываем приложение',
+                subtitle: 'Подготавливаем ваш рабочий стол',
+              ),
+            ),
           );
+        }
+
+        if (authService.currentUser == null) {
+          return const AuthScreen();
         }
 
         final showAdmin = _hasAdminTab();
         final showWorker = _hasWorkerTab();
+        final showTests = _hasTestsTab();
 
         final pages = <Widget>[
           const ChatsScreen(),
           const CartScreen(),
           if (showAdmin) const AdminPanel(),
           if (showWorker) const WorkerPanel(),
+          if (showTests) const SystemTestsScreen(),
           const ProfileScreen(),
           const SettingsScreen(),
         ];
 
         final navItems = <BottomNavigationBarItem>[
           const BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Чаты'),
-          const BottomNavigationBarItem(icon: Icon(Icons.shopping_cart), label: 'Корзина'),
-          if (showAdmin) const BottomNavigationBarItem(icon: Icon(Icons.admin_panel_settings), label: 'Админ'),
-          if (showWorker) const BottomNavigationBarItem(icon: Icon(Icons.work), label: 'Worker'),
-          const BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Профиль'),
-          const BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Настройки'),
+          const BottomNavigationBarItem(
+            icon: Icon(Icons.shopping_cart),
+            label: 'Корзина',
+          ),
+          if (showAdmin)
+            const BottomNavigationBarItem(
+              icon: Icon(Icons.admin_panel_settings),
+              label: 'Админ',
+            ),
+          if (showWorker)
+            const BottomNavigationBarItem(
+              icon: Icon(Icons.work),
+              label: 'Рабочий',
+            ),
+          if (showTests)
+            const BottomNavigationBarItem(
+              icon: Icon(Icons.science_outlined),
+              label: 'Тесты',
+            ),
+          const BottomNavigationBarItem(
+            icon: Icon(Icons.person),
+            label: 'Профиль',
+          ),
+          const BottomNavigationBarItem(
+            icon: Icon(Icons.settings),
+            label: 'Настройки',
+          ),
         ];
 
         if (_index >= pages.length) _index = pages.length - 1;
 
         return Scaffold(
           body: SafeArea(
-            child: IndexedStack(
-              index: _index,
-              children: pages,
-            ),
+            child: IndexedStack(index: _index, children: pages),
           ),
           bottomNavigationBar: BottomNavigationBar(
             currentIndex: _index,

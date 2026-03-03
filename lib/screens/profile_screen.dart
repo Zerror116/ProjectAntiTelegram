@@ -8,7 +8,6 @@ import '../main.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/avatar_crop_dialog.dart';
-import 'auth_screen.dart';
 import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
 
@@ -76,6 +75,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final value = double.tryParse('${raw ?? ''}');
     if (value == null || !value.isFinite) return 1;
     return value.clamp(1.0, 4.0);
+  }
+
+  String _roleLabel(String role) {
+    switch (role.toLowerCase().trim()) {
+      case 'creator':
+        return 'Создатель';
+      case 'admin':
+        return 'Администратор';
+      case 'worker':
+        return 'Работник';
+      case 'client':
+      default:
+        return 'Клиент';
+    }
   }
 
   void _applyUser(Map<String, dynamic> u) {
@@ -211,11 +224,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   Future<void> _logout() async {
     await authService.logout();
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => const AuthScreen()),
-      (route) => false,
-    );
   }
 
   Future<void> _changeViewMode(String mode) async {
@@ -252,11 +260,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final resp = await authService.dio.post('/api/auth/delete_account');
       if (resp.statusCode == 200) {
         await authService.clearToken();
-        if (!mounted) return;
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const AuthScreen()),
-          (route) => false,
-        );
         return;
       }
       if (!mounted) return;
@@ -353,6 +356,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final displayName = _name.isNotEmpty
         ? _name
         : (_email.isNotEmpty ? _email : 'Без имени');
+    final actualRole = authService.currentUser?.role ?? 'client';
+    final effectiveRole = authService.effectiveRole;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Профиль')),
@@ -459,13 +464,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           children: [
                             _statChip(
                               Icons.verified_user_outlined,
-                              authService.currentUser?.role.toUpperCase() ??
-                                  'CLIENT',
+                              _roleLabel(actualRole),
                             ),
-                            _statChip(
-                              Icons.visibility_outlined,
-                              'Режим: ${authService.effectiveRole}',
-                            ),
+                            if (canSwitchRole)
+                              _statChip(
+                                Icons.visibility_outlined,
+                                'Режим: ${_roleLabel(effectiveRole)}',
+                              ),
                           ],
                         ),
                         const SizedBox(height: 16),
@@ -554,19 +559,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             items: const [
                               DropdownMenuItem(
                                 value: 'creator',
-                                child: Text('Creator'),
+                                child: Text('Создатель'),
                               ),
                               DropdownMenuItem(
                                 value: 'admin',
-                                child: Text('Admin'),
+                                child: Text('Администратор'),
                               ),
                               DropdownMenuItem(
                                 value: 'worker',
-                                child: Text('Worker'),
+                                child: Text('Работник'),
                               ),
                               DropdownMenuItem(
                                 value: 'client',
-                                child: Text('Client'),
+                                child: Text('Клиент'),
                               ),
                             ],
                             onChanged: (v) {

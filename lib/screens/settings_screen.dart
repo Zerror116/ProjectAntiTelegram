@@ -48,6 +48,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await setNotificationsEnabled(v);
     if (!mounted) return;
     setState(() => _notifications = v);
+    showAppNotice(
+      context,
+      v ? 'Уведомления включены' : 'Уведомления отключены',
+      tone: v ? AppNoticeTone.success : AppNoticeTone.warning,
+    );
+    await playAppSound(v ? AppUiSound.success : AppUiSound.warning);
   }
 
   Future<void> _toggleDarkMode(bool v) async {
@@ -72,9 +78,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final role = authService.effectiveRole.toLowerCase().trim();
-    final canOpenBugReport = role == 'admin' || role == 'creator';
-
     return Scaffold(
       appBar: AppBar(title: const Text('Настройки')),
       body: SafeArea(
@@ -85,7 +88,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               value: _notifications,
               onChanged: _toggleNotifications,
               title: const Text('Уведомления'),
-              subtitle: const Text('Включить или отключить push-уведомления'),
+              subtitle: const Text(
+                'Локальные уведомления и звуки внутри приложения',
+              ),
             ),
             SwitchListTile(
               value: _darkMode,
@@ -100,15 +105,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               subtitle: const Text('Открыть чат поддержки и задать вопрос'),
               onTap: _openSupport,
             ),
-            if (canOpenBugReport)
-              ListTile(
-                leading: const Icon(Icons.bug_report_outlined),
-                title: const Text('Сообщить о баге'),
-                subtitle: const Text(
-                  'Отправить сообщение в отдельный баг-канал',
-                ),
-                onTap: _openBugReport,
+            ListTile(
+              leading: const Icon(Icons.report_problem_outlined),
+              title: const Text('Сообщить о проблеме'),
+              subtitle: const Text(
+                'Быстро отправить описание ошибки в отдельный служебный канал',
               ),
+              onTap: _openBugReport,
+            ),
           ],
         ),
       ),

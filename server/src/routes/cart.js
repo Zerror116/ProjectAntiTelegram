@@ -9,6 +9,15 @@ const { requireRole } = require('../utils/roles');
 
 const CART_STATUSES = ['pending_processing', 'processed', 'in_delivery'];
 
+function emitCartUpdated(req, userId, payload = {}) {
+  const io = req.app.get('io');
+  if (!io || !userId) return;
+  io.to(`user:${userId}`).emit('cart:updated', {
+    userId: String(userId),
+    ...payload,
+  });
+}
+
 function productMessageText(product) {
   const lines = [
     `🛒 ${product.title}`,
@@ -92,9 +101,12 @@ router.post('/add', authMiddleware, async (req, res) => {
     const updatedProduct = productUpd.rows[0];
 
     const existingQ = await client.query(
-      `SELECT id, quantity
+      `SELECT id, quantity, status
        FROM cart_items
-       WHERE user_id = $1 AND product_id = $2
+       WHERE user_id = $1
+         AND product_id = $2
+         AND status = 'pending_processing'
+       ORDER BY created_at DESC
        LIMIT 1
        FOR UPDATE`,
       [userId, productId]
@@ -182,8 +194,17 @@ router.post('/add', authMiddleware, async (req, res) => {
           chatId: message.chat_id,
           message,
         });
+        io.emit('chat:updated', { chatId: message.chat_id });
       }
     }
+
+    emitCartUpdated(req, userId, {
+      product_id: productId,
+      cart_item_id: cartItem.id,
+      status: cartItem.status,
+      available_in_stock: Number(updatedProduct.quantity),
+      reason: 'item_added',
+    });
 
     return res.status(201).json({
       ok: true,
@@ -219,22 +240,121 @@ router.get('/', authMiddleware, async (req, res) => {
               p.title,
               p.description,
               p.price,
-              p.image_url
+              p.image_url,
+              delivery.delivery_date,
+              delivery.courier_name,
+              delivery.courier_code,
+              delivery.eta_from,
+              delivery.eta_to,
+              delivery.delivery_status AS delivery_batch_status
        FROM cart_items c
        JOIN products p ON p.id = c.product_id
+       LEFT JOIN LATERAL (
+         SELECT b.delivery_date,
+                cst.courier_name,
+                cst.courier_code,
+                cst.eta_from,
+                cst.eta_to,
+                cst.delivery_status
+         FROM delivery_batch_items di
+         JOIN delivery_batch_customers cst ON cst.id = di.batch_customer_id
+         JOIN delivery_batches b ON b.id = di.batch_id
+         WHERE di.cart_item_id = c.id
+         ORDER BY b.created_at DESC
+         LIMIT 1
+       ) AS delivery ON true
        WHERE c.user_id = $1
-       ORDER BY c.created_at DESC`,
+       ORDER BY
+         CASE c.status
+           WHEN 'pending_processing' THEN 0
+           WHEN 'processed' THEN 1
+           WHEN 'preparing_delivery' THEN 2
+           WHEN 'handing_to_courier' THEN 3
+           WHEN 'in_delivery' THEN 4
+           ELSE 5
+         END,
+         c.updated_at DESC,
+         c.created_at DESC`,
       [userId]
     );
 
-    const items = result.rows.map((row) => ({
-      ...row,
-      line_total: Number(row.price) * Number(row.quantity),
-    }));
+    const grouped = new Map();
+    for (const row of result.rows) {
+      const normalized = {
+        ...row,
+        price: Number(row.price) || 0,
+        quantity: Number(row.quantity) || 0,
+      };
+      normalized.line_total = normalized.price * normalized.quantity;
+
+      const shouldAggregate =
+        normalized.status === 'processed' || normalized.status === 'in_delivery';
+      if (!shouldAggregate) {
+        grouped.set(`single:${normalized.id}`, normalized);
+        continue;
+      }
+
+      const key = `group:${normalized.product_id}:${normalized.status}`;
+      if (!grouped.has(key)) {
+        grouped.set(key, normalized);
+        continue;
+      }
+
+      const existing = grouped.get(key);
+      const mergedQuantity =
+        (Number(existing.quantity) || 0) + (Number(normalized.quantity) || 0);
+      const existingUpdatedAt = new Date(
+        existing.updated_at || existing.created_at || 0,
+      ).getTime();
+      const nextUpdatedAt = new Date(
+        normalized.updated_at || normalized.created_at || 0,
+      ).getTime();
+
+      grouped.set(key, {
+        ...existing,
+        quantity: mergedQuantity,
+        line_total: (Number(existing.price) || 0) * mergedQuantity,
+        updated_at:
+          nextUpdatedAt > existingUpdatedAt
+            ? normalized.updated_at
+            : existing.updated_at,
+        created_at:
+          nextUpdatedAt > existingUpdatedAt
+            ? normalized.created_at
+            : existing.created_at,
+        merged_item_ids: [
+          ...(Array.isArray(existing.merged_item_ids)
+            ? existing.merged_item_ids
+            : [existing.id]),
+          normalized.id,
+        ],
+      });
+    }
+
+    const items = Array.from(grouped.values()).sort((a, b) => {
+      const statusOrder = {
+        pending_processing: 0,
+        processed: 1,
+        in_delivery: 2,
+      };
+      const aOrder = statusOrder[a.status] ?? 3;
+      const bOrder = statusOrder[b.status] ?? 3;
+      if (aOrder != bOrder) return aOrder - bOrder;
+
+      const aTime = new Date(a.updated_at || a.created_at || 0).getTime();
+      const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
+      return bTime - aTime;
+    });
 
     const totalSum = items.reduce((sum, item) => sum + item.line_total, 0);
+    const processedStatuses = new Set([
+      'processed',
+      'preparing_delivery',
+      'handing_to_courier',
+      'in_delivery',
+    ]);
     const processedSum = items
-      .filter((item) => item.status === 'processed' || item.status === 'in_delivery')
+      .filter((item) => processedStatuses.has(item.status))
       .reduce((sum, item) => sum + item.line_total, 0);
 
     return res.json({
@@ -368,14 +488,24 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
           chatId: message.chat_id,
           message,
         });
+        io.emit('chat:updated', { chatId: message.chat_id });
       }
       if (removedReservedMessage) {
         io.to(`chat:${removedReservedMessage.chat_id}`).emit('chat:message:deleted', {
           chatId: removedReservedMessage.chat_id,
           messageId: removedReservedMessage.id,
         });
+        io.emit('chat:updated', { chatId: removedReservedMessage.chat_id });
       }
     }
+
+    emitCartUpdated(req, userId, {
+      product_id: item.product_id,
+      cart_item_id: cartItemId,
+      status: 'cancelled',
+      available_in_stock: Number(updatedProduct.quantity),
+      reason: 'item_cancelled',
+    });
 
     return res.json({
       ok: true,
@@ -418,7 +548,14 @@ router.patch('/items/:id/status', authMiddleware, requireRole('admin', 'creator'
     if (upd.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Позиция не найдена' });
     }
-    return res.json({ ok: true, data: upd.rows[0] });
+    const item = upd.rows[0];
+    emitCartUpdated(req, item.user_id, {
+      product_id: item.product_id,
+      cart_item_id: item.id,
+      status: item.status,
+      reason: 'status_changed',
+    });
+    return res.json({ ok: true, data: item });
   } catch (err) {
     console.error('cart.status error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });

@@ -338,15 +338,6 @@ class AuthService {
   Future<void> logout() async {
     try {
       debugPrint('🚪 AuthService.logout -> starting logout');
-
-      // ✅ ИСПРАВЛЕНИЕ: Уведомляем слушателей ПЕРЕД logout
-      _currentUser = null;
-      try {
-        _authController.add(null);
-        debugPrint('📢 authStream notified about logout');
-      } catch (_) {}
-
-      // Потом выполняем логаут на сервере
       try {
         await dio.post('/api/auth/logout');
         debugPrint('✅ Logout API call succeeded');
@@ -361,7 +352,6 @@ class AuthService {
     } catch (e) {
       debugPrint('❌ logout error: $e');
       await clearToken();
-      rethrow;
     }
   }
 

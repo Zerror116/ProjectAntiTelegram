@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
 import '../services/auth_service.dart';
 import '../main.dart'; // глобальный authService и dio
+import '../widgets/input_language_badge.dart';
 
 import 'phone_name_screen.dart';
 import 'main_shell.dart';
@@ -222,7 +223,10 @@ class _AuthScreenState extends State<AuthScreen> {
                 children: [
                   TextFormField(
                     controller: _emailController,
-                    decoration: const InputDecoration(labelText: 'Email'),
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(labelText: 'Email'),
+                      controller: _emailController,
+                    ),
                     keyboardType: TextInputType.emailAddress,
                     validator: (v) {
                       if (v == null || v.isEmpty) return 'Введите email';
@@ -233,12 +237,16 @@ class _AuthScreenState extends State<AuthScreen> {
                   const SizedBox(height: 12),
                   TextFormField(
                     controller: _passwordController,
-                    decoration: const InputDecoration(labelText: 'Пароль'),
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(labelText: 'Пароль'),
+                      controller: _passwordController,
+                    ),
                     obscureText: true,
                     validator: (v) {
                       if (v == null || v.isEmpty) return 'Введите пароль';
-                      if (v.length < 8)
+                      if (v.length < 8) {
                         return 'Пароль должен быть не менее 8 символов';
+                      }
                       return null;
                     },
                   ),

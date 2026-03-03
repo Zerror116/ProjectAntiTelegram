@@ -1,6 +1,7 @@
 // lib/screens/change_phone_screen.dart
 import 'package:flutter/material.dart';
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
 
 class ChangePhoneScreen extends StatefulWidget {
   const ChangePhoneScreen({super.key});
@@ -56,9 +57,23 @@ class _ChangePhoneScreenState extends State<ChangePhoneScreen> {
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(children: [
-          TextField(controller: _passwordController, obscureText: true, decoration: const InputDecoration(labelText: 'Пароль')),
+          TextField(
+            controller: _passwordController,
+            obscureText: true,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(labelText: 'Пароль'),
+              controller: _passwordController,
+            ),
+          ),
           const SizedBox(height: 12),
-          TextField(controller: _phoneController, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Новый номер')),
+          TextField(
+            controller: _phoneController,
+            keyboardType: TextInputType.phone,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(labelText: 'Новый номер'),
+              controller: _phoneController,
+            ),
+          ),
           const SizedBox(height: 12),
           ElevatedButton(onPressed: _loading ? null : _changePhone, child: _loading ? const CircularProgressIndicator() : const Text('Сменить номер')),
           const SizedBox(height: 12),

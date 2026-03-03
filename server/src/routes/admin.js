@@ -199,7 +199,6 @@ function productMessageText(product) {
   const lines = [
     `🛒 ${product.title}`,
     product.description ? String(product.description).trim() : null,
-    `ID товара: ${product.product_code}`,
     `Цена: ${product.price} RUB`,
     `Количество в наличии: ${product.quantity}`,
     'Нажмите "Купить", чтобы добавить в корзину',
@@ -1340,6 +1339,7 @@ router.post(
               chatId: reservedChannel.id,
               message: msgRes.rows[0],
             });
+            io.emit("chat:updated", { chatId: reservedChannel.id });
           }
         }
       }
@@ -1538,7 +1538,17 @@ router.post(
             chatId: reservedChannel.id,
             message,
           });
+          io.emit("chat:updated", { chatId: reservedChannel.id });
         }
+        io.to(`user:${item.user_id}`).emit("cart:updated", {
+          userId: String(item.user_id),
+          product_id: item.product_id ? String(item.product_id) : "",
+          cart_item_id: targetCartItemId || null,
+          status: "processed",
+          shelf_number: finalShelf,
+          processed_by_name: processedByName,
+          reason: "item_processed",
+        });
       }
 
       return res.json({
@@ -1671,12 +1681,11 @@ router.post(
 
         const messageInsert = await client.query(
           `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-         VALUES ($1, $2, $3, $4, $5::jsonb, now())
+         VALUES ($1, $2, NULL, $3, $4::jsonb, now())
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
           [
             uuidv4(),
             row.channel_id,
-            req.user.id,
             productMessageText(product),
             JSON.stringify(messageMeta),
           ],
@@ -1723,6 +1732,7 @@ router.post(
               chatId: item.channel_id,
               message: msgRes.rows[0],
             });
+            io.emit("chat:updated", { chatId: item.channel_id });
           }
         }
       }

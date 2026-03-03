@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../main.dart';
+import '../widgets/input_language_badge.dart';
+import '../widgets/phoenix_loader.dart';
 
 class SupportScreen extends StatefulWidget {
   final String? initialMessage;
@@ -60,9 +62,12 @@ class _SupportScreenState extends State<SupportScreen> {
     if (normalized.isEmpty) return;
     await Clipboard.setData(ClipboardData(text: normalized));
     if (!mounted) return;
-    ScaffoldMessenger.of(
+    showAppNotice(
       context,
-    ).showSnackBar(const SnackBar(content: Text('Текст скопирован')));
+      'Текст скопирован',
+      tone: AppNoticeTone.success,
+      duration: const Duration(milliseconds: 1000),
+    );
   }
 
   Future<void> _ask() async {
@@ -85,6 +90,7 @@ class _SupportScreenState extends State<SupportScreen> {
         reply = (data['data']['reply'] ?? reply).toString();
       }
       setState(() => _messages.add({'from': 'bot', 'text': reply}));
+      await playAppSound(AppUiSound.success);
     } catch (e) {
       setState(
         () => _messages.add({'from': 'bot', 'text': 'Ошибка поддержки: $e'}),
@@ -96,6 +102,7 @@ class _SupportScreenState extends State<SupportScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('Поддержка')),
       body: SafeArea(
@@ -121,13 +128,17 @@ class _SupportScreenState extends State<SupportScreen> {
                         margin: const EdgeInsets.symmetric(vertical: 4),
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: fromUser ? Colors.blue : Colors.grey[300],
-                          borderRadius: BorderRadius.circular(8),
+                          color: fromUser
+                              ? theme.colorScheme.primaryContainer
+                              : theme.colorScheme.surfaceContainerHigh,
+                          borderRadius: BorderRadius.circular(14),
                         ),
                         child: Text(
                           text,
                           style: TextStyle(
-                            color: fromUser ? Colors.white : Colors.black,
+                            color: fromUser
+                                ? theme.colorScheme.onPrimaryContainer
+                                : theme.colorScheme.onSurface,
                           ),
                         ),
                       ),
@@ -136,7 +147,15 @@ class _SupportScreenState extends State<SupportScreen> {
                 },
               ),
             ),
-            if (_loading) const LinearProgressIndicator(minHeight: 2),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 6),
+                child: PhoenixLoadingView(
+                  title: 'Поддержка отвечает',
+                  subtitle: 'Формируем ответ',
+                  size: 40,
+                ),
+              ),
             Padding(
               padding: const EdgeInsets.all(12),
               child: Row(
@@ -152,10 +171,12 @@ class _SupportScreenState extends State<SupportScreen> {
                         maxLines: 5,
                         keyboardType: TextInputType.multiline,
                         textInputAction: TextInputAction.newline,
-                        decoration: const InputDecoration(
-                          hintText:
-                              'Напишите вопрос... (Enter отправить, Shift+Enter новая строка)',
-                          border: OutlineInputBorder(),
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            hintText: 'Напишите вопрос...',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: _controller,
                         ),
                       ),
                     ),
