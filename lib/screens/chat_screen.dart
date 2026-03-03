@@ -17,13 +17,10 @@ import '../main.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/submit_on_enter.dart';
 
 class _ChatUploadFile {
-  const _ChatUploadFile({
-    required this.filename,
-    this.path,
-    this.bytes,
-  });
+  const _ChatUploadFile({required this.filename, this.path, this.bytes});
 
   final String filename;
   final String? path;
@@ -487,36 +484,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool _canCompose() {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    if (role == 'client') return false;
     if (_isPublicChannel()) {
-      final role = authService.effectiveRole.toLowerCase().trim();
       return role == 'admin' || role == 'creator';
     }
     return true;
   }
 
   String? _composeBlockedReason() {
-    if (!_isPublicChannel()) return null;
     if (_canCompose()) return null;
-    return 'В этом публичном канале писать могут только администратор и создатель';
-  }
-
-  KeyEventResult _onInputKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    final isEnter =
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.numpadEnter;
-    if (!isEnter) return KeyEventResult.ignored;
-
-    final isShiftPressed = HardwareKeyboard.instance.isShiftPressed;
-    if (isShiftPressed) {
-      return KeyEventResult.ignored;
+    if (_isPublicChannel()) {
+      return 'В этом публичном канале писать может только администрация';
     }
-
-    if (_canCompose()) {
-      _send();
-    }
-    return KeyEventResult.handled;
+    return 'Отправка сообщений для клиента здесь недоступна';
   }
 
   Future<void> _joinRoom() async {
@@ -687,7 +668,9 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
     return _ChatUploadFile(
-      filename: picked.name.isNotEmpty ? picked.name : picked.path.split('/').last,
+      filename: picked.name.isNotEmpty
+          ? picked.name
+          : picked.path.split('/').last,
       path: picked.path,
     );
   }
@@ -749,7 +732,10 @@ class _ChatScreenState extends State<ChatScreen> {
           if (attachmentType == 'image') {
             _controller.clear();
           }
-          _upsertMessage(Map<String, dynamic>.from(data['data']), autoScroll: true);
+          _upsertMessage(
+            Map<String, dynamic>.from(data['data']),
+            autoScroll: true,
+          );
           await playAppSound(AppUiSound.sent);
           return;
         }
@@ -789,10 +775,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final upload = await _pickImageUpload(source);
       if (upload == null) return;
-      await _sendMediaMessage(
-        upload: upload,
-        attachmentType: 'image',
-      );
+      await _sendMediaMessage(upload: upload, attachmentType: 'image');
     } catch (e) {
       if (!mounted) return;
       showAppNotice(
@@ -884,7 +867,8 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       final tempDir = await getTemporaryDirectory();
-      final useAac = defaultTargetPlatform == TargetPlatform.android ||
+      final useAac =
+          defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS ||
           defaultTargetPlatform == TargetPlatform.macOS;
       final extension = useAac ? 'm4a' : 'wav';
@@ -974,10 +958,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _startVoiceRecording();
   }
 
-  Future<void> _toggleVoicePlayback(
-    String messageId,
-    String voiceUrl,
-  ) async {
+  Future<void> _toggleVoicePlayback(String messageId, String voiceUrl) async {
     if (messageId.isEmpty || voiceUrl.trim().isEmpty) return;
     try {
       final isCurrent = _activeVoiceMessageId == messageId;
@@ -1232,24 +1213,72 @@ class _ChatScreenState extends State<ChatScreen> {
     if (customerId.isEmpty) return;
 
     String addressText = '';
+    String preferredTimeFrom = '';
+    String preferredTimeTo = '';
     if (accepted) {
-      final controller = TextEditingController(
+      final addressCtrl = TextEditingController(
         text: (meta['address_text'] ?? '').toString(),
       );
-      final result = await showDialog<String>(
+      final afterCtrl = TextEditingController(
+        text: (meta['preferred_time_from'] ?? '').toString(),
+      );
+      final beforeCtrl = TextEditingController(
+        text: (meta['preferred_time_to'] ?? '').toString(),
+      );
+      final result = await showDialog<Map<String, String>>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('Адрес доставки'),
-          content: TextField(
-            controller: controller,
-            minLines: 2,
-            maxLines: 4,
-            decoration: withInputLanguageBadge(
-              const InputDecoration(
-                hintText: 'Самара, улица, дом, подъезд',
-                border: OutlineInputBorder(),
-              ),
-              controller: controller,
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: addressCtrl,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      hintText: 'Самара, улица, дом, подъезд',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: addressCtrl,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: afterCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'После',
+                            hintText: '10:00',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: afterCtrl,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        controller: beforeCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'До',
+                            hintText: '16:00',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: beforeCtrl,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ),
           ),
           actions: [
@@ -1258,14 +1287,22 @@ class _ChatScreenState extends State<ChatScreen> {
               child: const Text('Отмена'),
             ),
             FilledButton(
-              onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+              onPressed: () => Navigator.of(ctx).pop({
+                'address_text': addressCtrl.text.trim(),
+                'preferred_time_from': afterCtrl.text.trim(),
+                'preferred_time_to': beforeCtrl.text.trim(),
+              }),
               child: const Text('Отправить'),
             ),
           ],
         ),
       );
-      if (result == null || result.trim().isEmpty) return;
-      addressText = result.trim();
+      if (result == null || (result['address_text'] ?? '').trim().isEmpty) {
+        return;
+      }
+      addressText = (result['address_text'] ?? '').trim();
+      preferredTimeFrom = (result['preferred_time_from'] ?? '').trim();
+      preferredTimeTo = (result['preferred_time_to'] ?? '').trim();
     }
 
     try {
@@ -1274,14 +1311,16 @@ class _ChatScreenState extends State<ChatScreen> {
         data: {
           'accepted': accepted,
           if (accepted) 'address_text': addressText,
+          if (accepted && preferredTimeFrom.isNotEmpty)
+            'preferred_time_from': preferredTimeFrom,
+          if (accepted && preferredTimeTo.isNotEmpty)
+            'preferred_time_to': preferredTimeTo,
         },
       );
       if (!mounted) return;
       showAppNotice(
         context,
-        accepted
-            ? 'Адрес доставки отправлен'
-            : 'Отказ от доставки сохранен',
+        accepted ? 'Адрес доставки отправлен' : 'Отказ от доставки сохранен',
         tone: AppNoticeTone.success,
         duration: const Duration(seconds: 2),
       );
@@ -1513,11 +1552,15 @@ class _ChatScreenState extends State<ChatScreen> {
     return (meta['attachment_type'] ?? '').toString().trim().toLowerCase();
   }
 
-  String _captionTextOf(Map<String, dynamic> message, Map<String, dynamic> meta) {
+  String _captionTextOf(
+    Map<String, dynamic> message,
+    Map<String, dynamic> meta,
+  ) {
     final caption = (meta['caption'] ?? '').toString().trim();
     if (caption.isNotEmpty) return caption;
     final text = (message['text'] ?? '').toString().trim();
-    if (text.toLowerCase() == 'фото' || text.toLowerCase() == 'голосовое сообщение') {
+    if (text.toLowerCase() == 'фото' ||
+        text.toLowerCase() == 'голосовое сообщение') {
       return '';
     }
     return text;
@@ -1904,7 +1947,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final messageId = message['id']?.toString().trim() ?? '';
     final voiceUrl = _voiceUrlOf(meta);
     final durationMs = _voiceDurationMsOf(meta);
-    final fallbackDuration = Duration(milliseconds: durationMs > 0 ? durationMs : 0);
+    final fallbackDuration = Duration(
+      milliseconds: durationMs > 0 ? durationMs : 0,
+    );
     final isActive = _activeVoiceMessageId == messageId;
     final isPlaying = isActive && _voicePlayerState == PlayerState.playing;
     final totalDuration = isActive && _activeVoiceDuration > Duration.zero
@@ -2002,7 +2047,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final isReservedOrder = !isDeleted && _isReservedOrder(message);
     final hasBuy = !isDeleted && !isReservedOrder && _isCatalogProduct(message);
-    final isDeliveryOffer = !isDeleted && !hasBuy && !isReservedOrder && _isDeliveryOffer(message);
+    final isDeliveryOffer =
+        !isDeleted && !hasBuy && !isReservedOrder && _isDeliveryOffer(message);
     final isImageMessage =
         !isDeleted &&
         !hasBuy &&
@@ -2037,12 +2083,23 @@ class _ChatScreenState extends State<ChatScreen> {
     final senderAvatarFocusX = _senderAvatarFocusXOf(message);
     final senderAvatarFocusY = _senderAvatarFocusYOf(message);
     final senderAvatarZoom = _senderAvatarZoomOf(message);
-    final offerStatus = (metaMap['offer_status'] ?? 'pending').toString().trim();
-    final offerDeliveryLabel = (metaMap['delivery_label'] ?? 'Доставка').toString();
-    final offerDeliveryDate = (metaMap['delivery_date'] ?? '').toString().trim();
+    final offerStatus = (metaMap['offer_status'] ?? 'pending')
+        .toString()
+        .trim();
+    final offerDeliveryLabel = (metaMap['delivery_label'] ?? 'Доставка')
+        .toString();
+    final offerDeliveryDate = (metaMap['delivery_date'] ?? '')
+        .toString()
+        .trim();
     final offerPhone = (metaMap['customer_phone'] ?? '').toString().trim();
     final offerProcessedSum = (metaMap['processed_sum'] ?? 0).toString();
     final offerAddress = (metaMap['address_text'] ?? '').toString().trim();
+    final offerPreferredAfter = (metaMap['preferred_time_from'] ?? '')
+        .toString()
+        .trim();
+    final offerPreferredBefore = (metaMap['preferred_time_to'] ?? '')
+        .toString()
+        .trim();
 
     final bubbleColor = hasBuy
         ? theme.colorScheme.surfaceContainerLow
@@ -2213,6 +2270,13 @@ class _ChatScreenState extends State<ChatScreen> {
                 const SizedBox(height: 8),
                 Text('Адрес: $offerAddress'),
               ],
+              if (offerPreferredAfter.isNotEmpty ||
+                  offerPreferredBefore.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(
+                  'Пожелание по времени: ${[if (offerPreferredAfter.isNotEmpty) 'после $offerPreferredAfter', if (offerPreferredBefore.isNotEmpty) 'до $offerPreferredBefore'].join(', ')}',
+                ),
+              ],
               const SizedBox(height: 10),
               if (offerStatus == 'pending') ...[
                 Wrap(
@@ -2220,18 +2284,14 @@ class _ChatScreenState extends State<ChatScreen> {
                   runSpacing: 8,
                   children: [
                     FilledButton.icon(
-                      onPressed: () => _respondToDeliveryOffer(
-                        metaMap,
-                        accepted: true,
-                      ),
+                      onPressed: () =>
+                          _respondToDeliveryOffer(metaMap, accepted: true),
                       icon: const Icon(Icons.check_circle_outline),
                       label: const Text('Да, согласен'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: () => _respondToDeliveryOffer(
-                        metaMap,
-                        accepted: false,
-                      ),
+                      onPressed: () =>
+                          _respondToDeliveryOffer(metaMap, accepted: false),
                       icon: const Icon(Icons.cancel_outlined),
                       label: const Text('Нет'),
                     ),
@@ -2368,10 +2428,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
                 if (captionText.isNotEmpty) ...[
                   const SizedBox(height: 10),
-                  Text(
-                    captionText,
-                    style: TextStyle(color: textColor),
-                  ),
+                  Text(captionText, style: TextStyle(color: textColor)),
                 ],
               ] else ...[
                 if (imageUrl != null) ...[
@@ -2386,7 +2443,9 @@ class _ChatScreenState extends State<ChatScreen> {
                       color: isDeleted
                           ? theme.colorScheme.onSurfaceVariant
                           : textColor,
-                      fontStyle: isDeleted ? FontStyle.italic : FontStyle.normal,
+                      fontStyle: isDeleted
+                          ? FontStyle.italic
+                          : FontStyle.normal,
                     ),
                   ),
               ],
@@ -2593,15 +2652,20 @@ class _ChatScreenState extends State<ChatScreen> {
                         )
                       : const Icon(Icons.add_photo_alternate_outlined),
                   onPressed:
-                      canCompose && !_mediaUploading && !_voiceSending && !_voiceRecording
+                      canCompose &&
+                          !_mediaUploading &&
+                          !_voiceSending &&
+                          !_voiceRecording
                       ? _openAttachmentSheet
                       : null,
                 ),
                 Expanded(
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: Focus(
-                      onKeyEvent: _onInputKey,
+                    child: SubmitOnEnter(
+                      controller: _controller,
+                      enabled: canCompose && !_voiceRecording,
+                      onSubmit: _send,
                       child: TextField(
                         focusNode: _inputFocusNode,
                         controller: _controller,

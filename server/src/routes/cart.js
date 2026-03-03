@@ -7,7 +7,14 @@ const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
 
-const CART_STATUSES = ['pending_processing', 'processed', 'in_delivery'];
+const CART_STATUSES = [
+  'pending_processing',
+  'processed',
+  'preparing_delivery',
+  'handing_to_courier',
+  'in_delivery',
+  'delivered',
+];
 
 function emitCartUpdated(req, userId, payload = {}) {
   const io = req.app.get('io');
@@ -251,19 +258,25 @@ router.get('/', authMiddleware, async (req, res) => {
        JOIN products p ON p.id = c.product_id
        LEFT JOIN LATERAL (
          SELECT b.delivery_date,
-                cst.courier_name,
-                cst.courier_code,
-                cst.eta_from,
-                cst.eta_to,
-                cst.delivery_status
+               cst.courier_name,
+               cst.courier_code,
+               cst.eta_from,
+               cst.eta_to,
+               cst.delivery_status
          FROM delivery_batch_items di
          JOIN delivery_batch_customers cst ON cst.id = di.batch_customer_id
          JOIN delivery_batches b ON b.id = di.batch_id
          WHERE di.cart_item_id = c.id
+           AND cst.delivery_status IN (
+             'preparing_delivery',
+             'handing_to_courier',
+             'in_delivery'
+           )
          ORDER BY b.created_at DESC
          LIMIT 1
        ) AS delivery ON true
        WHERE c.user_id = $1
+         AND c.status <> 'delivered'
        ORDER BY
          CASE c.status
            WHEN 'pending_processing' THEN 0
@@ -276,6 +289,47 @@ router.get('/', authMiddleware, async (req, res) => {
          c.updated_at DESC,
          c.created_at DESC`,
       [userId]
+    );
+
+    const recentDeliveriesQ = await db.query(
+      `WITH latest_batches AS (
+         SELECT DISTINCT b.id,
+                b.delivery_date,
+                b.delivery_label,
+                COALESCE(b.completed_at, b.updated_at, b.created_at) AS completed_at
+         FROM delivery_batches b
+         JOIN delivery_batch_customers cst ON cst.batch_id = b.id
+         JOIN delivery_batch_items di ON di.batch_customer_id = cst.id
+         JOIN cart_items c ON c.id = di.cart_item_id
+         WHERE c.user_id = $1
+           AND c.status = 'delivered'
+           AND b.status = 'completed'
+         ORDER BY COALESCE(b.completed_at, b.updated_at, b.created_at) DESC, b.id DESC
+         LIMIT 2
+       )
+       SELECT lb.id::text AS batch_id,
+              lb.delivery_date,
+              lb.delivery_label,
+              lb.completed_at,
+              c.id AS cart_item_id,
+              c.product_id,
+              c.quantity,
+              c.status,
+              c.created_at,
+              c.updated_at,
+              p.product_code,
+              p.title,
+              p.description,
+              p.price,
+              p.image_url
+       FROM latest_batches lb
+       JOIN delivery_batch_items di ON di.batch_id = lb.id
+       JOIN cart_items c ON c.id = di.cart_item_id
+       JOIN products p ON p.id = c.product_id
+       WHERE c.user_id = $1
+         AND c.status = 'delivered'
+       ORDER BY lb.completed_at DESC, c.updated_at DESC, c.created_at DESC`,
+      [userId],
     );
 
     const grouped = new Map();
@@ -357,12 +411,47 @@ router.get('/', authMiddleware, async (req, res) => {
       .filter((item) => processedStatuses.has(item.status))
       .reduce((sum, item) => sum + item.line_total, 0);
 
+    const recentDeliveriesMap = new Map();
+    for (const row of recentDeliveriesQ.rows) {
+      const batchId = String(row.batch_id || '').trim();
+      if (!batchId) continue;
+      const normalized = {
+        ...row,
+        id: row.cart_item_id,
+        price: Number(row.price) || 0,
+        quantity: Number(row.quantity) || 0,
+      };
+      normalized.line_total = normalized.price * normalized.quantity;
+      if (!recentDeliveriesMap.has(batchId)) {
+        recentDeliveriesMap.set(batchId, {
+          batch_id: batchId,
+          delivery_date: row.delivery_date,
+          delivery_label: row.delivery_label,
+          completed_at: row.completed_at,
+          total_sum: 0,
+          items_count: 0,
+          items: [],
+        });
+      }
+      const bucket = recentDeliveriesMap.get(batchId);
+      bucket.total_sum += normalized.line_total;
+      bucket.items_count += normalized.quantity;
+      bucket.items.push(normalized);
+    }
+
+    const recentDeliveries = Array.from(recentDeliveriesMap.values()).sort((a, b) => {
+      const aTime = new Date(a.completed_at || a.delivery_date || 0).getTime();
+      const bTime = new Date(b.completed_at || b.delivery_date || 0).getTime();
+      return bTime - aTime;
+    });
+
     return res.json({
       ok: true,
       data: {
         items,
         total_sum: totalSum,
         processed_sum: processedSum,
+        recent_deliveries: recentDeliveries,
       },
     });
   } catch (err) {

@@ -357,6 +357,9 @@ async function canUserAccessChat(user, chatId) {
     // Делаем io доступным в express
     app.set("io", io);
     console.log("✅ Socket.io initialized");
+    if (typeof deliveryRoutes.startBackgroundTasks === "function") {
+      deliveryRoutes.startBackgroundTasks(io);
+    }
 
     // ===================================
     // SOCKET.IO MIDDLEWARE И HANDLERS

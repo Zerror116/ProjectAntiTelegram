@@ -81,6 +81,28 @@ function normalizeSettings(raw) {
   return raw;
 }
 
+function schedulePublishedMessages(io, published) {
+  if (!io || !Array.isArray(published) || published.length === 0) return;
+  published.forEach((item, index) => {
+    setTimeout(async () => {
+      try {
+        const msgRes = await db.query(
+          "SELECT id, chat_id, sender_id, text, meta, created_at FROM messages WHERE id = $1 LIMIT 1",
+          [item.message_id],
+        );
+        if (msgRes.rowCount === 0) return;
+        io.to(`chat:${item.channel_id}`).emit("chat:message", {
+          chatId: item.channel_id,
+          message: msgRes.rows[0],
+        });
+        io.emit("chat:updated", { chatId: item.channel_id });
+      } catch (err) {
+        console.error("admin.publish_pending emit error", err);
+      }
+    }, index * 1000);
+  });
+}
+
 function normalizeVisibility(value) {
   const v = String(value || "public")
     .toLowerCase()
@@ -1720,22 +1742,7 @@ router.post(
 
       await client.query("COMMIT");
 
-      const io = req.app.get("io");
-      if (io) {
-        for (const item of published) {
-          const msgRes = await db.query(
-            "SELECT id, chat_id, sender_id, text, meta, created_at FROM messages WHERE id = $1 LIMIT 1",
-            [item.message_id],
-          );
-          if (msgRes.rowCount > 0) {
-            io.to(`chat:${item.channel_id}`).emit("chat:message", {
-              chatId: item.channel_id,
-              message: msgRes.rows[0],
-            });
-            io.emit("chat:updated", { chatId: item.channel_id });
-          }
-        }
-      }
+      schedulePublishedMessages(req.app.get("io"), published);
 
       return res.json({
         ok: true,

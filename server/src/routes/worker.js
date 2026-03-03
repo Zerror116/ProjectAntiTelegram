@@ -76,6 +76,11 @@ function toPositiveInteger(value, fallback = 1) {
   return Math.floor(n);
 }
 
+function hasAtLeastTwoLetters(value) {
+  const letters = String(value || '').match(/[A-Za-zА-Яа-яЁё]/g) || [];
+  return letters.length >= 2;
+}
+
 async function allocateProductCode(client) {
   await client.query('LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE');
 
@@ -150,10 +155,28 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'c
     if (!q) return res.json({ ok: true, data: [] });
 
     const result = await db.query(
-      `SELECT id, product_code, title, description, price, quantity, image_url, status, updated_at
-       FROM products
-       WHERE title ILIKE $1 OR description ILIKE $1
-       ORDER BY updated_at DESC
+      `WITH ranked AS (
+         SELECT id,
+                product_code,
+                title,
+                description,
+                price,
+                quantity,
+                image_url,
+                status,
+                created_at,
+                updated_at,
+                ROW_NUMBER() OVER (
+                  PARTITION BY LOWER(TRIM(title))
+                  ORDER BY created_at DESC, updated_at DESC
+                ) AS title_rank
+         FROM products
+         WHERE title ILIKE $1 OR description ILIKE $1
+       )
+       SELECT id, product_code, title, description, price, quantity, image_url, status, created_at, updated_at
+       FROM ranked
+       WHERE title_rank <= 2
+       ORDER BY created_at DESC, updated_at DESC
        LIMIT 30`,
       [`%${q}%`]
     );
@@ -193,11 +216,24 @@ router.post(
       }
 
       const normalizedPrice = toPositiveNumber(price, -1);
-      if (normalizedPrice < 0) {
+      if (normalizedPrice <= 0) {
         removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Некорректная цена товара' });
+        return res.status(400).json({ ok: false, error: 'Цена товара должна быть больше нуля' });
       }
-      const normalizedQuantity = toPositiveInteger(quantity, 1);
+      const rawQuantity = quantity == null || quantity === '' ? 1 : Number(quantity);
+      if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
+        removeUploadedFile(req.file);
+        return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
+      }
+      const normalizedQuantity = Math.floor(rawQuantity);
+      const normalizedDescription = String(description || '').trim();
+      if (!hasAtLeastTwoLetters(normalizedDescription)) {
+        removeUploadedFile(req.file);
+        return res.status(400).json({
+          ok: false,
+          error: 'Описание должно содержать минимум 2 буквы',
+        });
+      }
 
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(client, req.user.id);
@@ -220,7 +256,7 @@ router.post(
         [
           uuidv4(),
           normalizedTitle,
-          String(description || '').trim(),
+          normalizedDescription,
           normalizedPrice,
           normalizedQuantity,
           imageUrl,
@@ -327,7 +363,10 @@ router.post(
       const nextTitle = String(title || current.title || '').trim();
       const nextDescription = String(description ?? current.description ?? '').trim();
       const nextPrice = price != null ? toPositiveNumber(price, -1) : Number(current.price);
-      const nextQuantity = quantity != null ? toPositiveInteger(quantity, 1) : Number(current.quantity || 1);
+      const nextQuantity =
+        quantity != null && quantity !== ''
+          ? Number(quantity)
+          : Number(current.quantity || 1);
       let nextImageUrl = current.image_url;
       if (req.file) {
         nextImageUrl = toAbsoluteImageUrl(req, req.file);
@@ -339,9 +378,23 @@ router.post(
         removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
       }
-      if (!Number.isFinite(nextPrice) || nextPrice < 0) {
+      if (!hasAtLeastTwoLetters(nextDescription)) {
         removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Некорректная цена товара' });
+        return res.status(400).json({
+          ok: false,
+          error: 'Описание должно содержать минимум 2 буквы',
+        });
+      }
+      if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+        removeUploadedFile(req.file);
+        return res.status(400).json({ ok: false, error: 'Цена товара должна быть больше нуля' });
+      }
+      if (!Number.isFinite(nextQuantity) || nextQuantity <= 0) {
+        removeUploadedFile(req.file);
+        return res.status(400).json({
+          ok: false,
+          error: 'Количество должно быть больше нуля',
+        });
       }
       if (!nextImageUrl) {
         removeUploadedFile(req.file);
@@ -364,7 +417,7 @@ router.post(
              updated_at = now()
          WHERE id = $7
          RETURNING id, product_code, title, description, price, quantity, image_url, status`,
-        [nextTitle, nextDescription, nextPrice, nextQuantity, nextImageUrl, nextCode, productId]
+        [nextTitle, nextDescription, nextPrice, Math.floor(nextQuantity), nextImageUrl, nextCode, productId]
       );
       const product = upd.rows[0];
 

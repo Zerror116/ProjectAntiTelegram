@@ -1,9 +1,9 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../main.dart';
 import '../widgets/input_language_badge.dart';
+import '../widgets/submit_on_enter.dart';
 
 class BugReportScreen extends StatefulWidget {
   const BugReportScreen({super.key});
@@ -22,11 +22,13 @@ class _BugReportScreenState extends State<BugReportScreen> {
   static const List<Map<String, String>> _templates = [
     {
       'title': 'Не открывается чат',
-      'body': 'Что не открывается:\nШаги:\nЧто должно было произойти:\nЧто произошло:',
+      'body':
+          'Что не открывается:\nШаги:\nЧто должно было произойти:\nЧто произошло:',
     },
     {
       'title': 'Ошибка корзины',
-      'body': 'Какой товар:\nЧто пытались сделать:\nЧто ожидали:\nЧто получили:',
+      'body':
+          'Какой товар:\nЧто пытались сделать:\nЧто ожидали:\nЧто получили:',
     },
     {
       'title': 'Проблема с уведомлением',
@@ -34,7 +36,8 @@ class _BugReportScreenState extends State<BugReportScreen> {
     },
     {
       'title': 'Другая проблема',
-      'body': 'Опишите проблему:\nШаги для повторения:\nОжидаемый результат:\nФактический результат:',
+      'body':
+          'Опишите проблему:\nШаги для повторения:\nОжидаемый результат:\nФактический результат:',
     },
   ];
 
@@ -55,21 +58,6 @@ class _BugReportScreenState extends State<BugReportScreen> {
       return e.message ?? 'Ошибка отправки';
     }
     return e.toString();
-  }
-
-  KeyEventResult _onInputKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    final isEnter =
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.numpadEnter;
-    if (!isEnter) return KeyEventResult.ignored;
-
-    final isShiftPressed = HardwareKeyboard.instance.isShiftPressed;
-    if (isShiftPressed) return KeyEventResult.ignored;
-
-    _send();
-    return KeyEventResult.handled;
   }
 
   Future<void> _send() async {
@@ -94,7 +82,7 @@ class _BugReportScreenState extends State<BugReportScreen> {
         if (!mounted) return;
         setState(
           () => _message =
-              'Сообщение отправлено. Его увидят администратор и создатель в отдельном служебном канале.',
+              'Сообщение отправлено. Его увидит администрация в отдельном служебном канале.',
         );
         showAppNotice(
           context,
@@ -176,8 +164,10 @@ class _BugReportScreenState extends State<BugReportScreen> {
               }).toList(),
             ),
             const SizedBox(height: 12),
-            Focus(
-              onKeyEvent: _onInputKey,
+            SubmitOnEnter(
+              controller: _controller,
+              enabled: !_sending,
+              onSubmit: _send,
               child: TextField(
                 focusNode: _focusNode,
                 controller: _controller,

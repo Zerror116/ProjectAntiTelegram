@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -29,6 +30,7 @@ class _AdminPanelState extends State<AdminPanel>
   final _channelTitleCtrl = TextEditingController();
   final _channelDescriptionCtrl = TextEditingController();
   final _deliveryThresholdCtrl = TextEditingController();
+  final _deliveryOriginCtrl = TextEditingController();
   final _courierNamesCtrl = TextEditingController();
 
   bool _loading = true;
@@ -42,8 +44,11 @@ class _AdminPanelState extends State<AdminPanel>
 
   String _message = '';
   String _newChannelVisibility = 'public';
-  String _deliveryViewMode = 'list';
+  String _deliveryViewMode = 'map';
+  String _deliveryOriginLabel = 'Точка отправки';
   String? _pendingFilterChannelId;
+  double? _deliveryOriginLat;
+  double? _deliveryOriginLng;
 
   List<Map<String, dynamic>> _channels = [];
   List<Map<String, dynamic>> _pendingPosts = [];
@@ -76,6 +81,7 @@ class _AdminPanelState extends State<AdminPanel>
     _channelTitleCtrl.dispose();
     _channelDescriptionCtrl.dispose();
     _deliveryThresholdCtrl.dispose();
+    _deliveryOriginCtrl.dispose();
     _courierNamesCtrl.dispose();
     super.dispose();
   }
@@ -363,7 +369,9 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   String _formatMoney(dynamic value) {
-    final n = (value is num) ? value.toDouble() : double.tryParse('$value') ?? 0;
+    final n = (value is num)
+        ? value.toDouble()
+        : double.tryParse('$value') ?? 0;
     return '${n.toStringAsFixed(2)} RUB';
   }
 
@@ -388,13 +396,26 @@ class _AdminPanelState extends State<AdminPanel>
     return palette[index % palette.length];
   }
 
-  Widget _buildDeliveryMapView(
-    Map<String, dynamic> activeBatch,
-    List<Map<String, dynamic>> customers,
-  ) {
+  Widget _buildDeliveryMapView(List<Map<String, dynamic>> customers) {
     final theme = Theme.of(context);
-    const samaraCenter = LatLng(53.195878, 50.100202);
-    final points = <LatLng>[samaraCenter];
+    final activeBatch = _deliveryActiveBatch;
+    final activeBatchId = (activeBatch?['id'] ?? '').toString();
+    final originLat =
+        _toNullableDouble(activeBatch?['route_origin_lat']) ??
+        _deliveryOriginLat ??
+        53.195878;
+    final originLng =
+        _toNullableDouble(activeBatch?['route_origin_lng']) ??
+        _deliveryOriginLng ??
+        50.100202;
+    final originLabel =
+        (activeBatch?['route_origin_label'] ?? _deliveryOriginLabel).toString();
+    final originAddress =
+        (activeBatch?['route_origin_address'] ?? _deliveryOriginCtrl.text)
+            .toString()
+            .trim();
+    final originPoint = LatLng(originLat, originLng);
+    final points = <LatLng>[originPoint];
     final markers = <Marker>[];
     final routes = <String, List<Map<String, dynamic>>>{};
 
@@ -406,12 +427,15 @@ class _AdminPanelState extends State<AdminPanel>
       points.add(point);
       final courierKey = (customer['courier_name'] ?? '').toString().trim();
       final routeKey = courierKey.isEmpty ? '_pending' : courierKey;
-      routes.putIfAbsent(routeKey, () => <Map<String, dynamic>>[]).add(customer);
+      routes
+          .putIfAbsent(routeKey, () => <Map<String, dynamic>>[])
+          .add(customer);
     }
 
     final polylines = <Polyline>[];
-    final routeEntries = routes.entries.where((entry) => entry.key != '_pending').toList()
-      ..sort((a, b) => a.key.compareTo(b.key));
+    final routeEntries =
+        routes.entries.where((entry) => entry.key != '_pending').toList()
+          ..sort((a, b) => a.key.compareTo(b.key));
 
     for (var index = 0; index < routeEntries.length; index += 1) {
       final entry = routeEntries[index];
@@ -422,7 +446,7 @@ class _AdminPanelState extends State<AdminPanel>
           final right = _toInt(b['route_order'], fallback: 9999);
           return left.compareTo(right);
         });
-      final routePoints = <LatLng>[samaraCenter];
+      final routePoints = <LatLng>[originPoint];
       for (final customer in ordered) {
         final lat = _toNullableDouble(customer['lat']);
         final lng = _toNullableDouble(customer['lng']);
@@ -451,57 +475,109 @@ class _AdminPanelState extends State<AdminPanel>
           ? theme.colorScheme.outline
           : _deliveryRouteColor(
               theme,
-              routeEntries.indexWhere((entry) => entry.key == courierName).clamp(
-                    0,
-                    routeEntries.isEmpty ? 0 : routeEntries.length - 1,
-                  ),
+              routeEntries
+                  .indexWhere((entry) => entry.key == courierName)
+                  .clamp(0, routeEntries.isEmpty ? 0 : routeEntries.length - 1),
             );
       markers.add(
         Marker(
           point: LatLng(lat, lng),
           width: 104,
           height: 58,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 30,
-                height: 30,
-                decoration: BoxDecoration(
-                  color: routeColor,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                ),
-                alignment: Alignment.center,
-                child: Text(
-                  courierName.isEmpty ? '?' : '$routeOrder',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w800,
+          child: GestureDetector(
+            onTap: activeBatchId.isEmpty
+                ? null
+                : () => _reassignDeliveryCustomer(activeBatchId, customer),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: routeColor,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 2),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    courierName.isEmpty ? '?' : '$routeOrder',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w800,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 4),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surface.withValues(alpha: 0.92),
-                  borderRadius: BorderRadius.circular(999),
-                  border: Border.all(color: theme.colorScheme.outlineVariant),
-                ),
-                child: Text(
-                  (customer['customer_name'] ?? 'Клиент').toString(),
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
+                const SizedBox(height: 4),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 3,
                   ),
-                  overflow: TextOverflow.ellipsis,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surface.withValues(alpha: 0.92),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
+                  ),
+                  child: Text(
+                    (customer['customer_name'] ?? 'Клиент').toString(),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       );
     }
+
+    markers.insert(
+      0,
+      Marker(
+        point: originPoint,
+        width: 150,
+        height: 70,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 2),
+              ),
+              alignment: Alignment.center,
+              child: const Icon(
+                Icons.warehouse_outlined,
+                color: Colors.white,
+                size: 18,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surface.withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              ),
+              child: Text(
+                originLabel,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -513,43 +589,57 @@ class _AdminPanelState extends State<AdminPanel>
             border: Border.all(color: theme.colorScheme.outlineVariant),
           ),
           clipBehavior: Clip.antiAlias,
-          child: points.length <= 1
-              ? Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
+          child: Stack(
+            children: [
+              FlutterMap(
+                options: MapOptions(
+                  initialCenter: originPoint,
+                  initialZoom: 8.4,
+                ),
+                children: [
+                  TileLayer(
+                    urlTemplate:
+                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    userAgentPackageName: 'projectantitelegram',
+                  ),
+                  RichAttributionWidget(
+                    attributions: [
+                      TextSourceAttribution(
+                        'OpenStreetMap contributors',
+                        textStyle: theme.textTheme.labelSmall,
+                      ),
+                    ],
+                  ),
+                  if (polylines.isNotEmpty) PolylineLayer(polylines: polylines),
+                  MarkerLayer(markers: markers),
+                ],
+              ),
+              if (points.length <= 1)
+                Positioned(
+                  right: 16,
+                  bottom: 16,
+                  child: Container(
+                    constraints: const BoxConstraints(maxWidth: 280),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surface.withValues(alpha: 0.92),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: theme.colorScheme.outlineVariant,
+                      ),
+                    ),
                     child: Text(
-                      'На карте пока нечего показывать.\n'
-                      'Нужны координаты адресов клиентов.',
-                      textAlign: TextAlign.center,
-                      style: theme.textTheme.bodyLarge?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                      'Карта Самарской области готова.\n'
+                      'Точки и линии появятся после подтверждения адресов.\n'
+                      '${originAddress.isNotEmpty ? 'Старт: $originAddress' : 'Старт пока не задан, используется центр Самары.'}',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurface,
                       ),
                     ),
                   ),
-                )
-              : FlutterMap(
-                  options: const MapOptions(
-                    initialCenter: samaraCenter,
-                    initialZoom: 10,
-                  ),
-                  children: [
-                    TileLayer(
-                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'projectantitelegram',
-                    ),
-                    RichAttributionWidget(
-                      attributions: [
-                        TextSourceAttribution(
-                          'OpenStreetMap contributors',
-                          textStyle: theme.textTheme.labelSmall,
-                        ),
-                      ],
-                    ),
-                    if (polylines.isNotEmpty)
-                      PolylineLayer(polylines: polylines),
-                    MarkerLayer(markers: markers),
-                  ],
                 ),
+            ],
+          ),
         ),
         const SizedBox(height: 12),
         Wrap(
@@ -558,12 +648,21 @@ class _AdminPanelState extends State<AdminPanel>
           children: [
             for (var index = 0; index < routeEntries.length; index += 1)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
-                  color: _deliveryRouteColor(theme, index).withValues(alpha: 0.12),
+                  color: _deliveryRouteColor(
+                    theme,
+                    index,
+                  ).withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(
-                    color: _deliveryRouteColor(theme, index).withValues(alpha: 0.45),
+                    color: _deliveryRouteColor(
+                      theme,
+                      index,
+                    ).withValues(alpha: 0.45),
                   ),
                 ),
                 child: Text(
@@ -576,7 +675,10 @@ class _AdminPanelState extends State<AdminPanel>
               ),
             if (routes.containsKey('_pending'))
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
                   color: theme.colorScheme.surfaceContainerHighest,
                   borderRadius: BorderRadius.circular(12),
@@ -593,7 +695,7 @@ class _AdminPanelState extends State<AdminPanel>
         ),
         const SizedBox(height: 8),
         Text(
-          'Карта Самарской области для текущего листа доставки. Линии показывают автоматическую раскладку адресов по курьерам.',
+          'Карта Самарской области для текущего листа доставки. Маршрут начинается от точки отправки, старается делить доставки поровну и уменьшать пересечения. Нажми на точку клиента, чтобы перекинуть его на другого курьера.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -635,6 +737,12 @@ class _AdminPanelState extends State<AdminPanel>
         return 'Передается курьеру';
       case 'in_delivery':
         return 'У курьера';
+      case 'completed':
+        return 'Доставлено';
+      case 'returned_to_cart':
+        return 'Вернули в корзину';
+      case 'removed':
+        return 'Убрали из маршрута';
       case 'pending':
       default:
         return 'Еще не отправлено';
@@ -654,21 +762,34 @@ class _AdminPanelState extends State<AdminPanel>
         final payload = Map<String, dynamic>.from(data['data']);
         final settings = _asMap(payload['settings']);
         final threshold = settings['threshold_amount'];
-        _deliveryThresholdCtrl.text = _toInt(threshold, fallback: 1500).toString();
+        final originAddress = (settings['route_origin_address'] ?? '')
+            .toString();
+        final originLabel = (settings['route_origin_label'] ?? 'Точка отправки')
+            .toString();
+        _deliveryThresholdCtrl.text = _toInt(
+          threshold,
+          fallback: 1500,
+        ).toString();
+        _deliveryOriginCtrl.text = originAddress;
         if (mounted) {
           setState(() {
             _deliveryBatches = _asMapList(payload['batches']);
             _deliveryActiveBatch = payload['active_batch'] is Map
                 ? Map<String, dynamic>.from(payload['active_batch'])
                 : null;
+            _deliveryOriginLabel = originLabel;
+            _deliveryOriginLat = _toNullableDouble(
+              settings['route_origin_lat'],
+            );
+            _deliveryOriginLng = _toNullableDouble(
+              settings['route_origin_lng'],
+            );
           });
         }
       }
     } catch (e) {
       if (mounted) {
-        setState(
-          () => _message = 'Ошибка доставки: ${_extractDioError(e)}',
-        );
+        setState(() => _message = 'Ошибка доставки: ${_extractDioError(e)}');
       }
     } finally {
       if (mounted) {
@@ -683,6 +804,7 @@ class _AdminPanelState extends State<AdminPanel>
       setState(() => _message = 'Введите корректную сумму для доставки');
       return;
     }
+    final originAddress = _deliveryOriginCtrl.text.trim();
     setState(() {
       _deliverySaving = true;
       _message = '';
@@ -690,7 +812,11 @@ class _AdminPanelState extends State<AdminPanel>
     try {
       await authService.dio.patch(
         '/api/admin/delivery/settings',
-        data: {'threshold_amount': threshold},
+        data: {
+          'threshold_amount': threshold,
+          'route_origin_label': _deliveryOriginLabel,
+          'route_origin_address': originAddress,
+        },
       );
       await _loadDeliveryDashboard();
       if (mounted) {
@@ -739,7 +865,7 @@ class _AdminPanelState extends State<AdminPanel>
             () => _message = sentTotal > 0 || addedTotal > 0
                 ? 'Рассылка отправлена: $sentTotal${addedTotal > 0 ? ' (добавлено в лист: $addedTotal)' : ''}'
                 : (payload['message']?.toString() ??
-                    'Нет клиентов для рассылки'),
+                      'Нет клиентов для рассылки'),
           );
         }
       }
@@ -774,7 +900,9 @@ class _AdminPanelState extends State<AdminPanel>
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _message = 'Ошибка очистки доставки: ${_extractDioError(e)}');
+        setState(
+          () => _message = 'Ошибка очистки доставки: ${_extractDioError(e)}',
+        );
       }
     } finally {
       if (mounted) {
@@ -783,26 +911,90 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
-  Future<String?> _askDeliveryAddress({
-    required String initialValue,
+  String _trimClockValue(String raw) {
+    final value = raw.trim();
+    if (value.isEmpty) return '';
+    final match = RegExp(r'^(\d{1,2}):(\d{2})$').firstMatch(value);
+    if (match == null) return value;
+    final hours = int.tryParse(match.group(1) ?? '');
+    final minutes = int.tryParse(match.group(2) ?? '');
+    if (hours == null || minutes == null) return value;
+    return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}';
+  }
+
+  Future<Map<String, String>?> _askDeliveryDecisionData({
+    required String initialAddress,
+    required String initialAfter,
+    required String initialBefore,
     required String title,
   }) async {
-    final controller = TextEditingController(text: initialValue);
-    final result = await showDialog<String>(
+    final addressCtrl = TextEditingController(text: initialAddress);
+    final afterCtrl = TextEditingController(text: initialAfter);
+    final beforeCtrl = TextEditingController(text: initialBefore);
+    final result = await showDialog<Map<String, String>>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(title),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          minLines: 2,
-          maxLines: 4,
-          decoration: withInputLanguageBadge(
-            const InputDecoration(
-              hintText: 'Самара, улица, дом, подъезд',
-              border: OutlineInputBorder(),
-            ),
-            controller: controller,
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: addressCtrl,
+                autofocus: true,
+                minLines: 2,
+                maxLines: 4,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    hintText: 'Самара, улица, дом, подъезд',
+                    border: OutlineInputBorder(),
+                    labelText: 'Адрес доставки',
+                  ),
+                  controller: addressCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: afterCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          hintText: '10:00',
+                          labelText: 'После',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: afterCtrl,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextField(
+                      controller: beforeCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          hintText: '16:00',
+                          labelText: 'До',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: beforeCtrl,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Оставь время пустым, если клиенту без разницы. Базовое окно доставки: 10:00-16:00.',
+                  style: Theme.of(ctx).textTheme.bodySmall,
+                ),
+              ),
+            ],
           ),
         ),
         actions: [
@@ -811,13 +1003,96 @@ class _AdminPanelState extends State<AdminPanel>
             child: const Text('Отмена'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            onPressed: () => Navigator.of(ctx).pop({
+              'address_text': addressCtrl.text.trim(),
+              'preferred_time_from': _trimClockValue(afterCtrl.text),
+              'preferred_time_to': _trimClockValue(beforeCtrl.text),
+            }),
             child: const Text('Сохранить'),
           ),
         ],
       ),
     );
-    return result?.trim();
+    return result;
+  }
+
+  Future<Map<String, dynamic>?> _askDeliveryLogisticsData(
+    Map<String, dynamic> customer,
+  ) async {
+    final packageCtrl = TextEditingController(
+      text: _toInt(customer['package_places'], fallback: 1).toString(),
+    );
+    final bulkyCountCtrl = TextEditingController(
+      text: _toInt(customer['bulky_places'], fallback: 0).toString(),
+    );
+    final bulkyNoteCtrl = TextEditingController(
+      text: (customer['bulky_note'] ?? '').toString(),
+    );
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Логистика клиента'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: packageCtrl,
+                keyboardType: TextInputType.number,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Сколько мест',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: packageCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: bulkyCountCtrl,
+                keyboardType: TextInputType.number,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Количество габаритов',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: bulkyCountCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: bulkyNoteCtrl,
+                minLines: 2,
+                maxLines: 4,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Что относится к габариту',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: bulkyNoteCtrl,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop({
+              'package_places': int.tryParse(packageCtrl.text.trim()) ?? 0,
+              'bulky_places': int.tryParse(bulkyCountCtrl.text.trim()) ?? 0,
+              'bulky_note': bulkyNoteCtrl.text.trim(),
+            }),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+    return result;
   }
 
   Future<void> _setDeliveryDecision(
@@ -829,13 +1104,23 @@ class _AdminPanelState extends State<AdminPanel>
     if (customerId.isEmpty) return;
 
     String addressText = '';
+    String preferredTimeFrom = '';
+    String preferredTimeTo = '';
     if (accepted) {
-      final result = await _askDeliveryAddress(
-        initialValue: (customer['address_text'] ?? '').toString(),
+      final result = await _askDeliveryDecisionData(
+        initialAddress: (customer['address_text'] ?? '').toString(),
+        initialAfter: ((customer['preferred_time_from'] ?? '').toString())
+            .replaceAll(':00.000000', '')
+            .replaceAll(':00', ''),
+        initialBefore: ((customer['preferred_time_to'] ?? '').toString())
+            .replaceAll(':00.000000', '')
+            .replaceAll(':00', ''),
         title: 'Адрес доставки',
       );
-      if (result == null || result.isEmpty) return;
-      addressText = result;
+      if (result == null || (result['address_text'] ?? '').isEmpty) return;
+      addressText = (result['address_text'] ?? '').trim();
+      preferredTimeFrom = (result['preferred_time_from'] ?? '').trim();
+      preferredTimeTo = (result['preferred_time_to'] ?? '').trim();
     }
 
     setState(() {
@@ -848,6 +1133,10 @@ class _AdminPanelState extends State<AdminPanel>
         data: {
           'accepted': accepted,
           if (accepted) 'address_text': addressText,
+          if (accepted && preferredTimeFrom.isNotEmpty)
+            'preferred_time_from': preferredTimeFrom,
+          if (accepted && preferredTimeTo.isNotEmpty)
+            'preferred_time_to': preferredTimeTo,
         },
       );
       await _loadDeliveryDashboard();
@@ -873,6 +1162,356 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
+  String _formatClockLabel(dynamic raw) {
+    final value = (raw ?? '').toString().trim();
+    if (value.isEmpty) return '';
+    if (value.length >= 5 && value[2] == ':') {
+      return value.substring(0, 5);
+    }
+    return value;
+  }
+
+  Future<void> _editDeliveryLogistics(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (customerId.isEmpty) return;
+    final result = await _askDeliveryLogisticsData(customer);
+    if (result == null) return;
+
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/logistics',
+        data: result,
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Логистика клиента обновлена');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка логистики: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _manualAddDeliveryCustomer(String batchId) async {
+    final phoneCtrl = TextEditingController();
+    final addressCtrl = TextEditingController();
+    final afterCtrl = TextEditingController();
+    final beforeCtrl = TextEditingController();
+    final packageCtrl = TextEditingController(text: '1');
+    final bulkyCountCtrl = TextEditingController(text: '0');
+    final bulkyNoteCtrl = TextEditingController();
+
+    final payload = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Добавить клиента по телефону'),
+        content: SizedBox(
+          width: 460,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: phoneCtrl,
+                  keyboardType: TextInputType.phone,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Номер телефона',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: phoneCtrl,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: addressCtrl,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Адрес доставки',
+                      hintText: 'Самара, улица, дом, подъезд',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: addressCtrl,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: afterCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'После',
+                            hintText: '10:00',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: afterCtrl,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        controller: beforeCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'До',
+                            hintText: '16:00',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: beforeCtrl,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: packageCtrl,
+                        keyboardType: TextInputType.number,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Сколько мест',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: packageCtrl,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        controller: bulkyCountCtrl,
+                        keyboardType: TextInputType.number,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Габаритов',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: bulkyCountCtrl,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: bulkyNoteCtrl,
+                  minLines: 2,
+                  maxLines: 3,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Описание габарита',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: bulkyNoteCtrl,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop({
+              'phone': phoneCtrl.text.trim(),
+              'address_text': addressCtrl.text.trim(),
+              'preferred_time_from': _trimClockValue(afterCtrl.text),
+              'preferred_time_to': _trimClockValue(beforeCtrl.text),
+              'package_places': int.tryParse(packageCtrl.text.trim()) ?? 0,
+              'bulky_places': int.tryParse(bulkyCountCtrl.text.trim()) ?? 0,
+              'bulky_note': bulkyNoteCtrl.text.trim(),
+            }),
+            child: const Text('Добавить'),
+          ),
+        ],
+      ),
+    );
+    if (payload == null) return;
+
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/manual-add',
+        data: payload,
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Клиент добавлен в доставку');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка добавления клиента: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<bool> _downloadDeliveryExcel(String batchId) async {
+    if (batchId.trim().isEmpty) return false;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get<List<int>>(
+        '/api/admin/delivery/batches/$batchId/export',
+        options: Options(responseType: ResponseType.bytes),
+      );
+      final bytes = resp.data;
+      if (bytes == null || bytes.isEmpty) {
+        throw Exception('Пустой файл Excel');
+      }
+      if (kIsWeb) {
+        throw Exception('Excel-экспорт сейчас доступен в desktop версии');
+      }
+      final filePath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Сохранить Excel доставки',
+        fileName: 'delivery_$batchId.xlsx',
+        type: FileType.custom,
+        allowedExtensions: const ['xlsx'],
+      );
+      if (filePath == null || filePath.trim().isEmpty) {
+        if (mounted) {
+          setState(() => _message = 'Сохранение Excel отменено');
+        }
+        return false;
+      }
+      final file = File(filePath);
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(bytes, flush: true);
+      if (mounted) {
+        setState(() => _message = 'Excel сохранен: $filePath');
+      }
+      return true;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка Excel: ${_extractDioError(e)}');
+      }
+      return false;
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _reassignDeliveryCustomer(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    final courierNames = (_deliveryActiveBatch?['courier_names'] is List)
+        ? List<String>.from(
+            (_deliveryActiveBatch?['courier_names'] as List).map(
+              (item) => item.toString(),
+            ),
+          )
+        : const <String>[];
+    if (courierNames.isEmpty) {
+      setState(
+        () => _message =
+            'Сначала нажми "Распределить по курьерам", чтобы появилась сетка курьеров',
+      );
+      return;
+    }
+
+    final currentCourier = (customer['locked_courier_name'] ?? '')
+        .toString()
+        .trim();
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text(
+          'Курьер для ${(customer['customer_name'] ?? 'клиента').toString()}',
+        ),
+        children: [
+          for (final courier in courierNames)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(ctx).pop(courier),
+              child: Row(
+                children: [
+                  Icon(
+                    courier == currentCourier
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_off,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(courier)),
+                ],
+              ),
+            ),
+          const Divider(height: 1),
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(ctx).pop(''),
+            child: const Text('Авто-распределение'),
+          ),
+        ],
+      ),
+    );
+    if (selected == null) return;
+
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (customerId.isEmpty) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/reassign',
+        data: {if (selected.isNotEmpty) 'courier_name': selected},
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(
+          () => _message = selected.isEmpty
+              ? 'Клиент возвращен в авто-распределение'
+              : 'Клиент закреплен за курьером $selected',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка смены курьера: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
   Future<void> _assignCouriers(String batchId) async {
     final courierNames = _courierNamesCtrl.text
         .split('\n')
@@ -880,7 +1519,9 @@ class _AdminPanelState extends State<AdminPanel>
         .where((line) => line.isNotEmpty)
         .toList();
     if (courierNames.isEmpty) {
-      setState(() => _message = 'Введите имена курьеров, каждое с новой строки');
+      setState(
+        () => _message = 'Введите имена курьеров, каждое с новой строки',
+      );
       return;
     }
     setState(() {
@@ -893,8 +1534,16 @@ class _AdminPanelState extends State<AdminPanel>
         data: {'courier_names': courierNames},
       );
       await _loadDeliveryDashboard();
+      var excelSaved = true;
+      if (!kIsWeb) {
+        excelSaved = await _downloadDeliveryExcel(batchId);
+      }
       if (mounted) {
-        setState(() => _message = 'Курьеры назначены');
+        setState(
+          () => _message = excelSaved
+              ? 'Маршрут собран и Excel подготовлен'
+              : _message,
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -923,6 +1572,95 @@ class _AdminPanelState extends State<AdminPanel>
     } catch (e) {
       if (mounted) {
         setState(() => _message = 'Ошибка передачи: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _completeDeliveryBatch(String batchId) async {
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/complete',
+      );
+      await _loadDeliveryDashboard();
+      var excelSaved = true;
+      if (!kIsWeb) {
+        excelSaved = await _downloadDeliveryExcel(batchId);
+      }
+      if (mounted) {
+        setState(
+          () => _message = excelSaved
+              ? 'Доставка завершена, архив Excel сохранен'
+              : 'Доставка завершена',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка завершения доставки: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _removeDeliveryCustomerFromRoute(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (customerId.isEmpty) return;
+    final name = (customer['customer_name'] ?? 'клиента').toString();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Убрать из маршрута'),
+        content: Text(
+          'Вернуть $name обратно в корзину и на полку?\n'
+          'Товары исчезнут из текущего маршрута доставки.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Вернуть в корзину'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/remove-from-route',
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Клиент возвращен из маршрута в корзину');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () =>
+              _message = 'Ошибка возврата из маршрута: ${_extractDioError(e)}',
+        );
       }
     } finally {
       if (mounted) {
@@ -2308,7 +3046,9 @@ class _AdminPanelState extends State<AdminPanel>
                 alignment: Alignment.centerLeft,
                 child: Text(
                   description,
-                  style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
             ),
@@ -2683,7 +3423,9 @@ class _AdminPanelState extends State<AdminPanel>
     final theme = Theme.of(context);
     final name = (customer['customer_name'] ?? 'Клиент').toString();
     final phone = (customer['customer_phone'] ?? '—').toString();
-    final sum = _formatMoney(customer['processed_sum']);
+    final sum = _formatMoney(
+      customer['agreed_sum'] ?? customer['processed_sum'],
+    );
     final shelf = (customer['shelf_number'] ?? 'не назначена').toString();
     final address = (customer['address_text'] ?? '').toString().trim();
     final status = _deliveryCustomerStatusLabel(
@@ -2693,10 +3435,29 @@ class _AdminPanelState extends State<AdminPanel>
     final routeOrder = (customer['route_order'] ?? '').toString().trim();
     final etaFrom = _formatDateTimeLabel(customer['eta_from']);
     final etaTo = _formatDateTimeLabel(customer['eta_to']);
+    final preferredAfter = _formatClockLabel(customer['preferred_time_from']);
+    final preferredBefore = _formatClockLabel(customer['preferred_time_to']);
+    final lockedCourierName = (customer['locked_courier_name'] ?? '')
+        .toString()
+        .trim();
+    final packagePlaces = _toInt(customer['package_places'], fallback: 1);
+    final bulkyPlaces = _toInt(customer['bulky_places'], fallback: 0);
+    final bulkyNote = (customer['bulky_note'] ?? '').toString().trim();
     final items = _asMapList(customer['items']);
+    final itemsCount = items.fold<int>(
+      0,
+      (sum, item) => sum + _toInt(item['quantity'], fallback: 0),
+    );
 
     final callStatus = (customer['call_status'] ?? '').toString().trim();
     final canManualDecide = callStatus == 'pending';
+    final batchStatus = (_deliveryActiveBatch?['status'] ?? '')
+        .toString()
+        .trim();
+    final canRemoveFromRoute =
+        callStatus == 'accepted' &&
+        batchStatus != 'completed' &&
+        batchStatus != 'cancelled';
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       child: Padding(
@@ -2712,21 +3473,42 @@ class _AdminPanelState extends State<AdminPanel>
             ),
             const SizedBox(height: 4),
             Text('Телефон: $phone'),
-            Text('Сумма обработанного: $sum'),
+            Text('Сумма в доставке: $sum'),
             Text('Полка: $shelf'),
             Text('Статус доставки: $status'),
             Text(
-              'Ответ в личке: ${callStatus == 'accepted' ? 'Согласен' : callStatus == 'declined' ? 'Отказался' : callStatus == 'pending' ? 'Ожидаем ответ' : '—'}',
+              'Ответ в личке: ${callStatus == 'accepted'
+                  ? 'Согласен'
+                  : callStatus == 'declined'
+                  ? 'Отказался'
+                  : callStatus == 'removed'
+                  ? 'Убрали из маршрута'
+                  : callStatus == 'pending'
+                  ? 'Ожидаем ответ'
+                  : '—'}',
             ),
             if (address.isNotEmpty) Text('Адрес: $address'),
+            if (preferredAfter.isNotEmpty || preferredBefore.isNotEmpty)
+              Text(
+                'Пожелание по времени: ${[if (preferredAfter.isNotEmpty) 'после $preferredAfter', if (preferredBefore.isNotEmpty) 'до $preferredBefore'].join(', ')}',
+              ),
             if (courierName.isNotEmpty) Text('Курьер: $courierName'),
+            if (lockedCourierName.isNotEmpty)
+              Text('Закреплен за курьером: $lockedCourierName'),
             if (routeOrder.isNotEmpty) Text('Порядок по маршруту: $routeOrder'),
             if (etaFrom.isNotEmpty || etaTo.isNotEmpty)
               Text('Окно доставки: $etaFrom - $etaTo'),
+            Text('Мест: $packagePlaces'),
+            if (bulkyPlaces > 0 || bulkyNote.isNotEmpty)
+              Text(
+                bulkyNote.isNotEmpty
+                    ? 'Габарит ($bulkyPlaces): $bulkyNote'
+                    : 'Габарит: $bulkyPlaces',
+              ),
             if (items.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(
-                'Товары: ${items.length}',
+                'Товаров по штукам: $itemsCount',
                 style: theme.textTheme.labelLarge?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -2760,6 +3542,64 @@ class _AdminPanelState extends State<AdminPanel>
                     icon: const Icon(Icons.cancel_outlined),
                     label: const Text('Отказать за клиента'),
                   ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving
+                        ? null
+                        : () => _editDeliveryLogistics(batchId, customer),
+                    icon: const Icon(Icons.inventory_2_outlined),
+                    label: const Text('Логистика'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving
+                        ? null
+                        : () => _reassignDeliveryCustomer(batchId, customer),
+                    icon: const Icon(Icons.swap_horiz_outlined),
+                    label: const Text('Курьер'),
+                  ),
+                  if (canRemoveFromRoute)
+                    OutlinedButton.icon(
+                      onPressed: _deliverySaving
+                          ? null
+                          : () => _removeDeliveryCustomerFromRoute(
+                              batchId,
+                              customer,
+                            ),
+                      icon: const Icon(Icons.undo_rounded),
+                      label: const Text('Вернуть в корзину'),
+                    ),
+                ],
+              ),
+            ] else ...[
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving
+                        ? null
+                        : () => _editDeliveryLogistics(batchId, customer),
+                    icon: const Icon(Icons.inventory_2_outlined),
+                    label: const Text('Логистика'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving
+                        ? null
+                        : () => _reassignDeliveryCustomer(batchId, customer),
+                    icon: const Icon(Icons.swap_horiz_outlined),
+                    label: const Text('Курьер'),
+                  ),
+                  if (canRemoveFromRoute)
+                    OutlinedButton.icon(
+                      onPressed: _deliverySaving
+                          ? null
+                          : () => _removeDeliveryCustomerFromRoute(
+                              batchId,
+                              customer,
+                            ),
+                      icon: const Icon(Icons.undo_rounded),
+                      label: const Text('Вернуть в корзину'),
+                    ),
                 ],
               ),
             ],
@@ -2791,6 +3631,21 @@ class _AdminPanelState extends State<AdminPanel>
             ),
           ),
           const SizedBox(height: 12),
+          TextField(
+            controller: _deliveryOriginCtrl,
+            minLines: 2,
+            maxLines: 3,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Точка отправки курьеров',
+                hintText: 'Самара, адрес склада или точки старта',
+                border: OutlineInputBorder(),
+                helperText: 'Отсюда начинается маршрут каждого курьера',
+              ),
+              controller: _deliveryOriginCtrl,
+            ),
+          ),
+          const SizedBox(height: 12),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
@@ -2804,9 +3659,10 @@ class _AdminPanelState extends State<AdminPanel>
                   SizedBox(height: 8),
                   Text(
                     '1. Сохрани порог суммы для доставки.\n'
-                    '2. Нажми "Отправить рассылку" — система сама напишет клиентам в личные сообщения.\n'
-                    '3. Клиент ответит Да или Нет. Если Да, он сразу отправит адрес.\n'
-                    '4. Здесь появится его ответ, адрес и готовность к передаче курьеру.',
+                    '2. Укажи точку отправки курьеров.\n'
+                    '3. Нажми "Отправить рассылку" — система сама напишет клиентам в личные сообщения.\n'
+                    '4. Клиент ответит Да или Нет. Если Да, он сразу отправит адрес и пожелание по времени.\n'
+                    '5. Здесь можно вручную добавить клиента по телефону, поправить логистику и выгрузить Excel.',
                   ),
                 ],
               ),
@@ -2819,7 +3675,9 @@ class _AdminPanelState extends State<AdminPanel>
                 child: FilledButton.icon(
                   onPressed: _deliverySaving ? null : _saveDeliverySettings,
                   icon: const Icon(Icons.save_outlined),
-                  label: Text(_deliverySaving ? 'Сохранение...' : 'Сохранить порог'),
+                  label: Text(
+                    _deliverySaving ? 'Сохранение...' : 'Сохранить порог',
+                  ),
                 ),
               ),
               const SizedBox(width: 12),
@@ -2842,21 +3700,45 @@ class _AdminPanelState extends State<AdminPanel>
             ),
           ),
           const SizedBox(height: 16),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment<String>(
+                value: 'list',
+                icon: Icon(Icons.view_agenda_outlined),
+                label: Text('Список'),
+              ),
+              ButtonSegment<String>(
+                value: 'map',
+                icon: Icon(Icons.map_outlined),
+                label: Text('Карта'),
+              ),
+            ],
+            selected: {_deliveryViewMode},
+            onSelectionChanged: (selection) {
+              setState(() => _deliveryViewMode = selection.first);
+            },
+          ),
+          const SizedBox(height: 12),
           if (_deliveryLoading && activeBatch == null)
-            const Center(child: Padding(
-              padding: EdgeInsets.symmetric(vertical: 24),
-              child: CircularProgressIndicator(),
-            ))
-          else if (activeBatch == null)
-            const Card(
+            const Center(
               child: Padding(
-                padding: EdgeInsets.all(16),
-                child: Text(
-                  'Активного листа доставки пока нет.\nСистема возьмет клиентов, у которых сумма обработанных товаров достигла порога.',
-                ),
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: CircularProgressIndicator(),
               ),
             )
-          else ...[
+          else if (activeBatch == null) ...[
+            if (_deliveryViewMode == 'map')
+              _buildDeliveryMapView(const [])
+            else
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Text(
+                    'Активного листа доставки пока нет.\nСистема возьмет клиентов, у которых сумма обработанных товаров достигла порога.',
+                  ),
+                ),
+              ),
+          ] else ...[
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
@@ -2864,22 +3746,30 @@ class _AdminPanelState extends State<AdminPanel>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      (activeBatch['delivery_label'] ?? 'Лист доставки').toString(),
+                      (activeBatch['delivery_label'] ?? 'Лист доставки')
+                          .toString(),
                       style: Theme.of(context).textTheme.titleLarge?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Text('Дата: ${(activeBatch['delivery_date'] ?? '').toString()}'),
+                    Text(
+                      'Дата: ${(activeBatch['delivery_date'] ?? '').toString()}',
+                    ),
                     Text(
                       'Статус: ${_deliveryBatchStatusLabel((activeBatch['status'] ?? '').toString())}',
                     ),
                     Text(
                       'Клиентов: ${activeBatch['customers_total'] ?? customers.length}',
                     ),
-                    Text(
-                      'Подтвердили: ${activeBatch['accepted_total'] ?? 0}',
-                    ),
+                    Text('Подтвердили: ${activeBatch['accepted_total'] ?? 0}'),
+                    if (((activeBatch['route_origin_address'] ?? '')
+                            .toString()
+                            .trim())
+                        .isNotEmpty)
+                      Text(
+                        'Старт маршрута: ${(activeBatch['route_origin_address'] ?? '').toString()}',
+                      ),
                     const SizedBox(height: 12),
                     TextField(
                       controller: _courierNamesCtrl,
@@ -2910,11 +3800,44 @@ class _AdminPanelState extends State<AdminPanel>
                         OutlinedButton.icon(
                           onPressed: _deliverySaving
                               ? null
+                              : () => _manualAddDeliveryCustomer(
+                                  (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.person_add_alt_1_outlined),
+                          label: const Text('Добавить клиента'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed:
+                              _deliverySaving ||
+                                  (activeBatch['status'] ?? '').toString() ==
+                                      'completed'
+                              ? null
                               : () => _confirmDeliveryHandoff(
                                   (activeBatch['id'] ?? '').toString(),
                                 ),
                           icon: const Icon(Icons.done_all_outlined),
                           label: const Text('Передать курьерам'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed:
+                              _deliverySaving ||
+                                  (activeBatch['status'] ?? '').toString() !=
+                                      'handed_off'
+                              ? null
+                              : () => _completeDeliveryBatch(
+                                  (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.assignment_turned_in_outlined),
+                          label: const Text('Курьер закончил доставку'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _deliverySaving
+                              ? null
+                              : () => _downloadDeliveryExcel(
+                                  (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.table_view_outlined),
+                          label: const Text('Excel'),
                         ),
                       ],
                     ),
@@ -2923,27 +3846,8 @@ class _AdminPanelState extends State<AdminPanel>
               ),
             ),
             const SizedBox(height: 12),
-            SegmentedButton<String>(
-              segments: const [
-                ButtonSegment<String>(
-                  value: 'list',
-                  icon: Icon(Icons.view_agenda_outlined),
-                  label: Text('Список'),
-                ),
-                ButtonSegment<String>(
-                  value: 'map',
-                  icon: Icon(Icons.map_outlined),
-                  label: Text('Карта'),
-                ),
-              ],
-              selected: {_deliveryViewMode},
-              onSelectionChanged: (selection) {
-                setState(() => _deliveryViewMode = selection.first);
-              },
-            ),
-            const SizedBox(height: 12),
             if (_deliveryViewMode == 'map')
-              _buildDeliveryMapView(activeBatch, customers)
+              _buildDeliveryMapView(customers)
             else
               ...customers.map(
                 (customer) => _buildDeliveryCustomerCard(

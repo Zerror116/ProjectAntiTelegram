@@ -21,6 +21,7 @@ class _CartScreenState extends State<CartScreen> {
   bool _reloadQueued = false;
   String _error = '';
   List<Map<String, dynamic>> _items = [];
+  List<Map<String, dynamic>> _recentDeliveries = [];
   double _total = 0;
   double _processed = 0;
   StreamSubscription? _eventsSub;
@@ -52,6 +53,9 @@ class _CartScreenState extends State<CartScreen> {
   void _applyPayload(Map<String, dynamic> payload) {
     _items = payload['items'] is List
         ? List<Map<String, dynamic>>.from(payload['items'])
+        : [];
+    _recentDeliveries = payload['recent_deliveries'] is List
+        ? List<Map<String, dynamic>>.from(payload['recent_deliveries'])
         : [];
     _total = (payload['total_sum'] is num)
         ? (payload['total_sum'] as num).toDouble()
@@ -130,6 +134,8 @@ class _CartScreenState extends State<CartScreen> {
         return 'Обработан';
       case 'in_delivery':
         return 'В доставке';
+      case 'delivered':
+        return 'Доставлено';
       case 'pending_processing':
       default:
         return 'Ожидание обработки';
@@ -146,6 +152,8 @@ class _CartScreenState extends State<CartScreen> {
         return const Color(0xFF2E7D32);
       case 'in_delivery':
         return const Color(0xFF1565C0);
+      case 'delivered':
+        return const Color(0xFF6D4C41);
       case 'pending_processing':
       default:
         return const Color(0xFFEF6C00);
@@ -512,6 +520,87 @@ class _CartScreenState extends State<CartScreen> {
     );
   }
 
+  String _formatShortDeliveryDate(dynamic raw) {
+    final parsed = DateTime.tryParse('${raw ?? ''}');
+    if (parsed == null) return 'Доставка';
+    return _formatDeliveryEta(parsed).split(',').first;
+  }
+
+  Widget _buildRecentDeliveryCard(Map<String, dynamic> delivery) {
+    final theme = Theme.of(context);
+    final label = (delivery['delivery_label'] ?? 'Доставка').toString();
+    final dateLabel = _formatShortDeliveryDate(delivery['delivery_date']);
+    final total = _formatMoney(delivery['total_sum']);
+    final itemsCount = (delivery['items_count'] is num)
+        ? (delivery['items_count'] as num).toInt()
+        : int.tryParse('${delivery['items_count'] ?? 0}') ?? 0;
+    final items = delivery['items'] is List
+        ? List<Map<String, dynamic>>.from(delivery['items'])
+        : const <Map<String, dynamic>>[];
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Theme(
+        data: theme.copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          title: Text(
+            '$label • $dateLabel',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          subtitle: Text('Сумма: $total • Товаров: $itemsCount'),
+          children: items.map((item) {
+            final imageUrl = _resolveImageUrl(
+              (item['image_url'] ?? '').toString(),
+            );
+            final quantity = (item['quantity'] is num)
+                ? (item['quantity'] as num).toInt()
+                : int.tryParse('${item['quantity']}') ?? 0;
+            final lineTotal = (item['line_total'] is num)
+                ? (item['line_total'] as num).toDouble()
+                : double.tryParse('${item['line_total'] ?? 0}') ?? 0;
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildImage(imageUrl),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          (item['title'] ?? 'Товар').toString(),
+                          style: theme.textTheme.bodyLarge?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            _infoChip('Количество', '$quantity'),
+                            _infoChip('Сумма', _formatMoney(lineTotal)),
+                            _infoChip('Статус', 'Доставлено'),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }).toList(),
+        ),
+      ),
+    );
+  }
+
   Widget _infoChip(String label, String value) {
     final theme = Theme.of(context);
     return Container(
@@ -533,6 +622,15 @@ class _CartScreenState extends State<CartScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final inDeliveryItems = _items
+        .where((item) => (item['status'] ?? '').toString() == 'in_delivery')
+        .toList();
+    final basketItems = _items
+        .where((item) => (item['status'] ?? '').toString() != 'in_delivery')
+        .toList();
+    final hasVisibleCartContent =
+        basketItems.isNotEmpty || inDeliveryItems.isNotEmpty;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Корзина')),
       body: SafeArea(
@@ -566,7 +664,7 @@ class _CartScreenState extends State<CartScreen> {
                   children: [
                     _buildSummary(),
                     const SizedBox(height: 14),
-                    if (_items.isEmpty)
+                    if (!hasVisibleCartContent)
                       Builder(
                         builder: (context) {
                           final theme = Theme.of(context);
@@ -600,8 +698,37 @@ class _CartScreenState extends State<CartScreen> {
                           );
                         },
                       )
-                    else
-                      ..._items.map(_buildItemCard),
+                    else ...[
+                      if (basketItems.isNotEmpty) ...[
+                        Text(
+                          'Текущая корзина',
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                        const SizedBox(height: 10),
+                        ...basketItems.map(_buildItemCard),
+                      ],
+                      if (inDeliveryItems.isNotEmpty) ...[
+                        if (basketItems.isNotEmpty) const SizedBox(height: 16),
+                        Text(
+                          'Сейчас в доставке',
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                        const SizedBox(height: 10),
+                        ...inDeliveryItems.map(_buildItemCard),
+                      ],
+                    ],
+                    if (_recentDeliveries.isNotEmpty) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        'Две последние доставки',
+                        style: Theme.of(context).textTheme.titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 10),
+                      ..._recentDeliveries.map(_buildRecentDeliveryCard),
+                    ],
                   ],
                 ),
         ),

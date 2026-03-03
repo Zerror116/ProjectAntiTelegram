@@ -236,6 +236,10 @@ function canPostChat(context, userRole) {
   if (!context) return false;
   const role = normalizeRole(userRole);
 
+  if (role === "client") {
+    return false;
+  }
+
   if (context.chat.type === "channel") {
     if (context.isBlacklisted && !isAdminOrCreator(role)) {
       return false;

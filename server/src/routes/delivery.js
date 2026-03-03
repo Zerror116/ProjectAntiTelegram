@@ -1,5 +1,6 @@
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
+const ExcelJS = require("exceljs");
 
 const router = express.Router();
 const requireAuth = require("../middleware/requireAuth");
@@ -7,6 +8,13 @@ const requireRole = require("../middleware/requireRole");
 const db = require("../db");
 
 const SAMARA_CENTER = { lat: 53.195878, lng: 50.100202 };
+const DELIVERY_DAY_START_MINUTES = 10 * 60;
+const DELIVERY_SOFT_END_MINUTES = 16 * 60;
+const DELIVERY_HARD_END_MINUTES = 19 * 60;
+const DELIVERY_STOP_SERVICE_MINUTES = 12;
+const DELIVERY_STOP_BUFFER_MINUTES = 8;
+const DELIVERY_DIALOG_AUTO_DELETE_MS = 60 * 1000;
+const DELIVERY_DIALOG_CLEANUP_INTERVAL_MS = 15 * 1000;
 const DEMO_USER_EMAIL_PREFIX = "phantom.delivery.";
 const DEMO_PRODUCT_TITLE_PREFIX = "[DEMO DELIVERY]";
 const DEMO_SAMARA_POINTS = [
@@ -32,6 +40,19 @@ const DEMO_SAMARA_POINTS = [
   { name: "Глеб", address: "Самара, 5-я Просека, 110Е", lat: 53.24052, lng: 50.16349 },
 ];
 
+let deliveryDialogCleanupTimer = null;
+let deliveryDialogCleanupRunning = false;
+let deliveryDialogCleanupIo = null;
+
+function deliveryDialogWhere(alias = "c") {
+  return `${alias}.type = 'private'
+    AND (
+      COALESCE(${alias}.settings->>'kind', '') = 'delivery_dialog'
+      OR COALESCE(${alias}.settings->>'system_key', '') = 'delivery_dialog'
+      OR ${alias}.title = 'Доставка'
+    )`;
+}
+
 function toMoney(value, fallback = 0) {
   const num = Number(value);
   if (!Number.isFinite(num)) return fallback;
@@ -53,6 +74,16 @@ async function getDeliverySettings(queryable = db) {
   const value = normalizeJsonObject(result.rows[0]?.value);
   return {
     threshold_amount: Math.max(0, toMoney(value.threshold_amount, 1500)),
+    route_origin_label: String(value.route_origin_label || "Точка отправки").trim() || "Точка отправки",
+    route_origin_address: String(value.route_origin_address || "").trim(),
+    route_origin_lat:
+      value.route_origin_lat == null || value.route_origin_lat === ""
+        ? null
+        : Number(value.route_origin_lat),
+    route_origin_lng:
+      value.route_origin_lng == null || value.route_origin_lng === ""
+        ? null
+        : Number(value.route_origin_lng),
   };
 }
 
@@ -96,22 +127,284 @@ function firstLetterCode(name) {
   return trimmed[0].toUpperCase();
 }
 
-function buildEtaWindow(deliveryDate, routeOrder) {
+function ensureIsoDate(value) {
   const normalizedDate =
-    deliveryDate instanceof Date
-      ? formatDateOnly(deliveryDate)
-      : formatDateOnly(new Date(String(deliveryDate)));
-  const start = new Date(`${normalizedDate}T11:00:00`);
-  if (Number.isNaN(start.getTime())) {
+    value instanceof Date ? formatDateOnly(value) : String(value || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) {
+    throw new Error(`Некорректная дата доставки: ${String(value)}`);
+  }
+  return normalizedDate;
+}
+
+function parseClockToMinutes(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  const match = value.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function minutesToClock(minutes) {
+  if (!Number.isFinite(minutes)) return "";
+  const normalized = Math.max(0, Math.round(minutes));
+  const hours = Math.floor(normalized / 60);
+  const mins = normalized % 60;
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+}
+
+function dateTimeFromMinutes(deliveryDate, minutes) {
+  const normalizedDate = ensureIsoDate(deliveryDate);
+  const base = new Date(`${normalizedDate}T00:00:00`);
+  if (Number.isNaN(base.getTime())) {
     throw new Error(`Некорректная дата доставки: ${String(deliveryDate)}`);
   }
-  const offsetMinutes = Math.max(0, Number(routeOrder || 1) - 1) * 40;
-  start.setMinutes(start.getMinutes() + offsetMinutes);
+  base.setMinutes(Math.max(0, Math.round(minutes)));
+  return base;
+}
+
+function buildEtaWindow(deliveryDate, etaMinutes) {
+  const start = dateTimeFromMinutes(deliveryDate, etaMinutes);
   const end = new Date(start);
-  end.setMinutes(end.getMinutes() + 35);
+  end.setMinutes(end.getMinutes() + 30);
+  return { eta_from: start.toISOString(), eta_to: end.toISOString() };
+}
+
+function trafficMultiplierForMinutes(minutes) {
+  if (minutes >= 16 * 60) return 1.4;
+  if (minutes >= 14 * 60) return 1.28;
+  if (minutes >= 12 * 60) return 1.2;
+  if (minutes >= 10 * 60) return 1.12;
+  return 1;
+}
+
+function estimateTravelMinutesKm(distanceKmValue, departureMinutes) {
+  const safeDistance = Math.max(0, Number(distanceKmValue) || 0);
+  const kmPerHour = 25;
+  const baseMinutes = safeDistance === 0 ? 0 : (safeDistance / kmPerHour) * 60;
+  const traffic = trafficMultiplierForMinutes(departureMinutes);
+  return Math.max(7, Math.round(baseMinutes * traffic) + 3);
+}
+
+function sanitizePreferredWindow(rawFrom, rawTo) {
+  const fromMinutes = parseClockToMinutes(rawFrom);
+  const toMinutes = parseClockToMinutes(rawTo);
+  if (rawFrom && fromMinutes == null) {
+    throw new Error("Некорректное время 'после'. Используйте формат ЧЧ:ММ");
+  }
+  if (rawTo && toMinutes == null) {
+    throw new Error("Некорректное время 'до'. Используйте формат ЧЧ:ММ");
+  }
+  if (
+    fromMinutes != null &&
+    toMinutes != null &&
+    fromMinutes >= toMinutes
+  ) {
+    throw new Error("Время 'после' должно быть раньше времени 'до'");
+  }
   return {
-    eta_from: start.toISOString(),
-    eta_to: end.toISOString(),
+    fromMinutes,
+    toMinutes,
+    fromText: fromMinutes == null ? null : minutesToClock(fromMinutes),
+    toText: toMinutes == null ? null : minutesToClock(toMinutes),
+  };
+}
+
+function preferredWindowPenalty(slot, customer) {
+  const travelMinutes = estimateTravelMinutesKm(
+    distanceKm(slot.currentLat, slot.currentLng, customer.lat, customer.lng),
+    slot.currentMinutes,
+  );
+  const arrival = slot.currentMinutes + travelMinutes;
+  const prefFrom = parseClockToMinutes(customer.preferred_time_from);
+  const prefTo = parseClockToMinutes(customer.preferred_time_to);
+  const waitMinutes = prefFrom != null && arrival < prefFrom ? prefFrom - arrival : 0;
+  const lateMinutes = prefTo != null && arrival > prefTo ? arrival - prefTo : 0;
+  return {
+    travelMinutes,
+    waitMinutes,
+    lateMinutes,
+    score:
+      travelMinutes +
+      waitMinutes * 0.45 +
+      lateMinutes * 18 +
+      slot.items.length * 6,
+  };
+}
+
+function normalizeDeliveryOrigin(raw) {
+  const origin = normalizeJsonObject(raw);
+  const lat = origin.lat == null || origin.lat === "" ? null : Number(origin.lat);
+  const lng = origin.lng == null || origin.lng === "" ? null : Number(origin.lng);
+  return {
+    label: String(origin.label || "Точка отправки").trim() || "Точка отправки",
+    address: String(origin.address || "").trim(),
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+  };
+}
+
+function effectiveOriginPoint(origin) {
+  const normalized = normalizeDeliveryOrigin(origin);
+  return {
+    ...normalized,
+    lat: normalized.lat ?? SAMARA_CENTER.lat,
+    lng: normalized.lng ?? SAMARA_CENTER.lng,
+  };
+}
+
+function normalizeWhitespace(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .trim();
+}
+
+function stripAddressServiceParts(addressText) {
+  const normalized = normalizeWhitespace(addressText);
+  if (!normalized) return "";
+  const parts = normalized
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const filtered = parts.filter((part) => {
+    const lower = part.toLowerCase();
+    return !(
+      lower.includes("подъезд") ||
+      lower.includes("подьезд") ||
+      lower.includes("этаж") ||
+      /^кв\.?\s*\d+/i.test(part) ||
+      /^квартира\s*\d+/i.test(lower) ||
+      /^офис\s*\d+/i.test(lower) ||
+      lower.includes("домофон")
+    );
+  });
+  return filtered.join(", ");
+}
+
+function normalizeLocalityName(raw) {
+  const value = normalizeWhitespace(raw).toLowerCase();
+  if (!value) return "Самара";
+  if (value.includes("новик")) return "Новокуйбышевск";
+  if (value.includes("новокуйб")) return "Новокуйбышевск";
+  if (value.includes("самара")) return "Самара";
+  if (value.includes("чапаевск")) return "Чапаевск";
+  if (value.includes("сызран")) return "Сызрань";
+  if (value.includes("кинель")) return "Кинель";
+  if (value.includes("тольят")) return "Тольятти";
+  return raw;
+}
+
+function detectAddressLocality(addressText) {
+  const normalized = normalizeWhitespace(addressText);
+  if (!normalized) return "Самара";
+  const firstChunk = normalized.split(",")[0]?.trim() || "";
+  return normalizeLocalityName(firstChunk || "Самара");
+}
+
+function buildGeocodeQuery(addressText) {
+  const normalized = stripAddressServiceParts(addressText);
+  const locality = detectAddressLocality(normalized);
+  const hasLocalityInText = normalized
+    .toLowerCase()
+    .includes(locality.toLowerCase());
+  const withoutLocality = hasLocalityInText
+    ? normalized
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .filter((part, index) => {
+          if (index != 0) return true;
+          return normalizeLocalityName(part).toLowerCase() !== locality.toLowerCase();
+        })
+        .join(", ")
+    : normalized;
+  const addressCore = withoutLocality || normalized || locality;
+  const baseAddress = `${addressCore}, ${locality}`;
+  return {
+    locality,
+    query: `${baseAddress}, Самарская область, Россия`,
+  };
+}
+
+function extractGeocodeLocality(item) {
+  const address = item?.address || {};
+  return normalizeLocalityName(
+    address.city ||
+      address.town ||
+      address.village ||
+      address.municipality ||
+      address.county ||
+      address.state_district ||
+      "",
+  );
+}
+
+async function geocodeDeliveryAddress(addressText) {
+  const originalNormalized = normalizeWhitespace(addressText);
+  const cleaned = stripAddressServiceParts(originalNormalized);
+  const { locality, query } = buildGeocodeQuery(cleaned);
+  const queryVariants = [
+    query,
+    `${cleaned}, ${locality}, Самарская область, Россия`,
+    `${cleaned}, ${locality}, Россия`,
+  ].filter(Boolean);
+
+  let chosen = null;
+  for (const variant of queryVariants) {
+    const params = new URLSearchParams({
+      q: variant,
+      format: "jsonv2",
+      addressdetails: "1",
+      limit: "5",
+      countrycodes: "ru",
+      "accept-language": "ru",
+    });
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/search?${params.toString()}`,
+      {
+        headers: {
+          "User-Agent": "ProjectPhoenix/1.0 (delivery geocoder)",
+          Accept: "application/json",
+        },
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Геокодер недоступен: ${response.status}`);
+    }
+    const payload = await response.json();
+    if (!Array.isArray(payload) || payload.length === 0) {
+      continue;
+    }
+    const exactCity = payload.find((item) => {
+      const foundLocality = extractGeocodeLocality(item);
+      return foundLocality.toLowerCase() === locality.toLowerCase();
+    });
+    chosen = exactCity || payload[0];
+    if (chosen) break;
+  }
+
+  if (!chosen) {
+    return null;
+  }
+  const lat = Number(chosen.lat);
+  const lng = Number(chosen.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+  const foundLocality = extractGeocodeLocality(chosen);
+  if (locality && foundLocality && foundLocality.toLowerCase() !== locality.toLowerCase()) {
+    return null;
+  }
+  return {
+    address_text: originalNormalized,
+    locality,
+    lat,
+    lng,
+    resolved_label: chosen.display_name || "",
   };
 }
 
@@ -129,57 +422,135 @@ function distanceKm(aLat, aLng, bLat, bLng) {
   return earthRadiusKm * c;
 }
 
-function buildCourierSlots(courierNames) {
+function polarAngle(originLat, originLng, pointLat, pointLng) {
+  const angle = Math.atan2(pointLat - originLat, pointLng - originLng);
+  return angle >= 0 ? angle : angle + Math.PI * 2;
+}
+
+function optimizeSlotRoute(items, origin) {
+  const pending = [...items];
+  const ordered = [];
+  let currentLat = origin.lat;
+  let currentLng = origin.lng;
+  let currentMinutes = DELIVERY_DAY_START_MINUTES;
+
+  while (pending.length > 0) {
+    let bestIndex = 0;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < pending.length; index += 1) {
+      const candidate = pending[index];
+      const candidateScore = preferredWindowPenalty(
+        {
+          currentLat,
+          currentLng,
+          currentMinutes,
+          items: ordered,
+        },
+        candidate,
+      );
+      if (candidateScore.score < bestScore) {
+        bestScore = candidateScore.score;
+        bestIndex = index;
+      }
+    }
+    const [picked] = pending.splice(bestIndex, 1);
+    const travel = estimateTravelMinutesKm(
+      distanceKm(currentLat, currentLng, picked.lat, picked.lng),
+      currentMinutes,
+    );
+    const prefFrom = parseClockToMinutes(picked.preferred_time_from);
+    let etaMinutes = currentMinutes + travel;
+    if (prefFrom != null && etaMinutes < prefFrom) {
+      etaMinutes = prefFrom;
+    }
+    etaMinutes = Math.max(DELIVERY_DAY_START_MINUTES, etaMinutes);
+    if (etaMinutes > DELIVERY_HARD_END_MINUTES) {
+      etaMinutes = DELIVERY_HARD_END_MINUTES;
+    }
+    ordered.push({
+      ...picked,
+      eta_minutes: etaMinutes,
+    });
+    currentLat = picked.lat;
+    currentLng = picked.lng;
+    currentMinutes =
+      etaMinutes + DELIVERY_STOP_SERVICE_MINUTES + DELIVERY_STOP_BUFFER_MINUTES;
+  }
+
+  return ordered;
+}
+
+function buildCourierSlots(courierNames, origin) {
+  const start = effectiveOriginPoint(origin);
   return courierNames.map((name, index) => ({
     slot: index + 1,
     name,
     items: [],
-    currentLat: SAMARA_CENTER.lat,
-    currentLng: SAMARA_CENTER.lng,
+    currentLat: start.lat,
+    currentLng: start.lng,
+    currentMinutes: DELIVERY_DAY_START_MINUTES,
   }));
 }
 
-function distributeCustomersAcrossCouriers(customers, courierNames) {
-  const slots = buildCourierSlots(courierNames);
+function distributeCustomersAcrossCouriers(customers, courierNames, origin) {
+  const slots = buildCourierSlots(courierNames, origin);
+  const start = effectiveOriginPoint(origin);
   const withCoords = [];
   const withoutCoords = [];
+  const targetCounts = slots.map((_, index) => {
+    const base = Math.floor(customers.length / slots.length);
+    const remainder = customers.length % slots.length;
+    return base + (index < remainder ? 1 : 0);
+  });
 
   for (const customer of customers) {
     const lat = Number(customer.lat);
     const lng = Number(customer.lng);
+    const lockedCourierName = String(customer.locked_courier_name || "").trim();
+    const lockedSlot = Number(customer.locked_courier_slot);
+    const lockedMatch = slots.find(
+      (slot) =>
+        (lockedCourierName && slot.name === lockedCourierName) ||
+        (Number.isInteger(lockedSlot) && slot.slot === lockedSlot),
+    );
+    if (lockedMatch) {
+      lockedMatch.items.push({
+        ...customer,
+        lat: Number.isFinite(lat) ? lat : customer.lat,
+        lng: Number.isFinite(lng) ? lng : customer.lng,
+        locked: true,
+      });
+      continue;
+    }
     if (Number.isFinite(lat) && Number.isFinite(lng)) {
-      withCoords.push({ ...customer, lat, lng });
+      withCoords.push({
+        ...customer,
+        lat,
+        lng,
+        angle: polarAngle(start.lat, start.lng, lat, lng),
+      });
     } else {
       withoutCoords.push(customer);
     }
   }
 
-  while (withCoords.length > 0) {
-    const orderedSlots = [...slots].sort(
-      (a, b) => a.items.length - b.items.length || a.slot - b.slot,
-    );
-    for (const slot of orderedSlots) {
-      if (withCoords.length === 0) break;
-      let bestIndex = 0;
-      let bestDistance = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < withCoords.length; i += 1) {
-        const candidate = withCoords[i];
-        const nextDistance = distanceKm(
-          slot.currentLat,
-          slot.currentLng,
-          candidate.lat,
-          candidate.lng,
-        );
-        if (nextDistance < bestDistance) {
-          bestDistance = nextDistance;
-          bestIndex = i;
-        }
-      }
-      const [picked] = withCoords.splice(bestIndex, 1);
-      slot.items.push(picked);
-      slot.currentLat = picked.lat;
-      slot.currentLng = picked.lng;
+  withCoords.sort((a, b) => a.angle - b.angle);
+  let coordIndex = 0;
+  for (let slotIndex = 0; slotIndex < slots.length; slotIndex += 1) {
+    const slot = slots[slotIndex];
+    let capacity = Math.max(0, targetCounts[slotIndex] - slot.items.length);
+    while (capacity > 0 && coordIndex < withCoords.length) {
+      slot.items.push(withCoords[coordIndex]);
+      coordIndex += 1;
+      capacity -= 1;
     }
+  }
+  while (coordIndex < withCoords.length) {
+    const slot = [...slots].sort(
+      (a, b) => a.items.length - b.items.length || a.slot - b.slot,
+    )[0];
+    slot.items.push(withCoords[coordIndex]);
+    coordIndex += 1;
   }
 
   for (const customer of withoutCoords) {
@@ -187,6 +558,36 @@ function distributeCustomersAcrossCouriers(customers, courierNames) {
       (a, b) => a.items.length - b.items.length || a.slot - b.slot,
     )[0];
     slot.items.push(customer);
+  }
+
+  for (const slot of slots) {
+    const slotWithCoords = [];
+    const slotWithoutCoords = [];
+    for (const item of slot.items) {
+      const itemLat = Number(item.lat);
+      const itemLng = Number(item.lng);
+      if (Number.isFinite(itemLat) && Number.isFinite(itemLng)) {
+        slotWithCoords.push({
+          ...item,
+          lat: itemLat,
+          lng: itemLng,
+        });
+      } else {
+        slotWithoutCoords.push(item);
+      }
+    }
+    slot.items = [
+      ...optimizeSlotRoute(slotWithCoords, start),
+      ...slotWithoutCoords.map((item, index) => ({
+        ...item,
+        eta_minutes: Math.min(
+          DELIVERY_DAY_START_MINUTES +
+              (slotWithCoords.length + index) *
+                (DELIVERY_STOP_SERVICE_MINUTES + DELIVERY_STOP_BUFFER_MINUTES),
+          DELIVERY_HARD_END_MINUTES,
+        ),
+      })),
+    ];
   }
 
   return slots;
@@ -231,6 +632,12 @@ function mapBatchRow(row) {
     id: row.id,
     delivery_date: row.delivery_date,
     delivery_label: row.delivery_label,
+    route_origin_label: row.route_origin_label,
+    route_origin_address: row.route_origin_address,
+    route_origin_lat:
+      row.route_origin_lat == null ? null : Number(row.route_origin_lat),
+    route_origin_lng:
+      row.route_origin_lng == null ? null : Number(row.route_origin_lng),
     threshold_amount: toMoney(row.threshold_amount, 1500),
     status: row.status,
     courier_count: Number(row.courier_count) || 0,
@@ -249,6 +656,10 @@ async function fetchBatchSummaries(queryable) {
     `SELECT b.id,
             b.delivery_date,
             b.delivery_label,
+            b.route_origin_label,
+            b.route_origin_address,
+            b.route_origin_lat,
+            b.route_origin_lng,
             b.threshold_amount,
             b.status,
             b.courier_count,
@@ -282,6 +693,10 @@ async function fetchBatchDetails(queryable, batchId) {
     `SELECT b.id,
             b.delivery_date,
             b.delivery_label,
+            b.route_origin_label,
+            b.route_origin_address,
+            b.route_origin_lat,
+            b.route_origin_lng,
             b.threshold_amount,
             b.status,
             b.courier_count,
@@ -345,6 +760,7 @@ async function fetchBatchDetails(queryable, batchId) {
     customers: customersQ.rows.map((row) => ({
       ...row,
       processed_sum: toMoney(row.processed_sum),
+      agreed_sum: toMoney(row.agreed_sum),
       items: Array.isArray(row.items) ? row.items : [],
     })),
   };
@@ -366,16 +782,74 @@ function emitDeliveryUpdated(io, batchId) {
   });
 }
 
+async function upsertUserShelf(queryable, userId, shelfNumber) {
+  const normalizedShelf = Number(shelfNumber);
+  if (!userId || !Number.isInteger(normalizedShelf) || normalizedShelf <= 0) {
+    return;
+  }
+  await queryable.query(
+    `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
+     VALUES ($1, $2, now(), now())
+     ON CONFLICT (user_id) DO UPDATE
+       SET shelf_number = EXCLUDED.shelf_number,
+           updated_at = now()`,
+    [userId, normalizedShelf],
+  );
+}
+
 async function findDraftBatchId(queryable) {
   const activeBatchQ = await queryable.query(
     `SELECT id
      FROM delivery_batches
-     WHERE status = 'calling'
-     ORDER BY created_at DESC
+     WHERE status IN ('calling', 'couriers_assigned')
+     ORDER BY
+       CASE status
+         WHEN 'calling' THEN 0
+         WHEN 'couriers_assigned' THEN 1
+         ELSE 2
+       END,
+       created_at DESC
      LIMIT 1`,
   );
   if (activeBatchQ.rowCount === 0) return null;
   return String(activeBatchQ.rows[0].id);
+}
+
+async function insertDeliveryBatchItems(
+  queryable,
+  batchId,
+  batchCustomerId,
+  items,
+) {
+  for (const item of items || []) {
+    await queryable.query(
+      `INSERT INTO delivery_batch_items (
+         id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
+         quantity, unit_price, line_total, product_code, product_title,
+         product_description, product_image_url, created_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6,
+         $7, $8, $9, $10, $11,
+         $12, $13, now()
+       )`,
+      [
+        uuidv4(),
+        batchId,
+        batchCustomerId,
+        item.cart_item_id,
+        item.user_id,
+        item.product_id,
+        item.quantity,
+        item.unit_price,
+        item.line_total,
+        item.product_code,
+        item.product_title,
+        item.product_description,
+        item.product_image_url,
+      ],
+    );
+  }
 }
 
 async function collectEligibleCustomers(queryable) {
@@ -414,9 +888,20 @@ async function collectEligibleCustomers(queryable) {
        AND NOT EXISTS (
          SELECT 1
          FROM delivery_batch_items di
+         JOIN delivery_batch_customers dbc ON dbc.id = di.batch_customer_id
          JOIN delivery_batches dbt ON dbt.id = di.batch_id
          WHERE di.cart_item_id = c.id
-           AND dbt.status <> 'cancelled'
+           AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
+           AND (
+             COALESCE(dbc.call_status, '') IN ('pending', 'accepted', 'declined')
+             OR COALESCE(dbc.delivery_status, '') IN (
+               'awaiting_call',
+               'offer_sent',
+               'preparing_delivery',
+               'handing_to_courier',
+               'in_delivery'
+             )
+           )
        )
      ORDER BY c.user_id ASC, c.updated_at DESC, c.created_at DESC`,
   );
@@ -460,7 +945,8 @@ async function collectEligibleCustomers(queryable) {
   return Array.from(grouped.values());
 }
 
-async function createDeliveryBatch(queryable, thresholdAmount, createdBy) {
+async function createDeliveryBatch(queryable, settings, createdBy) {
+  const thresholdAmount = Math.max(0, toMoney(settings?.threshold_amount, 1500));
   const existingDraftBatchId = await findDraftBatchId(queryable);
   if (existingDraftBatchId) {
     return {
@@ -487,15 +973,32 @@ async function createDeliveryBatch(queryable, thresholdAmount, createdBy) {
 
   const { date: nextDate, label } = nextDeliveryInfo(new Date());
   const deliveryDate = formatDateOnly(nextDate);
+  const routeOrigin = effectiveOriginPoint({
+    label: settings?.route_origin_label,
+    address: settings?.route_origin_address,
+    lat: settings?.route_origin_lat,
+    lng: settings?.route_origin_lng,
+  });
 
   const batchInsert = await queryable.query(
     `INSERT INTO delivery_batches (
        id, delivery_date, delivery_label, threshold_amount,
+       route_origin_label, route_origin_address, route_origin_lat, route_origin_lng,
        status, courier_count, courier_names, created_by, created_at, updated_at
      )
-     VALUES ($1, $2, $3, $4, 'calling', 0, '[]'::jsonb, $5, now(), now())
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'calling', 0, '[]'::jsonb, $9, now(), now())
      RETURNING id`,
-    [uuidv4(), deliveryDate, label, thresholdAmount, createdBy || null],
+    [
+      uuidv4(),
+      deliveryDate,
+      label,
+      thresholdAmount,
+      routeOrigin.label,
+      routeOrigin.address || null,
+      routeOrigin.lat,
+      routeOrigin.lng,
+      createdBy || null,
+    ],
   );
   const batchId = String(batchInsert.rows[0].id);
 
@@ -530,35 +1033,7 @@ async function createDeliveryBatch(queryable, thresholdAmount, createdBy) {
       ],
     );
 
-    for (const item of candidate.items) {
-      await queryable.query(
-        `INSERT INTO delivery_batch_items (
-           id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
-           quantity, unit_price, line_total, product_code, product_title,
-           product_description, product_image_url, created_at
-         )
-         VALUES (
-           $1, $2, $3, $4, $5, $6,
-           $7, $8, $9, $10, $11,
-           $12, $13, now()
-         )`,
-        [
-          uuidv4(),
-          batchId,
-          batchCustomerId,
-          item.cart_item_id,
-          item.user_id,
-          item.product_id,
-          item.quantity,
-          item.unit_price,
-          item.line_total,
-          item.product_code,
-          item.product_title,
-          item.product_description,
-          item.product_image_url,
-        ],
-      );
-    }
+    await insertDeliveryBatchItems(queryable, batchId, batchCustomerId, candidate.items);
   }
 
   return {
@@ -577,18 +1052,88 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
   if (candidates.length === 0) return 0;
 
   const existingUsersQ = await queryable.query(
-    `SELECT user_id::text AS user_id
+    `SELECT id::text AS id,
+            user_id::text AS user_id,
+            COALESCE(call_status, '') AS call_status,
+            COALESCE(delivery_status, '') AS delivery_status
      FROM delivery_batch_customers
      WHERE batch_id = $1`,
     [batchId],
   );
-  const existingUsers = new Set(
-    existingUsersQ.rows.map((row) => String(row.user_id)),
-  );
+  const existingUsers = new Map();
+  for (const row of existingUsersQ.rows) {
+    const key = String(row.user_id);
+    if (!existingUsers.has(key)) existingUsers.set(key, []);
+    existingUsers.get(key).push(row);
+  }
 
   let addedTotal = 0;
   for (const candidate of candidates) {
-    if (existingUsers.has(candidate.user_id)) continue;
+    const existingRows = existingUsers.get(candidate.user_id) || [];
+    const reusableRow =
+      existingRows.find(
+        (row) =>
+          row.call_status === "removed" ||
+          row.delivery_status === "returned_to_cart",
+      ) || null;
+    const hasBlockingRow = existingRows.some(
+      (row) =>
+        row.call_status !== "removed" &&
+        row.delivery_status !== "returned_to_cart",
+    );
+    if (hasBlockingRow && !reusableRow) continue;
+
+    if (reusableRow) {
+      await queryable.query(
+        `UPDATE delivery_batch_customers
+         SET customer_name = $2,
+             customer_phone = $3,
+             processed_sum = $4,
+             processed_items_count = $5,
+             shelf_number = $6,
+             address_id = $7,
+             address_text = $8,
+             lat = $9,
+             lng = $10,
+             call_status = 'pending',
+             delivery_status = 'awaiting_call',
+             courier_slot = NULL,
+             courier_name = NULL,
+             courier_code = NULL,
+             route_order = NULL,
+             eta_from = NULL,
+             eta_to = NULL,
+             preferred_time_from = NULL,
+             preferred_time_to = NULL,
+             locked_courier_slot = NULL,
+             locked_courier_name = NULL,
+             locked_courier_code = NULL,
+             updated_at = now()
+         WHERE id = $1`,
+        [
+          reusableRow.id,
+          candidate.customer_name,
+          candidate.customer_phone,
+          candidate.processed_sum,
+          candidate.processed_items_count,
+          candidate.shelf_number,
+          candidate.address_id,
+          candidate.address_text || null,
+          candidate.lat,
+          candidate.lng,
+        ],
+      );
+
+      await queryable.query(
+        `DELETE FROM delivery_batch_items
+         WHERE batch_customer_id = $1`,
+        [reusableRow.id],
+      );
+      await insertDeliveryBatchItems(queryable, batchId, reusableRow.id, candidate.items);
+      addedTotal += 1;
+      continue;
+    }
+
     const batchCustomerId = uuidv4();
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
@@ -619,37 +1164,17 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
       ],
     );
 
-    for (const item of candidate.items) {
-      await queryable.query(
-        `INSERT INTO delivery_batch_items (
-           id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
-           quantity, unit_price, line_total, product_code, product_title,
-           product_description, product_image_url, created_at
-         )
-         VALUES (
-           $1, $2, $3, $4, $5, $6,
-           $7, $8, $9, $10, $11,
-           $12, $13, now()
-         )`,
-        [
-          uuidv4(),
-          batchId,
-          batchCustomerId,
-          item.cart_item_id,
-          item.user_id,
-          item.product_id,
-          item.quantity,
-          item.unit_price,
-          item.line_total,
-          item.product_code,
-          item.product_title,
-          item.product_description,
-          item.product_image_url,
-        ],
-      );
-    }
+    await insertDeliveryBatchItems(queryable, batchId, batchCustomerId, candidate.items);
 
-    existingUsers.add(candidate.user_id);
+    existingUsers.set(candidate.user_id, [
+      ...(existingUsers.get(candidate.user_id) || []),
+      {
+        id: batchCustomerId,
+        user_id: candidate.user_id,
+        call_status: "pending",
+        delivery_status: "awaiting_call",
+      },
+    ]);
     addedTotal += 1;
   }
 
@@ -657,27 +1182,87 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
 }
 
 async function ensureDeliveryChat(queryable, userId, createdBy) {
-  const existingQ = await queryable.query(
-    `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at
-     FROM chats c
-     JOIN chat_members cm ON cm.chat_id = c.id
-     WHERE cm.user_id = $1
-       AND c.type = 'private'
-       AND COALESCE(c.settings->>'kind', '') = 'delivery_dialog'
-     ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC
-     LIMIT 1`,
-    [userId],
-  );
-  if (existingQ.rowCount > 0) {
-    return { chat: existingQ.rows[0], created: false };
-  }
-
   const settings = {
     kind: "delivery_dialog",
     visibility: "private",
     system_key: "delivery_dialog",
     description: "Системный диалог по доставке",
   };
+  const existingQ = await queryable.query(
+    `SELECT c.id,
+            c.title,
+            c.type,
+            c.settings,
+            c.created_at,
+            c.updated_at,
+            EXISTS(
+              SELECT 1
+              FROM messages m
+              WHERE m.chat_id = c.id
+                AND COALESCE(m.meta->>'kind', '') = 'delivery_offer'
+                AND COALESCE(m.meta->>'offer_status', 'pending') = 'pending'
+            ) AS has_pending_offer
+     FROM chats c
+     JOIN chat_members cm ON cm.chat_id = c.id
+     WHERE cm.user_id = $1
+       AND ${deliveryDialogWhere("c")}
+     ORDER BY
+       CASE
+         WHEN EXISTS(
+           SELECT 1
+           FROM messages m
+           WHERE m.chat_id = c.id
+             AND COALESCE(m.meta->>'kind', '') = 'delivery_offer'
+             AND COALESCE(m.meta->>'offer_status', 'pending') = 'pending'
+         ) THEN 0
+         ELSE 1
+       END,
+       c.updated_at DESC NULLS LAST,
+       c.created_at DESC,
+       c.id DESC`,
+    [userId],
+  );
+  if (existingQ.rowCount > 0) {
+    const [primary, ...duplicates] = existingQ.rows;
+    const duplicateIds = duplicates
+      .map((row) => row.id?.toString())
+      .filter((id) => id && id !== primary.id);
+    if (duplicateIds.length > 0) {
+      await queryable.query(
+        `DELETE FROM chats
+         WHERE id = ANY($1::uuid[])`,
+        [duplicateIds],
+      );
+    }
+    if (!primary.has_pending_offer) {
+      await queryable.query(
+        `DELETE FROM messages
+         WHERE chat_id = $1`,
+        [primary.id],
+      );
+    }
+    await queryable.query(
+      `UPDATE chats
+       SET title = 'Доставка',
+           settings = $2::jsonb,
+           updated_at = now()
+       WHERE id = $1`,
+      [primary.id, JSON.stringify(settings)],
+    );
+    const refreshedQ = await queryable.query(
+      `SELECT id, title, type, settings, created_at, updated_at
+       FROM chats
+       WHERE id = $1
+       LIMIT 1`,
+      [primary.id],
+    );
+    return {
+      chat: refreshedQ.rows[0],
+      created: false,
+      deletedChatIds: duplicateIds,
+    };
+  }
+
   const chatInsert = await queryable.query(
     `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
      VALUES ($1, $2, 'private', $3, $4::jsonb, now(), now())
@@ -691,7 +1276,168 @@ async function ensureDeliveryChat(queryable, userId, createdBy) {
      ON CONFLICT (chat_id, user_id) DO NOTHING`,
     [uuidv4(), chat.id, userId],
   );
-  return { chat, created: true };
+  return { chat, created: true, deletedChatIds: [] };
+}
+
+async function markDeliveryChatForAutoDelete(
+  queryable,
+  chatId,
+  delayMs = DELIVERY_DIALOG_AUTO_DELETE_MS,
+) {
+  if (!chatId) return null;
+  const deleteAt = new Date(Date.now() + Math.max(1000, delayMs));
+  await queryable.query(
+    `UPDATE chats
+     SET settings = jsonb_set(
+           COALESCE(settings, '{}'::jsonb),
+           '{auto_delete_after}',
+           to_jsonb($2::text),
+           true
+         ),
+         updated_at = now()
+     WHERE id = $1`,
+    [chatId, deleteAt.toISOString()],
+  );
+  return deleteAt.toISOString();
+}
+
+async function deleteDeliveryChatsByIds(queryable, chatIds) {
+  const uniqueIds = [
+    ...new Set(
+      (chatIds || [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (uniqueIds.length === 0) return [];
+  const membersQ = await queryable.query(
+    `SELECT chat_id::text AS chat_id, user_id::text AS user_id
+     FROM chat_members
+     WHERE chat_id = ANY($1::uuid[])`,
+    [uniqueIds],
+  );
+  await queryable.query(
+    `DELETE FROM chats
+     WHERE id = ANY($1::uuid[])`,
+    [uniqueIds],
+  );
+  const userIdsByChat = new Map();
+  for (const row of membersQ.rows) {
+    const chatId = String(row.chat_id);
+    const current = userIdsByChat.get(chatId) || [];
+    current.push(String(row.user_id));
+    userIdsByChat.set(chatId, current);
+  }
+  return uniqueIds.map((chatId) => ({
+    chatId,
+    userIds: [...new Set(userIdsByChat.get(chatId) || [])],
+  }));
+}
+
+function emitDeletedDeliveryChats(io, deletedChats) {
+  if (!io || !Array.isArray(deletedChats) || deletedChats.length === 0) return;
+  for (const item of deletedChats) {
+    for (const userId of item.userIds || []) {
+      io.to(`user:${userId}`).emit("chat:deleted", {
+        chatId: item.chatId,
+      });
+    }
+  }
+}
+
+async function cleanupExpiredDeliveryChats(
+  queryable = db,
+  io = deliveryDialogCleanupIo,
+) {
+  const expiredQ = await queryable.query(
+    `SELECT c.id::text AS chat_id
+     FROM chats c
+     WHERE ${deliveryDialogWhere("c")}
+       AND NULLIF(BTRIM(COALESCE(c.settings->>'auto_delete_after', '')), '')::timestamptz <= now()
+       AND NOT EXISTS (
+         SELECT 1
+         FROM messages m
+         WHERE m.chat_id = c.id
+           AND COALESCE(m.meta->>'kind', '') = 'delivery_offer'
+           AND COALESCE(m.meta->>'offer_status', 'pending') = 'pending'
+       )`,
+  );
+  const deletedChats = await deleteDeliveryChatsByIds(
+    queryable,
+    expiredQ.rows.map((row) => row.chat_id),
+  );
+  emitDeletedDeliveryChats(io, deletedChats);
+  return deletedChats.length;
+}
+
+async function cleanupDuplicateDeliveryChats(
+  queryable = db,
+  io = deliveryDialogCleanupIo,
+) {
+  const duplicatesQ = await queryable.query(
+    `SELECT c.id::text AS chat_id,
+            cm.user_id::text AS user_id,
+            c.updated_at,
+            c.created_at
+     FROM chats c
+     JOIN chat_members cm ON cm.chat_id = c.id
+     WHERE ${deliveryDialogWhere("c")}
+     ORDER BY
+       cm.user_id,
+       CASE
+         WHEN EXISTS(
+           SELECT 1
+           FROM messages m
+           WHERE m.chat_id = c.id
+             AND COALESCE(m.meta->>'kind', '') = 'delivery_offer'
+             AND COALESCE(m.meta->>'offer_status', 'pending') = 'pending'
+         ) THEN 0
+         ELSE 1
+       END,
+       c.updated_at DESC NULLS LAST,
+       c.created_at DESC,
+       c.id DESC`,
+  );
+  const keepByUser = new Set();
+  const duplicateIds = [];
+  for (const row of duplicatesQ.rows) {
+    const userId = String(row.user_id);
+    if (!keepByUser.has(userId)) {
+      keepByUser.add(userId);
+      continue;
+    }
+    duplicateIds.push(String(row.chat_id));
+  }
+  const deletedChats = await deleteDeliveryChatsByIds(queryable, duplicateIds);
+  emitDeletedDeliveryChats(io, deletedChats);
+  return deletedChats.length;
+}
+
+async function runDeliveryDialogCleanup(io = deliveryDialogCleanupIo) {
+  if (deliveryDialogCleanupRunning) return;
+  deliveryDialogCleanupRunning = true;
+  try {
+    await cleanupDuplicateDeliveryChats(db, io);
+    await cleanupExpiredDeliveryChats(db, io);
+  } catch (error) {
+    console.error("delivery dialog cleanup error", error);
+  } finally {
+    deliveryDialogCleanupRunning = false;
+  }
+}
+
+function startDeliveryDialogCleanup(io) {
+  deliveryDialogCleanupIo = io || deliveryDialogCleanupIo;
+  if (deliveryDialogCleanupTimer) return;
+  deliveryDialogCleanupTimer = setInterval(() => {
+    runDeliveryDialogCleanup(deliveryDialogCleanupIo);
+  }, DELIVERY_DIALOG_CLEANUP_INTERVAL_MS);
+  if (typeof deliveryDialogCleanupTimer.unref === "function") {
+    deliveryDialogCleanupTimer.unref();
+  }
+  setImmediate(() => {
+    runDeliveryDialogCleanup(deliveryDialogCleanupIo);
+  });
 }
 
 async function hydrateSystemMessage(queryable, messageId) {
@@ -729,13 +1475,26 @@ function buildDeliveryOfferText(customer, batch) {
     `Обработано товара на сумму: ${amount} RUB`,
     "Согласны принять доставку?",
     "Если да, нажмите кнопку подтверждения и отправьте адрес доставки.",
+    "Доставка обычно идет с 10:00 до 16:00. При желании укажите время 'после' или 'до'.",
   ].join("\n");
 }
 
-function buildDeliveryAcceptedText(addressText) {
+function buildDeliveryAcceptedText(addressText, preferredFrom, preferredTo) {
+  const windowLabel =
+    preferredFrom || preferredTo
+      ? `Пожелание по времени: ${
+          [
+            preferredFrom ? `после ${preferredFrom}` : null,
+            preferredTo ? `до ${preferredTo}` : null,
+          ]
+            .filter(Boolean)
+            .join(", ")
+        }`
+      : null;
   return [
     "Доставка подтверждена.",
     addressText ? `Адрес: ${addressText}` : null,
+    windowLabel,
     "Мы готовим ваш заказ к отправке.",
   ]
     .filter(Boolean)
@@ -744,6 +1503,166 @@ function buildDeliveryAcceptedText(addressText) {
 
 function buildDeliveryDeclinedText() {
   return "Хорошо, свяжемся с вами в следующий раз.";
+}
+
+function formatDeliveryPreferenceLabel(preferredFrom, preferredTo) {
+  const fromText = String(preferredFrom || "").trim().slice(0, 5);
+  const toText = String(preferredTo || "").trim().slice(0, 5);
+  const defaultFrom = "10:00";
+  const defaultTo = "16:00";
+  if (!fromText && !toText) return "";
+  if (fromText && toText) {
+    if (fromText === defaultFrom && toText !== defaultTo) {
+      return `До ${toText}`;
+    }
+    if (toText === defaultTo && fromText !== defaultFrom) {
+      return `После ${fromText}`;
+    }
+    if (fromText === defaultFrom && toText === defaultTo) {
+      return "";
+    }
+    return `С ${fromText} до ${toText}`;
+  }
+  if (toText) return `До ${toText}`;
+  if (fromText) return `После ${fromText}`;
+  return "";
+}
+
+async function rerouteAcceptedCustomers(queryable, batchId) {
+  const batchQ = await queryable.query(
+    `SELECT id,
+            delivery_date,
+            status,
+            courier_names,
+            route_origin_label,
+            route_origin_address,
+            route_origin_lat,
+            route_origin_lng
+     FROM delivery_batches
+     WHERE id = $1
+     LIMIT 1`,
+    [batchId],
+  );
+  if (batchQ.rowCount === 0) return { rerouted: false, batchStatus: "" };
+  const batch = batchQ.rows[0];
+  const batchStatus = String(batch.status || "");
+  const courierNames = Array.isArray(batch.courier_names)
+    ? batch.courier_names.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  if (batchStatus !== "couriers_assigned" || courierNames.length === 0) {
+    return { rerouted: false, batchStatus };
+  }
+
+  const customersQ = await queryable.query(
+    `SELECT *
+     FROM delivery_batch_customers
+     WHERE batch_id = $1
+       AND call_status = 'accepted'
+     ORDER BY customer_name ASC`,
+    [batchId],
+  );
+  if (customersQ.rowCount === 0) {
+    return { rerouted: false, batchStatus };
+  }
+
+  await queryable.query(
+    `UPDATE delivery_batch_customers
+     SET courier_slot = NULL,
+         courier_name = NULL,
+         courier_code = NULL,
+         route_order = NULL,
+         eta_from = NULL,
+         eta_to = NULL,
+         delivery_status = 'preparing_delivery',
+         updated_at = now()
+     WHERE batch_id = $1
+       AND call_status = 'accepted'`,
+    [batchId],
+  );
+
+  const slots = distributeCustomersAcrossCouriers(customersQ.rows, courierNames, {
+    label: batch.route_origin_label,
+    address: batch.route_origin_address,
+    lat: batch.route_origin_lat,
+    lng: batch.route_origin_lng,
+  });
+
+  for (const slot of slots) {
+    for (let i = 0; i < slot.items.length; i += 1) {
+      const customer = slot.items[i];
+      const routeOrder = i + 1;
+      const eta = buildEtaWindow(batch.delivery_date, customer.eta_minutes);
+      await queryable.query(
+        `UPDATE delivery_batch_customers
+         SET courier_slot = $1,
+             courier_name = $2,
+             courier_code = $3,
+             route_order = $4,
+             eta_from = $5,
+             eta_to = $6,
+             delivery_status = 'handing_to_courier',
+             updated_at = now()
+         WHERE id = $7`,
+        [
+          slot.slot,
+          slot.name,
+          firstLetterCode(slot.name),
+          routeOrder,
+          eta.eta_from,
+          eta.eta_to,
+          customer.id,
+        ],
+      );
+    }
+  }
+
+  await queryable.query(
+    `UPDATE cart_items
+     SET status = 'handing_to_courier',
+         updated_at = now()
+     WHERE id IN (
+       SELECT i.cart_item_id
+       FROM delivery_batch_items i
+       JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
+       WHERE i.batch_id = $1
+         AND c.call_status = 'accepted'
+     )`,
+    [batchId],
+  );
+
+  await queryable.query(
+    `UPDATE delivery_batches
+     SET updated_at = now()
+     WHERE id = $1`,
+    [batchId],
+  );
+
+  return { rerouted: true, batchStatus };
+}
+
+function normalizePhone(value) {
+  return String(value || "").replace(/\D+/g, "");
+}
+
+async function findUserByPhone(queryable, phone) {
+  const normalized = normalizePhone(phone);
+  if (!normalized) return null;
+  const result = await queryable.query(
+    `SELECT u.id::text AS user_id,
+            COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+            ph.phone AS customer_phone
+     FROM phones ph
+     JOIN users u ON u.id = ph.user_id
+     WHERE regexp_replace(COALESCE(ph.phone, ''), '\D+', '', 'g') = $1
+     LIMIT 1`,
+    [normalized],
+  );
+  return result.rows[0] || null;
+}
+
+async function collectEligibleCustomerForUser(queryable, userId) {
+  const customers = await collectEligibleCustomers(queryable);
+  return customers.find((entry) => String(entry.user_id) === String(userId)) || null;
 }
 
 router.get(
@@ -786,12 +1705,86 @@ router.patch(
         .status(400)
         .json({ ok: false, error: "Некорректная сумма порога доставки" });
     }
+    const routeOriginLabel =
+      String(req.body?.route_origin_label || "Точка отправки").trim() ||
+      "Точка отправки";
+    const routeOriginAddress = String(req.body?.route_origin_address || "").trim();
+    let routeOriginLat =
+      req.body?.route_origin_lat == null || req.body?.route_origin_lat === ""
+        ? null
+        : Number(req.body.route_origin_lat);
+    let routeOriginLng =
+      req.body?.route_origin_lng == null || req.body?.route_origin_lng === ""
+        ? null
+        : Number(req.body.route_origin_lng);
+
+    if (
+      routeOriginAddress &&
+      (!Number.isFinite(routeOriginLat) || !Number.isFinite(routeOriginLng))
+    ) {
+      try {
+        const geocoded = await geocodeDeliveryAddress(routeOriginAddress);
+        if (!geocoded) {
+          return res.status(400).json({
+            ok: false,
+            error: "Не удалось найти точку отправки в Самарской области",
+          });
+        }
+        routeOriginLat = geocoded.lat;
+        routeOriginLng = geocoded.lng;
+      } catch (error) {
+        return res.status(400).json({
+          ok: false,
+          error: error.message || "Не удалось проверить точку отправки",
+        });
+      }
+    }
 
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
-      const nextSettings = { threshold_amount: thresholdAmount };
+      const nextSettings = {
+        threshold_amount: thresholdAmount,
+        route_origin_label: routeOriginLabel,
+        route_origin_address: routeOriginAddress,
+        route_origin_lat: Number.isFinite(routeOriginLat) ? routeOriginLat : null,
+        route_origin_lng: Number.isFinite(routeOriginLng) ? routeOriginLng : null,
+      };
       await saveDeliverySettings(client, nextSettings, req.user.id);
+      const activeBatchUpdate = await client.query(
+        `UPDATE delivery_batches
+         SET route_origin_label = $1,
+             route_origin_address = $2,
+             route_origin_lat = $3,
+             route_origin_lng = $4,
+             updated_at = now()
+         WHERE id = (
+           SELECT id
+           FROM delivery_batches
+           WHERE status IN ('calling', 'couriers_assigned')
+           ORDER BY
+             CASE status
+               WHEN 'calling' THEN 0
+               WHEN 'couriers_assigned' THEN 1
+               ELSE 2
+             END,
+             created_at DESC
+           LIMIT 1
+         )
+         RETURNING id, status`,
+        [
+          routeOriginLabel,
+          routeOriginAddress || null,
+          Number.isFinite(routeOriginLat) ? routeOriginLat : null,
+          Number.isFinite(routeOriginLng) ? routeOriginLng : null,
+        ],
+      );
+      if (activeBatchUpdate.rowCount > 0) {
+        const batchId = String(activeBatchUpdate.rows[0].id || "");
+        if (batchId) {
+          await rerouteAcceptedCustomers(client, batchId);
+        }
+      }
       await client.query("COMMIT");
       return res.json({ ok: true, data: nextSettings });
     } catch (err) {
@@ -818,15 +1811,15 @@ router.post(
         0,
         toMoney(req.body?.threshold_amount, settings.threshold_amount),
       );
-      await saveDeliverySettings(
-        client,
-        { threshold_amount: thresholdAmount },
-        req.user.id,
-      );
+      const nextSettings = {
+        ...settings,
+        threshold_amount: thresholdAmount,
+      };
+      await saveDeliverySettings(client, nextSettings, req.user.id);
 
       const createdBatch = await createDeliveryBatch(
         client,
-        thresholdAmount,
+        nextSettings,
         req.user.id,
       );
 
@@ -881,11 +1874,11 @@ router.post(
         0,
         toMoney(req.body?.threshold_amount, settings.threshold_amount),
       );
-      await saveDeliverySettings(
-        client,
-        { threshold_amount: thresholdAmount },
-        req.user.id,
-      );
+      const nextSettings = {
+        ...settings,
+        threshold_amount: thresholdAmount,
+      };
+      await saveDeliverySettings(client, nextSettings, req.user.id);
 
       let batchId = await findDraftBatchId(client);
       let created = false;
@@ -895,7 +1888,7 @@ router.post(
       if (!batchId) {
         const createdBatch = await createDeliveryBatch(
           client,
-          thresholdAmount,
+          nextSettings,
           req.user.id,
         );
         batchId = createdBatch.batchId;
@@ -977,6 +1970,7 @@ router.post(
           user_id: String(customer.user_id),
           chat,
           chatCreated: ensured.created,
+          deletedChatIds: ensured.deletedChatIds || [],
           message: hydrated,
         });
       }
@@ -986,6 +1980,11 @@ router.post(
       const io = req.app.get("io");
       if (io) {
         for (const item of systemMessages) {
+          for (const deletedChatId of item.deletedChatIds || []) {
+            io.to(`user:${item.user_id}`).emit("chat:deleted", {
+              chatId: deletedChatId,
+            });
+          }
           if (item.chatCreated) {
             io.to(`user:${item.user_id}`).emit("chat:created", {
               chat: item.chat,
@@ -1246,6 +2245,15 @@ router.post(
       req.body?.lng == null || req.body?.lng === ""
         ? null
         : Number(req.body.lng);
+    let preferredWindow;
+    try {
+      preferredWindow = sanitizePreferredWindow(
+        req.body?.preferred_time_from,
+        req.body?.preferred_time_to,
+      );
+    } catch (error) {
+      return res.status(400).json({ ok: false, error: error.message });
+    }
 
     if (accepted) {
       const hasAddress =
@@ -1284,6 +2292,13 @@ router.post(
         await client.query("ROLLBACK");
         return res.status(403).json({ ok: false, error: "Нет доступа" });
       }
+      if (!["calling", "couriers_assigned"].includes(String(customer.batch_status || ""))) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Этот лист уже закрыт для новых подтверждений",
+        });
+      }
       if (String(customer.call_status || "") !== "pending") {
         await client.query("ROLLBACK");
         return res.status(400).json({ ok: false, error: "Ответ уже сохранен" });
@@ -1296,6 +2311,20 @@ router.post(
         addressText || String(customer.address_text || "").trim();
       let nextLat = Number.isFinite(lat) ? lat : customer.lat;
       let nextLng = Number.isFinite(lng) ? lng : customer.lng;
+
+      if (accepted && addressText.length > 0 && (!Number.isFinite(lat) || !Number.isFinite(lng))) {
+        const geocoded = await geocodeDeliveryAddress(addressText);
+        if (!geocoded) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            error: "Не удалось найти этот адрес в указанном городе",
+          });
+        }
+        nextAddressText = geocoded.address_text;
+        nextLat = geocoded.lat;
+        nextLng = geocoded.lng;
+      }
 
       if (accepted && nextAddressText) {
         await client.query(
@@ -1325,8 +2354,12 @@ router.post(
              address_text = $4,
              lat = $5,
              lng = $6,
+             preferred_time_from = $7,
+             preferred_time_to = $8,
+             accepted_at = CASE WHEN $1 = 'accepted' THEN now() ELSE accepted_at END,
+             agreed_sum = CASE WHEN $1 = 'accepted' THEN processed_sum ELSE agreed_sum END,
              updated_at = now()
-         WHERE id = $7`,
+         WHERE id = $9`,
         [
           accepted ? "accepted" : "declined",
           accepted ? "preparing_delivery" : "declined",
@@ -1334,6 +2367,8 @@ router.post(
           nextAddressText || null,
           nextLat,
           nextLng,
+          preferredWindow.fromText,
+          preferredWindow.toText,
           customerId,
         ],
       );
@@ -1356,26 +2391,38 @@ router.post(
         `UPDATE messages
          SET meta = jsonb_set(
            jsonb_set(
-             jsonb_set(COALESCE(meta, '{}'::jsonb), '{offer_status}', to_jsonb($1::text), true),
-             '{address_text}',
-             to_jsonb($2::text),
+             jsonb_set(
+               jsonb_set(
+                 jsonb_set(COALESCE(meta, '{}'::jsonb), '{offer_status}', to_jsonb($1::text), true),
+                 '{address_text}',
+                 to_jsonb($2::text),
+                 true
+               ),
+               '{preferred_time_from}',
+               to_jsonb($3::text),
+               true
+             ),
+             '{preferred_time_to}',
+             to_jsonb($4::text),
              true
            ),
            '{responded_at}',
            to_jsonb(now()),
            true
          )
-         WHERE chat_id = $3
+         WHERE chat_id = $5
            AND COALESCE(meta->>'kind', '') = 'delivery_offer'
-           AND COALESCE(meta->>'delivery_customer_id', '') = $4
+           AND COALESCE(meta->>'delivery_customer_id', '') = $6
          RETURNING id`,
-        [
-          accepted ? "accepted" : "declined",
-          nextAddressText || "",
-          chat.id,
-          customerId,
-        ],
-      );
+          [
+            accepted ? "accepted" : "declined",
+            nextAddressText || "",
+            preferredWindow.fromText || "",
+            preferredWindow.toText || "",
+            chat.id,
+            customerId,
+          ],
+        );
 
       const followUpInsert = await client.query(
         `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
@@ -1385,7 +2432,11 @@ router.post(
           uuidv4(),
           chat.id,
           accepted
-            ? buildDeliveryAcceptedText(nextAddressText)
+            ? buildDeliveryAcceptedText(
+                nextAddressText,
+                preferredWindow.fromText,
+                preferredWindow.toText,
+              )
             : buildDeliveryDeclinedText(),
           JSON.stringify({
             kind: "delivery_offer_result",
@@ -1393,6 +2444,8 @@ router.post(
             delivery_customer_id: customerId,
             offer_status: accepted ? "accepted" : "declined",
             address_text: nextAddressText || "",
+            preferred_time_from: preferredWindow.fromText || "",
+            preferred_time_to: preferredWindow.toText || "",
           }),
         ],
       );
@@ -1400,10 +2453,19 @@ router.post(
       await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
         chat.id,
       ]);
+      const autoDeleteAt = await markDeliveryChatForAutoDelete(client, chat.id);
+      if (accepted) {
+        await rerouteAcceptedCustomers(client, customer.batch_id);
+      }
       await client.query("COMMIT");
 
       const io = req.app.get("io");
       if (io) {
+        for (const deletedChatId of ensured.deletedChatIds || []) {
+          io.to(`user:${customer.user_id}`).emit("chat:deleted", {
+            chatId: deletedChatId,
+          });
+        }
         for (const row of updatedOfferMessagesQ.rows) {
           const message = await hydrateSystemMessage(db, row.id);
           if (message) {
@@ -1426,6 +2488,18 @@ router.post(
         emitCartUpdated(io, customer.user_id, {
           status: accepted ? "preparing_delivery" : "processed",
           reason: accepted ? "delivery_confirmed" : "delivery_declined",
+        });
+        io.to(`user:${customer.user_id}`).emit("chat:updated", {
+          chatId: chat.id,
+          chat: {
+            ...chat,
+            settings: {
+              ...(chat.settings && typeof chat.settings === "object"
+                ? chat.settings
+                : {}),
+              auto_delete_after: autoDeleteAt,
+            },
+          },
         });
         emitDeliveryUpdated(io, customer.batch_id);
       }
@@ -1473,6 +2547,15 @@ router.post(
         ? null
         : Number(req.body.lng);
     const saveAsDefault = req.body?.save_as_default !== false;
+    let preferredWindow;
+    try {
+      preferredWindow = sanitizePreferredWindow(
+        req.body?.preferred_time_from,
+        req.body?.preferred_time_to,
+      );
+    } catch (error) {
+      return res.status(400).json({ ok: false, error: error.message });
+    }
 
     if (accepted) {
       const hasAddress = addressText.length > 0 || (Number.isFinite(lat) && Number.isFinite(lng));
@@ -1506,6 +2589,13 @@ router.post(
       }
 
       const customer = customerQ.rows[0];
+      if (!["calling", "couriers_assigned"].includes(String(customer.batch_status || ""))) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Этот лист уже закрыт для новых решений",
+        });
+      }
       if (String(customer.call_status || "") !== "pending") {
         await client.query("ROLLBACK");
         return res.status(400).json({
@@ -1519,6 +2609,20 @@ router.post(
       let nextLng = Number.isFinite(lng) ? lng : customer.lng;
       const ensured = await ensureDeliveryChat(client, customer.user_id, req.user.id);
       const chat = ensured.chat;
+
+      if (accepted && addressText.length > 0 && (!Number.isFinite(lat) || !Number.isFinite(lng))) {
+        const geocoded = await geocodeDeliveryAddress(addressText);
+        if (!geocoded) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            error: "Не удалось найти этот адрес в указанном городе",
+          });
+        }
+        nextAddressText = geocoded.address_text;
+        nextLat = geocoded.lat;
+        nextLng = geocoded.lng;
+      }
 
       if (accepted && saveAsDefault && (nextAddressText || (Number.isFinite(nextLat) && Number.isFinite(nextLng)))) {
         if (nextAddressText) {
@@ -1550,8 +2654,12 @@ router.post(
              address_text = $4,
              lat = $5,
              lng = $6,
+             preferred_time_from = $7,
+             preferred_time_to = $8,
+             accepted_at = CASE WHEN $1 = 'accepted' THEN now() ELSE accepted_at END,
+             agreed_sum = CASE WHEN $1 = 'accepted' THEN processed_sum ELSE agreed_sum END,
              updated_at = now()
-         WHERE id = $7`,
+         WHERE id = $9`,
         [
           accepted ? "accepted" : "declined",
           accepted ? "preparing_delivery" : "declined",
@@ -1559,6 +2667,8 @@ router.post(
           nextAddressText || null,
           nextLat,
           nextLng,
+          preferredWindow.fromText,
+          preferredWindow.toText,
           customerId,
         ],
       );
@@ -1581,22 +2691,34 @@ router.post(
         `UPDATE messages
          SET meta = jsonb_set(
            jsonb_set(
-             jsonb_set(COALESCE(meta, '{}'::jsonb), '{offer_status}', to_jsonb($1::text), true),
-             '{address_text}',
-             to_jsonb($2::text),
+             jsonb_set(
+               jsonb_set(
+                 jsonb_set(COALESCE(meta, '{}'::jsonb), '{offer_status}', to_jsonb($1::text), true),
+                 '{address_text}',
+                 to_jsonb($2::text),
+                 true
+               ),
+               '{preferred_time_from}',
+               to_jsonb($3::text),
+               true
+             ),
+             '{preferred_time_to}',
+             to_jsonb($4::text),
              true
            ),
            '{responded_at}',
            to_jsonb(now()),
            true
          )
-         WHERE chat_id = $3
+         WHERE chat_id = $5
            AND COALESCE(meta->>'kind', '') = 'delivery_offer'
-           AND COALESCE(meta->>'delivery_customer_id', '') = $4
+           AND COALESCE(meta->>'delivery_customer_id', '') = $6
          RETURNING id`,
         [
           accepted ? "accepted" : "declined",
           nextAddressText || "",
+          preferredWindow.fromText || "",
+          preferredWindow.toText || "",
           chat.id,
           customerId,
         ],
@@ -1610,7 +2732,11 @@ router.post(
           uuidv4(),
           chat.id,
           accepted
-            ? buildDeliveryAcceptedText(nextAddressText)
+            ? buildDeliveryAcceptedText(
+                nextAddressText,
+                preferredWindow.fromText,
+                preferredWindow.toText,
+              )
             : buildDeliveryDeclinedText(),
           JSON.stringify({
             kind: "delivery_offer_result",
@@ -1618,6 +2744,8 @@ router.post(
             delivery_customer_id: customerId,
             offer_status: accepted ? "accepted" : "declined",
             address_text: nextAddressText || "",
+            preferred_time_from: preferredWindow.fromText || "",
+            preferred_time_to: preferredWindow.toText || "",
             responded_by: "admin",
           }),
         ],
@@ -1626,9 +2754,13 @@ router.post(
       await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
         chat.id,
       ]);
+      const autoDeleteAt = await markDeliveryChatForAutoDelete(client, chat.id);
       await client.query("UPDATE delivery_batches SET updated_at = now() WHERE id = $1", [
         batchId,
       ]);
+      if (accepted) {
+        await rerouteAcceptedCustomers(client, batchId);
+      }
       await client.query("COMMIT");
 
       const io = req.app.get("io");
@@ -1638,6 +2770,11 @@ router.post(
         });
       }
       if (io) {
+        for (const deletedChatId of ensured.deletedChatIds || []) {
+          io.to(`user:${customer.user_id}`).emit("chat:deleted", {
+            chatId: deletedChatId,
+          });
+        }
         for (const row of updatedOfferMessagesQ.rows) {
           const message = await hydrateSystemMessage(db, row.id);
           if (message) {
@@ -1659,7 +2796,15 @@ router.post(
         }
         io.to(`user:${customer.user_id}`).emit("chat:updated", {
           chatId: chat.id,
-          chat,
+          chat: {
+            ...chat,
+            settings: {
+              ...(chat.settings && typeof chat.settings === "object"
+                ? chat.settings
+                : {}),
+              auto_delete_after: autoDeleteAt,
+            },
+          },
         });
       }
       if (accepted) {
@@ -1693,6 +2838,435 @@ router.post(
   },
 );
 
+router.patch(
+  "/batches/:batchId/customers/:customerId/logistics",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { batchId, customerId } = req.params;
+    const packagePlaces = Number(req.body?.package_places);
+    const bulkyPlaces = Number(req.body?.bulky_places ?? 0);
+    const bulkyNote = String(req.body?.bulky_note || "").trim();
+    if (!Number.isInteger(packagePlaces) || packagePlaces <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Количество мест должно быть больше нуля",
+      });
+    }
+    if (!Number.isInteger(bulkyPlaces) || bulkyPlaces < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Количество габаритов не может быть отрицательным",
+      });
+    }
+
+    try {
+      const updated = await db.query(
+        `UPDATE delivery_batch_customers
+         SET package_places = $1,
+             bulky_places = $2,
+             bulky_note = $3,
+             updated_at = now()
+         WHERE batch_id = $4
+           AND id = $5
+         RETURNING id`,
+        [packagePlaces, bulkyPlaces, bulkyNote || null, batchId, customerId],
+      );
+      if (updated.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Клиент в листе доставки не найден",
+        });
+      }
+      const activeBatch = await fetchBatchDetails(db, batchId);
+      const io = req.app.get("io");
+      emitDeliveryUpdated(io, batchId);
+      return res.json({ ok: true, data: { active_batch: activeBatch } });
+    } catch (err) {
+      console.error("delivery.customer.logistics error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.post(
+  "/batches/:batchId/customers/:customerId/reassign",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { batchId, customerId } = req.params;
+    const courierName = String(req.body?.courier_name || "").trim();
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const batchQ = await client.query(
+        `SELECT id, status, courier_names
+         FROM delivery_batches
+         WHERE id = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [batchId],
+      );
+      if (batchQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
+      }
+      const batch = batchQ.rows[0];
+      const batchStatus = String(batch.status || "");
+      if (!["calling", "couriers_assigned"].includes(batchStatus)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Менять курьера можно только в активном листе доставки",
+        });
+      }
+      const courierNames = Array.isArray(batch.courier_names)
+        ? batch.courier_names.map((item) => String(item || "").trim()).filter(Boolean)
+        : [];
+      let courierSlot = null;
+      let courierCode = null;
+      if (courierName) {
+        courierSlot = courierNames.findIndex((item) => item === courierName);
+        if (courierSlot < 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            error: "Такого курьера нет в текущем листе",
+          });
+        }
+        courierSlot += 1;
+        courierCode = firstLetterCode(courierName);
+      }
+
+      const customerQ = await client.query(
+        `SELECT id, call_status
+         FROM delivery_batch_customers
+         WHERE id = $1
+           AND batch_id = $2
+         LIMIT 1`,
+        [customerId, batchId],
+      );
+      if (customerQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          ok: false,
+          error: "Клиент в листе доставки не найден",
+        });
+      }
+      if (String(customerQ.rows[0].call_status || "") !== "accepted") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Курьера можно менять только для подтвержденного клиента",
+        });
+      }
+
+      await client.query(
+        `UPDATE delivery_batch_customers
+         SET locked_courier_slot = $1,
+             locked_courier_name = $2,
+             locked_courier_code = $3,
+             updated_at = now()
+         WHERE id = $4
+           AND batch_id = $5`,
+        [courierSlot, courierName || null, courierCode, customerId, batchId],
+      );
+
+      await rerouteAcceptedCustomers(client, batchId);
+      await client.query("COMMIT");
+
+      const activeBatch = await fetchBatchDetails(db, batchId);
+      const io = req.app.get("io");
+      emitDeliveryUpdated(io, batchId);
+      return res.json({ ok: true, data: { active_batch: activeBatch } });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("delivery.customer.reassign error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/batches/:batchId/customers/manual-add",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { batchId } = req.params;
+    const phone = String(req.body?.phone || "").trim();
+    const addressText = String(req.body?.address_text || "").trim();
+    const bulkyNote = String(req.body?.bulky_note || "").trim();
+    const packagePlaces = Number(req.body?.package_places ?? 1);
+    const bulkyPlaces = Number(req.body?.bulky_places ?? 0);
+    let preferredWindow;
+    try {
+      preferredWindow = sanitizePreferredWindow(
+        req.body?.preferred_time_from,
+        req.body?.preferred_time_to,
+      );
+    } catch (error) {
+      return res.status(400).json({ ok: false, error: error.message });
+    }
+    if (!phone) {
+      return res.status(400).json({ ok: false, error: "Нужно указать номер телефона" });
+    }
+    if (!addressText) {
+      return res.status(400).json({ ok: false, error: "Нужно указать адрес доставки" });
+    }
+    if (!Number.isInteger(packagePlaces) || packagePlaces <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Количество мест должно быть больше нуля",
+      });
+    }
+    if (!Number.isInteger(bulkyPlaces) || bulkyPlaces < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Количество габаритов не может быть отрицательным",
+      });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const batchQ = await client.query(
+        `SELECT id, status
+         FROM delivery_batches
+         WHERE id = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [batchId],
+      );
+      if (batchQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
+      }
+      const batchStatus = String(batchQ.rows[0].status || "");
+      if (!["calling", "couriers_assigned"].includes(batchStatus)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Вручную добавлять клиента можно только в текущий активный лист",
+        });
+      }
+
+      const user = await findUserByPhone(client, phone);
+      if (!user) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          ok: false,
+          error: "Клиент с таким номером телефона не найден",
+        });
+      }
+
+      const existingQ = await client.query(
+        `SELECT id, call_status
+         FROM delivery_batch_customers
+         WHERE batch_id = $1
+           AND user_id = $2
+         LIMIT 1`,
+        [batchId, user.user_id],
+      );
+      if (existingQ.rowCount > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error:
+            String(existingQ.rows[0].call_status || "") === "pending"
+              ? "Этот клиент уже в листе. Подтвердите его кнопкой в карточке."
+              : "Этот клиент уже есть в текущем листе доставки",
+        });
+      }
+
+      const eligible = await collectEligibleCustomerForUser(client, user.user_id);
+      if (!eligible || !Array.isArray(eligible.items) || eligible.items.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "У клиента нет обработанных товаров, готовых к доставке",
+        });
+      }
+
+      const geocoded = await geocodeDeliveryAddress(addressText);
+      if (!geocoded) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Не удалось найти этот адрес в указанном городе",
+        });
+      }
+
+      await client.query(
+        `UPDATE user_delivery_addresses
+         SET is_default = false,
+             updated_at = now()
+         WHERE user_id = $1`,
+        [user.user_id],
+      );
+      const addressInsert = await client.query(
+        `INSERT INTO user_delivery_addresses (
+           id, user_id, label, address_text, lat, lng,
+           is_default, created_at, updated_at
+         )
+         VALUES ($1, $2, 'Основной адрес', $3, $4, $5, true, now(), now())
+         RETURNING id`,
+        [uuidv4(), user.user_id, geocoded.address_text, geocoded.lat, geocoded.lng],
+      );
+      const addressId = String(addressInsert.rows[0].id);
+      const batchCustomerId = uuidv4();
+
+      await client.query(
+        `INSERT INTO delivery_batch_customers (
+           id, batch_id, user_id, customer_name, customer_phone,
+           processed_sum, agreed_sum, processed_items_count, shelf_number,
+           address_id, address_text, lat, lng,
+           call_status, delivery_status, preferred_time_from, preferred_time_to,
+           package_places, bulky_places, bulky_note, accepted_at, created_at, updated_at
+         )
+         VALUES (
+           $1, $2, $3, $4, $5,
+           $6, $6, $7, $8,
+           $9, $10, $11, $12,
+           'accepted', 'preparing_delivery', $13, $14,
+           $15, $16, $17, now(), now(), now()
+         )`,
+        [
+          batchCustomerId,
+          batchId,
+          user.user_id,
+          eligible.customer_name,
+          eligible.customer_phone,
+          eligible.processed_sum,
+          eligible.processed_items_count,
+          eligible.shelf_number,
+          addressId,
+          geocoded.address_text,
+          geocoded.lat,
+          geocoded.lng,
+          preferredWindow.fromText,
+          preferredWindow.toText,
+          packagePlaces,
+          bulkyPlaces,
+          bulkyNote || null,
+        ],
+      );
+
+      for (const item of eligible.items) {
+        await client.query(
+          `INSERT INTO delivery_batch_items (
+             id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
+             quantity, unit_price, line_total, product_code, product_title,
+             product_description, product_image_url, created_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5, $6,
+             $7, $8, $9, $10, $11,
+             $12, $13, now()
+           )`,
+          [
+            uuidv4(),
+            batchId,
+            batchCustomerId,
+            item.cart_item_id,
+            item.user_id,
+            item.product_id,
+            item.quantity,
+            item.unit_price,
+            item.line_total,
+            item.product_code,
+            item.product_title,
+            item.product_description,
+            item.product_image_url,
+          ],
+        );
+      }
+
+      await client.query(
+        `UPDATE cart_items
+         SET status = 'preparing_delivery',
+             updated_at = now()
+         WHERE id IN (
+           SELECT cart_item_id
+           FROM delivery_batch_items
+           WHERE batch_customer_id = $1
+         )`,
+        [batchCustomerId],
+      );
+
+      const ensured = await ensureDeliveryChat(client, user.user_id, req.user.id);
+      const chat = ensured.chat;
+      const followUpInsert = await client.query(
+        `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+         VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+         RETURNING id`,
+        [
+          uuidv4(),
+          chat.id,
+          buildDeliveryAcceptedText(
+            geocoded.address_text,
+            preferredWindow.fromText,
+            preferredWindow.toText,
+          ),
+          JSON.stringify({
+            kind: "delivery_offer_result",
+            delivery_batch_id: batchId,
+            delivery_customer_id: batchCustomerId,
+            offer_status: "accepted",
+            address_text: geocoded.address_text,
+            preferred_time_from: preferredWindow.fromText || "",
+            preferred_time_to: preferredWindow.toText || "",
+            responded_by: "admin_manual_add",
+          }),
+        ],
+      );
+
+      await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+        chat.id,
+      ]);
+
+      await rerouteAcceptedCustomers(client, batchId);
+      await client.query("COMMIT");
+
+      const io = req.app.get("io");
+      if (io && ensured.created) {
+        io.to(`user:${user.user_id}`).emit("chat:created", { chat });
+      }
+      if (io) {
+        const followUpMessage = await hydrateSystemMessage(
+          db,
+          followUpInsert.rows[0].id,
+        );
+        if (followUpMessage) {
+          io.to(`user:${user.user_id}`).emit("chat:message", {
+            chatId: chat.id,
+            message: followUpMessage,
+          });
+        }
+        emitCartUpdated(io, user.user_id, {
+          status:
+            batchStatus === "couriers_assigned"
+              ? "handing_to_courier"
+              : "preparing_delivery",
+          reason: "delivery_manual_add",
+        });
+        emitDeliveryUpdated(io, batchId);
+      }
+
+      const activeBatch = await fetchBatchDetails(db, batchId);
+      return res.status(201).json({ ok: true, data: { active_batch: activeBatch } });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("delivery.customer.manualAdd error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
 router.post(
   "/batches/:batchId/assign-couriers",
   requireAuth,
@@ -1715,7 +3289,7 @@ router.post(
       await client.query("BEGIN");
 
       const batchQ = await client.query(
-        `SELECT id, delivery_date, status
+        `SELECT id, status
          FROM delivery_batches
          WHERE id = $1
          LIMIT 1
@@ -1726,16 +3300,15 @@ router.post(
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
       }
-      const deliveryDate = batchQ.rows[0].delivery_date;
       const batchStatus = String(batchQ.rows[0].status || "");
-      if (batchStatus !== "calling") {
+      if (!["calling", "couriers_assigned"].includes(batchStatus)) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
           error:
             batchStatus === "handed_off"
               ? "Этот лист уже передан курьерам. Отправьте новую рассылку."
-              : "Распределять по курьерам можно только текущий лист доставки",
+              : "Распределять по курьерам можно только текущий активный лист доставки",
         });
       }
 
@@ -1755,54 +3328,6 @@ router.post(
         });
       }
 
-      const slots = distributeCustomersAcrossCouriers(
-        customersQ.rows,
-        courierNames,
-      );
-
-      for (const slot of slots) {
-        for (let i = 0; i < slot.items.length; i += 1) {
-          const customer = slot.items[i];
-          const routeOrder = i + 1;
-          const eta = buildEtaWindow(deliveryDate, routeOrder);
-          await client.query(
-            `UPDATE delivery_batch_customers
-             SET courier_slot = $1,
-                 courier_name = $2,
-                 courier_code = $3,
-                 route_order = $4,
-                 eta_from = $5,
-                 eta_to = $6,
-                 delivery_status = 'handing_to_courier',
-                 updated_at = now()
-             WHERE id = $7`,
-            [
-              slot.slot,
-              slot.name,
-              firstLetterCode(slot.name),
-              routeOrder,
-              eta.eta_from,
-              eta.eta_to,
-              customer.id,
-            ],
-          );
-        }
-      }
-
-      await client.query(
-        `UPDATE cart_items
-         SET status = 'handing_to_courier',
-             updated_at = now()
-         WHERE id IN (
-           SELECT i.cart_item_id
-           FROM delivery_batch_items i
-           JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
-           WHERE i.batch_id = $1
-             AND c.call_status = 'accepted'
-         )`,
-        [batchId],
-      );
-
       await client.query(
         `UPDATE delivery_batches
          SET courier_count = $1,
@@ -1812,6 +3337,8 @@ router.post(
          WHERE id = $3`,
         [courierNames.length, JSON.stringify(courierNames), batchId],
       );
+
+      await rerouteAcceptedCustomers(client, batchId);
 
       await client.query("COMMIT");
 
@@ -1901,6 +3428,19 @@ router.post(
              AND c.call_status = 'accepted'
              AND c.courier_name IS NOT NULL
              AND c.courier_name <> ''
+        )`,
+        [batchId],
+      );
+
+      await client.query(
+        `DELETE FROM user_shelves
+         WHERE user_id IN (
+           SELECT DISTINCT c.user_id
+           FROM delivery_batch_customers c
+           WHERE c.batch_id = $1
+             AND c.call_status = 'accepted'
+             AND c.courier_name IS NOT NULL
+             AND c.courier_name <> ''
          )`,
         [batchId],
       );
@@ -1944,5 +3484,357 @@ router.post(
     }
   },
 );
+
+router.post(
+  "/batches/:batchId/complete",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { batchId } = req.params;
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const batchQ = await client.query(
+        `SELECT id, status
+         FROM delivery_batches
+         WHERE id = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [batchId],
+      );
+      if (batchQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
+      }
+      const batchStatus = String(batchQ.rows[0].status || "");
+      if (batchStatus !== "handed_off") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error:
+            batchStatus === "completed"
+              ? "Этот лист уже завершен"
+              : "Завершить можно только лист, который уже передан курьерам",
+        });
+      }
+
+      const usersQ = await client.query(
+        `SELECT DISTINCT c.user_id::text AS user_id
+         FROM delivery_batch_customers c
+         WHERE c.batch_id = $1
+           AND c.call_status = 'accepted'
+           AND c.courier_name IS NOT NULL
+           AND c.courier_name <> ''`,
+        [batchId],
+      );
+
+      await client.query(
+        `UPDATE delivery_batch_customers
+         SET delivery_status = 'completed',
+             updated_at = now()
+         WHERE batch_id = $1
+           AND call_status = 'accepted'
+           AND courier_name IS NOT NULL
+           AND courier_name <> ''`,
+        [batchId],
+      );
+
+      await client.query(
+        `UPDATE cart_items
+         SET status = 'delivered',
+             updated_at = now()
+         WHERE id IN (
+           SELECT i.cart_item_id
+           FROM delivery_batch_items i
+           JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
+           WHERE i.batch_id = $1
+             AND c.call_status = 'accepted'
+             AND c.courier_name IS NOT NULL
+             AND c.courier_name <> ''
+         )`,
+        [batchId],
+      );
+
+      await client.query(
+        `UPDATE delivery_batches
+         SET status = 'completed',
+             completed_at = COALESCE(completed_at, now()),
+             updated_at = now()
+         WHERE id = $1`,
+        [batchId],
+      );
+
+      await client.query("COMMIT");
+
+      const detail = await fetchBatchDetails(db, batchId);
+      const io = req.app.get("io");
+      if (io) {
+        for (const row of usersQ.rows) {
+          emitCartUpdated(io, row.user_id, {
+            status: "delivered",
+            reason: "delivery_completed",
+            batch_id: batchId,
+          });
+        }
+        emitDeliveryUpdated(io, batchId);
+      }
+
+      return res.json({ ok: true, data: { active_batch: detail, batch_id: batchId } });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("delivery.complete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/batches/:batchId/customers/:customerId/remove-from-route",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { batchId, customerId } = req.params;
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const customerQ = await client.query(
+        `SELECT c.*,
+                b.status AS batch_status
+         FROM delivery_batch_customers c
+         JOIN delivery_batches b ON b.id = c.batch_id
+         WHERE c.id = $1
+           AND c.batch_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [customerId, batchId],
+      );
+      if (customerQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Клиент в листе доставки не найден" });
+      }
+
+      const customer = customerQ.rows[0];
+      const batchStatus = String(customer.batch_status || "");
+      if (!["calling", "couriers_assigned", "handed_off"].includes(batchStatus)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Из этого листа уже нельзя вернуть клиента в корзину",
+        });
+      }
+
+      if (String(customer.call_status || "") !== "accepted") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Вернуть в корзину можно только клиента с подтвержденной доставкой",
+        });
+      }
+
+      await client.query(
+        `UPDATE delivery_batch_customers
+         SET call_status = 'removed',
+             delivery_status = 'returned_to_cart',
+             courier_slot = NULL,
+             courier_name = NULL,
+             courier_code = NULL,
+             route_order = NULL,
+             eta_from = NULL,
+             eta_to = NULL,
+             locked_courier_slot = NULL,
+             locked_courier_name = NULL,
+             locked_courier_code = NULL,
+             updated_at = now()
+         WHERE id = $1`,
+        [customerId],
+      );
+
+      await client.query(
+        `UPDATE cart_items
+         SET status = 'processed',
+             updated_at = now()
+         WHERE id IN (
+           SELECT cart_item_id
+           FROM delivery_batch_items
+           WHERE batch_customer_id = $1
+         )`,
+        [customerId],
+      );
+
+      await upsertUserShelf(client, customer.user_id, customer.shelf_number);
+
+      if (batchStatus === "couriers_assigned") {
+        await rerouteAcceptedCustomers(client, batchId);
+      }
+
+      await client.query(
+        `UPDATE delivery_batches
+         SET updated_at = now()
+         WHERE id = $1`,
+        [batchId],
+      );
+
+      await client.query("COMMIT");
+
+      const detail = await fetchBatchDetails(db, batchId);
+      const io = req.app.get("io");
+      if (io) {
+        emitCartUpdated(io, customer.user_id, {
+          status: "processed",
+          reason: "delivery_removed_from_route",
+          batch_id: batchId,
+        });
+        emitDeliveryUpdated(io, batchId);
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          customer_id: customerId,
+          active_batch: detail,
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("delivery.removeFromRoute error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.get(
+  "/batches/:batchId/export",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { batchId } = req.params;
+    try {
+      const batchQ = await db.query(
+        `SELECT id, delivery_date
+         FROM delivery_batches
+         WHERE id = $1
+         LIMIT 1`,
+        [batchId],
+      );
+      if (batchQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
+      }
+      const rowsQ = await db.query(
+        `SELECT customer_phone,
+                customer_name,
+                agreed_sum,
+                processed_sum,
+                address_text,
+                courier_code,
+                bulky_note,
+                shelf_number,
+                package_places,
+                preferred_time_from,
+                preferred_time_to,
+                route_order
+         FROM delivery_batch_customers
+         WHERE batch_id = $1
+           AND call_status = 'accepted'
+         ORDER BY route_order ASC NULLS LAST, customer_name ASC`,
+        [batchId],
+      );
+
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Доставка");
+      worksheet.columns = [
+        { header: "Маршрут", key: "route_order", width: 12 },
+        { header: "Телефон клиента", key: "customer_phone", width: 20 },
+        { header: "Имя клиента", key: "customer_name", width: 24 },
+        { header: "Сумма в доставке", key: "delivery_sum", width: 18 },
+        { header: "Адрес клиента", key: "address_text", width: 52 },
+        { header: "Курьер", key: "courier_code", width: 12 },
+        { header: "Габарит", key: "bulky_note", width: 26 },
+        { header: "Номер полки", key: "shelf_number", width: 14 },
+        { header: "Сколько мест", key: "package_places", width: 14 },
+      ];
+      worksheet.getRow(1).font = { bold: true };
+      worksheet.views = [{ state: "frozen", ySplit: 1 }];
+
+      if (rowsQ.rows.length === 0) {
+        worksheet.addRow({
+          route_order: "",
+          customer_phone: "",
+          customer_name: "",
+          delivery_sum: "",
+          address_text: "",
+          courier_code: "",
+          bulky_note: "",
+          shelf_number: "",
+          package_places: "",
+        });
+      } else {
+        for (const customer of rowsQ.rows) {
+          const row = worksheet.addRow({
+            route_order:
+              customer.route_order == null ? "" : Number(customer.route_order),
+            customer_phone: String(customer.customer_phone || "").trim(),
+            customer_name: String(customer.customer_name || "").trim(),
+            delivery_sum: toMoney(customer.agreed_sum || customer.processed_sum),
+            address_text: "",
+            courier_code: String(customer.courier_code || "").trim(),
+            bulky_note: String(customer.bulky_note || "").trim(),
+            shelf_number:
+              customer.shelf_number == null ? "" : Number(customer.shelf_number),
+            package_places:
+              customer.package_places == null ? 1 : Number(customer.package_places),
+          });
+          const addressCell = row.getCell("address_text");
+          const addressText = String(customer.address_text || "").trim();
+          const preferenceLabel = formatDeliveryPreferenceLabel(
+            customer.preferred_time_from,
+            customer.preferred_time_to,
+          );
+          if (preferenceLabel) {
+            const richText = [];
+            if (addressText) {
+              richText.push({ text: addressText });
+              richText.push({ text: " " });
+            }
+            richText.push({ text: preferenceLabel, font: { bold: true } });
+            addressCell.value = { richText };
+          } else {
+            addressCell.value = addressText;
+          }
+        }
+      }
+
+      worksheet.eachRow((row, rowNumber) => {
+        row.alignment = {
+          vertical: "top",
+          wrapText: true,
+        };
+        if (rowNumber > 1) {
+          row.getCell("delivery_sum").numFmt = "0.00";
+        }
+      });
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const filename = `delivery_${String(batchQ.rows[0].delivery_date || "sheet").slice(0, 10)}.xlsx`;
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      return res.send(buffer);
+    } catch (err) {
+      console.error("delivery.export error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.startBackgroundTasks = startDeliveryDialogCleanup;
 
 module.exports = router;
