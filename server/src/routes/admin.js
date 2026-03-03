@@ -18,7 +18,15 @@ const channelUploadsDir = path.resolve(
   "uploads",
   "channels",
 );
+const productUploadsDir = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "uploads",
+  "products",
+);
 fs.mkdirSync(channelUploadsDir, { recursive: true });
+fs.mkdirSync(productUploadsDir, { recursive: true });
 
 const channelAvatarUpload = multer({
   storage: multer.diskStorage({
@@ -124,6 +132,22 @@ function normalizeAvatarFocus(value, fallback = 0) {
 
 function normalizeAvatarZoom(value, fallback = 1) {
   return clampNumber(value, 1, 4, fallback);
+}
+
+const demoPlaceholderPngBase64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAoAAAAHgCAYAAAA10dzkAAAACXBIWXMAAAsSAAALEgHS3X78AAAGnElEQVR4nO3UQQ0AIBDAsAP/nuGNAvZoFSzZOjM7AID3zA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDvzA4A4N0MAIDv7AFCiwL6geiJ2QAAAABJRU5ErkJggg==";
+
+function ensureDemoProductImage(req) {
+  const filename = "demo-placeholder.png";
+  const target = path.join(productUploadsDir, filename);
+  if (!fs.existsSync(target)) {
+    fs.writeFileSync(target, Buffer.from(demoPlaceholderPngBase64, "base64"));
+  }
+  return `${req.protocol}://${req.get("host")}/uploads/products/${filename}`;
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function isUuidLike(value) {
@@ -243,6 +267,47 @@ function reservedOrderMessageText(order) {
     "Статус: ожидание обработки",
   ].filter(Boolean);
   return lines.join("\n");
+}
+
+function buildDemoProduct(index, imageUrl) {
+  const nouns = [
+    "Шампунь",
+    "Кофта",
+    "Кружка",
+    "Плед",
+    "Игрушка",
+    "Сумка",
+    "Свеча",
+    "Куртка",
+    "Термос",
+    "Скраб",
+  ];
+  const adjectives = [
+    "новый",
+    "уютный",
+    "мягкий",
+    "яркий",
+    "плотный",
+    "аккуратный",
+    "зимний",
+    "летний",
+    "практичный",
+    "компактный",
+  ];
+  const noun = nouns[index % nouns.length];
+  const adjective = adjectives[randomInt(0, adjectives.length - 1)];
+  const price = randomInt(80, 2500);
+  const quantity = randomInt(1, 8);
+  return {
+    title: `${noun} ${index + 1}`,
+    description: `${adjective} товар для теста публикации на канал. Партия ${randomInt(
+      1,
+      99,
+    )}.`,
+    price,
+    quantity,
+    image_url: imageUrl,
+  };
 }
 
 async function allocateProductCode(client) {
@@ -1201,9 +1266,6 @@ router.get(
   requireRole("admin", "creator"),
   async (req, res) => {
     try {
-      const channelId = req.query.channel_id
-        ? String(req.query.channel_id)
-        : null;
       const result = await db.query(
         `SELECT q.id,
               q.product_id,
@@ -1220,20 +1282,118 @@ router.get(
               p.quantity AS product_quantity,
               p.image_url AS product_image_url,
               p.product_code,
-              u.email AS queued_by_email
+              u.email AS queued_by_email,
+              u.name AS queued_by_name
        FROM product_publication_queue q
        JOIN chats c ON c.id = q.channel_id
        JOIN products p ON p.id = q.product_id
        LEFT JOIN users u ON u.id = q.queued_by
        WHERE q.status = 'pending'
          AND COALESCE(q.is_sent, false) = false
-         AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
        ORDER BY q.created_at ASC`,
-        [channelId],
       );
-      return res.json({ ok: true, data: result.rows });
+      const reservedStatsQ = await db.query(
+        `SELECT COUNT(*)::int AS total,
+                COALESCE(SUM(quantity), 0)::int AS units
+         FROM reservations
+         WHERE is_fulfilled = false`,
+      );
+      return res.json({
+        ok: true,
+        data: result.rows,
+        meta: {
+          reserved_pending_total: Number(reservedStatsQ.rows[0]?.total || 0),
+          reserved_pending_units: Number(reservedStatsQ.rows[0]?.units || 0),
+        },
+      });
     } catch (err) {
       console.error("admin.channels.pending_posts error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/channels/pending_posts/:queueId",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const queueId = String(req.params.queueId || "").trim();
+    const title = String(req.body?.title || "").trim();
+    const description = String(req.body?.description || "").trim();
+    const price = Number(req.body?.price);
+    const quantity = Number(req.body?.quantity);
+
+    if (!queueId) {
+      return res.status(400).json({ ok: false, error: "queueId обязателен" });
+    }
+    if (!title) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Название товара обязательно" });
+    }
+    if (!description || description.length < 2) {
+      return res.status(400).json({
+        ok: false,
+        error: "Описание должно содержать минимум 2 символа",
+      });
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Цена должна быть больше нуля" });
+    }
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Количество должно быть больше нуля" });
+    }
+
+    try {
+      const updated = await db.query(
+        `WITH target AS (
+           SELECT q.id, q.product_id
+           FROM product_publication_queue q
+           WHERE q.id = $1
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+           LIMIT 1
+         ),
+         product_upd AS (
+           UPDATE products p
+           SET title = $2,
+               description = $3,
+               price = $4,
+               quantity = $5,
+               updated_at = now()
+           FROM target t
+           WHERE p.id = t.product_id
+           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.image_url, p.product_code
+         )
+         UPDATE product_publication_queue q
+         SET payload = jsonb_strip_nulls(
+               jsonb_build_object(
+                 'title', $2,
+                 'description', $3,
+                 'price', $4,
+                 'quantity', $5,
+                 'image_url', (SELECT image_url FROM product_upd LIMIT 1)
+               )
+             )
+         WHERE q.id = $1
+           AND EXISTS (SELECT 1 FROM target)
+         RETURNING q.id`,
+        [queueId, title, description, price, Math.floor(quantity)],
+      );
+      if (updated.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Пост не найден или уже опубликован",
+        });
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("admin.channels.pending_posts.patch error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     }
   },
@@ -1482,10 +1642,11 @@ router.post(
         `UPDATE reservations
          SET is_fulfilled = true,
              is_sent = true,
+             fulfilled_by_id = $2,
              fulfilled_at = now(),
              updated_at = now()
          WHERE id = $1`,
-        [item.id],
+        [item.id, req.user.id],
       );
 
       if (targetCartItemId) {
@@ -1752,6 +1913,139 @@ router.post(
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("admin.channels.publish_pending error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/test/publish-demo-posts",
+  requireAuth,
+  async (req, res) => {
+    if (String(req.user?.base_role || req.user?.role || "") !== "creator") {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const requestedCount = Number(req.body?.count);
+    const count = Number.isFinite(requestedCount)
+      ? Math.max(1, Math.min(50, Math.floor(requestedCount)))
+      : 10;
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { mainChannel } = await ensureSystemChannels(client, req.user.id);
+      const imageUrl = ensureDemoProductImage(req);
+      const published = [];
+
+      for (let index = 0; index < count; index += 1) {
+        const code = await allocateProductCode(client);
+        const demo = buildDemoProduct(index, imageUrl);
+        const productId = uuidv4();
+        await client.query(
+          `INSERT INTO products (
+             id, product_code, title, description, price, quantity,
+             image_url, created_by, status, created_at, updated_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5, $6,
+             $7, $8, 'published', now(), now()
+           )`,
+          [
+            productId,
+            code,
+            demo.title,
+            demo.description,
+            demo.price,
+            demo.quantity,
+            demo.image_url,
+            req.user.id,
+          ],
+        );
+
+        const queueId = uuidv4();
+        const payload = {
+          title: demo.title,
+          description: demo.description,
+          price: demo.price,
+          quantity: demo.quantity,
+          image_url: demo.image_url,
+        };
+        const messageMeta = {
+          kind: "catalog_product",
+          product_id: productId,
+          product_code: code,
+          price: demo.price,
+          quantity: demo.quantity,
+          image_url: demo.image_url,
+        };
+        const messageInsert = await client.query(
+          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+           RETURNING id`,
+          [
+            uuidv4(),
+            mainChannel.id,
+            productMessageText({
+              title: demo.title,
+              description: demo.description,
+              price: demo.price,
+              quantity: demo.quantity,
+            }),
+            JSON.stringify(messageMeta),
+          ],
+        );
+
+        await client.query(
+          `INSERT INTO product_publication_queue (
+             id, product_id, channel_id, queued_by,
+             status, is_sent, payload, approved_by, approved_at, published_message_id, created_at
+           )
+           VALUES (
+             $1, $2, $3, $4,
+             'published', true, $5::jsonb, $6, now(), $7, now()
+           )`,
+          [
+            queueId,
+            productId,
+            mainChannel.id,
+            req.user.id,
+            JSON.stringify(payload),
+            req.user.id,
+            messageInsert.rows[0].id,
+          ],
+        );
+
+        published.push({
+          queue_id: queueId,
+          channel_id: mainChannel.id,
+          channel_title: mainChannel.title,
+          product_id: productId,
+          product_code: code,
+          message_id: messageInsert.rows[0].id,
+        });
+      }
+
+      await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+        mainChannel.id,
+      ]);
+      await client.query("COMMIT");
+
+      schedulePublishedMessages(req.app.get("io"), published);
+
+      return res.json({
+        ok: true,
+        data: {
+          count,
+          channel_id: mainChannel.id,
+          channel_title: mainChannel.title,
+          posts: published,
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("admin.test.publish_demo_posts error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();

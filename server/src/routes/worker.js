@@ -459,4 +459,124 @@ router.post(
   }
 );
 
+router.get(
+  '/queue/mine',
+  authMiddleware,
+  requireRole('worker', 'admin', 'creator'),
+  async (req, res) => {
+    try {
+      const result = await db.query(
+        `SELECT q.id,
+                q.product_id,
+                q.channel_id,
+                q.queued_by,
+                q.status,
+                q.is_sent,
+                q.payload,
+                q.created_at,
+                c.title AS channel_title,
+                p.product_code,
+                p.title AS product_title,
+                p.description AS product_description,
+                p.price AS product_price,
+                p.quantity AS product_quantity,
+                p.image_url AS product_image_url
+         FROM product_publication_queue q
+         JOIN products p ON p.id = q.product_id
+         JOIN chats c ON c.id = q.channel_id
+         WHERE q.queued_by = $1
+           AND q.status = 'pending'
+           AND COALESCE(q.is_sent, false) = false
+         ORDER BY q.created_at DESC`,
+        [req.user.id]
+      );
+      return res.json({ ok: true, data: result.rows });
+    } catch (err) {
+      console.error('worker.queue.mine error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  }
+);
+
+router.patch(
+  '/queue/:queueId',
+  authMiddleware,
+  requireRole('worker', 'admin', 'creator'),
+  async (req, res) => {
+    const queueId = String(req.params.queueId || '').trim();
+    const title = String(req.body?.title || '').trim();
+    const description = String(req.body?.description || '').trim();
+    const price = Number(req.body?.price);
+    const quantity = Number(req.body?.quantity);
+
+    if (!queueId) {
+      return res.status(400).json({ ok: false, error: 'queueId обязателен' });
+    }
+    if (!title) {
+      return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
+    }
+    if (!hasAtLeastTwoLetters(description)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Описание должно содержать минимум 2 буквы',
+      });
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ ok: false, error: 'Цена должна быть больше нуля' });
+    }
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
+    }
+
+    try {
+      const result = await db.query(
+        `WITH target AS (
+           SELECT q.id, q.product_id
+           FROM product_publication_queue q
+           WHERE q.id = $1
+             AND q.queued_by = $2
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+           LIMIT 1
+         ),
+         product_upd AS (
+           UPDATE products p
+           SET title = $3,
+               description = $4,
+               price = $5,
+               quantity = $6,
+               updated_at = now()
+           FROM target t
+           WHERE p.id = t.product_id
+           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.image_url
+         )
+         UPDATE product_publication_queue q
+         SET payload = jsonb_strip_nulls(
+               jsonb_build_object(
+                 'title', $3,
+                 'description', $4,
+                 'price', $5,
+                 'quantity', $6,
+                 'image_url', (SELECT image_url FROM product_upd LIMIT 1)
+               )
+             )
+         WHERE q.id = $1
+           AND EXISTS (SELECT 1 FROM target)
+         RETURNING q.id`,
+        [queueId, req.user.id, title, description, price, Math.floor(quantity)]
+      );
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: 'Пост не найден, уже опубликован или не принадлежит вам',
+        });
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('worker.queue.patch error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  }
+);
+
 module.exports = router;

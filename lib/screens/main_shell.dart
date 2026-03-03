@@ -55,14 +55,15 @@ class _MainShellState extends State<MainShell> {
         setState(() {
           _loading = false;
           _lastEffectiveRole = nextRole;
-          _index = 0;
+          _index = _resolveNextIndexForRole(nextRole);
           _activatedDestinations.clear();
         });
       } else {
         setState(() {
           if (_lastEffectiveRole != nextRole) {
+            final nextIndex = _resolveNextIndexForRole(nextRole);
             _lastEffectiveRole = nextRole;
-            _index = 0;
+            _index = nextIndex;
             _activatedDestinations.clear();
           }
         });
@@ -85,6 +86,36 @@ class _MainShellState extends State<MainShell> {
   }
 
   String _effectiveRole() => authService.effectiveRole;
+
+  List<String> _destinationIdsForRole(String role) {
+    final normalized = role.toLowerCase().trim();
+    final showAdmin = normalized == 'admin' || normalized == 'creator';
+    final showWorker = normalized == 'worker' || normalized == 'creator';
+    final showTests =
+        (authService.currentUser?.role ?? '').toLowerCase().trim() == 'creator';
+    return <String>[
+      'chats',
+      'cart',
+      if (showAdmin) 'admin',
+      if (showWorker) 'worker',
+      'profile',
+      'settings',
+      if (showTests) 'tests',
+    ];
+  }
+
+  int _resolveNextIndexForRole(String nextRole) {
+    final previousIds = _destinationIdsForRole(_lastEffectiveRole);
+    final currentId = previousIds.isEmpty
+        ? 'profile'
+        : previousIds[_index.clamp(0, previousIds.length - 1)];
+    final nextIds = _destinationIdsForRole(nextRole);
+    final sameTabIndex = nextIds.indexOf(currentId);
+    if (sameTabIndex >= 0) return sameTabIndex;
+    final profileIndex = nextIds.indexOf('profile');
+    if (profileIndex >= 0) return profileIndex;
+    return 0;
+  }
 
   bool _hasAdminTab() {
     const roles = {'admin', 'creator'};

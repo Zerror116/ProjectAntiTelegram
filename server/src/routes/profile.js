@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require("uuid");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/requireAuth");
+const SAMARA_TZ = "Europe/Samara";
 
 const profileUploadsDir = path.resolve(
   __dirname,
@@ -130,9 +131,328 @@ async function loadUserProfile(userId) {
   };
 }
 
+function toNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function loadClientStats(userId) {
+  const result = await pool.query(
+    `SELECT
+       COALESCE(SUM(c.quantity) FILTER (
+         WHERE timezone($2, c.created_at) >= date_trunc('day', timezone($2, now()))
+       ), 0)::int AS items_today,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($2, c.created_at) >= date_trunc('day', timezone($2, now()))
+       ), 0)::numeric(12,2) AS spent_today,
+       COALESCE(SUM(c.quantity) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '7 days'
+       ), 0)::int AS items_week,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '7 days'
+       ), 0)::numeric(12,2) AS spent_week,
+       COALESCE(SUM(c.quantity) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '30 days'
+       ), 0)::int AS items_month,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '30 days'
+       ), 0)::numeric(12,2) AS spent_month,
+       COALESCE(SUM(c.quantity), 0)::int AS items_all_time,
+       COALESCE(SUM(c.quantity * p.price), 0)::numeric(12,2) AS spent_all_time
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id
+     WHERE c.user_id = $1`,
+    [userId, SAMARA_TZ],
+  );
+  const row = result.rows[0] || {};
+  return {
+    today: { items: toNumber(row.items_today), amount: toNumber(row.spent_today) },
+    week: { items: toNumber(row.items_week), amount: toNumber(row.spent_week) },
+    month: { items: toNumber(row.items_month), amount: toNumber(row.spent_month) },
+    all_time: {
+      items: toNumber(row.items_all_time),
+      amount: toNumber(row.spent_all_time),
+    },
+  };
+}
+
+async function loadWorkerStats(userId) {
+  const postsQ = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE timezone($2, p.created_at) >= date_trunc('day', timezone($2, now()))
+       )::int AS posts_today,
+       COUNT(*) FILTER (
+         WHERE timezone($2, p.created_at) >= timezone($2, now()) - interval '7 days'
+       )::int AS posts_week,
+       COUNT(*) FILTER (
+         WHERE timezone($2, p.created_at) >= timezone($2, now()) - interval '30 days'
+       )::int AS posts_month,
+       COUNT(*)::int AS posts_all_time
+     FROM products p
+     WHERE p.created_by = $1`,
+    [userId, SAMARA_TZ],
+  );
+  const salesQ = await pool.query(
+    `SELECT
+       COALESCE(SUM(c.quantity) FILTER (
+         WHERE timezone($2, c.created_at) >= date_trunc('day', timezone($2, now()))
+       ), 0)::int AS sold_today,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($2, c.created_at) >= date_trunc('day', timezone($2, now()))
+       ), 0)::numeric(12,2) AS revenue_today,
+       COALESCE(SUM(c.quantity) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '7 days'
+       ), 0)::int AS sold_week,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '7 days'
+       ), 0)::numeric(12,2) AS revenue_week,
+       COALESCE(SUM(c.quantity) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '30 days'
+       ), 0)::int AS sold_month,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($2, c.created_at) >= timezone($2, now()) - interval '30 days'
+       ), 0)::numeric(12,2) AS revenue_month,
+       COALESCE(SUM(c.quantity), 0)::int AS sold_all_time,
+       COALESCE(SUM(c.quantity * p.price), 0)::numeric(12,2) AS revenue_all_time
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id
+     WHERE p.created_by = $1`,
+    [userId, SAMARA_TZ],
+  );
+  const posts = postsQ.rows[0] || {};
+  const sales = salesQ.rows[0] || {};
+  return {
+    today: {
+      posts: toNumber(posts.posts_today),
+      sold: toNumber(sales.sold_today),
+      amount: toNumber(sales.revenue_today),
+    },
+    week: {
+      posts: toNumber(posts.posts_week),
+      sold: toNumber(sales.sold_week),
+      amount: toNumber(sales.revenue_week),
+    },
+    month: {
+      posts: toNumber(posts.posts_month),
+      sold: toNumber(sales.sold_month),
+      amount: toNumber(sales.revenue_month),
+    },
+    all_time: {
+      posts: toNumber(posts.posts_all_time),
+      sold: toNumber(sales.sold_all_time),
+      amount: toNumber(sales.revenue_all_time),
+    },
+  };
+}
+
+async function loadAdminStats(userId) {
+  const processedQ = await pool.query(
+    `SELECT
+       COALESCE(SUM(r.quantity) FILTER (
+         WHERE timezone($2, r.fulfilled_at) >= date_trunc('day', timezone($2, now()))
+       ), 0)::int AS processed_today,
+       COALESCE(SUM(p.price * r.quantity) FILTER (
+         WHERE timezone($2, r.fulfilled_at) >= date_trunc('day', timezone($2, now()))
+       ), 0)::numeric(12,2) AS processed_amount_today,
+       COALESCE(SUM(r.quantity) FILTER (
+         WHERE timezone($2, r.fulfilled_at) >= timezone($2, now()) - interval '7 days'
+       ), 0)::int AS processed_week,
+       COALESCE(SUM(p.price * r.quantity) FILTER (
+         WHERE timezone($2, r.fulfilled_at) >= timezone($2, now()) - interval '7 days'
+       ), 0)::numeric(12,2) AS processed_amount_week,
+       COALESCE(SUM(r.quantity) FILTER (
+         WHERE timezone($2, r.fulfilled_at) >= timezone($2, now()) - interval '30 days'
+       ), 0)::int AS processed_month,
+       COALESCE(SUM(p.price * r.quantity) FILTER (
+         WHERE timezone($2, r.fulfilled_at) >= timezone($2, now()) - interval '30 days'
+       ), 0)::numeric(12,2) AS processed_amount_month,
+       COALESCE(SUM(r.quantity), 0)::int AS processed_all_time,
+       COALESCE(SUM(p.price * r.quantity), 0)::numeric(12,2) AS processed_amount_all_time
+     FROM reservations r
+     JOIN products p ON p.id = r.product_id
+     WHERE r.fulfilled_by_id = $1
+       AND r.fulfilled_at IS NOT NULL`,
+    [userId, SAMARA_TZ],
+  );
+  const deliveriesQ = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE timezone($2, b.assembled_at) >= date_trunc('day', timezone($2, now()))
+       )::int AS deliveries_today,
+       COUNT(*) FILTER (
+         WHERE timezone($2, b.assembled_at) >= timezone($2, now()) - interval '7 days'
+       )::int AS deliveries_week,
+       COUNT(*) FILTER (
+         WHERE timezone($2, b.assembled_at) >= timezone($2, now()) - interval '30 days'
+       )::int AS deliveries_month,
+       COUNT(*)::int AS deliveries_all_time
+     FROM delivery_batches b
+     WHERE b.assembled_by_id = $1
+       AND b.assembled_at IS NOT NULL`,
+    [userId, SAMARA_TZ],
+  );
+  const processed = processedQ.rows[0] || {};
+  const deliveries = deliveriesQ.rows[0] || {};
+  return {
+    today: {
+      processed: toNumber(processed.processed_today),
+      processed_amount: toNumber(processed.processed_amount_today),
+      deliveries: toNumber(deliveries.deliveries_today),
+    },
+    week: {
+      processed: toNumber(processed.processed_week),
+      processed_amount: toNumber(processed.processed_amount_week),
+      deliveries: toNumber(deliveries.deliveries_week),
+    },
+    month: {
+      processed: toNumber(processed.processed_month),
+      processed_amount: toNumber(processed.processed_amount_month),
+      deliveries: toNumber(deliveries.deliveries_month),
+    },
+    all_time: {
+      processed: toNumber(processed.processed_all_time),
+      processed_amount: toNumber(processed.processed_amount_all_time),
+      deliveries: toNumber(deliveries.deliveries_all_time),
+    },
+  };
+}
+
+async function loadCreatorStats() {
+  const totalsQ = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE timezone($1, u.created_at) >= date_trunc('day', timezone($1, now()))
+       )::int AS users_today,
+       COUNT(*) FILTER (
+         WHERE timezone($1, u.created_at) >= timezone($1, now()) - interval '7 days'
+       )::int AS users_week,
+       COUNT(*) FILTER (
+         WHERE timezone($1, u.created_at) >= timezone($1, now()) - interval '30 days'
+       )::int AS users_month,
+       COUNT(*)::int AS users_all_time
+     FROM users u`,
+    [SAMARA_TZ],
+  );
+  const workerPostsQ = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE timezone($1, p.created_at) >= date_trunc('day', timezone($1, now()))
+       )::int AS posts_today,
+       COUNT(*) FILTER (
+         WHERE timezone($1, p.created_at) >= timezone($1, now()) - interval '7 days'
+       )::int AS posts_week,
+       COUNT(*) FILTER (
+         WHERE timezone($1, p.created_at) >= timezone($1, now()) - interval '30 days'
+       )::int AS posts_month,
+       COUNT(*)::int AS posts_all_time
+     FROM products p
+     JOIN users u ON u.id = p.created_by
+     WHERE u.role = 'worker'`,
+    [SAMARA_TZ],
+  );
+  const processedQ = await pool.query(
+    `SELECT
+       COALESCE(SUM(r.quantity) FILTER (
+         WHERE timezone($1, r.fulfilled_at) >= date_trunc('day', timezone($1, now()))
+       ), 0)::int AS processed_today,
+       COALESCE(SUM(r.quantity) FILTER (
+         WHERE timezone($1, r.fulfilled_at) >= timezone($1, now()) - interval '7 days'
+       ), 0)::int AS processed_week,
+       COALESCE(SUM(r.quantity) FILTER (
+         WHERE timezone($1, r.fulfilled_at) >= timezone($1, now()) - interval '30 days'
+       ), 0)::int AS processed_month,
+       COALESCE(SUM(r.quantity), 0)::int AS processed_all_time
+     FROM reservations r
+     WHERE r.fulfilled_at IS NOT NULL`,
+    [SAMARA_TZ],
+  );
+  const revenueQ = await pool.query(
+    `SELECT
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($1, c.created_at) >= date_trunc('day', timezone($1, now()))
+       ), 0)::numeric(12,2) AS revenue_today,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($1, c.created_at) >= timezone($1, now()) - interval '7 days'
+       ), 0)::numeric(12,2) AS revenue_week,
+       COALESCE(SUM(c.quantity * p.price) FILTER (
+         WHERE timezone($1, c.created_at) >= timezone($1, now()) - interval '30 days'
+       ), 0)::numeric(12,2) AS revenue_month,
+       COALESCE(SUM(c.quantity * p.price), 0)::numeric(12,2) AS revenue_all_time
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id`,
+    [SAMARA_TZ],
+  );
+  const liveQ = await pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int
+        FROM product_publication_queue q
+        WHERE q.status = 'pending' AND COALESCE(q.is_sent, false) = false) AS pending_posts,
+       (SELECT COALESCE(SUM(quantity), 0)::int
+        FROM reservations
+        WHERE is_fulfilled = false) AS unprocessed_reservations,
+       (SELECT COUNT(*)::int
+        FROM delivery_batch_customers c
+        JOIN delivery_batches b ON b.id = c.batch_id
+        WHERE b.status IN ('calling', 'couriers_assigned', 'handed_off')
+          AND c.call_status = 'accepted') AS active_delivery_clients`,
+  );
+  const totals = totalsQ.rows[0] || {};
+  const workerPosts = workerPostsQ.rows[0] || {};
+  const processed = processedQ.rows[0] || {};
+  const revenue = revenueQ.rows[0] || {};
+  const live = liveQ.rows[0] || {};
+  return {
+    today: {
+      users: toNumber(totals.users_today),
+      worker_posts: toNumber(workerPosts.posts_today),
+      admin_processed: toNumber(processed.processed_today),
+      client_amount: toNumber(revenue.revenue_today),
+    },
+    week: {
+      users: toNumber(totals.users_week),
+      worker_posts: toNumber(workerPosts.posts_week),
+      admin_processed: toNumber(processed.processed_week),
+      client_amount: toNumber(revenue.revenue_week),
+    },
+    month: {
+      users: toNumber(totals.users_month),
+      worker_posts: toNumber(workerPosts.posts_month),
+      admin_processed: toNumber(processed.processed_month),
+      client_amount: toNumber(revenue.revenue_month),
+    },
+    all_time: {
+      users: toNumber(totals.users_all_time),
+      worker_posts: toNumber(workerPosts.posts_all_time),
+      admin_processed: toNumber(processed.processed_all_time),
+      client_amount: toNumber(revenue.revenue_all_time),
+    },
+    live: {
+      pending_posts: toNumber(live.pending_posts),
+      unprocessed_reservations: toNumber(live.unprocessed_reservations),
+      active_delivery_clients: toNumber(live.active_delivery_clients),
+    },
+  };
+}
+
+async function loadRoleStats(userId, role) {
+  switch (String(role || "").trim()) {
+    case "worker":
+      return { role: "worker", periods: await loadWorkerStats(userId) };
+    case "admin":
+      return { role: "admin", periods: await loadAdminStats(userId) };
+    case "creator":
+      return { role: "creator", periods: await loadCreatorStats() };
+    case "client":
+    default:
+      return { role: "client", periods: await loadClientStats(userId) };
+  }
+}
+
 router.get("/", authMiddleware, async (req, res) => {
   try {
     const user = await loadUserProfile(req.user.id);
+    const stats = await loadRoleStats(req.user.id, req.user.role);
 
     if (!user) {
       return res.status(404).json({
@@ -144,6 +464,7 @@ router.get("/", authMiddleware, async (req, res) => {
     return res.json({
       ok: true,
       user,
+      stats,
     });
   } catch (err) {
     console.error("PROFILE ERROR:", err);
