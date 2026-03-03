@@ -3332,10 +3332,12 @@ router.post(
         `UPDATE delivery_batches
          SET courier_count = $1,
              courier_names = $2::jsonb,
+             assembled_by_id = $4,
+             assembled_at = now(),
              status = 'couriers_assigned',
              updated_at = now()
          WHERE id = $3`,
-        [courierNames.length, JSON.stringify(courierNames), batchId],
+        [courierNames.length, JSON.stringify(courierNames), batchId, req.user.id],
       );
 
       await rerouteAcceptedCustomers(client, batchId);

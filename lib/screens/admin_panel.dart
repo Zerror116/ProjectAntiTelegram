@@ -46,7 +46,6 @@ class _AdminPanelState extends State<AdminPanel>
   String _newChannelVisibility = 'public';
   String _deliveryViewMode = 'map';
   String _deliveryOriginLabel = 'Точка отправки';
-  String? _pendingFilterChannelId;
   double? _deliveryOriginLat;
   double? _deliveryOriginLng;
 
@@ -56,6 +55,8 @@ class _AdminPanelState extends State<AdminPanel>
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
   List<Map<String, dynamic>> _deliveryBatches = [];
   Map<String, dynamic>? _deliveryActiveBatch;
+  int _reservedPendingTotal = 0;
+  int _reservedPendingUnits = 0;
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
   final Set<String> _overviewLoading = <String>{};
@@ -343,20 +344,16 @@ class _AdminPanelState extends State<AdminPanel>
 
   Future<void> _loadPendingPosts() async {
     try {
-      final resp = await authService.dio.get(
-        '/api/admin/channels/pending_posts',
-        queryParameters: {
-          if (_pendingFilterChannelId != null &&
-              _pendingFilterChannelId!.isNotEmpty)
-            'channel_id': _pendingFilterChannelId,
-        },
-      );
+      final resp = await authService.dio.get('/api/admin/channels/pending_posts');
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         if (mounted) {
-          setState(
-            () => _pendingPosts = List<Map<String, dynamic>>.from(data['data']),
-          );
+          final meta = _asMap(data['meta']);
+          setState(() {
+            _pendingPosts = List<Map<String, dynamic>>.from(data['data']);
+            _reservedPendingTotal = _toInt(meta['reserved_pending_total']);
+            _reservedPendingUnits = _toInt(meta['reserved_pending_units']);
+          });
         }
       }
     } catch (e) {
@@ -1775,9 +1772,6 @@ class _AdminPanelState extends State<AdminPanel>
         'data': {'chatId': channelId},
       });
       _channelOverviews.remove(channelId);
-      if (_pendingFilterChannelId == channelId) {
-        _pendingFilterChannelId = null;
-      }
       await _reloadAll();
       if (mounted) setState(() => _message = 'Канал удалён');
     } catch (e) {
@@ -2357,11 +2351,7 @@ class _AdminPanelState extends State<AdminPanel>
     try {
       final resp = await authService.dio.post(
         '/api/admin/channels/publish_pending',
-        data: {
-          if (_pendingFilterChannelId != null &&
-              _pendingFilterChannelId!.isNotEmpty)
-            'channel_id': _pendingFilterChannelId,
-        },
+        data: const {},
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true) {
@@ -2388,6 +2378,154 @@ class _AdminPanelState extends State<AdminPanel>
       }
     } finally {
       if (mounted) setState(() => _publishing = false);
+    }
+  }
+
+  Future<void> _editPendingPost(Map<String, dynamic> post) async {
+    final titleCtrl = TextEditingController(
+      text: (post['product_title'] ?? '').toString(),
+    );
+    final descriptionCtrl = TextEditingController(
+      text: (post['product_description'] ?? '').toString(),
+    );
+    final priceCtrl = TextEditingController(
+      text: (post['product_price'] ?? '').toString(),
+    );
+    final quantityCtrl = TextEditingController(
+      text: (post['product_quantity'] ?? '').toString(),
+    );
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Изменить пост в модерации'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: titleCtrl,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Название товара',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: titleCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: descriptionCtrl,
+                minLines: 3,
+                maxLines: 5,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Описание',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: descriptionCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: priceCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Цена',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: priceCtrl,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: quantityCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Кол-во',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: quantityCtrl,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    final title = titleCtrl.text.trim();
+    final description = descriptionCtrl.text.trim();
+    final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
+    final quantity = int.tryParse(quantityCtrl.text.trim());
+
+    if (title.isEmpty) {
+      setState(() => _message = 'Название товара обязательно');
+      return;
+    }
+    if (description.length < 2) {
+      setState(() => _message = 'Описание должно быть осмысленным');
+      return;
+    }
+    if (price == null || price <= 0) {
+      setState(() => _message = 'Цена должна быть больше нуля');
+      return;
+    }
+    if (quantity == null || quantity <= 0) {
+      setState(() => _message = 'Количество должно быть больше нуля');
+      return;
+    }
+
+    setState(() {
+      _saving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/channels/pending_posts/${post['id']}',
+        data: {
+          'title': title,
+          'description': description,
+          'price': price,
+          'quantity': quantity,
+        },
+      );
+      await _loadPendingPosts();
+      if (!mounted) return;
+      setState(() => _message = 'Пост в модерации обновлен');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка изменения поста: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      }
     }
   }
 
@@ -3298,37 +3436,88 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  Widget _buildModerationChip(String label) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: theme.textTheme.labelLarge?.copyWith(
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
   Widget _buildModerationTab() {
+    final theme = Theme.of(context);
     return RefreshIndicator(
       onRefresh: _loadPendingPosts,
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          if (_channels.isNotEmpty)
-            DropdownButtonFormField<String>(
-              value: _pendingFilterChannelId,
-              decoration: const InputDecoration(
-                labelText: 'Фильтр по каналу',
-                border: OutlineInputBorder(),
-              ),
-              items: [
-                const DropdownMenuItem<String>(
-                  value: null,
-                  child: Text('Все каналы'),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
                 ),
-                ..._channels.map(
-                  (c) => DropdownMenuItem<String>(
-                    value: c['id']?.toString(),
-                    child: Text((c['title'] ?? 'Канал').toString()),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Text(
+                  'В очереди: ${_pendingPosts.length}',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: theme.colorScheme.onPrimaryContainer,
                   ),
                 ),
-              ],
-              onChanged: (v) async {
-                setState(() => _pendingFilterChannelId = v);
-                await _loadPendingPosts();
-              },
-            ),
-          const SizedBox(height: 12),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
+                ),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                child: Text(
+                  'Забронировано и не обработано: $_reservedPendingTotal',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
+                ),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                child: Text(
+                  'Штук в резерве: $_reservedPendingUnits',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
@@ -3371,18 +3560,88 @@ class _AdminPanelState extends State<AdminPanel>
           else
             ..._pendingPosts.map((p) {
               final title = (p['product_title'] ?? 'Товар').toString();
-              final price = p['product_price']?.toString() ?? '0';
-              final qty = p['product_quantity']?.toString() ?? '0';
-              final channel = (p['channel_title'] ?? 'Канал').toString();
-              final workerEmail = (p['queued_by_email'] ?? 'работник')
+              final description = (p['product_description'] ?? '').toString();
+              final channel = (p['channel_title'] ?? 'Основной канал')
                   .toString();
-              return Card(
-                child: ListTile(
-                  title: Text(title),
-                  subtitle: Text(
-                    'Канал: $channel\nРаботник: $workerEmail\nЦена: $price RUB, Кол-во: $qty',
-                  ),
-                  isThreeLine: true,
+              final workerName = (p['queued_by_name'] ??
+                      p['queued_by_email'] ??
+                      'Работник')
+                  .toString();
+              final imageUrl = _resolveImageUrl(
+                (p['product_image_url'] ?? '').toString(),
+              );
+              return Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (imageUrl != null) ...[
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(18),
+                        child: AspectRatio(
+                          aspectRatio: 4 / 3,
+                          child: Image.network(
+                            imageUrl,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, error, stackTrace) => Container(
+                              color: theme.colorScheme.surfaceContainerHighest,
+                              alignment: Alignment.center,
+                              child: const Icon(
+                                Icons.image_not_supported_outlined,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+                    Text(
+                      title,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      description,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _buildModerationChip(
+                          'ID: ${(p['product_code'] ?? '—').toString()}',
+                        ),
+                        _buildModerationChip(
+                          'Цена: ${_toInt(p['product_price']).toString()} RUB',
+                        ),
+                        _buildModerationChip(
+                          'Количество: ${_toInt(p['product_quantity'])}',
+                        ),
+                        _buildModerationChip('Работник: $workerName'),
+                        _buildModerationChip('Канал: $channel'),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: FilledButton.tonalIcon(
+                        onPressed: _saving ? null : () => _editPendingPost(p),
+                        icon: const Icon(Icons.edit_outlined),
+                        label: const Text('Изменить'),
+                      ),
+                    ),
+                  ],
                 ),
               );
             }),

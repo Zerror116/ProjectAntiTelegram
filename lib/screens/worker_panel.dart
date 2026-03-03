@@ -23,6 +23,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     with SingleTickerProviderStateMixin {
   late final TabController _tabController;
   StreamSubscription? _chatEventsSub;
+  Timer? _ownPostsRefreshDebounce;
 
   final _titleCtrl = TextEditingController();
   final _descriptionCtrl = TextEditingController();
@@ -46,8 +47,10 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   bool _loadingChannels = true;
+  bool _loadingOwnPosts = false;
   bool _posting = false;
   bool _searching = false;
+  bool _savingOwnPost = false;
   String _message = '';
 
   double _toDoubleValue(dynamic value, [double fallback = 0]) {
@@ -64,16 +67,25 @@ class _WorkerPanelState extends State<WorkerPanel>
   List<Map<String, dynamic>> _channels = [];
   String? _selectedChannelId;
   List<Map<String, dynamic>> _searchResults = [];
+  List<Map<String, dynamic>> _ownQueuedPosts = [];
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
     _loadChannels();
+    _loadOwnQueuedPosts();
     _chatEventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
       if (type == 'chat:created' || type == 'chat:deleted') {
         _loadChannels();
+      }
+      if (type == 'chat:updated') {
+        _ownPostsRefreshDebounce?.cancel();
+        _ownPostsRefreshDebounce = Timer(
+          const Duration(milliseconds: 650),
+          _loadOwnQueuedPosts,
+        );
       }
     });
   }
@@ -81,6 +93,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   @override
   void dispose() {
     _chatEventsSub?.cancel();
+    _ownPostsRefreshDebounce?.cancel();
     _tabController.dispose();
     _titleCtrl.dispose();
     _descriptionCtrl.dispose();
@@ -429,6 +442,29 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
+  Future<void> _loadOwnQueuedPosts() async {
+    if (mounted) {
+      setState(() => _loadingOwnPosts = true);
+    }
+    try {
+      final resp = await authService.dio.get('/api/worker/queue/mine');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        if (!mounted) return;
+        setState(() {
+          _ownQueuedPosts = List<Map<String, dynamic>>.from(data['data']);
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка загрузки своих постов: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _loadingOwnPosts = false);
+      }
+    }
+  }
+
   Future<void> _queueProduct() async {
     final channelId = _selectedChannelId;
     if (channelId == null || channelId.isEmpty) {
@@ -505,6 +541,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           }
         });
         _resetProductForm();
+        _loadOwnQueuedPosts();
         if (mounted) {
           showAppNotice(
             context,
@@ -657,6 +694,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               : 'Старый товар отправлен в очередь повторно';
           _removeImageOnSubmit = false;
         });
+        _loadOwnQueuedPosts();
         if (mounted) {
           showAppNotice(
             context,
@@ -1000,6 +1038,278 @@ class _WorkerPanelState extends State<WorkerPanel>
     );
   }
 
+  Future<void> _editOwnQueuedPost(Map<String, dynamic> post) async {
+    final titleCtrl = TextEditingController(
+      text: (post['product_title'] ?? '').toString(),
+    );
+    final descriptionCtrl = TextEditingController(
+      text: (post['product_description'] ?? '').toString(),
+    );
+    final priceCtrl = TextEditingController(
+      text: (post['product_price'] ?? '').toString(),
+    );
+    final quantityCtrl = TextEditingController(
+      text: (post['product_quantity'] ?? '1').toString(),
+    );
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Изменить свой пост'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: titleCtrl,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Название товара',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: titleCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: descriptionCtrl,
+                minLines: 3,
+                maxLines: 5,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Описание',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: descriptionCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: priceCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Цена',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: priceCtrl,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: quantityCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Кол-во',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: quantityCtrl,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    final title = titleCtrl.text.trim();
+    final description = descriptionCtrl.text.trim();
+    final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
+    final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
+    final hasImage =
+        ((post['product_image_url'] ?? '').toString().trim().isNotEmpty);
+    final validationError = _validateProductFields(
+      title: title,
+      description: description,
+      price: price,
+      quantity: quantity,
+      hasImage: hasImage,
+    );
+    if (validationError != null) {
+      if (!mounted) return;
+      setState(() => _message = validationError);
+      return;
+    }
+
+    if (mounted) {
+      setState(() => _savingOwnPost = true);
+    }
+    try {
+      await authService.dio.patch(
+        '/api/worker/queue/${post['id']}',
+        data: {
+          'title': title,
+          'description': description,
+          'price': price,
+          'quantity': quantity,
+        },
+      );
+      await _loadOwnQueuedPosts();
+      if (!mounted) return;
+      setState(() => _message = 'Пост обновлен');
+      showAppNotice(
+        context,
+        'Свой пост обновлен',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка сохранения поста: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _savingOwnPost = false);
+      }
+    }
+  }
+
+  Widget _buildOwnPostsTab() {
+    final theme = Theme.of(context);
+    if (_loadingOwnPosts) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 20),
+        child: PhoenixLoadingView(
+          title: 'Загружаем ваши посты',
+          subtitle: 'Собираем еще не опубликованные позиции',
+          size: 46,
+        ),
+      );
+    }
+    if (_ownQueuedPosts.isEmpty) {
+      return ListView(
+        padding: const EdgeInsets.all(16),
+        children: const [
+          Text('У вас пока нет своих постов в очереди'),
+        ],
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: _loadOwnQueuedPosts,
+      child: ListView.separated(
+        padding: const EdgeInsets.all(16),
+        itemCount: _ownQueuedPosts.length,
+        separatorBuilder: (_, __) => const SizedBox(height: 12),
+        itemBuilder: (context, index) {
+          final post = _ownQueuedPosts[index];
+          final imageUrl = _resolveImageUrl(
+            (post['product_image_url'] ?? '').toString(),
+          );
+          return Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerLow,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: theme.colorScheme.outlineVariant),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (imageUrl != null) ...[
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: AspectRatio(
+                      aspectRatio: 4 / 3,
+                      child: Image.network(
+                        imageUrl,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, error, stackTrace) => Container(
+                          color: theme.colorScheme.surfaceContainerHighest,
+                          alignment: Alignment.center,
+                          child: const Icon(Icons.image_not_supported_outlined),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                Text(
+                  (post['product_title'] ?? 'Товар').toString(),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  (post['product_description'] ?? '').toString(),
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _statChip('ID: ${(post['product_code'] ?? '—').toString()}'),
+                    _statChip(
+                      'Цена: ${_toDoubleValue(post['product_price']).toStringAsFixed(0)} RUB',
+                    ),
+                    _statChip('Количество: ${_toIntValue(post['product_quantity'])}'),
+                    _statChip(
+                      'В очереди: ${(post['channel_title'] ?? 'Основной канал').toString()}',
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton.tonalIcon(
+                    onPressed: _savingOwnPost
+                        ? null
+                        : () => _editOwnQueuedPost(post),
+                    icon: const Icon(Icons.edit_outlined),
+                    label: const Text('Изменить'),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _statChip(String label) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: theme.textTheme.labelLarge?.copyWith(
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1010,6 +1320,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           tabs: const [
             Tab(text: 'Новый товар'),
             Tab(text: 'Старые товары'),
+            Tab(text: 'Свои посты'),
           ],
         ),
       ),
@@ -1030,7 +1341,11 @@ class _WorkerPanelState extends State<WorkerPanel>
             Expanded(
               child: TabBarView(
                 controller: _tabController,
-                children: [_buildQueueTab(), _buildSearchTab()],
+                children: [
+                  _buildQueueTab(),
+                  _buildSearchTab(),
+                  _buildOwnPostsTab(),
+                ],
               ),
             ),
           ],

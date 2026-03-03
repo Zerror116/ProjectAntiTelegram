@@ -31,6 +31,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   double _avatarZoom = 1;
   String _message = '';
   String _viewMode = 'creator';
+  Map<String, dynamic> _stats = const {};
 
   @override
   void initState() {
@@ -114,7 +115,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (data is Map && data['user'] is Map) {
         final u = Map<String, dynamic>.from(data['user']);
         if (!mounted) return;
-        setState(() => _applyUser(u));
+        setState(() {
+          _applyUser(u);
+          _stats = data['stats'] is Map
+              ? Map<String, dynamic>.from(data['stats'])
+              : const {};
+        });
       } else {
         if (!mounted) return;
         setState(() => _message = 'Ошибка загрузки профиля');
@@ -230,6 +236,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     await authService.setViewRole(mode == 'creator' ? null : mode);
     if (!mounted) return;
     setState(() => _viewMode = mode);
+    await _load();
   }
 
   Future<void> _deleteAccount() async {
@@ -344,6 +351,195 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  String _formatMoneyCompact(dynamic raw) {
+    final value = double.tryParse('${raw ?? ''}') ?? 0;
+    return '${value.toStringAsFixed(value.truncateToDouble() == value ? 0 : 2)} RUB';
+  }
+
+  Map<String, dynamic> _statsMap(dynamic raw) {
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return <String, dynamic>{};
+  }
+
+  Widget _statsMetricRow(String label, String value) {
+    final theme = Theme.of(context);
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            label,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Text(
+          value,
+          style: theme.textTheme.titleSmall?.copyWith(
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _periodCard({
+    required String title,
+    required List<Widget> children,
+  }) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 10),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatsSection(String effectiveRole) {
+    final theme = Theme.of(context);
+    final stats = _statsMap(_stats['periods']);
+    final today = _statsMap(stats['today']);
+    final week = _statsMap(stats['week']);
+    final month = _statsMap(stats['month']);
+    final allTime = _statsMap(stats['all_time']);
+    final live = _statsMap(stats['live']);
+
+    Widget buildClientCard(String title, Map<String, dynamic> data) {
+      return _periodCard(
+        title: title,
+        children: [
+          _statsMetricRow('Куплено товаров', '${data['items'] ?? 0}'),
+          const SizedBox(height: 8),
+          _statsMetricRow('Потрачено', _formatMoneyCompact(data['amount'])),
+        ],
+      );
+    }
+
+    Widget buildWorkerCard(String title, Map<String, dynamic> data) {
+      return _periodCard(
+        title: title,
+        children: [
+          _statsMetricRow('Сделано постов', '${data['posts'] ?? 0}'),
+          const SizedBox(height: 8),
+          _statsMetricRow('Продано штук', '${data['sold'] ?? 0}'),
+          const SizedBox(height: 8),
+          _statsMetricRow('Принес денег', _formatMoneyCompact(data['amount'])),
+        ],
+      );
+    }
+
+    Widget buildAdminCard(String title, Map<String, dynamic> data) {
+      return _periodCard(
+        title: title,
+        children: [
+          _statsMetricRow('Обработано штук', '${data['processed'] ?? 0}'),
+          const SizedBox(height: 8),
+          _statsMetricRow(
+            'Стоимость обработки',
+            _formatMoneyCompact(data['processed_amount']),
+          ),
+          const SizedBox(height: 8),
+          _statsMetricRow('Собрано доставок', '${data['deliveries'] ?? 0}'),
+        ],
+      );
+    }
+
+    Widget buildCreatorCard(String title, Map<String, dynamic> data) {
+      return _periodCard(
+        title: title,
+        children: [
+          _statsMetricRow('Новых людей', '${data['users'] ?? 0}'),
+          const SizedBox(height: 8),
+          _statsMetricRow('Постов работников', '${data['worker_posts'] ?? 0}'),
+          const SizedBox(height: 8),
+          _statsMetricRow(
+            'Обработано админами',
+            '${data['admin_processed'] ?? 0}',
+          ),
+          const SizedBox(height: 8),
+          _statsMetricRow(
+            'Потрачено клиентами',
+            _formatMoneyCompact(data['client_amount']),
+          ),
+        ],
+      );
+    }
+
+    Widget buildByRole(String title, Map<String, dynamic> data) {
+      switch (effectiveRole) {
+        case 'worker':
+          return buildWorkerCard(title, data);
+        case 'admin':
+          return buildAdminCard(title, data);
+        case 'creator':
+          return buildCreatorCard(title, data);
+        case 'client':
+        default:
+          return buildClientCard(title, data);
+      }
+    }
+
+    return _sectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Статистика',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 14),
+          buildByRole('Сегодня', today),
+          const SizedBox(height: 12),
+          buildByRole('За неделю', week),
+          const SizedBox(height: 12),
+          buildByRole('За месяц', month),
+          const SizedBox(height: 12),
+          buildByRole('За всё время', allTime),
+          if (effectiveRole == 'creator' && live.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: [
+                _statChip(
+                  Icons.inventory_2_outlined,
+                  'Очередь: ${live['pending_posts'] ?? 0}',
+                ),
+                _statChip(
+                  Icons.pending_actions_outlined,
+                  'Не обработано резервов: ${live['unprocessed_reservations'] ?? 0}',
+                ),
+                _statChip(
+                  Icons.local_shipping_outlined,
+                  'Активных доставок: ${live['active_delivery_clients'] ?? 0}',
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -497,6 +693,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ],
                     ),
                   ),
+                  const SizedBox(height: 16),
+                  _buildStatsSection(effectiveRole),
                   const SizedBox(height: 16),
                   _sectionCard(
                     child: Column(

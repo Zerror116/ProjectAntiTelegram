@@ -14,6 +14,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
   String _messageStatus = 'sending';
   String _rolePreview = 'creator';
   bool _deliveryBusy = false;
+  bool _demoPostsBusy = false;
   Map<String, dynamic>? _deliverySnapshot;
 
   @override
@@ -199,6 +200,37 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     }
   }
 
+  Future<void> _publishDemoPosts(int count) async {
+    setState(() => _demoPostsBusy = true);
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/test/publish-demo-posts',
+        data: {'count': count},
+      );
+      if (!mounted) return;
+      final data = resp.data;
+      final payload = data is Map && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
+      showAppNotice(
+        context,
+        'Тестовых постов отправлено: ${payload['count'] ?? count}',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка тестовой отправки постов: $e',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _demoPostsBusy = false);
+      }
+    }
+  }
+
   Widget _sectionTitle(String text) {
     final theme = Theme.of(context);
     return Text(
@@ -359,6 +391,59 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     );
   }
 
+  Widget _demoPostsCard() {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Тест отправки постов',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Создает и постепенно публикует тестовые товарные посты в Основной канал с заглушкой фото и случайными данными.',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _demoPostsBusy ? null : () => _publishDemoPosts(10),
+                icon: const Icon(Icons.queue_play_next_outlined),
+                label: const Text('10 постов'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _demoPostsBusy ? null : () => _publishDemoPosts(25),
+                icon: const Icon(Icons.dynamic_feed_outlined),
+                label: const Text('25 постов'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _demoPostsBusy ? null : () => _publishDemoPosts(50),
+                icon: const Icon(Icons.local_fire_department_outlined),
+                label: const Text('50 постов'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -505,6 +590,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
             _sectionTitle('Доставка'),
             const SizedBox(height: 12),
             _deliveryPreviewCard(),
+            const SizedBox(height: 24),
+            _sectionTitle('Публикация'),
+            const SizedBox(height: 12),
+            _demoPostsCard(),
             const SizedBox(height: 24),
             _sectionTitle('Загрузка'),
             const SizedBox(height: 12),
