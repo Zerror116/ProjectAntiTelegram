@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import '../utils/date_time_utils.dart';
 import '../widgets/phoenix_loader.dart';
 
 class CartScreen extends StatefulWidget {
@@ -173,25 +174,7 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   String _formatDeliveryEta(DateTime dateTime) {
-    const months = [
-      'января',
-      'февраля',
-      'марта',
-      'апреля',
-      'мая',
-      'июня',
-      'июля',
-      'августа',
-      'сентября',
-      'октября',
-      'ноября',
-      'декабря',
-    ];
-    final day = dateTime.day.toString().padLeft(2, '0');
-    final month = months[dateTime.month - 1];
-    final hour = dateTime.hour.toString().padLeft(2, '0');
-    final minute = dateTime.minute.toString().padLeft(2, '0');
-    return '$day $month, $hour:$minute';
+    return formatDateTimeValue(dateTime);
   }
 
   DateTime? _extractDeliveryEta() {
@@ -521,9 +504,7 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   String _formatShortDeliveryDate(dynamic raw) {
-    final parsed = DateTime.tryParse('${raw ?? ''}');
-    if (parsed == null) return 'Доставка';
-    return _formatDeliveryEta(parsed).split(',').first;
+    return formatDateTimeValue(raw, fallback: 'Доставка');
   }
 
   Widget _buildRecentDeliveryCard(Map<String, dynamic> delivery) {

@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 import '../main.dart';
+import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
@@ -225,11 +226,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   DateTime? _parseDate(dynamic raw) {
-    if (raw == null) return null;
-    if (raw is DateTime) return raw.toLocal();
-    final value = raw.toString().trim();
-    if (value.isEmpty) return null;
-    return DateTime.tryParse(value)?.toLocal();
+    return parseDateTimeValue(raw);
   }
 
   int _compareByCreatedAt(Map<String, dynamic> a, Map<String, dynamic> b) {
@@ -247,10 +244,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _formatMessageTime(dynamic raw) {
-    final date = _parseDate(raw);
-    if (date == null) return '';
-    String pad(int v) => v < 10 ? '0$v' : '$v';
-    return '${pad(date.hour)}:${pad(date.minute)}';
+    return formatDateTimeValue(raw);
   }
 
   String _generateClientMessageId() {
@@ -1851,10 +1845,10 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Ошибка редактирования: ${_extractDioError(e)}'),
-        ),
+      showAppNotice(
+        context,
+        'Ошибка редактирования: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
       );
     }
   }
@@ -1903,8 +1897,10 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Ошибка удаления: ${_extractDioError(e)}')),
+      showAppNotice(
+        context,
+        'Ошибка удаления: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
       );
     }
   }
@@ -1950,8 +1946,10 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Ошибка очистки чата: ${_extractDioError(e)}')),
+      showAppNotice(
+        context,
+        'Ошибка очистки чата: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
       );
     }
   }
@@ -2345,9 +2343,10 @@ class _ChatScreenState extends State<ChatScreen> {
         .trim();
     final offerDeliveryLabel = (metaMap['delivery_label'] ?? 'Доставка')
         .toString();
-    final offerDeliveryDate = (metaMap['delivery_date'] ?? '')
-        .toString()
-        .trim();
+    final offerDeliveryDate = formatDateTimeValue(
+      metaMap['delivery_date'],
+      fallback: '',
+    );
     final offerPhone = (metaMap['customer_phone'] ?? '').toString().trim();
     final offerProcessedSum = (metaMap['processed_sum'] ?? 0).toString();
     final offerAddress = (metaMap['address_text'] ?? '').toString().trim();

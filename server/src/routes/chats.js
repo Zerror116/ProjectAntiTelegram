@@ -585,7 +585,11 @@ router.get("/", requireAuth, async (req, res) => {
            )
          )
        )
-       AND c.tenant_id = $6
+       AND ($6::uuid IS NULL OR c.tenant_id = $6::uuid)
+       AND (
+         c.type <> 'channel'
+         OR COALESCE((c.settings->>'hidden_in_chat_list')::boolean, false) = false
+       )
        ORDER BY updated_at DESC NULLS LAST
        LIMIT 200`,
       [
@@ -641,7 +645,7 @@ router.get("/", requireAuth, async (req, res) => {
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE c.type <> 'channel'
          AND cm.user_id = $1
-         AND c.tenant_id = $3
+         AND ($3::uuid IS NULL OR c.tenant_id = $3::uuid)
        ORDER BY updated_at DESC NULLS LAST
        LIMIT 100`,
       [userId, userIdText, tenantId],

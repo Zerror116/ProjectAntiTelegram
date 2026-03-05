@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
@@ -9,6 +10,7 @@ import '../main.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/avatar_crop_dialog.dart';
+import '../widgets/input_language_badge.dart';
 import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
 import 'creator_keys_screen.dart';
@@ -39,12 +41,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _viewMode = 'creator';
   Map<String, dynamic> _stats = const {};
   bool _statsExpanded = false;
+  bool _sessionsBusy = false;
+  bool _switchingSession = false;
+  bool _addGroupBusy = false;
+  final _addGroupCodeCtrl = TextEditingController();
+  final _addGroupPasswordCtrl = TextEditingController();
+  List<Map<String, dynamic>> _savedTenantSessions = const [];
 
   @override
   void initState() {
     super.initState();
     _viewMode = authService.viewRole ?? 'creator';
     _load();
+  }
+
+  @override
+  void dispose() {
+    _addGroupCodeCtrl.dispose();
+    _addGroupPasswordCtrl.dispose();
+    super.dispose();
   }
 
   String _extractDioMessage(Object e) {
@@ -72,6 +87,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
     return '$base/$value';
   }
+
+  bool get _isClientAccount =>
+      (authService.currentUser?.role ?? '').toLowerCase().trim() == 'client';
 
   double _toAvatarFocus(Object? raw) {
     final value = double.tryParse('${raw ?? ''}');
@@ -110,6 +128,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _avatarZoom = _toAvatarZoom(u['avatar_zoom']);
   }
 
+  String get _currentSessionId {
+    final user = authService.currentUser;
+    if (user == null) return '';
+    final email = user.email.trim().toLowerCase();
+    final tenant = (user.tenantCode ?? '').trim().toLowerCase();
+    return '$email::$tenant';
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -137,7 +163,262 @@ class _ProfileScreenState extends State<ProfileScreen> {
       setState(() => _message = _extractDioMessage(e));
     } finally {
       if (mounted) setState(() => _loading = false);
+      unawaited(_loadSavedSessions());
     }
+  }
+
+  Future<void> _loadSavedSessions() async {
+    if (_sessionsBusy) return;
+    _sessionsBusy = true;
+    try {
+      final sessionsRaw = await authService.listSavedTenantSessions();
+      List<Map<String, dynamic>> sessions = const [];
+      if (_isClientAccount) {
+        final currentEmail = (authService.currentUser?.email ?? '')
+            .trim()
+            .toLowerCase();
+        final filtered = sessionsRaw.where((row) {
+          final email = (row['email'] ?? '').toString().trim().toLowerCase();
+          final role = (row['role'] ?? '').toString().trim().toLowerCase();
+          final tenantCode = (row['tenant_code'] ?? '')
+              .toString()
+              .trim()
+              .toLowerCase();
+          return email == currentEmail &&
+              role == 'client' &&
+              tenantCode.isNotEmpty;
+        });
+        final seenTenantCodes = <String>{};
+        sessions = filtered.where((row) {
+          final tenantCode = (row['tenant_code'] ?? '')
+              .toString()
+              .trim()
+              .toLowerCase();
+          if (tenantCode.isEmpty) return false;
+          if (seenTenantCodes.contains(tenantCode)) return false;
+          seenTenantCodes.add(tenantCode);
+          return true;
+        }).toList();
+      }
+      if (!mounted) return;
+      setState(() {
+        _savedTenantSessions = sessions;
+      });
+    } finally {
+      _sessionsBusy = false;
+    }
+  }
+
+  String _sessionTenantLabel(Map<String, dynamic> row) {
+    final tenantName = (row['tenant_name'] ?? '').toString().trim();
+    if (tenantName.isNotEmpty) return tenantName;
+    final tenantCode = (row['tenant_code'] ?? '').toString().trim();
+    if (tenantCode.isNotEmpty) return tenantCode;
+    return 'Неизвестная группа';
+  }
+
+  Map<String, String> _extractInvitePayload(String raw) {
+    final source = raw.trim();
+    if (source.isEmpty) {
+      return const {'invite': '', 'tenant': ''};
+    }
+
+    String invite = '';
+    String tenant = '';
+
+    void extractFromUri(Uri uri) {
+      if (invite.isEmpty) {
+        invite =
+            (uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '')
+                .trim();
+      }
+      if (tenant.isEmpty) {
+        tenant =
+            (uri.queryParameters['tenant'] ??
+                    uri.queryParameters['tenant_code'] ??
+                    '')
+                .trim()
+                .toLowerCase();
+      }
+      if (uri.fragment.isNotEmpty) {
+        final fragment = uri.fragment;
+        final qIndex = fragment.indexOf('?');
+        if (qIndex >= 0 && qIndex + 1 < fragment.length) {
+          final inFragment = Uri.splitQueryString(
+            fragment.substring(qIndex + 1),
+          );
+          if (invite.isEmpty) {
+            invite = (inFragment['invite'] ?? inFragment['code'] ?? '').trim();
+          }
+          if (tenant.isEmpty) {
+            tenant = (inFragment['tenant'] ?? inFragment['tenant_code'] ?? '')
+                .trim()
+                .toLowerCase();
+          }
+        }
+      }
+    }
+
+    try {
+      final uri = Uri.parse(source);
+      if (uri.hasScheme || source.contains('?') || source.contains('#')) {
+        extractFromUri(uri);
+      }
+    } catch (_) {}
+
+    if (invite.isEmpty) {
+      invite = source;
+    }
+
+    return {'invite': invite, 'tenant': tenant};
+  }
+
+  Future<String> _resolveTenantCodeByInvite(String inviteCode) async {
+    final normalized = inviteCode.trim();
+    if (normalized.isEmpty) return '';
+    try {
+      final resp = await authService.dio.post(
+        '/api/auth/invite/resolve',
+        data: {'invite_code': normalized},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final row = Map<String, dynamic>.from(data['data']);
+        return (row['tenant_code'] ?? '').toString().trim().toLowerCase();
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  Future<void> _addGroupByInvite() async {
+    if (_addGroupBusy || !_isClientAccount) return;
+
+    final invitePayload = _extractInvitePayload(_addGroupCodeCtrl.text);
+    final inviteCode = (invitePayload['invite'] ?? '').trim();
+    var tenantCode = (invitePayload['tenant'] ?? '').trim().toLowerCase();
+    final password = _addGroupPasswordCtrl.text.trim();
+
+    if (inviteCode.isEmpty) {
+      setState(() => _message = 'Введите код или ссылку приглашения');
+      return;
+    }
+    if (password.length < 8) {
+      setState(() => _message = 'Введите пароль (минимум 8 символов)');
+      return;
+    }
+
+    final current = authService.currentUser;
+    if (current == null || current.email.trim().isEmpty) {
+      setState(() => _message = 'Сессия не найдена. Перезайдите в аккаунт');
+      return;
+    }
+
+    final previousSessionId = _currentSessionId;
+    final previousTenantCode = (current.tenantCode ?? '').trim();
+    final email = current.email.trim();
+    final name = (_name.isNotEmpty ? _name : (current.name ?? '')).trim();
+    final phone = (current.phone ?? '').toString().trim();
+
+    setState(() {
+      _addGroupBusy = true;
+      _message = '';
+    });
+    try {
+      if (tenantCode.isEmpty) {
+        tenantCode = await _resolveTenantCodeByInvite(inviteCode);
+      }
+      if (tenantCode.isNotEmpty) {
+        await authService.setTenantCode(tenantCode);
+      }
+
+      var joined = false;
+      try {
+        await authService.register(
+          email: email,
+          password: password,
+          name: name.isEmpty ? null : name,
+          phone: phone.isEmpty ? null : phone,
+          accessKey: inviteCode,
+        );
+        joined = true;
+      } catch (e) {
+        final text = _extractDioMessage(e).toLowerCase();
+        final alreadyRegistered =
+            text.contains('email already registered') ||
+            text.contains('уже зарегистр');
+        if (alreadyRegistered && tenantCode.isNotEmpty) {
+          await authService.login(email: email, password: password);
+          joined = true;
+        } else {
+          rethrow;
+        }
+      }
+
+      if (!joined) {
+        throw Exception('Не удалось добавить группу');
+      }
+
+      var switchedBack = true;
+      if (previousSessionId.isNotEmpty) {
+        switchedBack = await authService.switchToSavedTenantSession(
+          previousSessionId,
+        );
+      }
+      if (previousTenantCode.isNotEmpty) {
+        await authService.setTenantCode(previousTenantCode);
+      }
+
+      _addGroupCodeCtrl.clear();
+      _addGroupPasswordCtrl.clear();
+      await _loadSavedSessions();
+      await _load();
+      if (!mounted) return;
+      setState(() {
+        _message = switchedBack
+            ? 'Группа добавлена. Теперь можно переключаться в "Мои группы".'
+            : 'Группа добавлена, но не удалось вернуться в прошлую группу автоматически.';
+      });
+    } catch (e) {
+      if (previousTenantCode.isNotEmpty) {
+        await authService.setTenantCode(previousTenantCode);
+      }
+      if (!mounted) return;
+      final text = _extractDioMessage(e);
+      setState(() => _message = 'Ошибка добавления группы: $text');
+    } finally {
+      if (mounted) setState(() => _addGroupBusy = false);
+    }
+  }
+
+  Future<void> _switchToSession(Map<String, dynamic> row) async {
+    if (_switchingSession) return;
+    final sessionId = (row['id'] ?? '').toString().trim();
+    if (sessionId.isEmpty) return;
+    setState(() => _switchingSession = true);
+    try {
+      final ok = await authService.switchToSavedTenantSession(sessionId);
+      if (!mounted) return;
+      if (!ok) {
+        setState(() => _message = 'Не удалось переключить группу');
+        await _loadSavedSessions();
+        return;
+      }
+      Navigator.of(context).pushNamedAndRemoveUntil('/main', (route) => false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка переключения: ${_extractDioMessage(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _switchingSession = false);
+    }
+  }
+
+  Future<void> _removeSavedSession(Map<String, dynamic> row) async {
+    final sessionId = (row['id'] ?? '').toString().trim();
+    if (sessionId.isEmpty || sessionId == _currentSessionId) return;
+    await authService.removeSavedTenantSession(sessionId);
+    await _loadSavedSessions();
   }
 
   Future<void> _pickAndUploadAvatar() async {
@@ -651,6 +932,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
         actualRole.toLowerCase().trim() == 'creator' &&
         (authService.currentUser?.email ?? '').toLowerCase().trim() ==
             _platformCreatorEmail;
+    final tenantLabel =
+        (authService.currentUser?.tenantName ?? '').trim().isNotEmpty
+        ? (authService.currentUser?.tenantName ?? '').trim()
+        : ((authService.currentUser?.tenantCode ?? '').trim().isNotEmpty
+              ? (authService.currentUser?.tenantCode ?? '').trim()
+              : 'Группа не выбрана');
 
     return Scaffold(
       appBar: AppBar(title: const Text('Профиль')),
@@ -841,6 +1128,156 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                     ),
                   ],
+                  if (_isClientAccount) ...[
+                    const SizedBox(height: 16),
+                    _sectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Мои группы',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Здесь отображаются только ваши клиентские группы. Добавьте новую по коду приглашения.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: _addGroupCodeCtrl,
+                            decoration: withInputLanguageBadge(
+                              const InputDecoration(
+                                labelText: 'Код или ссылка приглашения',
+                                border: OutlineInputBorder(),
+                              ),
+                              controller: _addGroupCodeCtrl,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _addGroupPasswordCtrl,
+                            obscureText: true,
+                            decoration: withInputLanguageBadge(
+                              const InputDecoration(
+                                labelText: 'Пароль аккаунта в новой группе',
+                                border: OutlineInputBorder(),
+                              ),
+                              controller: _addGroupPasswordCtrl,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.icon(
+                              onPressed: _addGroupBusy
+                                  ? null
+                                  : _addGroupByInvite,
+                              icon: _addGroupBusy
+                                  ? const SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.group_add_outlined),
+                              label: Text(
+                                _addGroupBusy
+                                    ? 'Добавление...'
+                                    : 'Добавить группу',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          if (_savedTenantSessions.isEmpty)
+                            Text(
+                              'Пока доступна только текущая группа.',
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ..._savedTenantSessions.map((row) {
+                            final sessionId = (row['id'] ?? '').toString();
+                            final active = sessionId == _currentSessionId;
+                            final tenantLabel = _sessionTenantLabel(row);
+                            final roleLabel = _roleLabel(
+                              (row['role'] ?? 'client').toString(),
+                            );
+                            final email = (row['email'] ?? '').toString();
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 10),
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: active
+                                    ? theme.colorScheme.primaryContainer
+                                    : theme.colorScheme.surfaceContainerLow,
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(
+                                  color: active
+                                      ? theme.colorScheme.primary
+                                      : theme.colorScheme.outlineVariant,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          tenantLabel,
+                                          style: theme.textTheme.titleSmall
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.w800,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          '$roleLabel • $email',
+                                          style: theme.textTheme.bodySmall
+                                              ?.copyWith(
+                                                color: theme
+                                                    .colorScheme
+                                                    .onSurfaceVariant,
+                                              ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  if (active)
+                                    const Icon(Icons.check_circle_outline)
+                                  else
+                                    FilledButton.tonal(
+                                      onPressed: _switchingSession
+                                          ? null
+                                          : () => _switchToSession(row),
+                                      child: const Text('Выбрать'),
+                                    ),
+                                  if (!active) ...[
+                                    const SizedBox(width: 6),
+                                    IconButton(
+                                      tooltip: 'Убрать из списка',
+                                      onPressed: _switchingSession
+                                          ? null
+                                          : () => _removeSavedSession(row),
+                                      icon: const Icon(Icons.delete_outline),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            );
+                          }),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 16),
                   _sectionCard(
                     child: Column(
@@ -869,6 +1306,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           icon: Icons.phone_outlined,
                           label: 'Телефон',
                           value: _phone.isEmpty ? 'Не указан' : _phone,
+                        ),
+                        const SizedBox(height: 10),
+                        _infoTile(
+                          icon: Icons.groups_outlined,
+                          label: 'Текущая группа',
+                          value: tenantLabel,
                         ),
                       ],
                     ),
