@@ -34,6 +34,7 @@ const supportRoutes = require("./routes/support");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
 const { logMonitoringEvent } = require("./utils/monitoring");
+const { tenantRoom } = require("./utils/socket");
 
 // ===================================
 // MIDDLEWARE И КОНФИГУРАЦИЯ
@@ -101,6 +102,15 @@ app.use("/api/support", supportRoutes);
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "change_me_long_secret";
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || "10", 10);
+
+if (
+  process.env.NODE_ENV === "production" &&
+  JWT_SECRET === "change_me_long_secret"
+) {
+  throw new Error(
+    "JWT_SECRET must be configured in production (default fallback is forbidden).",
+  );
+}
 
 /**
  * Подписывает JWT токен
@@ -435,6 +445,11 @@ async function canUserAccessChat(user, chatId) {
       if (uid) {
         socket.join(`user:${uid}`);
         console.log(`Socket ${sid} joined user:${uid}`);
+      }
+      const scopedTenantRoom = tenantRoom(socket.user?.tenant_id || null);
+      if (scopedTenantRoom) {
+        socket.join(scopedTenantRoom);
+        console.log(`Socket ${sid} joined ${scopedTenantRoom}`);
       }
 
       // Для тестов/мультисессии (например, creator + client view на одном устройстве)

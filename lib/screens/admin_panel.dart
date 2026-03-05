@@ -4722,6 +4722,7 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  // ignore: unused_element
   Widget _buildKeysTab() {
     if (!_showKeysTab) {
       return const Center(child: Text('Доступ только создателю'));

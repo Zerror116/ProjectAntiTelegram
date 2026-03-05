@@ -6,6 +6,7 @@ const router = express.Router();
 const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
+const { emitToTenant } = require('../utils/socket');
 
 const CART_STATUSES = [
   'pending_processing',
@@ -142,12 +143,44 @@ router.post('/add', authMiddleware, async (req, res) => {
         [newQty, existing.id]
       );
     } else {
-      upsert = await client.query(
-        `INSERT INTO cart_items (id, user_id, product_id, quantity, status, created_at, updated_at, reserved_sent_at)
-         VALUES ($1, $2, $3, $4, 'pending_processing', now(), now(), NULL)
-         RETURNING id, user_id, product_id, quantity, status, created_at, updated_at`,
-        [uuidv4(), userId, productId, quantity]
-      );
+      try {
+        upsert = await client.query(
+          `INSERT INTO cart_items (id, user_id, product_id, quantity, status, created_at, updated_at, reserved_sent_at)
+           VALUES ($1, $2, $3, $4, 'pending_processing', now(), now(), NULL)
+           RETURNING id, user_id, product_id, quantity, status, created_at, updated_at`,
+          [uuidv4(), userId, productId, quantity]
+        );
+      } catch (insertErr) {
+        const isLegacyUnique =
+          String(insertErr?.code || '') === '23505' &&
+          String(insertErr?.constraint || '') === 'cart_items_user_id_product_id_key';
+        if (!isLegacyUnique) throw insertErr;
+
+        // Fallback for legacy schema where cart_items still has UNIQUE(user_id, product_id).
+        const existingAnyQ = await client.query(
+          `SELECT id, quantity
+           FROM cart_items
+           WHERE user_id = $1
+             AND product_id = $2
+           ORDER BY updated_at DESC NULLS LAST, created_at DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [userId, productId]
+        );
+        if (existingAnyQ.rowCount === 0) throw insertErr;
+        const existingAny = existingAnyQ.rows[0];
+        const mergedQty = (Number(existingAny.quantity) || 0) + quantity;
+        upsert = await client.query(
+          `UPDATE cart_items
+           SET quantity = $1,
+               status = 'pending_processing',
+               reserved_sent_at = NULL,
+               updated_at = now()
+           WHERE id = $2
+           RETURNING id, user_id, product_id, quantity, status, created_at, updated_at`,
+          [mergedQty, existingAny.id]
+        );
+      }
     }
     const cartItem = upsert.rows[0];
 
@@ -209,7 +242,9 @@ router.post('/add', authMiddleware, async (req, res) => {
           chatId: message.chat_id,
           message,
         });
-        io.emit('chat:updated', { chatId: message.chat_id });
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: message.chat_id,
+        });
       }
     }
 
@@ -585,14 +620,18 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
           chatId: message.chat_id,
           message,
         });
-        io.emit('chat:updated', { chatId: message.chat_id });
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: message.chat_id,
+        });
       }
       if (removedReservedMessage) {
         io.to(`chat:${removedReservedMessage.chat_id}`).emit('chat:message:deleted', {
           chatId: removedReservedMessage.chat_id,
           messageId: removedReservedMessage.id,
         });
-        io.emit('chat:updated', { chatId: removedReservedMessage.chat_id });
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: removedReservedMessage.chat_id,
+        });
       }
     }
 

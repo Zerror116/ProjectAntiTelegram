@@ -10,6 +10,7 @@ const {
   readEncryptedText,
   writeEncryptedTextParams,
 } = require("../utils/secureData");
+const { emitToTenant } = require("../utils/socket");
 
 const SAMARA_CENTER = { lat: 53.195878, lng: 50.100202 };
 const DELIVERY_DAY_START_MINUTES = 10 * 60;
@@ -829,9 +830,9 @@ function emitCartUpdated(io, userId, payload) {
   });
 }
 
-function emitDeliveryUpdated(io, batchId) {
+function emitDeliveryUpdated(io, batchId, tenantId = null) {
   if (!io) return;
-  io.emit("delivery:updated", {
+  emitToTenant(io, tenantId, "delivery:updated", {
     batchId: String(batchId || ""),
     updatedAt: new Date().toISOString(),
   });
@@ -1747,7 +1748,7 @@ function normalizePhone(value) {
   return String(value || "").replace(/\D+/g, "");
 }
 
-async function findUserByPhone(queryable, phone) {
+async function findUserByPhone(queryable, phone, tenantId = null) {
   const normalized = normalizePhone(phone);
   if (!normalized) return null;
   const result = await queryable.query(
@@ -1757,8 +1758,9 @@ async function findUserByPhone(queryable, phone) {
      FROM phones ph
      JOIN users u ON u.id = ph.user_id
      WHERE regexp_replace(COALESCE(ph.phone, ''), '\D+', '', 'g') = $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
      LIMIT 1`,
-    [normalized],
+    [normalized, tenantId || null],
   );
   return result.rows[0] || null;
 }
@@ -2338,7 +2340,7 @@ router.post(
             });
           }
         }
-        emitDeliveryUpdated(io, batchId);
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
       const activeBatch = await fetchBatchDetails(db, batchId);
@@ -2458,7 +2460,7 @@ router.post(
             reason: "delivery_reset",
           });
         }
-        emitDeliveryUpdated(io, "reset");
+        emitDeliveryUpdated(io, "reset", req.user?.tenant_id || null);
       }
 
       return res.json({
@@ -2885,7 +2887,7 @@ router.post(
             },
           },
         });
-        emitDeliveryUpdated(io, customer.batch_id);
+        emitDeliveryUpdated(io, customer.batch_id, req.user?.tenant_id || null);
       }
 
       const activeBatch = await fetchBatchDetails(db, customer.batch_id);
@@ -3233,7 +3235,7 @@ router.post(
           reason: "delivery_declined",
         });
       }
-      emitDeliveryUpdated(io, batchId);
+      emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
 
       const activeBatch = await fetchBatchDetails(db, batchId);
       return res.json({
@@ -3295,7 +3297,7 @@ router.patch(
       }
       const activeBatch = await fetchBatchDetails(db, batchId);
       const io = req.app.get("io");
-      emitDeliveryUpdated(io, batchId);
+      emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       return res.json({ ok: true, data: { active_batch: activeBatch } });
     } catch (err) {
       console.error("delivery.customer.logistics error", err);
@@ -3393,7 +3395,7 @@ router.post(
 
       const activeBatch = await fetchBatchDetails(db, batchId);
       const io = req.app.get("io");
-      emitDeliveryUpdated(io, batchId);
+      emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       return res.json({ ok: true, data: { active_batch: activeBatch } });
     } catch (err) {
       await client.query("ROLLBACK");
@@ -3468,7 +3470,11 @@ router.post(
         });
       }
 
-      const user = await findUserByPhone(client, phone);
+      const user = await findUserByPhone(
+        client,
+        phone,
+        req.user?.tenant_id || null,
+      );
       if (!user) {
         await client.query("ROLLBACK");
         return res.status(404).json({
@@ -3693,7 +3699,7 @@ router.post(
               : "preparing_delivery",
           reason: "delivery_manual_add",
         });
-        emitDeliveryUpdated(io, batchId);
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
       const activeBatch = await fetchBatchDetails(db, batchId);
@@ -3794,7 +3800,7 @@ router.post(
             reason: "couriers_assigned",
           });
         }
-        emitDeliveryUpdated(io, batchId);
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
       return res.json({ ok: true, data: { active_batch: detail } });
@@ -3914,7 +3920,7 @@ router.post(
             delivery_date: detail.delivery_date,
           });
         }
-        emitDeliveryUpdated(io, batchId);
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
       return res.json({ ok: true, data: { active_batch: detail } });
@@ -4020,7 +4026,7 @@ router.post(
             batch_id: batchId,
           });
         }
-        emitDeliveryUpdated(io, batchId);
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
       return res.json({ ok: true, data: { active_batch: detail, batch_id: batchId } });
@@ -4131,7 +4137,7 @@ router.post(
           reason: "delivery_removed_from_route",
           batch_id: batchId,
         });
-        emitDeliveryUpdated(io, batchId);
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
       return res.json({

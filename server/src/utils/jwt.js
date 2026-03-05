@@ -5,6 +5,15 @@ require('dotenv').config();
 const SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
 const EXPIRES_IN = '7d';
 
+if (
+  process.env.NODE_ENV === 'production' &&
+  SECRET === 'change_me_long_secret'
+) {
+  throw new Error(
+    'JWT_SECRET must be configured in production (default fallback is forbidden).',
+  );
+}
+
 function signJwt(payload) {
   // payload должен содержать { id, email, role }
   return jwt.sign(payload, SECRET, { expiresIn: EXPIRES_IN });

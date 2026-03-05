@@ -22,6 +22,7 @@ const {
   provisionIsolatedTenantDatabase,
 } = require("../utils/tenantDatabases");
 const { logMonitoringEvent } = require("../utils/monitoring");
+const { emitToTenant } = require("../utils/socket");
 
 const channelUploadsDir = path.resolve(
   __dirname,
@@ -101,7 +102,7 @@ function normalizeSettings(raw) {
   return raw;
 }
 
-function schedulePublishedMessages(io, published) {
+function schedulePublishedMessages(io, published, tenantId = null) {
   if (!io || !Array.isArray(published) || published.length === 0) return;
   published.forEach((item, index) => {
     setTimeout(async () => {
@@ -115,7 +116,7 @@ function schedulePublishedMessages(io, published) {
           chatId: item.channel_id,
           message: msgRes.rows[0],
         });
-        io.emit("chat:updated", { chatId: item.channel_id });
+        emitToTenant(io, tenantId, "chat:updated", { chatId: item.channel_id });
       } catch (err) {
         console.error("admin.publish_pending emit error", err);
       }
@@ -437,7 +438,7 @@ function publishDemoPostsSequentially({
             chatId: channelId,
             message: messageInsert.rows[0],
           });
-          io.emit("chat:updated", {
+          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
             chatId: channelId,
             chat: {
               id: channelId,
@@ -1321,7 +1322,9 @@ router.post(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:created", { chatId: channel.id });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:created", {
+          chatId: channel.id,
+        });
       }
 
       return res.status(201).json({ ok: true, data: channel });
@@ -1406,7 +1409,9 @@ router.delete(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:deleted", { chatId: id });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:deleted", {
+          chatId: id,
+        });
       }
 
       return res.json({ ok: true, data: deletedChannel });
@@ -1521,7 +1526,9 @@ router.patch(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:updated", { chat: updated.rows[0] });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chat: updated.rows[0],
+        });
       }
 
       return res.json({ ok: true, data: updated.rows[0] });
@@ -1890,7 +1897,9 @@ router.post(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:updated", { chat: updated.rows[0] });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chat: updated.rows[0],
+        });
       }
 
       return res.json({
@@ -1974,7 +1983,9 @@ router.delete(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:updated", { chat: updated.rows[0] });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chat: updated.rows[0],
+        });
       }
 
       return res.json({
@@ -2040,7 +2051,9 @@ router.post(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:updated", { chat: updated });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chat: updated,
+        });
       }
 
       return res.json({ ok: true, data: updated });
@@ -2091,7 +2104,9 @@ router.delete(
 
       const io = req.app.get("io");
       if (io) {
-        io.emit("chat:updated", { chat: updated });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chat: updated,
+        });
       }
 
       return res.json({ ok: true, data: updated });
@@ -2216,9 +2231,11 @@ router.patch(
         `WITH target AS (
            SELECT q.id, q.product_id
            FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
            WHERE q.id = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
+             AND ($6::uuid IS NULL OR c.tenant_id = $6::uuid)
            LIMIT 1
          ),
          product_upd AS (
@@ -2245,7 +2262,14 @@ router.patch(
          WHERE q.id = $1
            AND EXISTS (SELECT 1 FROM target)
          RETURNING q.id`,
-        [queueId, title, description, price, Math.floor(quantity)],
+        [
+          queueId,
+          title,
+          description,
+          price,
+          Math.floor(quantity),
+          req.user.tenant_id || null,
+        ],
       );
       if (updated.rowCount === 0) {
         return res.status(404).json({
@@ -2390,7 +2414,9 @@ router.post(
               chatId: reservedChannel.id,
               message: msgRes.rows[0],
             });
-            io.emit("chat:updated", { chatId: reservedChannel.id });
+            emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+              chatId: reservedChannel.id,
+            });
           }
         }
       }
@@ -2656,7 +2682,9 @@ router.post(
             chatId: reservedChannel.id,
             message,
           });
-          io.emit("chat:updated", { chatId: reservedChannel.id });
+          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+            chatId: reservedChannel.id,
+          });
         }
         io.to(`user:${item.user_id}`).emit("cart:updated", {
           userId: String(item.user_id),
@@ -2672,7 +2700,9 @@ router.post(
             chatId: hiddenMessage.chat_id,
             message: hiddenMessage,
           });
-          io.emit("chat:updated", { chatId: hiddenMessage.chat_id });
+          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+            chatId: hiddenMessage.chat_id,
+          });
         }
       }
 
@@ -2848,7 +2878,11 @@ router.post(
 
       await client.query("COMMIT");
 
-      schedulePublishedMessages(req.app.get("io"), published);
+      schedulePublishedMessages(
+        req.app.get("io"),
+        published,
+        req.user?.tenant_id || null,
+      );
 
       return res.json({
         ok: true,

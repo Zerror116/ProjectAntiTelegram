@@ -25,6 +25,15 @@ const {
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
+
+if (
+  process.env.NODE_ENV === 'production' &&
+  JWT_SECRET === 'change_me_long_secret'
+) {
+  throw new Error(
+    'JWT_SECRET must be configured in production (default fallback is forbidden).',
+  );
+}
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
 // Настройки для Creator

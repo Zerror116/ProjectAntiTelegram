@@ -5,6 +5,16 @@ const RAW_KEY =
   process.env.APP_DATA_KEY ||
   process.env.ADDRESS_DATA_KEY ||
   'project-phoenix-local-dev-key-change-me';
+
+if (
+  process.env.NODE_ENV === 'production' &&
+  RAW_KEY === 'project-phoenix-local-dev-key-change-me'
+) {
+  throw new Error(
+    'APP_DATA_KEY (or ADDRESS_DATA_KEY) must be configured in production.',
+  );
+}
+
 const KEY = crypto.createHash('sha256').update(String(RAW_KEY)).digest();
 
 function normalizePlainText(value) {

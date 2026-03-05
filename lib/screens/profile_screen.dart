@@ -613,20 +613,48 @@ class _ProfileScreenState extends State<ProfileScreen> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: theme.colorScheme.outlineVariant),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
-          const SizedBox(width: 8),
-          Flexible(
-            child: Text(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final bounded = constraints.hasBoundedWidth;
+          final compact = bounded && constraints.maxWidth < 160;
+          if (!bounded) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
+                const SizedBox(width: 8),
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelLarge,
+                ),
+              ],
+            );
+          }
+          if (compact) {
+            return Text(
               label,
-              maxLines: 1,
+              maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: theme.textTheme.labelLarge,
-            ),
-          ),
-        ],
+            );
+          }
+          return Row(
+            children: [
+              Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelLarge,
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -1223,54 +1251,88 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                       : theme.colorScheme.outlineVariant,
                                 ),
                               ),
-                              child: Row(
-                                children: [
-                                  Expanded(
-                                    child: Column(
+                              child: LayoutBuilder(
+                                builder: (context, constraints) {
+                                  final compact = constraints.maxWidth < 420;
+                                  final actions = <Widget>[
+                                    if (active)
+                                      const Icon(Icons.check_circle_outline)
+                                    else
+                                      FilledButton.tonal(
+                                        onPressed: _switchingSession
+                                            ? null
+                                            : () => _switchToSession(row),
+                                        child: const Text('Выбрать'),
+                                      ),
+                                    if (!active)
+                                      IconButton(
+                                        tooltip: 'Убрать из списка',
+                                        onPressed: _switchingSession
+                                            ? null
+                                            : () => _removeSavedSession(row),
+                                        icon: const Icon(Icons.delete_outline),
+                                      ),
+                                  ];
+
+                                  final details = Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        tenantLabel,
+                                        style: theme.textTheme.titleSmall
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        '$roleLabel • $email',
+                                        style: theme.textTheme.bodySmall
+                                            ?.copyWith(
+                                              color: theme
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                            ),
+                                      ),
+                                    ],
+                                  );
+
+                                  if (compact) {
+                                    return Column(
                                       crossAxisAlignment:
                                           CrossAxisAlignment.start,
                                       children: [
-                                        Text(
-                                          tenantLabel,
-                                          style: theme.textTheme.titleSmall
-                                              ?.copyWith(
-                                                fontWeight: FontWeight.w800,
-                                              ),
-                                        ),
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          '$roleLabel • $email',
-                                          style: theme.textTheme.bodySmall
-                                              ?.copyWith(
-                                                color: theme
-                                                    .colorScheme
-                                                    .onSurfaceVariant,
-                                              ),
+                                        details,
+                                        const SizedBox(height: 8),
+                                        Align(
+                                          alignment: Alignment.centerRight,
+                                          child: Wrap(
+                                            spacing: 6,
+                                            runSpacing: 6,
+                                            crossAxisAlignment:
+                                                WrapCrossAlignment.center,
+                                            alignment: WrapAlignment.end,
+                                            children: actions,
+                                          ),
                                         ),
                                       ],
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  if (active)
-                                    const Icon(Icons.check_circle_outline)
-                                  else
-                                    FilledButton.tonal(
-                                      onPressed: _switchingSession
-                                          ? null
-                                          : () => _switchToSession(row),
-                                      child: const Text('Выбрать'),
-                                    ),
-                                  if (!active) ...[
-                                    const SizedBox(width: 6),
-                                    IconButton(
-                                      tooltip: 'Убрать из списка',
-                                      onPressed: _switchingSession
-                                          ? null
-                                          : () => _removeSavedSession(row),
-                                      icon: const Icon(Icons.delete_outline),
-                                    ),
-                                  ],
-                                ],
+                                    );
+                                  }
+
+                                  return Row(
+                                    children: [
+                                      Expanded(child: details),
+                                      const SizedBox(width: 8),
+                                      Wrap(
+                                        spacing: 6,
+                                        crossAxisAlignment:
+                                            WrapCrossAlignment.center,
+                                        children: actions,
+                                      ),
+                                    ],
+                                  );
+                                },
                               ),
                             );
                           }),
