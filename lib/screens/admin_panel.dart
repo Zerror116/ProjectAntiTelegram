@@ -15,6 +15,7 @@ import 'package:image/image.dart' as img;
 import 'package:latlong2/latlong.dart';
 
 import '../main.dart';
+import '../utils/date_time_utils.dart';
 import '../widgets/input_language_badge.dart';
 
 const String _defaultMapLightTiles =
@@ -57,7 +58,7 @@ class _AdminPanelState extends State<AdminPanel>
   final _tenantNameCtrl = TextEditingController();
   final _tenantNotesCtrl = TextEditingController();
   final _tenantMonthsCtrl = TextEditingController(text: '1');
-  final _inviteMaxUsesCtrl = TextEditingController(text: '1');
+  final _inviteMaxUsesCtrl = TextEditingController();
   final _inviteExpiresDaysCtrl = TextEditingController(text: '30');
   final _inviteNotesCtrl = TextEditingController();
 
@@ -395,13 +396,16 @@ class _AdminPanelState extends State<AdminPanel>
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final created = Map<String, dynamic>.from(data['data']);
         final key = (created['access_key'] ?? '').toString();
+        final warning = (created['warning'] ?? '').toString().trim();
         if (mounted) {
           setState(() {
             _lastGeneratedTenantKey = key;
             _tenantNameCtrl.clear();
             _tenantNotesCtrl.clear();
             _tenantMonthsCtrl.text = '1';
-            _message = 'Ключ арендатора создан';
+            _message = warning.isNotEmpty
+                ? 'Ключ создан. $warning'
+                : 'Ключ арендатора создан';
           });
         }
         await _loadTenants(silent: true);
@@ -741,12 +745,7 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   String _formatDateTimeLabel(dynamic raw) {
-    final value = raw?.toString().trim() ?? '';
-    if (value.isEmpty) return '';
-    final parsed = DateTime.tryParse(value);
-    if (parsed == null) return value;
-    String pad(int number) => number.toString().padLeft(2, '0');
-    return '${pad(parsed.day)}.${pad(parsed.month)}.${parsed.year} ${pad(parsed.hour)}:${pad(parsed.minute)}';
+    return formatDateTimeValue(raw, fallback: '');
   }
 
   Color _deliveryRouteColor(ThemeData theme, int index) {
@@ -4593,7 +4592,7 @@ class _AdminPanelState extends State<AdminPanel>
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'Дата: ${(activeBatch['delivery_date'] ?? '').toString()}',
+                      'Дата: ${_formatDateTimeLabel(activeBatch['delivery_date'])}',
                     ),
                     Text(
                       'Статус: ${_deliveryBatchStatusLabel((activeBatch['status'] ?? '').toString())}',
@@ -4709,7 +4708,7 @@ class _AdminPanelState extends State<AdminPanel>
                     (batch['delivery_label'] ?? 'Лист доставки').toString(),
                   ),
                   subtitle: Text(
-                    'Дата: ${(batch['delivery_date'] ?? '').toString()}\n'
+                    'Дата: ${_formatDateTimeLabel(batch['delivery_date'])}\n'
                     'Статус: ${_deliveryBatchStatusLabel((batch['status'] ?? '').toString())}\n'
                     'Клиентов: ${(batch['customers_total'] ?? 0).toString()}',
                   ),
@@ -4868,10 +4867,9 @@ class _AdminPanelState extends State<AdminPanel>
               final code = (tenant['code'] ?? '').toString();
               final status = (tenant['status'] ?? '').toString();
               final keyMask = (tenant['access_key_mask'] ?? '—').toString();
-              final subscription = (tenant['subscription_expires_at'] ?? '')
-                  .toString()
-                  .replaceFirst('T', ' ')
-                  .replaceFirst('Z', '');
+              final subscription = _formatDateTimeLabel(
+                tenant['subscription_expires_at'],
+              );
               final isActive = status == 'active';
               return Card(
                 child: Padding(

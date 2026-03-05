@@ -1,5 +1,6 @@
 // lib/services/auth_service.dart
 import 'dart:async';
+import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
@@ -12,6 +13,7 @@ class User {
   final String role;
   final String? phone;
   final String? tenantCode;
+  final String? tenantName;
 
   User({
     required this.id,
@@ -20,6 +22,7 @@ class User {
     required this.role,
     this.phone,
     this.tenantCode,
+    this.tenantName,
   });
 
   factory User.fromMap(Map<String, dynamic> m) {
@@ -35,6 +38,12 @@ class User {
             .trim();
         return raw.isEmpty ? null : raw;
       })(),
+      tenantName: (() {
+        final raw = (m['tenant_name'] ?? m['tenantName'] ?? '')
+            .toString()
+            .trim();
+        return raw.isEmpty ? null : raw;
+      })(),
     );
   }
 
@@ -46,6 +55,7 @@ class User {
       'role': role,
       'phone': phone,
       'tenant_code': tenantCode,
+      'tenant_name': tenantName,
     };
   }
 }
@@ -55,6 +65,7 @@ class AuthService {
   static const _tokenKey = 'auth_token';
   static const _viewRoleKey = 'creator_view_role';
   static const _tenantCodeKey = 'tenant_code_scope';
+  static const _savedSessionsKey = 'saved_tenant_sessions_v1';
 
   // Temporary storage for multi-step registration
   String? pendingEmail;
@@ -86,6 +97,125 @@ class AuthService {
 
   AuthService({required this.dio});
 
+  String _sessionIdFor(String email, String? tenantCode) {
+    final mail = email.trim().toLowerCase();
+    final tenant = (tenantCode ?? '').trim().toLowerCase();
+    return '$mail::$tenant';
+  }
+
+  Future<List<Map<String, dynamic>>> listSavedTenantSessions() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_savedSessionsKey);
+      if (raw == null || raw.trim().isEmpty) return const [];
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      final data = decoded
+          .whereType<Map>()
+          .map((row) => Map<String, dynamic>.from(row))
+          .where((row) {
+            final token = (row['token'] ?? '').toString().trim();
+            final email = (row['email'] ?? '').toString().trim();
+            return token.isNotEmpty && email.isNotEmpty;
+          })
+          .toList();
+      data.sort((a, b) {
+        final aa = (a['updated_at'] ?? '').toString();
+        final bb = (b['updated_at'] ?? '').toString();
+        return bb.compareTo(aa);
+      });
+      return data;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> _upsertSavedSession(String token, User? user) async {
+    if (token.trim().isEmpty || user == null) return;
+    if (user.email.trim().isEmpty) return;
+
+    final sessions = await listSavedTenantSessions();
+    final id = _sessionIdFor(user.email, user.tenantCode);
+    final next = <String, dynamic>{
+      'id': id,
+      'token': token,
+      'email': user.email,
+      'name': user.name ?? '',
+      'role': user.role,
+      'tenant_code': user.tenantCode ?? '',
+      'tenant_name': user.tenantName ?? '',
+      'updated_at': DateTime.now().toIso8601String(),
+    };
+
+    final updated = <Map<String, dynamic>>[
+      next,
+      ...sessions.where((row) => (row['id'] ?? '').toString() != id),
+    ];
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_savedSessionsKey, jsonEncode(updated));
+    } catch (_) {}
+  }
+
+  Future<void> removeSavedTenantSession(String sessionId) async {
+    final id = sessionId.trim();
+    if (id.isEmpty) return;
+    final sessions = await listSavedTenantSessions();
+    final updated = sessions
+        .where((row) => (row['id'] ?? '').toString() != id)
+        .toList();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_savedSessionsKey, jsonEncode(updated));
+    } catch (_) {}
+  }
+
+  Future<bool> switchToSavedTenantSession(String sessionId) async {
+    final id = sessionId.trim();
+    if (id.isEmpty) return false;
+    final sessions = await listSavedTenantSessions();
+    final found = sessions.firstWhere(
+      (row) => (row['id'] ?? '').toString() == id,
+      orElse: () => const <String, dynamic>{},
+    );
+    if (found.isEmpty) return false;
+
+    final token = (found['token'] ?? '').toString().trim();
+    if (token.isEmpty) return false;
+
+    try {
+      await setToken(token);
+      final resp = await dio.get('/api/profile');
+      if (resp.statusCode == 200 &&
+          resp.data is Map &&
+          resp.data['user'] is Map) {
+        _currentUser = User.fromMap(
+          Map<String, dynamic>.from(resp.data['user']),
+        );
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          if (_currentUser?.role.toLowerCase().trim() == 'creator') {
+            _viewRole = prefs.getString(_viewRoleKey);
+          } else {
+            _viewRole = null;
+            await prefs.remove(_viewRoleKey);
+          }
+        } catch (_) {}
+        try {
+          _authController.add(_currentUser);
+        } catch (_) {}
+        await _upsertSavedSession(token, _currentUser);
+        return true;
+      }
+      await removeSavedTenantSession(id);
+      return false;
+    } catch (_) {
+      await removeSavedTenantSession(id);
+      return false;
+    }
+  }
+
   String _shortToken(String token) {
     if (token.isEmpty) return '';
     final n = token.length < 20 ? token.length : 20;
@@ -115,6 +245,7 @@ class AuthService {
     if (responseTenantCode.isNotEmpty) {
       await setTenantCode(responseTenantCode);
     }
+    await _upsertSavedSession(token, _currentUser);
     try {
       final prefs = await SharedPreferences.getInstance();
       if (_currentUser?.role.toLowerCase().trim() == 'creator') {
@@ -219,7 +350,21 @@ class AuthService {
     // ✅ ИСПРАВЛЕНИЕ: Cast правильно
     final data = (resp.data as Map<dynamic, dynamic>).cast<String, dynamic>();
     final token = data['token'] ?? data['access'];
-    final userMap = data['user'] as Map<String, dynamic>?;
+    Map<String, dynamic>? userMap;
+    if (data['user'] is Map) {
+      userMap = Map<String, dynamic>.from(data['user']);
+    }
+    String? tenantNameFromResponse;
+    final tenant = data['tenant'];
+    if (tenant is Map && tenant['name'] != null) {
+      final raw = tenant['name'].toString().trim();
+      tenantNameFromResponse = raw.isEmpty ? null : raw;
+    }
+    if (userMap != null &&
+        tenantNameFromResponse != null &&
+        (userMap['tenant_name'] ?? '').toString().trim().isEmpty) {
+      userMap['tenant_name'] = tenantNameFromResponse;
+    }
 
     if (token == null) throw Exception('No token in response');
     final tokenStr = token.toString();
@@ -248,7 +393,6 @@ class AuthService {
     }
 
     String? tenantCodeFromResponse;
-    final tenant = data['tenant'];
     if (tenant is Map && tenant['code'] != null) {
       tenantCodeFromResponse = tenant['code'].toString().trim();
     }

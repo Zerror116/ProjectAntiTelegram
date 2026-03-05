@@ -5,6 +5,128 @@ function normalizeSettings(raw) {
   return raw;
 }
 
+function mergeWithSystemDuplicateFlags(settings, archivedSystemKey) {
+  const base = normalizeSettings(settings);
+  return {
+    ...base,
+    kind: "system_duplicate",
+    system_key: archivedSystemKey,
+    hidden_in_chat_list: true,
+    visibility: "private",
+    is_post_channel: false,
+    worker_can_post: false,
+  };
+}
+
+async function listSystemDuplicates(client, tenantId, keepId, systemKey) {
+  if (systemKey === "main_channel") {
+    const q = await client.query(
+      `SELECT id, title, settings
+       FROM chats
+       WHERE type = 'channel'
+         AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+         AND id <> $2
+         AND (
+           COALESCE(settings->>'system_key', '') = 'main_channel'
+           OR COALESCE((settings->>'is_post_channel')::boolean, false) = true
+           OR LOWER(TRIM(title)) = 'основной канал'
+         )`,
+      [tenantId || null, keepId],
+    );
+    return q.rows;
+  }
+
+  const q = await client.query(
+    `SELECT id, title, settings
+     FROM chats
+     WHERE type = 'channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+       AND id <> $2
+       AND (
+         COALESCE(settings->>'system_key', '') = 'reserved_orders'
+         OR COALESCE(settings->>'kind', '') = 'reserved_orders'
+         OR LOWER(TRIM(title)) = 'забронированный товар'
+       )`,
+    [tenantId || null, keepId],
+  );
+  return q.rows;
+}
+
+async function consolidateSystemDuplicates(client, tenantId, keepId, systemKey) {
+  const duplicates = await listSystemDuplicates(client, tenantId, keepId, systemKey);
+  if (!Array.isArray(duplicates) || duplicates.length === 0) return;
+  const duplicateIds = duplicates
+    .map((row) => String(row.id || "").trim())
+    .filter(Boolean);
+  if (duplicateIds.length === 0) return;
+
+  await client.query(
+    `UPDATE product_publication_queue
+     SET channel_id = $1
+     WHERE channel_id = ANY($2::uuid[])
+       AND status = 'pending'
+       AND COALESCE(is_sent, false) = false`,
+    [keepId, duplicateIds],
+  );
+
+  await client.query(
+    `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+     SELECT gen_random_uuid(), $1, cm.user_id, now(), cm.role
+     FROM chat_members cm
+     WHERE cm.chat_id = ANY($2::uuid[])
+     ON CONFLICT (chat_id, user_id) DO NOTHING`,
+    [keepId, duplicateIds],
+  );
+
+  await client.query(
+    `UPDATE messages
+     SET chat_id = $1
+     WHERE chat_id = ANY($2::uuid[])`,
+    [keepId, duplicateIds],
+  );
+
+  await client.query(
+    `UPDATE message_reads mr
+     SET chat_id = $1
+     FROM messages m
+     WHERE mr.message_id = m.id
+       AND mr.chat_id = ANY($2::uuid[])
+       AND m.chat_id = $1`,
+    [keepId, duplicateIds],
+  );
+
+  const archivedSystemKey =
+    systemKey === "main_channel"
+      ? "archived_main_channel_duplicate"
+      : "archived_reserved_orders_duplicate";
+
+  for (const row of duplicates) {
+    const currentSettings = normalizeSettings(row.settings);
+    const nextSettings = mergeWithSystemDuplicateFlags(
+      currentSettings,
+      archivedSystemKey,
+    );
+    await client.query(
+      `UPDATE chats
+       SET settings = $2::jsonb,
+           updated_at = now(),
+           title = CASE
+             WHEN LOWER(TRIM(title)) LIKE '%дубликат%' THEN title
+             ELSE title || ' (дубликат)'
+           END
+       WHERE id = $1`,
+      [row.id, JSON.stringify(nextSettings)],
+    );
+  }
+
+  await client.query(
+    `UPDATE chats
+     SET updated_at = now()
+     WHERE id = $1`,
+    [keepId],
+  );
+}
+
 function mergeJson(base, patch) {
   return { ...base, ...patch };
 }
@@ -247,6 +369,18 @@ async function ensureReservedOrdersChannel(client, createdBy, tenantId = null) {
 async function ensureSystemChannels(client, createdBy, tenantId = null) {
   const main = await ensureMainChannel(client, createdBy, tenantId);
   const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
+  await consolidateSystemDuplicates(
+    client,
+    tenantId,
+    main.channel.id,
+    "main_channel",
+  );
+  await consolidateSystemDuplicates(
+    client,
+    tenantId,
+    reserved.channel.id,
+    "reserved_orders",
+  );
   return {
     mainChannel: main.channel,
     reservedChannel: reserved.channel,

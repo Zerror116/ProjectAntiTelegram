@@ -153,6 +153,16 @@ async function resolveTenantInviteByCode(inviteCode) {
   return inviteRes.rows[0];
 }
 
+async function resolveDefaultTenant() {
+  const result = await db.platformQuery(
+    `SELECT id, code, name, status, subscription_expires_at, db_mode, db_url, db_name
+     FROM tenants
+     WHERE code = 'default'
+     LIMIT 1`,
+  );
+  return result.rowCount > 0 ? result.rows[0] : null;
+}
+
 /**
  * POST /api/auth/check_email
  * body: { email }
@@ -181,6 +191,64 @@ router.post('/check_email', async (req, res) => {
     }
     console.error('check_email error', err);
     return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/invite/resolve', async (req, res) => {
+  try {
+    const normalized = normalizeInviteCode(
+      req.body?.invite_code || req.body?.invite || req.body?.code || '',
+    );
+    if (!normalized) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invite_code required',
+      });
+    }
+
+    const invite = await resolveTenantInviteByCode(normalized);
+    if (!invite) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Код приглашения не найден',
+      });
+    }
+    if (invite.is_active !== true) {
+      return res.status(403).json({ ok: false, error: 'Код приглашения отключен' });
+    }
+    if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
+      return res.status(403).json({ ok: false, error: 'Срок действия кода приглашения истек' });
+    }
+    const maxUses = Number(invite.max_uses);
+    const usedCount = Number(invite.used_count || 0);
+    if (Number.isFinite(maxUses) && maxUses > 0 && usedCount >= maxUses) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Лимит использований этого кода приглашения исчерпан',
+      });
+    }
+
+    const tenantState = isTenantActive({
+      status: invite.status,
+      subscription_expires_at: invite.subscription_expires_at,
+    });
+    if (!tenantState.ok) {
+      return res.status(403).json({ ok: false, error: tenantState.error });
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        invite_code: normalized,
+        role: String(invite.role || 'client').toLowerCase().trim(),
+        tenant_id: invite.tenant_id,
+        tenant_code: invite.tenant_code,
+        tenant_name: invite.tenant_name,
+      },
+    });
+  } catch (err) {
+    console.error('auth.invite.resolve error', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
   }
 });
 
@@ -224,6 +292,12 @@ router.post('/register', async (req, res) => {
         return res.status(403).json({ error: 'Invalid secret for this email' });
       }
       role = 'creator';
+      tenant = await resolveDefaultTenant();
+      if (!tenant?.id) {
+        return res.status(500).json({
+          error: 'Default-арендатор не найден. Выполните /api/setup и перезапустите сервер.',
+        });
+      }
     } else {
       const rawInputCode = String(access_key || '').trim();
       const rawAccessKey = normalizeAccessKey(rawInputCode);
@@ -300,7 +374,7 @@ router.post('/register', async (req, res) => {
             password_hash,
             name || null,
             role,
-            isPlatformCreator ? null : tenant?.id || null,
+            tenant?.id || null,
           ],
         );
         const user = insertUser.rows[0];
@@ -395,6 +469,7 @@ router.post('/register', async (req, res) => {
         role: registration.user.role,
         tenant_id: registration.user.tenant_id || null,
         tenant_code: tenant?.code || null,
+        tenant_name: tenant?.name || null,
       },
       tenant: tenant
         ? {
@@ -537,9 +612,7 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    const effectiveTenantCode = isPlatformCreator
-      ? null
-      : tenant?.code || result.user.tenant_code || null;
+    const effectiveTenantCode = tenant?.code || result.user.tenant_code || null;
     const token = signToken({
       id: result.user.id,
       email: result.user.email,
@@ -557,6 +630,7 @@ router.post('/login', async (req, res) => {
         role: result.user.role,
         tenant_id: result.user.tenant_id || null,
         tenant_code: effectiveTenantCode,
+        tenant_name: result.user.tenant_name || tenant?.name || null,
       },
       tenant: result.user.tenant_id
         ? {

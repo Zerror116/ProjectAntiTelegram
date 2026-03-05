@@ -198,6 +198,22 @@ function isBugReportsTitle(value) {
   );
 }
 
+function isMainSystemTitle(value) {
+  return (
+    String(value || "")
+      .trim()
+      .toLowerCase() === "основной канал"
+  );
+}
+
+function isReservedSystemTitle(value) {
+  return (
+    String(value || "")
+      .trim()
+      .toLowerCase() === "забронированный товар"
+  );
+}
+
 function normalizeBlacklistEntries(settings) {
   const entriesRaw = Array.isArray(settings?.blacklist_entries)
     ? settings.blacklist_entries
@@ -605,37 +621,84 @@ router.post(
       await client.query("COMMIT");
 
       const createdRow = created.rows[0];
+      var dbMode = "isolated";
+      var dbName = null;
+      var warning = "";
 
-      const provision = await provisionIsolatedTenantDatabase({
-        platformDbUrl,
-        tenantId,
-        tenantCode: code,
-        tenantName: name,
-        accessKeyHash,
-        accessKeyMask,
-        status: "active",
-        subscriptionExpiresAt: createdRow.subscription_expires_at,
-        createdBy: req.user.id,
-        notes,
-      });
+      try {
+        const provision = await provisionIsolatedTenantDatabase({
+          platformDbUrl,
+          tenantId,
+          tenantCode: code,
+          tenantName: name,
+          accessKeyHash,
+          accessKeyMask,
+          status: "active",
+          subscriptionExpiresAt: createdRow.subscription_expires_at,
+          createdBy: req.user.id,
+          notes,
+        });
 
-      await db.platformQuery(
-        `UPDATE tenants
-         SET db_mode = 'isolated',
-             db_name = $2,
-             db_url = $3,
-             updated_at = now()
-         WHERE id = $1`,
-        [tenantId, provision.dbName, provision.dbUrl],
-      );
+        dbName = provision.dbName;
+        await db.platformQuery(
+          `UPDATE tenants
+           SET db_mode = 'isolated',
+               db_name = $2,
+               db_url = $3,
+               updated_at = now()
+           WHERE id = $1`,
+          [tenantId, provision.dbName, provision.dbUrl],
+        );
+      } catch (provisionErr) {
+        console.error(
+          "admin.tenants.create isolated provision failed, fallback to shared",
+          provisionErr,
+        );
+
+        const sharedClient = await db.platformConnect();
+        try {
+          await sharedClient.query("BEGIN");
+          await ensureSystemChannels(
+            sharedClient,
+            req.user.id || null,
+            tenantId || null,
+          );
+          const currentDbQ = await sharedClient.query(
+            "SELECT current_database() AS db_name",
+          );
+          dbName = String(currentDbQ.rows[0]?.db_name || "").trim() || null;
+          await sharedClient.query(
+            `UPDATE tenants
+             SET db_mode = 'shared',
+                 db_name = $2,
+                 db_url = NULL,
+                 updated_at = now()
+             WHERE id = $1`,
+            [tenantId, dbName],
+          );
+          await sharedClient.query("COMMIT");
+        } catch (sharedErr) {
+          try {
+            await sharedClient.query("ROLLBACK");
+          } catch (_) {}
+          throw sharedErr;
+        } finally {
+          sharedClient.release();
+        }
+
+        dbMode = "shared";
+        warning =
+          "Отдельную БД создать не удалось. Арендатор создан в общей БД (shared).";
+      }
 
       return res.status(201).json({
         ok: true,
         data: {
           ...createdRow,
           access_key: accessKey,
-          db_mode: "isolated",
-          db_name: provision.dbName,
+          db_mode: dbMode,
+          db_name: dbName,
+          warning,
         },
       });
     } catch (err) {
@@ -783,6 +846,14 @@ function tenantInviteRole(rawRole) {
   return "client";
 }
 
+function parseNullablePositiveInt(raw, { min = 1, max = 100000 } = {}) {
+  if (raw == null) return null;
+  if (typeof raw === "string" && raw.trim() === "") return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
 async function resolveTargetTenantForInvite(req) {
   const ownTenantId = String(req.user?.tenant_id || "").trim();
   if (ownTenantId) {
@@ -864,11 +935,8 @@ function inviteLinkForRequest(req, inviteCode, tenantCode = "") {
 router.get(
   "/tenant/invites",
   requireAuth,
-  requireRole("creator"),
+  requireRole("admin", "creator"),
   async (req, res) => {
-    if (req.user?.is_platform_creator !== true) {
-      return res.status(403).json({ ok: false, error: "Forbidden" });
-    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -921,11 +989,8 @@ router.get(
 router.post(
   "/tenant/invites",
   requireAuth,
-  requireRole("creator"),
+  requireRole("admin", "creator"),
   async (req, res) => {
-    if (req.user?.is_platform_creator !== true) {
-      return res.status(403).json({ ok: false, error: "Forbidden" });
-    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -935,16 +1000,61 @@ router.post(
     }
     const role = tenantInviteRole(req.body?.role);
     const notes = String(req.body?.notes || "").trim();
-    const maxUsesRaw = Number(req.body?.max_uses);
-    const maxUses = Number.isFinite(maxUsesRaw)
-      ? Math.max(1, Math.min(100000, Math.floor(maxUsesRaw)))
-      : null;
-    const expiresDaysRaw = Number(req.body?.expires_days);
-    const expiresDays = Number.isFinite(expiresDaysRaw)
-      ? Math.max(1, Math.min(365, Math.floor(expiresDaysRaw)))
-      : null;
+    const maxUses = parseNullablePositiveInt(req.body?.max_uses, {
+      min: 1,
+      max: 100000,
+    });
+    const expiresDays = parseNullablePositiveInt(req.body?.expires_days, {
+      min: 1,
+      max: 365,
+    });
+    const forceNew = req.body?.force_new === true;
 
     try {
+      if (!forceNew) {
+        const existing = await db.platformQuery(
+          `SELECT id,
+                  tenant_id,
+                  code,
+                  role,
+                  is_active,
+                  max_uses,
+                  used_count,
+                  expires_at,
+                  created_by,
+                  last_used_at,
+                  notes,
+                  created_at,
+                  updated_at
+           FROM tenant_invites
+           WHERE tenant_id = $1
+             AND role = $2
+             AND is_active = true
+             AND max_uses IS NULL
+             AND expires_at IS NULL
+             AND (expires_at IS NULL OR expires_at > now())
+             AND (max_uses IS NULL OR used_count < max_uses)
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [targetTenant.id, role],
+        );
+        if (existing.rowCount > 0) {
+          const row = existing.rows[0];
+          return res.json({
+            ok: true,
+            reused: true,
+            data: {
+              ...row,
+              invite_link: inviteLinkForRequest(
+                req,
+                row.code,
+                targetTenant.code || "",
+              ),
+            },
+          });
+        }
+      }
+
       let tries = 0;
       while (tries < 5) {
         tries += 1;
@@ -1018,11 +1128,8 @@ router.post(
 router.patch(
   "/tenant/invites/:inviteId/status",
   requireAuth,
-  requireRole("creator"),
+  requireRole("admin", "creator"),
   async (req, res) => {
-    if (req.user?.is_platform_creator !== true) {
-      return res.status(403).json({ ok: false, error: "Forbidden" });
-    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -1084,11 +1191,8 @@ router.patch(
 router.delete(
   "/tenant/invites/:inviteId",
   requireAuth,
-  requireRole("creator"),
+  requireRole("admin", "creator"),
   async (req, res) => {
-    if (req.user?.is_platform_creator !== true) {
-      return res.status(403).json({ ok: false, error: "Forbidden" });
-    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -1146,12 +1250,13 @@ router.get(
         `SELECT id, title, type, created_by, settings, created_at, updated_at
        FROM chats
        WHERE type = 'channel'
-         AND tenant_id = $1
+         AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
          AND COALESCE(settings->>'kind', 'channel') = 'channel'
          AND COALESCE((settings->>'admin_only')::boolean, false) = false
+         AND COALESCE((settings->>'hidden_in_chat_list')::boolean, false) = false
          AND LOWER(TRIM(title)) <> LOWER(TRIM('Баг-репорты'))
        ORDER BY updated_at DESC NULLS LAST, created_at DESC`,
-        [req.user.tenant_id],
+        [req.user.tenant_id || null],
       );
       return res.json({ ok: true, data: result.rows });
     } catch (err) {
@@ -1175,6 +1280,13 @@ router.post(
         return res
           .status(400)
           .json({ ok: false, error: "Название канала обязательно" });
+      }
+      if (isMainSystemTitle(normalizedTitle) || isReservedSystemTitle(normalizedTitle)) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Это системное название. Измените существующий системный канал в настройках, а не создавайте новый.",
+        });
       }
 
       const nextVisibility = normalizeVisibility(visibility);
@@ -2613,10 +2725,10 @@ router.post(
          WHERE q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
            AND q.id = ANY($1::uuid[])
-           AND c.tenant_id = $2
+           AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
          ORDER BY q.created_at ASC
          FOR UPDATE`,
-          [queueIds, req.user.tenant_id],
+          [queueIds, req.user.tenant_id || null],
         );
         rows = q.rows;
       } else {
@@ -2630,10 +2742,10 @@ router.post(
          WHERE q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
            AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
-           AND c.tenant_id = $2
+           AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
          ORDER BY q.created_at ASC
          FOR UPDATE`,
-          [channelId, req.user.tenant_id],
+          [channelId, req.user.tenant_id || null],
         );
         rows = q.rows;
       }

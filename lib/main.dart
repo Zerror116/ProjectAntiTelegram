@@ -47,6 +47,27 @@ enum AppNoticeTone { info, success, warning, error }
 
 enum AppUiSound { tap, sent, incoming, success, warning }
 
+class _AppNoticePayload {
+  final int id;
+  final String message;
+  final String? title;
+  final AppNoticeTone tone;
+  final Duration duration;
+
+  const _AppNoticePayload({
+    required this.id,
+    required this.message,
+    required this.title,
+    required this.tone,
+    required this.duration,
+  });
+}
+
+final ValueNotifier<_AppNoticePayload?> _appNoticeNotifier =
+    ValueNotifier<_AppNoticePayload?>(null);
+int _appNoticeSeq = 0;
+Timer? _appNoticeTimer;
+
 String _settingsScopeUserId() {
   final id = authService.currentUser?.id;
   if (id != null && id.trim().isNotEmpty) return id;
@@ -117,93 +138,201 @@ void showAppNotice(
   String message, {
   String? title,
   AppNoticeTone tone = AppNoticeTone.info,
-  Duration duration = const Duration(milliseconds: 1600),
+  Duration duration = const Duration(seconds: 5),
 }) {
-  final messenger = ScaffoldMessenger.maybeOf(context);
-  if (messenger == null) return;
-
-  final theme = Theme.of(context);
-  final scheme = theme.colorScheme;
-  final (icon, accent) = switch (tone) {
-    AppNoticeTone.success => (
-      Icons.check_circle_outline,
-      theme.brightness == Brightness.dark
-          ? const Color(0xFF8BCF9B)
-          : const Color(0xFF2E7D32),
-    ),
-    AppNoticeTone.warning => (
-      Icons.notifications_active_outlined,
-      theme.brightness == Brightness.dark
-          ? const Color(0xFFFFC870)
-          : const Color(0xFFB26A00),
-    ),
-    AppNoticeTone.error => (
-      Icons.error_outline,
-      theme.brightness == Brightness.dark
-          ? const Color(0xFFFF9C92)
-          : const Color(0xFFB3261E),
-    ),
-    AppNoticeTone.info => (
-      Icons.mark_chat_unread_outlined,
-      theme.brightness == Brightness.dark
-          ? const Color(0xFF9CCBFF)
-          : const Color(0xFF215EA6),
-    ),
-  };
-
-  messenger
-    ..hideCurrentSnackBar()
-    ..showSnackBar(
-      SnackBar(
-        duration: duration,
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        backgroundColor: scheme.surfaceContainerHigh,
-        content: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.only(top: 1),
-              child: Icon(icon, color: accent, size: 20),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (title != null && title.trim().isNotEmpty)
-                    Text(
-                      title,
-                      style: theme.textTheme.labelLarge?.copyWith(
-                        color: scheme.onSurface,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  Text(
-                    message,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: scheme.onSurface,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+  _showGlobalNotice(message, title: title, tone: tone, duration: duration);
 }
 
 void showGlobalAppNotice(
   String message, {
   String? title,
   AppNoticeTone tone = AppNoticeTone.info,
-  Duration duration = const Duration(milliseconds: 1600),
+  Duration duration = const Duration(seconds: 5),
 }) {
-  final context = navigatorKey.currentContext;
-  if (context == null) return;
-  showAppNotice(context, message, title: title, tone: tone, duration: duration);
+  _showGlobalNotice(message, title: title, tone: tone, duration: duration);
+}
+
+Duration _normalizeNoticeDuration(Duration duration) {
+  return const Duration(seconds: 5);
+}
+
+void _showGlobalNotice(
+  String message, {
+  String? title,
+  AppNoticeTone tone = AppNoticeTone.info,
+  Duration duration = const Duration(seconds: 5),
+}) {
+  final text = message.trim();
+  if (text.isEmpty) return;
+  final normalizedDuration = _normalizeNoticeDuration(duration);
+  final payload = _AppNoticePayload(
+    id: ++_appNoticeSeq,
+    message: text,
+    title: title?.trim().isNotEmpty == true ? title!.trim() : null,
+    tone: tone,
+    duration: normalizedDuration,
+  );
+  _appNoticeNotifier.value = payload;
+  _appNoticeTimer?.cancel();
+  _appNoticeTimer = Timer(normalizedDuration, () {
+    final current = _appNoticeNotifier.value;
+    if (current != null && current.id == payload.id) {
+      _appNoticeNotifier.value = null;
+    }
+  });
+}
+
+class _GlobalNoticeHost extends StatelessWidget {
+  final Widget child;
+
+  const _GlobalNoticeHost({required this.child});
+
+  ({IconData icon, Color accent}) _noticeVisuals(
+    BuildContext context,
+    AppNoticeTone tone,
+  ) {
+    final theme = Theme.of(context);
+    return switch (tone) {
+      AppNoticeTone.success => (
+        icon: Icons.check_circle_outline,
+        accent: theme.brightness == Brightness.dark
+            ? const Color(0xFF8BCF9B)
+            : const Color(0xFF2E7D32),
+      ),
+      AppNoticeTone.warning => (
+        icon: Icons.notifications_active_outlined,
+        accent: theme.brightness == Brightness.dark
+            ? const Color(0xFFFFC870)
+            : const Color(0xFFB26A00),
+      ),
+      AppNoticeTone.error => (
+        icon: Icons.error_outline,
+        accent: theme.brightness == Brightness.dark
+            ? const Color(0xFFFF9C92)
+            : const Color(0xFFB3261E),
+      ),
+      AppNoticeTone.info => (
+        icon: Icons.mark_chat_unread_outlined,
+        accent: theme.brightness == Brightness.dark
+            ? const Color(0xFF9CCBFF)
+            : const Color(0xFF215EA6),
+      ),
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        child,
+        IgnorePointer(
+          ignoring: false,
+          child: SafeArea(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: ValueListenableBuilder<_AppNoticePayload?>(
+                valueListenable: _appNoticeNotifier,
+                builder: (context, notice, _) {
+                  return AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 220),
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    child: notice == null
+                        ? const SizedBox.shrink()
+                        : Padding(
+                            key: ValueKey(notice.id),
+                            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 760),
+                              child: Material(
+                                color: theme.colorScheme.surfaceContainerHigh,
+                                elevation: 8,
+                                borderRadius: BorderRadius.circular(16),
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(16),
+                                  onTap: () => _appNoticeNotifier.value = null,
+                                  child: Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      14,
+                                      12,
+                                      14,
+                                      12,
+                                    ),
+                                    child: Builder(
+                                      builder: (context) {
+                                        final visuals = _noticeVisuals(
+                                          context,
+                                          notice.tone,
+                                        );
+                                        return Row(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                top: 1,
+                                              ),
+                                              child: Icon(
+                                                visuals.icon,
+                                                color: visuals.accent,
+                                                size: 20,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Expanded(
+                                              child: Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  if (notice.title != null)
+                                                    Text(
+                                                      notice.title!,
+                                                      style: theme
+                                                          .textTheme
+                                                          .labelLarge
+                                                          ?.copyWith(
+                                                            color: theme
+                                                                .colorScheme
+                                                                .onSurface,
+                                                            fontWeight:
+                                                                FontWeight.w700,
+                                                          ),
+                                                    ),
+                                                  Text(
+                                                    notice.message,
+                                                    style: theme
+                                                        .textTheme
+                                                        .bodyMedium
+                                                        ?.copyWith(
+                                                          color: theme
+                                                              .colorScheme
+                                                              .onSurface,
+                                                        ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ],
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 String _incomingMessagePreview(Map<String, dynamic>? message) {
@@ -638,7 +767,9 @@ Future<void> main() async {
       darkTheme: AppTheme.dark(),
       themeMode: themeModeNotifier.value,
       builder: (context, child) {
-        return ScaffoldMessenger(child: child ?? const SizedBox.shrink());
+        return ScaffoldMessenger(
+          child: _GlobalNoticeHost(child: child ?? const SizedBox.shrink()),
+        );
       },
     );
   };
@@ -756,6 +887,13 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
                 subtitle: _status ?? 'Подготавливаем приложение',
               ),
             ),
+            builder: (context, child) {
+              return ScaffoldMessenger(
+                child: _GlobalNoticeHost(
+                  child: child ?? const SizedBox.shrink(),
+                ),
+              );
+            },
           );
         },
       );
@@ -775,6 +913,11 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             '/auth': (_) => const AuthScreen(),
             '/phone_name': (_) => const PhoneNameScreen(isRegisterFlow: false),
             '/main': (_) => const MainShell(),
+          },
+          builder: (context, child) {
+            return ScaffoldMessenger(
+              child: _GlobalNoticeHost(child: child ?? const SizedBox.shrink()),
+            );
           },
         );
       },
@@ -808,10 +951,10 @@ class SetupFailedScreen extends StatelessWidget {
                       MaterialPageRoute(builder: (_) => const AuthScreen()),
                     );
                   } else {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Попытка подключения провалилась'),
-                      ),
+                    showAppNotice(
+                      context,
+                      'Попытка подключения провалилась',
+                      tone: AppNoticeTone.error,
                     );
                   }
                 },

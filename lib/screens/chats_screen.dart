@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/phoenix_loader.dart';
 import 'chat_screen.dart';
@@ -155,22 +156,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   DateTime? _parseDate(dynamic raw) {
-    if (raw == null) return null;
-    if (raw is DateTime) return raw.toLocal();
-    return DateTime.tryParse(raw.toString())?.toLocal();
+    return parseDateTimeValue(raw);
   }
 
   String _formatTime(dynamic raw) {
-    final date = _parseDate(raw);
-    if (date == null) return '';
-    String pad(int v) => v < 10 ? '0$v' : '$v';
-    final now = DateTime.now();
-    final sameDay =
-        date.year == now.year && date.month == now.month && date.day == now.day;
-    if (sameDay) {
-      return '${pad(date.hour)}:${pad(date.minute)}';
-    }
-    return '${pad(date.day)}.${pad(date.month)}';
+    return formatDateTimeValue(raw);
   }
 
   String _compactMessage(String text) {

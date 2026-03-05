@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../main.dart';
+import '../utils/date_time_utils.dart';
 import '../widgets/input_language_badge.dart';
 
 class CreatorKeysScreen extends StatefulWidget {
@@ -18,7 +19,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   final _tenantNameCtrl = TextEditingController();
   final _tenantNotesCtrl = TextEditingController();
   final _tenantMonthsCtrl = TextEditingController(text: '1');
-  final _inviteMaxUsesCtrl = TextEditingController(text: '1');
+  final _inviteMaxUsesCtrl = TextEditingController();
   final _inviteExpiresDaysCtrl = TextEditingController(text: '30');
   final _inviteNotesCtrl = TextEditingController();
 
@@ -249,13 +250,16 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final row = Map<String, dynamic>.from(data['data']);
+        final warning = (row['warning'] ?? '').toString().trim();
         if (mounted) {
           setState(() {
             _lastGeneratedTenantKey = (row['access_key'] ?? '').toString();
             _tenantNameCtrl.clear();
             _tenantNotesCtrl.clear();
             _tenantMonthsCtrl.text = '1';
-            _message = 'Ключ арендатора создан';
+            _message = warning.isNotEmpty
+                ? 'Ключ создан. $warning'
+                : 'Ключ арендатора создан';
           });
         }
         await _loadTenants(silent: true);
@@ -388,12 +392,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final row = Map<String, dynamic>.from(data['data']);
+        final reused = data['reused'] == true;
         if (mounted) {
           setState(() {
             _lastInviteCode = (row['code'] ?? '').toString();
             _lastInviteLink = (row['invite_link'] ?? '').toString();
             _inviteNotesCtrl.clear();
-            _message = 'Код приглашения создан';
+            _message = reused
+                ? 'Активный код уже существовал, возвращаю его'
+                : 'Код приглашения создан';
           });
         }
         await _loadInvites(silent: true);
@@ -575,10 +582,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         final code = (tenant['code'] ?? '').toString();
         final status = (tenant['status'] ?? '').toString();
         final keyMask = (tenant['access_key_mask'] ?? '—').toString();
-        final subscription = (tenant['subscription_expires_at'] ?? '')
-            .toString()
-            .replaceFirst('T', ' ')
-            .replaceFirst('Z', '');
+        final subscription = formatDateTimeValue(
+          tenant['subscription_expires_at'],
+          fallback: '',
+        );
         final isActive = status == 'active';
 
         return Card(
@@ -747,7 +754,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                   keyboardType: TextInputType.number,
                   decoration: withInputLanguageBadge(
                     const InputDecoration(
-                      labelText: 'Сколько раз можно использовать код',
+                      labelText: 'Лимит использований (пусто = без лимита)',
                       border: OutlineInputBorder(),
                     ),
                     controller: _inviteMaxUsesCtrl,

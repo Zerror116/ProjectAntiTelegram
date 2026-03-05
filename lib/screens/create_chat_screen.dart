@@ -42,12 +42,16 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
       final status = resp.statusCode;
       final data = resp.data;
 
-      final ok = (status == 201) || (data is Map && (data['ok'] == true || data['data'] != null));
+      final ok =
+          (status == 201) ||
+          (data is Map && (data['ok'] == true || data['data'] != null));
       if (ok) {
         // Показываем краткое подтверждение и возвращаем true
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Чат успешно создан')),
+        showAppNotice(
+          context,
+          'Чат успешно создан',
+          tone: AppNoticeTone.success,
         );
         Navigator.of(context).pop(true);
         return;
@@ -56,8 +60,10 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
       // Попытка извлечь сообщение ошибки из ответа
       String msg = 'Ошибка создания чата';
       if (data is Map) {
-        if (data['error'] != null) msg = data['error'].toString();
-        else if (data['message'] != null) msg = data['message'].toString();
+        if (data['error'] != null)
+          msg = data['error'].toString();
+        else if (data['message'] != null)
+          msg = data['message'].toString();
       }
       setState(() => _error = msg);
     } catch (e) {
@@ -75,54 +81,67 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
       appBar: AppBar(title: const Text('Создать чат')),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(children: [
-          TextField(
-            controller: _titleCtrl,
-            decoration: withInputLanguageBadge(
-              const InputDecoration(
-                labelText: 'Название чата',
-                hintText: 'Введите название',
-              ),
+        child: Column(
+          children: [
+            TextField(
               controller: _titleCtrl,
+              decoration: withInputLanguageBadge(
+                const InputDecoration(
+                  labelText: 'Название чата',
+                  hintText: 'Введите название',
+                ),
+                controller: _titleCtrl,
+              ),
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _create(),
             ),
-            textInputAction: TextInputAction.done,
-            onSubmitted: (_) => _create(),
-          ),
-          const SizedBox(height: 12),
-          Row(children: [
-            Expanded(
-              child: RadioListTile<String>(
-                value: 'public',
-                groupValue: _type,
-                title: const Text('Публичный'),
-                onChanged: (v) => setState(() => _type = v ?? 'public'),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: RadioListTile<String>(
+                    value: 'public',
+                    groupValue: _type,
+                    title: const Text('Публичный'),
+                    onChanged: (v) => setState(() => _type = v ?? 'public'),
+                  ),
+                ),
+                Expanded(
+                  child: RadioListTile<String>(
+                    value: 'private',
+                    groupValue: _type,
+                    title: const Text('Приватный'),
+                    onChanged: (v) => setState(() => _type = v ?? 'private'),
+                  ),
+                ),
+              ],
+            ),
+            if (_error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(_error, style: const TextStyle(color: Colors.red)),
+            ],
+            const Spacer(),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _loading ? null : _create,
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                child: _loading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Text('Создать'),
               ),
             ),
-            Expanded(
-              child: RadioListTile<String>(
-                value: 'private',
-                groupValue: _type,
-                title: const Text('Приватный'),
-                onChanged: (v) => setState(() => _type = v ?? 'private'),
-              ),
-            ),
-          ]),
-          if (_error.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Text(_error, style: const TextStyle(color: Colors.red)),
           ],
-          const Spacer(),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: _loading ? null : _create,
-              style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
-              child: _loading
-                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                  : const Text('Создать'),
-            ),
-          ),
-        ]),
+        ),
       ),
     );
   }
