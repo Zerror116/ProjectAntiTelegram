@@ -45,6 +45,11 @@ class _AuthScreenState extends State<AuthScreen> {
     _passwordController.addListener(_passwordListener);
     _accessKeyController.addListener(_accessKeyListener);
 
+    final tenantFromLink = _extractTenantFromUri();
+    if (tenantFromLink.isNotEmpty) {
+      _authService.setTenantCode(tenantFromLink);
+    }
+
     final inviteFromLink = _extractInviteFromUri();
     if (inviteFromLink.isNotEmpty) {
       _accessKeyController.text = inviteFromLink;
@@ -69,6 +74,32 @@ class _AuthScreenState extends State<AuthScreen> {
           );
           final value = (inFragment['invite'] ?? inFragment['code'] ?? '')
               .trim();
+          if (value.isNotEmpty) return value;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  String _extractTenantFromUri() {
+    try {
+      final uri = Uri.base;
+      final direct =
+          uri.queryParameters['tenant'] ??
+          uri.queryParameters['tenant_code'] ??
+          '';
+      if (direct.trim().isNotEmpty) return direct.trim().toLowerCase();
+      if (uri.fragment.isNotEmpty) {
+        final fragment = uri.fragment;
+        final qIndex = fragment.indexOf('?');
+        if (qIndex >= 0 && qIndex + 1 < fragment.length) {
+          final inFragment = Uri.splitQueryString(
+            fragment.substring(qIndex + 1),
+          );
+          final value =
+              (inFragment['tenant'] ?? inFragment['tenant_code'] ?? '')
+                  .trim()
+                  .toLowerCase();
           if (value.isNotEmpty) return value;
         }
       }

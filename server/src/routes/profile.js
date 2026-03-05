@@ -97,6 +97,7 @@ async function loadUserProfile(userId) {
        u.email,
        u.name,
        u.role,
+       t.code AS tenant_code,
        u.avatar_url,
        COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
        COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
@@ -105,6 +106,7 @@ async function loadUserProfile(userId) {
        p.status AS phone_status,
        p.verified_at AS phone_verified_at
      FROM users u
+     LEFT JOIN tenants t ON t.id = u.tenant_id
      LEFT JOIN phones p ON p.user_id = u.id
      WHERE u.id = $1
      LIMIT 1`,
@@ -121,6 +123,7 @@ async function loadUserProfile(userId) {
     email: row.email,
     name: row.name || null,
     role: row.role || "client",
+    tenant_code: row.tenant_code || null,
     avatar_url: row.avatar_url || null,
     avatar_focus_x: Number(row.avatar_focus_x || 0),
     avatar_focus_y: Number(row.avatar_focus_y || 0),

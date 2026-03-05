@@ -46,7 +46,36 @@ function verifyToken(token) {
   }
 }
 
+function decodeJwtPayloadUnsafe(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return null;
+    const payloadPart = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const normalized = payloadPart.padEnd(
+      payloadPart.length + ((4 - (payloadPart.length % 4)) % 4),
+      '=',
+    );
+    const json = Buffer.from(normalized, 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch (_) {
+    return null;
+  }
+}
+
 async function resolveAuthContextFromToken(token, requestedViewRole = '') {
+  const unsafePayload = decodeJwtPayloadUnsafe(token) || {};
+  const tenantCodeHint = db.normalizeTenantCode(
+    unsafePayload.tenant_code ||
+      unsafePayload.tenantCode ||
+      unsafePayload.tcode ||
+      '',
+  );
+  const tenantIdHint = String(
+    unsafePayload.tenant_id ||
+      unsafePayload.tenantId ||
+      '',
+  ).trim();
+
   const payload = verifyToken(token);
   if (!payload) {
     return { ok: false, status: 401, error: 'Invalid token' };
@@ -58,28 +87,44 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
     return { ok: false, status: 401, error: 'Unauthorized' };
   }
 
+  let tenantScope = null;
+  if (tenantCodeHint) {
+    tenantScope = await db.resolveTenantByCode(tenantCodeHint);
+  } else if (tenantIdHint) {
+    tenantScope = await db.resolveTenantById(tenantIdHint);
+  }
+
   if (sessionId) {
-    const sessionAlive = await touchUserSession({
-      queryable: db,
-      sessionId: String(sessionId),
-    });
+    const touchSession = async () =>
+      await touchUserSession({
+        queryable: db,
+        sessionId: String(sessionId),
+      });
+    const sessionAlive = tenantScope
+      ? await db.runWithTenantRow(tenantScope, touchSession)
+      : await db.runWithPlatform(touchSession);
     if (!sessionAlive) {
       return { ok: false, status: 401, error: 'Сессия истекла или отозвана' };
     }
   }
 
-  const userRes = await db.query(
-    `SELECT u.id, u.email, u.role, u.is_active, u.tenant_id,
-            t.code AS tenant_code,
-            t.name AS tenant_name,
-            t.status AS tenant_status,
-            t.subscription_expires_at
-     FROM users u
-     LEFT JOIN tenants t ON t.id = u.tenant_id
-     WHERE u.id = $1
-     LIMIT 1`,
-    [userId],
-  );
+  const lookupUser = async () =>
+    await db.query(
+      `SELECT u.id, u.email, u.role, u.is_active, u.tenant_id,
+              t.code AS tenant_code,
+              t.name AS tenant_name,
+              t.status AS tenant_status,
+              t.subscription_expires_at
+       FROM users u
+       LEFT JOIN tenants t ON t.id = u.tenant_id
+       WHERE u.id = $1
+       LIMIT 1`,
+      [userId],
+    );
+
+  const userRes = tenantScope
+    ? await db.runWithTenantRow(tenantScope, lookupUser)
+    : await db.runWithPlatform(lookupUser);
 
   if (userRes.rowCount === 0) {
     return { ok: false, status: 401, error: 'Unauthorized' };
@@ -93,17 +138,38 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
   const baseRole = (row.role || 'client').toString().toLowerCase().trim() || 'client';
   const isPlatformCreator = baseRole === 'creator' && isPlatformCreatorEmail(row.email);
 
+  let tenantRegistry = null;
   if (!isPlatformCreator) {
-    if (!row.tenant_id) {
+    const effectiveTenantCode = db.normalizeTenantCode(
+      tenantCodeHint || row.tenant_code || '',
+    );
+    if (!row.tenant_id || !effectiveTenantCode) {
       return {
         ok: false,
         status: 403,
         error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
       };
     }
+
+    const tenantRes = await db.platformQuery(
+      `SELECT id, code, name, status, subscription_expires_at, db_mode, db_url, db_name
+       FROM tenants
+       WHERE lower(code) = $1
+       LIMIT 1`,
+      [effectiveTenantCode],
+    );
+    if (tenantRes.rowCount === 0) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'Арендатор не найден. Обратитесь к владельцу приложения.',
+      };
+    }
+    tenantRegistry = tenantRes.rows[0];
+
     const tenantState = isTenantActive({
-      status: row.tenant_status,
-      subscription_expires_at: row.subscription_expires_at,
+      status: tenantRegistry.status,
+      subscription_expires_at: tenantRegistry.subscription_expires_at,
     });
     if (!tenantState.ok) {
       return {
@@ -130,15 +196,18 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
     effective_role: effectiveRole,
     view_role: effectiveRole !== baseRole ? effectiveRole : null,
     tenant_id: row.tenant_id || null,
-    tenant_code: row.tenant_code || null,
-    tenant_name: row.tenant_name || null,
-    tenant_status: row.tenant_status || null,
-    subscription_expires_at: row.subscription_expires_at || null,
+    tenant_code: tenantRegistry?.code || row.tenant_code || tenantCodeHint || null,
+    tenant_name: tenantRegistry?.name || row.tenant_name || null,
+    tenant_status: tenantRegistry?.status || row.tenant_status || null,
+    subscription_expires_at:
+      tenantRegistry?.subscription_expires_at ||
+      row.subscription_expires_at ||
+      null,
     is_platform_creator: isPlatformCreator,
     session_id: sessionId ? String(sessionId) : null,
   };
 
-  return { ok: true, user };
+  return { ok: true, user, tenantScope: tenantRegistry || tenantScope || null };
 }
 
 async function authMiddleware(req, res, next) {
@@ -163,7 +232,13 @@ async function authMiddleware(req, res, next) {
       return res.status(context.status || 401).json({ error: context.error || 'Unauthorized' });
     }
     req.user = context.user;
-    return next();
+    if (context.user?.is_platform_creator === true) {
+      return db.runWithPlatform(() => next());
+    }
+    if (context.tenantScope) {
+      return db.runWithTenantRow(context.tenantScope, () => next());
+    }
+    return db.runWithPlatform(() => next());
   } catch (err) {
     console.error('authMiddleware error:', err);
     return res.status(500).json({ error: 'Server error' });

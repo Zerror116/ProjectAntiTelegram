@@ -1510,6 +1510,18 @@ async function runDeliveryDialogCleanup(io = deliveryDialogCleanupIo) {
   try {
     await cleanupDuplicateDeliveryChats(db, io);
     await cleanupExpiredDeliveryChats(db, io);
+    const isolatedTenants = await db.platformQuery(
+      `SELECT id, code, db_mode, db_url, db_name, status, subscription_expires_at
+       FROM tenants
+       WHERE db_mode = 'isolated'
+         AND db_url IS NOT NULL`,
+    );
+    for (const tenant of isolatedTenants.rows) {
+      await db.runWithTenantRow(tenant, async () => {
+        await cleanupDuplicateDeliveryChats(db, io);
+        await cleanupExpiredDeliveryChats(db, io);
+      });
+    }
   } catch (error) {
     console.error("delivery dialog cleanup error", error);
   } finally {

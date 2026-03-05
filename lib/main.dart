@@ -331,6 +331,16 @@ void _attachAuthInterceptor() {
           } else {
             options.headers.remove('Authorization');
           }
+          final tenantCode = await authService.getTenantCode();
+          final currentRole =
+              authService.currentUser?.role.toLowerCase().trim() ?? '';
+          if (currentRole == 'creator') {
+            options.headers.remove('X-Tenant-Code');
+          } else if (tenantCode != null && tenantCode.trim().isNotEmpty) {
+            options.headers['X-Tenant-Code'] = tenantCode.trim().toLowerCase();
+          } else {
+            options.headers.remove('X-Tenant-Code');
+          }
           final viewRole = authService.viewRole?.trim();
           if ((authService.currentUser?.role.toLowerCase().trim() ?? '') ==
                   'creator' &&
