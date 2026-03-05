@@ -197,18 +197,17 @@ class _AuthScreenState extends State<AuthScreen> {
         );
         if (!mounted) return;
 
-        // Вариант B: сброс всего стека и переход на PhoneNameScreen
-        // Это удалит экран регистрации из стека, поэтому кнопки "назад" не будет.
+        // Переход к шагу имени/телефона без очистки стека:
+        // так у пользователя всегда есть рабочая кнопка "Назад".
         setState(() => _loading = false);
-        await Navigator.of(context).pushAndRemoveUntil(
+        await Navigator.of(context).push(
           MaterialPageRoute(
-            builder: (_) => const PhoneNameScreen(isRegisterFlow: true),
+            builder: (_) =>
+                PhoneNameScreen(isRegisterFlow: true, registrationEmail: email),
           ),
-          (Route<dynamic> route) => false,
         );
 
-        // После pushAndRemoveUntil управление обычно не вернётся сюда,
-        // но на всякий случай завершаем метод.
+        // После возврата остаемся на экране auth.
         return;
       } else {
         // Обычный логин

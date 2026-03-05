@@ -110,7 +110,9 @@ InputDecoration withInputLanguageBadge(
   InputDecoration decoration, {
   TextEditingController? controller,
 }) {
-  if (decoration.suffix != null && decoration.suffixText != null) {
+  if (decoration.suffix != null ||
+      decoration.suffixText != null ||
+      decoration.suffixIcon != null) {
     return decoration;
   }
   return decoration.copyWith(
