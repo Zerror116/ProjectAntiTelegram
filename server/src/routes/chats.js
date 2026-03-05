@@ -1175,6 +1175,70 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
   }
 });
 
+router.delete("/:chatId/messages", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const baseRole = String(req.user.base_role || role || "")
+      .toLowerCase()
+      .trim();
+    const { chatId } = req.params;
+
+    if (baseRole !== "creator") {
+      return res.status(403).json({
+        ok: false,
+        error: "Полная очистка чата доступна только создателю",
+      });
+    }
+
+    const context = await getChatAccessContext(chatId, userId);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const mediaQ = await db.query(
+      `SELECT meta
+       FROM messages
+       WHERE chat_id = $1`,
+      [chatId],
+    );
+
+    for (const row of mediaQ.rows) {
+      const meta = parseMeta(row.meta);
+      removeChatMediaByUrl(meta?.image_url);
+      removeChatMediaByUrl(meta?.voice_url);
+    }
+
+    await db.query("DELETE FROM message_reads WHERE chat_id = $1", [chatId]);
+    const deleted = await db.query(
+      `DELETE FROM messages
+       WHERE chat_id = $1`,
+      [chatId],
+    );
+    await db.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
+
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`chat:${chatId}`).emit("chat:cleared", { chatId });
+      io.emit("chat:updated", { chatId });
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        chat_id: chatId,
+        deleted_count: deleted.rowCount || 0,
+      },
+    });
+  } catch (err) {
+    console.error("chats.clearMessages error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 // Members management endpoints
 router.get("/:chatId/members", requireAuth, async (req, res) => {
   try {

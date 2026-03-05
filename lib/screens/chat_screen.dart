@@ -56,6 +56,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _incomingQueue = [];
+  final Set<String> _appearingMessageIds = {};
 
   bool _loading = true;
   bool _buyLoading = false;
@@ -147,6 +148,17 @@ class _ChatScreenState extends State<ChatScreen> {
         final messageId = data['messageId']?.toString() ?? '';
         if (messageId.isEmpty) return;
         _removeMessageLocally(messageId);
+        return;
+      }
+      if (type == 'chat:cleared' && data is Map) {
+        final chatId = data['chatId']?.toString() ?? '';
+        if (chatId != widget.chatId) return;
+        setState(() {
+          _messages = [];
+          _incomingQueue.clear();
+          _messageIds.clear();
+          _appearingMessageIds.clear();
+        });
         return;
       }
       if (type == 'chat:message:read' && data is Map) {
@@ -284,8 +296,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final clientMsgId = normalized['client_msg_id']?.toString() ?? '';
     final meta = _metaMapOf(normalized['meta']);
     final localOnly = meta['local_only'] == true;
+    var inserted = false;
     setState(() {
       if (msgId == null || msgId.isEmpty) {
+        inserted = true;
         _messages = [..._messages, normalized]..sort(_compareByCreatedAt);
       } else {
         var index = _messages.indexWhere((m) => m['id']?.toString() == msgId);
@@ -304,6 +318,7 @@ class _ChatScreenState extends State<ChatScreen> {
             _messageIds.remove(previousId);
           }
         } else {
+          inserted = true;
           _messages = [..._messages, normalized];
         }
         _messages.sort(_compareByCreatedAt);
@@ -312,6 +327,10 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
     });
+
+    if (inserted && msgId != null && msgId.isNotEmpty) {
+      _markMessageAppearing(msgId);
+    }
 
     if (autoScroll) {
       _scrollToBottom(animated: true);
@@ -361,6 +380,16 @@ class _ChatScreenState extends State<ChatScreen> {
           .toList();
       _incomingQueue.removeWhere((m) => m['id']?.toString() == messageId);
       _messageIds.remove(messageId);
+      _appearingMessageIds.remove(messageId);
+    });
+  }
+
+  void _markMessageAppearing(String messageId) {
+    if (messageId.isEmpty) return;
+    setState(() => _appearingMessageIds.add(messageId));
+    Future.delayed(const Duration(milliseconds: 420), () {
+      if (!mounted) return;
+      setState(() => _appearingMessageIds.remove(messageId));
     });
   }
 
@@ -533,6 +562,7 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _messages = messages;
           _incomingQueue.clear();
+          _appearingMessageIds.clear();
           _messageIds
             ..clear()
             ..addAll(
@@ -1747,6 +1777,55 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<void> _deleteAllMessagesInChat() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('УДАЛИТЬ ВСЁ!'),
+        content: Text(
+          'Будут удалены все сообщения в чате "${widget.chatTitle}". Это действие необратимо.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text(
+              'УДАЛИТЬ ВСЁ!',
+              style: TextStyle(color: Colors.red),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      await authService.dio.delete('/api/chats/${widget.chatId}/messages');
+      if (!mounted) return;
+      setState(() {
+        _messages = [];
+        _incomingQueue.clear();
+        _messageIds.clear();
+        _appearingMessageIds.clear();
+      });
+      showAppNotice(
+        context,
+        'Все сообщения удалены',
+        tone: AppNoticeTone.warning,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Ошибка очистки чата: ${_extractDioError(e)}'),
+        ),
+      );
+    }
+  }
+
   void _replyToMessage(String text) {
     final snippet = text.trim().replaceAll('\n', ' ');
     if (snippet.isEmpty) return;
@@ -1769,6 +1848,7 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool canEdit,
     required bool canDeleteForMe,
     required bool canDeleteForAll,
+    required bool canDeleteEntireChat,
     required bool canReply,
     required bool canCopy,
     required bool canCopyId,
@@ -1794,6 +1874,8 @@ class _ChatScreenState extends State<ChatScreen> {
         await _deleteMessage(message, forAll: false);
       } else if (action == 'delete_all') {
         await _deleteMessage(message, forAll: true);
+      } else if (action == 'delete_chat') {
+        await _deleteAllMessagesInChat();
       } else if (action == 'copy_id' && canCopyId) {
         final id = message['id']?.toString() ?? '';
         if (id.isNotEmpty) {
@@ -1832,6 +1914,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (canDeleteForAll) {
       options.add(
         const PopupMenuItem(value: 'delete_all', child: Text('Удалить у всех')),
+      );
+    }
+    if (canDeleteEntireChat) {
+      options.add(
+        const PopupMenuItem(
+          value: 'delete_chat',
+          child: Text(
+            'УДАЛИТЬ ВСЁ!',
+            style: TextStyle(color: Colors.red),
+          ),
+        ),
       );
     }
     if (options.isEmpty) return;
@@ -1903,6 +1996,18 @@ class _ChatScreenState extends State<ChatScreen> {
                   style: TextStyle(color: Colors.red),
                 ),
                 onTap: () => Navigator.of(ctx).pop('delete_all'),
+              ),
+            if (canDeleteEntireChat)
+              ListTile(
+                leading: const Icon(
+                  Icons.delete_forever_outlined,
+                  color: Colors.red,
+                ),
+                title: const Text(
+                  'УДАЛИТЬ ВСЁ!',
+                  style: TextStyle(color: Colors.red),
+                ),
+                onTap: () => Navigator.of(ctx).pop('delete_chat'),
               ),
           ],
         ),
@@ -2134,6 +2239,7 @@ class _ChatScreenState extends State<ChatScreen> {
             (!isDeleted &&
                 ((isPlainMessage && (fromMe || _isAdminOrCreator())) ||
                     ((hasBuy || isReservedOrder) && _isAdminOrCreator()))));
+    final canDeleteEntireChat = isCreator;
     final canReply =
         !isClient && isPlainMessage && text.trim().isNotEmpty && !isDeleted;
     final canCopy =
@@ -2184,6 +2290,7 @@ class _ChatScreenState extends State<ChatScreen> {
         canEdit: canEdit,
         canDeleteForMe: canDeleteForMe,
         canDeleteForAll: canDeleteForAll,
+        canDeleteEntireChat: canDeleteEntireChat,
         canReply: canReply,
         canCopy: canCopy,
         canCopyId: canCopyId,
@@ -2194,6 +2301,7 @@ class _ChatScreenState extends State<ChatScreen> {
         canEdit: canEdit,
         canDeleteForMe: canDeleteForMe,
         canDeleteForAll: canDeleteForAll,
+        canDeleteEntireChat: canDeleteEntireChat,
         canReply: canReply,
         canCopy: canCopy,
         canCopyId: canCopyId,
@@ -2501,38 +2609,54 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final showAvatar = !hasBuy && !isReservedOrder;
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-      child: Row(
-        mainAxisAlignment: fromMe
-            ? MainAxisAlignment.end
-            : MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          if (!fromMe && showAvatar) ...[
-            AppAvatar(
-              title: senderName,
-              imageUrl: senderAvatarUrl,
-              focusX: senderAvatarFocusX,
-              focusY: senderAvatarFocusY,
-              zoom: senderAvatarZoom,
-              radius: 18,
-            ),
-            const SizedBox(width: 10),
+    final isAppearing =
+        messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
+      duration: const Duration(milliseconds: 380),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        final dx = fromMe ? 18 * (1 - value) : -28 * (1 - value);
+        final dy = 10 * (1 - value);
+        return Opacity(
+          opacity: value.clamp(0, 1),
+          child: Transform.translate(offset: Offset(dx, dy), child: child),
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        child: Row(
+          mainAxisAlignment: fromMe
+              ? MainAxisAlignment.end
+              : MainAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            if (!fromMe && showAvatar) ...[
+              AppAvatar(
+                title: senderName,
+                imageUrl: senderAvatarUrl,
+                focusX: senderAvatarFocusX,
+                focusY: senderAvatarFocusY,
+                zoom: senderAvatarZoom,
+                radius: 18,
+              ),
+              const SizedBox(width: 10),
+            ],
+            Flexible(child: bubble),
+            if (fromMe && showAvatar) ...[
+              const SizedBox(width: 10),
+              AppAvatar(
+                title: senderName,
+                imageUrl: senderAvatarUrl,
+                focusX: senderAvatarFocusX,
+                focusY: senderAvatarFocusY,
+                zoom: senderAvatarZoom,
+                radius: 18,
+              ),
+            ],
           ],
-          Flexible(child: bubble),
-          if (fromMe && showAvatar) ...[
-            const SizedBox(width: 10),
-            AppAvatar(
-              title: senderName,
-              imageUrl: senderAvatarUrl,
-              focusX: senderAvatarFocusX,
-              focusY: senderAvatarFocusY,
-              zoom: senderAvatarZoom,
-              radius: 18,
-            ),
-          ],
-        ],
+        ),
       ),
     );
   }

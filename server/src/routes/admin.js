@@ -310,6 +310,124 @@ function buildDemoProduct(index, imageUrl) {
   };
 }
 
+function publishDemoPostsSequentially({
+  io,
+  count,
+  channelId,
+  channelTitle,
+  createdBy,
+  imageUrl,
+}) {
+  for (let index = 0; index < count; index += 1) {
+    setTimeout(async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const code = await allocateProductCode(client);
+        const demo = buildDemoProduct(index, imageUrl);
+        const productId = uuidv4();
+        await client.query(
+          `INSERT INTO products (
+             id, product_code, title, description, price, quantity,
+             image_url, created_by, status, created_at, updated_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5, $6,
+             $7, $8, 'published', now(), now()
+           )`,
+          [
+            productId,
+            code,
+            demo.title,
+            demo.description,
+            demo.price,
+            demo.quantity,
+            demo.image_url,
+            createdBy,
+          ],
+        );
+
+        const payload = {
+          title: demo.title,
+          description: demo.description,
+          price: demo.price,
+          quantity: demo.quantity,
+          image_url: demo.image_url,
+        };
+        const messageMeta = {
+          kind: "catalog_product",
+          product_id: productId,
+          product_code: code,
+          price: demo.price,
+          quantity: demo.quantity,
+          image_url: demo.image_url,
+        };
+        const messageInsert = await client.query(
+          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [
+            uuidv4(),
+            channelId,
+            productMessageText({
+              title: demo.title,
+              description: demo.description,
+              price: demo.price,
+              quantity: demo.quantity,
+            }),
+            JSON.stringify(messageMeta),
+          ],
+        );
+
+        await client.query(
+          `INSERT INTO product_publication_queue (
+             id, product_id, channel_id, queued_by,
+             status, is_sent, payload, approved_by, approved_at, published_message_id, created_at
+           )
+           VALUES (
+             $1, $2, $3, $4,
+             'published', true, $5::jsonb, $6, now(), $7, now()
+           )`,
+          [
+            uuidv4(),
+            productId,
+            channelId,
+            createdBy,
+            JSON.stringify(payload),
+            createdBy,
+            messageInsert.rows[0].id,
+          ],
+        );
+
+        await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+          channelId,
+        ]);
+        await client.query("COMMIT");
+
+        if (io) {
+          io.to(`chat:${channelId}`).emit("chat:message", {
+            chatId: channelId,
+            message: messageInsert.rows[0],
+          });
+          io.emit("chat:updated", {
+            chatId: channelId,
+            chat: {
+              id: channelId,
+              title: channelTitle,
+              updated_at: new Date().toISOString(),
+            },
+          });
+        }
+      } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("admin.test.publishDemoPostsSequentially error", err);
+      } finally {
+        client.release();
+      }
+    }, index * 1000);
+  }
+}
+
 async function allocateProductCode(client) {
   await client.query("LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE");
 
@@ -1937,110 +2055,25 @@ router.post(
       await client.query("BEGIN");
       const { mainChannel } = await ensureSystemChannels(client, req.user.id);
       const imageUrl = ensureDemoProductImage(req);
-      const published = [];
-
-      for (let index = 0; index < count; index += 1) {
-        const code = await allocateProductCode(client);
-        const demo = buildDemoProduct(index, imageUrl);
-        const productId = uuidv4();
-        await client.query(
-          `INSERT INTO products (
-             id, product_code, title, description, price, quantity,
-             image_url, created_by, status, created_at, updated_at
-           )
-           VALUES (
-             $1, $2, $3, $4, $5, $6,
-             $7, $8, 'published', now(), now()
-           )`,
-          [
-            productId,
-            code,
-            demo.title,
-            demo.description,
-            demo.price,
-            demo.quantity,
-            demo.image_url,
-            req.user.id,
-          ],
-        );
-
-        const queueId = uuidv4();
-        const payload = {
-          title: demo.title,
-          description: demo.description,
-          price: demo.price,
-          quantity: demo.quantity,
-          image_url: demo.image_url,
-        };
-        const messageMeta = {
-          kind: "catalog_product",
-          product_id: productId,
-          product_code: code,
-          price: demo.price,
-          quantity: demo.quantity,
-          image_url: demo.image_url,
-        };
-        const messageInsert = await client.query(
-          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
-           RETURNING id`,
-          [
-            uuidv4(),
-            mainChannel.id,
-            productMessageText({
-              title: demo.title,
-              description: demo.description,
-              price: demo.price,
-              quantity: demo.quantity,
-            }),
-            JSON.stringify(messageMeta),
-          ],
-        );
-
-        await client.query(
-          `INSERT INTO product_publication_queue (
-             id, product_id, channel_id, queued_by,
-             status, is_sent, payload, approved_by, approved_at, published_message_id, created_at
-           )
-           VALUES (
-             $1, $2, $3, $4,
-             'published', true, $5::jsonb, $6, now(), $7, now()
-           )`,
-          [
-            queueId,
-            productId,
-            mainChannel.id,
-            req.user.id,
-            JSON.stringify(payload),
-            req.user.id,
-            messageInsert.rows[0].id,
-          ],
-        );
-
-        published.push({
-          queue_id: queueId,
-          channel_id: mainChannel.id,
-          channel_title: mainChannel.title,
-          product_id: productId,
-          product_code: code,
-          message_id: messageInsert.rows[0].id,
-        });
-      }
-
-      await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
-        mainChannel.id,
-      ]);
       await client.query("COMMIT");
 
-      schedulePublishedMessages(req.app.get("io"), published);
+      publishDemoPostsSequentially({
+        io: req.app.get("io"),
+        count,
+        channelId: mainChannel.id,
+        channelTitle: mainChannel.title,
+        createdBy: req.user.id,
+        imageUrl,
+      });
 
       return res.json({
         ok: true,
         data: {
           count,
+          scheduled: true,
+          interval_ms: 1000,
           channel_id: mainChannel.id,
           channel_title: mainChannel.title,
-          posts: published,
         },
       });
     } catch (err) {
