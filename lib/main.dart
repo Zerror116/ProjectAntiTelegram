@@ -18,7 +18,11 @@ import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
-final Dio dio = Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3000'));
+const String _defaultApiBaseUrl = String.fromEnvironment(
+  'FENIX_API_BASE_URL',
+  defaultValue: 'http://127.0.0.1:3000',
+);
+final Dio dio = Dio(BaseOptions(baseUrl: _defaultApiBaseUrl));
 late final AuthService authService;
 
 // Socket and event bus for chat events
@@ -393,7 +397,7 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
     _incomingMessagePreview(message),
     title: sender,
     tone: AppNoticeTone.info,
-    duration: const Duration(seconds: 2),
+    duration: const Duration(seconds: 5),
   );
 }
 
@@ -418,20 +422,33 @@ Future<void> disconnectSocket() async {
 
 Future<bool> ensureDatabaseExists() async {
   try {
-    debugPrint('ensureDatabaseExists: calling /api/setup');
+    debugPrint('ensureDatabaseExists: checking /health');
+    final health = await dio.get('/health');
+    debugPrint(
+      'ensureDatabaseExists: /health status=${health.statusCode}, data=${health.data}',
+    );
+    if (health.statusCode == 200) {
+      final data = health.data;
+      if (data is Map && data['ok'] == true) return true;
+      return true;
+    }
+  } catch (e) {
+    debugPrint('ensureDatabaseExists: /health failed: $e');
+  }
+
+  try {
+    debugPrint('ensureDatabaseExists: fallback /api/setup');
     final resp = await dio.post('/api/setup');
     debugPrint(
-      'ensureDatabaseExists: status=${resp.statusCode}, data=${resp.data}',
+      'ensureDatabaseExists: /api/setup status=${resp.statusCode}, data=${resp.data}',
     );
     if (resp.statusCode == 200) {
       final data = resp.data;
-      if (data is Map && data['ok'] == true) {
-        return true;
-      }
+      if (data is Map && data['ok'] == true) return true;
     }
     return false;
   } catch (e) {
-    debugPrint('ensureDatabaseExists error: $e');
+    debugPrint('ensureDatabaseExists fallback error: $e');
     return false;
   }
 }
@@ -546,9 +563,17 @@ Future<void> _initSocket() async {
   final sameBinding =
       _socketBoundUserId == userId &&
       (_socketBoundViewRole ?? '') == (viewRole ?? '');
-  if (socket != null && socket!.connected && sameBinding) {
-    debugPrint('✅ _initSocket skipped: socket already connected');
-    return;
+  if (socket != null && sameBinding) {
+    final alreadyActive = socket!.connected || socket!.active;
+    if (alreadyActive) {
+      debugPrint('✅ _initSocket skipped: socket already active/connecting');
+      if (!socket!.connected) {
+        try {
+          socket!.connect();
+        } catch (_) {}
+      }
+      return;
+    }
   }
 
   _socketInitInProgress = true;
@@ -570,7 +595,7 @@ Future<void> _initSocket() async {
 
     // Build options
     socket = io.io(
-      'http://127.0.0.1:3000',
+      _defaultApiBaseUrl,
       io.OptionBuilder()
           .setTransports(['websocket'])
           .disableAutoConnect()
@@ -706,7 +731,6 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await inputLanguageService.initialize();
   if (kIsWeb) {
     try {
       await BrowserContextMenu.disableContextMenu();
@@ -820,6 +844,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     try {
       authService = AuthService(dio: dio);
       _attachAuthInterceptor();
+      unawaited(inputLanguageService.initialize());
 
       // ✅ ИСПРАВЛЕНИЕ: Подписка на изменения аутентификации
       // При logout (user == null) отключаем socket

@@ -110,12 +110,16 @@ InputDecoration withInputLanguageBadge(
   InputDecoration decoration, {
   TextEditingController? controller,
 }) {
-  if (decoration.suffix != null ||
-      decoration.suffixText != null ||
-      decoration.suffixIcon != null) {
-    return decoration;
+  var normalized = decoration;
+  if (normalized.suffix != null && normalized.suffixText != null) {
+    normalized = normalized.copyWith(suffix: null);
   }
-  return decoration.copyWith(
+  if (normalized.suffix != null ||
+      normalized.suffixText != null ||
+      normalized.suffixIcon != null) {
+    return normalized;
+  }
+  return normalized.copyWith(
     suffixIcon: Padding(
       padding: const EdgeInsetsDirectional.only(end: 8),
       child: Align(

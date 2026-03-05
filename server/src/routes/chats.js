@@ -11,6 +11,7 @@ const { authMiddleware: requireAuth } = require("../utils/auth");
 const { requireRole } = require("../utils/roles");
 const { requireChatPermission } = require("../utils/permissions");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
+const { emitToTenant } = require("../utils/socket");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -404,10 +405,78 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
       chatId,
       message: broadcastMessage,
     });
-    io.emit("chat:updated", { chatId });
+    emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
   }
 
   return responseMessage;
+}
+
+async function insertMessageWithDedup({
+  clientMsgId,
+  chatId,
+  senderId,
+  text,
+  metaJson = null,
+}) {
+  const hasMeta = metaJson != null;
+  const insertWithConflictSql = hasMeta
+    ? `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, meta, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())
+       ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
+       RETURNING id`
+    : `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, created_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
+       RETURNING id`;
+  const insertWithConflictParams = hasMeta
+    ? [uuidv4(), clientMsgId, chatId, senderId, text, metaJson]
+    : [uuidv4(), clientMsgId, chatId, senderId, text];
+
+  const insertDirectSql = hasMeta
+    ? `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, meta, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())
+       RETURNING id`
+    : `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, created_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       RETURNING id`;
+  const insertDirectParams = hasMeta
+    ? [uuidv4(), clientMsgId, chatId, senderId, text, metaJson]
+    : [uuidv4(), clientMsgId, chatId, senderId, text];
+
+  if (!clientMsgId) {
+    if (hasMeta) {
+      return db.query(
+        `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, now())
+         RETURNING id`,
+        [uuidv4(), chatId, senderId, text, metaJson],
+      );
+    }
+    return db.query(
+      `INSERT INTO messages (id, chat_id, sender_id, text, created_at)
+       VALUES ($1, $2, $3, $4, now())
+       RETURNING id`,
+      [uuidv4(), chatId, senderId, text],
+    );
+  }
+
+  try {
+    const inserted = await db.query(insertWithConflictSql, insertWithConflictParams);
+    if (inserted.rowCount > 0) return inserted;
+  } catch (err) {
+    if (String(err?.code || "") !== "42P10") throw err;
+  }
+
+  const existing = await db.query(
+    `SELECT id
+     FROM messages
+     WHERE client_msg_id = $1
+     LIMIT 1`,
+    [clientMsgId],
+  );
+  if (existing.rowCount > 0) return existing;
+
+  return db.query(insertDirectSql, insertDirectParams);
 }
 
 async function markChatMessagesRead(chatId, userId) {
@@ -721,7 +790,7 @@ router.post(
 
       const io = req.app.get("io");
       if (safeType === "public" && io) {
-        io.emit("chat:created", { chat });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:created", { chat });
       }
 
       return res.status(201).json({ ok: true, data: chat });
@@ -893,7 +962,7 @@ router.post("/:chatId/pin/:messageId", requireAuth, async (req, res) => {
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:pinned", { chatId, pin });
-      io.emit("chat:updated", { chatId });
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
     }
 
     return res.json({ ok: true, data: pin });
@@ -935,7 +1004,7 @@ router.delete("/:chatId/pin", requireAuth, async (req, res) => {
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:pinned", { chatId, pin: null });
-      io.emit("chat:updated", { chatId });
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
     }
 
     return res.json({ ok: true, data: null });
@@ -1023,31 +1092,12 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
         });
     }
 
-    let insert;
-    if (client_msg_id) {
-      insert = await db.query(
-        `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, created_at)
-         VALUES ($1, $2, $3, $4, $5, now())
-         ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
-         RETURNING id`,
-        [uuidv4(), client_msg_id, chatId, userId, text],
-      );
-      if (insert.rowCount === 0) {
-        insert = await db.query(
-          `SELECT id
-           FROM messages
-           WHERE client_msg_id = $1`,
-          [client_msg_id],
-        );
-      }
-    } else {
-      insert = await db.query(
-        `INSERT INTO messages (id, chat_id, sender_id, text, created_at)
-         VALUES ($1, $2, $3, $4, now())
-         RETURNING id`,
-        [uuidv4(), chatId, userId, text],
-      );
-    }
+    const insert = await insertMessageWithDedup({
+      clientMsgId: String(client_msg_id || "").trim() || null,
+      chatId,
+      senderId: userId,
+      text: String(text),
+    });
 
     const messageId = insert.rows[0]?.id;
     if (!messageId) {
@@ -1120,12 +1170,13 @@ router.post(
       const durationMs = Number.isFinite(durationMsRaw) && durationMsRaw > 0
         ? durationMsRaw
         : 0;
+      const hasCaption = caption.length > 0;
       const text = attachmentType === "image"
-        ? (caption.isNotEmpty ? caption : "Фото")
+        ? (hasCaption ? caption : "Фото")
         : "Голосовое сообщение";
       const meta = {
         attachment_type: attachmentType,
-        ...(caption.isNotEmpty ? { caption } : {}),
+        ...(hasCaption ? { caption } : {}),
         ...(attachmentType === "image"
           ? {
               image_url: mediaUrl,
@@ -1140,32 +1191,33 @@ router.post(
             }),
       };
 
-      let insert;
       if (clientMsgId) {
-        insert = await db.query(
-          `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, meta, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())
-           ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
-           RETURNING id`,
-          [uuidv4(), clientMsgId, chatId, userId, text, JSON.stringify(meta)],
+        const existing = await db.query(
+          `SELECT id
+           FROM messages
+           WHERE client_msg_id = $1
+           LIMIT 1`,
+          [clientMsgId],
         );
-        if (insert.rowCount === 0) {
+        if (existing.rowCount > 0) {
           removeUploadedFiles(uploadedFiles);
-          insert = await db.query(
-            `SELECT id
-             FROM messages
-             WHERE client_msg_id = $1`,
-            [clientMsgId],
+          const responseMessage = await finalizeCreatedMessage(
+            req,
+            chatId,
+            existing.rows[0].id,
+            userId,
           );
+          return res.status(201).json({ ok: true, data: responseMessage });
         }
-      } else {
-        insert = await db.query(
-          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-           VALUES ($1, $2, $3, $4, $5::jsonb, now())
-           RETURNING id`,
-          [uuidv4(), chatId, userId, text, JSON.stringify(meta)],
-        );
       }
+
+      const insert = await insertMessageWithDedup({
+        clientMsgId: clientMsgId || null,
+        chatId,
+        senderId: userId,
+        text,
+        metaJson: JSON.stringify(meta),
+      });
 
       const messageId = insert.rows[0]?.id;
       if (!messageId) {
@@ -1260,7 +1312,7 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:message", { chatId, message: updated });
-      io.emit("chat:updated", { chatId });
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
     }
 
     return res.json({ ok: true, data: updated });
@@ -1388,7 +1440,7 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
         chatId,
         messageId,
       });
-      io.emit("chat:updated", { chatId });
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
     }
 
     return res.json({
@@ -1452,7 +1504,7 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:cleared", { chatId });
-      io.emit("chat:updated", { chatId });
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
     }
 
     return res.json({

@@ -16,6 +16,7 @@ class InputLanguageService {
   final ValueNotifier<String> currentCode = ValueNotifier('EN');
 
   Timer? _pollTimer;
+  Timer? _retryTimer;
   bool _initialized = false;
   bool _nativeLookupAvailable = false;
 
@@ -30,24 +31,48 @@ class InputLanguageService {
       return;
     }
 
-    final initial = await _queryFromPlatform();
-    if (initial == null) {
-      // Плагин может отсутствовать на desktop/web debug сборках.
-      return;
+    await _bootstrapNativeLookup();
+  }
+
+  void dispose() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _initialized = false;
+    _nativeLookupAvailable = false;
+  }
+
+  Future<void> _bootstrapNativeLookup() async {
+    for (var attempt = 0; attempt < 6; attempt += 1) {
+      final initial = await _queryFromPlatform();
+      if (initial != null) {
+        _nativeLookupAvailable = true;
+        _updateCode(initial);
+        _ensurePolling();
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
     }
-    _nativeLookupAvailable = true;
-    _updateCode(initial);
+    _nativeLookupAvailable = false;
+    _scheduleRetry();
+  }
+
+  void _ensurePolling() {
+    if (_pollTimer != null) return;
     _pollTimer = Timer.periodic(
       const Duration(milliseconds: 300),
       (_) => _refreshFromPlatform(),
     );
   }
 
-  void dispose() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
-    _initialized = false;
-    _nativeLookupAvailable = false;
+  void _scheduleRetry() {
+    if (!_initialized || _retryTimer != null) return;
+    _retryTimer = Timer(const Duration(seconds: 1), () async {
+      _retryTimer = null;
+      if (!_initialized) return;
+      await _bootstrapNativeLookup();
+    });
   }
 
   Future<void> _refreshFromPlatform() async {
@@ -55,6 +80,7 @@ class InputLanguageService {
     final value = await _queryFromPlatform();
     if (value == null) {
       _nativeLookupAvailable = false;
+      _scheduleRetry();
       return;
     }
     _updateCode(value);

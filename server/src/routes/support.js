@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require("uuid");
 const router = express.Router();
 const db = require("../db");
 const { authMiddleware } = require("../utils/auth");
+const { emitToTenant } = require("../utils/socket");
 
 function buildCartSummaryReply(total, processed) {
   return `Общая сумма вашей корзины: ${total} RUB. Обработано на сумму: ${processed} RUB.`;
@@ -14,11 +15,12 @@ function normalizeSettings(raw) {
   return raw;
 }
 
-async function ensureBugReportsChannel(client, createdBy) {
+async function ensureBugReportsChannel(client, createdBy, tenantId = null) {
   const existing = await client.query(
     `SELECT id, title, type, settings, created_at, updated_at
      FROM chats
      WHERE type = 'channel'
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
        AND (
          COALESCE(settings->>'kind', '') = 'bug_reports'
          OR LOWER(TRIM(title)) = LOWER(TRIM($1))
@@ -28,7 +30,7 @@ async function ensureBugReportsChannel(client, createdBy) {
        updated_at DESC NULLS LAST,
        created_at DESC
      LIMIT 1`,
-    ["Баг-репорты"],
+    ["Баг-репорты", tenantId || null],
   );
 
   if (existing.rowCount > 0) {
@@ -67,29 +69,38 @@ async function ensureBugReportsChannel(client, createdBy) {
   };
 
   const inserted = await client.query(
-    `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
-     VALUES ($1, $2, 'channel', $3, $4::jsonb, now(), now())
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, $2, 'channel', $3, $4, $5::jsonb, now(), now())
      RETURNING id, title, type, settings, created_at, updated_at`,
-    [uuidv4(), "Баг-репорты", createdBy || null, JSON.stringify(settings)],
+    [
+      uuidv4(),
+      "Баг-репорты",
+      createdBy || null,
+      tenantId || null,
+      JSON.stringify(settings),
+    ],
   );
 
   return { channel: inserted.rows[0], created: true };
 }
 
-async function ensureAdminCreatorMembers(client, chatId) {
+async function ensureAdminCreatorMembers(client, chatId, tenantId = null) {
   await client.query(
     `DELETE FROM chat_members cm
      USING users u
      WHERE cm.chat_id = $1
        AND cm.user_id = u.id
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
        AND u.role NOT IN ('admin', 'creator')`,
-    [chatId],
+    [chatId, tenantId || null],
   );
 
   const staff = await client.query(
     `SELECT id, role
      FROM users
-     WHERE role IN ('admin', 'creator')`,
+     WHERE role IN ('admin', 'creator')
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
+    [tenantId || null],
   );
 
   for (const user of staff.rows) {
@@ -179,7 +190,7 @@ router.post("/bug-report", authMiddleware, async (req, res) => {
     await client.query("BEGIN");
 
     const profileQ = await client.query(
-      `SELECT id, email, role, name
+      `SELECT id, email, role, name, tenant_id
        FROM users
        WHERE id = $1
        LIMIT 1`,
@@ -196,8 +207,9 @@ router.post("/bug-report", authMiddleware, async (req, res) => {
     const { channel, created } = await ensureBugReportsChannel(
       client,
       req.user.id,
+      reporter.tenant_id || null,
     );
-    await ensureAdminCreatorMembers(client, channel.id);
+    await ensureAdminCreatorMembers(client, channel.id, reporter.tenant_id || null);
 
     const title = reporter.name || reporter.email || reporter.id;
     const text = [
@@ -234,9 +246,13 @@ router.post("/bug-report", authMiddleware, async (req, res) => {
     const io = req.app.get("io");
     if (io) {
       if (created) {
-        io.emit("chat:created", { chatId: channel.id });
+        emitToTenant(io, reporter.tenant_id || null, "chat:created", {
+          chatId: channel.id,
+        });
       }
-      io.emit("chat:updated", { chatId: channel.id });
+      emitToTenant(io, reporter.tenant_id || null, "chat:updated", {
+        chatId: channel.id,
+      });
       io.to(`chat:${channel.id}`).emit("chat:message", {
         chatId: channel.id,
         message: messageInsert.rows[0],
