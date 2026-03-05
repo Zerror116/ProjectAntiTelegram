@@ -73,7 +73,7 @@ INSERT INTO tenants (
 VALUES (
   'default',
   'Default Tenant',
-  encode(digest('PHOENIX-DEFAULT-KEY', 'sha256'), 'hex'),
+  encode(digest('PHOENIX-ZERROR-KEY', 'sha256'), 'hex'),
   'PHOENIX-****-****-KEY',
   'active',
   now() + interval '120 months',

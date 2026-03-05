@@ -7,7 +7,12 @@ import '../widgets/input_language_badge.dart';
 
 class PhoneNameScreen extends StatefulWidget {
   final bool isRegisterFlow;
-  const PhoneNameScreen({super.key, this.isRegisterFlow = false});
+  final String? registrationEmail;
+  const PhoneNameScreen({
+    super.key,
+    this.isRegisterFlow = false,
+    this.registrationEmail,
+  });
 
   @override
   State<PhoneNameScreen> createState() => _PhoneNameScreenState();
@@ -28,8 +33,10 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   static const String _creatorEmail = 'zerotwo02166@gmail.com';
 
   bool get _isCreatorPending {
-    final pending = authService.pendingEmail;
-    return pending != null && pending.toLowerCase() == _creatorEmail.toLowerCase();
+    final pending = (widget.registrationEmail ?? authService.pendingEmail)
+        ?.trim();
+    return pending != null &&
+        pending.toLowerCase() == _creatorEmail.toLowerCase();
   }
 
   bool get _isCreatorCurrentUser {
@@ -37,7 +44,23 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
     return email != null && email.toLowerCase() == _creatorEmail.toLowerCase();
   }
 
-  bool get _shouldShowSecretField => widget.isRegisterFlow ? _isCreatorPending : _isCreatorCurrentUser;
+  bool get _shouldShowSecretField =>
+      widget.isRegisterFlow ? _isCreatorPending : _isCreatorCurrentUser;
+
+  Future<void> _handleBack() async {
+    if (_loading) return;
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+      return;
+    }
+    if (widget.isRegisterFlow) {
+      authService.pendingEmail = null;
+      authService.pendingPassword = null;
+      authService.pendingAccessKey = null;
+      if (!mounted) return;
+      Navigator.of(context).pushNamedAndRemoveUntil('/auth', (route) => false);
+    }
+  }
 
   @override
   void initState() {
@@ -59,9 +82,15 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
   @override
   void dispose() {
-    try { _nameCtrl.removeListener(_nameListener); } catch (_) {}
-    try { _phoneCtrl.removeListener(_phoneListener); } catch (_) {}
-    try { _secretCtrl.removeListener(_secretListener); } catch (_) {}
+    try {
+      _nameCtrl.removeListener(_nameListener);
+    } catch (_) {}
+    try {
+      _phoneCtrl.removeListener(_phoneListener);
+    } catch (_) {}
+    try {
+      _secretCtrl.removeListener(_secretListener);
+    } catch (_) {}
 
     _nameCtrl.dispose();
     _phoneCtrl.dispose();
@@ -94,7 +123,10 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
     }
 
     if (!PhoneUtils.validatePhone(phoneRaw)) {
-      setState(() => _message = 'Неверный формат номера. Примеры: 89991234567, +7 (999) 123-45-67');
+      setState(
+        () => _message =
+            'Неверный формат номера. Примеры: 89991234567, +7 (999) 123-45-67',
+      );
       return;
     }
 
@@ -116,14 +148,23 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
     try {
       if (widget.isRegisterFlow) {
-        if (authService.pendingEmail == null || authService.pendingPassword == null) {
-          setState(() => _message = 'Нет сохранённых данных регистрации. Повторите шаг регистрации.');
+        final pendingEmail =
+            (authService.pendingEmail ?? widget.registrationEmail)?.trim();
+        final pendingPassword = authService.pendingPassword;
+        if (pendingEmail == null ||
+            pendingEmail.isEmpty ||
+            pendingPassword == null ||
+            pendingPassword.isEmpty) {
+          setState(
+            () => _message =
+                'Нет сохранённых данных регистрации. Повторите шаг регистрации.',
+          );
           return;
         }
 
         final data = {
-          'email': authService.pendingEmail,
-          'password': authService.pendingPassword,
+          'email': pendingEmail,
+          'password': pendingPassword,
           'name': name,
           'phone': apiPhone,
           if ((authService.pendingAccessKey ?? '').trim().isNotEmpty)
@@ -131,18 +172,28 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         };
         if (_isCreatorPending) data['secret'] = secret;
 
-        final resp = await authService.dio.post('/api/auth/register', data: data);
+        final resp = await authService.dio.post(
+          '/api/auth/register',
+          data: data,
+        );
 
         // ✅ ИСПРАВЛЕНИЕ: Cast правильно
-        final respData = (resp.data as Map<dynamic, dynamic>).cast<String, dynamic>();
+        final respData = (resp.data as Map<dynamic, dynamic>)
+            .cast<String, dynamic>();
         final token = respData['token'] ?? respData['access'];
         if (token == null) {
-          setState(() => _message = 'Регистрация прошла, но токен не получен от сервера.');
+          setState(
+            () => _message =
+                'Регистрация прошла, но токен не получен от сервера.',
+          );
           return;
         }
 
         // Сохраняем токен гибко (поддержка разных authService)
-        await authService.applyLoginResponse(token as String, respData['user'] as Map<String, dynamic>?);
+        await authService.applyLoginResponse(
+          token as String,
+          respData['user'] as Map<String, dynamic>?,
+        );
 
         // Очистим pending
         try {
@@ -158,13 +209,24 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         final profileData = {'name': name};
         if (_isCreatorCurrentUser) profileData['secret'] = secret;
 
-        final p1 = authService.dio.post('/api/profile/update', data: profileData);
-        final p2 = authService.dio.post('/api/phones/request', data: {'phone': apiPhone});
+        final p1 = authService.dio.post(
+          '/api/profile/update',
+          data: profileData,
+        );
+        final p2 = authService.dio.post(
+          '/api/phones/request',
+          data: {'phone': apiPhone},
+        );
         final results = await Future.wait([p1, p2]);
 
-        final ok1 = (results[0].statusCode == 200) ||
-            (results[0].data is Map && (results[0].data['ok'] == true || results[0].data['user'] != null));
-        final ok2 = (results[1].statusCode == 200) || (results[1].data is Map && results[1].data['ok'] == true);
+        final ok1 =
+            (results[0].statusCode == 200) ||
+            (results[0].data is Map &&
+                (results[0].data['ok'] == true ||
+                    results[0].data['user'] != null));
+        final ok2 =
+            (results[1].statusCode == 200) ||
+            (results[1].data is Map && results[1].data['ok'] == true);
 
         if (ok1 && ok2) {
           try {
@@ -193,15 +255,13 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Введите имя и номер'),
-        leading: widget.isRegisterFlow
-            ? null
-            : IconButton(
-                icon: const Icon(Icons.arrow_back),
-                onPressed: () => Navigator.of(context).pop(),
-              ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: _handleBack,
+        ),
       ),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
           child: Column(
             children: [
@@ -241,11 +301,20 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
               ElevatedButton(
                 onPressed: _loading ? null : _submit,
                 child: _loading
-                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                    : Text(widget.isRegisterFlow ? 'Завершить регистрацию' : 'Сохранить'),
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(
+                        widget.isRegisterFlow
+                            ? 'Завершить регистрацию'
+                            : 'Сохранить',
+                      ),
               ),
               const SizedBox(height: 12),
-              if (_message.isNotEmpty) Text(_message, style: const TextStyle(color: Colors.red)),
+              if (_message.isNotEmpty)
+                Text(_message, style: const TextStyle(color: Colors.red)),
             ],
           ),
         ),
