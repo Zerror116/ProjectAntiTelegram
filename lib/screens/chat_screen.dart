@@ -65,6 +65,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _searchMode = false;
   bool _voiceRecording = false;
   bool _voiceSending = false;
+  bool _pinLoading = false;
 
   String _searchQuery = '';
   int _recordingSeconds = 0;
@@ -84,12 +85,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final Set<String> _messageIds = {};
   final Set<String> _placedCartItemIds = {};
+  Map<String, dynamic>? _activePin;
 
   @override
   void initState() {
     super.initState();
     activeChatIdNotifier.value = widget.chatId;
     _loadMessages();
+    _loadPinnedMessage();
     _joinRoom();
 
     _searchController.addListener(() {
@@ -177,6 +180,17 @@ class _ChatScreenState extends State<ChatScreen> {
           readByMe: readerId == authService.currentUser?.id,
           readByOthers: readerId != authService.currentUser?.id,
         );
+        return;
+      }
+      if (type == 'chat:pinned' && data is Map) {
+        final chatId = data['chatId']?.toString() ?? '';
+        if (chatId != widget.chatId) return;
+        final pinRaw = data['pin'];
+        if (pinRaw is Map) {
+          setState(() => _activePin = Map<String, dynamic>.from(pinRaw));
+        } else {
+          setState(() => _activePin = null);
+        }
       }
     });
   }
@@ -458,6 +472,97 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  bool _canPinMessages() {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return role == 'admin' || role == 'creator';
+  }
+
+  Future<void> _loadPinnedMessage() async {
+    if (_pinLoading) return;
+    _pinLoading = true;
+    try {
+      final resp = await authService.dio.get('/api/chats/${widget.chatId}/pin');
+      final data = resp.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true) {
+        final raw = data['data'];
+        setState(() {
+          _activePin = raw is Map ? Map<String, dynamic>.from(raw) : null;
+        });
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _activePin = null);
+    } finally {
+      _pinLoading = false;
+    }
+  }
+
+  Future<void> _pinMessage(String messageId) async {
+    if (!_canPinMessages() || messageId.trim().isEmpty) return;
+    try {
+      final resp = await authService.dio.post(
+        '/api/chats/${widget.chatId}/pin/$messageId',
+      );
+      final data = resp.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true) {
+        final raw = data['data'];
+        setState(() {
+          _activePin = raw is Map ? Map<String, dynamic>.from(raw) : null;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка закрепления: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  Future<void> _unpinMessage() async {
+    if (!_canPinMessages()) return;
+    try {
+      await authService.dio.delete('/api/chats/${widget.chatId}/pin');
+      if (!mounted) return;
+      setState(() => _activePin = null);
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка открепления: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  String _pinPreviewText() {
+    final pin = _activePin;
+    if (pin == null) return '';
+    final messageRaw = pin['message'];
+    if (messageRaw is Map) {
+      final message = Map<String, dynamic>.from(messageRaw);
+      final text = (message['text'] ?? '').toString().trim();
+      if (text.isNotEmpty) return text;
+      final meta = _metaMapOf(message['meta']);
+      final title = (meta['title'] ?? '').toString().trim();
+      if (title.isNotEmpty) return title;
+      if ((meta['image_url'] ?? '').toString().trim().isNotEmpty) return 'Фото';
+      if ((meta['voice_url'] ?? '').toString().trim().isNotEmpty) {
+        return 'Голосовое сообщение';
+      }
+    }
+    return 'Закрепленное сообщение';
+  }
+
+  bool _isMessagePinned(String messageId) {
+    final pin = _activePin;
+    if (pin == null) return false;
+    return (pin['message_id'] ?? '').toString() == messageId;
+  }
+
   Future<void> _markChatAsRead() async {
     try {
       final resp = await authService.dio.post(
@@ -475,6 +580,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _enqueueIncomingMessage(Map<String, dynamic> msg) {
+    if (_isHiddenForAll(msg)) {
+      final messageId = msg['id']?.toString() ?? '';
+      if (messageId.isNotEmpty) {
+        _removeMessageLocally(messageId);
+      }
+      return;
+    }
+
     final msgId = msg['id']?.toString();
     if (msgId != null && msgId.isNotEmpty) {
       if (_messageIds.contains(msgId)) {
@@ -500,6 +613,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _incomingQueue.add(msg);
     _startIncomingQueueDrain();
+  }
+
+  bool _isHiddenForAll(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final raw = meta['hidden_for_all'];
+    if (raw is bool) return raw;
+    final normalized = raw?.toString().toLowerCase().trim() ?? '';
+    return normalized == 'true' || normalized == '1';
   }
 
   bool _isPublicChannel() {
@@ -1203,34 +1324,45 @@ class _ChatScreenState extends State<ChatScreen> {
     final controller = TextEditingController();
     final result = await showDialog<int>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Номер полки'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          keyboardType: TextInputType.number,
-          decoration: withInputLanguageBadge(
-            const InputDecoration(
-              hintText: 'Введите номер полки',
-              border: OutlineInputBorder(),
+      builder: (ctx) {
+        final width = MediaQuery.of(ctx).size.width;
+        final dialogWidth = width < 420 ? width * 0.9 : 360.0;
+        return AlertDialog(
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 24,
+            vertical: 24,
+          ),
+          title: const Text('Номер полки'),
+          content: SizedBox(
+            width: dialogWidth,
+            child: TextField(
+              controller: controller,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              decoration: withInputLanguageBadge(
+                const InputDecoration(
+                  hintText: 'Введите номер полки',
+                  border: OutlineInputBorder(),
+                ),
+                controller: controller,
+              ),
             ),
-            controller: controller,
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Отмена'),
-          ),
-          TextButton(
-            onPressed: () {
-              final value = int.tryParse(controller.text.trim());
-              Navigator.of(ctx).pop(value);
-            },
-            child: const Text('Сохранить'),
-          ),
-        ],
-      ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Отмена'),
+            ),
+            TextButton(
+              onPressed: () {
+                final value = int.tryParse(controller.text.trim());
+                Navigator.of(ctx).pop(value);
+              },
+              child: const Text('Сохранить'),
+            ),
+          ],
+        );
+      },
     );
     return result;
   }
@@ -1819,9 +1951,7 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Ошибка очистки чата: ${_extractDioError(e)}'),
-        ),
+        SnackBar(content: Text('Ошибка очистки чата: ${_extractDioError(e)}')),
       );
     }
   }
@@ -1849,6 +1979,8 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool canDeleteForMe,
     required bool canDeleteForAll,
     required bool canDeleteEntireChat,
+    required bool canPin,
+    required bool isPinned,
     required bool canReply,
     required bool canCopy,
     required bool canCopyId,
@@ -1876,6 +2008,13 @@ class _ChatScreenState extends State<ChatScreen> {
         await _deleteMessage(message, forAll: true);
       } else if (action == 'delete_chat') {
         await _deleteAllMessagesInChat();
+      } else if (action == 'pin' && canPin) {
+        final messageId = message['id']?.toString() ?? '';
+        if (messageId.isNotEmpty) {
+          await _pinMessage(messageId);
+        }
+      } else if (action == 'unpin' && canPin) {
+        await _unpinMessage();
       } else if (action == 'copy_id' && canCopyId) {
         final id = message['id']?.toString() ?? '';
         if (id.isNotEmpty) {
@@ -1892,6 +2031,14 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     if (canReply) {
       options.add(const PopupMenuItem(value: 'reply', child: Text('Ответить')));
+    }
+    if (canPin) {
+      options.add(
+        PopupMenuItem(
+          value: isPinned ? 'unpin' : 'pin',
+          child: Text(isPinned ? 'Открепить' : 'Закрепить'),
+        ),
+      );
     }
     if (canOpenImage) {
       options.add(
@@ -1920,10 +2067,7 @@ class _ChatScreenState extends State<ChatScreen> {
       options.add(
         const PopupMenuItem(
           value: 'delete_chat',
-          child: Text(
-            'УДАЛИТЬ ВСЁ!',
-            style: TextStyle(color: Colors.red),
-          ),
+          child: Text('УДАЛИТЬ ВСЁ!', style: TextStyle(color: Colors.red)),
         ),
       );
     }
@@ -1963,6 +2107,14 @@ class _ChatScreenState extends State<ChatScreen> {
                 leading: const Icon(Icons.reply_outlined),
                 title: const Text('Ответить'),
                 onTap: () => Navigator.of(ctx).pop('reply'),
+              ),
+            if (canPin)
+              ListTile(
+                leading: Icon(
+                  isPinned ? Icons.push_pin_outlined : Icons.push_pin,
+                ),
+                title: Text(isPinned ? 'Открепить' : 'Закрепить'),
+                onTap: () => Navigator.of(ctx).pop(isPinned ? 'unpin' : 'pin'),
               ),
             if (canOpenImage)
               ListTile(
@@ -2240,6 +2392,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 ((isPlainMessage && (fromMe || _isAdminOrCreator())) ||
                     ((hasBuy || isReservedOrder) && _isAdminOrCreator()))));
     final canDeleteEntireChat = isCreator;
+    final canPin = _canPinMessages() && hasMessageId && !isDeleted;
+    final isPinned = hasMessageId && _isMessagePinned(messageId);
     final canReply =
         !isClient && isPlainMessage && text.trim().isNotEmpty && !isDeleted;
     final canCopy =
@@ -2291,6 +2445,8 @@ class _ChatScreenState extends State<ChatScreen> {
         canDeleteForMe: canDeleteForMe,
         canDeleteForAll: canDeleteForAll,
         canDeleteEntireChat: canDeleteEntireChat,
+        canPin: canPin,
+        isPinned: isPinned,
         canReply: canReply,
         canCopy: canCopy,
         canCopyId: canCopyId,
@@ -2302,6 +2458,8 @@ class _ChatScreenState extends State<ChatScreen> {
         canDeleteForMe: canDeleteForMe,
         canDeleteForAll: canDeleteForAll,
         canDeleteEntireChat: canDeleteEntireChat,
+        canPin: canPin,
+        isPinned: isPinned,
         canReply: canReply,
         canCopy: canCopy,
         canCopyId: canCopyId,
@@ -2700,6 +2858,43 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
+          if (_activePin != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+              padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.push_pin,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _pinPreviewText(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                  ),
+                  if (_canPinMessages())
+                    IconButton(
+                      tooltip: 'Открепить',
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: _unpinMessage,
+                    ),
+                ],
+              ),
+            ),
           Expanded(
             child: _loading
                 ? const PhoenixLoadingView(

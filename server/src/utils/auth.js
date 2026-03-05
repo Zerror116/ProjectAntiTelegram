@@ -1,5 +1,8 @@
 // server/src/utils/auth.js
 const jwt = require('jsonwebtoken');
+const db = require('../db');
+const { isTenantActive, isPlatformCreatorEmail } = require('./tenants');
+const { touchUserSession } = require('./sessions');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
@@ -43,7 +46,102 @@ function verifyToken(token) {
   }
 }
 
-function authMiddleware(req, res, next) {
+async function resolveAuthContextFromToken(token, requestedViewRole = '') {
+  const payload = verifyToken(token);
+  if (!payload) {
+    return { ok: false, status: 401, error: 'Invalid token' };
+  }
+
+  const userId = payload.id || payload.userId || payload.sub || null;
+  const sessionId = payload.sid || payload.session_id || null;
+  if (!userId) {
+    return { ok: false, status: 401, error: 'Unauthorized' };
+  }
+
+  if (sessionId) {
+    const sessionAlive = await touchUserSession({
+      queryable: db,
+      sessionId: String(sessionId),
+    });
+    if (!sessionAlive) {
+      return { ok: false, status: 401, error: 'Сессия истекла или отозвана' };
+    }
+  }
+
+  const userRes = await db.query(
+    `SELECT u.id, u.email, u.role, u.is_active, u.tenant_id,
+            t.code AS tenant_code,
+            t.name AS tenant_name,
+            t.status AS tenant_status,
+            t.subscription_expires_at
+     FROM users u
+     LEFT JOIN tenants t ON t.id = u.tenant_id
+     WHERE u.id = $1
+     LIMIT 1`,
+    [userId],
+  );
+
+  if (userRes.rowCount === 0) {
+    return { ok: false, status: 401, error: 'Unauthorized' };
+  }
+
+  const row = userRes.rows[0];
+  if (row.is_active === false) {
+    return { ok: false, status: 403, error: 'Аккаунт отключён' };
+  }
+
+  const baseRole = (row.role || 'client').toString().toLowerCase().trim() || 'client';
+  const isPlatformCreator = baseRole === 'creator' && isPlatformCreatorEmail(row.email);
+
+  if (!isPlatformCreator) {
+    if (!row.tenant_id) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
+      };
+    }
+    const tenantState = isTenantActive({
+      status: row.tenant_status,
+      subscription_expires_at: row.subscription_expires_at,
+    });
+    if (!tenantState.ok) {
+      return {
+        ok: false,
+        status: tenantState.reason === 'tenant_expired' ? 402 : 403,
+        error: tenantState.error,
+      };
+    }
+  }
+
+  const rawViewRole = String(requestedViewRole || '').toLowerCase().trim();
+  const allowedViewRoles = new Set(['client', 'worker', 'admin', 'creator']);
+  const effectiveRole =
+    baseRole === 'creator' && allowedViewRoles.has(rawViewRole) && rawViewRole
+      ? rawViewRole
+      : baseRole;
+
+  const user = {
+    ...payload,
+    id: row.id,
+    email: row.email,
+    role: effectiveRole,
+    base_role: baseRole,
+    effective_role: effectiveRole,
+    view_role: effectiveRole !== baseRole ? effectiveRole : null,
+    tenant_id: row.tenant_id || null,
+    tenant_code: row.tenant_code || null,
+    tenant_name: row.tenant_name || null,
+    tenant_status: row.tenant_status || null,
+    subscription_expires_at: row.subscription_expires_at || null,
+    is_platform_creator: isPlatformCreator,
+    session_id: sessionId ? String(sessionId) : null,
+  };
+
+  return { ok: true, user };
+}
+
+async function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || req.headers.Authorization;
   if (NODE_ENV !== 'production') {
     console.log('AUTH HEADER:', auth);
@@ -53,39 +151,23 @@ function authMiddleware(req, res, next) {
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-
-  const payload = verifyToken(token);
-  if (!payload) {
-    if (NODE_ENV !== 'production') {
-      console.error('Token verify failed or expired');
+  try {
+    const context = await resolveAuthContextFromToken(
+      token,
+      req.headers['x-view-role'],
+    );
+    if (!context.ok) {
+      if (NODE_ENV !== 'production') {
+        console.error('Token verify failed or access blocked:', context.error);
+      }
+      return res.status(context.status || 401).json({ error: context.error || 'Unauthorized' });
     }
-    return res.status(401).json({ error: 'Invalid token' });
+    req.user = context.user;
+    return next();
+  } catch (err) {
+    console.error('authMiddleware error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
-
-  // Normalize req.user to include common fields and default role
-  const baseRole = (payload.role || 'client').toString().toLowerCase().trim() || 'client';
-  const rawViewRole = String(req.headers['x-view-role'] || '').toLowerCase().trim();
-  const allowedViewRoles = new Set(['client', 'worker', 'admin', 'creator']);
-  const effectiveRole =
-    baseRole === 'creator' && allowedViewRoles.has(rawViewRole) && rawViewRole
-      ? rawViewRole
-      : baseRole;
-
-  req.user = {
-    id: payload.id || payload.userId || null,
-    email: payload.email || payload.sub || null,
-    role: effectiveRole,
-    base_role: baseRole,
-    effective_role: effectiveRole,
-    view_role: effectiveRole !== baseRole ? effectiveRole : null,
-    ...payload,
-  };
-  req.user.role = effectiveRole;
-  req.user.base_role = baseRole;
-  req.user.effective_role = effectiveRole;
-  req.user.view_role = effectiveRole !== baseRole ? effectiveRole : null;
-
-  return next();
 }
 
 function requireAdmin(req, res, next) {
@@ -98,4 +180,4 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
-module.exports = { authMiddleware, requireAdmin };
+module.exports = { authMiddleware, requireAdmin, resolveAuthContextFromToken };

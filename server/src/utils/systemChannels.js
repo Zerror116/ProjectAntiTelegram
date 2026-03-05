@@ -12,6 +12,7 @@ function mergeJson(base, patch) {
 async function ensureStaffMembers(
   client,
   chatId,
+  tenantId,
   { removeNonStaff = false, includeWorkers = false } = {},
 ) {
   const allowedRoles = includeWorkers
@@ -24,16 +25,18 @@ async function ensureStaffMembers(
        USING users u
        WHERE cm.chat_id = $1
          AND cm.user_id = u.id
+         AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
          AND u.role <> ALL($2::text[])`,
-      [chatId, allowedRoles],
+      [chatId, allowedRoles, tenantId || null],
     );
   }
 
   const staffQ = await client.query(
     `SELECT id, role
      FROM users
-     WHERE role = ANY($1::text[])`,
-    [allowedRoles],
+     WHERE role = ANY($1::text[])
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)`,
+    [allowedRoles, tenantId || null],
   );
 
   for (const staff of staffQ.rows) {
@@ -53,11 +56,12 @@ async function ensureStaffMembers(
   }
 }
 
-async function findMainChannel(client) {
+async function findMainChannel(client, tenantId = null) {
   return client.query(
     `SELECT id, title, type, created_by, settings, created_at, updated_at
      FROM chats
      WHERE type = 'channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
        AND (
          COALESCE(settings->>'system_key', '') = 'main_channel'
          OR (
@@ -74,14 +78,16 @@ async function findMainChannel(client) {
        updated_at DESC NULLS LAST,
        created_at DESC
      LIMIT 1`,
+    [tenantId || null],
   );
 }
 
-async function findReservedChannel(client) {
+async function findReservedChannel(client, tenantId = null) {
   return client.query(
     `SELECT id, title, type, created_by, settings, created_at, updated_at
      FROM chats
      WHERE type = 'channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
        AND (
          COALESCE(settings->>'system_key', '') = 'reserved_orders'
          OR COALESCE(settings->>'kind', '') = 'reserved_orders'
@@ -92,15 +98,17 @@ async function findReservedChannel(client) {
        updated_at DESC NULLS LAST,
        created_at DESC
      LIMIT 1`,
+    [tenantId || null],
   );
 }
 
-async function ensureMainChannel(client, createdBy) {
-  const mainQ = await findMainChannel(client);
+async function ensureMainChannel(client, createdBy, tenantId = null) {
+  const mainQ = await findMainChannel(client, tenantId);
 
   const baseSettings = {
     kind: "channel",
     system_key: "main_channel",
+    tenant_id: tenantId || null,
     visibility: "public",
     worker_can_post: true,
     is_post_channel: true,
@@ -117,18 +125,26 @@ async function ensureMainChannel(client, createdBy) {
       `UPDATE chats
        SET title = $1,
            settings = $2::jsonb,
+           tenant_id = $4,
            updated_at = now()
        WHERE id = $3
        RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-      [current.title || "Основной канал", JSON.stringify(nextSettings), current.id],
+      [
+        current.title || "Основной канал",
+        JSON.stringify(nextSettings),
+        current.id,
+        tenantId || null,
+      ],
     );
 
     await client.query(
       `UPDATE chats
        SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{is_post_channel}', 'false'::jsonb, true),
            updated_at = now()
-       WHERE type = 'channel' AND id <> $1`,
-      [updated.rows[0].id],
+       WHERE type = 'channel'
+         AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+         AND id <> $1`,
+      [updated.rows[0].id, tenantId || null],
     );
 
     await client.query(
@@ -143,28 +159,37 @@ async function ensureMainChannel(client, createdBy) {
   }
 
   const inserted = await client.query(
-    `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
-     VALUES ($1, $2, 'channel', $3, $4::jsonb, now(), now())
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, $2, 'channel', $3, $4, $5::jsonb, now(), now())
      RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-    [uuidv4(), "Основной канал", createdBy || null, JSON.stringify(baseSettings)],
+    [
+      uuidv4(),
+      "Основной канал",
+      createdBy || null,
+      tenantId || null,
+      JSON.stringify(baseSettings),
+    ],
   );
 
   await client.query(
     `UPDATE chats
      SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{is_post_channel}', 'false'::jsonb, true),
          updated_at = now()
-     WHERE type = 'channel' AND id <> $1`,
-    [inserted.rows[0].id],
+     WHERE type = 'channel'
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       AND id <> $1`,
+    [inserted.rows[0].id, tenantId || null],
   );
 
   return { channel: inserted.rows[0], created: true };
 }
 
-async function ensureReservedOrdersChannel(client, createdBy) {
-  const reservedQ = await findReservedChannel(client);
+async function ensureReservedOrdersChannel(client, createdBy, tenantId = null) {
+  const reservedQ = await findReservedChannel(client, tenantId);
   const baseSettings = {
     kind: "reserved_orders",
     system_key: "reserved_orders",
+    tenant_id: tenantId || null,
     visibility: "private",
     admin_only: false,
     worker_can_post: false,
@@ -180,6 +205,7 @@ async function ensureReservedOrdersChannel(client, createdBy) {
       `UPDATE chats
        SET title = $1,
            settings = $2::jsonb,
+           tenant_id = $4,
            updated_at = now()
        WHERE id = $3
        RETURNING id, title, type, created_by, settings, created_at, updated_at`,
@@ -187,10 +213,11 @@ async function ensureReservedOrdersChannel(client, createdBy) {
         current.title || "Забронированный товар",
         JSON.stringify(nextSettings),
         current.id,
+        tenantId || null,
       ],
     );
 
-    await ensureStaffMembers(client, updated.rows[0].id, {
+    await ensureStaffMembers(client, updated.rows[0].id, tenantId, {
       removeNonStaff: true,
       includeWorkers: true,
     });
@@ -198,27 +225,28 @@ async function ensureReservedOrdersChannel(client, createdBy) {
   }
 
   const inserted = await client.query(
-    `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
-     VALUES ($1, $2, 'channel', $3, $4::jsonb, now(), now())
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, $2, 'channel', $3, $4, $5::jsonb, now(), now())
      RETURNING id, title, type, created_by, settings, created_at, updated_at`,
     [
       uuidv4(),
       "Забронированный товар",
       createdBy || null,
+      tenantId || null,
       JSON.stringify(baseSettings),
     ],
   );
 
-  await ensureStaffMembers(client, inserted.rows[0].id, {
+  await ensureStaffMembers(client, inserted.rows[0].id, tenantId, {
     removeNonStaff: true,
     includeWorkers: true,
   });
   return { channel: inserted.rows[0], created: true };
 }
 
-async function ensureSystemChannels(client, createdBy) {
-  const main = await ensureMainChannel(client, createdBy);
-  const reserved = await ensureReservedOrdersChannel(client, createdBy);
+async function ensureSystemChannels(client, createdBy, tenantId = null) {
+  const main = await ensureMainChannel(client, createdBy, tenantId);
+  const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
   return {
     mainChannel: main.channel,
     reservedChannel: reserved.channel,

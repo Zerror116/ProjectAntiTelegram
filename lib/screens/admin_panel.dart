@@ -17,6 +17,27 @@ import 'package:latlong2/latlong.dart';
 import '../main.dart';
 import '../widgets/input_language_badge.dart';
 
+const String _defaultMapLightTiles =
+    'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+const String _defaultMapDarkTiles =
+    'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const String _mapTileLightUrl = String.fromEnvironment(
+  'FENIX_MAP_TILE_LIGHT',
+  defaultValue: _defaultMapLightTiles,
+);
+const String _mapTileDarkUrl = String.fromEnvironment(
+  'FENIX_MAP_TILE_DARK',
+  defaultValue: _defaultMapDarkTiles,
+);
+const String _mapTileSubdomainsRaw = String.fromEnvironment(
+  'FENIX_MAP_TILE_SUBDOMAINS',
+  defaultValue: 'a,b,c,d',
+);
+const String _mapAttributionText = String.fromEnvironment(
+  'FENIX_MAP_ATTRIBUTION',
+  defaultValue: '© OpenStreetMap contributors © CARTO',
+);
+
 class AdminPanel extends StatefulWidget {
   const AdminPanel({super.key});
 
@@ -27,11 +48,18 @@ class AdminPanel extends StatefulWidget {
 class _AdminPanelState extends State<AdminPanel>
     with SingleTickerProviderStateMixin {
   late final TabController _tabController;
+  final bool _showKeysTab = false;
   final _channelTitleCtrl = TextEditingController();
   final _channelDescriptionCtrl = TextEditingController();
   final _deliveryThresholdCtrl = TextEditingController();
   final _deliveryOriginCtrl = TextEditingController();
   final _courierNamesCtrl = TextEditingController();
+  final _tenantNameCtrl = TextEditingController();
+  final _tenantNotesCtrl = TextEditingController();
+  final _tenantMonthsCtrl = TextEditingController(text: '1');
+  final _inviteMaxUsesCtrl = TextEditingController(text: '1');
+  final _inviteExpiresDaysCtrl = TextEditingController(text: '30');
+  final _inviteNotesCtrl = TextEditingController();
 
   bool _loading = true;
   bool _saving = false;
@@ -40,6 +68,10 @@ class _AdminPanelState extends State<AdminPanel>
   bool _avatarUpdating = false;
   bool _deliveryLoading = false;
   bool _deliverySaving = false;
+  bool _tenantsLoading = false;
+  bool _tenantActionLoading = false;
+  bool _invitesLoading = false;
+  bool _inviteActionLoading = false;
   StreamSubscription? _eventsSub;
 
   String _message = '';
@@ -54,9 +86,17 @@ class _AdminPanelState extends State<AdminPanel>
   List<Map<String, dynamic>> _lastPublished = [];
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
   List<Map<String, dynamic>> _deliveryBatches = [];
+  List<Map<String, dynamic>> _tenants = [];
+  List<Map<String, dynamic>> _tenantInvites = [];
   Map<String, dynamic>? _deliveryActiveBatch;
   int _reservedPendingTotal = 0;
   int _reservedPendingUnits = 0;
+  String _lastGeneratedTenantKey = '';
+  bool _tenantApiAllowed = true;
+  bool _inviteApiAllowed = true;
+  String _inviteRole = 'client';
+  String _lastInviteCode = '';
+  String _lastInviteLink = '';
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
   final Set<String> _overviewLoading = <String>{};
@@ -84,7 +124,28 @@ class _AdminPanelState extends State<AdminPanel>
     _deliveryThresholdCtrl.dispose();
     _deliveryOriginCtrl.dispose();
     _courierNamesCtrl.dispose();
+    _tenantNameCtrl.dispose();
+    _tenantNotesCtrl.dispose();
+    _tenantMonthsCtrl.dispose();
+    _inviteMaxUsesCtrl.dispose();
+    _inviteExpiresDaysCtrl.dispose();
+    _inviteNotesCtrl.dispose();
     super.dispose();
+  }
+
+  String _activeMapTileUrl(ThemeData theme) {
+    return theme.brightness == Brightness.dark
+        ? _mapTileDarkUrl
+        : _mapTileLightUrl;
+  }
+
+  List<String> _activeMapSubdomains(String urlTemplate) {
+    if (!urlTemplate.contains('{s}')) return const <String>[];
+    return _mapTileSubdomainsRaw
+        .split(',')
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList();
   }
 
   Map<String, dynamic> _asMap(dynamic raw) {
@@ -104,6 +165,13 @@ class _AdminPanelState extends State<AdminPanel>
 
   String _channelIdOf(Map<String, dynamic> channel) {
     return (channel['id'] ?? '').toString();
+  }
+
+  String _roleLabel(String role) {
+    final normalized = role.toLowerCase().trim();
+    if (normalized == 'admin') return 'Админ';
+    if (normalized == 'worker') return 'Рабочий';
+    return 'Клиент';
   }
 
   int _toInt(dynamic value, {int fallback = 0}) {
@@ -252,6 +320,304 @@ class _AdminPanelState extends State<AdminPanel>
     await _loadChannels();
     await _loadPendingPosts();
     await _loadDeliveryDashboard();
+    if (_showKeysTab) {
+      await _loadTenants();
+      await _loadTenantInvites();
+    }
+  }
+
+  int _tenantMonthsOrDefault() {
+    final parsed = int.tryParse(_tenantMonthsCtrl.text.trim());
+    if (parsed == null) return 1;
+    return parsed.clamp(1, 24);
+  }
+
+  Future<void> _loadTenants({bool silent = false}) async {
+    if (!_showKeysTab) return;
+    if (!silent && mounted) {
+      setState(() => _tenantsLoading = true);
+    } else {
+      _tenantsLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get('/api/admin/tenants');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        if (!mounted) return;
+        setState(() {
+          _tenantApiAllowed = true;
+          _tenants = List<Map<String, dynamic>>.from(data['data']);
+        });
+      } else if (mounted) {
+        setState(() {
+          _tenantApiAllowed = false;
+          _message = 'Не удалось загрузить ключи арендаторов';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      final msg = _extractDioError(e);
+      setState(() {
+        _tenantApiAllowed = false;
+        _message = 'Ключи недоступны: $msg';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _tenantsLoading = false);
+      } else {
+        _tenantsLoading = false;
+      }
+    }
+  }
+
+  Future<void> _createTenantKey() async {
+    final name = _tenantNameCtrl.text.trim();
+    if (name.isEmpty) {
+      setState(() => _message = 'Введите название арендатора');
+      return;
+    }
+    final months = _tenantMonthsOrDefault();
+    final notes = _tenantNotesCtrl.text.trim();
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/tenants',
+        data: {
+          'name': name,
+          'months': months,
+          if (notes.isNotEmpty) 'notes': notes,
+        },
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final created = Map<String, dynamic>.from(data['data']);
+        final key = (created['access_key'] ?? '').toString();
+        if (mounted) {
+          setState(() {
+            _lastGeneratedTenantKey = key;
+            _tenantNameCtrl.clear();
+            _tenantNotesCtrl.clear();
+            _tenantMonthsCtrl.text = '1';
+            _message = 'Ключ арендатора создан';
+          });
+        }
+        await _loadTenants(silent: true);
+      } else {
+        setState(() => _message = 'Не удалось создать ключ');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка создания ключа: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+  }
+
+  Future<void> _confirmTenantPayment(String tenantId, {int months = 1}) async {
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/tenants/$tenantId/confirm-payment',
+        data: {'months': months.clamp(1, 24)},
+      );
+      if (mounted) setState(() => _message = 'Оплата подтверждена');
+      await _loadTenants(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка оплаты: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+  }
+
+  Future<void> _setTenantStatus(String tenantId, String status) async {
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/tenants/$tenantId/status',
+        data: {'status': status},
+      );
+      if (mounted) {
+        setState(
+          () => _message = status == 'active'
+              ? 'Ключ активирован'
+              : 'Ключ заблокирован',
+        );
+      }
+      await _loadTenants(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка статуса: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+  }
+
+  Future<void> _deleteTenant(String tenantId, String tenantName) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Удалить ключ арендатора'),
+        content: Text(
+          'Арендатор "$tenantName" будет отключен.\n'
+          'Его подписка станет недействительной.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Отключить'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.delete('/api/admin/tenants/$tenantId');
+      if (mounted) setState(() => _message = 'Ключ арендатора удален');
+      await _loadTenants(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка удаления: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+  }
+
+  int? _toPositiveIntOrNull(String raw, {int min = 1, int max = 100000}) {
+    final parsed = int.tryParse(raw.trim());
+    if (parsed == null) return null;
+    return parsed.clamp(min, max);
+  }
+
+  Future<void> _loadTenantInvites({bool silent = false}) async {
+    if (!_showKeysTab) return;
+    if (!silent && mounted) {
+      setState(() => _invitesLoading = true);
+    } else {
+      _invitesLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/tenant/invites',
+        queryParameters: {'include_inactive': 1},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        if (!mounted) return;
+        setState(() {
+          _inviteApiAllowed = true;
+          _tenantInvites = List<Map<String, dynamic>>.from(data['data']);
+        });
+      } else if (mounted) {
+        setState(() => _inviteApiAllowed = false);
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _inviteApiAllowed = false);
+    } finally {
+      if (mounted) {
+        setState(() => _invitesLoading = false);
+      } else {
+        _invitesLoading = false;
+      }
+    }
+  }
+
+  Future<void> _createInvite() async {
+    final maxUses = _toPositiveIntOrNull(
+      _inviteMaxUsesCtrl.text,
+      min: 1,
+      max: 100000,
+    );
+    final expiresDays = _toPositiveIntOrNull(
+      _inviteExpiresDaysCtrl.text,
+      min: 1,
+      max: 365,
+    );
+    final notes = _inviteNotesCtrl.text.trim();
+    setState(() {
+      _inviteActionLoading = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/tenant/invites',
+        data: {
+          'role': _inviteRole,
+          if (maxUses != null) 'max_uses': maxUses,
+          if (expiresDays != null) 'expires_days': expiresDays,
+          if (notes.isNotEmpty) 'notes': notes,
+        },
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final row = Map<String, dynamic>.from(data['data']);
+        if (mounted) {
+          setState(() {
+            _lastInviteCode = (row['code'] ?? '').toString();
+            _lastInviteLink = (row['invite_link'] ?? '').toString();
+            _inviteNotesCtrl.clear();
+            _message = 'Код приглашения создан';
+          });
+        }
+        await _loadTenantInvites(silent: true);
+      } else {
+        setState(() => _message = 'Не удалось создать код приглашения');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка приглашения: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _inviteActionLoading = false);
+    }
+  }
+
+  Future<void> _setInviteStatus(String inviteId, bool active) async {
+    setState(() => _inviteActionLoading = true);
+    try {
+      await authService.dio.patch(
+        '/api/admin/tenant/invites/$inviteId/status',
+        data: {'is_active': active},
+      );
+      await _loadTenantInvites(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка кода: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _inviteActionLoading = false);
+    }
+  }
+
+  Future<void> _deleteInvite(String inviteId) async {
+    setState(() => _inviteActionLoading = true);
+    try {
+      await authService.dio.delete('/api/admin/tenant/invites/$inviteId');
+      await _loadTenantInvites(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка удаления кода: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _inviteActionLoading = false);
+    }
   }
 
   Future<void> _loadChannels() async {
@@ -344,7 +710,9 @@ class _AdminPanelState extends State<AdminPanel>
 
   Future<void> _loadPendingPosts() async {
     try {
-      final resp = await authService.dio.get('/api/admin/channels/pending_posts');
+      final resp = await authService.dio.get(
+        '/api/admin/channels/pending_posts',
+      );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         if (mounted) {
@@ -594,15 +962,21 @@ class _AdminPanelState extends State<AdminPanel>
                   initialZoom: 8.4,
                 ),
                 children: [
-                  TileLayer(
-                    urlTemplate:
-                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                    userAgentPackageName: 'projectantitelegram',
+                  Builder(
+                    builder: (context) {
+                      final tileUrl = _activeMapTileUrl(theme);
+                      final subdomains = _activeMapSubdomains(tileUrl);
+                      return TileLayer(
+                        urlTemplate: tileUrl,
+                        subdomains: subdomains,
+                        userAgentPackageName: 'projectantitelegram',
+                      );
+                    },
                   ),
                   RichAttributionWidget(
                     attributions: [
                       TextSourceAttribution(
-                        'OpenStreetMap contributors',
+                        _mapAttributionText,
                         textStyle: theme.textTheme.labelSmall,
                       ),
                     ],
@@ -2521,7 +2895,9 @@ class _AdminPanelState extends State<AdminPanel>
       setState(() => _message = 'Пост в модерации обновлен');
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = 'Ошибка изменения поста: ${_extractDioError(e)}');
+      setState(
+        () => _message = 'Ошибка изменения поста: ${_extractDioError(e)}',
+      );
     } finally {
       if (mounted) {
         setState(() => _saving = false);
@@ -3144,6 +3520,154 @@ class _AdminPanelState extends State<AdminPanel>
             label: Text(_saving ? 'Создание...' : 'Создать канал'),
           ),
         ),
+        const SizedBox(height: 16),
+        if (_showKeysTab && _invitesLoading)
+          const Center(child: CircularProgressIndicator())
+        else if (_showKeysTab && _inviteApiAllowed) ...[
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Коды приглашения в ваш проект',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 10),
+                  DropdownButtonFormField<String>(
+                    value: _inviteRole,
+                    decoration: const InputDecoration(
+                      labelText: 'Роль по приглашению',
+                      border: OutlineInputBorder(),
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: 'client', child: Text('Клиент')),
+                      DropdownMenuItem(value: 'worker', child: Text('Рабочий')),
+                      DropdownMenuItem(
+                        value: 'admin',
+                        child: Text('Администратор'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setState(() => _inviteRole = value);
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _inviteMaxUsesCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Сколько раз можно использовать код',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _inviteMaxUsesCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _inviteExpiresDaysCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Срок действия (дней)',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _inviteExpiresDaysCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _inviteNotesCtrl,
+                    minLines: 1,
+                    maxLines: 3,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Заметка (опционально)',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _inviteNotesCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: _inviteActionLoading ? null : _createInvite,
+                    icon: const Icon(Icons.person_add_alt_1_outlined),
+                    label: Text(
+                      _inviteActionLoading
+                          ? 'Создание...'
+                          : 'Создать код приглашения',
+                    ),
+                  ),
+                  if (_lastInviteCode.trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    SelectableText(
+                      'Код: $_lastInviteCode',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                  ],
+                  if (_lastInviteLink.trim().isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    SelectableText(_lastInviteLink),
+                    const SizedBox(height: 6),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        await Clipboard.setData(
+                          ClipboardData(text: _lastInviteLink),
+                        );
+                        if (!mounted) return;
+                        setState(
+                          () => _message = 'Ссылка приглашения скопирована',
+                        );
+                      },
+                      icon: const Icon(Icons.copy_all_outlined),
+                      label: const Text('Копировать ссылку'),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          ..._tenantInvites.take(10).map((invite) {
+            final id = (invite['id'] ?? '').toString();
+            final code = (invite['code'] ?? '').toString();
+            final role = (invite['role'] ?? 'client').toString();
+            final isActive = invite['is_active'] == true;
+            final used = _toInt(invite['used_count']);
+            final maxUses = invite['max_uses'];
+            final maxUsesLabel = maxUses == null ? '∞' : '$maxUses';
+            return Card(
+              child: ListTile(
+                title: Text('$code • ${_roleLabel(role)}'),
+                subtitle: Text('Использовано: $used / $maxUsesLabel'),
+                trailing: Wrap(
+                  spacing: 6,
+                  children: [
+                    IconButton(
+                      tooltip: isActive ? 'Отключить' : 'Включить',
+                      icon: Icon(
+                        isActive ? Icons.block_outlined : Icons.check_circle,
+                      ),
+                      onPressed: _inviteActionLoading
+                          ? null
+                          : () => _setInviteStatus(id, !isActive),
+                    ),
+                    IconButton(
+                      tooltip: 'Удалить',
+                      icon: const Icon(Icons.delete_outline),
+                      onPressed: _inviteActionLoading
+                          ? null
+                          : () => _deleteInvite(id),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }),
+        ],
       ],
     );
   }
@@ -3563,10 +4087,9 @@ class _AdminPanelState extends State<AdminPanel>
               final description = (p['product_description'] ?? '').toString();
               final channel = (p['channel_title'] ?? 'Основной канал')
                   .toString();
-              final workerName = (p['queued_by_name'] ??
-                      p['queued_by_email'] ??
-                      'Работник')
-                  .toString();
+              final workerName =
+                  (p['queued_by_name'] ?? p['queued_by_email'] ?? 'Работник')
+                      .toString();
               final imageUrl = _resolveImageUrl(
                 (p['product_image_url'] ?? '').toString(),
               );
@@ -4200,20 +4723,272 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  Widget _buildKeysTab() {
+    if (!_showKeysTab) {
+      return const Center(child: Text('Доступ только создателю'));
+    }
+    if (!_tenantApiAllowed) {
+      return RefreshIndicator(
+        onRefresh: _loadTenants,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: const [
+            Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'API ключей недоступен для этой учетной записи. Вкладка работает только для платформенного создателя.',
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _loadTenants,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Новый арендатор',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _tenantNameCtrl,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Название арендатора',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _tenantNameCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _tenantMonthsCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Срок подписки (месяцы)',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _tenantMonthsCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _tenantNotesCtrl,
+                    minLines: 2,
+                    maxLines: 4,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Заметка (опционально)',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _tenantNotesCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: _tenantActionLoading ? null : _createTenantKey,
+                    icon: const Icon(Icons.key_outlined),
+                    label: Text(
+                      _tenantActionLoading ? 'Сохранение...' : 'Создать ключ',
+                    ),
+                  ),
+                  if (_lastGeneratedTenantKey.trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Выданный ключ (показывается один раз):',
+                            style: TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          const SizedBox(height: 8),
+                          SelectableText(
+                            _lastGeneratedTenantKey,
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(
+                            onPressed: () async {
+                              await Clipboard.setData(
+                                ClipboardData(text: _lastGeneratedTenantKey),
+                              );
+                              if (!mounted) return;
+                              setState(() => _message = 'Ключ скопирован');
+                            },
+                            icon: const Icon(Icons.copy_all_outlined),
+                            label: const Text('Скопировать ключ'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (_tenantsLoading)
+            const Center(child: CircularProgressIndicator())
+          else if (_tenants.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('Арендаторы пока не созданы'),
+              ),
+            )
+          else
+            ..._tenants.map((tenant) {
+              final id = (tenant['id'] ?? '').toString();
+              final name = (tenant['name'] ?? '').toString();
+              final code = (tenant['code'] ?? '').toString();
+              final status = (tenant['status'] ?? '').toString();
+              final keyMask = (tenant['access_key_mask'] ?? '—').toString();
+              final subscription = (tenant['subscription_expires_at'] ?? '')
+                  .toString()
+                  .replaceFirst('T', ' ')
+                  .replaceFirst('Z', '');
+              final isActive = status == 'active';
+              return Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              name.isEmpty ? 'Без названия' : name,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                                fontSize: 16,
+                              ),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isActive
+                                  ? Colors.green.withValues(alpha: 0.15)
+                                  : Colors.red.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: isActive
+                                    ? Colors.green.withValues(alpha: 0.5)
+                                    : Colors.red.withValues(alpha: 0.5),
+                              ),
+                            ),
+                            child: Text(
+                              isActive ? 'Оплачено' : 'Не оплачено',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: isActive
+                                    ? Colors.green.shade700
+                                    : Colors.red.shade700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text('Код: $code'),
+                      Text('Маска ключа: $keyMask'),
+                      if (subscription.isNotEmpty)
+                        Text('Подписка до: $subscription'),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          FilledButton.tonalIcon(
+                            onPressed: _tenantActionLoading
+                                ? null
+                                : () => _confirmTenantPayment(id, months: 1),
+                            icon: const Icon(Icons.payments_outlined),
+                            label: const Text('+1 месяц'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _tenantActionLoading
+                                ? null
+                                : () => _setTenantStatus(
+                                    id,
+                                    isActive ? 'blocked' : 'active',
+                                  ),
+                            icon: Icon(
+                              isActive
+                                  ? Icons.block_outlined
+                                  : Icons.check_circle_outline,
+                            ),
+                            label: Text(
+                              isActive ? 'Отключить' : 'Активировать',
+                            ),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _tenantActionLoading
+                                ? null
+                                : () => _deleteTenant(id, name),
+                            icon: const Icon(Icons.delete_outline),
+                            label: const Text('Удалить'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final tabs = <Tab>[
+      const Tab(text: 'Создание'),
+      const Tab(text: 'Каналы'),
+      const Tab(text: 'Модерация'),
+      const Tab(text: 'Доставка'),
+    ];
+    final tabViews = <Widget>[
+      _buildCreateTab(),
+      _buildSettingsTab(),
+      _buildModerationTab(),
+      _buildDeliveryTab(),
+    ];
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Админ-панель'),
-        bottom: TabBar(
-          controller: _tabController,
-          tabs: const [
-            Tab(text: 'Создание'),
-            Tab(text: 'Каналы'),
-            Tab(text: 'Модерация'),
-            Tab(text: 'Доставка'),
-          ],
-        ),
+        bottom: TabBar(controller: _tabController, tabs: tabs),
       ),
       body: SafeArea(
         child: Column(
@@ -4227,15 +5002,7 @@ class _AdminPanelState extends State<AdminPanel>
                 ),
               ),
             Expanded(
-              child: TabBarView(
-                controller: _tabController,
-                children: [
-                  _buildCreateTab(),
-                  _buildSettingsTab(),
-                  _buildModerationTab(),
-                  _buildDeliveryTab(),
-                ],
-              ),
+              child: TabBarView(controller: _tabController, children: tabViews),
             ),
           ],
         ),

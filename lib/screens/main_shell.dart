@@ -87,12 +87,17 @@ class _MainShellState extends State<MainShell> {
 
   String _effectiveRole() => authService.effectiveRole;
 
+  bool _isCreatorNativeView() {
+    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    final effectiveRole = authService.effectiveRole.toLowerCase().trim();
+    return baseRole == 'creator' && effectiveRole == 'creator';
+  }
+
   List<String> _destinationIdsForRole(String role) {
     final normalized = role.toLowerCase().trim();
     final showAdmin = normalized == 'admin' || normalized == 'creator';
     final showWorker = normalized == 'worker' || normalized == 'creator';
-    final showTests =
-        (authService.currentUser?.role ?? '').toLowerCase().trim() == 'creator';
+    final showTests = _isCreatorNativeView();
     return <String>[
       'chats',
       'cart',
@@ -128,8 +133,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   bool _hasTestsTab() {
-    return (authService.currentUser?.role ?? '').toLowerCase().trim() ==
-        'creator';
+    return _isCreatorNativeView();
   }
 
   bool _useCompactNavigation(BuildContext context) {

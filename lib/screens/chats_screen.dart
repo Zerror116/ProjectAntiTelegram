@@ -61,7 +61,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
-  void _applyIncomingMessagePreview(String chatId, Map<String, dynamic> message) {
+  void _applyIncomingMessagePreview(
+    String chatId,
+    Map<String, dynamic> message,
+  ) {
     if (chatId.isEmpty) return;
     final text = (message['text'] ?? '').toString();
     final senderId = (message['sender_id'] ?? '').toString();
@@ -223,6 +226,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
         return;
       }
 
+      if (type == 'chat:pinned') {
+        _scheduleChatsRefresh();
+        return;
+      }
+
       if (type == 'chat:deleted') {
         if (data is Map) {
           _removeChatLocally((data['chatId'] ?? '').toString());
@@ -230,14 +238,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
         return;
       }
 
-      if (type == 'chat:message' ||
-          type == 'chat:message:global') {
+      if (type == 'chat:message' || type == 'chat:message:global') {
         if (data is Map) {
           final msg = data['message'];
           final chatId = (data['chatId'] ?? msg?['chat_id'] ?? msg?['chatId'])
               ?.toString();
           if (chatId != null && msg is Map) {
-            _applyIncomingMessagePreview(chatId, Map<String, dynamic>.from(msg));
+            _applyIncomingMessagePreview(
+              chatId,
+              Map<String, dynamic>.from(msg),
+            );
           }
         }
         _scheduleChatsRefresh();
@@ -349,9 +359,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
               ),
             ).then((_) {
-              _scheduleChatsRefresh(
-                delay: const Duration(milliseconds: 150),
-              );
+              _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
             });
           },
           child: Ink(

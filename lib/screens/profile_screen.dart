@@ -10,6 +10,7 @@ import '../widgets/app_avatar.dart';
 import '../widgets/avatar_crop_dialog.dart';
 import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
+import 'creator_keys_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -19,6 +20,8 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
+  static const String _platformCreatorEmail = 'zerotwo02166@gmail.com';
+
   bool _loading = true;
   bool _deletingAccount = false;
   bool _avatarBusy = false;
@@ -294,7 +297,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
         children: [
           Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
           const SizedBox(width: 8),
-          Text(label, style: theme.textTheme.labelLarge),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelLarge,
+            ),
+          ),
         ],
       ),
     );
@@ -391,10 +401,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  Widget _periodCard({
-    required String title,
-    required List<Widget> children,
-  }) {
+  Widget _periodCard({required String title, required List<Widget> children}) {
     final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.all(14),
@@ -599,6 +606,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
         : (_email.isNotEmpty ? _email : 'Без имени');
     final actualRole = authService.currentUser?.role ?? 'client';
     final effectiveRole = authService.effectiveRole;
+    final isPlatformCreator =
+        actualRole.toLowerCase().trim() == 'creator' &&
+        (authService.currentUser?.email ?? '').toLowerCase().trim() ==
+            _platformCreatorEmail;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Профиль')),
@@ -821,6 +832,43 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               if (v == null) return;
                               _changeViewMode(v);
                             },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (isPlatformCreator) ...[
+                    const SizedBox(height: 16),
+                    _sectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Ключи арендаторов',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Управление арендаторскими ключами и кодами приглашений.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.icon(
+                              onPressed: () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => const CreatorKeysScreen(),
+                                ),
+                              ),
+                              icon: const Icon(Icons.vpn_key_outlined),
+                              label: const Text('Открыть ключи'),
+                            ),
                           ),
                         ],
                       ),

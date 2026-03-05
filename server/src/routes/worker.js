@@ -112,7 +112,7 @@ async function allocateProductCode(client) {
   return Number(nextRes.rows[0].next_code);
 }
 
-async function getAllowedPostChannels(userRole) {
+async function getAllowedPostChannels(userRole, tenantId = null) {
   const role = String(userRole || '').toLowerCase().trim();
   if (!['worker', 'admin', 'creator'].includes(role)) {
     return [];
@@ -121,7 +121,11 @@ async function getAllowedPostChannels(userRole) {
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
-    const { mainChannel } = await ensureSystemChannels(client, null);
+    const { mainChannel } = await ensureSystemChannels(
+      client,
+      null,
+      tenantId || null,
+    );
     await client.query('COMMIT');
     return [
       {
@@ -140,7 +144,7 @@ async function getAllowedPostChannels(userRole) {
 // Список каналов, доступных для очереди публикаций
 router.get('/channels', authMiddleware, requireRole('worker', 'admin', 'creator'), async (req, res) => {
   try {
-    const data = await getAllowedPostChannels(req.user?.role);
+    const data = await getAllowedPostChannels(req.user?.role, req.user?.tenant_id || null);
     return res.json({ ok: true, data });
   } catch (err) {
     console.error('worker.channels.list error', err);
@@ -156,29 +160,36 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'c
 
     const result = await db.query(
       `WITH ranked AS (
-         SELECT id,
-                product_code,
-                title,
-                description,
-                price,
-                quantity,
-                image_url,
-                status,
-                created_at,
-                updated_at,
+         SELECT p.id,
+                p.product_code,
+                p.title,
+                p.description,
+                p.price,
+                p.quantity,
+                p.image_url,
+                p.status,
+                p.created_at,
+                p.updated_at,
                 ROW_NUMBER() OVER (
-                  PARTITION BY LOWER(TRIM(title))
-                  ORDER BY created_at DESC, updated_at DESC
+                  PARTITION BY LOWER(TRIM(p.title))
+                  ORDER BY p.created_at DESC, p.updated_at DESC
                 ) AS title_rank
-         FROM products
-         WHERE title ILIKE $1 OR description ILIKE $1
+         FROM products p
+         WHERE (p.title ILIKE $1 OR p.description ILIKE $1)
+           AND EXISTS (
+             SELECT 1
+             FROM product_publication_queue q
+             JOIN chats c ON c.id = q.channel_id
+             WHERE q.product_id = p.id
+               AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+           )
        )
        SELECT id, product_code, title, description, price, quantity, image_url, status, created_at, updated_at
        FROM ranked
        WHERE title_rank <= 2
        ORDER BY created_at DESC, updated_at DESC
        LIMIT 30`,
-      [`%${q}%`]
+      [`%${q}%`, req.user?.tenant_id || null]
     );
     return res.json({ ok: true, data: result.rows });
   } catch (err) {
@@ -236,7 +247,11 @@ router.post(
       }
 
       await client.query('BEGIN');
-      const { mainChannel } = await ensureSystemChannels(client, req.user.id);
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id,
+      );
       if (String(chatId) !== String(mainChannel.id)) {
         await client.query('ROLLBACK');
         removeUploadedFile(req.file);
@@ -336,7 +351,11 @@ router.post(
       }
 
       await client.query('BEGIN');
-      const { mainChannel } = await ensureSystemChannels(client, req.user.id);
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id,
+      );
       if (String(channel_id) !== String(mainChannel.id)) {
         await client.query('ROLLBACK');
         removeUploadedFile(req.file);
@@ -351,8 +370,15 @@ router.post(
         `SELECT id, product_code, title, description, price, quantity, image_url
          FROM products
          WHERE id = $1
+           AND EXISTS (
+             SELECT 1
+             FROM product_publication_queue q
+             JOIN chats c ON c.id = q.channel_id
+             WHERE q.product_id = products.id
+               AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+           )
          LIMIT 1`,
-        [productId]
+        [productId, req.user?.tenant_id || null]
       );
       if (productQ.rowCount === 0) {
         removeUploadedFile(req.file);

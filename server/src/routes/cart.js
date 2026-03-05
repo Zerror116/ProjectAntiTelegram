@@ -29,7 +29,6 @@ function productMessageText(product) {
   const lines = [
     `🛒 ${product.title}`,
     product.description ? String(product.description).trim() : null,
-    `ID товара: ${product.product_code ?? '—'}`,
     `Цена: ${product.price} RUB`,
     `Количество в наличии: ${product.quantity}`,
     'Нажмите "Купить", чтобы добавить в корзину',
@@ -55,9 +54,18 @@ router.post('/add', authMiddleware, async (req, res) => {
       `SELECT id, product_code, title, description, price, quantity, image_url, status
        FROM products
        WHERE id = $1
+         AND EXISTS (
+           SELECT 1
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.product_id = products.id
+             AND q.status = 'published'
+             AND COALESCE(q.is_sent, false) = true
+             AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+         )
        LIMIT 1
        FOR UPDATE`,
-      [productId]
+      [productId, req.user?.tenant_id || null]
     );
     if (productQ.rowCount === 0) {
       await client.query('ROLLBACK');

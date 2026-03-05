@@ -109,7 +109,14 @@ async function ensureSystemChannelsReady(createdBy = null) {
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
-    const ensured = await ensureSystemChannels(client, createdBy);
+    let tenantId = null;
+    const defaultTenantQ = await client.query(
+      "SELECT id FROM tenants WHERE code = 'default' LIMIT 1",
+    );
+    if (defaultTenantQ.rowCount > 0) {
+      tenantId = defaultTenantQ.rows[0].id;
+    }
+    const ensured = await ensureSystemChannels(client, createdBy, tenantId);
     await client.query("COMMIT");
     return {
       main_channel_id: ensured.mainChannel.id,

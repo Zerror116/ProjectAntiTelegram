@@ -55,7 +55,9 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   double _toDoubleValue(dynamic value, [double fallback = 0]) {
     if (value is num) return value.toDouble();
-    final parsed = double.tryParse(value?.toString().replaceAll(',', '.') ?? '');
+    final parsed = double.tryParse(
+      value?.toString().replaceAll(',', '.') ?? '',
+    );
     return parsed ?? fallback;
   }
 
@@ -64,6 +66,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final parsed = int.tryParse(value?.toString() ?? '');
     return parsed ?? fallback;
   }
+
   List<Map<String, dynamic>> _channels = [];
   String? _selectedChannelId;
   List<Map<String, dynamic>> _searchResults = [];
@@ -715,6 +718,89 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
+  Future<void> _quickDuplicateProduct(Map<String, dynamic> product) async {
+    final channelId = _selectedChannelId;
+    if (channelId == null || channelId.isEmpty) {
+      setState(() => _message = 'Сначала выберите канал');
+      return;
+    }
+
+    final productId = product['id']?.toString();
+    if (productId == null || productId.isEmpty) {
+      setState(() => _message = 'Не удалось определить товар');
+      return;
+    }
+
+    final title = (product['title'] ?? '').toString().trim();
+    final description = (product['description'] ?? '').toString().trim();
+    final price = _toDoubleValue(product['price'], 0);
+    final quantity = _toIntValue(product['quantity'], 1);
+    final imageUrl = (product['image_url'] ?? '').toString().trim();
+
+    final validationError = _validateProductFields(
+      title: title,
+      description: description,
+      price: price,
+      quantity: quantity,
+      hasImage: imageUrl.isNotEmpty,
+    );
+    if (validationError != null) {
+      setState(() => _message = validationError);
+      return;
+    }
+
+    setState(() {
+      _posting = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post(
+        '/api/worker/products/$productId/requeue',
+        data: {
+          'channel_id': channelId,
+          'title': title,
+          'description': description,
+          'price': price,
+          'quantity': quantity,
+          'image_url': imageUrl,
+        },
+      );
+      if (resp.statusCode == 201 || resp.statusCode == 200) {
+        String? productCode;
+        final data = resp.data;
+        if (data is Map && data['data'] is Map) {
+          final body = Map<String, dynamic>.from(data['data']);
+          final productMap = body['product'];
+          if (productMap is Map) {
+            productCode = productMap['product_code']?.toString();
+          }
+        }
+        setState(() {
+          _message = productCode != null && productCode.isNotEmpty
+              ? 'Дубль товара отправлен. ID товара: $productCode'
+              : 'Дубль товара отправлен в очередь';
+        });
+        _loadOwnQueuedPosts();
+        if (mounted) {
+          showAppNotice(
+            context,
+            productCode != null && productCode.isNotEmpty
+                ? 'Дубль готов. ID: $productCode'
+                : 'Товар продублирован в очередь',
+            tone: AppNoticeTone.success,
+          );
+        }
+        await playAppSound(AppUiSound.success);
+      } else {
+        setState(() => _message = 'Не удалось продублировать товар');
+      }
+    } catch (e) {
+      setState(() => _message = 'Ошибка дубля товара: $e');
+    } finally {
+      if (mounted) setState(() => _posting = false);
+    }
+  }
+
   Widget _buildPhotoPicker() {
     final theme = Theme.of(context);
     final localPath = _pickedImage?.path;
@@ -1018,9 +1104,15 @@ class _WorkerPanelState extends State<WorkerPanel>
                     _fillFormFromProduct(p);
                   } else if (v == 'requeue') {
                     _requeueProduct(p);
+                  } else if (v == 'quick_requeue') {
+                    _quickDuplicateProduct(p);
                   }
                 },
                 itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'quick_requeue',
+                    child: Text('Быстрый дубль (1 клик)'),
+                  ),
                   PopupMenuItem(
                     value: 'fill',
                     child: Text('Подставить в форму'),
@@ -1030,6 +1122,19 @@ class _WorkerPanelState extends State<WorkerPanel>
                     child: Text('Сразу в очередь'),
                   ),
                 ],
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: 'Быстрый дубль',
+                      onPressed: _posting
+                          ? null
+                          : () => _quickDuplicateProduct(p),
+                      icon: const Icon(Icons.copy_all_outlined),
+                    ),
+                    const Icon(Icons.more_vert),
+                  ],
+                ),
               ),
             ),
           );
@@ -1141,8 +1246,10 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
-    final hasImage =
-        ((post['product_image_url'] ?? '').toString().trim().isNotEmpty);
+    final hasImage = ((post['product_image_url'] ?? '')
+        .toString()
+        .trim()
+        .isNotEmpty);
     final validationError = _validateProductFields(
       title: title,
       description: description,
@@ -1172,11 +1279,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       await _loadOwnQueuedPosts();
       if (!mounted) return;
       setState(() => _message = 'Пост обновлен');
-      showAppNotice(
-        context,
-        'Свой пост обновлен',
-        tone: AppNoticeTone.success,
-      );
+      showAppNotice(context, 'Свой пост обновлен', tone: AppNoticeTone.success);
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = 'Ошибка сохранения поста: $e');
@@ -1202,9 +1305,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (_ownQueuedPosts.isEmpty) {
       return ListView(
         padding: const EdgeInsets.all(16),
-        children: const [
-          Text('У вас пока нет своих постов в очереди'),
-        ],
+        children: const [Text('У вас пока нет своих постов в очереди')],
       );
     }
     return RefreshIndicator(
@@ -1240,16 +1341,20 @@ class _WorkerPanelState extends State<WorkerPanel>
                             ? Image.network(
                                 imageUrl,
                                 fit: BoxFit.cover,
-                                errorBuilder: (_, error, stackTrace) => Container(
-                                  color: theme.colorScheme.surfaceContainerHighest,
-                                  alignment: Alignment.center,
-                                  child: const Icon(
-                                    Icons.image_not_supported_outlined,
-                                  ),
-                                ),
+                                errorBuilder: (_, error, stackTrace) =>
+                                    Container(
+                                      color: theme
+                                          .colorScheme
+                                          .surfaceContainerHighest,
+                                      alignment: Alignment.center,
+                                      child: const Icon(
+                                        Icons.image_not_supported_outlined,
+                                      ),
+                                    ),
                               )
                             : Container(
-                                color: theme.colorScheme.surfaceContainerHighest,
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
                                 alignment: Alignment.center,
                                 child: const Icon(Icons.photo_outlined),
                               ),
