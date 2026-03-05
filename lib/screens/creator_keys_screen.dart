@@ -33,6 +33,8 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   String _lastGeneratedTenantKey = '';
   String _lastInviteCode = '';
   String _lastInviteLink = '';
+  String _selectedTenantId = '';
+  String _selectedTenantCode = '';
 
   List<Map<String, dynamic>> _tenants = [];
   List<Map<String, dynamic>> _invites = [];
@@ -118,7 +120,8 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         _message = '';
       });
     }
-    await Future.wait([_loadTenants(silent: true), _loadInvites(silent: true)]);
+    await _loadTenants(silent: true);
+    await _loadInvites(silent: true);
     if (mounted) setState(() => _loading = false);
   }
 
@@ -136,8 +139,31 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           data['ok'] == true &&
           data['data'] is List &&
           mounted) {
+        final rows = List<Map<String, dynamic>>.from(data['data']);
+        String selectedId = _selectedTenantId;
+        String selectedCode = _selectedTenantCode;
+        if (rows.isNotEmpty) {
+          final hasSelected =
+              selectedId.isNotEmpty &&
+              rows.any((row) => (row['id'] ?? '').toString() == selectedId);
+          if (!hasSelected) {
+            selectedId = (rows.first['id'] ?? '').toString();
+            selectedCode = (rows.first['code'] ?? '').toString();
+          } else {
+            final selected = rows.firstWhere(
+              (row) => (row['id'] ?? '').toString() == selectedId,
+              orElse: () => rows.first,
+            );
+            selectedCode = (selected['code'] ?? '').toString();
+          }
+        } else {
+          selectedId = '';
+          selectedCode = '';
+        }
         setState(() {
-          _tenants = List<Map<String, dynamic>>.from(data['data']);
+          _tenants = rows;
+          _selectedTenantId = selectedId;
+          _selectedTenantCode = selectedCode;
         });
       }
     } catch (e) {
@@ -165,7 +191,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     try {
       final resp = await authService.dio.get(
         '/api/admin/tenant/invites',
-        queryParameters: {'include_inactive': 1},
+        queryParameters: {
+          'include_inactive': 1,
+          if (_selectedTenantId.trim().isNotEmpty)
+            'tenant_id': _selectedTenantId.trim(),
+          if (_selectedTenantCode.trim().isNotEmpty)
+            'tenant_code': _selectedTenantCode.trim(),
+        },
       );
       final data = resp.data;
       if (data is Map &&
@@ -342,6 +374,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       final resp = await authService.dio.post(
         '/api/admin/tenant/invites',
         data: {
+          if (_selectedTenantId.trim().isNotEmpty)
+            'tenant_id': _selectedTenantId.trim(),
+          if (_selectedTenantCode.trim().isNotEmpty)
+            'tenant_code': _selectedTenantCode.trim(),
           'role': _inviteRole,
           if (maxUses != null) 'max_uses': maxUses,
           if (expiresDays != null) 'expires_days': expiresDays,
@@ -375,7 +411,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     try {
       await authService.dio.patch(
         '/api/admin/tenant/invites/$inviteId/status',
-        data: {'is_active': active},
+        data: {
+          'is_active': active,
+          if (_selectedTenantId.trim().isNotEmpty)
+            'tenant_id': _selectedTenantId.trim(),
+          if (_selectedTenantCode.trim().isNotEmpty)
+            'tenant_code': _selectedTenantCode.trim(),
+        },
       );
       await _loadInvites(silent: true);
     } catch (e) {
@@ -389,7 +431,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   Future<void> _deleteInvite(String inviteId) async {
     setState(() => _inviteActionLoading = true);
     try {
-      await authService.dio.delete('/api/admin/tenant/invites/$inviteId');
+      await authService.dio.delete(
+        '/api/admin/tenant/invites/$inviteId',
+        data: {
+          if (_selectedTenantId.trim().isNotEmpty)
+            'tenant_id': _selectedTenantId.trim(),
+          if (_selectedTenantCode.trim().isNotEmpty)
+            'tenant_code': _selectedTenantCode.trim(),
+        },
+      );
       await _loadInvites(silent: true);
     } catch (e) {
       if (!mounted) return;
@@ -639,6 +689,39 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                   style: TextStyle(fontWeight: FontWeight.w700),
                 ),
                 const SizedBox(height: 10),
+                if (_tenants.isNotEmpty) ...[
+                  DropdownButtonFormField<String>(
+                    value: _selectedTenantId.isEmpty ? null : _selectedTenantId,
+                    decoration: const InputDecoration(
+                      labelText: 'Арендатор для приглашений',
+                      border: OutlineInputBorder(),
+                    ),
+                    items: _tenants
+                        .map(
+                          (tenant) => DropdownMenuItem<String>(
+                            value: (tenant['id'] ?? '').toString(),
+                            child: Text(
+                              '${(tenant['name'] ?? '').toString()} (${(tenant['code'] ?? '').toString()})',
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (value) {
+                      if (value == null) return;
+                      final selected = _tenants.firstWhere(
+                        (tenant) => (tenant['id'] ?? '').toString() == value,
+                        orElse: () => _tenants.first,
+                      );
+                      setState(() {
+                        _selectedTenantId = value;
+                        _selectedTenantCode = (selected['code'] ?? '')
+                            .toString();
+                      });
+                      _loadInvites();
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                ],
                 DropdownButtonFormField<String>(
                   value: _inviteRole,
                   decoration: const InputDecoration(

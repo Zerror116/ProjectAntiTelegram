@@ -11,6 +11,7 @@ class User {
   final String? name;
   final String role;
   final String? phone;
+  final String? tenantCode;
 
   User({
     required this.id,
@@ -18,6 +19,7 @@ class User {
     this.name,
     required this.role,
     this.phone,
+    this.tenantCode,
   });
 
   factory User.fromMap(Map<String, dynamic> m) {
@@ -27,6 +29,12 @@ class User {
       name: m['name']?.toString(),
       role: m['role']?.toString() ?? 'client',
       phone: m['phone']?.toString(),
+      tenantCode: (() {
+        final raw = (m['tenant_code'] ?? m['tenantCode'] ?? '')
+            .toString()
+            .trim();
+        return raw.isEmpty ? null : raw;
+      })(),
     );
   }
 
@@ -37,6 +45,7 @@ class User {
       'name': name,
       'role': role,
       'phone': phone,
+      'tenant_code': tenantCode,
     };
   }
 }
@@ -45,6 +54,7 @@ class AuthService {
   final Dio dio;
   static const _tokenKey = 'auth_token';
   static const _viewRoleKey = 'creator_view_role';
+  static const _tenantCodeKey = 'tenant_code_scope';
 
   // Temporary storage for multi-step registration
   String? pendingEmail;
@@ -65,12 +75,14 @@ class AuthService {
   }
 
   // Stream controller to notify listeners about auth changes (user or logout)
-  final StreamController<User?> _authController = StreamController<User?>.broadcast();
+  final StreamController<User?> _authController =
+      StreamController<User?>.broadcast();
   Stream<User?> get authStream => _authController.stream;
 
   // Prevent re-entrant or duplicate logout/clear operations
   bool _isLoggingOut = false;
   String? _deviceFingerprintCache;
+  String? _tenantCodeCache;
 
   AuthService({required this.dio});
 
@@ -93,10 +105,16 @@ class AuthService {
 
   /// Публичный: установить токен и (опционально) user, уведомить слушателей
   Future<void> setToken(String token, [User? user]) async {
-    debugPrint('🔐 setToken called with token: ${_shortToken(token)}..., user: ${user?.email}');
+    debugPrint(
+      '🔐 setToken called with token: ${_shortToken(token)}..., user: ${user?.email}',
+    );
     await _saveToken(token);
     _setAuthHeader(token);
     if (user != null) _currentUser = user;
+    final responseTenantCode = (user?.tenantCode ?? '').trim();
+    if (responseTenantCode.isNotEmpty) {
+      await setTenantCode(responseTenantCode);
+    }
     try {
       final prefs = await SharedPreferences.getInstance();
       if (_currentUser?.role.toLowerCase().trim() == 'creator') {
@@ -109,7 +127,9 @@ class AuthService {
     try {
       _authController.add(_currentUser);
     } catch (_) {}
-    debugPrint('✅ AuthService.setToken -> token set, user=${_currentUser?.email}');
+    debugPrint(
+      '✅ AuthService.setToken -> token set, user=${_currentUser?.email}',
+    );
   }
 
   /// Публичный: очистить токен и user (logout)
@@ -147,7 +167,9 @@ class AuthService {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_tokenKey, token);
-      debugPrint('✅ Token saved to SharedPreferences: ${_shortToken(token)}...');
+      debugPrint(
+        '✅ Token saved to SharedPreferences: ${_shortToken(token)}...',
+      );
     } catch (e) {
       debugPrint('❌ Error saving token: $e');
     }
@@ -158,12 +180,37 @@ class AuthService {
     try {
       final prefs = await SharedPreferences.getInstance();
       final token = prefs.getString(_tokenKey);
-      debugPrint('🔑 getToken -> ${token != null ? '${_shortToken(token)}...' : 'null'}');
+      debugPrint(
+        '🔑 getToken -> ${token != null ? '${_shortToken(token)}...' : 'null'}',
+      );
       return token;
     } catch (e) {
       debugPrint('❌ Error getting token: $e');
       return null;
     }
+  }
+
+  Future<void> setTenantCode(String? tenantCode) async {
+    final normalized = tenantCode?.trim().toLowerCase() ?? '';
+    final prefs = await SharedPreferences.getInstance();
+    if (normalized.isEmpty) {
+      _tenantCodeCache = null;
+      await prefs.remove(_tenantCodeKey);
+      return;
+    }
+    _tenantCodeCache = normalized;
+    await prefs.setString(_tenantCodeKey, normalized);
+  }
+
+  Future<String?> getTenantCode() async {
+    if (_tenantCodeCache != null && _tenantCodeCache!.trim().isNotEmpty) {
+      return _tenantCodeCache;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final stored = prefs.getString(_tenantCodeKey)?.trim() ?? '';
+    if (stored.isEmpty) return null;
+    _tenantCodeCache = stored.toLowerCase();
+    return _tenantCodeCache;
   }
 
   /// Обработать ответ от /auth (вытянуть токен и user), использовать setToken
@@ -187,8 +234,11 @@ class AuthService {
       try {
         debugPrint('📡 Fetching profile...');
         final profileResp = await dio.get('/api/profile');
-        if (profileResp.statusCode == 200 && profileResp.data is Map && profileResp.data['user'] is Map) {
-          final profileMap = (profileResp.data['user'] as Map<dynamic, dynamic>).cast<String, dynamic>();
+        if (profileResp.statusCode == 200 &&
+            profileResp.data is Map &&
+            profileResp.data['user'] is Map) {
+          final profileMap = (profileResp.data['user'] as Map<dynamic, dynamic>)
+              .cast<String, dynamic>();
           _currentUser = User.fromMap(profileMap);
           debugPrint('👤 Profile fetched: ${_currentUser?.email}');
         }
@@ -197,13 +247,24 @@ class AuthService {
       }
     }
 
+    String? tenantCodeFromResponse;
+    final tenant = data['tenant'];
+    if (tenant is Map && tenant['code'] != null) {
+      tenantCodeFromResponse = tenant['code'].toString().trim();
+    }
+    tenantCodeFromResponse ??= _currentUser?.tenantCode;
+    if ((tenantCodeFromResponse ?? '').isNotEmpty) {
+      await setTenantCode(tenantCodeFromResponse);
+    }
+
     // ✅ Сохраняем токен ПЕРЕД установкой заголовка
     await setToken(tokenStr, _currentUser);
     debugPrint('✅ _processAuthResponse complete');
   }
 
   Future<String?> _getDeviceFingerprintSafe() async {
-    if (_deviceFingerprintCache != null && _deviceFingerprintCache!.isNotEmpty) {
+    if (_deviceFingerprintCache != null &&
+        _deviceFingerprintCache!.isNotEmpty) {
       return _deviceFingerprintCache;
     }
     try {
@@ -226,13 +287,19 @@ class AuthService {
   }) async {
     debugPrint('🔓 login called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
-    final resp = await dio.post('/api/auth/login', data: {
-      'email': email,
-      'password': password,
-      if (accessKey != null && accessKey.trim().isNotEmpty)
-        'access_key': accessKey.trim(),
-      if (fingerprint != null) 'device_fingerprint': fingerprint,
-    });
+    final tenantCode = await getTenantCode();
+    final resp = await dio.post(
+      '/api/auth/login',
+      data: {
+        'email': email,
+        'password': password,
+        if (accessKey != null && accessKey.trim().isNotEmpty)
+          'access_key': accessKey.trim(),
+        if (tenantCode != null && tenantCode.trim().isNotEmpty)
+          'tenant_code': tenantCode.trim(),
+        if (fingerprint != null) 'device_fingerprint': fingerprint,
+      },
+    );
     debugPrint('📬 login response received, status: ${resp.statusCode}');
 
     await _processAuthResponse(resp);
@@ -241,7 +308,10 @@ class AuthService {
     pendingPassword = null;
     pendingAccessKey = null;
     debugPrint('✅ login complete');
-    return {'access': resp.data['token'] ?? resp.data['access'], 'user': _currentUser?.toMap()};
+    return {
+      'access': resp.data['token'] ?? resp.data['access'],
+      'user': _currentUser?.toMap(),
+    };
   }
 
   /// Регистрация (полная: email+password+name+phone + optional secret)
@@ -255,16 +325,22 @@ class AuthService {
   }) async {
     debugPrint('✍️ register called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
-    final resp = await dio.post('/api/auth/register', data: {
-      'email': email,
-      'password': password,
-      if (accessKey != null && accessKey.trim().isNotEmpty)
-        'access_key': accessKey.trim(),
-      if (name != null) 'name': name,
-      if (phone != null) 'phone': phone,
-      if (secret != null) 'secret': secret,
-      if (fingerprint != null) 'device_fingerprint': fingerprint,
-    });
+    final tenantCode = await getTenantCode();
+    final resp = await dio.post(
+      '/api/auth/register',
+      data: {
+        'email': email,
+        'password': password,
+        if (accessKey != null && accessKey.trim().isNotEmpty)
+          'access_key': accessKey.trim(),
+        if (tenantCode != null && tenantCode.trim().isNotEmpty)
+          'tenant_code': tenantCode.trim(),
+        if (name != null) 'name': name,
+        if (phone != null) 'phone': phone,
+        if (secret != null) 'secret': secret,
+        if (fingerprint != null) 'device_fingerprint': fingerprint,
+      },
+    );
     debugPrint('📬 register response received, status: ${resp.statusCode}');
 
     await _processAuthResponse(resp);
@@ -273,7 +349,10 @@ class AuthService {
     pendingPassword = null;
     pendingAccessKey = null;
     debugPrint('✅ register complete');
-    return {'access': resp.data['token'] ?? resp.data['access'], 'user': _currentUser?.toMap()};
+    return {
+      'access': resp.data['token'] ?? resp.data['access'],
+      'user': _currentUser?.toMap(),
+    };
   }
 
   /// Устанавливаем временные данные при первом шаге регистрации
@@ -289,21 +368,31 @@ class AuthService {
   }
 
   /// Завершение регистрации: используем pendingEmail/pendingPassword + name + phone + optional secret
-  Future<void> completePendingRegistration({required String name, required String phone, String? secret}) async {
+  Future<void> completePendingRegistration({
+    required String name,
+    required String phone,
+    String? secret,
+  }) async {
     if (pendingEmail == null || pendingPassword == null) {
       throw Exception('No pending credentials');
     }
     final fingerprint = await _getDeviceFingerprintSafe();
-    final resp = await dio.post('/api/auth/register', data: {
-      'email': pendingEmail,
-      'password': pendingPassword,
-      if (pendingAccessKey != null && pendingAccessKey!.trim().isNotEmpty)
-        'access_key': pendingAccessKey!.trim(),
-      'name': name,
-      'phone': phone,
-      if (secret != null) 'secret': secret,
-      if (fingerprint != null) 'device_fingerprint': fingerprint,
-    });
+    final tenantCode = await getTenantCode();
+    final resp = await dio.post(
+      '/api/auth/register',
+      data: {
+        'email': pendingEmail,
+        'password': pendingPassword,
+        if (pendingAccessKey != null && pendingAccessKey!.trim().isNotEmpty)
+          'access_key': pendingAccessKey!.trim(),
+        if (tenantCode != null && tenantCode.trim().isNotEmpty)
+          'tenant_code': tenantCode.trim(),
+        'name': name,
+        'phone': phone,
+        if (secret != null) 'secret': secret,
+        if (fingerprint != null) 'device_fingerprint': fingerprint,
+      },
+    );
 
     await _processAuthResponse(resp);
     pendingEmail = null;
@@ -311,9 +400,11 @@ class AuthService {
     pendingAccessKey = null;
   }
 
-  bool hasAnyRole(List<String> roles) => _currentUser != null && roles.contains(_currentUser!.role);
+  bool hasAnyRole(List<String> roles) =>
+      _currentUser != null && roles.contains(_currentUser!.role);
 
-  bool get canSwitchViewRole => _currentUser?.role.toLowerCase().trim() == 'creator';
+  bool get canSwitchViewRole =>
+      _currentUser?.role.toLowerCase().trim() == 'creator';
 
   Future<void> setViewRole(String? role) async {
     if (!canSwitchViewRole) return;
@@ -332,7 +423,10 @@ class AuthService {
   }
 
   /// Применить ответ логина/регистрации (если вызывается извне)
-  Future<void> applyLoginResponse(String token, Map<String, dynamic>? userMap) async {
+  Future<void> applyLoginResponse(
+    String token,
+    Map<String, dynamic>? userMap,
+  ) async {
     debugPrint('🔐 applyLoginResponse called');
     User? user;
     if (userMap != null) user = User.fromMap(userMap);
@@ -367,7 +461,9 @@ class AuthService {
           try {
             _authController.add(_currentUser);
           } catch (_) {}
-          debugPrint('✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}');
+          debugPrint(
+            '✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}',
+          );
           return true;
         }
       }

@@ -11,6 +11,7 @@ const {
   PLATFORM_CREATOR_EMAIL,
   normalizeAccessKey,
   normalizeInviteCode,
+  generateInviteCode,
   hashAccessKey,
   isTenantActive,
 } = require('../utils/tenants');
@@ -42,6 +43,31 @@ function buildSessionExpiry() {
 function normalizeDeviceFingerprint(value) {
   const normalized = String(value || '').trim();
   return normalized ? normalized.slice(0, 255) : null;
+}
+
+function extractTenantCodeHint(req) {
+  const fromHeader = String(req.get('x-tenant-code') || '').trim();
+  if (fromHeader) return db.normalizeTenantCode(fromHeader);
+
+  const fromBody = String(req.body?.tenant_code || '').trim();
+  if (fromBody) return db.normalizeTenantCode(fromBody);
+
+  const fromQuery = String(req.query?.tenant || req.query?.tenant_code || '').trim();
+  if (fromQuery) return db.normalizeTenantCode(fromQuery);
+
+  return '';
+}
+
+function buildInviteLink(req, inviteCode, tenantCode = '') {
+  const base = String(process.env.INVITE_LINK_BASE || '').trim();
+  const encodedInvite = encodeURIComponent(String(inviteCode || '').trim());
+  const encodedTenant = encodeURIComponent(String(tenantCode || '').trim());
+  const tenantPart = encodedTenant ? `&tenant=${encodedTenant}` : '';
+  if (base) {
+    const glue = base.includes('?') ? '&' : '?';
+    return `${base}${glue}invite=${encodedInvite}${tenantPart}`;
+  }
+  return `${req.protocol}://${req.get('host')}/?invite=${encodedInvite}${tenantPart}`;
 }
 
 async function assertDeviceAccountLimit(queryable, deviceFingerprint, userId = null) {
@@ -82,12 +108,13 @@ async function upsertDevice(queryable, userId, deviceFingerprint) {
   return result.rows[0]?.id || null;
 }
 
-async function resolveTenantByAccessKey(queryable, accessKey) {
+async function resolveTenantByAccessKey(accessKey) {
   const normalized = normalizeAccessKey(accessKey);
   if (!normalized) return null;
   const hash = hashAccessKey(normalized);
-  const tenantRes = await queryable.query(
-    `SELECT id, code, name, status, subscription_expires_at
+  const tenantRes = await db.platformQuery(
+    `SELECT id, code, name, status, subscription_expires_at,
+            db_mode, db_url, db_name
      FROM tenants
      WHERE access_key_hash = $1
      LIMIT 1`,
@@ -96,10 +123,10 @@ async function resolveTenantByAccessKey(queryable, accessKey) {
   return tenantRes.rowCount > 0 ? tenantRes.rows[0] : null;
 }
 
-async function resolveTenantInviteByCode(queryable, inviteCode) {
+async function resolveTenantInviteByCode(inviteCode) {
   const normalized = normalizeInviteCode(inviteCode);
   if (!normalized) return null;
-  const inviteRes = await queryable.query(
+  const inviteRes = await db.platformQuery(
     `SELECT i.id,
             i.tenant_id,
             i.code,
@@ -111,7 +138,10 @@ async function resolveTenantInviteByCode(queryable, inviteCode) {
             t.code AS tenant_code,
             t.name AS tenant_name,
             t.status,
-            t.subscription_expires_at
+            t.subscription_expires_at,
+            t.db_mode,
+            t.db_url,
+            t.db_name
      FROM tenant_invites i
      JOIN tenants t ON t.id = i.tenant_id
      WHERE i.code = $1
@@ -137,9 +167,18 @@ router.post('/check_email', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email' });
     }
 
-    const existing = await db.query('SELECT 1 FROM users WHERE email = $1', [normalizedEmail]);
+    const tenantCodeHint = extractTenantCodeHint(req);
+    const existing = tenantCodeHint
+      ? await db.runWithTenantCode(
+          tenantCodeHint,
+          () => db.query('SELECT 1 FROM users WHERE email = $1', [normalizedEmail]),
+        )
+      : await db.platformQuery('SELECT 1 FROM users WHERE email = $1', [normalizedEmail]);
     return res.json({ exists: existing.rowCount > 0 });
   } catch (err) {
+    if (String(err?.code || '') === 'TENANT_NOT_FOUND') {
+      return res.status(404).json({ exists: false, error: 'Арендатор не найден' });
+    }
     console.error('check_email error', err);
     return res.status(500).json({ error: 'Server error' });
   }
@@ -154,7 +193,6 @@ router.post('/check_email', async (req, res) => {
  * - Returns { token, user: { id, email, name, role } }
  */
 router.post('/register', async (req, res) => {
-  const client = await db.pool.connect();
   try {
     const {
       email,
@@ -176,66 +214,43 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
 
-    await client.query('BEGIN');
-
-    const existing = await client.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
-    if (existing.rowCount > 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Email already registered' });
-    }
-
     let role = 'client';
     let tenant = null;
     let invite = null;
-    const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL;
-    if (normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase()) {
-      if (typeof secret === 'string' && secret === CREATOR_SECRET) {
-        role = 'creator';
-      } else {
-        await client.query('ROLLBACK');
+    const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase();
+
+    if (isPlatformCreator) {
+      if (typeof secret !== 'string' || secret !== CREATOR_SECRET) {
         return res.status(403).json({ error: 'Invalid secret for this email' });
       }
+      role = 'creator';
     } else {
       const rawInputCode = String(access_key || '').trim();
       const rawAccessKey = normalizeAccessKey(rawInputCode);
       const rawInviteCode = normalizeInviteCode(invite_code || access_key);
       const looksLikeAccessKey = rawAccessKey.startsWith('PHX');
+
       if (looksLikeAccessKey) {
-        tenant = await resolveTenantByAccessKey(client, rawAccessKey);
+        tenant = await resolveTenantByAccessKey(rawAccessKey);
         if (!tenant) {
-          await client.query('ROLLBACK');
-          return res.status(403).json({
-            error: 'Неверный ключ арендатора.',
-          });
+          return res.status(403).json({ error: 'Неверный ключ арендатора.' });
         }
         role = 'admin';
       } else if (rawInviteCode) {
-        invite = await resolveTenantInviteByCode(client, rawInviteCode);
+        invite = await resolveTenantInviteByCode(rawInviteCode);
         if (!invite) {
-          await client.query('ROLLBACK');
-          return res.status(403).json({
-            error: 'Неверный или устаревший код приглашения.',
-          });
+          return res.status(403).json({ error: 'Неверный или устаревший код приглашения.' });
         }
         if (invite.is_active !== true) {
-          await client.query('ROLLBACK');
-          return res.status(403).json({
-            error: 'Код приглашения отключен.',
-          });
+          return res.status(403).json({ error: 'Код приглашения отключен.' });
         }
         if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
-          await client.query('ROLLBACK');
-          return res.status(403).json({
-            error: 'Срок действия кода приглашения истек.',
-          });
+          return res.status(403).json({ error: 'Срок действия кода приглашения истек.' });
         }
         const maxUses = Number(invite.max_uses);
         const usedCount = Number(invite.used_count || 0);
         if (Number.isFinite(maxUses) && maxUses > 0 && usedCount >= maxUses) {
-          await client.query('ROLLBACK');
-          return res.status(403).json({
-            error: 'Лимит использований этого кода приглашения исчерпан.',
-          });
+          return res.status(403).json({ error: 'Лимит использований этого кода приглашения исчерпан.' });
         }
         tenant = {
           id: invite.tenant_id,
@@ -243,99 +258,143 @@ router.post('/register', async (req, res) => {
           name: invite.tenant_name,
           status: invite.status,
           subscription_expires_at: invite.subscription_expires_at,
+          db_mode: invite.db_mode || 'shared',
+          db_url: invite.db_url || null,
+          db_name: invite.db_name || null,
         };
         const invitedRole = String(invite.role || 'client').toLowerCase().trim();
         role = invitedRole === 'worker' || invitedRole === 'admin' ? invitedRole : 'client';
       } else {
-        await client.query('ROLLBACK');
         return res.status(403).json({
           error:
             'Для регистрации нужен ключ арендатора (для владельца) или код приглашения (для сотрудника/клиента).',
         });
       }
+
       const tenantState = isTenantActive(tenant);
       if (!tenantState.ok) {
-        await client.query('ROLLBACK');
         return res.status(403).json({ error: tenantState.error });
       }
     }
 
-    await assertDeviceAccountLimit(client, device_fingerprint);
+    const registerInScope = async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
 
-    const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
-    const insertUser = await client.query(
-      `INSERT INTO users (email, password_hash, name, role, tenant_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, now())
-       RETURNING id, email, name, role, tenant_id`,
-      [normalizedEmail, password_hash, name || null, role, isPlatformCreator ? null : tenant?.id || null]
+        const existing = await client.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
+        if (existing.rowCount > 0) {
+          await client.query('ROLLBACK');
+          return { ok: false, status: 409, error: 'Email already registered' };
+        }
+
+        await assertDeviceAccountLimit(client, device_fingerprint);
+
+        const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
+        const insertUser = await client.query(
+          `INSERT INTO users (email, password_hash, name, role, tenant_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, now())
+           RETURNING id, email, name, role, tenant_id`,
+          [
+            normalizedEmail,
+            password_hash,
+            name || null,
+            role,
+            isPlatformCreator ? null : tenant?.id || null,
+          ],
+        );
+        const user = insertUser.rows[0];
+
+        if (phone) {
+          const normalizedPhone = String(phone).replace(/\D/g, '');
+          if (normalizedPhone.length < 10) {
+            await client.query('ROLLBACK');
+            return { ok: false, status: 400, error: 'Invalid phone format' };
+          }
+          await client.query(
+            `INSERT INTO phones (user_id, phone, status, created_at)
+             VALUES ($1, $2, 'pending_verification', now())
+             ON CONFLICT (user_id) DO UPDATE
+               SET phone = $2, status = 'pending_verification', created_at = now()`,
+            [user.id, normalizedPhone],
+          );
+        }
+
+        await upsertDevice(client, user.id, device_fingerprint);
+
+        const sessionId = uuidv4();
+        const sessionExpiresAt = buildSessionExpiry();
+        await createUserSession({
+          queryable: client,
+          userId: user.id,
+          sessionId,
+          deviceFingerprint: device_fingerprint,
+          userAgent: req.get('user-agent') || '',
+          ipAddress:
+            req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+            req.ip ||
+            '',
+          expiresAt: sessionExpiresAt,
+        });
+
+        await client.query('COMMIT');
+        return { ok: true, user, sessionId };
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    };
+
+    const registration = await db.runWithTenantRow(
+      isPlatformCreator ? null : tenant,
+      registerInScope,
     );
-    const user = insertUser.rows[0];
+    if (!registration?.ok) {
+      return res.status(registration?.status || 500).json({
+        error: registration?.error || 'Internal server error',
+      });
+    }
 
     if (invite?.id) {
-      await client.query(
-        `UPDATE tenant_invites
-         SET used_count = used_count + 1,
-             is_active = CASE
-               WHEN max_uses IS NOT NULL AND used_count + 1 >= max_uses THEN false
-               ELSE is_active
-             END,
-             last_used_at = now(),
-             updated_at = now()
-         WHERE id = $1`,
-        [invite.id],
-      );
-    }
-
-    if (phone) {
-      const normalizedPhone = String(phone).replace(/\D/g, '');
-      if (normalizedPhone.length < 10) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Invalid phone format' });
+      try {
+        await db.platformQuery(
+          `UPDATE tenant_invites
+           SET used_count = used_count + 1,
+               is_active = CASE
+                 WHEN max_uses IS NOT NULL AND used_count + 1 >= max_uses THEN false
+                 ELSE is_active
+               END,
+               last_used_at = now(),
+               updated_at = now()
+           WHERE id = $1`,
+          [invite.id],
+        );
+      } catch (err) {
+        console.error('auth.register invite usage update error', err);
       }
-      await client.query(
-        `INSERT INTO phones (user_id, phone, status, created_at)
-         VALUES ($1, $2, 'pending_verification', now())
-         ON CONFLICT (user_id) DO UPDATE SET phone = $2, status = 'pending_verification', created_at = now()`,
-        [user.id, normalizedPhone]
-      );
     }
-
-    await upsertDevice(client, user.id, device_fingerprint);
-
-    const sessionId = uuidv4();
-    const sessionExpiresAt = buildSessionExpiry();
-    await createUserSession({
-      queryable: client,
-      userId: user.id,
-      sessionId,
-      deviceFingerprint: device_fingerprint,
-      userAgent: req.get('user-agent') || '',
-      ipAddress:
-        req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
-        req.ip ||
-        '',
-      expiresAt: sessionExpiresAt,
-    });
-
-    await client.query('COMMIT');
 
     const token = signToken({
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      tenant_id: user.tenant_id || null,
-      sid: sessionId,
+      id: registration.user.id,
+      email: registration.user.email,
+      role: registration.user.role,
+      tenant_id: registration.user.tenant_id || null,
+      tenant_code: tenant?.code || null,
+      sid: registration.sessionId,
     });
 
     return res.status(201).json({
       token,
-      session_id: sessionId,
+      session_id: registration.sessionId,
       user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        tenant_id: user.tenant_id || null,
+        id: registration.user.id,
+        email: registration.user.email,
+        name: registration.user.name,
+        role: registration.user.role,
+        tenant_id: registration.user.tenant_id || null,
+        tenant_code: tenant?.code || null,
       },
       tenant: tenant
         ? {
@@ -347,11 +406,8 @@ router.post('/register', async (req, res) => {
         : null,
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('auth.register error', err);
     return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
-  } finally {
-    client.release();
   }
 });
 
@@ -362,9 +418,8 @@ router.post('/register', async (req, res) => {
  * Returns { token, user: { id, email, role } }
  */
 router.post('/login', async (req, res) => {
-  const client = await db.pool.connect();
   try {
-    const { email, password, device_fingerprint } = req.body || {};
+    const { email, password, device_fingerprint, access_key } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const normalizedEmail = validator.normalizeEmail(email);
@@ -372,99 +427,236 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Неверный логин или пароль' });
     }
 
-    await client.query('BEGIN');
+    const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase();
+    let tenant = null;
 
-    const userRes = await client.query(
-      `SELECT u.id, u.email, u.password_hash, u.role, u.tenant_id,
-              t.code AS tenant_code, t.name AS tenant_name, t.status AS tenant_status,
-              t.subscription_expires_at
-       FROM users u
-       LEFT JOIN tenants t ON t.id = u.tenant_id
-       WHERE u.email = $1
-       LIMIT 1`,
-      [normalizedEmail],
-    );
-    const user = userRes.rows[0];
-    if (!user) {
-      await client.query('ROLLBACK');
-      return res.status(401).json({ error: 'Неверные данные' });
-    }
-
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) {
-      await client.query('ROLLBACK');
-      return res.status(401).json({ error: 'Неверные данные' });
-    }
-
-    const isPlatformCreator = String(user.email || '').toLowerCase() === CREATOR_EMAIL;
     if (!isPlatformCreator) {
-      if (!user.tenant_id) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({
-          error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
+      const tenantCodeHint = extractTenantCodeHint(req);
+      if (tenantCodeHint) {
+        tenant = await db.resolveTenantByCode(tenantCodeHint);
+      } else {
+        const normalizedAccessKey = normalizeAccessKey(access_key);
+        if (normalizedAccessKey.startsWith('PHX')) {
+          tenant = await resolveTenantByAccessKey(normalizedAccessKey);
+        }
+      }
+
+      if (!tenant) {
+        return res.status(400).json({
+          error:
+            'Не определен арендатор. Войдите по приглашению вашей группы или укажите код арендатора.',
         });
       }
-      const tenantState = isTenantActive({
-        status: user.tenant_status,
-        subscription_expires_at: user.subscription_expires_at,
-      });
+      const tenantState = isTenantActive(tenant);
       if (!tenantState.ok) {
-        await client.query('ROLLBACK');
         return res.status(403).json({ error: tenantState.error });
       }
     }
 
-    await assertDeviceAccountLimit(client, device_fingerprint, user.id);
-    await upsertDevice(client, user.id, device_fingerprint);
+    const loginInScope = async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const userRes = await client.query(
+          `SELECT u.id, u.email, u.password_hash, u.role, u.tenant_id,
+                  t.code AS tenant_code, t.name AS tenant_name, t.status AS tenant_status,
+                  t.subscription_expires_at
+           FROM users u
+           LEFT JOIN tenants t ON t.id = u.tenant_id
+           WHERE u.email = $1
+           LIMIT 1`,
+          [normalizedEmail],
+        );
+        const user = userRes.rows[0];
+        if (!user) {
+          await client.query('ROLLBACK');
+          return { ok: false, status: 401, error: 'Неверные данные' };
+        }
 
-    const sessionId = uuidv4();
-    const sessionExpiresAt = buildSessionExpiry();
-    await createUserSession({
-      queryable: client,
-      userId: user.id,
-      sessionId,
-      deviceFingerprint: device_fingerprint,
-      userAgent: req.get('user-agent') || '',
-      ipAddress:
-        req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
-        req.ip ||
-        '',
-      expiresAt: sessionExpiresAt,
-    });
+        const ok = await bcrypt.compare(password, user.password_hash);
+        if (!ok) {
+          await client.query('ROLLBACK');
+          return { ok: false, status: 401, error: 'Неверные данные' };
+        }
 
-    await client.query('COMMIT');
+        if (!isPlatformCreator) {
+          if (!user.tenant_id) {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 403,
+              error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
+            };
+          }
+          const tenantState = isTenantActive({
+            status: user.tenant_status || tenant?.status,
+            subscription_expires_at:
+              user.subscription_expires_at || tenant?.subscription_expires_at,
+          });
+          if (!tenantState.ok) {
+            await client.query('ROLLBACK');
+            return { ok: false, status: 403, error: tenantState.error };
+          }
+        }
 
+        await assertDeviceAccountLimit(client, device_fingerprint, user.id);
+        await upsertDevice(client, user.id, device_fingerprint);
+
+        const sessionId = uuidv4();
+        const sessionExpiresAt = buildSessionExpiry();
+        await createUserSession({
+          queryable: client,
+          userId: user.id,
+          sessionId,
+          deviceFingerprint: device_fingerprint,
+          userAgent: req.get('user-agent') || '',
+          ipAddress:
+            req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+            req.ip ||
+            '',
+          expiresAt: sessionExpiresAt,
+        });
+
+        await client.query('COMMIT');
+        return { ok: true, user, sessionId };
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    };
+
+    const result = await db.runWithTenantRow(
+      isPlatformCreator ? null : tenant,
+      loginInScope,
+    );
+    if (!result?.ok) {
+      return res.status(result?.status || 500).json({
+        error: result?.error || 'Internal server error',
+      });
+    }
+
+    const effectiveTenantCode = isPlatformCreator
+      ? null
+      : tenant?.code || result.user.tenant_code || null;
     const token = signToken({
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      tenant_id: user.tenant_id || null,
-      sid: sessionId,
+      id: result.user.id,
+      email: result.user.email,
+      role: result.user.role,
+      tenant_id: result.user.tenant_id || null,
+      tenant_code: effectiveTenantCode,
+      sid: result.sessionId,
     });
     return res.json({
       token,
-      session_id: sessionId,
+      session_id: result.sessionId,
       user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        tenant_id: user.tenant_id || null,
+        id: result.user.id,
+        email: result.user.email,
+        role: result.user.role,
+        tenant_id: result.user.tenant_id || null,
+        tenant_code: effectiveTenantCode,
       },
-      tenant: user.tenant_id
+      tenant: result.user.tenant_id
         ? {
-            id: user.tenant_id,
-            code: user.tenant_code || null,
-            name: user.tenant_name || null,
-            subscription_expires_at: user.subscription_expires_at || null,
+            id: result.user.tenant_id,
+            code: effectiveTenantCode,
+            name: result.user.tenant_name || tenant?.name || null,
+            subscription_expires_at:
+              result.user.subscription_expires_at || tenant?.subscription_expires_at || null,
           }
         : null,
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('auth.login error', err);
     return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
-  } finally {
-    client.release();
+  }
+});
+
+router.get('/tenant/public-invite', authMiddleware, async (req, res) => {
+  try {
+    if (req.user?.is_platform_creator === true) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Для создателя ссылка приглашения не требуется',
+      });
+    }
+
+    const tenantId = String(req.user?.tenant_id || '').trim();
+    const tenantCode = String(req.user?.tenant_code || '').trim();
+    if (!tenantId || !tenantCode) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Аккаунт не привязан к арендатору',
+      });
+    }
+
+    const existing = await db.platformQuery(
+      `SELECT id, code, is_active, max_uses, used_count, expires_at
+       FROM tenant_invites
+       WHERE tenant_id = $1
+         AND role = 'client'
+         AND is_active = true
+         AND (expires_at IS NULL OR expires_at > now())
+         AND (max_uses IS NULL OR used_count < max_uses)
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [tenantId],
+    );
+
+    let inviteCode = '';
+    let inviteId = '';
+
+    if (existing.rowCount > 0) {
+      inviteCode = String(existing.rows[0].code || '').trim();
+      inviteId = String(existing.rows[0].id || '').trim();
+    } else {
+      let created = null;
+      for (let i = 0; i < 5; i += 1) {
+        const code = normalizeInviteCode(generateInviteCode());
+        try {
+          const insert = await db.platformQuery(
+            `INSERT INTO tenant_invites (
+               id, tenant_id, code, role, is_active, max_uses,
+               used_count, expires_at, created_by, notes, created_at, updated_at
+             )
+             VALUES (
+               $1, $2, $3, 'client', true, NULL,
+               0, NULL, $4, 'Публичная клиентская ссылка', now(), now()
+             )
+             RETURNING id, code`,
+            [uuidv4(), tenantId, code, req.user.id],
+          );
+          created = insert.rows[0];
+          break;
+        } catch (err) {
+          if (String(err?.code || '') === '23505') continue;
+          throw err;
+        }
+      }
+      if (!created) {
+        return res.status(500).json({
+          ok: false,
+          error: 'Не удалось создать ссылку приглашения',
+        });
+      }
+      inviteCode = String(created.code || '').trim();
+      inviteId = String(created.id || '').trim();
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        invite_id: inviteId,
+        code: inviteCode,
+        tenant_code: tenantCode,
+        invite_link: buildInviteLink(req, inviteCode, tenantCode),
+      },
+    });
+  } catch (err) {
+    console.error('auth.tenant.publicInvite error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });
 

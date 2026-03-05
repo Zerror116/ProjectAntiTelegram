@@ -18,6 +18,9 @@ const {
   maskAccessKey,
   normalizeInviteCode,
 } = require("../utils/tenants");
+const {
+  provisionIsolatedTenantDatabase,
+} = require("../utils/tenantDatabases");
 const { logMonitoringEvent } = require("../utils/monitoring");
 
 const channelUploadsDir = path.resolve(
@@ -527,9 +530,10 @@ router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => 
     return res.status(403).json({ ok: false, error: "Forbidden" });
   }
   try {
-    const result = await db.query(
+    const result = await db.platformQuery(
       `SELECT id, code, name, status, access_key_mask,
               subscription_expires_at, last_payment_confirmed_at, notes,
+              db_mode, db_name,
               created_at, updated_at
        FROM tenants
        ORDER BY created_at DESC`,
@@ -566,23 +570,29 @@ router.post(
     const accessKey = generateAccessKey();
     const accessKeyHash = hashAccessKey(accessKey);
     const accessKeyMask = maskAccessKey(accessKey);
+    const tenantId = uuidv4();
     const code = generateTenantCode(name);
 
+    const platformDbUrl =
+      process.env.DATABASE_URL ||
+      "postgresql://antitelegram:antitelegram@localhost:5432/antitelegram";
+    const client = await db.platformConnect();
     try {
-      const created = await db.query(
+      await client.query("BEGIN");
+      const created = await client.query(
         `INSERT INTO tenants (
            id, code, name, access_key_hash, access_key_mask,
            status, subscription_expires_at, last_payment_confirmed_at,
-           created_by, notes, created_at, updated_at
+           created_by, notes, db_mode, db_name, db_url, created_at, updated_at
          )
          VALUES (
            $1, $2, $3, $4, $5,
            'active', now() + make_interval(months => $6::int), now(),
-           $7, $8, now(), now()
+           $7, $8, 'isolated', NULL, NULL, now(), now()
          )
          RETURNING id, code, name, status, access_key_mask, subscription_expires_at, notes, created_at`,
         [
-          uuidv4(),
+          tenantId,
           code,
           name,
           accessKeyHash,
@@ -592,17 +602,57 @@ router.post(
           notes,
         ],
       );
+      await client.query("COMMIT");
+
+      const createdRow = created.rows[0];
+
+      const provision = await provisionIsolatedTenantDatabase({
+        platformDbUrl,
+        tenantId,
+        tenantCode: code,
+        tenantName: name,
+        accessKeyHash,
+        accessKeyMask,
+        status: "active",
+        subscriptionExpiresAt: createdRow.subscription_expires_at,
+        createdBy: req.user.id,
+        notes,
+      });
+
+      await db.platformQuery(
+        `UPDATE tenants
+         SET db_mode = 'isolated',
+             db_name = $2,
+             db_url = $3,
+             updated_at = now()
+         WHERE id = $1`,
+        [tenantId, provision.dbName, provision.dbUrl],
+      );
 
       return res.status(201).json({
         ok: true,
         data: {
-          ...created.rows[0],
+          ...createdRow,
           access_key: accessKey,
+          db_mode: "isolated",
+          db_name: provision.dbName,
         },
       });
     } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      try {
+        await db.platformQuery("DELETE FROM tenants WHERE id = $1", [tenantId]);
+      } catch (_) {}
       console.error("admin.tenants.create error", err);
-      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Не удалось создать арендатора и его отдельную БД. Проверьте доступ к PostgreSQL.",
+      });
+    } finally {
+      client.release();
     }
   },
 );
@@ -626,7 +676,7 @@ router.post(
     }
 
     try {
-      const updated = await db.query(
+      const updated = await db.platformQuery(
         `UPDATE tenants
          SET status = 'active',
              subscription_expires_at = GREATEST(now(), subscription_expires_at) + make_interval(months => $1::int),
@@ -669,7 +719,7 @@ router.patch(
     }
 
     try {
-      const updated = await db.query(
+      const updated = await db.platformQuery(
         `UPDATE tenants
          SET status = $1,
              updated_at = now()
@@ -703,7 +753,7 @@ router.delete(
       return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
     }
     try {
-      const archived = await db.query(
+      const archived = await db.platformQuery(
         `UPDATE tenants
          SET status = 'blocked',
              subscription_expires_at = now(),
@@ -733,14 +783,82 @@ function tenantInviteRole(rawRole) {
   return "client";
 }
 
-function inviteLinkForRequest(req, inviteCode) {
+async function resolveTargetTenantForInvite(req) {
+  const ownTenantId = String(req.user?.tenant_id || "").trim();
+  if (ownTenantId) {
+    return {
+      id: ownTenantId,
+      code: String(req.user?.tenant_code || "").trim() || null,
+    };
+  }
+
+  const tenantIdHint = String(
+    req.query?.tenant_id || req.body?.tenant_id || "",
+  ).trim();
+  if (tenantIdHint) {
+    const byId = await db.platformQuery(
+      `SELECT id, code
+       FROM tenants
+       WHERE id = $1
+       LIMIT 1`,
+      [tenantIdHint],
+    );
+    if (byId.rowCount > 0) {
+      return {
+        id: byId.rows[0].id,
+        code: byId.rows[0].code || null,
+      };
+    }
+  }
+
+  const tenantCodeHint = String(
+    req.query?.tenant_code || req.body?.tenant_code || "",
+  )
+    .trim()
+    .toLowerCase();
+  if (tenantCodeHint) {
+    const byCode = await db.platformQuery(
+      `SELECT id, code
+       FROM tenants
+       WHERE lower(code) = $1
+       LIMIT 1`,
+      [tenantCodeHint],
+    );
+    if (byCode.rowCount > 0) {
+      return {
+        id: byCode.rows[0].id,
+        code: byCode.rows[0].code || null,
+      };
+    }
+  }
+
+  const latest = await db.platformQuery(
+    `SELECT id, code
+     FROM tenants
+     WHERE code <> 'default'
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC
+     LIMIT 1`,
+  );
+  if (latest.rowCount > 0) {
+    return {
+      id: latest.rows[0].id,
+      code: latest.rows[0].code || null,
+    };
+  }
+  return null;
+}
+
+function inviteLinkForRequest(req, inviteCode, tenantCode = "") {
   const base = String(process.env.INVITE_LINK_BASE || "").trim();
   const encoded = encodeURIComponent(inviteCode);
+  const tenantPart = tenantCode
+    ? `&tenant=${encodeURIComponent(tenantCode)}`
+    : "";
   if (base) {
     const glue = base.includes("?") ? "&" : "?";
-    return `${base}${glue}invite=${encoded}`;
+    return `${base}${glue}invite=${encoded}${tenantPart}`;
   }
-  return `${req.protocol}://${req.get("host")}/?invite=${encoded}`;
+  return `${req.protocol}://${req.get("host")}/?invite=${encoded}${tenantPart}`;
 }
 
 router.get(
@@ -751,40 +869,46 @@ router.get(
     if (req.user?.is_platform_creator !== true) {
       return res.status(403).json({ ok: false, error: "Forbidden" });
     }
-    const tenantId = req.user?.tenant_id || null;
-    if (!tenantId) {
+    const targetTenant = await resolveTargetTenantForInvite(req);
+    if (!targetTenant?.id) {
       return res.status(403).json({
         ok: false,
-        error: "Учетная запись не привязана к арендатору",
+        error: "Не выбран арендатор для кодов приглашения",
       });
     }
     try {
       const includeInactive = String(req.query?.include_inactive || "")
         .toLowerCase()
         .trim() === "1";
-      const result = await db.query(
-        `SELECT id,
-                tenant_id,
-                code,
-                role,
-                is_active,
-                max_uses,
-                used_count,
-                expires_at,
-                created_by,
-                last_used_at,
-                notes,
-                created_at,
-                updated_at
-         FROM tenant_invites
-         WHERE tenant_id = $1
-           AND ($2::boolean = true OR is_active = true)
-         ORDER BY created_at DESC`,
-        [tenantId, includeInactive],
+      const result = await db.platformQuery(
+        `SELECT i.id,
+                i.tenant_id,
+                t.code AS tenant_code,
+                i.code,
+                i.role,
+                i.is_active,
+                i.max_uses,
+                i.used_count,
+                i.expires_at,
+                i.created_by,
+                i.last_used_at,
+                i.notes,
+                i.created_at,
+                i.updated_at
+         FROM tenant_invites i
+         JOIN tenants t ON t.id = i.tenant_id
+         WHERE i.tenant_id = $1
+           AND ($2::boolean = true OR i.is_active = true)
+         ORDER BY i.created_at DESC`,
+        [targetTenant.id, includeInactive],
       );
       const data = result.rows.map((row) => ({
         ...row,
-        invite_link: inviteLinkForRequest(req, row.code),
+        invite_link: inviteLinkForRequest(
+          req,
+          row.code,
+          row.tenant_code || targetTenant.code || "",
+        ),
       }));
       return res.json({ ok: true, data });
     } catch (err) {
@@ -802,11 +926,11 @@ router.post(
     if (req.user?.is_platform_creator !== true) {
       return res.status(403).json({ ok: false, error: "Forbidden" });
     }
-    const tenantId = req.user?.tenant_id || null;
-    if (!tenantId) {
+    const targetTenant = await resolveTargetTenantForInvite(req);
+    if (!targetTenant?.id) {
       return res.status(403).json({
         ok: false,
-        error: "Учетная запись не привязана к арендатору",
+        error: "Не выбран арендатор для кодов приглашения",
       });
     }
     const role = tenantInviteRole(req.body?.role);
@@ -826,7 +950,7 @@ router.post(
         tries += 1;
         const code = generateInviteCode();
         try {
-          const inserted = await db.query(
+          const inserted = await db.platformQuery(
             `INSERT INTO tenant_invites (
                id, tenant_id, code, role, is_active, max_uses,
                used_count, expires_at, created_by, notes, created_at, updated_at
@@ -852,7 +976,7 @@ router.post(
                        updated_at`,
             [
               uuidv4(),
-              tenantId,
+              targetTenant.id,
               normalizeInviteCode(code),
               role,
               maxUses,
@@ -866,7 +990,11 @@ router.post(
             ok: true,
             data: {
               ...row,
-              invite_link: inviteLinkForRequest(req, row.code),
+              invite_link: inviteLinkForRequest(
+                req,
+                row.code,
+                targetTenant.code || "",
+              ),
             },
           });
         } catch (err) {
@@ -895,11 +1023,11 @@ router.patch(
     if (req.user?.is_platform_creator !== true) {
       return res.status(403).json({ ok: false, error: "Forbidden" });
     }
-    const tenantId = req.user?.tenant_id || null;
-    if (!tenantId) {
+    const targetTenant = await resolveTargetTenantForInvite(req);
+    if (!targetTenant?.id) {
       return res.status(403).json({
         ok: false,
-        error: "Учетная запись не привязана к арендатору",
+        error: "Не выбран арендатор для кодов приглашения",
       });
     }
     const inviteId = String(req.params?.inviteId || "").trim();
@@ -908,7 +1036,7 @@ router.patch(
       return res.status(400).json({ ok: false, error: "Некорректный inviteId" });
     }
     try {
-      const updated = await db.query(
+      const updated = await db.platformQuery(
         `UPDATE tenant_invites
          SET is_active = $1,
              updated_at = now()
@@ -927,7 +1055,7 @@ router.patch(
                    notes,
                    created_at,
                    updated_at`,
-        [active, inviteId, tenantId],
+        [active, inviteId, targetTenant.id],
       );
       if (updated.rowCount === 0) {
         return res
@@ -939,7 +1067,11 @@ router.patch(
         ok: true,
         data: {
           ...row,
-          invite_link: inviteLinkForRequest(req, row.code),
+          invite_link: inviteLinkForRequest(
+            req,
+            row.code,
+            targetTenant.code || "",
+          ),
         },
       });
     } catch (err) {
@@ -957,11 +1089,11 @@ router.delete(
     if (req.user?.is_platform_creator !== true) {
       return res.status(403).json({ ok: false, error: "Forbidden" });
     }
-    const tenantId = req.user?.tenant_id || null;
-    if (!tenantId) {
+    const targetTenant = await resolveTargetTenantForInvite(req);
+    if (!targetTenant?.id) {
       return res.status(403).json({
         ok: false,
-        error: "Учетная запись не привязана к арендатору",
+        error: "Не выбран арендатор для кодов приглашения",
       });
     }
     const inviteId = String(req.params?.inviteId || "").trim();
@@ -969,14 +1101,14 @@ router.delete(
       return res.status(400).json({ ok: false, error: "Некорректный inviteId" });
     }
     try {
-      const removed = await db.query(
+      const removed = await db.platformQuery(
         `UPDATE tenant_invites
          SET is_active = false,
              updated_at = now()
          WHERE id = $1
            AND tenant_id = $2
          RETURNING id`,
-        [inviteId, tenantId],
+        [inviteId, targetTenant.id],
       );
       if (removed.rowCount === 0) {
         return res

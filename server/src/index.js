@@ -411,6 +411,7 @@ async function canUserAccessChat(user, chatId) {
           return next(new Error(context.error || "Unauthorized"));
         }
         socket.user = context.user;
+        socket.tenantScope = context.tenantScope || null;
         console.log(
           `Socket ${socket.id} authenticated as user ${context.user.id} (role=${context.user.role})`,
         );
@@ -427,6 +428,8 @@ async function canUserAccessChat(user, chatId) {
     io.on("connection", (socket) => {
       const sid = socket.id;
       const uid = socket.user?.id;
+      const runInSocketTenantContext = (fn) =>
+        db.runWithTenantRow(socket.tenantScope || null, fn);
       console.log(`📡 Socket connected: ${sid} (user=${uid || "anonymous"})`);
 
       if (uid) {
@@ -440,6 +443,7 @@ async function canUserAccessChat(user, chatId) {
       // Присоединение к комнате чата
       socket.on("join_chat", async (chatId) => {
         try {
+          await runInSocketTenantContext(async () => {
           if (!chatId) {
             console.warn(`Socket ${sid}: join_chat called with empty chatId`);
             return;
@@ -475,6 +479,7 @@ async function canUserAccessChat(user, chatId) {
           // Присоединись к новой комнате
           socket.join(`chat:${chatId}`);
           console.log(`Socket ${sid} joined chat:${chatId}`);
+          });
         } catch (err) {
           console.error(`Socket ${sid} join_chat error:`, err);
         }

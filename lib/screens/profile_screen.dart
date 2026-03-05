@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../main.dart';
 import '../utils/phone_utils.dart';
@@ -25,6 +26,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _loading = true;
   bool _deletingAccount = false;
   bool _avatarBusy = false;
+  bool _inviteBusy = false;
   String _name = '';
   String _email = '';
   String _phone = '';
@@ -33,6 +35,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   double _avatarFocusY = 0;
   double _avatarZoom = 1;
   String _message = '';
+  String _publicInviteLink = '';
   String _viewMode = 'creator';
   Map<String, dynamic> _stats = const {};
   bool _statsExpanded = false;
@@ -280,6 +283,43 @@ class _ProfileScreenState extends State<ProfileScreen> {
       setState(() => _message = _extractDioMessage(e));
     } finally {
       if (mounted) setState(() => _deletingAccount = false);
+    }
+  }
+
+  Future<void> _fetchPublicInviteLink() async {
+    if (_inviteBusy) return;
+    setState(() {
+      _inviteBusy = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get('/api/auth/tenant/public-invite');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final row = Map<String, dynamic>.from(data['data']);
+        final link = (row['invite_link'] ?? '').toString().trim();
+        if (link.isEmpty) {
+          if (!mounted) return;
+          setState(() => _message = 'Ссылка приглашения недоступна');
+          return;
+        }
+        await Clipboard.setData(ClipboardData(text: link));
+        if (!mounted) return;
+        setState(() {
+          _publicInviteLink = link;
+          _message = 'Ссылка приглашения скопирована';
+        });
+      } else {
+        if (!mounted) return;
+        setState(() => _message = 'Не удалось получить ссылку приглашения');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка ссылки приглашения: ${_extractDioMessage(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _inviteBusy = false);
     }
   }
 
@@ -606,6 +646,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         : (_email.isNotEmpty ? _email : 'Без имени');
     final actualRole = authService.currentUser?.role ?? 'client';
     final effectiveRole = authService.effectiveRole;
+    final canShareInvite = actualRole.toLowerCase().trim() != 'creator';
     final isPlatformCreator =
         actualRole.toLowerCase().trim() == 'creator' &&
         (authService.currentUser?.email ?? '').toLowerCase().trim() ==
@@ -751,6 +792,55 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   ),
                   const SizedBox(height: 16),
                   _buildStatsSection(effectiveRole),
+                  if (canShareInvite) ...[
+                    const SizedBox(height: 16),
+                    _sectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Приглашение в вашу группу',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Вы можете поделиться ссылкой с новыми клиентами.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.tonalIcon(
+                              onPressed: _inviteBusy
+                                  ? null
+                                  : _fetchPublicInviteLink,
+                              icon: _inviteBusy
+                                  ? const SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.share_outlined),
+                              label: const Text('Скопировать ссылку'),
+                            ),
+                          ),
+                          if (_publicInviteLink.trim().isNotEmpty) ...[
+                            const SizedBox(height: 10),
+                            SelectableText(
+                              _publicInviteLink,
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 16),
                   _sectionCard(
                     child: Column(
