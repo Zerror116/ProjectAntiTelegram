@@ -1219,7 +1219,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             (post['product_image_url'] ?? '').toString(),
           );
           return Container(
-            padding: const EdgeInsets.all(14),
+            padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: theme.colorScheme.surfaceContainerLow,
               borderRadius: BorderRadius.circular(20),
@@ -1228,62 +1228,99 @@ class _WorkerPanelState extends State<WorkerPanel>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (imageUrl != null) ...[
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(16),
-                    child: AspectRatio(
-                      aspectRatio: 4 / 3,
-                      child: Image.network(
-                        imageUrl,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, error, stackTrace) => Container(
-                          color: theme.colorScheme.surfaceContainerHighest,
-                          alignment: Alignment.center,
-                          child: const Icon(Icons.image_not_supported_outlined),
-                        ),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(14),
+                      child: SizedBox(
+                        width: 92,
+                        height: 92,
+                        child: imageUrl != null
+                            ? Image.network(
+                                imageUrl,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, error, stackTrace) => Container(
+                                  color: theme.colorScheme.surfaceContainerHighest,
+                                  alignment: Alignment.center,
+                                  child: const Icon(
+                                    Icons.image_not_supported_outlined,
+                                  ),
+                                ),
+                              )
+                            : Container(
+                                color: theme.colorScheme.surfaceContainerHighest,
+                                alignment: Alignment.center,
+                                child: const Icon(Icons.photo_outlined),
+                              ),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 12),
-                ],
-                Text(
-                  (post['product_title'] ?? 'Товар').toString(),
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  (post['product_description'] ?? '').toString(),
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    _statChip('ID: ${(post['product_code'] ?? '—').toString()}'),
-                    _statChip(
-                      'Цена: ${_toDoubleValue(post['product_price']).toStringAsFixed(0)} RUB',
-                    ),
-                    _statChip('Количество: ${_toIntValue(post['product_quantity'])}'),
-                    _statChip(
-                      'В очереди: ${(post['channel_title'] ?? 'Основной канал').toString()}',
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            (post['product_title'] ?? 'Товар').toString(),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            (post['product_description'] ?? '').toString(),
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              _statChip(
+                                'ID ${(post['product_code'] ?? '—').toString()}',
+                              ),
+                              _statChip(
+                                '${_toDoubleValue(post['product_price']).toStringAsFixed(0)} RUB',
+                              ),
+                              _statChip(
+                                'x${_toIntValue(post['product_quantity'])}',
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: FilledButton.tonalIcon(
-                    onPressed: _savingOwnPost
-                        ? null
-                        : () => _editOwnQueuedPost(post),
-                    icon: const Icon(Icons.edit_outlined),
-                    label: const Text('Изменить'),
-                  ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        (post['channel_title'] ?? 'Основной канал').toString(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.tonalIcon(
+                      onPressed: _savingOwnPost
+                          ? null
+                          : () => _editOwnQueuedPost(post),
+                      icon: const Icon(Icons.edit_outlined, size: 18),
+                      label: const Text('Изменить'),
+                    ),
+                  ],
                 ),
               ],
             ),

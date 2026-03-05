@@ -32,6 +32,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _message = '';
   String _viewMode = 'creator';
   Map<String, dynamic> _stats = const {};
+  bool _statsExpanded = false;
 
   @override
   void initState() {
@@ -505,41 +506,85 @@ class _ProfileScreenState extends State<ProfileScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'Статистика',
-            style: theme.textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w800,
+          InkWell(
+            borderRadius: BorderRadius.circular(18),
+            onTap: () => setState(() => _statsExpanded = !_statsExpanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Статистика',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    _statsExpanded ? 'Скрыть' : 'Показать',
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      color: theme.colorScheme.primary,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Icon(
+                    _statsExpanded
+                        ? Icons.keyboard_arrow_up_rounded
+                        : Icons.keyboard_arrow_down_rounded,
+                    color: theme.colorScheme.primary,
+                  ),
+                ],
+              ),
             ),
           ),
-          const SizedBox(height: 14),
-          buildByRole('Сегодня', today),
-          const SizedBox(height: 12),
-          buildByRole('За неделю', week),
-          const SizedBox(height: 12),
-          buildByRole('За месяц', month),
-          const SizedBox(height: 12),
-          buildByRole('За всё время', allTime),
-          if (effectiveRole == 'creator' && live.isNotEmpty) ...[
-            const SizedBox(height: 14),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
+          AnimatedCrossFade(
+            duration: const Duration(milliseconds: 220),
+            crossFadeState: _statsExpanded
+                ? CrossFadeState.showFirst
+                : CrossFadeState.showSecond,
+            firstChild: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _statChip(
-                  Icons.inventory_2_outlined,
-                  'Очередь: ${live['pending_posts'] ?? 0}',
-                ),
-                _statChip(
-                  Icons.pending_actions_outlined,
-                  'Не обработано резервов: ${live['unprocessed_reservations'] ?? 0}',
-                ),
-                _statChip(
-                  Icons.local_shipping_outlined,
-                  'Активных доставок: ${live['active_delivery_clients'] ?? 0}',
-                ),
+                const SizedBox(height: 14),
+                buildByRole('Сегодня', today),
+                const SizedBox(height: 12),
+                buildByRole('За неделю', week),
+                const SizedBox(height: 12),
+                buildByRole('За месяц', month),
+                const SizedBox(height: 12),
+                buildByRole('За всё время', allTime),
+                if (effectiveRole == 'creator' && live.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      _statChip(
+                        Icons.inventory_2_outlined,
+                        'Очередь: ${live['pending_posts'] ?? 0}',
+                      ),
+                      _statChip(
+                        Icons.pending_actions_outlined,
+                        'Не обработано резервов: ${live['unprocessed_reservations'] ?? 0}',
+                      ),
+                      _statChip(
+                        Icons.local_shipping_outlined,
+                        'Активных доставок: ${live['active_delivery_clients'] ?? 0}',
+                      ),
+                    ],
+                  ),
+                ],
               ],
             ),
-          ],
+            secondChild: Text(
+              'Статистика скрыта',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
         ],
       ),
     );

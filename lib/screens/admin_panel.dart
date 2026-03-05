@@ -3572,7 +3572,7 @@ class _AdminPanelState extends State<AdminPanel>
               );
               return Container(
                 margin: const EdgeInsets.only(bottom: 12),
-                padding: const EdgeInsets.all(14),
+                padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: theme.colorScheme.surfaceContainerLow,
                   borderRadius: BorderRadius.circular(22),
@@ -3581,65 +3581,102 @@ class _AdminPanelState extends State<AdminPanel>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (imageUrl != null) ...[
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(18),
-                        child: AspectRatio(
-                          aspectRatio: 4 / 3,
-                          child: Image.network(
-                            imageUrl,
-                            fit: BoxFit.cover,
-                            errorBuilder: (_, error, stackTrace) => Container(
-                              color: theme.colorScheme.surfaceContainerHighest,
-                              alignment: Alignment.center,
-                              child: const Icon(
-                                Icons.image_not_supported_outlined,
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(14),
+                          child: SizedBox(
+                            width: 96,
+                            height: 96,
+                            child: imageUrl != null
+                                ? Image.network(
+                                    imageUrl,
+                                    fit: BoxFit.cover,
+                                    errorBuilder: (_, error, stackTrace) =>
+                                        Container(
+                                          color: theme
+                                              .colorScheme
+                                              .surfaceContainerHighest,
+                                          alignment: Alignment.center,
+                                          child: const Icon(
+                                            Icons.image_not_supported_outlined,
+                                          ),
+                                        ),
+                                  )
+                                : Container(
+                                    color: theme
+                                        .colorScheme
+                                        .surfaceContainerHighest,
+                                    alignment: Alignment.center,
+                                    child: const Icon(Icons.photo_outlined),
+                                  ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                ),
                               ),
+                              const SizedBox(height: 4),
+                              Text(
+                                description,
+                                maxLines: 3,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                children: [
+                                  _buildModerationChip(
+                                    'ID ${(p['product_code'] ?? '—').toString()}',
+                                  ),
+                                  _buildModerationChip(
+                                    '${_toInt(p['product_price'])} RUB',
+                                  ),
+                                  _buildModerationChip(
+                                    'x${_toInt(p['product_quantity'])}',
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            '$workerName · $channel',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                              fontWeight: FontWeight.w700,
                             ),
                           ),
                         ),
-                      ),
-                      const SizedBox(height: 12),
-                    ],
-                    Text(
-                      title,
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      description,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _buildModerationChip(
-                          'ID: ${(p['product_code'] ?? '—').toString()}',
+                        const SizedBox(width: 8),
+                        FilledButton.tonalIcon(
+                          onPressed: _saving ? null : () => _editPendingPost(p),
+                          icon: const Icon(Icons.edit_outlined, size: 18),
+                          label: const Text('Изменить'),
                         ),
-                        _buildModerationChip(
-                          'Цена: ${_toInt(p['product_price']).toString()} RUB',
-                        ),
-                        _buildModerationChip(
-                          'Количество: ${_toInt(p['product_quantity'])}',
-                        ),
-                        _buildModerationChip('Работник: $workerName'),
-                        _buildModerationChip('Канал: $channel'),
                       ],
-                    ),
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: FilledButton.tonalIcon(
-                        onPressed: _saving ? null : () => _editPendingPost(p),
-                        icon: const Icon(Icons.edit_outlined),
-                        label: const Text('Изменить'),
-                      ),
                     ),
                   ],
                 ),

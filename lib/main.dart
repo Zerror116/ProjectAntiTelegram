@@ -452,6 +452,11 @@ Future<void> _initSocket() async {
       chatEventsController.add({'type': 'chat:message:deleted', 'data': data});
     });
 
+    socket?.on('chat:cleared', (data) {
+      debugPrint('📬 Socket event chat:cleared -> $data');
+      chatEventsController.add({'type': 'chat:cleared', 'data': data});
+    });
+
     socket?.on('chat:message:read', (data) {
       debugPrint('📬 Socket event chat:message:read -> $data');
       chatEventsController.add({'type': 'chat:message:read', 'data': data});
