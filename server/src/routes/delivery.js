@@ -6,6 +6,10 @@ const router = express.Router();
 const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
 const db = require("../db");
+const {
+  readEncryptedText,
+  writeEncryptedTextParams,
+} = require("../utils/secureData");
 
 const SAMARA_CENTER = { lat: 53.195878, lng: 50.100202 };
 const DELIVERY_DAY_START_MINUTES = 10 * 60;
@@ -17,6 +21,14 @@ const DELIVERY_DIALOG_AUTO_DELETE_MS = 60 * 1000;
 const DELIVERY_DIALOG_CLEANUP_INTERVAL_MS = 15 * 1000;
 const DEMO_USER_EMAIL_PREFIX = "phantom.delivery.";
 const DEMO_PRODUCT_TITLE_PREFIX = "[DEMO DELIVERY]";
+const GEOCODER_SEARCH_URL =
+  String(process.env.GEOCODER_SEARCH_URL || "").trim() ||
+  "https://nominatim.openstreetmap.org/search";
+const GEOCODER_USER_AGENT =
+  String(process.env.GEOCODER_USER_AGENT || "").trim() ||
+  "ProjectPhoenix/1.0 (delivery geocoder)";
+const GEOCODER_AUTH_HEADER = String(process.env.GEOCODER_AUTH_HEADER || "").trim();
+const GEOCODER_API_KEY = String(process.env.GEOCODER_API_KEY || "").trim();
 const DEMO_SAMARA_POINTS = [
   { name: "Анна", address: "Самара, Московское шоссе, 4к4", lat: 53.23327, lng: 50.18391 },
   { name: "Олег", address: "Самара, Ново-Садовая, 106", lat: 53.22794, lng: 50.16091 },
@@ -263,6 +275,38 @@ function normalizeWhitespace(value) {
     .trim();
 }
 
+function normalizeClockValue(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  const minutes = parseClockToMinutes(value);
+  if (minutes == null) return null;
+  return minutesToClock(minutes);
+}
+
+function decodeAddressFromRow(row) {
+  const value = readEncryptedText(row, "address");
+  return String(value || "").trim();
+}
+
+function buildAddressEncryption(addressText) {
+  return writeEncryptedTextParams(addressText);
+}
+
+function mapDeliverySlotRow(row) {
+  return {
+    id: row.id,
+    title: String(row.title || "").trim(),
+    from_time: normalizeClockValue(row.from_time),
+    to_time: normalizeClockValue(row.to_time),
+    sort_order: Number(row.sort_order) || 0,
+    is_active: row.is_active !== false,
+    is_system: row.is_system === true,
+    tenant_id: row.tenant_id || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
 function stripAddressServiceParts(addressText) {
   const normalized = normalizeWhitespace(addressText);
   if (!normalized) return "";
@@ -289,6 +333,9 @@ function normalizeLocalityName(raw) {
   const value = normalizeWhitespace(raw).toLowerCase();
   if (!value) return "Самара";
   if (value.includes("новик")) return "Новокуйбышевск";
+  if (value.includes("новак")) return "Новокуйбышевск";
+  if (value.includes("Новик")) return "Новокуйбышевск";
+  if (value.includes("Новак")) return "Новокуйбышевск";
   if (value.includes("новокуйб")) return "Новокуйбышевск";
   if (value.includes("самара")) return "Самара";
   if (value.includes("чапаевск")) return "Чапаевск";
@@ -363,14 +410,21 @@ async function geocodeDeliveryAddress(addressText) {
       countrycodes: "ru",
       "accept-language": "ru",
     });
+    if (GEOCODER_API_KEY) {
+      params.set("apikey", GEOCODER_API_KEY);
+    }
+    const headers = {
+      Accept: "application/json",
+    };
+    if (GEOCODER_USER_AGENT) {
+      headers["User-Agent"] = GEOCODER_USER_AGENT;
+    }
+    if (GEOCODER_AUTH_HEADER) {
+      headers.Authorization = GEOCODER_AUTH_HEADER;
+    }
     const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?${params.toString()}`,
-      {
-        headers: {
-          "User-Agent": "ProjectPhoenix/1.0 (delivery geocoder)",
-          Accept: "application/json",
-        },
-      },
+      `${GEOCODER_SEARCH_URL}?${params.toString()}`,
+      { headers },
     );
     if (!response.ok) {
       throw new Error(`Геокодер недоступен: ${response.status}`);
@@ -759,6 +813,7 @@ async function fetchBatchDetails(queryable, batchId) {
     ...mapBatchRow(batchQ.rows[0]),
     customers: customersQ.rows.map((row) => ({
       ...row,
+      address_text: decodeAddressFromRow(row),
       processed_sum: toMoney(row.processed_sum),
       agreed_sum: toMoney(row.agreed_sum),
       items: Array.isArray(row.items) ? row.items : [],
@@ -870,6 +925,9 @@ async function collectEligibleCustomers(queryable) {
             us.shelf_number,
             addr.id::text AS address_id,
             addr.address_text,
+            addr.address_ciphertext,
+            addr.address_iv,
+            addr.address_tag,
             addr.lat,
             addr.lng
      FROM cart_items c
@@ -879,6 +937,7 @@ async function collectEligibleCustomers(queryable) {
      LEFT JOIN user_shelves us ON us.user_id = c.user_id
      LEFT JOIN LATERAL (
        SELECT a.id, a.address_text, a.lat, a.lng
+              ,a.address_ciphertext, a.address_iv, a.address_tag
        FROM user_delivery_addresses a
        WHERE a.user_id = c.user_id
        ORDER BY a.is_default DESC, a.updated_at DESC
@@ -918,7 +977,7 @@ async function collectEligibleCustomers(queryable) {
         shelf_number:
           row.shelf_number == null ? null : Number(row.shelf_number) || null,
         address_id: row.address_id || null,
-        address_text: row.address_text || "",
+        address_text: decodeAddressFromRow(row) || "",
         lat: row.lat == null ? null : Number(row.lat),
         lng: row.lng == null ? null : Number(row.lng),
         processed_sum: 0,
@@ -1004,17 +1063,20 @@ async function createDeliveryBatch(queryable, settings, createdBy) {
 
   for (const candidate of candidates) {
     const batchCustomerId = uuidv4();
+    const encryptedAddress = buildAddressEncryption(candidate.address_text || "");
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
          id, batch_id, user_id, customer_name, customer_phone,
          processed_sum, processed_items_count, shelf_number,
-         address_id, address_text, lat, lng,
+         address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+         lat, lng,
          call_status, delivery_status, created_at, updated_at
        )
        VALUES (
          $1, $2, $3, $4, $5,
          $6, $7, $8,
-         $9, $10, $11, $12,
+         $9, NULL, $10, $11, $12, $13, $14,
+         $15, $16,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1027,7 +1089,11 @@ async function createDeliveryBatch(queryable, settings, createdBy) {
         candidate.processed_items_count,
         candidate.shelf_number,
         candidate.address_id,
-        candidate.address_text || null,
+        encryptedAddress.ciphertext,
+        encryptedAddress.iv,
+        encryptedAddress.tag,
+        encryptedAddress.version,
+        encryptedAddress.encryptedAt,
         candidate.lat,
         candidate.lng,
       ],
@@ -1084,6 +1150,7 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
     if (hasBlockingRow && !reusableRow) continue;
 
     if (reusableRow) {
+      const encryptedAddress = buildAddressEncryption(candidate.address_text || "");
       await queryable.query(
         `UPDATE delivery_batch_customers
          SET customer_name = $2,
@@ -1092,9 +1159,14 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
              processed_items_count = $5,
              shelf_number = $6,
              address_id = $7,
-             address_text = $8,
-             lat = $9,
-             lng = $10,
+             address_text = NULL,
+             address_ciphertext = $8,
+             address_iv = $9,
+             address_tag = $10,
+             address_encryption_version = $11,
+             address_encrypted_at = $12,
+             lat = $13,
+             lng = $14,
              call_status = 'pending',
              delivery_status = 'awaiting_call',
              courier_slot = NULL,
@@ -1118,7 +1190,11 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
           candidate.processed_items_count,
           candidate.shelf_number,
           candidate.address_id,
-          candidate.address_text || null,
+          encryptedAddress.ciphertext,
+          encryptedAddress.iv,
+          encryptedAddress.tag,
+          encryptedAddress.version,
+          encryptedAddress.encryptedAt,
           candidate.lat,
           candidate.lng,
         ],
@@ -1135,17 +1211,20 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
     }
 
     const batchCustomerId = uuidv4();
+    const encryptedAddress = buildAddressEncryption(candidate.address_text || "");
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
          id, batch_id, user_id, customer_name, customer_phone,
          processed_sum, processed_items_count, shelf_number,
-         address_id, address_text, lat, lng,
+         address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+         lat, lng,
          call_status, delivery_status, created_at, updated_at
        )
        VALUES (
          $1, $2, $3, $4, $5,
          $6, $7, $8,
-         $9, $10, $11, $12,
+         $9, NULL, $10, $11, $12, $13, $14,
+         $15, $16,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1158,7 +1237,11 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
         candidate.processed_items_count,
         candidate.shelf_number,
         candidate.address_id,
-        candidate.address_text || null,
+        encryptedAddress.ciphertext,
+        encryptedAddress.iv,
+        encryptedAddress.tag,
+        encryptedAddress.version,
+        encryptedAddress.encryptedAt,
         candidate.lat,
         candidate.lng,
       ],
@@ -1181,7 +1264,7 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
   return addedTotal;
 }
 
-async function ensureDeliveryChat(queryable, userId, createdBy) {
+async function ensureDeliveryChat(queryable, userId, createdBy, tenantId = null) {
   const settings = {
     kind: "delivery_dialog",
     visibility: "private",
@@ -1205,6 +1288,7 @@ async function ensureDeliveryChat(queryable, userId, createdBy) {
      FROM chats c
      JOIN chat_members cm ON cm.chat_id = c.id
      WHERE cm.user_id = $1
+       AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid OR c.tenant_id IS NULL)
        AND ${deliveryDialogWhere("c")}
      ORDER BY
        CASE
@@ -1220,7 +1304,7 @@ async function ensureDeliveryChat(queryable, userId, createdBy) {
        c.updated_at DESC NULLS LAST,
        c.created_at DESC,
        c.id DESC`,
-    [userId],
+    [userId, tenantId || null],
   );
   if (existingQ.rowCount > 0) {
     const [primary, ...duplicates] = existingQ.rows;
@@ -1244,10 +1328,11 @@ async function ensureDeliveryChat(queryable, userId, createdBy) {
     await queryable.query(
       `UPDATE chats
        SET title = 'Доставка',
+           tenant_id = COALESCE(tenant_id, $3::uuid),
            settings = $2::jsonb,
            updated_at = now()
        WHERE id = $1`,
-      [primary.id, JSON.stringify(settings)],
+      [primary.id, JSON.stringify(settings), tenantId || null],
     );
     const refreshedQ = await queryable.query(
       `SELECT id, title, type, settings, created_at, updated_at
@@ -1264,10 +1349,16 @@ async function ensureDeliveryChat(queryable, userId, createdBy) {
   }
 
   const chatInsert = await queryable.query(
-    `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
-     VALUES ($1, $2, 'private', $3, $4::jsonb, now(), now())
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, $2, 'private', $3, $4, $5::jsonb, now(), now())
      RETURNING id, title, type, settings, created_at, updated_at`,
-    [uuidv4(), "Доставка", createdBy || null, JSON.stringify(settings)],
+    [
+      uuidv4(),
+      "Доставка",
+      createdBy || null,
+      tenantId || null,
+      JSON.stringify(settings),
+    ],
   );
   const chat = chatInsert.rows[0];
   await queryable.query(
@@ -1797,6 +1888,235 @@ router.patch(
   },
 );
 
+router.get("/slots", requireAuth, async (req, res) => {
+  try {
+    const role = String(req.user?.role || "").toLowerCase().trim();
+    const allowAll = (role === "admin" || role === "creator") && String(req.query?.all || "") === "1";
+    const result = await db.query(
+      `SELECT id, tenant_id, title, from_time, to_time, sort_order, is_active, is_system, created_at, updated_at
+       FROM delivery_slot_presets
+       WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+         AND ($2::boolean = true OR is_active = true)
+       ORDER BY is_system DESC, sort_order ASC, created_at ASC`,
+      [req.user?.tenant_id || null, allowAll],
+    );
+    return res.json({
+      ok: true,
+      data: result.rows.map(mapDeliverySlotRow),
+    });
+  } catch (err) {
+    console.error("delivery.slots.list error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.post(
+  "/slots",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const title = String(req.body?.title || "").trim();
+    const fromTime = normalizeClockValue(req.body?.from_time);
+    const toTime = normalizeClockValue(req.body?.to_time);
+    const sortOrderRaw = Number(req.body?.sort_order);
+    const sortOrder = Number.isFinite(sortOrderRaw)
+      ? Math.max(1, Math.min(9999, Math.floor(sortOrderRaw)))
+      : 100;
+    const isActive = req.body?.is_active !== false;
+
+    if (title.length < 2 || title.length > 48) {
+      return res.status(400).json({
+        ok: false,
+        error: "Название слота должно быть от 2 до 48 символов",
+      });
+    }
+    if (!fromTime && !toTime) {
+      return res.status(400).json({
+        ok: false,
+        error: "Нужно указать время начала, окончания или оба значения",
+      });
+    }
+    if (fromTime && toTime) {
+      const fromMinutes = parseClockToMinutes(fromTime);
+      const toMinutes = parseClockToMinutes(toTime);
+      if (
+        fromMinutes == null ||
+        toMinutes == null ||
+        fromMinutes >= toMinutes
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Время начала должно быть раньше времени окончания",
+        });
+      }
+    }
+
+    try {
+      const created = await db.query(
+        `INSERT INTO delivery_slot_presets (
+           id, tenant_id, title, from_time, to_time, sort_order,
+           is_active, is_system, created_by, created_at, updated_at
+         )
+         VALUES (
+           $1, $2, $3, $4, $5, $6,
+           $7, false, $8, now(), now()
+         )
+         RETURNING id, tenant_id, title, from_time, to_time, sort_order, is_active, is_system, created_at, updated_at`,
+        [
+          uuidv4(),
+          req.user?.tenant_id || null,
+          title,
+          fromTime,
+          toTime,
+          sortOrder,
+          isActive,
+          req.user?.id || null,
+        ],
+      );
+      return res.status(201).json({
+        ok: true,
+        data: mapDeliverySlotRow(created.rows[0]),
+      });
+    } catch (err) {
+      console.error("delivery.slots.create error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/slots/:slotId",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const slotId = String(req.params?.slotId || "").trim();
+    if (!slotId) {
+      return res.status(400).json({ ok: false, error: "slotId обязателен" });
+    }
+
+    try {
+      const existingQ = await db.query(
+        `SELECT id, tenant_id, is_system, title, from_time, to_time, sort_order, is_active
+         FROM delivery_slot_presets
+         WHERE id = $1
+         LIMIT 1`,
+        [slotId],
+      );
+      if (existingQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Слот не найден" });
+      }
+      const existing = existingQ.rows[0];
+      if (existing.is_system === true || existing.tenant_id == null) {
+        return res.status(403).json({
+          ok: false,
+          error: "Системный слот нельзя изменять напрямую",
+        });
+      }
+      if (String(existing.tenant_id) !== String(req.user?.tenant_id || "")) {
+        return res.status(403).json({ ok: false, error: "Нет доступа" });
+      }
+
+      const nextTitle = Object.prototype.hasOwnProperty.call(req.body || {}, "title")
+        ? String(req.body?.title || "").trim()
+        : String(existing.title || "").trim();
+      const nextFrom = Object.prototype.hasOwnProperty.call(req.body || {}, "from_time")
+        ? normalizeClockValue(req.body?.from_time)
+        : normalizeClockValue(existing.from_time);
+      const nextTo = Object.prototype.hasOwnProperty.call(req.body || {}, "to_time")
+        ? normalizeClockValue(req.body?.to_time)
+        : normalizeClockValue(existing.to_time);
+      const nextSortOrder = Object.prototype.hasOwnProperty.call(req.body || {}, "sort_order")
+        ? Math.max(1, Math.min(9999, Math.floor(Number(req.body?.sort_order) || 100)))
+        : Number(existing.sort_order) || 100;
+      const nextIsActive = Object.prototype.hasOwnProperty.call(req.body || {}, "is_active")
+        ? req.body?.is_active === true
+        : existing.is_active !== false;
+
+      if (nextTitle.length < 2 || nextTitle.length > 48) {
+        return res.status(400).json({
+          ok: false,
+          error: "Название слота должно быть от 2 до 48 символов",
+        });
+      }
+      if (!nextFrom && !nextTo) {
+        return res.status(400).json({
+          ok: false,
+          error: "Нужно указать время начала, окончания или оба значения",
+        });
+      }
+      if (nextFrom && nextTo) {
+        const fromMinutes = parseClockToMinutes(nextFrom);
+        const toMinutes = parseClockToMinutes(nextTo);
+        if (
+          fromMinutes == null ||
+          toMinutes == null ||
+          fromMinutes >= toMinutes
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error: "Время начала должно быть раньше времени окончания",
+          });
+        }
+      }
+
+      const updated = await db.query(
+        `UPDATE delivery_slot_presets
+         SET title = $1,
+             from_time = $2,
+             to_time = $3,
+             sort_order = $4,
+             is_active = $5,
+             updated_at = now()
+         WHERE id = $6
+         RETURNING id, tenant_id, title, from_time, to_time, sort_order, is_active, is_system, created_at, updated_at`,
+        [nextTitle, nextFrom, nextTo, nextSortOrder, nextIsActive, slotId],
+      );
+      return res.json({
+        ok: true,
+        data: mapDeliverySlotRow(updated.rows[0]),
+      });
+    } catch (err) {
+      console.error("delivery.slots.patch error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.delete(
+  "/slots/:slotId",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const slotId = String(req.params?.slotId || "").trim();
+    if (!slotId) {
+      return res.status(400).json({ ok: false, error: "slotId обязателен" });
+    }
+
+    try {
+      const updated = await db.query(
+        `UPDATE delivery_slot_presets
+         SET is_active = false,
+             updated_at = now()
+         WHERE id = $1
+           AND tenant_id = $2
+           AND is_system = false
+         RETURNING id`,
+        [slotId, req.user?.tenant_id || null],
+      );
+      if (updated.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Слот не найден или недоступен для удаления",
+        });
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("delivery.slots.delete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 router.post(
   "/batches/generate",
   requireAuth,
@@ -1930,7 +2250,12 @@ router.post(
       });
 
       for (const customer of targetCustomers) {
-        const ensured = await ensureDeliveryChat(client, customer.user_id, req.user.id);
+        const ensured = await ensureDeliveryChat(
+          client,
+          customer.user_id,
+          req.user.id,
+          req.user.tenant_id || null,
+        );
         const chat = ensured.chat;
         const meta = {
           kind: "delivery_offer",
@@ -2177,13 +2502,29 @@ router.post(
            VALUES ($1, $2, now(), now())`,
           [userId, 200 + i],
         );
+        const encryptedAddress = buildAddressEncryption(point.address);
         await client.query(
           `INSERT INTO user_delivery_addresses (
-             id, user_id, label, address_text, lat, lng,
-             is_default, created_at, updated_at
+             id, user_id, label, address_text,
+             address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+             lat, lng, is_default, created_at, updated_at
            )
-           VALUES ($1, $2, 'Тестовый адрес', $3, $4, $5, true, now(), now())`,
-          [uuidv4(), userId, point.address, point.lat, point.lng],
+           VALUES (
+             $1, $2, 'Тестовый адрес', NULL,
+             $3, $4, $5, $6, $7,
+             $8, $9, true, now(), now()
+           )`,
+          [
+            uuidv4(),
+            userId,
+            encryptedAddress.ciphertext,
+            encryptedAddress.iv,
+            encryptedAddress.tag,
+            encryptedAddress.version,
+            encryptedAddress.encryptedAt,
+            point.lat,
+            point.lng,
+          ],
         );
 
         const product = demoProducts[i % demoProducts.length];
@@ -2304,11 +2645,16 @@ router.post(
         return res.status(400).json({ ok: false, error: "Ответ уже сохранен" });
       }
 
-      const ensured = await ensureDeliveryChat(client, customer.user_id, null);
+      const ensured = await ensureDeliveryChat(
+        client,
+        customer.user_id,
+        null,
+        req.user.tenant_id || null,
+      );
       const chat = ensured.chat;
       let addressId = customer.address_id ? String(customer.address_id) : null;
       let nextAddressText =
-        addressText || String(customer.address_text || "").trim();
+        addressText || decodeAddressFromRow(customer);
       let nextLat = Number.isFinite(lat) ? lat : customer.lat;
       let nextLng = Number.isFinite(lng) ? lng : customer.lng;
 
@@ -2334,37 +2680,63 @@ router.post(
            WHERE user_id = $1`,
           [customer.user_id],
         );
+        const encryptedAddress = buildAddressEncryption(nextAddressText);
         const addressInsert = await client.query(
           `INSERT INTO user_delivery_addresses (
-             id, user_id, label, address_text, lat, lng,
-             is_default, created_at, updated_at
+             id, user_id, label, address_text,
+             address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+             lat, lng, is_default, created_at, updated_at
            )
-           VALUES ($1, $2, 'Основной адрес', $3, $4, $5, true, now(), now())
+           VALUES (
+             $1, $2, 'Основной адрес', NULL,
+             $3, $4, $5, $6, $7,
+             $8, $9, true, now(), now()
+           )
            RETURNING id`,
-          [uuidv4(), customer.user_id, nextAddressText || null, nextLat, nextLng],
+          [
+            uuidv4(),
+            customer.user_id,
+            encryptedAddress.ciphertext,
+            encryptedAddress.iv,
+            encryptedAddress.tag,
+            encryptedAddress.version,
+            encryptedAddress.encryptedAt,
+            nextLat,
+            nextLng,
+          ],
         );
         addressId = String(addressInsert.rows[0].id);
       }
 
+      const customerEncryptedAddress = buildAddressEncryption(nextAddressText || "");
       await client.query(
         `UPDATE delivery_batch_customers
          SET call_status = $1,
              delivery_status = $2,
              address_id = $3,
-             address_text = $4,
-             lat = $5,
-             lng = $6,
-             preferred_time_from = $7,
-             preferred_time_to = $8,
+             address_text = NULL,
+             address_ciphertext = $4,
+             address_iv = $5,
+             address_tag = $6,
+             address_encryption_version = $7,
+             address_encrypted_at = $8,
+             lat = $9,
+             lng = $10,
+             preferred_time_from = $11,
+             preferred_time_to = $12,
              accepted_at = CASE WHEN $1 = 'accepted' THEN now() ELSE accepted_at END,
              agreed_sum = CASE WHEN $1 = 'accepted' THEN processed_sum ELSE agreed_sum END,
              updated_at = now()
-         WHERE id = $9`,
+         WHERE id = $13`,
         [
           accepted ? "accepted" : "declined",
           accepted ? "preparing_delivery" : "declined",
           addressId,
-          nextAddressText || null,
+          customerEncryptedAddress.ciphertext,
+          customerEncryptedAddress.iv,
+          customerEncryptedAddress.tag,
+          customerEncryptedAddress.version,
+          customerEncryptedAddress.encryptedAt,
           nextLat,
           nextLng,
           preferredWindow.fromText,
@@ -2604,10 +2976,15 @@ router.post(
         });
       }
       let addressId = customer.address_id ? String(customer.address_id) : null;
-      let nextAddressText = addressText || String(customer.address_text || "").trim();
+      let nextAddressText = addressText || decodeAddressFromRow(customer);
       let nextLat = Number.isFinite(lat) ? lat : customer.lat;
       let nextLng = Number.isFinite(lng) ? lng : customer.lng;
-      const ensured = await ensureDeliveryChat(client, customer.user_id, req.user.id);
+      const ensured = await ensureDeliveryChat(
+        client,
+        customer.user_id,
+        req.user.id,
+        req.user.tenant_id || null,
+      );
       const chat = ensured.chat;
 
       if (accepted && addressText.length > 0 && (!Number.isFinite(lat) || !Number.isFinite(lng))) {
@@ -2633,38 +3010,64 @@ router.post(
              WHERE user_id = $1`,
             [customer.user_id],
           );
+          const encryptedAddress = buildAddressEncryption(nextAddressText);
           const addressInsert = await client.query(
             `INSERT INTO user_delivery_addresses (
-               id, user_id, label, address_text, lat, lng,
-               is_default, created_at, updated_at
+               id, user_id, label, address_text,
+               address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+               lat, lng, is_default, created_at, updated_at
              )
-             VALUES ($1, $2, 'Основной адрес', $3, $4, $5, true, now(), now())
+             VALUES (
+               $1, $2, 'Основной адрес', NULL,
+               $3, $4, $5, $6, $7,
+               $8, $9, true, now(), now()
+             )
              RETURNING id`,
-            [uuidv4(), customer.user_id, nextAddressText || null, nextLat, nextLng],
+            [
+              uuidv4(),
+              customer.user_id,
+              encryptedAddress.ciphertext,
+              encryptedAddress.iv,
+              encryptedAddress.tag,
+              encryptedAddress.version,
+              encryptedAddress.encryptedAt,
+              nextLat,
+              nextLng,
+            ],
           );
           addressId = String(addressInsert.rows[0].id);
         }
       }
 
+      const customerEncryptedAddress = buildAddressEncryption(nextAddressText || "");
       await client.query(
         `UPDATE delivery_batch_customers
          SET call_status = $1,
              delivery_status = $2,
              address_id = $3,
-             address_text = $4,
-             lat = $5,
-             lng = $6,
-             preferred_time_from = $7,
-             preferred_time_to = $8,
+             address_text = NULL,
+             address_ciphertext = $4,
+             address_iv = $5,
+             address_tag = $6,
+             address_encryption_version = $7,
+             address_encrypted_at = $8,
+             lat = $9,
+             lng = $10,
+             preferred_time_from = $11,
+             preferred_time_to = $12,
              accepted_at = CASE WHEN $1 = 'accepted' THEN now() ELSE accepted_at END,
              agreed_sum = CASE WHEN $1 = 'accepted' THEN processed_sum ELSE agreed_sum END,
              updated_at = now()
-         WHERE id = $9`,
+         WHERE id = $13`,
         [
           accepted ? "accepted" : "declined",
           accepted ? "preparing_delivery" : "declined",
           addressId,
-          nextAddressText || null,
+          customerEncryptedAddress.ciphertext,
+          customerEncryptedAddress.iv,
+          customerEncryptedAddress.tag,
+          customerEncryptedAddress.version,
+          customerEncryptedAddress.encryptedAt,
           nextLat,
           nextLng,
           preferredWindow.fromText,
@@ -3106,32 +3509,49 @@ router.post(
          WHERE user_id = $1`,
         [user.user_id],
       );
+      const encryptedAddress = buildAddressEncryption(geocoded.address_text);
       const addressInsert = await client.query(
         `INSERT INTO user_delivery_addresses (
-           id, user_id, label, address_text, lat, lng,
-           is_default, created_at, updated_at
+           id, user_id, label, address_text,
+           address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+           lat, lng, is_default, created_at, updated_at
          )
-         VALUES ($1, $2, 'Основной адрес', $3, $4, $5, true, now(), now())
+         VALUES (
+           $1, $2, 'Основной адрес', NULL,
+           $3, $4, $5, $6, $7,
+           $8, $9, true, now(), now()
+         )
          RETURNING id`,
-        [uuidv4(), user.user_id, geocoded.address_text, geocoded.lat, geocoded.lng],
+        [
+          uuidv4(),
+          user.user_id,
+          encryptedAddress.ciphertext,
+          encryptedAddress.iv,
+          encryptedAddress.tag,
+          encryptedAddress.version,
+          encryptedAddress.encryptedAt,
+          geocoded.lat,
+          geocoded.lng,
+        ],
       );
       const addressId = String(addressInsert.rows[0].id);
       const batchCustomerId = uuidv4();
 
+      const batchEncryptedAddress = buildAddressEncryption(geocoded.address_text);
       await client.query(
         `INSERT INTO delivery_batch_customers (
            id, batch_id, user_id, customer_name, customer_phone,
            processed_sum, agreed_sum, processed_items_count, shelf_number,
-           address_id, address_text, lat, lng,
+           address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at, lat, lng,
            call_status, delivery_status, preferred_time_from, preferred_time_to,
            package_places, bulky_places, bulky_note, accepted_at, created_at, updated_at
          )
          VALUES (
            $1, $2, $3, $4, $5,
            $6, $6, $7, $8,
-           $9, $10, $11, $12,
-           'accepted', 'preparing_delivery', $13, $14,
-           $15, $16, $17, now(), now(), now()
+           $9, NULL, $10, $11, $12, $13, $14, $15, $16,
+           'accepted', 'preparing_delivery', $17, $18,
+           $19, $20, $21, now(), now(), now()
          )`,
         [
           batchCustomerId,
@@ -3143,7 +3563,11 @@ router.post(
           eligible.processed_items_count,
           eligible.shelf_number,
           addressId,
-          geocoded.address_text,
+          batchEncryptedAddress.ciphertext,
+          batchEncryptedAddress.iv,
+          batchEncryptedAddress.tag,
+          batchEncryptedAddress.version,
+          batchEncryptedAddress.encryptedAt,
           geocoded.lat,
           geocoded.lng,
           preferredWindow.fromText,
@@ -3196,7 +3620,12 @@ router.post(
         [batchCustomerId],
       );
 
-      const ensured = await ensureDeliveryChat(client, user.user_id, req.user.id);
+      const ensured = await ensureDeliveryChat(
+        client,
+        user.user_id,
+        req.user.id,
+        req.user.tenant_id || null,
+      );
       const chat = ensured.chat;
       const followUpInsert = await client.query(
         `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
@@ -3733,6 +4162,9 @@ router.get(
                 agreed_sum,
                 processed_sum,
                 address_text,
+                address_ciphertext,
+                address_iv,
+                address_tag,
                 courier_code,
                 bulky_note,
                 shelf_number,
@@ -3792,7 +4224,7 @@ router.get(
               customer.package_places == null ? 1 : Number(customer.package_places),
           });
           const addressCell = row.getCell("address_text");
-          const addressText = String(customer.address_text || "").trim();
+          const addressText = decodeAddressFromRow(customer);
           const preferenceLabel = formatDeliveryPreferenceLabel(
             customer.preferred_time_from,
             customer.preferred_time_to,

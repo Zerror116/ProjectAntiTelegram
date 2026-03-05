@@ -31,8 +31,9 @@ const deliveryRoutes = require("./routes/delivery");
 const workerRoutes = require("./routes/worker");
 const cartRoutes = require("./routes/cart");
 const supportRoutes = require("./routes/support");
-const { authMiddleware } = require("./utils/auth");
+const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
+const { logMonitoringEvent } = require("./utils/monitoring");
 
 // ===================================
 // MIDDLEWARE И КОНФИГУРАЦИЯ
@@ -200,6 +201,25 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   const status = err.status || err.statusCode || 500;
+  void logMonitoringEvent({
+    queryable: db,
+    tenantId: req.user?.tenant_id || null,
+    userId: req.user?.id || null,
+    scope: "http",
+    level: status >= 500 ? "error" : "warn",
+    code: "unhandled_http_error",
+    source: `${req.method} ${req.path}`,
+    message: err?.message || "Unhandled server error",
+    details: {
+      status,
+      method: req.method,
+      path: req.path,
+      stack:
+        process.env.NODE_ENV === "development"
+          ? String(err?.stack || "")
+          : undefined,
+    },
+  });
   res.status(status).json({
     error: "Server error",
     message: err.message,
@@ -239,14 +259,18 @@ async function ensureCreator() {
 
 async function canUserAccessChat(user, chatId) {
   const userId = user?.id;
+  const tenantId = user?.tenant_id || null;
   const role = String(user?.role || "client")
     .toLowerCase()
     .trim();
   if (!userId || !chatId) return false;
 
   const chatQ = await db.query(
-    "SELECT id, title, type, settings FROM chats WHERE id = $1",
-    [chatId],
+    `SELECT id, title, type, settings
+     FROM chats
+     WHERE id = $1
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)`,
+    [chatId, tenantId],
   );
   if (chatQ.rowCount === 0) return false;
 
@@ -351,7 +375,8 @@ async function canUserAccessChat(user, chatId) {
         methods: ["GET", "POST"],
         credentials: false,
       },
-      transports: ["websocket", "polling"],
+      allowEIO3: true,
+      transports: ["websocket"],
     });
 
     // Делаем io доступным в express
@@ -368,54 +393,27 @@ async function canUserAccessChat(user, chatId) {
     /**
      * Аутентификация сокета по JWT токену
      */
-    io.use((socket, next) => {
+    io.use(async (socket, next) => {
       try {
         const token =
           socket.handshake.auth?.token || socket.handshake.query?.token;
         if (!token) return next(new Error("Unauthorized"));
 
-        try {
-          const payload = jwt.verify(token, JWT_SECRET);
-          const userId = payload.id || payload.userId || payload.sub;
-          if (!userId) return next(new Error("Unauthorized"));
-          const baseRole = String(payload.role || "client")
-            .toLowerCase()
-            .trim();
-          const requestedViewRole = String(
-            socket.handshake.auth?.view_role || "",
-          )
-            .toLowerCase()
-            .trim();
-          const allowedViewRoles = new Set([
-            "client",
-            "worker",
-            "admin",
-            "creator",
-          ]);
-          const effectiveRole =
-            baseRole === "creator" &&
-            allowedViewRoles.has(requestedViewRole) &&
-            requestedViewRole
-              ? requestedViewRole
-              : baseRole;
-          socket.user = {
-            ...payload,
-            id: userId,
-            role: effectiveRole,
-            base_role: baseRole,
-            effective_role: effectiveRole,
-            view_role: effectiveRole !== baseRole ? effectiveRole : null,
-          };
-          console.log(
-            `Socket ${socket.id} authenticated as user ${payload.id} (role=${effectiveRole})`,
-          );
-        } catch (err) {
+        const context = await resolveAuthContextFromToken(
+          token,
+          socket.handshake.auth?.view_role || "",
+        );
+        if (!context.ok || !context.user?.id) {
           console.warn(
-            `Socket ${socket.id} token verification failed:`,
-            err.message,
+            `Socket ${socket.id} auth denied:`,
+            context.error || "Unauthorized",
           );
-          return next(new Error("Unauthorized"));
+          return next(new Error(context.error || "Unauthorized"));
         }
+        socket.user = context.user;
+        console.log(
+          `Socket ${socket.id} authenticated as user ${context.user.id} (role=${context.user.role})`,
+        );
         return next();
       } catch (err) {
         console.error("io.use middleware error:", err);
@@ -436,28 +434,8 @@ async function canUserAccessChat(user, chatId) {
         console.log(`Socket ${sid} joined user:${uid}`);
       }
 
-      // ✅ ИСПРАВЛЕНИЕ: Если юзер залогинился, очисти его старые сокеты
-      if (uid) {
-        // Получи все сокеты этого юзера
-        const userSockets = io.sockets.sockets;
-        let socketCount = 0;
-
-        for (const [existingSid, existingSocket] of userSockets) {
-          if (existingSocket.user?.id === uid && existingSid !== sid) {
-            console.log(
-              `🔌 Disconnecting old socket ${existingSid} for user ${uid}`,
-            );
-            existingSocket.disconnect(true); // true = отправи клиенту disconnect событие
-            socketCount++;
-          }
-        }
-
-        if (socketCount > 0) {
-          console.log(
-            `✅ Cleaned up ${socketCount} old socket(s) for user ${uid}`,
-          );
-        }
-      }
+      // Для тестов/мультисессии (например, creator + client view на одном устройстве)
+      // разрешаем несколько активных сокетов одного пользователя.
 
       // Присоединение к комнате чата
       socket.on("join_chat", async (chatId) => {
@@ -530,6 +508,19 @@ async function canUserAccessChat(user, chatId) {
       // Обработчик ошибок сокета
       socket.on("error", (error) => {
         console.error(`Socket ${sid} error:`, error);
+        void logMonitoringEvent({
+          queryable: db,
+          tenantId: socket.user?.tenant_id || null,
+          userId: socket.user?.id || null,
+          scope: "socket",
+          level: "error",
+          code: "socket_runtime_error",
+          source: "socket.on(error)",
+          message: String(error?.message || error || "Socket runtime error"),
+          details: {
+            socket_id: sid,
+          },
+        });
       });
 
       // ✅ Логирование всех событий для отладки (опционально)
@@ -544,6 +535,17 @@ async function canUserAccessChat(user, chatId) {
     });
 
     // Запуск сервера
+    server.on("error", (err) => {
+      if (err?.code === "EADDRINUSE") {
+        console.error(
+          `❌ Порт ${PORT} уже занят. Остановите предыдущий сервер или запустите с другим PORT.`,
+        );
+        process.exit(1);
+      }
+      console.error("❌ HTTP server error:", err);
+      process.exit(1);
+    });
+
     server.listen(PORT, "0.0.0.0", () => {
       console.log(`\n✅ Server listening on http://0.0.0.0:${PORT}`);
       console.log(`📝 Environment: ${process.env.NODE_ENV || "development"}`);

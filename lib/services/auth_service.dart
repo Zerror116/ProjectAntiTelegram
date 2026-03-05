@@ -49,6 +49,7 @@ class AuthService {
   // Temporary storage for multi-step registration
   String? pendingEmail;
   String? pendingPassword;
+  String? pendingAccessKey;
 
   // Current authenticated user (populated after login / profile fetch)
   User? _currentUser;
@@ -128,6 +129,7 @@ class AuthService {
       _setAuthHeader(null);
       pendingEmail = null;
       pendingPassword = null;
+      pendingAccessKey = null;
       _currentUser = null;
       _viewRole = null;
 
@@ -220,12 +222,15 @@ class AuthService {
   Future<Map<String, dynamic>> login({
     required String email,
     required String password,
+    String? accessKey,
   }) async {
     debugPrint('🔓 login called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
     final resp = await dio.post('/api/auth/login', data: {
       'email': email,
       'password': password,
+      if (accessKey != null && accessKey.trim().isNotEmpty)
+        'access_key': accessKey.trim(),
       if (fingerprint != null) 'device_fingerprint': fingerprint,
     });
     debugPrint('📬 login response received, status: ${resp.statusCode}');
@@ -234,6 +239,7 @@ class AuthService {
 
     pendingEmail = null;
     pendingPassword = null;
+    pendingAccessKey = null;
     debugPrint('✅ login complete');
     return {'access': resp.data['token'] ?? resp.data['access'], 'user': _currentUser?.toMap()};
   }
@@ -244,6 +250,7 @@ class AuthService {
     required String password,
     String? name,
     String? phone,
+    String? accessKey,
     String? secret, // для special creator email
   }) async {
     debugPrint('✍️ register called with email: $email');
@@ -251,6 +258,8 @@ class AuthService {
     final resp = await dio.post('/api/auth/register', data: {
       'email': email,
       'password': password,
+      if (accessKey != null && accessKey.trim().isNotEmpty)
+        'access_key': accessKey.trim(),
       if (name != null) 'name': name,
       if (phone != null) 'phone': phone,
       if (secret != null) 'secret': secret,
@@ -262,14 +271,20 @@ class AuthService {
 
     pendingEmail = null;
     pendingPassword = null;
+    pendingAccessKey = null;
     debugPrint('✅ register complete');
     return {'access': resp.data['token'] ?? resp.data['access'], 'user': _currentUser?.toMap()};
   }
 
   /// Устанавливаем временные данные при первом шаге регистрации
-  void setPendingCredentials({required String email, required String password}) {
+  void setPendingCredentials({
+    required String email,
+    required String password,
+    String? accessKey,
+  }) {
     pendingEmail = email;
     pendingPassword = password;
+    pendingAccessKey = accessKey?.trim();
     debugPrint('📋 AuthService.setPendingCredentials -> email saved');
   }
 
@@ -282,6 +297,8 @@ class AuthService {
     final resp = await dio.post('/api/auth/register', data: {
       'email': pendingEmail,
       'password': pendingPassword,
+      if (pendingAccessKey != null && pendingAccessKey!.trim().isNotEmpty)
+        'access_key': pendingAccessKey!.trim(),
       'name': name,
       'phone': phone,
       if (secret != null) 'secret': secret,
@@ -291,6 +308,7 @@ class AuthService {
     await _processAuthResponse(resp);
     pendingEmail = null;
     pendingPassword = null;
+    pendingAccessKey = null;
   }
 
   bool hasAnyRole(List<String> roles) => _currentUser != null && roles.contains(_currentUser!.role);

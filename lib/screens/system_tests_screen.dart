@@ -20,6 +20,9 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
   @override
   void initState() {
     super.initState();
+    if ((authService.effectiveRole).toLowerCase().trim() != 'creator') {
+      return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadDeliverySnapshot();
     });
@@ -131,11 +134,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
       }
     } catch (e) {
       if (!mounted) return;
-      showAppNotice(
-        context,
-        'Ошибка доставки: $e',
-        tone: AppNoticeTone.error,
-      );
+      showAppNotice(context, 'Ошибка доставки: $e', tone: AppNoticeTone.error);
     } finally {
       if (mounted) {
         setState(() => _deliveryBusy = false);
@@ -149,11 +148,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
       await authService.dio.post('/api/admin/delivery/reset');
       await _loadDeliverySnapshot();
       if (!mounted) return;
-      showAppNotice(
-        context,
-        'Доставка очищена',
-        tone: AppNoticeTone.warning,
-      );
+      showAppNotice(context, 'Доставка очищена', tone: AppNoticeTone.warning);
     } catch (e) {
       if (!mounted) return;
       showAppNotice(
@@ -367,7 +362,9 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
               FilledButton.tonalIcon(
                 onPressed: _deliveryBusy ? null : _loadDeliverySnapshot,
                 icon: const Icon(Icons.refresh_rounded),
-                label: Text(_deliveryBusy ? 'Проверяем...' : 'Проверить доставку'),
+                label: Text(
+                  _deliveryBusy ? 'Проверяем...' : 'Проверить доставку',
+                ),
               ),
               FilledButton.tonalIcon(
                 onPressed: _deliveryBusy ? null : _resetDeliverySnapshot,
@@ -375,12 +372,16 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
                 label: const Text('Очистить доставку'),
               ),
               FilledButton.tonalIcon(
-                onPressed: _deliveryBusy ? null : () => _seedDeliveryClients(10),
+                onPressed: _deliveryBusy
+                    ? null
+                    : () => _seedDeliveryClients(10),
                 icon: const Icon(Icons.group_add_outlined),
                 label: const Text('Добавить 10 клиентов'),
               ),
               FilledButton.tonalIcon(
-                onPressed: _deliveryBusy ? null : () => _seedDeliveryClients(20),
+                onPressed: _deliveryBusy
+                    ? null
+                    : () => _seedDeliveryClients(20),
                 icon: const Icon(Icons.groups_2_outlined),
                 label: const Text('Добавить 20 клиентов'),
               ),
@@ -446,6 +447,17 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if ((authService.effectiveRole).toLowerCase().trim() != 'creator') {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Тесты')),
+        body: const SafeArea(
+          child: Center(
+            child: Text('Вкладка тестов доступна только в режиме создателя'),
+          ),
+        ),
+      );
+    }
+
     final theme = Theme.of(context);
 
     return Scaffold(

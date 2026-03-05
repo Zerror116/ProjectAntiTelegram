@@ -126,6 +126,8 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           'password': authService.pendingPassword,
           'name': name,
           'phone': apiPhone,
+          if ((authService.pendingAccessKey ?? '').trim().isNotEmpty)
+            'access_key': authService.pendingAccessKey!.trim(),
         };
         if (_isCreatorPending) data['secret'] = secret;
 
@@ -143,7 +145,11 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         await authService.applyLoginResponse(token as String, respData['user'] as Map<String, dynamic>?);
 
         // Очистим pending
-        try { authService.pendingEmail = null; authService.pendingPassword = null; } catch (_) {}
+        try {
+          authService.pendingEmail = null;
+          authService.pendingPassword = null;
+          authService.pendingAccessKey = null;
+        } catch (_) {}
 
         if (!mounted) return;
         Navigator.of(context).pushReplacementNamed('/main');

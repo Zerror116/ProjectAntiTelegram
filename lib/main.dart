@@ -7,7 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:socket_io_client/socket_io_client.dart' as io;
 
 import 'screens/auth_screen.dart';
 import 'screens/phone_name_screen.dart';
@@ -22,7 +22,7 @@ final Dio dio = Dio(BaseOptions(baseUrl: 'http://127.0.0.1:3000'));
 late final AuthService authService;
 
 // Socket and event bus for chat events
-IO.Socket? socket;
+io.Socket? socket;
 final StreamController<Map<String, dynamic>> chatEventsController =
     StreamController.broadcast();
 final ValueNotifier<bool> notificationsEnabledNotifier = ValueNotifier(true);
@@ -39,6 +39,9 @@ String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
 final AudioPlayer _appSoundPlayer = AudioPlayer();
 bool _appSoundPlayerPrepared = false;
+bool _socketInitInProgress = false;
+String? _socketBoundUserId;
+String? _socketBoundViewRole;
 
 enum AppNoticeTone { info, success, warning, error }
 
@@ -268,12 +271,17 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
 // ✅ Функция для безопасного отключения socket
 Future<void> disconnectSocket() async {
   try {
-    if (socket != null && socket!.connected) {
+    if (socket != null) {
       debugPrint('🔌 Disconnecting socket...');
       socket!.disconnect();
-      socket = null;
-      debugPrint('✅ Socket disconnected');
+      try {
+        socket!.dispose();
+      } catch (_) {}
     }
+    socket = null;
+    _socketBoundUserId = null;
+    _socketBoundViewRole = null;
+    debugPrint('✅ Socket disconnected');
   } catch (e) {
     debugPrint('❌ Error disconnecting socket: $e');
   }
@@ -324,7 +332,8 @@ void _attachAuthInterceptor() {
             options.headers.remove('Authorization');
           }
           final viewRole = authService.viewRole?.trim();
-          if ((authService.currentUser?.role.toLowerCase().trim() ?? '') == 'creator' &&
+          if ((authService.currentUser?.role.toLowerCase().trim() ?? '') ==
+                  'creator' &&
               viewRole != null &&
               viewRole.isNotEmpty) {
             options.headers['X-View-Role'] = viewRole;
@@ -379,38 +388,58 @@ void _attachAuthInterceptor() {
 
 // ✅ ИСПРАВЛЕННАЯ инициализация Socket
 Future<void> _initSocket() async {
+  if (_socketInitInProgress) {
+    debugPrint('⏳ _initSocket skipped: initialization already in progress');
+    return;
+  }
+
+  final userId = authService.currentUser?.id.trim();
+  if (userId == null || userId.isEmpty) {
+    debugPrint('⏭️ _initSocket skipped: no authenticated user');
+    return;
+  }
+
+  final currentRole = authService.currentUser?.role.toLowerCase().trim() ?? '';
+  final viewRole = currentRole == 'creator'
+      ? authService.viewRole?.trim()
+      : null;
+
+  final sameBinding =
+      _socketBoundUserId == userId &&
+      (_socketBoundViewRole ?? '') == (viewRole ?? '');
+  if (socket != null && socket!.connected && sameBinding) {
+    debugPrint('✅ _initSocket skipped: socket already connected');
+    return;
+  }
+
+  _socketInitInProgress = true;
   try {
     debugPrint('🚀 Initializing socket...');
 
-    // ✅ Закрой старое соединение, если оно есть
-    try {
-      if (socket != null && socket!.connected) {
-        debugPrint('🔌 Closing old socket connection...');
-        socket!.disconnect();
-      }
-      socket = null;
-    } catch (_) {
-      socket = null;
-    }
-
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('auth_token');
-    final currentRole = authService.currentUser?.role.toLowerCase().trim() ?? '';
-    final viewRole = authService.viewRole?.trim();
-    final socketAuth = <String, dynamic>{'token': token ?? ''};
+    if (token == null || token.trim().isEmpty) {
+      debugPrint('⏭️ _initSocket skipped: empty auth token');
+      return;
+    }
+
+    await disconnectSocket();
+    final socketAuth = <String, dynamic>{'token': token};
     if (currentRole == 'creator' && viewRole != null && viewRole.isNotEmpty) {
       socketAuth['view_role'] = viewRole;
     }
 
     // Build options
-    socket = IO.io(
+    socket = io.io(
       'http://127.0.0.1:3000',
-      IO.OptionBuilder()
+      io.OptionBuilder()
           .setTransports(['websocket'])
-          .enableAutoConnect()
+          .disableAutoConnect()
           .setAuth(socketAuth)
           .build(),
     );
+    _socketBoundUserId = userId;
+    _socketBoundViewRole = viewRole ?? '';
 
     socket?.on('connect', (_) {
       debugPrint('✅ Socket connected: ${socket?.id}');
@@ -438,6 +467,11 @@ Future<void> _initSocket() async {
     socket?.on('chat:updated', (data) {
       debugPrint('📬 Socket event chat:updated -> $data');
       chatEventsController.add({'type': 'chat:updated', 'data': data});
+    });
+
+    socket?.on('chat:pinned', (data) {
+      debugPrint('📬 Socket event chat:pinned -> $data');
+      chatEventsController.add({'type': 'chat:pinned', 'data': data});
     });
 
     // New message -> notify listeners
@@ -483,6 +517,9 @@ Future<void> _initSocket() async {
     debugPrint('🔗 Socket connecting...');
   } catch (e, st) {
     debugPrint('_initSocket error: $e\n$st');
+    await disconnectSocket();
+  } finally {
+    _socketInitInProgress = false;
   }
 }
 
@@ -495,8 +532,7 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: tryRefreshOnStartup -> $logged');
 
   if (logged) {
-    // init socket after successful refresh/login
-    await _initSocket();
+    _handlingAuthFailure = false;
   }
 
   if (!logged) {

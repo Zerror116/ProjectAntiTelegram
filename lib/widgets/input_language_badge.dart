@@ -10,10 +10,11 @@ class InputLanguageBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final animation = Listenable.merge([
-      inputLanguageService.currentCode,
-      if (controller case final controller?) controller,
-    ]);
+    final listenables = <Listenable>[inputLanguageService.currentCode];
+    if (controller != null) {
+      listenables.add(controller!);
+    }
+    final animation = Listenable.merge(listenables);
     return AnimatedBuilder(
       animation: animation,
       builder: (context, _) {
@@ -65,18 +66,25 @@ bool _isLatin(int rune) =>
     (rune >= 0x1E00 && rune <= 0x1EFF);
 
 bool _isCyrillic(int rune) =>
-    (rune >= 0x0400 && rune <= 0x04FF) ||
-    (rune >= 0x0500 && rune <= 0x052F);
+    (rune >= 0x0400 && rune <= 0x04FF) || (rune >= 0x0500 && rune <= 0x052F);
 
-bool _isUkrainian(int rune) => const {0x0404, 0x0454, 0x0406, 0x0456, 0x0407, 0x0457, 0x0490, 0x0491}.contains(rune);
+bool _isUkrainian(int rune) => const {
+  0x0404,
+  0x0454,
+  0x0406,
+  0x0456,
+  0x0407,
+  0x0457,
+  0x0490,
+  0x0491,
+}.contains(rune);
 
 bool _isBelarusian(int rune) => const {0x040E, 0x045E}.contains(rune);
 
 bool _isArmenian(int rune) => rune >= 0x0530 && rune <= 0x058F;
 
 bool _isGeorgian(int rune) =>
-    (rune >= 0x10A0 && rune <= 0x10FF) ||
-    (rune >= 0x1C90 && rune <= 0x1CBF);
+    (rune >= 0x10A0 && rune <= 0x10FF) || (rune >= 0x1C90 && rune <= 0x1CBF);
 
 bool _isHebrew(int rune) => rune >= 0x0590 && rune <= 0x05FF;
 
@@ -88,8 +96,7 @@ bool _isArabic(int rune) =>
 bool _isGreek(int rune) => rune >= 0x0370 && rune <= 0x03FF;
 
 bool _isHiraganaOrKatakana(int rune) =>
-    (rune >= 0x3040 && rune <= 0x309F) ||
-    (rune >= 0x30A0 && rune <= 0x30FF);
+    (rune >= 0x3040 && rune <= 0x309F) || (rune >= 0x30A0 && rune <= 0x30FF);
 
 bool _isHangul(int rune) =>
     (rune >= 0x1100 && rune <= 0x11FF) ||
@@ -97,19 +104,24 @@ bool _isHangul(int rune) =>
     (rune >= 0xAC00 && rune <= 0xD7AF);
 
 bool _isCjk(int rune) =>
-    (rune >= 0x3400 && rune <= 0x4DBF) ||
-    (rune >= 0x4E00 && rune <= 0x9FFF);
+    (rune >= 0x3400 && rune <= 0x4DBF) || (rune >= 0x4E00 && rune <= 0x9FFF);
 
 InputDecoration withInputLanguageBadge(
   InputDecoration decoration, {
   TextEditingController? controller,
 }) {
+  if (decoration.suffix != null && decoration.suffixText != null) {
+    return decoration;
+  }
   return decoration.copyWith(
-    suffixIcon: null,
-    suffixIconConstraints: null,
-    suffix: Padding(
-      padding: const EdgeInsets.only(right: 8),
-      child: InputLanguageBadge(controller: controller),
+    suffixIcon: Padding(
+      padding: const EdgeInsetsDirectional.only(end: 8),
+      child: Align(
+        alignment: Alignment.centerRight,
+        widthFactor: 1,
+        child: InputLanguageBadge(controller: controller),
+      ),
     ),
+    suffixIconConstraints: const BoxConstraints(minWidth: 58, minHeight: 40),
   );
 }

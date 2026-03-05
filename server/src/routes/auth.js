@@ -4,20 +4,39 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const validator = require('validator');
 const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
 const db = require('../db'); // предполагается, что db экспортирует функцию query
 const { authMiddleware } = require('../utils/auth');
+const {
+  PLATFORM_CREATOR_EMAIL,
+  normalizeAccessKey,
+  normalizeInviteCode,
+  hashAccessKey,
+  isTenantActive,
+} = require('../utils/tenants');
+const {
+  createUserSession,
+  listUserSessions,
+  revokeOtherUserSessions,
+  revokeSessionByRecordId,
+  revokeUserSession,
+} = require('../utils/sessions');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
 // Настройки для Creator
-const CREATOR_EMAIL = 'zerotwo02166@gmail.com';
+const CREATOR_EMAIL = PLATFORM_CREATOR_EMAIL;
 const CREATOR_SECRET = process.env.CREATOR_SECRET || 'Макарова Лиза';
 const MAX_ACCOUNTS_PER_DEVICE = 2;
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+}
+
+function buildSessionExpiry() {
+  return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 }
 
 function normalizeDeviceFingerprint(value) {
@@ -63,6 +82,47 @@ async function upsertDevice(queryable, userId, deviceFingerprint) {
   return result.rows[0]?.id || null;
 }
 
+async function resolveTenantByAccessKey(queryable, accessKey) {
+  const normalized = normalizeAccessKey(accessKey);
+  if (!normalized) return null;
+  const hash = hashAccessKey(normalized);
+  const tenantRes = await queryable.query(
+    `SELECT id, code, name, status, subscription_expires_at
+     FROM tenants
+     WHERE access_key_hash = $1
+     LIMIT 1`,
+    [hash],
+  );
+  return tenantRes.rowCount > 0 ? tenantRes.rows[0] : null;
+}
+
+async function resolveTenantInviteByCode(queryable, inviteCode) {
+  const normalized = normalizeInviteCode(inviteCode);
+  if (!normalized) return null;
+  const inviteRes = await queryable.query(
+    `SELECT i.id,
+            i.tenant_id,
+            i.code,
+            i.role,
+            i.is_active,
+            i.max_uses,
+            i.used_count,
+            i.expires_at,
+            t.code AS tenant_code,
+            t.name AS tenant_name,
+            t.status,
+            t.subscription_expires_at
+     FROM tenant_invites i
+     JOIN tenants t ON t.id = i.tenant_id
+     WHERE i.code = $1
+     LIMIT 1
+     FOR UPDATE`,
+    [normalized],
+  );
+  if (inviteRes.rowCount === 0) return null;
+  return inviteRes.rows[0];
+}
+
 /**
  * POST /api/auth/check_email
  * body: { email }
@@ -96,7 +156,16 @@ router.post('/check_email', async (req, res) => {
 router.post('/register', async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const { email, password, name, phone, secret, device_fingerprint } = req.body || {};
+    const {
+      email,
+      password,
+      name,
+      phone,
+      secret,
+      device_fingerprint,
+      access_key,
+      invite_code,
+    } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const normalizedEmail = validator.normalizeEmail(email);
@@ -116,6 +185,9 @@ router.post('/register', async (req, res) => {
     }
 
     let role = 'client';
+    let tenant = null;
+    let invite = null;
+    const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL;
     if (normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase()) {
       if (typeof secret === 'string' && secret === CREATOR_SECRET) {
         role = 'creator';
@@ -123,21 +195,101 @@ router.post('/register', async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(403).json({ error: 'Invalid secret for this email' });
       }
+    } else {
+      const rawInputCode = String(access_key || '').trim();
+      const rawAccessKey = normalizeAccessKey(rawInputCode);
+      const rawInviteCode = normalizeInviteCode(invite_code || access_key);
+      const looksLikeAccessKey = rawAccessKey.startsWith('PHX');
+      if (looksLikeAccessKey) {
+        tenant = await resolveTenantByAccessKey(client, rawAccessKey);
+        if (!tenant) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: 'Неверный ключ арендатора.',
+          });
+        }
+        role = 'admin';
+      } else if (rawInviteCode) {
+        invite = await resolveTenantInviteByCode(client, rawInviteCode);
+        if (!invite) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: 'Неверный или устаревший код приглашения.',
+          });
+        }
+        if (invite.is_active !== true) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: 'Код приглашения отключен.',
+          });
+        }
+        if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: 'Срок действия кода приглашения истек.',
+          });
+        }
+        const maxUses = Number(invite.max_uses);
+        const usedCount = Number(invite.used_count || 0);
+        if (Number.isFinite(maxUses) && maxUses > 0 && usedCount >= maxUses) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: 'Лимит использований этого кода приглашения исчерпан.',
+          });
+        }
+        tenant = {
+          id: invite.tenant_id,
+          code: invite.tenant_code,
+          name: invite.tenant_name,
+          status: invite.status,
+          subscription_expires_at: invite.subscription_expires_at,
+        };
+        const invitedRole = String(invite.role || 'client').toLowerCase().trim();
+        role = invitedRole === 'worker' || invitedRole === 'admin' ? invitedRole : 'client';
+      } else {
+        await client.query('ROLLBACK');
+        return res.status(403).json({
+          error:
+            'Для регистрации нужен ключ арендатора (для владельца) или код приглашения (для сотрудника/клиента).',
+        });
+      }
+      const tenantState = isTenantActive(tenant);
+      if (!tenantState.ok) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: tenantState.error });
+      }
     }
 
     await assertDeviceAccountLimit(client, device_fingerprint);
 
     const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
     const insertUser = await client.query(
-      'INSERT INTO users (email, password_hash, name, role, created_at) VALUES ($1, $2, $3, $4, now()) RETURNING id, email, name, role',
-      [normalizedEmail, password_hash, name || null, role]
+      `INSERT INTO users (email, password_hash, name, role, tenant_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       RETURNING id, email, name, role, tenant_id`,
+      [normalizedEmail, password_hash, name || null, role, isPlatformCreator ? null : tenant?.id || null]
     );
     const user = insertUser.rows[0];
+
+    if (invite?.id) {
+      await client.query(
+        `UPDATE tenant_invites
+         SET used_count = used_count + 1,
+             is_active = CASE
+               WHEN max_uses IS NOT NULL AND used_count + 1 >= max_uses THEN false
+               ELSE is_active
+             END,
+             last_used_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [invite.id],
+      );
+    }
 
     if (phone) {
       const normalizedPhone = String(phone).replace(/\D/g, '');
       if (normalizedPhone.length < 10) {
-        await db.query('ROLLBACK');
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Invalid phone format' });
       }
       await client.query(
@@ -150,13 +302,49 @@ router.post('/register', async (req, res) => {
 
     await upsertDevice(client, user.id, device_fingerprint);
 
+    const sessionId = uuidv4();
+    const sessionExpiresAt = buildSessionExpiry();
+    await createUserSession({
+      queryable: client,
+      userId: user.id,
+      sessionId,
+      deviceFingerprint: device_fingerprint,
+      userAgent: req.get('user-agent') || '',
+      ipAddress:
+        req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+        req.ip ||
+        '',
+      expiresAt: sessionExpiresAt,
+    });
+
     await client.query('COMMIT');
 
-    const token = signToken({ id: user.id, email: user.email, role: user.role });
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tenant_id: user.tenant_id || null,
+      sid: sessionId,
+    });
 
     return res.status(201).json({
       token,
-      user: { id: user.id, email: user.email, name: user.name, role: user.role }
+      session_id: sessionId,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        tenant_id: user.tenant_id || null,
+      },
+      tenant: tenant
+        ? {
+            id: tenant.id,
+            code: tenant.code,
+            name: tenant.name,
+            subscription_expires_at: tenant.subscription_expires_at,
+          }
+        : null,
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -186,7 +374,16 @@ router.post('/login', async (req, res) => {
 
     await client.query('BEGIN');
 
-    const userRes = await client.query('SELECT id, email, password_hash, role FROM users WHERE email = $1', [normalizedEmail]);
+    const userRes = await client.query(
+      `SELECT u.id, u.email, u.password_hash, u.role, u.tenant_id,
+              t.code AS tenant_code, t.name AS tenant_name, t.status AS tenant_status,
+              t.subscription_expires_at
+       FROM users u
+       LEFT JOIN tenants t ON t.id = u.tenant_id
+       WHERE u.email = $1
+       LIMIT 1`,
+      [normalizedEmail],
+    );
     const user = userRes.rows[0];
     if (!user) {
       await client.query('ROLLBACK');
@@ -199,15 +396,68 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Неверные данные' });
     }
 
+    const isPlatformCreator = String(user.email || '').toLowerCase() === CREATOR_EMAIL;
+    if (!isPlatformCreator) {
+      if (!user.tenant_id) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({
+          error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
+        });
+      }
+      const tenantState = isTenantActive({
+        status: user.tenant_status,
+        subscription_expires_at: user.subscription_expires_at,
+      });
+      if (!tenantState.ok) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: tenantState.error });
+      }
+    }
+
     await assertDeviceAccountLimit(client, device_fingerprint, user.id);
     await upsertDevice(client, user.id, device_fingerprint);
 
+    const sessionId = uuidv4();
+    const sessionExpiresAt = buildSessionExpiry();
+    await createUserSession({
+      queryable: client,
+      userId: user.id,
+      sessionId,
+      deviceFingerprint: device_fingerprint,
+      userAgent: req.get('user-agent') || '',
+      ipAddress:
+        req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+        req.ip ||
+        '',
+      expiresAt: sessionExpiresAt,
+    });
+
     await client.query('COMMIT');
 
-    const token = signToken({ id: user.id, email: user.email, role: user.role });
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tenant_id: user.tenant_id || null,
+      sid: sessionId,
+    });
     return res.json({
       token,
-      user: { id: user.id, email: user.email, role: user.role }
+      session_id: sessionId,
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        tenant_id: user.tenant_id || null,
+      },
+      tenant: user.tenant_id
+        ? {
+            id: user.tenant_id,
+            code: user.tenant_code || null,
+            name: user.tenant_name || null,
+            subscription_expires_at: user.subscription_expires_at || null,
+          }
+        : null,
     });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -218,9 +468,66 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.post('/logout', (req, res) => {
-  // Здесь можно делать audit, удалять refresh-токены и т.д.
-  res.json({ ok: true, message: 'Logged out (stateless JWT)' });
+router.post('/logout', authMiddleware, async (req, res) => {
+  try {
+    const currentSessionId = req.user?.session_id || null;
+    if (currentSessionId) {
+      await revokeUserSession({ queryable: db, sessionId: currentSessionId });
+    }
+    return res.json({ ok: true, message: 'Logged out' });
+  } catch (err) {
+    console.error('auth.logout error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/sessions', authMiddleware, async (req, res) => {
+  try {
+    const rows = await listUserSessions({
+      queryable: db,
+      userId: req.user.id,
+      currentSessionId: req.user.session_id || null,
+    });
+    return res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('auth.sessions.list error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/sessions/revoke_others', authMiddleware, async (req, res) => {
+  try {
+    const revoked = await revokeOtherUserSessions({
+      queryable: db,
+      userId: req.user.id,
+      sessionId: req.user.session_id || null,
+    });
+    return res.json({ ok: true, data: { revoked } });
+  } catch (err) {
+    console.error('auth.sessions.revoke_others error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.delete('/sessions/:id', authMiddleware, async (req, res) => {
+  try {
+    const sessionRecordId = String(req.params?.id || '').trim();
+    if (!sessionRecordId) {
+      return res.status(400).json({ ok: false, error: 'session id обязателен' });
+    }
+    const revoked = await revokeSessionByRecordId({
+      queryable: db,
+      userId: req.user.id,
+      sessionRecordId,
+    });
+    if (!revoked) {
+      return res.status(404).json({ ok: false, error: 'Сессия не найдена' });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('auth.sessions.revoke error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
 });
 
 /**

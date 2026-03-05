@@ -16,9 +16,11 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
+  static const String _creatorEmail = 'zerotwo02166@gmail.com';
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _accessKeyController = TextEditingController();
   bool _loading = false;
   String _message = '';
   bool _isRegister = false;
@@ -28,6 +30,7 @@ class _AuthScreenState extends State<AuthScreen> {
   // listeners so we can remove them properly
   late final VoidCallback _emailListener;
   late final VoidCallback _passwordListener;
+  late final VoidCallback _accessKeyListener;
 
   @override
   void initState() {
@@ -37,10 +40,40 @@ class _AuthScreenState extends State<AuthScreen> {
     // Подписываемся на контроллеры, чтобы гарантированно перерисовывать UI при вводе
     _emailListener = () => setState(() {});
     _passwordListener = () => setState(() {});
+    _accessKeyListener = () => setState(() {});
     _emailController.addListener(_emailListener);
     _passwordController.addListener(_passwordListener);
+    _accessKeyController.addListener(_accessKeyListener);
+
+    final inviteFromLink = _extractInviteFromUri();
+    if (inviteFromLink.isNotEmpty) {
+      _accessKeyController.text = inviteFromLink;
+      _isRegister = true;
+    }
 
     _tryAutoLogin();
+  }
+
+  String _extractInviteFromUri() {
+    try {
+      final uri = Uri.base;
+      final direct =
+          uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '';
+      if (direct.trim().isNotEmpty) return direct.trim();
+      if (uri.fragment.isNotEmpty) {
+        final fragment = uri.fragment;
+        final qIndex = fragment.indexOf('?');
+        if (qIndex >= 0 && qIndex + 1 < fragment.length) {
+          final inFragment = Uri.splitQueryString(
+            fragment.substring(qIndex + 1),
+          );
+          final value = (inFragment['invite'] ?? inFragment['code'] ?? '')
+              .trim();
+          if (value.isNotEmpty) return value;
+        }
+      }
+    } catch (_) {}
+    return '';
   }
 
   @override
@@ -52,9 +85,13 @@ class _AuthScreenState extends State<AuthScreen> {
     try {
       _passwordController.removeListener(_passwordListener);
     } catch (_) {}
+    try {
+      _accessKeyController.removeListener(_accessKeyListener);
+    } catch (_) {}
 
     _emailController.dispose();
     _passwordController.dispose();
+    _accessKeyController.dispose();
     super.dispose();
   }
 
@@ -107,6 +144,7 @@ class _AuthScreenState extends State<AuthScreen> {
 
     final email = _emailController.text.trim();
     final password = _passwordController.text;
+    final accessKey = _accessKeyController.text.trim();
 
     try {
       if (_isRegister) {
@@ -121,7 +159,11 @@ class _AuthScreenState extends State<AuthScreen> {
         }
 
         // Email свободен — сохраняем pending данные и переходим на экран ввода имени+телефона
-        _authService.setPendingCredentials(email: email, password: password);
+        _authService.setPendingCredentials(
+          email: email,
+          password: password,
+          accessKey: accessKey,
+        );
         if (!mounted) return;
 
         // Вариант B: сброс всего стека и переход на PhoneNameScreen
@@ -250,7 +292,34 @@ class _AuthScreenState extends State<AuthScreen> {
                       return null;
                     },
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
+                  if (_isRegister) ...[
+                    TextFormField(
+                      controller: _accessKeyController,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Ключ арендатора или код приглашения',
+                          hintText:
+                              'Владелец: PHX-.... или сотрудник/клиент: INV-....',
+                        ),
+                        controller: _accessKeyController,
+                      ),
+                      validator: (v) {
+                        final mail = _emailController.text.trim().toLowerCase();
+                        final isCreator = mail == _creatorEmail.toLowerCase();
+                        if (isCreator) return null;
+                        if (v == null || v.trim().isEmpty) {
+                          return 'Введите ключ арендатора или код приглашения';
+                        }
+                        if (v.trim().length < 6) {
+                          return 'Код слишком короткий';
+                        }
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                  ] else
+                    const SizedBox(height: 16),
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(

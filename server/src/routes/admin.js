@@ -10,6 +10,15 @@ const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
 const db = require("../db");
 const { ensureSystemChannels } = require("../utils/systemChannels");
+const {
+  generateAccessKey,
+  generateInviteCode,
+  generateTenantCode,
+  hashAccessKey,
+  maskAccessKey,
+  normalizeInviteCode,
+} = require("../utils/tenants");
+const { logMonitoringEvent } = require("../utils/monitoring");
 
 const channelUploadsDir = path.resolve(
   __dirname,
@@ -512,6 +521,476 @@ router.post(
   },
 );
 
+// Управление арендаторами (только platform creator)
+router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => {
+  if (req.user?.is_platform_creator !== true) {
+    return res.status(403).json({ ok: false, error: "Forbidden" });
+  }
+  try {
+    const result = await db.query(
+      `SELECT id, code, name, status, access_key_mask,
+              subscription_expires_at, last_payment_confirmed_at, notes,
+              created_at, updated_at
+       FROM tenants
+       ORDER BY created_at DESC`,
+    );
+    return res.json({ ok: true, data: result.rows });
+  } catch (err) {
+    console.error("admin.tenants.list error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.post(
+  "/tenants",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+
+    const name = String(req.body?.name || "").trim();
+    const monthsRaw = Number(req.body?.months);
+    const months = Number.isFinite(monthsRaw)
+      ? Math.max(1, Math.min(24, Math.floor(monthsRaw)))
+      : 1;
+    const notes = String(req.body?.notes || "").trim();
+
+    if (!name) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Название арендатора обязательно" });
+    }
+
+    const accessKey = generateAccessKey();
+    const accessKeyHash = hashAccessKey(accessKey);
+    const accessKeyMask = maskAccessKey(accessKey);
+    const code = generateTenantCode(name);
+
+    try {
+      const created = await db.query(
+        `INSERT INTO tenants (
+           id, code, name, access_key_hash, access_key_mask,
+           status, subscription_expires_at, last_payment_confirmed_at,
+           created_by, notes, created_at, updated_at
+         )
+         VALUES (
+           $1, $2, $3, $4, $5,
+           'active', now() + make_interval(months => $6::int), now(),
+           $7, $8, now(), now()
+         )
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, notes, created_at`,
+        [
+          uuidv4(),
+          code,
+          name,
+          accessKeyHash,
+          accessKeyMask,
+          months,
+          req.user.id,
+          notes,
+        ],
+      );
+
+      return res.status(201).json({
+        ok: true,
+        data: {
+          ...created.rows[0],
+          access_key: accessKey,
+        },
+      });
+    } catch (err) {
+      console.error("admin.tenants.create error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.post(
+  "/tenants/:tenantId/confirm-payment",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = String(req.params?.tenantId || "").trim();
+    const monthsRaw = Number(req.body?.months);
+    const months = Number.isFinite(monthsRaw)
+      ? Math.max(1, Math.min(24, Math.floor(monthsRaw)))
+      : 1;
+
+    if (!isUuidLike(tenantId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
+    }
+
+    try {
+      const updated = await db.query(
+        `UPDATE tenants
+         SET status = 'active',
+             subscription_expires_at = GREATEST(now(), subscription_expires_at) + make_interval(months => $1::int),
+             last_payment_confirmed_at = now(),
+             updated_at = now()
+         WHERE id = $2
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, last_payment_confirmed_at`,
+        [months, tenantId],
+      );
+      if (updated.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      return res.json({ ok: true, data: updated.rows[0] });
+    } catch (err) {
+      console.error("admin.tenants.confirmPayment error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/tenants/:tenantId/status",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = String(req.params?.tenantId || "").trim();
+    const status = String(req.body?.status || "")
+      .toLowerCase()
+      .trim();
+    if (!isUuidLike(tenantId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
+    }
+    if (status !== "active" && status !== "blocked") {
+      return res.status(400).json({ ok: false, error: "Статус должен быть active или blocked" });
+    }
+
+    try {
+      const updated = await db.query(
+        `UPDATE tenants
+         SET status = $1,
+             updated_at = now()
+         WHERE id = $2
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
+        [status, tenantId],
+      );
+      if (updated.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      return res.json({ ok: true, data: updated.rows[0] });
+    } catch (err) {
+      console.error("admin.tenants.updateStatus error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.delete(
+  "/tenants/:tenantId",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = String(req.params?.tenantId || "").trim();
+    if (!isUuidLike(tenantId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
+    }
+    try {
+      const archived = await db.query(
+        `UPDATE tenants
+         SET status = 'blocked',
+             subscription_expires_at = now(),
+             updated_at = now()
+         WHERE id = $1
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
+        [tenantId],
+      );
+      if (archived.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      return res.json({ ok: true, data: archived.rows[0] });
+    } catch (err) {
+      console.error("admin.tenants.delete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+function tenantInviteRole(rawRole) {
+  const role = String(rawRole || "")
+    .toLowerCase()
+    .trim();
+  if (role === "admin" || role === "worker") return role;
+  return "client";
+}
+
+function inviteLinkForRequest(req, inviteCode) {
+  const base = String(process.env.INVITE_LINK_BASE || "").trim();
+  const encoded = encodeURIComponent(inviteCode);
+  if (base) {
+    const glue = base.includes("?") ? "&" : "?";
+    return `${base}${glue}invite=${encoded}`;
+  }
+  return `${req.protocol}://${req.get("host")}/?invite=${encoded}`;
+}
+
+router.get(
+  "/tenant/invites",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Учетная запись не привязана к арендатору",
+      });
+    }
+    try {
+      const includeInactive = String(req.query?.include_inactive || "")
+        .toLowerCase()
+        .trim() === "1";
+      const result = await db.query(
+        `SELECT id,
+                tenant_id,
+                code,
+                role,
+                is_active,
+                max_uses,
+                used_count,
+                expires_at,
+                created_by,
+                last_used_at,
+                notes,
+                created_at,
+                updated_at
+         FROM tenant_invites
+         WHERE tenant_id = $1
+           AND ($2::boolean = true OR is_active = true)
+         ORDER BY created_at DESC`,
+        [tenantId, includeInactive],
+      );
+      const data = result.rows.map((row) => ({
+        ...row,
+        invite_link: inviteLinkForRequest(req, row.code),
+      }));
+      return res.json({ ok: true, data });
+    } catch (err) {
+      console.error("admin.tenant.invites.list error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.post(
+  "/tenant/invites",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Учетная запись не привязана к арендатору",
+      });
+    }
+    const role = tenantInviteRole(req.body?.role);
+    const notes = String(req.body?.notes || "").trim();
+    const maxUsesRaw = Number(req.body?.max_uses);
+    const maxUses = Number.isFinite(maxUsesRaw)
+      ? Math.max(1, Math.min(100000, Math.floor(maxUsesRaw)))
+      : null;
+    const expiresDaysRaw = Number(req.body?.expires_days);
+    const expiresDays = Number.isFinite(expiresDaysRaw)
+      ? Math.max(1, Math.min(365, Math.floor(expiresDaysRaw)))
+      : null;
+
+    try {
+      let tries = 0;
+      while (tries < 5) {
+        tries += 1;
+        const code = generateInviteCode();
+        try {
+          const inserted = await db.query(
+            `INSERT INTO tenant_invites (
+               id, tenant_id, code, role, is_active, max_uses,
+               used_count, expires_at, created_by, notes, created_at, updated_at
+             )
+             VALUES (
+               $1, $2, $3, $4, true, $5,
+               0,
+               CASE WHEN $6::int IS NULL THEN NULL ELSE now() + make_interval(days => $6::int) END,
+               $7, NULLIF($8, ''), now(), now()
+             )
+             RETURNING id,
+                       tenant_id,
+                       code,
+                       role,
+                       is_active,
+                       max_uses,
+                       used_count,
+                       expires_at,
+                       created_by,
+                       last_used_at,
+                       notes,
+                       created_at,
+                       updated_at`,
+            [
+              uuidv4(),
+              tenantId,
+              normalizeInviteCode(code),
+              role,
+              maxUses,
+              expiresDays,
+              req.user.id,
+              notes,
+            ],
+          );
+          const row = inserted.rows[0];
+          return res.status(201).json({
+            ok: true,
+            data: {
+              ...row,
+              invite_link: inviteLinkForRequest(req, row.code),
+            },
+          });
+        } catch (err) {
+          if (String(err?.code || "") === "23505") {
+            continue;
+          }
+          throw err;
+        }
+      }
+      return res.status(500).json({
+        ok: false,
+        error: "Не удалось сгенерировать уникальный код приглашения",
+      });
+    } catch (err) {
+      console.error("admin.tenant.invites.create error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/tenant/invites/:inviteId/status",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Учетная запись не привязана к арендатору",
+      });
+    }
+    const inviteId = String(req.params?.inviteId || "").trim();
+    const active = req.body?.is_active === true;
+    if (!isUuidLike(inviteId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный inviteId" });
+    }
+    try {
+      const updated = await db.query(
+        `UPDATE tenant_invites
+         SET is_active = $1,
+             updated_at = now()
+         WHERE id = $2
+           AND tenant_id = $3
+         RETURNING id,
+                   tenant_id,
+                   code,
+                   role,
+                   is_active,
+                   max_uses,
+                   used_count,
+                   expires_at,
+                   created_by,
+                   last_used_at,
+                   notes,
+                   created_at,
+                   updated_at`,
+        [active, inviteId, tenantId],
+      );
+      if (updated.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Код приглашения не найден" });
+      }
+      const row = updated.rows[0];
+      return res.json({
+        ok: true,
+        data: {
+          ...row,
+          invite_link: inviteLinkForRequest(req, row.code),
+        },
+      });
+    } catch (err) {
+      console.error("admin.tenant.invites.status error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.delete(
+  "/tenant/invites/:inviteId",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Учетная запись не привязана к арендатору",
+      });
+    }
+    const inviteId = String(req.params?.inviteId || "").trim();
+    if (!isUuidLike(inviteId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный inviteId" });
+    }
+    try {
+      const removed = await db.query(
+        `UPDATE tenant_invites
+         SET is_active = false,
+             updated_at = now()
+         WHERE id = $1
+           AND tenant_id = $2
+         RETURNING id`,
+        [inviteId, tenantId],
+      );
+      if (removed.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Код приглашения не найден" });
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("admin.tenant.invites.delete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 // Получить список каналов
 router.get(
   "/channels",
@@ -522,7 +1001,7 @@ router.get(
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        await ensureSystemChannels(client, req.user.id);
+        await ensureSystemChannels(client, req.user.id, req.user.tenant_id);
         await client.query("COMMIT");
       } catch (err) {
         await client.query("ROLLBACK");
@@ -535,10 +1014,12 @@ router.get(
         `SELECT id, title, type, created_by, settings, created_at, updated_at
        FROM chats
        WHERE type = 'channel'
+         AND tenant_id = $1
          AND COALESCE(settings->>'kind', 'channel') = 'channel'
          AND COALESCE((settings->>'admin_only')::boolean, false) = false
          AND LOWER(TRIM(title)) <> LOWER(TRIM('Баг-репорты'))
        ORDER BY updated_at DESC NULLS LAST, created_at DESC`,
+        [req.user.tenant_id],
       );
       return res.json({ ok: true, data: result.rows });
     } catch (err) {
@@ -567,6 +1048,7 @@ router.post(
       const nextVisibility = normalizeVisibility(visibility);
       const settings = {
         kind: "channel",
+        tenant_id: req.user.tenant_id,
         description: String(description || "").trim(),
         visibility: nextVisibility,
         worker_can_post: false,
@@ -580,10 +1062,16 @@ router.post(
       };
 
       const insert = await db.query(
-        `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
-       VALUES ($1, $2, 'channel', $3, $4::jsonb, now(), now())
+        `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+       VALUES ($1, $2, 'channel', $3, $4, $5::jsonb, now(), now())
        RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [uuidv4(), normalizedTitle, req.user.id, JSON.stringify(settings)],
+        [
+          uuidv4(),
+          normalizedTitle,
+          req.user.id,
+          req.user.tenant_id,
+          JSON.stringify(settings),
+        ],
       );
       const channel = insert.rows[0];
 
@@ -614,10 +1102,10 @@ router.delete(
       const current = await client.query(
         `SELECT id, title, settings
        FROM chats
-       WHERE id = $1 AND type = 'channel'
+       WHERE id = $1 AND type = 'channel' AND tenant_id = $2
        LIMIT 1
        FOR UPDATE`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (current.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -640,9 +1128,9 @@ router.delete(
 
       const deleted = await client.query(
         `DELETE FROM chats
-       WHERE id = $1 AND type = 'channel'
+       WHERE id = $1 AND type = 'channel' AND tenant_id = $2
        RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [id],
+        [id, req.user.tenant_id],
       );
       const deletedChannel = deleted.rows[0];
       const deletedSettings = normalizeSettings(deletedChannel.settings);
@@ -653,9 +1141,11 @@ router.delete(
           `SELECT id
          FROM chats
          WHERE type = 'channel'
+           AND tenant_id = $1
            AND COALESCE(settings->>'kind', 'channel') = 'channel'
          ORDER BY updated_at DESC NULLS LAST, created_at DESC
          LIMIT 1`,
+          [req.user.tenant_id],
         );
         if (next.rowCount > 0) {
           await client.query(
@@ -697,9 +1187,9 @@ router.patch(
       const current = await db.query(
         `SELECT id, title, settings
        FROM chats
-       WHERE id = $1 AND type = 'channel'
+       WHERE id = $1 AND type = 'channel' AND tenant_id = $2
        LIMIT 1`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (current.rowCount === 0) {
         return res.status(404).json({ ok: false, error: "Канал не найден" });
@@ -809,9 +1299,9 @@ router.get(
       const channelQ = await db.query(
         `SELECT id, title, type, created_by, settings, created_at, updated_at
          FROM chats
-         WHERE id = $1 AND type = 'channel'
+         WHERE id = $1 AND type = 'channel' AND tenant_id = $2
          LIMIT 1`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (channelQ.rowCount === 0) {
         return res.status(404).json({ ok: false, error: "Канал не найден" });
@@ -910,14 +1400,17 @@ router.get(
            FROM users u
            LEFT JOIN phones ph ON ph.user_id = u.id
            WHERE u.role = 'client'
+             AND u.tenant_id = $2
            ORDER BY u.created_at DESC
            LIMIT 300`,
-          [id],
+          [id, req.user.tenant_id],
         );
         const clientsCountQ = await db.query(
           `SELECT COUNT(*)::int AS total
            FROM users
-           WHERE role = 'client'`,
+           WHERE role = 'client'
+             AND tenant_id = $1`,
+          [req.user.tenant_id],
         );
         clientsTotal = Number(clientsCountQ.rows[0]?.total || 0);
       }
@@ -982,8 +1475,9 @@ router.get(
              FROM users u
              LEFT JOIN phones ph ON ph.user_id = u.id
              WHERE u.id = ANY($1::uuid[])
+               AND u.tenant_id = $2
              LIMIT 300`,
-            [validBlacklistedIds],
+            [validBlacklistedIds, req.user.tenant_id],
           );
           const byId = new Map(usersQ.rows.map((u) => [String(u.user_id), u]));
           blacklistedUsers = blacklistEntries.map((entry) => ({
@@ -1066,10 +1560,10 @@ router.post(
       const channelQ = await client.query(
         `SELECT id, title, settings
          FROM chats
-         WHERE id = $1 AND type = 'channel'
+         WHERE id = $1 AND type = 'channel' AND tenant_id = $2
          LIMIT 1
          FOR UPDATE`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (channelQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -1089,8 +1583,9 @@ router.post(
         `SELECT id::text AS user_id, role, name, email
          FROM users
          WHERE id = $1::uuid
+           AND tenant_id = $2
          LIMIT 1`,
-        [userId],
+        [userId, req.user.tenant_id],
       );
       if (userQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -1135,9 +1630,9 @@ router.post(
         `UPDATE chats
          SET settings = $1::jsonb,
              updated_at = now()
-         WHERE id = $2
+         WHERE id = $2 AND tenant_id = $3
          RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [JSON.stringify(nextSettings), id],
+        [JSON.stringify(nextSettings), id, req.user.tenant_id],
       );
 
       // Если канал приватный и пользователь был участником — удаляем его.
@@ -1192,10 +1687,10 @@ router.delete(
       const channelQ = await client.query(
         `SELECT id, title, settings
          FROM chats
-         WHERE id = $1 AND type = 'channel'
+         WHERE id = $1 AND type = 'channel' AND tenant_id = $2
          LIMIT 1
          FOR UPDATE`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (channelQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -1227,9 +1722,9 @@ router.delete(
         `UPDATE chats
          SET settings = $1::jsonb,
              updated_at = now()
-         WHERE id = $2
+         WHERE id = $2 AND tenant_id = $3
          RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [JSON.stringify(nextSettings), id],
+        [JSON.stringify(nextSettings), id, req.user.tenant_id],
       );
       await client.query("COMMIT");
 
@@ -1271,9 +1766,9 @@ router.post(
       const current = await db.query(
         `SELECT id, title, type, created_by, settings, created_at, updated_at
          FROM chats
-         WHERE id = $1 AND type = 'channel'
+         WHERE id = $1 AND type = 'channel' AND tenant_id = $2
          LIMIT 1`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (current.rowCount === 0) {
         removeUploadedFile(req.file);
@@ -1289,9 +1784,9 @@ router.post(
         `UPDATE chats
          SET settings = $1::jsonb,
              updated_at = now()
-         WHERE id = $2
+         WHERE id = $2 AND tenant_id = $3
          RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [JSON.stringify(nextSettings), id],
+        [JSON.stringify(nextSettings), id, req.user.tenant_id],
       );
       const updated = upd.rows[0];
 
@@ -1324,9 +1819,9 @@ router.delete(
       const current = await db.query(
         `SELECT id, title, type, created_by, settings, created_at, updated_at
          FROM chats
-         WHERE id = $1 AND type = 'channel'
+         WHERE id = $1 AND type = 'channel' AND tenant_id = $2
          LIMIT 1`,
-        [id],
+        [id, req.user.tenant_id],
       );
       if (current.rowCount === 0) {
         return res.status(404).json({ ok: false, error: "Канал не найден" });
@@ -1340,9 +1835,9 @@ router.delete(
         `UPDATE chats
          SET settings = $1::jsonb,
              updated_at = now()
-         WHERE id = $2
+         WHERE id = $2 AND tenant_id = $3
          RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [JSON.stringify(nextSettings), id],
+        [JSON.stringify(nextSettings), id, req.user.tenant_id],
       );
       const updated = upd.rows[0];
 
@@ -1408,13 +1903,18 @@ router.get(
        LEFT JOIN users u ON u.id = q.queued_by
        WHERE q.status = 'pending'
          AND COALESCE(q.is_sent, false) = false
+         AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
        ORDER BY q.created_at ASC`,
+        [req.user.tenant_id || null],
       );
       const reservedStatsQ = await db.query(
         `SELECT COUNT(*)::int AS total,
                 COALESCE(SUM(quantity), 0)::int AS units
-         FROM reservations
-         WHERE is_fulfilled = false`,
+         FROM reservations r
+         JOIN users u ON u.id = r.user_id
+         WHERE r.is_fulfilled = false
+           AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
+        [req.user.tenant_id || null],
       );
       return res.json({
         ok: true,
@@ -1526,7 +2026,11 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
-      const { reservedChannel } = await ensureSystemChannels(client, req.user.id);
+      const { reservedChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id,
+      );
 
       const ordersQ = await client.query(
         `SELECT r.id AS reservation_id,
@@ -1550,8 +2054,11 @@ router.post(
          LEFT JOIN phones ph ON ph.user_id = r.user_id
          LEFT JOIN user_shelves us ON us.user_id = r.user_id
          WHERE r.is_fulfilled = false
+           AND COALESCE(r.is_sent, false) = false
+           AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
          ORDER BY r.created_at ASC
          FOR UPDATE OF r`,
+        [req.user.tenant_id || null],
       );
 
       const dispatched = [];
@@ -1685,7 +2192,11 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
-      const { reservedChannel } = await ensureSystemChannels(client, req.user.id);
+      const { reservedChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id,
+      );
 
       const reservationQ = await client.query(
         `SELECT r.id,
@@ -1701,15 +2212,17 @@ router.post(
          FROM reservations r
          LEFT JOIN cart_items c ON c.id = r.cart_item_id
          JOIN products p ON p.id = r.product_id
+         JOIN users buyer ON buyer.id = r.user_id
          WHERE (
            ($1::uuid IS NOT NULL AND r.id = $1::uuid)
            OR
            ($1::uuid IS NULL AND $2::uuid IS NOT NULL AND r.cart_item_id = $2::uuid)
          )
+           AND ($3::uuid IS NULL OR buyer.tenant_id = $3::uuid)
          ORDER BY r.created_at DESC
          LIMIT 1
          FOR UPDATE OF r`,
-        [reservationId || null, cartItemId || null],
+        [reservationId || null, cartItemId || null, req.user.tenant_id || null],
       );
       if (reservationQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -1826,6 +2339,66 @@ router.post(
         ],
       );
 
+      let hiddenCatalogMessages = [];
+      const productIdText = String(item.product_id || "").trim();
+      if (productIdText) {
+        const productQ = await client.query(
+          `SELECT id, quantity
+           FROM products
+           WHERE id = $1
+           LIMIT 1
+           FOR UPDATE`,
+          [productIdText],
+        );
+        if (
+          productQ.rowCount > 0 &&
+          Number(productQ.rows[0].quantity || 0) <= 0
+        ) {
+          const unresolvedQ = await client.query(
+            `SELECT 1
+             FROM reservations r
+             JOIN users u ON u.id = r.user_id
+             WHERE r.product_id = $1
+               AND r.is_fulfilled = false
+               AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+             LIMIT 1`,
+            [productIdText, req.user.tenant_id || null],
+          );
+          if (unresolvedQ.rowCount === 0) {
+            await client.query(
+              `UPDATE products
+               SET status = 'archived',
+                   reusable_at = now() + interval '2 months',
+                   updated_at = now()
+               WHERE id = $1
+                 AND status <> 'archived'`,
+              [productIdText],
+            );
+
+            const hiddenQ = await client.query(
+              `UPDATE messages
+               SET meta = jsonb_set(
+                     jsonb_set(
+                       COALESCE(meta, '{}'::jsonb),
+                       '{hidden_for_all}',
+                       'true'::jsonb,
+                       true
+                     ),
+                     '{sold_out_processed}',
+                     'true'::jsonb,
+                     true
+                   )
+               WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
+                 AND COALESCE(meta->>'product_id', '') = $1::text
+                 AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+               RETURNING id, chat_id, sender_id, text, meta, created_at`,
+              [productIdText],
+            );
+            hiddenCatalogMessages = hiddenQ.rows;
+          }
+        }
+      }
+
       await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
         reservedChannel.id,
       ]);
@@ -1848,8 +2421,15 @@ router.post(
           status: "processed",
           shelf_number: finalShelf,
           processed_by_name: processedByName,
-          reason: "item_processed",
+            reason: "item_processed",
         });
+        for (const hiddenMessage of hiddenCatalogMessages) {
+          io.to(`chat:${hiddenMessage.chat_id}`).emit("chat:message", {
+            chatId: hiddenMessage.chat_id,
+            message: hiddenMessage,
+          });
+          io.emit("chat:updated", { chatId: hiddenMessage.chat_id });
+        }
       }
 
       return res.json({
@@ -1860,6 +2440,7 @@ router.post(
           status: "processed",
           shelf_number: finalShelf,
           processed_by_name: processedByName,
+          product_hidden_after_sellout: hiddenCatalogMessages.length > 0,
         },
       });
     } catch (err) {
@@ -1900,9 +2481,10 @@ router.post(
          WHERE q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
            AND q.id = ANY($1::uuid[])
+           AND c.tenant_id = $2
          ORDER BY q.created_at ASC
          FOR UPDATE`,
-          [queueIds],
+          [queueIds, req.user.tenant_id],
         );
         rows = q.rows;
       } else {
@@ -1916,9 +2498,10 @@ router.post(
          WHERE q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
            AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
+           AND c.tenant_id = $2
          ORDER BY q.created_at ASC
          FOR UPDATE`,
-          [channelId],
+          [channelId, req.user.tenant_id],
         );
         rows = q.rows;
       }
@@ -2053,7 +2636,11 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
-      const { mainChannel } = await ensureSystemChannels(client, req.user.id);
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id,
+      );
       const imageUrl = ensureDemoProductImage(req);
       await client.query("COMMIT");
 
@@ -2113,5 +2700,449 @@ router.post(
     }
   },
 );
+
+function isCreatorBase(user) {
+  const base = String(user?.base_role || user?.role || "")
+    .toLowerCase()
+    .trim();
+  return base === "creator";
+}
+
+function tenantFilterSql(alias = "u", tenantIdParamIndex = 1) {
+  return `($${tenantIdParamIndex}::uuid IS NULL OR ${alias}.tenant_id = $${tenantIdParamIndex}::uuid)`;
+}
+
+router.get(
+  "/role-templates",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    try {
+      const tenantId = req.user.tenant_id || null;
+      const templatesQ = await db.query(
+        `SELECT rt.id,
+                rt.tenant_id,
+                rt.code,
+                rt.title,
+                rt.description,
+                rt.permissions,
+                rt.is_system,
+                rt.created_at,
+                rt.updated_at,
+                COUNT(urt.user_id)::int AS assigned_users
+         FROM role_templates rt
+         LEFT JOIN user_role_templates urt ON urt.template_id = rt.id
+         WHERE rt.tenant_id = $1::uuid
+            OR rt.tenant_id IS NULL
+         GROUP BY rt.id
+         ORDER BY
+           CASE WHEN rt.tenant_id IS NULL THEN 1 ELSE 0 END,
+           rt.is_system DESC,
+           rt.updated_at DESC`,
+        [tenantId],
+      );
+      return res.json({ ok: true, data: templatesQ.rows });
+    } catch (err) {
+      console.error("admin.roleTemplates.list error", err);
+      await logMonitoringEvent({
+        tenantId: req.user.tenant_id || null,
+        userId: req.user.id,
+        level: "error",
+        code: "admin_role_templates_list_failed",
+        source: "admin.role-templates",
+        message: "Не удалось загрузить шаблоны ролей",
+        details: { error: String(err?.message || err) },
+      });
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.post(
+  "/role-templates",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const code = String(req.body?.code || "")
+        .trim()
+        .toLowerCase();
+      const title = String(req.body?.title || "").trim();
+      const description = String(req.body?.description || "").trim();
+      const permissions =
+        req.body?.permissions &&
+        typeof req.body.permissions === "object" &&
+        !Array.isArray(req.body.permissions)
+          ? req.body.permissions
+          : {};
+
+      if (!/^[a-z0-9_.-]{2,40}$/.test(code)) {
+        return res.status(400).json({
+          ok: false,
+          error: "code должен содержать 2-40 символов: a-z, 0-9, _, -, .",
+        });
+      }
+      if (!title) {
+        return res.status(400).json({ ok: false, error: "title обязателен" });
+      }
+
+      const result = await db.query(
+        `INSERT INTO role_templates (
+           id,
+           tenant_id,
+           code,
+           title,
+           description,
+           permissions,
+           is_system,
+           created_by,
+           created_at,
+           updated_at
+         )
+         VALUES (
+           gen_random_uuid(),
+           $1,
+           $2,
+           $3,
+           NULLIF($4, ''),
+           $5::jsonb,
+           false,
+           $6,
+           now(),
+           now()
+         )
+         RETURNING *`,
+        [
+          req.user.tenant_id || null,
+          code,
+          title,
+          description,
+          JSON.stringify(permissions),
+          req.user.id,
+        ],
+      );
+      return res.status(201).json({ ok: true, data: result.rows[0] });
+    } catch (err) {
+      console.error("admin.roleTemplates.create error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/role-templates/:id",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    try {
+      const templateId = String(req.params?.id || "").trim();
+      if (!isUuidLike(templateId)) {
+        return res.status(400).json({ ok: false, error: "Некорректный id" });
+      }
+
+      const title = String(req.body?.title || "").trim();
+      const description = String(req.body?.description || "").trim();
+      const permissions =
+        req.body?.permissions &&
+        typeof req.body.permissions === "object" &&
+        !Array.isArray(req.body.permissions)
+          ? req.body.permissions
+          : null;
+
+      const existingQ = await db.query(
+        `SELECT id, tenant_id, is_system
+         FROM role_templates
+         WHERE id = $1
+         LIMIT 1`,
+        [templateId],
+      );
+      if (existingQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Шаблон не найден" });
+      }
+      const existing = existingQ.rows[0];
+      if (existing.is_system === true) {
+        return res.status(403).json({
+          ok: false,
+          error: "Системный шаблон редактировать нельзя",
+        });
+      }
+      if (String(existing.tenant_id || "") !== String(req.user.tenant_id || "")) {
+        return res.status(403).json({ ok: false, error: "Нет доступа" });
+      }
+
+      const upd = await db.query(
+        `UPDATE role_templates
+         SET title = COALESCE(NULLIF($1, ''), title),
+             description = CASE WHEN $2::text IS NULL THEN description ELSE NULLIF($2, '') END,
+             permissions = CASE
+               WHEN $3::jsonb IS NULL THEN permissions
+               ELSE $3::jsonb
+             END,
+             updated_at = now()
+         WHERE id = $4
+         RETURNING *`,
+        [title, description || null, permissions ? JSON.stringify(permissions) : null, templateId],
+      );
+      return res.json({ ok: true, data: upd.rows[0] });
+    } catch (err) {
+      console.error("admin.roleTemplates.patch error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.post(
+  "/role-templates/assign",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    try {
+      const userId = String(req.body?.user_id || "").trim();
+      const templateId = String(req.body?.template_id || "").trim();
+      if (!isUuidLike(userId) || !isUuidLike(templateId)) {
+        return res.status(400).json({
+          ok: false,
+          error: "user_id и template_id должны быть UUID",
+        });
+      }
+
+      const userQ = await db.query(
+        `SELECT id, tenant_id
+         FROM users
+         WHERE id = $1
+           AND ${tenantFilterSql("users", 2)}
+         LIMIT 1`,
+        [userId, req.user.tenant_id || null],
+      );
+      if (userQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Пользователь не найден" });
+      }
+
+      const templateQ = await db.query(
+        `SELECT id, tenant_id
+         FROM role_templates
+         WHERE id = $1
+           AND (
+             tenant_id = $2::uuid
+             OR tenant_id IS NULL
+           )
+         LIMIT 1`,
+        [templateId, req.user.tenant_id || null],
+      );
+      if (templateQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Шаблон роли не найден" });
+      }
+
+      await db.query(
+        `INSERT INTO user_role_templates (
+           user_id,
+           template_id,
+           assigned_by,
+           assigned_at,
+           updated_at
+         )
+         VALUES ($1, $2, $3, now(), now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET template_id = EXCLUDED.template_id,
+               assigned_by = EXCLUDED.assigned_by,
+               assigned_at = now(),
+               updated_at = now()`,
+        [userId, templateId, req.user.id],
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("admin.roleTemplates.assign error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.get("/problem-report", requireAuth, async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: "Доступ только создателю" });
+    }
+    const tenantId = req.user.tenant_id || null;
+
+    const pendingPostsQ = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE q.created_at < now() - interval '12 hours')::int AS stale
+       FROM product_publication_queue q
+       JOIN chats c ON c.id = q.channel_id
+       WHERE q.status = 'pending'
+         AND COALESCE(q.is_sent, false) = false
+         AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)`,
+      [tenantId],
+    );
+    const reservationsQ = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              COALESCE(SUM(r.quantity), 0)::int AS units
+       FROM reservations r
+       JOIN users u ON u.id = r.user_id
+       WHERE r.is_fulfilled = false
+         AND (${tenantFilterSql("u", 1)})`,
+      [tenantId],
+    );
+    const deliveryQ = await db.query(
+      `SELECT COUNT(*)::int AS waiting_for_courier
+       FROM delivery_batch_customers c
+       JOIN delivery_batches b ON b.id = c.batch_id
+       JOIN users u ON u.id = c.user_id
+       WHERE b.status IN ('calling', 'couriers_assigned')
+         AND c.call_status = 'accepted'
+         AND COALESCE(c.courier_name, '') = ''
+         AND (${tenantFilterSql("u", 1)})`,
+      [tenantId],
+    );
+    const monitoringQ = await db.query(
+      `SELECT level,
+              COUNT(*)::int AS total
+       FROM monitoring_events
+       WHERE resolved = false
+         AND created_at >= now() - interval '7 days'
+         AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+       GROUP BY level`,
+      [tenantId],
+    );
+    const sourceQ = await db.query(
+      `SELECT COALESCE(NULLIF(TRIM(source), ''), 'unknown') AS source,
+              COUNT(*)::int AS total
+       FROM monitoring_events
+       WHERE created_at >= now() - interval '7 days'
+         AND level IN ('error', 'critical')
+         AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+       GROUP BY 1
+       ORDER BY total DESC, source ASC
+       LIMIT 8`,
+      [tenantId],
+    );
+
+    const byLevel = {};
+    for (const row of monitoringQ.rows) {
+      byLevel[row.level] = Number(row.total) || 0;
+    }
+
+    const pendingPosts = Number(pendingPostsQ.rows[0]?.total || 0);
+    const stalePendingPosts = Number(pendingPostsQ.rows[0]?.stale || 0);
+    const unresolvedReservations = Number(reservationsQ.rows[0]?.total || 0);
+    const unresolvedReservationUnits = Number(reservationsQ.rows[0]?.units || 0);
+    const waitingForCourier = Number(deliveryQ.rows[0]?.waiting_for_courier || 0);
+    const criticalErrors = Number(byLevel.critical || 0);
+    const errorEvents = Number(byLevel.error || 0);
+
+    const hotspots = [];
+    if (stalePendingPosts > 0) {
+      hotspots.push({
+        key: "stale_pending_posts",
+        title: "Зависшие посты в модерации",
+        value: stalePendingPosts,
+        severity: stalePendingPosts > 25 ? "high" : "medium",
+      });
+    }
+    if (waitingForCourier > 0) {
+      hotspots.push({
+        key: "waiting_for_courier",
+        title: "Клиенты без назначенного курьера",
+        value: waitingForCourier,
+        severity: waitingForCourier > 15 ? "high" : "medium",
+      });
+    }
+    if (criticalErrors + errorEvents > 0) {
+      hotspots.push({
+        key: "monitoring_errors",
+        title: "Ошибки сервера за 7 дней",
+        value: criticalErrors + errorEvents,
+        severity: criticalErrors > 0 ? "high" : "medium",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        summary: {
+          pending_posts: pendingPosts,
+          stale_pending_posts: stalePendingPosts,
+          unresolved_reservations: unresolvedReservations,
+          unresolved_reservation_units: unresolvedReservationUnits,
+          waiting_for_courier: waitingForCourier,
+          monitoring_errors_7d: errorEvents,
+          monitoring_critical_7d: criticalErrors,
+        },
+        hotspots,
+        error_sources_7d: sourceQ.rows.map((row) => ({
+          source: row.source,
+          total: Number(row.total) || 0,
+        })),
+      },
+    });
+  } catch (err) {
+    console.error("admin.problemReport error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.get("/monitoring/events", requireAuth, async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: "Доступ только создателю" });
+    }
+    const tenantId = req.user.tenant_id || null;
+    const limitRaw = Number(req.query?.limit || 120);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(20, Math.min(500, Math.floor(limitRaw)))
+      : 120;
+
+    const rows = await db.query(
+      `SELECT id,
+              tenant_id,
+              user_id,
+              scope,
+              level,
+              code,
+              message,
+              source,
+              details,
+              resolved,
+              created_at
+       FROM monitoring_events
+       WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [tenantId, limit],
+    );
+    return res.json({ ok: true, data: rows.rows });
+  } catch (err) {
+    console.error("admin.monitoring.list error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.patch("/monitoring/events/:id/resolve", requireAuth, async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: "Доступ только создателю" });
+    }
+    const id = String(req.params?.id || "").trim();
+    if (!isUuidLike(id)) {
+      return res.status(400).json({ ok: false, error: "Некорректный id события" });
+    }
+    const tenantId = req.user.tenant_id || null;
+    const upd = await db.query(
+      `UPDATE monitoring_events
+       SET resolved = true
+       WHERE id = $1
+         AND ($2::uuid IS NULL OR tenant_id = $2::uuid OR tenant_id IS NULL)
+       RETURNING id, resolved`,
+      [id, tenantId],
+    );
+    if (upd.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Событие не найдено" });
+    }
+    return res.json({ ok: true, data: upd.rows[0] });
+  } catch (err) {
+    console.error("admin.monitoring.resolve error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
 
 module.exports = router;

@@ -10,6 +10,7 @@ const db = require("../db");
 const { authMiddleware: requireAuth } = require("../utils/auth");
 const { requireRole } = require("../utils/roles");
 const { requireChatPermission } = require("../utils/permissions");
+const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -170,10 +171,14 @@ function isReservedOrdersChannel(chat, settings) {
   );
 }
 
-async function getChatAccessContext(chatId, userId) {
+async function getChatAccessContext(chatId, userId, tenantId = null) {
   const chatQ = await db.query(
-    "SELECT id, title, type, settings FROM chats WHERE id = $1 LIMIT 1",
-    [chatId],
+    `SELECT id, title, type, settings, tenant_id
+     FROM chats
+     WHERE id = $1
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+     LIMIT 1`,
+    [chatId, tenantId || null],
   );
   if (chatQ.rowCount === 0) return null;
 
@@ -410,12 +415,13 @@ async function markChatMessagesRead(chatId, userId) {
     `WITH unread AS (
        SELECT m.id, m.sender_id
        FROM messages m
-       WHERE m.chat_id = $1
-         AND m.sender_id IS NOT NULL
-         AND m.sender_id <> $2
-         AND NOT EXISTS (
-           SELECT 1
-           FROM message_reads mr
+     WHERE m.chat_id = $1
+       AND m.sender_id IS NOT NULL
+       AND m.sender_id <> $2
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND NOT EXISTS (
+         SELECT 1
+         FROM message_reads mr
            WHERE mr.message_id = m.id
              AND mr.user_id = $2
          )
@@ -436,9 +442,55 @@ async function markChatMessagesRead(chatId, userId) {
   return result.rows;
 }
 
+async function canPinInChat(user) {
+  if (!user) return false;
+  const role = normalizeRole(user.base_role || user.role);
+  if (role === "creator" || role === "admin") return true;
+
+  const resolved = await resolvePermissionSet(user, db);
+  return hasPermission(resolved.permissions, "chat.pin");
+}
+
+async function getActivePinForUser(chatId, userId) {
+  const pinQ = await db.query(
+    `SELECT cp.id,
+            cp.chat_id,
+            cp.message_id,
+            cp.pinned_by,
+            cp.created_at,
+            cp.updated_at,
+            COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS pinned_by_name
+     FROM chat_pins cp
+     JOIN messages m ON m.id = cp.message_id
+     LEFT JOIN users u ON u.id = cp.pinned_by
+     WHERE cp.chat_id = $1
+       AND cp.is_active = true
+       AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+     ORDER BY cp.updated_at DESC
+     LIMIT 1`,
+    [chatId, String(userId || "")],
+  );
+  if (pinQ.rowCount === 0) return null;
+  const pin = pinQ.rows[0];
+  const message = await getHydratedMessageById(pin.message_id, userId);
+  if (!message) return null;
+  return {
+    id: pin.id,
+    chat_id: pin.chat_id,
+    message_id: pin.message_id,
+    pinned_by: pin.pinned_by,
+    pinned_by_name: pin.pinned_by_name,
+    created_at: pin.created_at,
+    updated_at: pin.updated_at,
+    message,
+  };
+}
+
 router.get("/", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
+    const tenantId = req.user.tenant_id || null;
     const userIdText = String(userId);
     const role = normalizeRole(req.user.role);
     const workerOrHigher =
@@ -465,6 +517,7 @@ router.get("/", requireAuth, async (req, res) => {
          FROM messages m
          WHERE m.chat_id = c.id
            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $4::text)
+           AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
          ORDER BY m.created_at DESC
          LIMIT 1
        ) AS last_msg ON true
@@ -475,6 +528,7 @@ router.get("/", requireAuth, async (req, res) => {
            AND um.sender_id IS NOT NULL
            AND um.sender_id <> $1
            AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
+           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
            AND NOT EXISTS (
              SELECT 1
              FROM message_reads mr
@@ -531,9 +585,17 @@ router.get("/", requireAuth, async (req, res) => {
            )
          )
        )
+       AND c.tenant_id = $6
        ORDER BY updated_at DESC NULLS LAST
        LIMIT 200`,
-      [userId, workerOrHigher, adminOrCreator, userIdText, userIdText],
+      [
+        userId,
+        workerOrHigher,
+        adminOrCreator,
+        userIdText,
+        userIdText,
+        tenantId,
+      ],
     );
 
     const privateQ = await db.query(
@@ -557,6 +619,7 @@ router.get("/", requireAuth, async (req, res) => {
          FROM messages m
          WHERE m.chat_id = c.id
            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+           AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
          ORDER BY m.created_at DESC
          LIMIT 1
        ) AS last_msg ON true
@@ -567,6 +630,7 @@ router.get("/", requireAuth, async (req, res) => {
            AND um.sender_id IS NOT NULL
            AND um.sender_id <> $1
            AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
            AND NOT EXISTS (
              SELECT 1
              FROM message_reads mr
@@ -575,10 +639,12 @@ router.get("/", requireAuth, async (req, res) => {
            )
        ) AS unread_stats ON true
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
-       WHERE c.type <> 'channel' AND cm.user_id = $1
+       WHERE c.type <> 'channel'
+         AND cm.user_id = $1
+         AND c.tenant_id = $3
        ORDER BY updated_at DESC NULLS LAST
        LIMIT 100`,
-      [userId, userIdText],
+      [userId, userIdText, tenantId],
     );
 
     const byId = new Map();
@@ -611,14 +677,15 @@ router.post(
       }
       const safeType = type === "private" ? "private" : "public";
       const insert = await db.query(
-        `INSERT INTO chats (id, title, type, created_by, settings, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, now(), now())
+        `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, now(), now())
        RETURNING id, title, type, created_by, settings`,
         [
           uuidv4(),
           title,
           safeType,
           req.user.id,
+          req.user.tenant_id,
           JSON.stringify({ kind: "chat" }),
         ],
       );
@@ -627,7 +694,15 @@ router.post(
       if (safeType === "private") {
         const creatorId = req.user.id;
         const membersArr = Array.isArray(members) ? members : [];
-        const toAdd = Array.from(new Set([creatorId, ...membersArr]));
+        const toAddRaw = Array.from(new Set([creatorId, ...membersArr]));
+        const allowedMembersQ = await db.query(
+          `SELECT id::text AS id
+           FROM users
+           WHERE id::text = ANY($1::text[])
+             AND ($2::uuid IS NULL OR tenant_id = $2::uuid)`,
+          [toAddRaw, req.user.tenant_id || null],
+        );
+        const toAdd = allowedMembersQ.rows.map((row) => String(row.id || "").trim()).filter(Boolean);
         await Promise.all(
           toAdd.map((uid) =>
             db.query(
@@ -662,7 +737,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
     const role = req.user.role;
     const { chatId } = req.params;
 
-    const context = await getChatAccessContext(chatId, userId);
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
     if (!canReadChat(context, role)) {
@@ -705,6 +780,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
        LEFT JOIN users u ON u.id = m.sender_id
        WHERE m.chat_id = $1
          AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
        ORDER BY m.created_at ASC
        LIMIT 1000`,
       [chatId, String(userId)],
@@ -716,13 +792,162 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
   }
 });
 
+router.get("/:chatId/pin", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const pin = await getActivePinForUser(chatId, userId);
+    return res.json({ ok: true, data: pin });
+  } catch (err) {
+    console.error("chats.getPin error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.post("/:chatId/pin/:messageId", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId, messageId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+    if (!(await canPinInChat(req.user))) {
+      return res.status(403).json({
+        ok: false,
+        error: "Закреплять сообщения могут только администраторы",
+      });
+    }
+
+    const messageQ = await db.query(
+      `SELECT id
+       FROM messages
+       WHERE id = $1
+         AND chat_id = $2
+       LIMIT 1`,
+      [messageId, chatId],
+    );
+    if (messageQ.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "Сообщение не найдено в этом чате",
+      });
+    }
+
+    await db.query(
+      `UPDATE chat_pins
+       SET is_active = false,
+           updated_at = now()
+       WHERE chat_id = $1
+         AND is_active = true`,
+      [chatId],
+    );
+
+    await db.query(
+      `INSERT INTO chat_pins (
+         id,
+         chat_id,
+         message_id,
+         pinned_by,
+         is_active,
+         created_at,
+         updated_at
+       )
+       VALUES (
+         gen_random_uuid(),
+         $1,
+         $2,
+         $3,
+         true,
+         now(),
+         now()
+       )
+       ON CONFLICT (chat_id, message_id)
+       DO UPDATE
+         SET pinned_by = EXCLUDED.pinned_by,
+             is_active = true,
+             updated_at = now()`,
+      [chatId, messageId, userId],
+    );
+
+    const pin = await getActivePinForUser(chatId, userId);
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`chat:${chatId}`).emit("chat:pinned", { chatId, pin });
+      io.emit("chat:updated", { chatId });
+    }
+
+    return res.json({ ok: true, data: pin });
+  } catch (err) {
+    console.error("chats.pinMessage error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.delete("/:chatId/pin", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+    if (!(await canPinInChat(req.user))) {
+      return res.status(403).json({
+        ok: false,
+        error: "Снимать закреп может только администратор",
+      });
+    }
+
+    await db.query(
+      `UPDATE chat_pins
+       SET is_active = false,
+           updated_at = now()
+       WHERE chat_id = $1
+         AND is_active = true`,
+      [chatId],
+    );
+
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`chat:${chatId}`).emit("chat:pinned", { chatId, pin: null });
+      io.emit("chat:updated", { chatId });
+    }
+
+    return res.json({ ok: true, data: null });
+  } catch (err) {
+    console.error("chats.unpinMessage error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 router.post("/:chatId/read", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
     const role = req.user.role;
     const { chatId } = req.params;
 
-    const context = await getChatAccessContext(chatId, userId);
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
     if (!canReadChat(context, role)) {
@@ -782,7 +1007,7 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     if (!text || !text.trim())
       return res.status(400).json({ ok: false, error: "Text required" });
 
-    const context = await getChatAccessContext(chatId, userId);
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
     if (!canPostChat(context, role)) {
@@ -875,7 +1100,7 @@ router.post(
         });
       }
 
-      const context = await getChatAccessContext(chatId, userId);
+      const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
       if (!context) {
         removeUploadedFiles(uploadedFiles);
         return res.status(404).json({ ok: false, error: "Chat not found" });
@@ -976,7 +1201,7 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Text required" });
     }
 
-    const context = await getChatAccessContext(chatId, userId);
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
     if (!canReadChat(context, role)) {
@@ -1062,7 +1287,7 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       });
     }
 
-    const context = await getChatAccessContext(chatId, userId);
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
     if (!canReadChat(context, role)) {
@@ -1191,7 +1416,7 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
       });
     }
 
-    const context = await getChatAccessContext(chatId, userId);
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context) {
       return res.status(404).json({ ok: false, error: "Chat not found" });
     }

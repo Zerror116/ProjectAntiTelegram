@@ -9,18 +9,15 @@ class InputLanguageService {
 
   static final InputLanguageService instance = InputLanguageService._();
 
-  static const EventChannel _macosChannel = EventChannel(
-    'project_fenix/input_language',
-  );
   static const MethodChannel _macosMethodChannel = MethodChannel(
     'project_fenix/input_language_query',
   );
 
   final ValueNotifier<String> currentCode = ValueNotifier('EN');
 
-  StreamSubscription<dynamic>? _subscription;
   Timer? _pollTimer;
   bool _initialized = false;
+  bool _nativeLookupAvailable = false;
 
   Future<void> initialize() async {
     if (_initialized) return;
@@ -33,16 +30,13 @@ class InputLanguageService {
       return;
     }
 
-    _subscription = _macosChannel.receiveBroadcastStream().listen(
-      (dynamic event) {
-        final next = _normalizeCode(event?.toString());
-        if (next != currentCode.value) {
-          currentCode.value = next;
-        }
-      },
-      onError: (_) {},
-    );
-    await _refreshFromPlatform();
+    final initial = await _queryFromPlatform();
+    if (initial == null) {
+      // Плагин может отсутствовать на desktop/web debug сборках.
+      return;
+    }
+    _nativeLookupAvailable = true;
+    _updateCode(initial);
     _pollTimer = Timer.periodic(
       const Duration(milliseconds: 300),
       (_) => _refreshFromPlatform(),
@@ -50,23 +44,38 @@ class InputLanguageService {
   }
 
   void dispose() {
-    _subscription?.cancel();
-    _subscription = null;
     _pollTimer?.cancel();
     _pollTimer = null;
     _initialized = false;
+    _nativeLookupAvailable = false;
   }
 
   Future<void> _refreshFromPlatform() async {
+    if (!_nativeLookupAvailable) return;
+    final value = await _queryFromPlatform();
+    if (value == null) {
+      _nativeLookupAvailable = false;
+      return;
+    }
+    _updateCode(value);
+  }
+
+  Future<String?> _queryFromPlatform() async {
     try {
-      final value = await _macosMethodChannel.invokeMethod<String>(
+      return await _macosMethodChannel.invokeMethod<String>(
         'getCurrentLanguage',
       );
-      final next = _normalizeCode(value);
-      if (next != currentCode.value) {
-        currentCode.value = next;
-      }
+    } on MissingPluginException {
+      return null;
     } catch (_) {}
+    return null;
+  }
+
+  void _updateCode(String? raw) {
+    final next = _normalizeCode(raw);
+    if (next != currentCode.value) {
+      currentCode.value = next;
+    }
   }
 
   String _normalizeCode(String? raw) {
