@@ -96,8 +96,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool get _isClientAccount =>
       (authService.currentUser?.role ?? '').toLowerCase().trim() == 'client';
 
-  bool get _isTenantAccount =>
-      (authService.currentUser?.role ?? '').toLowerCase().trim() == 'tenant';
+  bool get _isTenantManagerAccount {
+    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    return role == 'tenant' || role == 'creator';
+  }
+
+  Options _tenantManagerRequestOptions() {
+    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    if (role == 'creator') {
+      return Options(headers: const {'X-View-Role': 'creator'});
+    }
+    if (role == 'tenant') {
+      return Options(headers: const {'X-View-Role': 'tenant'});
+    }
+    return Options();
+  }
 
   double _toAvatarFocus(Object? raw) {
     final value = double.tryParse('${raw ?? ''}');
@@ -174,7 +187,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } finally {
       if (mounted) setState(() => _loading = false);
       unawaited(_loadSavedSessions());
-      if (_isTenantAccount) {
+      if (_isTenantManagerAccount) {
         unawaited(_loadTenantClients());
       }
     }
@@ -589,6 +602,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     try {
       final resp = await authService.dio.get(
         '/api/profile/tenant/client-invite',
+        options: _tenantManagerRequestOptions(),
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -620,7 +634,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _loadTenantClients({String? searchOverride}) async {
-    if (!_isTenantAccount) return;
+    if (!_isTenantManagerAccount) return;
     final search = (searchOverride ?? _tenantClientSearchCtrl.text).trim();
     setState(() {
       _tenantClientsLoading = true;
@@ -630,6 +644,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final resp = await authService.dio.get(
         '/api/profile/tenant/clients',
         queryParameters: {'search': search},
+        options: _tenantManagerRequestOptions(),
       );
       final data = resp.data;
       if (!mounted) return;
@@ -661,6 +676,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       await authService.dio.patch(
         '/api/profile/tenant/clients/$id/role',
         data: {'role': role},
+        options: _tenantManagerRequestOptions(),
       );
       if (!mounted) return;
       setState(() => _message = 'Роль успешно обновлена');
@@ -1070,8 +1086,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
         : (_email.isNotEmpty ? _email : 'Без имени');
     final actualRole = authService.currentUser?.role ?? 'client';
     final effectiveRole = authService.effectiveRole;
-    final isTenantAccount = actualRole.toLowerCase().trim() == 'tenant';
-    final canShareInvite = isTenantAccount;
+    final isTenantManagerAccount = _isTenantManagerAccount;
+    final canShareInvite = isTenantManagerAccount;
     final isPlatformCreator =
         actualRole.toLowerCase().trim() == 'creator' &&
         (authService.currentUser?.email ?? '').toLowerCase().trim() ==
@@ -1272,7 +1288,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                     ),
                   ],
-                  if (isTenantAccount) ...[
+                  if (isTenantManagerAccount) ...[
                     const SizedBox(height: 16),
                     _sectionCard(
                       child: Column(
@@ -1721,7 +1737,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'Управление арендаторскими ключами и кодами приглашений.',
+                            'Управление ключами доступа арендаторов.',
                             style: theme.textTheme.bodyMedium?.copyWith(
                               color: theme.colorScheme.onSurfaceVariant,
                             ),

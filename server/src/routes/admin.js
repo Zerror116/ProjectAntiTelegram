@@ -900,10 +900,8 @@ router.delete(
 );
 
 function tenantInviteRole(rawRole) {
-  const role = String(rawRole || "")
-    .toLowerCase()
-    .trim();
-  if (role === "admin" || role === "worker") return role;
+  const role = String(rawRole || "").toLowerCase().trim();
+  if (role === "client") return role;
   return "client";
 }
 
@@ -1020,6 +1018,13 @@ router.get(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (req.user?.is_platform_creator === true) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Коды приглашений здесь отключены. Используйте раздел Профиль внутри нужной группы.",
+      });
+    }
     if (isTenantUser(req.user)) {
       return res.status(403).json({
         ok: false,
@@ -1081,6 +1086,13 @@ router.post(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (req.user?.is_platform_creator === true) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Коды приглашений здесь отключены. Используйте раздел Профиль внутри нужной группы.",
+      });
+    }
     if (isTenantUser(req.user)) {
       return res.status(403).json({
         ok: false,
@@ -1227,6 +1239,13 @@ router.patch(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (req.user?.is_platform_creator === true) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Коды приглашений здесь отключены. Используйте раздел Профиль внутри нужной группы.",
+      });
+    }
     if (isTenantUser(req.user)) {
       return res.status(403).json({
         ok: false,
@@ -1297,6 +1316,13 @@ router.delete(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (req.user?.is_platform_creator === true) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Коды приглашений здесь отключены. Используйте раздел Профиль внутри нужной группы.",
+      });
+    }
     if (isTenantUser(req.user)) {
       return res.status(403).json({
         ok: false,

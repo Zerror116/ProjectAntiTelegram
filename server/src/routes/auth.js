@@ -374,12 +374,12 @@ router.post('/register', async (req, res) => {
           db_url: invite.db_url || null,
           db_name: invite.db_name || null,
         };
-        const invitedRole = String(invite.role || 'client').toLowerCase().trim();
-        role = invitedRole === 'worker' || invitedRole === 'admin' ? invitedRole : 'client';
+        // Приглашения всегда регистрируют клиента.
+        role = 'client';
       } else {
         return res.status(403).json({
           error:
-            'Для регистрации нужен ключ арендатора (для владельца) или код приглашения (для сотрудника/клиента).',
+            'Для регистрации нужен ключ арендатора (для владельца) или клиентский код приглашения.',
         });
       }
 

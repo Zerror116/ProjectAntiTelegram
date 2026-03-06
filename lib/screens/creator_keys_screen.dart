@@ -19,31 +19,30 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   final _tenantNameCtrl = TextEditingController();
   final _tenantNotesCtrl = TextEditingController();
   final _tenantMonthsCtrl = TextEditingController(text: '1');
-  final _inviteMaxUsesCtrl = TextEditingController();
-  final _inviteExpiresDaysCtrl = TextEditingController(text: '30');
-  final _inviteNotesCtrl = TextEditingController();
 
   bool _loading = true;
   bool _tenantActionLoading = false;
-  bool _inviteActionLoading = false;
   bool _tenantsLoading = false;
-  bool _invitesLoading = false;
 
   String _message = '';
-  String _inviteRole = 'client';
   String _lastGeneratedTenantKey = '';
-  String _lastInviteCode = '';
-  String _lastInviteLink = '';
   String _selectedTenantId = '';
   String _selectedTenantCode = '';
 
   List<Map<String, dynamic>> _tenants = [];
-  List<Map<String, dynamic>> _invites = [];
 
   bool get _isPlatformCreator {
     final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
     final email = (authService.currentUser?.email ?? '').toLowerCase().trim();
     return role == 'creator' && email == _platformCreatorEmail;
+  }
+
+  Options _creatorRequestOptions() {
+    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    if (role == 'creator') {
+      return Options(headers: const {'X-View-Role': 'creator'});
+    }
+    return Options();
   }
 
   @override
@@ -57,9 +56,6 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantNameCtrl.dispose();
     _tenantNotesCtrl.dispose();
     _tenantMonthsCtrl.dispose();
-    _inviteMaxUsesCtrl.dispose();
-    _inviteExpiresDaysCtrl.dispose();
-    _inviteNotesCtrl.dispose();
     super.dispose();
   }
 
@@ -81,36 +77,12 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     return parsed.clamp(1, 24);
   }
 
-  int? _toPositiveIntOrNull(String raw, {int min = 1, int max = 100000}) {
-    final parsed = int.tryParse(raw.trim());
-    if (parsed == null) return null;
-    return parsed.clamp(min, max);
-  }
-
-  int _toInt(dynamic value, {int fallback = 0}) {
-    if (value is int) return value;
-    return int.tryParse('${value ?? ''}') ?? fallback;
-  }
-
-  String _roleLabel(String role) {
-    switch (role.toLowerCase().trim()) {
-      case 'admin':
-        return 'Администратор';
-      case 'worker':
-        return 'Работник';
-      case 'client':
-      default:
-        return 'Клиент';
-    }
-  }
-
   Future<void> _reloadAll() async {
     if (!_isPlatformCreator) {
       if (mounted) {
         setState(() {
           _loading = false;
           _tenants = [];
-          _invites = [];
         });
       }
       return;
@@ -122,7 +94,6 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       });
     }
     await _loadTenants(silent: true);
-    await _loadInvites(silent: true);
     if (mounted) setState(() => _loading = false);
   }
 
@@ -134,7 +105,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       _tenantsLoading = true;
     }
     try {
-      final resp = await authService.dio.get('/api/admin/tenants');
+      final resp = await authService.dio.get(
+        '/api/admin/tenants',
+        options: _creatorRequestOptions(),
+      );
       final data = resp.data;
       if (data is Map &&
           data['ok'] == true &&
@@ -182,49 +156,6 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     }
   }
 
-  Future<void> _loadInvites({bool silent = false}) async {
-    if (!_isPlatformCreator) return;
-    if (mounted && !silent) {
-      setState(() => _invitesLoading = true);
-    } else {
-      _invitesLoading = true;
-    }
-    try {
-      final resp = await authService.dio.get(
-        '/api/admin/tenant/invites',
-        queryParameters: {
-          'include_inactive': 1,
-          if (_selectedTenantId.trim().isNotEmpty)
-            'tenant_id': _selectedTenantId.trim(),
-          if (_selectedTenantCode.trim().isNotEmpty)
-            'tenant_code': _selectedTenantCode.trim(),
-        },
-      );
-      final data = resp.data;
-      if (data is Map &&
-          data['ok'] == true &&
-          data['data'] is List &&
-          mounted) {
-        setState(() {
-          _invites = List<Map<String, dynamic>>.from(data['data']);
-        });
-      }
-    } catch (e) {
-      if (mounted && !silent) {
-        setState(
-          () =>
-              _message = 'Ошибка загрузки приглашений: ${_extractDioError(e)}',
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _invitesLoading = false);
-      } else {
-        _invitesLoading = false;
-      }
-    }
-  }
-
   Future<void> _createTenantKey() async {
     final name = _tenantNameCtrl.text.trim();
     if (name.isEmpty) {
@@ -246,6 +177,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           if (_tenantNotesCtrl.text.trim().isNotEmpty)
             'notes': _tenantNotesCtrl.text.trim(),
         },
+        options: _creatorRequestOptions(),
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -283,6 +215,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       await authService.dio.post(
         '/api/admin/tenants/$tenantId/confirm-payment',
         data: {'months': months.clamp(1, 24)},
+        options: _creatorRequestOptions(),
       );
       if (mounted) setState(() => _message = 'Оплата подтверждена');
       await _loadTenants(silent: true);
@@ -303,6 +236,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       await authService.dio.patch(
         '/api/admin/tenants/$tenantId/status',
         data: {'status': status},
+        options: _creatorRequestOptions(),
       );
       if (mounted) {
         setState(() {
@@ -348,7 +282,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       _message = '';
     });
     try {
-      await authService.dio.delete('/api/admin/tenants/$tenantId');
+      await authService.dio.delete(
+        '/api/admin/tenants/$tenantId',
+        options: _creatorRequestOptions(),
+      );
       if (mounted) setState(() => _message = 'Ключ арендатора удален');
       await _loadTenants(silent: true);
     } catch (e) {
@@ -356,103 +293,6 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       setState(() => _message = 'Ошибка удаления: ${_extractDioError(e)}');
     } finally {
       if (mounted) setState(() => _tenantActionLoading = false);
-    }
-  }
-
-  Future<void> _createInvite() async {
-    final maxUses = _toPositiveIntOrNull(
-      _inviteMaxUsesCtrl.text,
-      min: 1,
-      max: 100000,
-    );
-    final expiresDays = _toPositiveIntOrNull(
-      _inviteExpiresDaysCtrl.text,
-      min: 1,
-      max: 365,
-    );
-    setState(() {
-      _inviteActionLoading = true;
-      _message = '';
-    });
-    try {
-      final resp = await authService.dio.post(
-        '/api/admin/tenant/invites',
-        data: {
-          if (_selectedTenantId.trim().isNotEmpty)
-            'tenant_id': _selectedTenantId.trim(),
-          if (_selectedTenantCode.trim().isNotEmpty)
-            'tenant_code': _selectedTenantCode.trim(),
-          'role': _inviteRole,
-          if (maxUses != null) 'max_uses': maxUses,
-          if (expiresDays != null) 'expires_days': expiresDays,
-          if (_inviteNotesCtrl.text.trim().isNotEmpty)
-            'notes': _inviteNotesCtrl.text.trim(),
-        },
-      );
-      final data = resp.data;
-      if (data is Map && data['ok'] == true && data['data'] is Map) {
-        final row = Map<String, dynamic>.from(data['data']);
-        final reused = data['reused'] == true;
-        if (mounted) {
-          setState(() {
-            _lastInviteCode = (row['code'] ?? '').toString();
-            _lastInviteLink = (row['invite_link'] ?? '').toString();
-            _inviteNotesCtrl.clear();
-            _message = reused
-                ? 'Активный код уже существовал, возвращаю его'
-                : 'Код приглашения создан';
-          });
-        }
-        await _loadInvites(silent: true);
-      }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _message = 'Ошибка приглашения: ${_extractDioError(e)}');
-    } finally {
-      if (mounted) setState(() => _inviteActionLoading = false);
-    }
-  }
-
-  Future<void> _setInviteStatus(String inviteId, bool active) async {
-    setState(() => _inviteActionLoading = true);
-    try {
-      await authService.dio.patch(
-        '/api/admin/tenant/invites/$inviteId/status',
-        data: {
-          'is_active': active,
-          if (_selectedTenantId.trim().isNotEmpty)
-            'tenant_id': _selectedTenantId.trim(),
-          if (_selectedTenantCode.trim().isNotEmpty)
-            'tenant_code': _selectedTenantCode.trim(),
-        },
-      );
-      await _loadInvites(silent: true);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _message = 'Ошибка кода: ${_extractDioError(e)}');
-    } finally {
-      if (mounted) setState(() => _inviteActionLoading = false);
-    }
-  }
-
-  Future<void> _deleteInvite(String inviteId) async {
-    setState(() => _inviteActionLoading = true);
-    try {
-      await authService.dio.delete(
-        '/api/admin/tenant/invites/$inviteId',
-        data: {
-          if (_selectedTenantId.trim().isNotEmpty)
-            'tenant_id': _selectedTenantId.trim(),
-          if (_selectedTenantCode.trim().isNotEmpty)
-            'tenant_code': _selectedTenantCode.trim(),
-        },
-      );
-      await _loadInvites(silent: true);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _message = 'Ошибка удаления кода: ${_extractDioError(e)}');
-    } finally {
-      if (mounted) setState(() => _inviteActionLoading = false);
     }
   }
 
@@ -582,6 +422,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         final code = (tenant['code'] ?? '').toString();
         final status = (tenant['status'] ?? '').toString();
         final keyMask = (tenant['access_key_mask'] ?? '—').toString();
+        final isProtected = code.toLowerCase().trim() == 'default';
         final subscription = formatDateTimeValue(
           tenant['subscription_expires_at'],
           fallback: '',
@@ -665,11 +506,11 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       label: Text(isActive ? 'Отключить' : 'Активировать'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _tenantActionLoading
+                      onPressed: _tenantActionLoading || isProtected
                           ? null
                           : () => _deleteTenant(id, name),
                       icon: const Icon(Icons.delete_outline),
-                      label: const Text('Удалить'),
+                      label: Text(isProtected ? 'Системный' : 'Удалить'),
                     ),
                   ],
                 ),
@@ -678,194 +519,6 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           ),
         );
       }).toList(),
-    );
-  }
-
-  Widget _inviteSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Коды приглашения',
-                  style: TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 10),
-                if (_tenants.isNotEmpty) ...[
-                  DropdownButtonFormField<String>(
-                    value: _selectedTenantId.isEmpty ? null : _selectedTenantId,
-                    decoration: const InputDecoration(
-                      labelText: 'Арендатор для приглашений',
-                      border: OutlineInputBorder(),
-                    ),
-                    items: _tenants
-                        .map(
-                          (tenant) => DropdownMenuItem<String>(
-                            value: (tenant['id'] ?? '').toString(),
-                            child: Text(
-                              '${(tenant['name'] ?? '').toString()} (${(tenant['code'] ?? '').toString()})',
-                            ),
-                          ),
-                        )
-                        .toList(),
-                    onChanged: (value) {
-                      if (value == null) return;
-                      final selected = _tenants.firstWhere(
-                        (tenant) => (tenant['id'] ?? '').toString() == value,
-                        orElse: () => _tenants.first,
-                      );
-                      setState(() {
-                        _selectedTenantId = value;
-                        _selectedTenantCode = (selected['code'] ?? '')
-                            .toString();
-                      });
-                      _loadInvites();
-                    },
-                  ),
-                  const SizedBox(height: 10),
-                ],
-                DropdownButtonFormField<String>(
-                  value: _inviteRole,
-                  decoration: const InputDecoration(
-                    labelText: 'Роль по приглашению',
-                    border: OutlineInputBorder(),
-                  ),
-                  items: const [
-                    DropdownMenuItem(value: 'client', child: Text('Клиент')),
-                    DropdownMenuItem(value: 'worker', child: Text('Работник')),
-                    DropdownMenuItem(
-                      value: 'admin',
-                      child: Text('Администратор'),
-                    ),
-                  ],
-                  onChanged: (value) {
-                    if (value == null) return;
-                    setState(() => _inviteRole = value);
-                  },
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _inviteMaxUsesCtrl,
-                  keyboardType: TextInputType.number,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Лимит использований (пусто = без лимита)',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: _inviteMaxUsesCtrl,
-                  ),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _inviteExpiresDaysCtrl,
-                  keyboardType: TextInputType.number,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Срок действия (дней)',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: _inviteExpiresDaysCtrl,
-                  ),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _inviteNotesCtrl,
-                  minLines: 1,
-                  maxLines: 3,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Заметка (опционально)',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: _inviteNotesCtrl,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _inviteActionLoading ? null : _createInvite,
-                  icon: const Icon(Icons.person_add_alt_1_outlined),
-                  label: Text(
-                    _inviteActionLoading
-                        ? 'Создание...'
-                        : 'Создать код приглашения',
-                  ),
-                ),
-                if (_lastInviteCode.trim().isNotEmpty) ...[
-                  const SizedBox(height: 12),
-                  SelectableText(
-                    'Код: $_lastInviteCode',
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                ],
-                if (_lastInviteLink.trim().isNotEmpty) ...[
-                  const SizedBox(height: 6),
-                  SelectableText(_lastInviteLink),
-                  const SizedBox(height: 6),
-                  OutlinedButton.icon(
-                    onPressed: () async {
-                      await Clipboard.setData(
-                        ClipboardData(text: _lastInviteLink),
-                      );
-                      if (!mounted) return;
-                      setState(
-                        () => _message = 'Ссылка приглашения скопирована',
-                      );
-                    },
-                    icon: const Icon(Icons.copy_all_outlined),
-                    label: const Text('Копировать ссылку'),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
-        if (_invitesLoading)
-          const Center(child: CircularProgressIndicator())
-        else
-          ..._invites.take(10).map((invite) {
-            final id = (invite['id'] ?? '').toString();
-            final code = (invite['code'] ?? '').toString();
-            final role = (invite['role'] ?? 'client').toString();
-            final isActive = invite['is_active'] == true;
-            final used = _toInt(invite['used_count']);
-            final maxUses = invite['max_uses'];
-            final maxUsesLabel = maxUses == null ? '∞' : '$maxUses';
-
-            return Card(
-              child: ListTile(
-                title: Text('$code • ${_roleLabel(role)}'),
-                subtitle: Text('Использовано: $used / $maxUsesLabel'),
-                trailing: Wrap(
-                  spacing: 6,
-                  children: [
-                    IconButton(
-                      tooltip: isActive ? 'Отключить' : 'Включить',
-                      icon: Icon(
-                        isActive ? Icons.block_outlined : Icons.check_circle,
-                      ),
-                      onPressed: _inviteActionLoading
-                          ? null
-                          : () => _setInviteStatus(id, !isActive),
-                    ),
-                    IconButton(
-                      tooltip: 'Удалить',
-                      icon: const Icon(Icons.delete_outline),
-                      onPressed: _inviteActionLoading
-                          ? null
-                          : () => _deleteInvite(id),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          }),
-      ],
     );
   }
 
@@ -909,8 +562,6 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                     _tenantCreateCard(),
                     const SizedBox(height: 10),
                     _tenantList(),
-                    const SizedBox(height: 8),
-                    _inviteSection(),
                     const SizedBox(height: 20),
                   ],
                 ),
