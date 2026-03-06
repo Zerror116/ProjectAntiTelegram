@@ -186,6 +186,14 @@ class _AdminPanelState extends State<AdminPanel>
     return int.tryParse('${value ?? ''}') ?? fallback;
   }
 
+  String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
+    final code = _toInt(productCode, fallback: 0);
+    final shelf = _toInt(shelfNumber, fallback: 1);
+    final codePart = code > 0 ? '$code' : '—';
+    final shelfPart = shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+    return '$codePart--$shelfPart';
+  }
+
   double _toFocus(dynamic value) {
     final parsed = double.tryParse('${value ?? ''}');
     if (parsed == null || !parsed.isFinite) return 0;
@@ -2905,6 +2913,9 @@ class _AdminPanelState extends State<AdminPanel>
     final quantityCtrl = TextEditingController(
       text: (post['product_quantity'] ?? '').toString(),
     );
+    final shelfCtrl = TextEditingController(
+      text: _toInt(post['product_shelf_number'], fallback: 1).toString(),
+    );
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -2971,6 +2982,21 @@ class _AdminPanelState extends State<AdminPanel>
                       ),
                     ),
                   ),
+                  const SizedBox(width: 12),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: shelfCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Полка',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: shelfCtrl,
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ],
@@ -2995,6 +3021,7 @@ class _AdminPanelState extends State<AdminPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim());
+    final shelfNumber = int.tryParse(shelfCtrl.text.trim());
 
     if (title.isEmpty) {
       setState(() => _message = 'Название товара обязательно');
@@ -3012,6 +3039,10 @@ class _AdminPanelState extends State<AdminPanel>
       setState(() => _message = 'Количество должно быть больше нуля');
       return;
     }
+    if (shelfNumber == null || shelfNumber <= 0) {
+      setState(() => _message = 'Номер полки должен быть больше нуля');
+      return;
+    }
 
     setState(() {
       _saving = true;
@@ -3025,6 +3056,7 @@ class _AdminPanelState extends State<AdminPanel>
           'description': description,
           'price': price,
           'quantity': quantity,
+          'shelf_number': shelfNumber,
         },
       );
       await _loadPendingPosts();
@@ -4234,6 +4266,10 @@ class _AdminPanelState extends State<AdminPanel>
               final workerName =
                   (p['queued_by_name'] ?? p['queued_by_email'] ?? 'Работник')
                       .toString();
+              final productLabel = _formatProductLabel(
+                p['product_code'],
+                p['product_shelf_number'],
+              );
               final imageUrl = _resolveImageUrl(
                 (p['product_image_url'] ?? '').toString(),
               );
@@ -4307,9 +4343,7 @@ class _AdminPanelState extends State<AdminPanel>
                                 spacing: 6,
                                 runSpacing: 6,
                                 children: [
-                                  _buildModerationChip(
-                                    'ID ${(p['product_code'] ?? '—').toString()}',
-                                  ),
+                                  _buildModerationChip('ID $productLabel'),
                                   _buildModerationChip(
                                     '${_toInt(p['product_price'])} RUB',
                                   ),
@@ -4359,11 +4393,16 @@ class _AdminPanelState extends State<AdminPanel>
             ..._lastPublished.map((item) {
               final channelTitle = (item['channel_title'] ?? 'Канал')
                   .toString();
-              final productCode = item['product_code']?.toString() ?? '—';
+              final productLabel =
+                  item['product_label']?.toString() ??
+                  _formatProductLabel(
+                    item['product_code'],
+                    item['shelf_number'],
+                  );
               final productId = item['product_id']?.toString() ?? '—';
               return Card(
                 child: ListTile(
-                  title: Text('ID товара: $productCode'),
+                  title: Text('ID товара: $productLabel'),
                   subtitle: Text('Канал: $channelTitle\nDB ID: $productId'),
                 ),
               );
@@ -4378,14 +4417,19 @@ class _AdminPanelState extends State<AdminPanel>
             const SizedBox(height: 8),
             ..._lastDispatchedOrders.map((item) {
               final clientName = (item['client_name'] ?? '—').toString();
-              final productCode = (item['product_code'] ?? '—').toString();
+              final productLabel =
+                  item['product_label']?.toString() ??
+                  _formatProductLabel(
+                    item['product_code'],
+                    item['product_shelf_number'],
+                  );
               final quantity = (item['quantity'] ?? '—').toString();
               final shelf = (item['shelf_number'] ?? 'не назначена').toString();
               return Card(
                 child: ListTile(
                   title: Text('Клиент: $clientName'),
                   subtitle: Text(
-                    'ID товара: $productCode\n'
+                    'ID товара: $productLabel\n'
                     'Количество: $quantity\n'
                     'Полка: $shelf',
                   ),

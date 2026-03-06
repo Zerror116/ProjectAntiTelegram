@@ -29,8 +29,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   final _descriptionCtrl = TextEditingController();
   final _priceCtrl = TextEditingController();
   final _quantityCtrl = TextEditingController(text: '1');
+  final _shelfCtrl = TextEditingController(text: '1');
   final _searchCtrl = TextEditingController();
-  final _revisionPercentCtrl = TextEditingController(text: '-10');
+  final _revisionPercentCtrl = TextEditingController(text: '10');
 
   final ImagePicker _imagePicker = ImagePicker();
   XFile? _pickedImage;
@@ -70,6 +71,30 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (value is num) return value.toInt();
     final parsed = int.tryParse(value?.toString() ?? '');
     return parsed ?? fallback;
+  }
+
+  int _resolveShelfNumberFromValue(dynamic value, {int fallback = 1}) {
+    final parsed = _toIntValue(value, fallback);
+    if (parsed <= 0) return fallback;
+    return parsed;
+  }
+
+  int _resolveShelfNumberFromProduct(
+    Map<String, dynamic> product, {
+    int fallback = 1,
+  }) {
+    return _resolveShelfNumberFromValue(
+      product['shelf_number'] ?? product['product_shelf_number'],
+      fallback: fallback,
+    );
+  }
+
+  String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
+    final code = _toIntValue(productCode, 0);
+    final shelf = _resolveShelfNumberFromValue(shelfNumber, fallback: 1);
+    final codePart = code > 0 ? '$code' : '—';
+    final shelfPart = shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+    return '$codePart--$shelfPart';
   }
 
   List<Map<String, dynamic>> _channels = [];
@@ -114,6 +139,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _descriptionCtrl.dispose();
     _priceCtrl.dispose();
     _quantityCtrl.dispose();
+    _shelfCtrl.dispose();
     _searchCtrl.dispose();
     _revisionPercentCtrl.dispose();
     super.dispose();
@@ -150,6 +176,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _descriptionCtrl.clear();
     _priceCtrl.clear();
     _quantityCtrl.text = '1';
+    _shelfCtrl.text = '1';
     _pickedImage = null;
     _existingImageUrl = null;
     _removeImageOnSubmit = false;
@@ -374,12 +401,14 @@ class _WorkerPanelState extends State<WorkerPanel>
     required String description,
     required double price,
     required int quantity,
+    required int shelfNumber,
   }) async {
     final map = <String, dynamic>{
       'title': title,
       'description': description,
       'price': price,
       'quantity': quantity,
+      'shelf_number': shelfNumber,
     };
 
     if (_pickedImage != null) {
@@ -404,6 +433,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     required String description,
     required double price,
     required int quantity,
+    required int shelfNumber,
   }) async {
     final map = <String, dynamic>{
       'channel_id': channelId,
@@ -411,6 +441,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       'description': description,
       'price': price,
       'quantity': quantity,
+      'shelf_number': shelfNumber,
     };
 
     if (_pickedImage != null) {
@@ -576,11 +607,19 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Future<void> _runAutoRevision() async {
     final rawPercent = _revisionPercentCtrl.text.trim().replaceAll(',', '.');
-    final percent = double.tryParse(rawPercent);
-    if (percent == null) {
+    final enteredPercent = double.tryParse(rawPercent);
+    if (enteredPercent == null) {
       setState(() => _message = 'Введите корректный процент ревизии');
       return;
     }
+    if (enteredPercent <= 0 || enteredPercent > 95) {
+      setState(
+        () => _message = 'Процент снижения должен быть больше 0 и не больше 95',
+      );
+      return;
+    }
+    // Пользователь вводит 50 => снижение на 50% (в API уходит -50).
+    final percent = -enteredPercent.abs();
     if (_selectedRevisionDates.isEmpty) {
       setState(() => _message = 'Выберите хотя бы одну дату ревизии');
       return;
@@ -591,7 +630,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       builder: (context) => AlertDialog(
         title: const Text('Авто-ревизия'),
         content: Text(
-          'Изменить цены на $rawPercent% и '
+          'Снизить цены на ${enteredPercent.toStringAsFixed(enteredPercent % 1 == 0 ? 0 : 1)}% и '
           '${_autoHideOldRevisionPosts ? 'скрыть старые версии постов' : 'оставить старые версии'}?',
         ),
         actions: [
@@ -673,6 +712,9 @@ class _WorkerPanelState extends State<WorkerPanel>
     final quantityCtrl = TextEditingController(
       text: _toIntValue(post['quantity'], 1).toString(),
     );
+    final shelfCtrl = TextEditingController(
+      text: _resolveShelfNumberFromValue(post['shelf_number']).toString(),
+    );
 
     final confirm = await showDialog<bool>(
       context: context,
@@ -739,6 +781,21 @@ class _WorkerPanelState extends State<WorkerPanel>
                       ),
                     ),
                   ),
+                  const SizedBox(width: 12),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: shelfCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Полка',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: shelfCtrl,
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ],
@@ -762,6 +819,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
+    final shelfNumber = int.tryParse(shelfCtrl.text.trim()) ?? 0;
     final hasImage = (post['image_url'] ?? '').toString().trim().isNotEmpty;
     final validationError = _validateProductFields(
       title: title,
@@ -773,6 +831,11 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (validationError != null) {
       if (!mounted) return;
       setState(() => _message = validationError);
+      return;
+    }
+    if (shelfNumber <= 0) {
+      if (!mounted) return;
+      setState(() => _message = 'Номер полки должен быть больше нуля');
       return;
     }
 
@@ -791,6 +854,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               'description': description,
               'price': price,
               'quantity': quantity,
+              'shelf_number': shelfNumber,
               'image_url': (post['image_url'] ?? '').toString(),
             },
           ],
@@ -826,6 +890,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = _descriptionCtrl.text.trim();
     final priceText = _priceCtrl.text.trim().replaceAll(',', '.');
     final qtyText = _quantityCtrl.text.trim();
+    final shelfText = _shelfCtrl.text.trim();
     final hasImage =
         _pickedImage != null ||
         ((_existingImageUrl?.trim().isNotEmpty ?? false) &&
@@ -837,6 +902,11 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
     final price = double.tryParse(priceText);
     final quantity = int.tryParse(qtyText) ?? 1;
+    final shelfNumber = int.tryParse(shelfText) ?? 0;
+    if (shelfNumber <= 0) {
+      setState(() => _message = 'Номер полки должен быть больше нуля');
+      return;
+    }
     final validationError = _validateProductFields(
       title: title,
       description: description,
@@ -860,6 +930,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         description: description,
         price: price!,
         quantity: quantity,
+        shelfNumber: shelfNumber,
       );
 
       final resp = await authService.dio.post(
@@ -869,21 +940,25 @@ class _WorkerPanelState extends State<WorkerPanel>
       if (resp.statusCode == 201 || resp.statusCode == 200) {
         final data = resp.data;
         String? queueId;
-        String? productCode;
+        String? productLabel;
         if (data is Map && data['data'] is Map) {
           final dataMap = Map<String, dynamic>.from(data['data']);
           final queue = dataMap['queue'];
           if (queue is Map) {
             queueId = queue['id']?.toString();
           }
+          productLabel = dataMap['product_label']?.toString();
           final product = dataMap['product'];
           if (product is Map) {
-            productCode = product['product_code']?.toString();
+            productLabel ??= _formatProductLabel(
+              product['product_code'],
+              product['shelf_number'],
+            );
           }
         }
         setState(() {
-          if (productCode != null && productCode.isNotEmpty) {
-            _message = 'Товар отправлен в очередь. ID товара: $productCode';
+          if (productLabel != null && productLabel.isNotEmpty) {
+            _message = 'Товар отправлен в очередь. ID товара: $productLabel';
           } else if (queueId != null) {
             _message = 'Товар отправлен в очередь. ID заявки: $queueId';
           } else {
@@ -895,8 +970,8 @@ class _WorkerPanelState extends State<WorkerPanel>
         if (mounted) {
           showAppNotice(
             context,
-            productCode != null && productCode.isNotEmpty
-                ? 'Товар отправлен в очередь. ID: $productCode'
+            productLabel != null && productLabel.isNotEmpty
+                ? 'Товар отправлен в очередь. ID: $productLabel'
                 : 'Товар отправлен в очередь',
             tone: AppNoticeTone.success,
             duration: const Duration(milliseconds: 1400),
@@ -948,6 +1023,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _descriptionCtrl.text = (product['description'] ?? '').toString();
     _priceCtrl.text = (product['price'] ?? '').toString();
     _quantityCtrl.text = ((product['quantity'] ?? 1)).toString();
+    _shelfCtrl.text = _resolveShelfNumberFromProduct(product).toString();
     setState(() {
       _pickedImage = null;
       _existingImageUrl = (product['image_url'] ?? '').toString();
@@ -992,6 +1068,14 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
     final fallbackQty = _toIntValue(product['quantity'], 1);
     final quantity = editedQty ?? fallbackQty;
+    final parsedShelfInput = int.tryParse(_shelfCtrl.text.trim());
+    final shelfNumber = parsedShelfInput != null && parsedShelfInput > 0
+        ? parsedShelfInput
+        : _resolveShelfNumberFromProduct(product);
+    if (shelfNumber <= 0) {
+      setState(() => _message = 'Номер полки должен быть больше нуля');
+      return;
+    }
     final existingImage = (product['image_url'] ?? '').toString().trim();
     final hasImage =
         _pickedImage != null ||
@@ -1022,6 +1106,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         description: description,
         price: price,
         quantity: quantity,
+        shelfNumber: shelfNumber,
       );
 
       final resp = await authService.dio.post(
@@ -1029,18 +1114,22 @@ class _WorkerPanelState extends State<WorkerPanel>
         data: payload,
       );
       if (resp.statusCode == 201 || resp.statusCode == 200) {
-        String? productCode;
+        String? productLabel;
         final data = resp.data;
         if (data is Map && data['data'] is Map) {
           final body = Map<String, dynamic>.from(data['data']);
+          productLabel = body['product_label']?.toString();
           final product = body['product'];
           if (product is Map) {
-            productCode = product['product_code']?.toString();
+            productLabel ??= _formatProductLabel(
+              product['product_code'],
+              product['shelf_number'],
+            );
           }
         }
         setState(() {
-          _message = productCode != null && productCode.isNotEmpty
-              ? 'Старый товар отправлен в очередь. ID товара: $productCode'
+          _message = productLabel != null && productLabel.isNotEmpty
+              ? 'Старый товар отправлен в очередь. ID товара: $productLabel'
               : 'Старый товар отправлен в очередь повторно';
           _removeImageOnSubmit = false;
         });
@@ -1048,8 +1137,8 @@ class _WorkerPanelState extends State<WorkerPanel>
         if (mounted) {
           showAppNotice(
             context,
-            productCode != null && productCode.isNotEmpty
-                ? 'Товар снова в очереди. ID: $productCode'
+            productLabel != null && productLabel.isNotEmpty
+                ? 'Товар снова в очереди. ID: $productLabel'
                 : 'Товар снова отправлен в очередь',
             tone: AppNoticeTone.success,
           );
@@ -1082,6 +1171,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = (product['description'] ?? '').toString().trim();
     final price = _toDoubleValue(product['price'], 0);
     final quantity = _toIntValue(product['quantity'], 1);
+    final shelfNumber = _resolveShelfNumberFromProduct(product);
     final imageUrl = (product['image_url'] ?? '').toString().trim();
 
     final validationError = _validateProductFields(
@@ -1109,30 +1199,35 @@ class _WorkerPanelState extends State<WorkerPanel>
           'description': description,
           'price': price,
           'quantity': quantity,
+          'shelf_number': shelfNumber,
           'image_url': imageUrl,
         },
       );
       if (resp.statusCode == 201 || resp.statusCode == 200) {
-        String? productCode;
+        String? productLabel;
         final data = resp.data;
         if (data is Map && data['data'] is Map) {
           final body = Map<String, dynamic>.from(data['data']);
+          productLabel = body['product_label']?.toString();
           final productMap = body['product'];
           if (productMap is Map) {
-            productCode = productMap['product_code']?.toString();
+            productLabel ??= _formatProductLabel(
+              productMap['product_code'],
+              productMap['shelf_number'],
+            );
           }
         }
         setState(() {
-          _message = productCode != null && productCode.isNotEmpty
-              ? 'Дубль товара отправлен. ID товара: $productCode'
+          _message = productLabel != null && productLabel.isNotEmpty
+              ? 'Дубль товара отправлен. ID товара: $productLabel'
               : 'Дубль товара отправлен в очередь';
         });
         _loadOwnQueuedPosts();
         if (mounted) {
           showAppNotice(
             context,
-            productCode != null && productCode.isNotEmpty
-                ? 'Дубль готов. ID: $productCode'
+            productLabel != null && productLabel.isNotEmpty
+                ? 'Дубль готов. ID: $productLabel'
                 : 'Товар продублирован в очередь',
             tone: AppNoticeTone.success,
           );
@@ -1316,6 +1411,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         Row(
           children: [
             Expanded(
+              flex: 3,
               child: TextField(
                 controller: _priceCtrl,
                 keyboardType: const TextInputType.numberWithOptions(
@@ -1331,8 +1427,8 @@ class _WorkerPanelState extends State<WorkerPanel>
               ),
             ),
             const SizedBox(width: 12),
-            SizedBox(
-              width: 120,
+            Expanded(
+              flex: 2,
               child: TextField(
                 controller: _quantityCtrl,
                 keyboardType: TextInputType.number,
@@ -1342,6 +1438,21 @@ class _WorkerPanelState extends State<WorkerPanel>
                     border: OutlineInputBorder(),
                   ),
                   controller: _quantityCtrl,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              flex: 2,
+              child: TextField(
+                controller: _shelfCtrl,
+                keyboardType: TextInputType.number,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Полка',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: _shelfCtrl,
                 ),
               ),
             ),
@@ -1410,7 +1521,10 @@ class _WorkerPanelState extends State<WorkerPanel>
         if (!_searching && _searchResults.isEmpty)
           const Text('Результаты появятся здесь'),
         ..._searchResults.map((p) {
-          final code = p['product_code']?.toString() ?? 'без ID';
+          final label = _formatProductLabel(
+            p['product_code'],
+            p['shelf_number'],
+          );
           final imageUrl = _resolveImageUrl((p['image_url'] ?? '').toString());
           return Card(
             child: ListTile(
@@ -1441,7 +1555,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                   : null,
               title: Text((p['title'] ?? 'Товар').toString()),
               subtitle: Text(
-                'ID: $code\n'
+                'ID: $label\n'
                 'Цена: ${p['price']} RUB\n'
                 '${(p['description'] ?? '').toString()}',
               ),
@@ -1503,6 +1617,9 @@ class _WorkerPanelState extends State<WorkerPanel>
     );
     final quantityCtrl = TextEditingController(
       text: (post['product_quantity'] ?? '1').toString(),
+    );
+    final shelfCtrl = TextEditingController(
+      text: _resolveShelfNumberFromProduct(post).toString(),
     );
 
     final confirmed = await showDialog<bool>(
@@ -1570,6 +1687,21 @@ class _WorkerPanelState extends State<WorkerPanel>
                       ),
                     ),
                   ),
+                  const SizedBox(width: 12),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: shelfCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Полка',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: shelfCtrl,
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ],
@@ -1594,6 +1726,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
+    final shelfNumber = int.tryParse(shelfCtrl.text.trim()) ?? 0;
     final hasImage = ((post['product_image_url'] ?? '')
         .toString()
         .trim()
@@ -1610,6 +1743,11 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _message = validationError);
       return;
     }
+    if (shelfNumber <= 0) {
+      if (!mounted) return;
+      setState(() => _message = 'Номер полки должен быть больше нуля');
+      return;
+    }
 
     if (mounted) {
       setState(() => _savingOwnPost = true);
@@ -1622,6 +1760,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           'description': description,
           'price': price,
           'quantity': quantity,
+          'shelf_number': shelfNumber,
         },
       );
       await _loadOwnQueuedPosts();
@@ -1736,7 +1875,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                             runSpacing: 6,
                             children: [
                               _statChip(
-                                'ID ${(post['product_code'] ?? '—').toString()}',
+                                'ID ${_formatProductLabel(post['product_code'], post['product_shelf_number'])}',
                               ),
                               _statChip(
                                 '${_toDoubleValue(post['product_price']).toStringAsFixed(0)} RUB',
@@ -1844,11 +1983,11 @@ class _WorkerPanelState extends State<WorkerPanel>
                   controller: _revisionPercentCtrl,
                   keyboardType: const TextInputType.numberWithOptions(
                     decimal: true,
-                    signed: true,
+                    signed: false,
                   ),
                   decoration: withInputLanguageBadge(
                     const InputDecoration(
-                      labelText: 'Процент ревизии (например: -10, 15)',
+                      labelText: 'Процент снижения (например: 10, 25, 50)',
                       border: OutlineInputBorder(),
                     ),
                     controller: _revisionPercentCtrl,
@@ -1874,6 +2013,32 @@ class _WorkerPanelState extends State<WorkerPanel>
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [10, 25, 50]
+                  .map(
+                    (value) => ActionChip(
+                      label: Text('$value%'),
+                      onPressed: _runningRevision
+                          ? null
+                          : () {
+                              _revisionPercentCtrl.text = '$value';
+                              _revisionPercentCtrl.selection =
+                                  TextSelection.fromPosition(
+                                    TextPosition(
+                                      offset: _revisionPercentCtrl.text.length,
+                                    ),
+                                  );
+                            },
+                    ),
+                  )
+                  .toList(),
+            ),
           ),
           const SizedBox(height: 8),
           SwitchListTile(
@@ -1907,7 +2072,10 @@ class _WorkerPanelState extends State<WorkerPanel>
               final imageUrl = _resolveImageUrl(
                 (post['image_url'] ?? '').toString(),
               );
-              final code = (post['product_code'] ?? '—').toString();
+              final productLabel = _formatProductLabel(
+                post['product_code'],
+                post['shelf_number'],
+              );
               final createdAt = (post['created_at'] ?? '').toString();
               final createdAtShort = createdAt.length >= 16
                   ? createdAt.substring(0, 16).replaceFirst('T', ' ')
@@ -1976,7 +2144,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                             spacing: 6,
                             runSpacing: 6,
                             children: [
-                              _statChip('ID $code'),
+                              _statChip('ID $productLabel'),
                               _statChip(
                                 '${_toDoubleValue(post['price']).toStringAsFixed(0)} RUB',
                               ),

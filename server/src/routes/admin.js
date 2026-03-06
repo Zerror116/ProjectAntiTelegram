@@ -281,7 +281,21 @@ function productMessageText(product) {
   return lines.join("\n");
 }
 
+function formatProductLabel(productCode, shelfNumber) {
+  const code = Number(productCode);
+  const shelf = Number(shelfNumber);
+  const codePart = Number.isFinite(code) && code > 0 ? String(Math.floor(code)) : "—";
+  const shelfPart = Number.isFinite(shelf) && shelf > 0
+    ? String(Math.floor(shelf)).padStart(2, "0")
+    : "—";
+  return `${codePart}--${shelfPart}`;
+}
+
 function reservedOrderMessageText(order) {
+  const productLabel = formatProductLabel(
+    order.product_code,
+    order.product_shelf_number,
+  );
   const lines = [
     `📦 ${order.product_title}`,
     order.product_description
@@ -289,10 +303,11 @@ function reservedOrderMessageText(order) {
       : null,
     `Клиент: ${order.client_name || "—"}`,
     `Телефон: ${order.client_phone || "—"}`,
-    `ID товара: ${order.product_code ?? "—"}`,
+    `ID товара: ${productLabel}`,
     `Цена: ${order.product_price} RUB`,
     `Куплено: ${order.quantity}`,
-    `Полка: ${order.shelf_number ?? "не назначена"}`,
+    `Полка товара: ${order.product_shelf_number ?? "не назначена"}`,
+    `Полка клиента: ${order.shelf_number ?? "не назначена"}`,
     "Статус: ожидание обработки",
   ].filter(Boolean);
   return lines.join("\n");
@@ -306,13 +321,14 @@ function archivedProductMessageText({
   queuedByPhone,
 }) {
   const creator = queuedByName || queuedByEmail || "Неизвестно";
+  const productLabel = formatProductLabel(product.product_code, product.shelf_number);
   const lines = [
     "🗂 Архив поста товара",
     `Название: ${product.title}`,
     product.description ? `Описание: ${String(product.description).trim()}` : null,
     `Цена: ${product.price} RUB`,
     `Количество: ${product.quantity}`,
-    `ID товара: ${product.product_code ?? "—"}`,
+    `ID товара: ${productLabel}`,
     `Канал публикации: ${sourceChannelTitle || "Основной канал"}`,
     `Кто создал пост: ${creator}`,
     queuedByPhone ? `Телефон создателя: ${queuedByPhone}` : null,
@@ -2331,6 +2347,7 @@ router.get(
               p.description AS product_description,
               p.price AS product_price,
               p.quantity AS product_quantity,
+              p.shelf_number AS product_shelf_number,
               p.image_url AS product_image_url,
               p.product_code,
               u.email AS queued_by_email,
@@ -2379,6 +2396,7 @@ router.patch(
     const description = String(req.body?.description || "").trim();
     const price = Number(req.body?.price);
     const quantity = Number(req.body?.quantity);
+    const shelfNumber = Number(req.body?.shelf_number);
 
     if (!queueId) {
       return res.status(400).json({ ok: false, error: "queueId обязателен" });
@@ -2404,17 +2422,22 @@ router.patch(
         .status(400)
         .json({ ok: false, error: "Количество должно быть больше нуля" });
     }
+    if (!Number.isFinite(shelfNumber) || shelfNumber <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Номер полки должен быть больше нуля" });
+    }
 
     try {
       const updated = await db.query(
-        `WITH target AS (
+         `WITH target AS (
            SELECT q.id, q.product_id
            FROM product_publication_queue q
            JOIN chats c ON c.id = q.channel_id
            WHERE q.id = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
-             AND ($6::uuid IS NULL OR c.tenant_id = $6::uuid)
+             AND ($7::uuid IS NULL OR c.tenant_id = $7::uuid)
            LIMIT 1
          ),
          product_upd AS (
@@ -2423,10 +2446,11 @@ router.patch(
                description = $3,
                price = $4,
                quantity = $5,
-               updated_at = now()
+               shelf_number = $6,
+                updated_at = now()
            FROM target t
            WHERE p.id = t.product_id
-           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.image_url, p.product_code
+           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url, p.product_code
          )
          UPDATE product_publication_queue q
          SET payload = jsonb_strip_nulls(
@@ -2435,6 +2459,7 @@ router.patch(
                  'description', $3,
                  'price', $4,
                  'quantity', $5,
+                 'shelf_number', $6,
                  'image_url', (SELECT image_url FROM product_upd LIMIT 1)
                )
              )
@@ -2447,6 +2472,7 @@ router.patch(
           description,
           price,
           Math.floor(quantity),
+          Math.floor(shelfNumber),
           req.user.tenant_id || null,
         ],
       );
@@ -2488,6 +2514,7 @@ router.post(
                 r.is_fulfilled,
                 r.is_sent,
                 p.product_code,
+                p.shelf_number AS product_shelf_number,
                 p.title AS product_title,
                 p.description AS product_description,
                 p.price AS product_price,
@@ -2517,6 +2544,11 @@ router.post(
           user_id: row.user_id,
           product_id: row.product_id,
           product_code: row.product_code,
+          product_label: formatProductLabel(
+            row.product_code,
+            row.product_shelf_number,
+          ),
+          product_shelf_number: row.product_shelf_number,
           title: row.product_title,
           description: row.product_description,
           price: Number(row.product_price),
@@ -2568,6 +2600,7 @@ router.post(
           user_id: row.user_id,
           shelf_number: row.shelf_number,
           product_code: row.product_code,
+          product_shelf_number: row.product_shelf_number,
           quantity: Number(row.quantity),
           client_name: row.client_name || "—",
         });
@@ -2941,49 +2974,75 @@ router.post(
 
       let rows;
       if (onlySelected) {
-        const q = await client.query(
-          `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
-                p.title, p.description, p.price, p.quantity, p.image_url, p.product_code,
-                c.title AS channel_title,
-                u.name AS queued_by_name,
-                u.email AS queued_by_email,
-                ph.phone AS queued_by_phone
-         FROM product_publication_queue q
-         JOIN products p ON p.id = q.product_id
-         JOIN chats c ON c.id = q.channel_id
-         LEFT JOIN users u ON u.id = q.queued_by
-         LEFT JOIN phones ph ON ph.user_id = q.queued_by
-         WHERE q.status = 'pending'
-           AND COALESCE(q.is_sent, false) = false
-           AND q.id = ANY($1::uuid[])
-           AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
-         ORDER BY q.created_at ASC
-         FOR UPDATE OF q`,
+        const lockedQ = await client.query(
+          `SELECT q.id
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+             AND q.id = ANY($1::uuid[])
+             AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+           ORDER BY q.created_at ASC
+           FOR UPDATE OF q`,
           [queueIds, req.user.tenant_id || null],
         );
-        rows = q.rows;
+        const lockedIds = lockedQ.rows.map((row) => row.id);
+        if (lockedIds.length === 0) {
+          rows = [];
+        } else {
+          const detailsQ = await client.query(
+            `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
+                  p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url, p.product_code,
+                  c.title AS channel_title,
+                  u.name AS queued_by_name,
+                  u.email AS queued_by_email,
+                  ph.phone AS queued_by_phone
+             FROM product_publication_queue q
+             JOIN products p ON p.id = q.product_id
+             JOIN chats c ON c.id = q.channel_id
+             LEFT JOIN users u ON u.id = q.queued_by
+             LEFT JOIN phones ph ON ph.user_id = q.queued_by
+             WHERE q.id = ANY($1::uuid[])
+             ORDER BY q.created_at ASC`,
+            [lockedIds],
+          );
+          rows = detailsQ.rows;
+        }
       } else {
-        const q = await client.query(
-          `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
-                p.title, p.description, p.price, p.quantity, p.image_url, p.product_code,
-                c.title AS channel_title,
-                u.name AS queued_by_name,
-                u.email AS queued_by_email,
-                ph.phone AS queued_by_phone
-         FROM product_publication_queue q
-         JOIN products p ON p.id = q.product_id
-         JOIN chats c ON c.id = q.channel_id
-         LEFT JOIN users u ON u.id = q.queued_by
-         LEFT JOIN phones ph ON ph.user_id = q.queued_by
-         WHERE q.status = 'pending'
-           AND COALESCE(q.is_sent, false) = false
-           AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
-           AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
-         ORDER BY q.created_at ASC
-         FOR UPDATE OF q`,
+        const lockedQ = await client.query(
+          `SELECT q.id
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+             AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
+             AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+           ORDER BY q.created_at ASC
+           FOR UPDATE OF q`,
           [channelId, req.user.tenant_id || null],
         );
-        rows = q.rows;
+        const lockedIds = lockedQ.rows.map((row) => row.id);
+        if (lockedIds.length === 0) {
+          rows = [];
+        } else {
+          const detailsQ = await client.query(
+            `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
+                  p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url, p.product_code,
+                  c.title AS channel_title,
+                  u.name AS queued_by_name,
+                  u.email AS queued_by_email,
+                  ph.phone AS queued_by_phone
+             FROM product_publication_queue q
+             JOIN products p ON p.id = q.product_id
+             JOIN chats c ON c.id = q.channel_id
+             LEFT JOIN users u ON u.id = q.queued_by
+             LEFT JOIN phones ph ON ph.user_id = q.queued_by
+             WHERE q.id = ANY($1::uuid[])
+             ORDER BY q.created_at ASC`,
+            [lockedIds],
+          );
+          rows = detailsQ.rows;
+        }
       }
 
       const published = [];
@@ -3037,6 +3096,10 @@ router.post(
           : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
             ? Math.floor(fallbackQuantity)
             : 1);
+        const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 1);
+        const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
+          ? Math.floor(rawNextShelf)
+          : 1;
         const nextImageUrl = payload.image_url || row.image_url || null;
 
         const productUpdate = await client.query(
@@ -3046,18 +3109,20 @@ router.post(
              description = $3,
              price = $4,
              quantity = $5,
-             image_url = $6,
+             shelf_number = $6,
+             image_url = $7,
              status = 'published',
              reusable_at = NULL,
              updated_at = now()
-         WHERE id = $7
-         RETURNING id, product_code, title, description, price, quantity, image_url`,
+         WHERE id = $8
+         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
           [
             code,
             nextTitle,
             nextDescription,
             nextPrice,
             nextQuantity,
+            nextShelfNumber,
             nextImageUrl,
             row.product_id,
           ],
@@ -3075,8 +3140,13 @@ router.post(
           kind: "catalog_product",
           product_id: product.id,
           product_code: product.product_code,
+          product_label: formatProductLabel(
+            product.product_code,
+            product.shelf_number,
+          ),
           price: Number(product.price),
           quantity: Number(product.quantity),
+          shelf_number: Number(product.shelf_number),
           image_url: product.image_url,
         };
 
@@ -3125,8 +3195,13 @@ router.post(
             kind: "catalog_product_archive",
             product_id: product.id,
             product_code: product.product_code,
+            product_label: formatProductLabel(
+              product.product_code,
+              product.shelf_number,
+            ),
             price: Number(product.price),
             quantity: Number(product.quantity),
+            shelf_number: Number(product.shelf_number),
             image_url: product.image_url,
             source_channel_id: row.channel_id,
             source_channel_title: row.channel_title,
@@ -3190,6 +3265,11 @@ router.post(
           channel_title: row.channel_title,
           product_id: product.id,
           product_code: product.product_code,
+          product_label: formatProductLabel(
+            product.product_code,
+            product.shelf_number,
+          ),
+          shelf_number: Number(product.shelf_number),
           message_id: message.id,
         });
       }
