@@ -464,6 +464,14 @@ bool _isAuthEndpoint(RequestOptions options) {
       path.contains('/register');
 }
 
+String? _encodeTenantCodeHeaderValue(String? tenantCode) {
+  final value = (tenantCode ?? '').trim().toLowerCase();
+  if (value.isEmpty) return null;
+  final encoded = Uri.encodeComponent(value);
+  if (encoded.isEmpty) return null;
+  return encoded;
+}
+
 void _attachAuthInterceptor() {
   debugPrint('_attachAuthInterceptor: attaching');
   dio.interceptors.add(
@@ -482,10 +490,13 @@ void _attachAuthInterceptor() {
               authService.currentUser?.role.toLowerCase().trim() ?? '';
           if (currentRole == 'creator') {
             options.headers.remove('X-Tenant-Code');
-          } else if (tenantCode != null && tenantCode.trim().isNotEmpty) {
-            options.headers['X-Tenant-Code'] = tenantCode.trim().toLowerCase();
           } else {
-            options.headers.remove('X-Tenant-Code');
+            final encodedTenantCode = _encodeTenantCodeHeaderValue(tenantCode);
+            if (encodedTenantCode != null) {
+              options.headers['X-Tenant-Code'] = encodedTenantCode;
+            } else {
+              options.headers.remove('X-Tenant-Code');
+            }
           }
           final viewRole = authService.viewRole?.trim();
           if ((authService.currentUser?.role.toLowerCase().trim() ?? '') ==

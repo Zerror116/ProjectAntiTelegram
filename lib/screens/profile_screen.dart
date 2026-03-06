@@ -37,7 +37,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   double _avatarFocusY = 0;
   double _avatarZoom = 1;
   String _message = '';
-  String _publicInviteLink = '';
+  String _publicInviteCode = '';
   String _viewMode = 'creator';
   Map<String, dynamic> _stats = const {};
   bool _statsExpanded = false;
@@ -593,7 +593,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
-  Future<void> _fetchPublicInviteLink() async {
+  Future<void> _fetchPublicInviteCode() async {
     if (_inviteBusy) return;
     setState(() {
       _inviteBusy = true;
@@ -607,26 +607,38 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final row = Map<String, dynamic>.from(data['data']);
-        final link = (row['invite_link'] ?? '').toString().trim();
-        if (link.isEmpty) {
+        var code = (row['code'] ?? '').toString().trim().toUpperCase();
+        if (code.isEmpty) {
+          final link = (row['invite_link'] ?? '').toString().trim();
+          if (link.isNotEmpty) {
+            try {
+              final uri = Uri.parse(link);
+              code =
+                  (uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '')
+                      .trim()
+                      .toUpperCase();
+            } catch (_) {}
+          }
+        }
+        if (code.isEmpty) {
           if (!mounted) return;
-          setState(() => _message = 'Ссылка приглашения недоступна');
+          setState(() => _message = 'Код приглашения недоступен');
           return;
         }
-        await Clipboard.setData(ClipboardData(text: link));
+        await Clipboard.setData(ClipboardData(text: code));
         if (!mounted) return;
         setState(() {
-          _publicInviteLink = link;
-          _message = 'Ссылка приглашения скопирована';
+          _publicInviteCode = code;
+          _message = 'Код приглашения скопирован';
         });
       } else {
         if (!mounted) return;
-        setState(() => _message = 'Не удалось получить ссылку приглашения');
+        setState(() => _message = 'Не удалось получить код приглашения');
       }
     } catch (e) {
       if (!mounted) return;
       setState(
-        () => _message = 'Ошибка ссылки приглашения: ${_extractDioMessage(e)}',
+        () => _message = 'Ошибка кода приглашения: ${_extractDioMessage(e)}',
       );
     } finally {
       if (mounted) setState(() => _inviteBusy = false);
@@ -1253,7 +1265,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'Вы можете поделиться ссылкой с новыми клиентами.',
+                            'Скопируйте короткий код и отправьте клиенту для регистрации.',
                             style: theme.textTheme.bodyMedium?.copyWith(
                               color: theme.colorScheme.onSurfaceVariant,
                             ),
@@ -1264,7 +1276,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             child: FilledButton.tonalIcon(
                               onPressed: _inviteBusy
                                   ? null
-                                  : _fetchPublicInviteLink,
+                                  : _fetchPublicInviteCode,
                               icon: _inviteBusy
                                   ? const SizedBox(
                                       width: 14,
@@ -1274,13 +1286,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                       ),
                                     )
                                   : const Icon(Icons.share_outlined),
-                              label: const Text('Скопировать ссылку'),
+                              label: const Text('Скопировать код'),
                             ),
                           ),
-                          if (_publicInviteLink.trim().isNotEmpty) ...[
+                          if (_publicInviteCode.trim().isNotEmpty) ...[
                             const SizedBox(height: 10),
                             SelectableText(
-                              _publicInviteLink,
+                              _publicInviteCode,
                               style: theme.textTheme.bodySmall,
                             ),
                           ],

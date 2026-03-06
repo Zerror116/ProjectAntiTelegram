@@ -577,13 +577,18 @@ router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => 
     return res.status(403).json({ ok: false, error: "Forbidden" });
   }
   try {
+    const includeDeleted = String(req.query?.include_deleted || "")
+      .trim()
+      .toLowerCase() === "1";
     const result = await db.platformQuery(
       `SELECT id, code, name, status, access_key_mask,
               subscription_expires_at, last_payment_confirmed_at, notes,
-              db_mode, db_name,
+              db_mode, db_name, is_deleted,
               created_at, updated_at
        FROM tenants
+       WHERE ($1::boolean = true OR COALESCE(is_deleted, false) = false)
        ORDER BY created_at DESC`,
+      [includeDeleted],
     );
     return res.json({ ok: true, data: result.rows });
   } catch (err) {
@@ -783,6 +788,7 @@ router.post(
              last_payment_confirmed_at = now(),
              updated_at = now()
          WHERE id = $2
+           AND COALESCE(is_deleted, false) = false
          RETURNING id, code, name, status, access_key_mask, subscription_expires_at, last_payment_confirmed_at`,
         [months, tenantId],
       );
@@ -825,6 +831,12 @@ router.patch(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден" });
       }
+      if (tenant.is_deleted === true) {
+        return res.status(404).json({
+          ok: false,
+          error: "Арендатор уже удален",
+        });
+      }
       if (isProtectedTenantCode(tenant.code)) {
         return res.status(403).json({
           ok: false,
@@ -836,6 +848,7 @@ router.patch(
          SET status = $1,
              updated_at = now()
          WHERE id = $2
+           AND COALESCE(is_deleted, false) = false
          RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
         [status, tenantId],
       );
@@ -871,6 +884,12 @@ router.delete(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден" });
       }
+      if (tenant.is_deleted === true) {
+        return res.status(404).json({
+          ok: false,
+          error: "Арендатор уже удален",
+        });
+      }
       if (isProtectedTenantCode(tenant.code)) {
         return res.status(403).json({
           ok: false,
@@ -880,16 +899,18 @@ router.delete(
       const archived = await db.platformQuery(
         `UPDATE tenants
          SET status = 'blocked',
+             is_deleted = true,
              subscription_expires_at = now(),
              updated_at = now()
          WHERE id = $1
-         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
+           AND COALESCE(is_deleted, false) = false
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at, is_deleted`,
         [tenantId],
       );
       if (archived.rowCount === 0) {
         return res
           .status(404)
-          .json({ ok: false, error: "Арендатор не найден" });
+          .json({ ok: false, error: "Арендатор не найден или уже удален" });
       }
       return res.json({ ok: true, data: archived.rows[0] });
     } catch (err) {
@@ -1000,7 +1021,7 @@ function isTenantUser(user) {
 
 async function getTenantById(tenantId) {
   const result = await db.platformQuery(
-    `SELECT id, code, name
+    `SELECT id, code, name, is_deleted
      FROM tenants
      WHERE id = $1
      LIMIT 1`,

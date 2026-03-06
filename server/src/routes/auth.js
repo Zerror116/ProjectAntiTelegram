@@ -55,8 +55,18 @@ function normalizeDeviceFingerprint(value) {
   return normalized ? normalized.slice(0, 255) : null;
 }
 
+function decodeTenantCodeHeaderValue(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  try {
+    return decodeURIComponent(value);
+  } catch (_) {
+    return value;
+  }
+}
+
 function extractTenantCodeHint(req) {
-  const fromHeader = String(req.get('x-tenant-code') || '').trim();
+  const fromHeader = decodeTenantCodeHeaderValue(req.get('x-tenant-code'));
   if (fromHeader) return db.normalizeTenantCode(fromHeader);
 
   const fromBody = String(req.body?.tenant_code || '').trim();
