@@ -95,7 +95,10 @@ class _MainShellState extends State<MainShell> {
 
   List<String> _destinationIdsForRole(String role) {
     final normalized = role.toLowerCase().trim();
-    final showAdmin = normalized == 'admin' || normalized == 'creator';
+    final showAdmin =
+        normalized == 'admin' ||
+        normalized == 'tenant' ||
+        normalized == 'creator';
     final showWorker = normalized == 'worker' || normalized == 'creator';
     final showTests = _isCreatorNativeView();
     return <String>[
@@ -123,7 +126,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   bool _hasAdminTab() {
-    const roles = {'admin', 'creator'};
+    const roles = {'admin', 'tenant', 'creator'};
     return roles.contains(_effectiveRole());
   }
 

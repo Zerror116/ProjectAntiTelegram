@@ -330,7 +330,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         const InputDecoration(
                           labelText: 'Ключ арендатора или код приглашения',
                           hintText:
-                              'Владелец: PHX-.... или сотрудник/клиент: INV-....',
+                              'Арендатор: PHX-.... или сотрудник/клиент: INV-....',
                         ),
                         controller: _accessKeyController,
                       ),

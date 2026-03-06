@@ -114,7 +114,7 @@ async function allocateProductCode(client) {
 
 async function getAllowedPostChannels(userRole, tenantId = null) {
   const role = String(userRole || '').toLowerCase().trim();
-  if (!['worker', 'admin', 'creator'].includes(role)) {
+  if (!['worker', 'admin', 'tenant', 'creator'].includes(role)) {
     return [];
   }
 

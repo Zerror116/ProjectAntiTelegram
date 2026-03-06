@@ -24,6 +24,17 @@ const DEFAULT_ROLE_PERMISSIONS = {
     'reservation.fulfill': true,
     'delivery.manage': true,
   },
+  tenant: {
+    'chat.read': true,
+    'chat.write.public': true,
+    'chat.pin': true,
+    'chat.delete.all': true,
+    'product.publish': true,
+    'reservation.fulfill': true,
+    'delivery.manage': true,
+    'tenant.invites.manage': true,
+    'tenant.users.manage': true,
+  },
   creator: {
     all: true,
   },

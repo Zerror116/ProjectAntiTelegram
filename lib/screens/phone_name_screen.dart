@@ -21,10 +21,14 @@ class PhoneNameScreen extends StatefulWidget {
 class _PhoneNameScreenState extends State<PhoneNameScreen> {
   final _nameCtrl = TextEditingController();
   final _phoneCtrl = TextEditingController();
+  final _groupNameCtrl = TextEditingController();
+  final _mainChannelCtrl = TextEditingController();
   final _secretCtrl = TextEditingController();
 
   late final VoidCallback _nameListener;
   late final VoidCallback _phoneListener;
+  late final VoidCallback _groupNameListener;
+  late final VoidCallback _mainChannelListener;
   late final VoidCallback _secretListener;
 
   bool _loading = false;
@@ -46,6 +50,19 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
   bool get _shouldShowSecretField =>
       widget.isRegisterFlow ? _isCreatorPending : _isCreatorCurrentUser;
+
+  String get _normalizedPendingAccessKey {
+    return (authService.pendingAccessKey ?? '')
+        .toUpperCase()
+        .replaceAll(RegExp(r'\s+'), '')
+        .trim();
+  }
+
+  bool get _isTenantKeyRegistration {
+    if (!widget.isRegisterFlow) return false;
+    if (_isCreatorPending) return false;
+    return _normalizedPendingAccessKey.startsWith('PHX');
+  }
 
   Future<void> _handleBack() async {
     if (_loading) return;
@@ -73,10 +90,14 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
     _nameListener = () => setState(() {});
     _phoneListener = () => setState(() {});
+    _groupNameListener = () => setState(() {});
+    _mainChannelListener = () => setState(() {});
     _secretListener = () => setState(() {});
 
     _nameCtrl.addListener(_nameListener);
     _phoneCtrl.addListener(_phoneListener);
+    _groupNameCtrl.addListener(_groupNameListener);
+    _mainChannelCtrl.addListener(_mainChannelListener);
     _secretCtrl.addListener(_secretListener);
   }
 
@@ -89,11 +110,19 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
       _phoneCtrl.removeListener(_phoneListener);
     } catch (_) {}
     try {
+      _groupNameCtrl.removeListener(_groupNameListener);
+    } catch (_) {}
+    try {
+      _mainChannelCtrl.removeListener(_mainChannelListener);
+    } catch (_) {}
+    try {
       _secretCtrl.removeListener(_secretListener);
     } catch (_) {}
 
     _nameCtrl.dispose();
     _phoneCtrl.dispose();
+    _groupNameCtrl.dispose();
+    _mainChannelCtrl.dispose();
     _secretCtrl.dispose();
     super.dispose();
   }
@@ -111,6 +140,8 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   Future<void> _submit() async {
     final name = _nameCtrl.text.trim();
     final phoneRaw = _phoneCtrl.text.trim();
+    final groupName = _groupNameCtrl.text.trim();
+    final mainChannelTitle = _mainChannelCtrl.text.trim();
     final secret = _secretCtrl.text.trim();
 
     if (name.isEmpty) {
@@ -132,6 +163,14 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
     if (_shouldShowSecretField && secret.isEmpty) {
       setState(() => _message = 'Введите секретное слово');
+      return;
+    }
+    if (_isTenantKeyRegistration && groupName.isEmpty) {
+      setState(() => _message = 'Введите название вашей группы');
+      return;
+    }
+    if (_isTenantKeyRegistration && mainChannelTitle.isEmpty) {
+      setState(() => _message = 'Введите название основного канала');
       return;
     }
 
@@ -171,6 +210,10 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
             'access_key': authService.pendingAccessKey!.trim(),
         };
         if (_isCreatorPending) data['secret'] = secret;
+        if (_isTenantKeyRegistration) {
+          data['group_name'] = groupName;
+          data['main_channel_title'] = mainChannelTitle;
+        }
 
         final resp = await authService.dio.post(
           '/api/auth/register',
@@ -293,6 +336,32 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
                   decoration: withInputLanguageBadge(
                     const InputDecoration(labelText: 'Секретное слово'),
                     controller: _secretCtrl,
+                  ),
+                  textInputAction: TextInputAction.done,
+                ),
+                const SizedBox(height: 12),
+              ],
+              if (_isTenantKeyRegistration) ...[
+                TextField(
+                  controller: _groupNameCtrl,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Название вашей группы',
+                      hintText: 'Например: Феникс Самара',
+                    ),
+                    controller: _groupNameCtrl,
+                  ),
+                  textInputAction: TextInputAction.next,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _mainChannelCtrl,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Название основного канала',
+                      hintText: 'Например: Витрина Феникс',
+                    ),
+                    controller: _mainChannelCtrl,
                   ),
                   textInputAction: TextInputAction.done,
                 ),

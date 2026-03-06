@@ -1905,7 +1905,9 @@ router.patch(
 router.get("/slots", requireAuth, async (req, res) => {
   try {
     const role = String(req.user?.role || "").toLowerCase().trim();
-    const allowAll = (role === "admin" || role === "creator") && String(req.query?.all || "") === "1";
+    const allowAll =
+      (role === "admin" || role === "tenant" || role === "creator") &&
+      String(req.query?.all || "") === "1";
     const result = await db.query(
       `SELECT id, tenant_id, title, from_time, to_time, sort_order, is_active, is_system, created_at, updated_at
        FROM delivery_slot_presets

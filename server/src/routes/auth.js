@@ -22,6 +22,7 @@ const {
   revokeSessionByRecordId,
   revokeUserSession,
 } = require('../utils/sessions');
+const { ensureSystemChannels } = require("../utils/systemChannels");
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
@@ -77,6 +78,20 @@ function buildInviteLink(req, inviteCode, tenantCode = '') {
     return `${base}${glue}invite=${encodedInvite}${tenantPart}`;
   }
   return `${req.protocol}://${req.get('host')}/?invite=${encodedInvite}${tenantPart}`;
+}
+
+function normalizeTenantGroupName(raw) {
+  return String(raw || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function normalizeMainChannelTitle(raw) {
+  return String(raw || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
 }
 
 async function assertDeviceAccountLimit(queryable, deviceFingerprint, userId = null) {
@@ -280,6 +295,8 @@ router.post('/register', async (req, res) => {
       device_fingerprint,
       access_key,
       invite_code,
+      group_name,
+      main_channel_title,
     } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
@@ -295,6 +312,8 @@ router.post('/register', async (req, res) => {
     let tenant = null;
     let invite = null;
     const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase();
+    const tenantGroupName = normalizeTenantGroupName(group_name);
+    const tenantMainChannelTitle = normalizeMainChannelTitle(main_channel_title);
 
     if (isPlatformCreator) {
       if (typeof secret !== 'string' || secret !== CREATOR_SECRET) {
@@ -318,7 +337,17 @@ router.post('/register', async (req, res) => {
         if (!tenant) {
           return res.status(403).json({ error: 'Неверный ключ арендатора.' });
         }
-        role = 'admin';
+        if (!tenantGroupName) {
+          return res.status(400).json({
+            error: "Введите название вашей группы арендатора",
+          });
+        }
+        if (!tenantMainChannelTitle) {
+          return res.status(400).json({
+            error: "Введите название основного канала",
+          });
+        }
+        role = 'tenant';
       } else if (rawInviteCode) {
         invite = await resolveTenantInviteByCode(rawInviteCode);
         if (!invite) {
@@ -401,6 +430,47 @@ router.post('/register', async (req, res) => {
                SET phone = $2, status = 'pending_verification', created_at = now()`,
             [user.id, normalizedPhone],
           );
+        }
+
+        if (role === "tenant" && tenant?.id) {
+          const ownerQ = await client.query(
+            `SELECT id
+             FROM users
+             WHERE tenant_id = $1
+               AND role = 'tenant'
+               AND id <> $2
+             LIMIT 1`,
+            [tenant.id, user.id],
+          );
+          if (ownerQ.rowCount > 0) {
+            await client.query("ROLLBACK");
+            return {
+              ok: false,
+              status: 409,
+              error:
+                "Этот ключ арендатора уже активирован. Обратитесь к создателю за новым ключом.",
+            };
+          }
+
+          await client.query(
+            `UPDATE tenants
+             SET name = $1,
+                 updated_at = now()
+             WHERE id = $2`,
+            [tenantGroupName, tenant.id],
+          );
+          tenant.name = tenantGroupName;
+
+          const ensured = await ensureSystemChannels(client, user.id || null, tenant.id);
+          if (tenantMainChannelTitle && ensured?.mainChannel?.id) {
+            await client.query(
+              `UPDATE chats
+               SET title = $1,
+                   updated_at = now()
+               WHERE id = $2`,
+              [tenantMainChannelTitle, ensured.mainChannel.id],
+            );
+          }
         }
 
         await upsertDevice(client, user.id, device_fingerprint);
@@ -663,6 +733,16 @@ router.get('/tenant/public-invite', authMiddleware, async (req, res) => {
       return res.status(403).json({
         ok: false,
         error: 'Для создателя ссылка приглашения не требуется',
+      });
+    }
+
+    const requesterRole = String(req.user?.role || '')
+      .toLowerCase()
+      .trim();
+    if (requesterRole !== "tenant") {
+      return res.status(403).json({
+        ok: false,
+        error: "Ссылку приглашения клиентов может создавать только арендатор",
       });
     }
 

@@ -138,8 +138,8 @@ async function ensureStaffMembers(
   { removeNonStaff = false, includeWorkers = false } = {},
 ) {
   const allowedRoles = includeWorkers
-    ? ["worker", "admin", "creator"]
-    : ["admin", "creator"];
+    ? ["worker", "admin", "tenant", "creator"]
+    : ["admin", "tenant", "creator"];
 
   if (removeNonStaff) {
     await client.query(
@@ -166,7 +166,7 @@ async function ensureStaffMembers(
     const memberRole =
       normalizedRole === "creator"
         ? "owner"
-        : normalizedRole === "admin"
+        : normalizedRole === "admin" || normalizedRole === "tenant"
           ? "moderator"
           : "member";
     await client.query(

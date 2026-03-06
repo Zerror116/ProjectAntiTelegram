@@ -249,7 +249,13 @@ function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
   const isAdminFlag = !!req.user.isAdmin;
   const role = (req.user.role || '').toString().toLowerCase();
-  if (!isAdminFlag && role !== 'admin' && role !== 'creator' && role !== 'superadmin') {
+  if (
+    !isAdminFlag &&
+    role !== 'admin' &&
+    role !== 'tenant' &&
+    role !== 'creator' &&
+    role !== 'superadmin'
+  ) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   return next();

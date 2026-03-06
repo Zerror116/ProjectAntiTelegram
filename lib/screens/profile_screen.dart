@@ -46,6 +46,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _addGroupBusy = false;
   final _addGroupCodeCtrl = TextEditingController();
   final _addGroupPasswordCtrl = TextEditingController();
+  final _tenantClientSearchCtrl = TextEditingController();
+  bool _tenantClientsLoading = false;
+  List<Map<String, dynamic>> _tenantClients = const [];
+  String _tenantRoleUpdateUserId = '';
   List<Map<String, dynamic>> _savedTenantSessions = const [];
 
   @override
@@ -59,6 +63,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   void dispose() {
     _addGroupCodeCtrl.dispose();
     _addGroupPasswordCtrl.dispose();
+    _tenantClientSearchCtrl.dispose();
     super.dispose();
   }
 
@@ -91,6 +96,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool get _isClientAccount =>
       (authService.currentUser?.role ?? '').toLowerCase().trim() == 'client';
 
+  bool get _isTenantAccount =>
+      (authService.currentUser?.role ?? '').toLowerCase().trim() == 'tenant';
+
   double _toAvatarFocus(Object? raw) {
     final value = double.tryParse('${raw ?? ''}');
     if (value == null || !value.isFinite) return 0;
@@ -107,6 +115,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     switch (role.toLowerCase().trim()) {
       case 'creator':
         return 'Создатель';
+      case 'tenant':
+        return 'Арендатор';
       case 'admin':
         return 'Администратор';
       case 'worker':
@@ -164,6 +174,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } finally {
       if (mounted) setState(() => _loading = false);
       unawaited(_loadSavedSessions());
+      if (_isTenantAccount) {
+        unawaited(_loadTenantClients());
+      }
     }
   }
 
@@ -574,7 +587,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _message = '';
     });
     try {
-      final resp = await authService.dio.get('/api/auth/tenant/public-invite');
+      final resp = await authService.dio.get(
+        '/api/profile/tenant/client-invite',
+      );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final row = Map<String, dynamic>.from(data['data']);
@@ -602,6 +617,105 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } finally {
       if (mounted) setState(() => _inviteBusy = false);
     }
+  }
+
+  Future<void> _loadTenantClients({String? searchOverride}) async {
+    if (!_isTenantAccount) return;
+    final search = (searchOverride ?? _tenantClientSearchCtrl.text).trim();
+    setState(() {
+      _tenantClientsLoading = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get(
+        '/api/profile/tenant/clients',
+        queryParameters: {'search': search},
+      );
+      final data = resp.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        setState(() {
+          _tenantClients = List<Map<String, dynamic>>.from(data['data']);
+        });
+      } else {
+        setState(() => _message = 'Не удалось загрузить список клиентов');
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка списка клиентов: ${_extractDioMessage(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _tenantClientsLoading = false);
+    }
+  }
+
+  Future<void> _setTenantClientRole(String userId, String role) async {
+    final id = userId.trim();
+    if (id.isEmpty) return;
+    setState(() {
+      _tenantRoleUpdateUserId = id;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/profile/tenant/clients/$id/role',
+        data: {'role': role},
+      );
+      if (!mounted) return;
+      setState(() => _message = 'Роль успешно обновлена');
+      await _loadTenantClients();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка смены роли: ${_extractDioMessage(e)}');
+    } finally {
+      if (mounted) {
+        setState(() {
+          if (_tenantRoleUpdateUserId == id) _tenantRoleUpdateUserId = '';
+        });
+      }
+    }
+  }
+
+  Future<void> _openTenantRoleMenu(Map<String, dynamic> userRow) async {
+    final userId = (userRow['id'] ?? '').toString().trim();
+    final currentRole = (userRow['role'] ?? 'client').toString().trim();
+    if (userId.isEmpty) return;
+
+    final role = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final options = const <Map<String, String>>[
+          {'value': 'client', 'label': 'Клиент'},
+          {'value': 'worker', 'label': 'Работник'},
+          {'value': 'admin', 'label': 'Администратор'},
+        ];
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ...options.map((option) {
+                final value = option['value'] ?? 'client';
+                final label = option['label'] ?? value;
+                final selected = currentRole == value;
+                return ListTile(
+                  leading: Icon(
+                    selected ? Icons.check_circle : Icons.circle_outlined,
+                  ),
+                  title: Text(label),
+                  onTap: () => Navigator.of(ctx).pop(value),
+                );
+              }),
+              const SizedBox(height: 6),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (role == null || role == currentRole) return;
+    await _setTenantClientRole(userId, role);
   }
 
   Widget _statChip(IconData icon, String label) {
@@ -848,6 +962,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       switch (effectiveRole) {
         case 'worker':
           return buildWorkerCard(title, data);
+        case 'tenant':
         case 'admin':
           return buildAdminCard(title, data);
         case 'creator':
@@ -955,7 +1070,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
         : (_email.isNotEmpty ? _email : 'Без имени');
     final actualRole = authService.currentUser?.role ?? 'client';
     final effectiveRole = authService.effectiveRole;
-    final canShareInvite = actualRole.toLowerCase().trim() != 'creator';
+    final isTenantAccount = actualRole.toLowerCase().trim() == 'tenant';
+    final canShareInvite = isTenantAccount;
     final isPlatformCreator =
         actualRole.toLowerCase().trim() == 'creator' &&
         (authService.currentUser?.email ?? '').toLowerCase().trim() ==
@@ -1152,6 +1268,165 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               style: theme.textTheme.bodySmall,
                             ),
                           ],
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (isTenantAccount) ...[
+                    const SizedBox(height: 16),
+                    _sectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Управление клиентами',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Ищите клиентов вашей группы и меняйте их роль на работника или администратора.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: TextField(
+                                  controller: _tenantClientSearchCtrl,
+                                  decoration: withInputLanguageBadge(
+                                    const InputDecoration(
+                                      labelText:
+                                          'Поиск по имени, email, телефону',
+                                      border: OutlineInputBorder(),
+                                    ),
+                                    controller: _tenantClientSearchCtrl,
+                                  ),
+                                  onSubmitted: (_) => _loadTenantClients(),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              IconButton.filledTonal(
+                                tooltip: 'Найти',
+                                onPressed: _tenantClientsLoading
+                                    ? null
+                                    : () => _loadTenantClients(),
+                                icon: _tenantClientsLoading
+                                    ? const SizedBox(
+                                        width: 14,
+                                        height: 14,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Icon(Icons.search_rounded),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          if (_tenantClients.isEmpty && !_tenantClientsLoading)
+                            Text(
+                              'Список пока пуст.',
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ..._tenantClients.map((row) {
+                            final userId = (row['id'] ?? '').toString();
+                            final fullName = (row['name'] ?? '')
+                                .toString()
+                                .trim();
+                            final email = (row['email'] ?? '')
+                                .toString()
+                                .trim();
+                            final phone = PhoneUtils.formatForDisplay(
+                              (row['phone'] ?? '').toString(),
+                            );
+                            final role = (row['role'] ?? 'client').toString();
+                            final isBusy =
+                                userId.isNotEmpty &&
+                                _tenantRoleUpdateUserId == userId;
+
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 10),
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: theme.colorScheme.surfaceContainerLow,
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(
+                                  color: theme.colorScheme.outlineVariant,
+                                ),
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          fullName.isNotEmpty
+                                              ? fullName
+                                              : email,
+                                          style: theme.textTheme.titleSmall
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          email,
+                                          style: theme.textTheme.bodySmall
+                                              ?.copyWith(
+                                                color: theme
+                                                    .colorScheme
+                                                    .onSurfaceVariant,
+                                              ),
+                                        ),
+                                        if (phone.trim().isNotEmpty) ...[
+                                          const SizedBox(height: 2),
+                                          Text(
+                                            phone,
+                                            style: theme.textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color: theme
+                                                      .colorScheme
+                                                      .onSurfaceVariant,
+                                                ),
+                                          ),
+                                        ],
+                                        const SizedBox(height: 8),
+                                        _statChip(
+                                          Icons.badge_outlined,
+                                          'Роль: ${_roleLabel(role)}',
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  IconButton(
+                                    tooltip: 'Изменить роль',
+                                    onPressed: isBusy
+                                        ? null
+                                        : () => _openTenantRoleMenu(row),
+                                    icon: isBusy
+                                        ? const SizedBox(
+                                            width: 16,
+                                            height: 16,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : const Icon(Icons.manage_accounts),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }),
                         ],
                       ),
                     ),
