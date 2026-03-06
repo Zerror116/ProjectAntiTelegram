@@ -10,9 +10,11 @@ const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
 const { ensureSystemChannels } = require('../utils/systemChannels');
+const { emitToTenant } = require('../utils/socket');
 
 const productUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
+const SAMARA_TZ = 'Europe/Samara';
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -79,6 +81,136 @@ function toPositiveInteger(value, fallback = 1) {
 function hasAtLeastTwoLetters(value) {
   const letters = String(value || '').match(/[A-Za-zА-Яа-яЁё]/g) || [];
   return letters.length >= 2;
+}
+
+function isIsoDay(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim());
+}
+
+function parseRevisionDates(value) {
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((item) => String(item || '').trim())
+      .filter((item) => item && isIsoDay(item));
+    return Array.from(new Set(normalized)).slice(0, 2);
+  }
+  if (typeof value === 'string') {
+    const normalized = value
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item && isIsoDay(item));
+    return Array.from(new Set(normalized)).slice(0, 2);
+  }
+  return [];
+}
+
+function roundPriceToStep(value, step = 50, min = 50) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  const rounded = Math.round(n / step) * step;
+  return Math.max(min, rounded);
+}
+
+function toBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) return fallback;
+  return ['1', 'true', 'yes', 'y', 'on'].includes(normalized);
+}
+
+function productMessageText(product) {
+  const lines = [
+    `🛒 ${product.title}`,
+    product.description ? String(product.description).trim() : null,
+    `Цена: ${product.price} RUB`,
+    `Количество в наличии: ${product.quantity}`,
+    'Нажмите "Купить", чтобы добавить в корзину',
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+function normalizeRevisionEntry(raw) {
+  const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const title = String(item.title || '').trim();
+  const description = String(item.description || '').trim();
+  const price = Number(item.price);
+  const quantity = Number(item.quantity);
+  return {
+    product_id: String(item.product_id || '').trim(),
+    message_id: String(item.message_id || '').trim(),
+    title,
+    description,
+    price,
+    quantity,
+    image_url: normalizeImageUrl(item.image_url),
+  };
+}
+
+async function fetchRevisionDays(client, channelId, limit = 2) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 2, 1), 10);
+  const q = await client.query(
+    `SELECT to_char((m.created_at AT TIME ZONE $2), 'YYYY-MM-DD') AS day,
+            to_char((m.created_at AT TIME ZONE $2), 'DD.MM.YYYY') AS label,
+            COUNT(*)::int AS posts
+     FROM messages m
+     WHERE m.chat_id = $1
+       AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+     GROUP BY day, label
+     ORDER BY day DESC
+     LIMIT $3`,
+    [channelId, SAMARA_TZ, safeLimit]
+  );
+  return q.rows;
+}
+
+async function fetchRevisionPosts(client, channelId, selectedDates) {
+  const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
+  const rows = await client.query(
+    `SELECT m.id AS message_id,
+            m.chat_id,
+            m.created_at,
+            m.text,
+            m.meta,
+            p.id AS product_id,
+            p.product_code,
+            p.title AS product_title,
+            p.description AS product_description,
+            p.price AS product_price,
+            p.quantity AS product_quantity,
+            p.image_url AS product_image_url
+     FROM messages m
+     LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+     WHERE m.chat_id = $1
+       AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND (
+         $2::text[] IS NULL
+         OR to_char((m.created_at AT TIME ZONE $3), 'YYYY-MM-DD') = ANY($2::text[])
+       )
+     ORDER BY m.created_at DESC`,
+    [channelId, dateFilter, SAMARA_TZ]
+  );
+  return rows.rows.map((row) => {
+    const meta = parseSettings(row.meta);
+    const fallbackPrice = toPositiveNumber(meta.price, 0);
+    const fallbackQuantity = toPositiveInteger(meta.quantity, 1);
+    const fallbackImage = normalizeImageUrl(meta.image_url);
+    return {
+      message_id: row.message_id,
+      chat_id: row.chat_id,
+      created_at: row.created_at,
+      text: row.text,
+      meta,
+      product_id: row.product_id || meta.product_id || null,
+      product_code: row.product_code ?? meta.product_code ?? null,
+      title: String(row.product_title || '').trim(),
+      description: String(row.product_description || '').trim(),
+      price: Number(row.product_price ?? fallbackPrice),
+      quantity: Number(row.product_quantity ?? fallbackQuantity),
+      image_url: normalizeImageUrl(row.product_image_url) || fallbackImage,
+    };
+  });
 }
 
 async function allocateProductCode(client) {
@@ -601,6 +733,436 @@ router.patch(
     } catch (err) {
       console.error('worker.queue.patch error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  }
+);
+
+router.get(
+  '/revision/dates',
+  authMiddleware,
+  requireRole('worker', 'admin', 'creator'),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id || null
+      );
+      const days = await fetchRevisionDays(client, mainChannel.id, 2);
+      await client.query('COMMIT');
+      return res.json({ ok: true, data: days });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('worker.revision.dates error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.get(
+  '/revision/posts',
+  authMiddleware,
+  requireRole('worker', 'admin', 'creator'),
+  async (req, res) => {
+    const selectedDates = parseRevisionDates(req.query?.dates);
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id || null
+      );
+      const fallbackDays = selectedDates.length > 0
+        ? selectedDates
+        : (await fetchRevisionDays(client, mainChannel.id, 2)).map((x) => x.day);
+      const posts = await fetchRevisionPosts(client, mainChannel.id, fallbackDays);
+      await client.query('COMMIT');
+      return res.json({
+        ok: true,
+        data: {
+          dates: fallbackDays,
+          posts,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('worker.revision.posts error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.post(
+  '/revision/manual',
+  authMiddleware,
+  requireRole('worker', 'admin', 'creator'),
+  async (req, res) => {
+    const entries = Array.isArray(req.body?.entries) ? req.body.entries : [];
+    if (!entries.length) {
+      return res.status(400).json({ ok: false, error: 'Передайте entries для ручной ревизии' });
+    }
+    if (entries.length > 200) {
+      return res.status(400).json({ ok: false, error: 'Слишком много позиций за один запрос' });
+    }
+
+    const normalized = entries.map(normalizeRevisionEntry);
+    for (const item of normalized) {
+      if (!item.product_id && !item.message_id) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Для каждой позиции нужен product_id или message_id',
+        });
+      }
+      if (!item.title) {
+        return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
+      }
+      if (!hasAtLeastTwoLetters(item.description)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Описание должно содержать минимум 2 буквы',
+        });
+      }
+      if (!Number.isFinite(item.price) || item.price <= 0) {
+        return res.status(400).json({ ok: false, error: 'Цена должна быть больше нуля' });
+      }
+      if (!Number.isFinite(item.quantity) || item.quantity <= 0) {
+        return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
+      }
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id || null
+      );
+
+      const updatedMessages = [];
+
+      for (const item of normalized) {
+        let targetQ;
+        if (item.message_id) {
+          targetQ = await client.query(
+            `SELECT m.id AS message_id,
+                    m.chat_id,
+                    m.meta,
+                    p.id AS product_id,
+                    p.product_code,
+                    p.title AS product_title,
+                    p.description AS product_description,
+                    p.price AS product_price,
+                    p.quantity AS product_quantity,
+                    p.image_url AS product_image_url
+             FROM messages m
+             LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+             WHERE m.id = $1
+               AND m.chat_id = $2
+               AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+             LIMIT 1`,
+            [item.message_id, mainChannel.id]
+          );
+        } else {
+          targetQ = await client.query(
+            `SELECT m.id AS message_id,
+                    m.chat_id,
+                    m.meta,
+                    p.id AS product_id,
+                    p.product_code,
+                    p.title AS product_title,
+                    p.description AS product_description,
+                    p.price AS product_price,
+                    p.quantity AS product_quantity,
+                    p.image_url AS product_image_url
+             FROM messages m
+             JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+             WHERE p.id = $1::uuid
+               AND m.chat_id = $2
+               AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+               AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+             ORDER BY m.created_at DESC
+             LIMIT 1`,
+            [item.product_id, mainChannel.id]
+          );
+        }
+
+        if (targetQ.rowCount === 0) {
+          continue;
+        }
+        const target = targetQ.rows[0];
+        const productId = String(target.product_id || '').trim();
+        if (!productId) {
+          continue;
+        }
+
+        const nextQuantity = Math.floor(item.quantity);
+        const nextPrice = roundPriceToStep(item.price, 50, 50);
+        const nextImageUrl = item.image_url || normalizeImageUrl(target.product_image_url) || null;
+
+        const productUpdate = await client.query(
+          `UPDATE products
+           SET title = $1,
+               description = $2,
+               price = $3,
+               quantity = $4,
+               image_url = $5,
+               status = CASE WHEN status = 'archived' THEN 'published' ELSE status END,
+               updated_at = now()
+           WHERE id = $6::uuid
+           RETURNING id, product_code, title, description, price, quantity, image_url`,
+          [item.title, item.description, nextPrice, nextQuantity, nextImageUrl, productId]
+        );
+        if (productUpdate.rowCount === 0) {
+          continue;
+        }
+        const product = productUpdate.rows[0];
+
+        const messageUpdate = await client.query(
+          `UPDATE messages
+           SET text = $1,
+               meta = jsonb_strip_nulls(
+                 COALESCE(meta, '{}'::jsonb)
+                 || jsonb_build_object(
+                    'kind', 'catalog_product',
+                    'product_id', $2::text,
+                    'product_code', $3::int,
+                    'price', $4::numeric,
+                    'quantity', $5::int,
+                    'image_url', $6::text
+                  )
+               )
+           WHERE id = $7
+             AND chat_id = $8
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [
+            productMessageText(product),
+            product.id,
+            product.product_code,
+            Number(product.price),
+            Number(product.quantity),
+            product.image_url,
+            target.message_id,
+            mainChannel.id,
+          ]
+        );
+        if (messageUpdate.rowCount > 0) {
+          updatedMessages.push(messageUpdate.rows[0]);
+        }
+      }
+
+      await client.query('UPDATE chats SET updated_at = now() WHERE id = $1', [mainChannel.id]);
+      await client.query('COMMIT');
+
+      const io = req.app.get('io');
+      if (io) {
+        for (const message of updatedMessages) {
+          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+            chatId: mainChannel.id,
+            message,
+          });
+        }
+        if (updatedMessages.length > 0) {
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: mainChannel.id,
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          updated_count: updatedMessages.length,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('worker.revision.manual error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.post(
+  '/revision/auto',
+  authMiddleware,
+  requireRole('worker', 'admin', 'creator'),
+  async (req, res) => {
+    const dates = parseRevisionDates(req.body?.dates);
+    const percent = Number(req.body?.percent);
+    const hideOldVersions = toBoolean(req.body?.hide_old_versions, true);
+
+    if (!Number.isFinite(percent) || percent < -95 || percent > 500) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Процент ревизии должен быть в диапазоне от -95 до 500',
+      });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { mainChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id || null
+      );
+      const selectedDates = dates.length > 0
+        ? dates
+        : (await fetchRevisionDays(client, mainChannel.id, 2)).map((x) => x.day);
+      const posts = await fetchRevisionPosts(client, mainChannel.id, selectedDates);
+
+      const groups = new Map();
+      for (const post of posts) {
+        const productId = String(post.product_id || '').trim();
+        if (!productId) continue;
+        if (!groups.has(productId)) groups.set(productId, []);
+        groups.get(productId).push(post);
+      }
+
+      const keepPosts = [];
+      const hideMessageIds = [];
+      for (const list of groups.values()) {
+        list.sort((a, b) => Date.parse(String(b.created_at)) - Date.parse(String(a.created_at)));
+        keepPosts.push(list[0]);
+        if (hideOldVersions) {
+          for (const old of list.slice(1)) {
+            if (old.message_id) hideMessageIds.push(old.message_id);
+          }
+        }
+      }
+
+      const updatedMessages = [];
+      const hiddenMessages = [];
+
+      for (const post of keepPosts) {
+        const productId = String(post.product_id || '').trim();
+        if (!productId) continue;
+        const basePrice = Number(post.price || 0);
+        if (!Number.isFinite(basePrice) || basePrice <= 0) continue;
+
+        const revisedPrice = roundPriceToStep(basePrice * (1 + percent / 100), 50, 50);
+        const nextQuantity = toPositiveInteger(post.quantity, 1);
+
+        const updatedProductQ = await client.query(
+          `UPDATE products
+           SET price = $1,
+               quantity = $2,
+               updated_at = now()
+           WHERE id = $3::uuid
+           RETURNING id, product_code, title, description, price, quantity, image_url`,
+          [revisedPrice, nextQuantity, productId]
+        );
+        if (updatedProductQ.rowCount === 0) continue;
+        const product = updatedProductQ.rows[0];
+
+        const updatedMessageQ = await client.query(
+          `UPDATE messages
+           SET text = $1,
+               meta = jsonb_strip_nulls(
+                 COALESCE(meta, '{}'::jsonb)
+                 || jsonb_build_object(
+                    'kind', 'catalog_product',
+                    'product_id', $2::text,
+                    'product_code', $3::int,
+                    'price', $4::numeric,
+                    'quantity', $5::int,
+                    'image_url', $6::text
+                  )
+               )
+           WHERE id = $7
+             AND chat_id = $8
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [
+            productMessageText(product),
+            product.id,
+            product.product_code,
+            Number(product.price),
+            Number(product.quantity),
+            product.image_url,
+            post.message_id,
+            mainChannel.id,
+          ]
+        );
+        if (updatedMessageQ.rowCount > 0) {
+          updatedMessages.push(updatedMessageQ.rows[0]);
+        }
+      }
+
+      if (hideMessageIds.length > 0) {
+        const hiddenQ = await client.query(
+          `UPDATE messages
+           SET meta = jsonb_set(
+             COALESCE(meta, '{}'::jsonb),
+             '{hidden_for_all}',
+             'true'::jsonb,
+             true
+           )
+           WHERE id = ANY($1::uuid[])
+             AND chat_id = $2
+             AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [hideMessageIds, mainChannel.id]
+        );
+        hiddenMessages.push(...hiddenQ.rows);
+      }
+
+      await client.query('UPDATE chats SET updated_at = now() WHERE id = $1', [mainChannel.id]);
+      await client.query('COMMIT');
+
+      const io = req.app.get('io');
+      if (io) {
+        for (const message of updatedMessages) {
+          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+            chatId: mainChannel.id,
+            message,
+          });
+        }
+        for (const message of hiddenMessages) {
+          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+            chatId: mainChannel.id,
+            message,
+          });
+        }
+        if (updatedMessages.length > 0 || hiddenMessages.length > 0) {
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: mainChannel.id,
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          dates: selectedDates,
+          percent,
+          updated_count: updatedMessages.length,
+          hidden_old_count: hiddenMessages.length,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('worker.revision.auto error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
     }
   }
 );

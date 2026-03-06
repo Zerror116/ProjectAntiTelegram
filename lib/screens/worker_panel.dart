@@ -30,6 +30,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   final _priceCtrl = TextEditingController();
   final _quantityCtrl = TextEditingController(text: '1');
   final _searchCtrl = TextEditingController();
+  final _revisionPercentCtrl = TextEditingController(text: '-10');
 
   final ImagePicker _imagePicker = ImagePicker();
   XFile? _pickedImage;
@@ -51,6 +52,10 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool _posting = false;
   bool _searching = false;
   bool _savingOwnPost = false;
+  bool _loadingRevisionDates = false;
+  bool _loadingRevisionPosts = false;
+  bool _runningRevision = false;
+  bool _autoHideOldRevisionPosts = true;
   String _message = '';
 
   double _toDoubleValue(dynamic value, [double fallback = 0]) {
@@ -71,13 +76,17 @@ class _WorkerPanelState extends State<WorkerPanel>
   String? _selectedChannelId;
   List<Map<String, dynamic>> _searchResults = [];
   List<Map<String, dynamic>> _ownQueuedPosts = [];
+  List<Map<String, dynamic>> _revisionDates = [];
+  List<Map<String, dynamic>> _revisionPosts = [];
+  Set<String> _selectedRevisionDates = {};
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _loadChannels();
     _loadOwnQueuedPosts();
+    _loadRevisionDates();
     _chatEventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
       if (type == 'chat:created' || type == 'chat:deleted') {
@@ -87,7 +96,10 @@ class _WorkerPanelState extends State<WorkerPanel>
         _ownPostsRefreshDebounce?.cancel();
         _ownPostsRefreshDebounce = Timer(
           const Duration(milliseconds: 650),
-          _loadOwnQueuedPosts,
+          () async {
+            await _loadOwnQueuedPosts();
+            await _loadRevisionPosts();
+          },
         );
       }
     });
@@ -103,6 +115,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _priceCtrl.dispose();
     _quantityCtrl.dispose();
     _searchCtrl.dispose();
+    _revisionPercentCtrl.dispose();
     super.dispose();
   }
 
@@ -464,6 +477,333 @@ class _WorkerPanelState extends State<WorkerPanel>
     } finally {
       if (mounted) {
         setState(() => _loadingOwnPosts = false);
+      }
+    }
+  }
+
+  Future<void> _loadRevisionDates() async {
+    if (mounted) {
+      setState(() => _loadingRevisionDates = true);
+    }
+    try {
+      final resp = await authService.dio.get('/api/worker/revision/dates');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        final dates = List<Map<String, dynamic>>.from(data['data']);
+        final nextSelected = dates
+            .map((e) => (e['day'] ?? '').toString())
+            .where((e) => e.isNotEmpty)
+            .take(2)
+            .toSet();
+        if (!mounted) return;
+        setState(() {
+          _revisionDates = dates;
+          _selectedRevisionDates = nextSelected;
+        });
+        await _loadRevisionPosts();
+      } else {
+        if (!mounted) return;
+        setState(() {
+          _revisionDates = [];
+          _selectedRevisionDates = {};
+          _revisionPosts = [];
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка загрузки дат ревизии: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _loadingRevisionDates = false);
+      }
+    }
+  }
+
+  Future<void> _loadRevisionPosts() async {
+    if (mounted) {
+      setState(() => _loadingRevisionPosts = true);
+    }
+    try {
+      final selected = _selectedRevisionDates.toList()..sort();
+      final resp = await authService.dio.get(
+        '/api/worker/revision/posts',
+        queryParameters: {if (selected.isNotEmpty) 'dates': selected.join(',')},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final payload = Map<String, dynamic>.from(data['data']);
+        final posts = payload['posts'] is List
+            ? List<Map<String, dynamic>>.from(payload['posts'])
+            : <Map<String, dynamic>>[];
+        final dates = payload['dates'] is List
+            ? (payload['dates'] as List)
+                  .map((e) => e?.toString() ?? '')
+                  .where((e) => e.isNotEmpty)
+                  .toSet()
+            : _selectedRevisionDates;
+        if (!mounted) return;
+        setState(() {
+          _revisionPosts = posts;
+          _selectedRevisionDates = dates;
+        });
+      } else {
+        if (!mounted) return;
+        setState(() => _revisionPosts = []);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка загрузки постов ревизии: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _loadingRevisionPosts = false);
+      }
+    }
+  }
+
+  Future<void> _toggleRevisionDate(String day) async {
+    final next = Set<String>.from(_selectedRevisionDates);
+    if (next.contains(day)) {
+      if (next.length == 1) return;
+      next.remove(day);
+    } else {
+      if (next.length >= 2) return;
+      next.add(day);
+    }
+    if (!mounted) return;
+    setState(() => _selectedRevisionDates = next);
+    await _loadRevisionPosts();
+  }
+
+  Future<void> _runAutoRevision() async {
+    final rawPercent = _revisionPercentCtrl.text.trim().replaceAll(',', '.');
+    final percent = double.tryParse(rawPercent);
+    if (percent == null) {
+      setState(() => _message = 'Введите корректный процент ревизии');
+      return;
+    }
+    if (_selectedRevisionDates.isEmpty) {
+      setState(() => _message = 'Выберите хотя бы одну дату ревизии');
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Авто-ревизия'),
+        content: Text(
+          'Изменить цены на $rawPercent% и '
+          '${_autoHideOldRevisionPosts ? 'скрыть старые версии постов' : 'оставить старые версии'}?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Запустить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    if (mounted) {
+      setState(() => _runningRevision = true);
+    }
+    try {
+      final resp = await authService.dio.post(
+        '/api/worker/revision/auto',
+        data: {
+          'dates': _selectedRevisionDates.toList(),
+          'percent': percent,
+          'hide_old_versions': _autoHideOldRevisionPosts,
+        },
+      );
+      final data = resp.data;
+      final updatedCount = _toIntValue(
+        data is Map && data['data'] is Map
+            ? (data['data'] as Map)['updated_count']
+            : null,
+      );
+      final hiddenCount = _toIntValue(
+        data is Map && data['data'] is Map
+            ? (data['data'] as Map)['hidden_old_count']
+            : null,
+      );
+      if (!mounted) return;
+      setState(
+        () => _message =
+            'Авто-ревизия выполнена: обновлено $updatedCount, скрыто старых версий $hiddenCount',
+      );
+      showAppNotice(
+        context,
+        'Авто-ревизия завершена',
+        tone: AppNoticeTone.success,
+      );
+      await playAppSound(AppUiSound.success);
+      await _loadRevisionPosts();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка авто-ревизии: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _runningRevision = false);
+      }
+    }
+  }
+
+  Future<void> _manualRevisionEdit(Map<String, dynamic> post) async {
+    final titleCtrl = TextEditingController(
+      text: (post['title'] ?? '').toString(),
+    );
+    final descriptionCtrl = TextEditingController(
+      text: (post['description'] ?? '').toString(),
+    );
+    final priceCtrl = TextEditingController(
+      text: _toDoubleValue(post['price']).toStringAsFixed(0),
+    );
+    final quantityCtrl = TextEditingController(
+      text: _toIntValue(post['quantity'], 1).toString(),
+    );
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ручная ревизия товара'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: titleCtrl,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Название',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: titleCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: descriptionCtrl,
+                minLines: 3,
+                maxLines: 5,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Описание',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: descriptionCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: priceCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Цена',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: priceCtrl,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  SizedBox(
+                    width: 120,
+                    child: TextField(
+                      controller: quantityCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Кол-во',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: quantityCtrl,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Применить'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    final title = titleCtrl.text.trim();
+    final description = descriptionCtrl.text.trim();
+    final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
+    final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
+    final hasImage = (post['image_url'] ?? '').toString().trim().isNotEmpty;
+    final validationError = _validateProductFields(
+      title: title,
+      description: description,
+      price: price,
+      quantity: quantity,
+      hasImage: hasImage,
+    );
+    if (validationError != null) {
+      if (!mounted) return;
+      setState(() => _message = validationError);
+      return;
+    }
+
+    if (mounted) {
+      setState(() => _runningRevision = true);
+    }
+    try {
+      await authService.dio.post(
+        '/api/worker/revision/manual',
+        data: {
+          'entries': [
+            {
+              'product_id': (post['product_id'] ?? '').toString(),
+              'message_id': (post['message_id'] ?? '').toString(),
+              'title': title,
+              'description': description,
+              'price': price,
+              'quantity': quantity,
+              'image_url': (post['image_url'] ?? '').toString(),
+            },
+          ],
+        },
+      );
+      if (!mounted) return;
+      setState(() => _message = 'Ревизия товара сохранена');
+      showAppNotice(
+        context,
+        'Изменения ревизии сохранены',
+        tone: AppNoticeTone.success,
+      );
+      await playAppSound(AppUiSound.success);
+      await _loadRevisionPosts();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка ручной ревизии: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _runningRevision = false);
       }
     }
   }
@@ -1313,7 +1653,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       child: ListView.separated(
         padding: const EdgeInsets.all(16),
         itemCount: _ownQueuedPosts.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 12),
+        separatorBuilder: (context, index) => const SizedBox(height: 12),
         itemBuilder: (context, index) {
           final post = _ownQueuedPosts[index];
           final imageUrl = _resolveImageUrl(
@@ -1341,7 +1681,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                             ? Image.network(
                                 imageUrl,
                                 fit: BoxFit.cover,
-                                errorBuilder: (_, error, stackTrace) =>
+                                errorBuilder: (context, error, stackTrace) =>
                                     Container(
                                       color: theme
                                           .colorScheme
@@ -1435,6 +1775,235 @@ class _WorkerPanelState extends State<WorkerPanel>
     );
   }
 
+  Widget _buildRevisionTab() {
+    final theme = Theme.of(context);
+    return RefreshIndicator(
+      onRefresh: () async {
+        await _loadRevisionDates();
+      },
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerLow,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: theme.colorScheme.outlineVariant),
+            ),
+            child: const Text(
+              'Ревизия: выберите до 2 дат публикации, затем запускайте авто-ревизию '
+              'или вручную редактируйте карточки.',
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (_loadingRevisionDates)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 10),
+              child: PhoenixLoadingView(
+                title: 'Загружаем даты ревизии',
+                subtitle: 'Собираем последние даты публикаций',
+                size: 44,
+              ),
+            )
+          else if (_revisionDates.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('Нет данных для ревизии'),
+            )
+          else
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _revisionDates.map((item) {
+                final day = (item['day'] ?? '').toString();
+                final label = (item['label'] ?? day).toString();
+                final count = _toIntValue(item['posts'], 0);
+                final selected = _selectedRevisionDates.contains(day);
+                return FilterChip(
+                  selected: selected,
+                  onSelected: (_) => _toggleRevisionDate(day),
+                  label: Text('$label • $count'),
+                );
+              }).toList(),
+            ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _revisionPercentCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                    signed: true,
+                  ),
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Процент ревизии (например: -10, 15)',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: _revisionPercentCtrl,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              SizedBox(
+                height: 56,
+                child: ElevatedButton.icon(
+                  onPressed: _runningRevision ? null : _runAutoRevision,
+                  icon: _runningRevision
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Icon(Icons.auto_fix_high_outlined),
+                  label: const Text('Авто'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _autoHideOldRevisionPosts,
+            onChanged: _runningRevision
+                ? null
+                : (v) => setState(() => _autoHideOldRevisionPosts = v),
+            title: const Text('Скрывать старые версии постов'),
+            subtitle: const Text(
+              'Оставлять только самый свежий вариант товара',
+            ),
+          ),
+          const SizedBox(height: 8),
+          if (_loadingRevisionPosts)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 10),
+              child: PhoenixLoadingView(
+                title: 'Загружаем посты ревизии',
+                subtitle: 'Собираем товары по выбранным датам',
+                size: 44,
+              ),
+            )
+          else if (_revisionPosts.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('Нет постов для выбранных дат'),
+            )
+          else
+            ..._revisionPosts.map((post) {
+              final imageUrl = _resolveImageUrl(
+                (post['image_url'] ?? '').toString(),
+              );
+              final code = (post['product_code'] ?? '—').toString();
+              final createdAt = (post['created_at'] ?? '').toString();
+              final createdAtShort = createdAt.length >= 16
+                  ? createdAt.substring(0, 16).replaceFirst('T', ' ')
+                  : createdAt;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: SizedBox(
+                        width: 78,
+                        height: 78,
+                        child: imageUrl != null
+                            ? Image.network(
+                                imageUrl,
+                                fit: BoxFit.cover,
+                                errorBuilder: (context, error, stackTrace) =>
+                                    Container(
+                                      color: theme
+                                          .colorScheme
+                                          .surfaceContainerHighest,
+                                      alignment: Alignment.center,
+                                      child: const Icon(Icons.photo_outlined),
+                                    ),
+                              )
+                            : Container(
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
+                                alignment: Alignment.center,
+                                child: const Icon(Icons.photo_outlined),
+                              ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            (post['title'] ?? 'Товар').toString(),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            (post['description'] ?? '').toString(),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              _statChip('ID $code'),
+                              _statChip(
+                                '${_toDoubleValue(post['price']).toStringAsFixed(0)} RUB',
+                              ),
+                              _statChip('x${_toIntValue(post['quantity'], 1)}'),
+                            ],
+                          ),
+                          if (createdAtShort.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              createdAtShort,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      tooltip: 'Ручная ревизия',
+                      onPressed: _runningRevision
+                          ? null
+                          : () => _manualRevisionEdit(post),
+                      icon: const Icon(Icons.edit_outlined),
+                    ),
+                  ],
+                ),
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
   Widget _statChip(String label) {
     final theme = Theme.of(context);
     return Container(
@@ -1463,6 +2032,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             Tab(text: 'Новый товар'),
             Tab(text: 'Старые товары'),
             Tab(text: 'Свои посты'),
+            Tab(text: 'Ревизия'),
           ],
         ),
       ),
@@ -1487,6 +2057,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                   _buildQueueTab(),
                   _buildSearchTab(),
                   _buildOwnPostsTab(),
+                  _buildRevisionTab(),
                 ],
               ),
             ),
