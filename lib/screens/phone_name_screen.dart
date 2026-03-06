@@ -246,7 +246,10 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         } catch (_) {}
 
         if (!mounted) return;
-        Navigator.of(context).pushReplacementNamed('/main');
+        Navigator.of(context).pushNamedAndRemoveUntil(
+          '/main',
+          (route) => false,
+        );
         return;
       } else {
         final profileData = {'name': name};
@@ -277,7 +280,10 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           } catch (_) {}
 
           if (!mounted) return;
-          Navigator.of(context).pushReplacementNamed('/main');
+          Navigator.of(context).pushNamedAndRemoveUntil(
+            '/main',
+            (route) => false,
+          );
           return;
         } else {
           setState(() => _message = 'Ошибка обновления профиля');
