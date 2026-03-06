@@ -16,6 +16,20 @@ const CART_STATUSES = [
   'in_delivery',
   'delivered',
 ];
+const CLAIM_TYPES = new Set(['return', 'discount']);
+const CLAIM_STATUSES = new Set([
+  'pending',
+  'approved_return',
+  'approved_discount',
+  'rejected',
+  'settled',
+]);
+
+function toMoney(value, fallback = 0) {
+  const raw = Number(value);
+  const normalized = Number.isFinite(raw) ? raw : Number(fallback || 0);
+  return Math.round(normalized * 100) / 100;
+}
 
 function emitCartUpdated(req, userId, payload = {}) {
   const io = req.app.get('io');
@@ -375,6 +389,36 @@ router.get('/', authMiddleware, async (req, res) => {
       [userId],
     );
 
+    const claimsQ = await db.query(
+      `SELECT cc.id,
+              cc.user_id,
+              cc.cart_item_id,
+              cc.product_id,
+              cc.delivery_batch_id,
+              cc.claim_type,
+              cc.status,
+              cc.description,
+              cc.image_url,
+              cc.requested_amount,
+              cc.approved_amount,
+              cc.resolution_note,
+              cc.handled_by,
+              cc.handled_at,
+              cc.settled_at,
+              cc.created_at,
+              cc.updated_at,
+              p.title AS product_title,
+              p.image_url AS product_image_url,
+              COALESCE(NULLIF(BTRIM(handler.name), ''), NULLIF(BTRIM(handler.email), ''), '') AS handled_by_name
+       FROM customer_claims cc
+       LEFT JOIN products p ON p.id = cc.product_id
+       LEFT JOIN users handler ON handler.id = cc.handled_by
+       WHERE cc.user_id = $1
+       ORDER BY cc.created_at DESC
+       LIMIT 50`,
+      [userId],
+    );
+
     const grouped = new Map();
     for (const row of result.rows) {
       const normalized = {
@@ -453,6 +497,14 @@ router.get('/', authMiddleware, async (req, res) => {
     const processedSum = items
       .filter((item) => processedStatuses.has(item.status))
       .reduce((sum, item) => sum + item.line_total, 0);
+    const approvedClaimsTotal = claimsQ.rows
+      .filter((row) =>
+        ['approved_return', 'approved_discount'].includes(
+          String(row.status || ''),
+        ),
+      )
+      .reduce((sum, row) => sum + toMoney(row.approved_amount), 0);
+    const adjustedProcessedSum = Math.max(0, toMoney(processedSum - approvedClaimsTotal));
 
     const recentDeliveriesMap = new Map();
     for (const row of recentDeliveriesQ.rows) {
@@ -488,13 +540,22 @@ router.get('/', authMiddleware, async (req, res) => {
       return bTime - aTime;
     });
 
+    const claims = claimsQ.rows.map((row) => ({
+      ...row,
+      requested_amount: toMoney(row.requested_amount),
+      approved_amount: toMoney(row.approved_amount),
+    }));
+
     return res.json({
       ok: true,
       data: {
         items,
         total_sum: totalSum,
-        processed_sum: processedSum,
+        processed_sum: adjustedProcessedSum,
+        processed_sum_raw: toMoney(processedSum),
+        claims_total: toMoney(approvedClaimsTotal),
         recent_deliveries: recentDeliveries,
+        claims,
       },
     });
   } catch (err) {
@@ -697,5 +758,421 @@ router.patch('/items/:id/status', authMiddleware, requireRole('admin', 'creator'
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });
+
+// Создать заявку на брак/скидку по доставленному товару
+router.post('/claims', authMiddleware, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const userId = String(req.user?.id || '').trim();
+    const tenantId = req.user?.tenant_id || null;
+    const cartItemId = String(req.body?.cart_item_id || '').trim();
+    const claimType = String(req.body?.claim_type || 'return')
+      .trim()
+      .toLowerCase();
+    const description = String(req.body?.description || '').trim();
+    const imageUrl = String(req.body?.image_url || '').trim();
+    const requestedRaw = req.body?.requested_amount;
+
+    if (!cartItemId) {
+      return res.status(400).json({ ok: false, error: 'cart_item_id обязателен' });
+    }
+    if (!CLAIM_TYPES.has(claimType)) {
+      return res.status(400).json({ ok: false, error: 'Некорректный тип заявки' });
+    }
+    if (description.length < 5) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Опишите проблему минимум в 5 символов',
+      });
+    }
+
+    await client.query('BEGIN');
+    const itemQ = await client.query(
+      `SELECT c.id,
+              c.user_id,
+              c.product_id,
+              c.quantity,
+              c.status,
+              p.title,
+              p.price,
+              p.image_url
+       FROM cart_items c
+       JOIN products p ON p.id = c.product_id
+       WHERE c.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [cartItemId],
+    );
+    if (itemQ.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Товар не найден в корзине' });
+    }
+    const item = itemQ.rows[0];
+    if (String(item.user_id) !== userId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ ok: false, error: 'Это не ваш товар' });
+    }
+    if (String(item.status) !== 'delivered') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'Заявку можно создать только по доставленному товару',
+      });
+    }
+
+    const existingOpenQ = await client.query(
+      `SELECT id, status
+       FROM customer_claims
+       WHERE cart_item_id = $1
+         AND status IN ('pending', 'approved_return', 'approved_discount')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [cartItemId],
+    );
+    if (existingOpenQ.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'По этому товару уже есть активная заявка',
+      });
+    }
+
+    const lineTotal = toMoney(Number(item.price || 0) * Number(item.quantity || 0));
+    const requestedAmountInput = toMoney(requestedRaw, lineTotal);
+    const requestedAmount = Math.max(
+      0,
+      Math.min(lineTotal, Number.isFinite(requestedAmountInput) ? requestedAmountInput : lineTotal),
+    );
+
+    const batchQ = await client.query(
+      `SELECT b.id
+       FROM delivery_batch_items di
+       JOIN delivery_batch_customers cst ON cst.id = di.batch_customer_id
+       JOIN delivery_batches b ON b.id = di.batch_id
+       WHERE di.cart_item_id = $1
+         AND cst.user_id = $2
+       ORDER BY COALESCE(b.completed_at, b.updated_at, b.created_at) DESC
+       LIMIT 1`,
+      [cartItemId, userId],
+    );
+
+    const insertQ = await client.query(
+      `INSERT INTO customer_claims (
+         id, tenant_id, user_id, cart_item_id, product_id, delivery_batch_id,
+         claim_type, status, description, image_url,
+         requested_amount, approved_amount, created_at, updated_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6,
+         $7, 'pending', $8, $9,
+         $10, 0, now(), now()
+       )
+       RETURNING *`,
+      [
+        uuidv4(),
+        tenantId,
+        userId,
+        cartItemId,
+        item.product_id,
+        batchQ.rowCount > 0 ? batchQ.rows[0].id : null,
+        claimType,
+        description,
+        imageUrl || null,
+        requestedAmount,
+      ],
+    );
+
+    await client.query('COMMIT');
+    const claim = insertQ.rows[0];
+    emitCartUpdated(req, userId, {
+      cart_item_id: cartItemId,
+      reason: 'claim_created',
+      claim_id: claim.id,
+    });
+    return res.status(201).json({
+      ok: true,
+      data: {
+        ...claim,
+        requested_amount: toMoney(claim.requested_amount),
+        approved_amount: toMoney(claim.approved_amount),
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    if (String(err?.code || '') === '23505') {
+      return res.status(400).json({
+        ok: false,
+        error: 'По этому товару уже есть активная заявка',
+      });
+    }
+    console.error('cart.claims.create error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
+// Список заявок текущего клиента
+router.get('/claims', authMiddleware, async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    const result = await db.query(
+      `SELECT cc.id,
+              cc.user_id,
+              cc.cart_item_id,
+              cc.product_id,
+              cc.delivery_batch_id,
+              cc.claim_type,
+              cc.status,
+              cc.description,
+              cc.image_url,
+              cc.requested_amount,
+              cc.approved_amount,
+              cc.resolution_note,
+              cc.handled_by,
+              cc.handled_at,
+              cc.settled_at,
+              cc.created_at,
+              cc.updated_at,
+              p.title AS product_title,
+              p.image_url AS product_image_url,
+              COALESCE(NULLIF(BTRIM(handler.name), ''), NULLIF(BTRIM(handler.email), ''), '') AS handled_by_name
+       FROM customer_claims cc
+       LEFT JOIN products p ON p.id = cc.product_id
+       LEFT JOIN users handler ON handler.id = cc.handled_by
+       WHERE cc.user_id = $1
+       ORDER BY cc.created_at DESC`,
+      [userId],
+    );
+    return res.json({
+      ok: true,
+      data: result.rows.map((row) => ({
+        ...row,
+        requested_amount: toMoney(row.requested_amount),
+        approved_amount: toMoney(row.approved_amount),
+      })),
+    });
+  } catch (err) {
+    console.error('cart.claims.list error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+// Админ/создатель: список заявок в tenant
+router.get(
+  '/claims/admin',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    try {
+      const tenantId = req.user?.tenant_id || null;
+      const status = String(req.query?.status || '')
+        .trim()
+        .toLowerCase();
+      const statusFilter = CLAIM_STATUSES.has(status) ? status : null;
+      const result = await db.query(
+        `SELECT cc.id,
+                cc.tenant_id,
+                cc.user_id,
+                cc.cart_item_id,
+                cc.product_id,
+                cc.delivery_batch_id,
+                cc.claim_type,
+                cc.status,
+                cc.description,
+                cc.image_url,
+                cc.requested_amount,
+                cc.approved_amount,
+                cc.resolution_note,
+                cc.handled_by,
+                cc.handled_at,
+                cc.settled_at,
+                cc.created_at,
+                cc.updated_at,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+                u.email AS customer_email,
+                ph.phone AS customer_phone,
+                p.title AS product_title,
+                p.image_url AS product_image_url,
+                COALESCE(NULLIF(BTRIM(handler.name), ''), NULLIF(BTRIM(handler.email), ''), '') AS handled_by_name
+         FROM customer_claims cc
+         JOIN users u ON u.id = cc.user_id
+         LEFT JOIN LATERAL (
+           SELECT phone
+           FROM phones
+           WHERE user_id = u.id
+           ORDER BY created_at DESC
+           LIMIT 1
+         ) ph ON true
+         LEFT JOIN products p ON p.id = cc.product_id
+         LEFT JOIN users handler ON handler.id = cc.handled_by
+         WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+           AND ($2::text IS NULL OR cc.status = $2::text)
+         ORDER BY
+           CASE cc.status
+             WHEN 'pending' THEN 0
+             WHEN 'approved_return' THEN 1
+             WHEN 'approved_discount' THEN 2
+             WHEN 'rejected' THEN 3
+             WHEN 'settled' THEN 4
+             ELSE 5
+           END,
+           cc.created_at DESC
+         LIMIT 300`,
+        [tenantId, statusFilter],
+      );
+      return res.json({
+        ok: true,
+        data: result.rows.map((row) => ({
+          ...row,
+          requested_amount: toMoney(row.requested_amount),
+          approved_amount: toMoney(row.approved_amount),
+        })),
+      });
+    } catch (err) {
+      console.error('cart.claims.admin.list error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
+
+function normalizeClaimDecision(raw) {
+  const value = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'approve_return' || value === 'approved_return') {
+    return 'approved_return';
+  }
+  if (value === 'approve_discount' || value === 'approved_discount') {
+    return 'approved_discount';
+  }
+  if (value === 'reject' || value === 'rejected') {
+    return 'rejected';
+  }
+  if (value === 'settle' || value === 'settled') {
+    return 'settled';
+  }
+  return '';
+}
+
+// Админ/создатель: решение по заявке
+router.patch(
+  '/claims/:id/review',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      const claimId = String(req.params?.id || '').trim();
+      const decision = normalizeClaimDecision(req.body?.decision);
+      const resolutionNote = String(req.body?.resolution_note || '').trim();
+      const approvedAmountInput = toMoney(req.body?.approved_amount, NaN);
+      if (!claimId) {
+        return res.status(400).json({ ok: false, error: 'id заявки обязателен' });
+      }
+      if (!decision) {
+        return res.status(400).json({ ok: false, error: 'Некорректное решение' });
+      }
+
+      await client.query('BEGIN');
+      const claimQ = await client.query(
+        `SELECT cc.*
+         FROM customer_claims cc
+         WHERE cc.id = $1
+           AND ($2::uuid IS NULL OR cc.tenant_id = $2::uuid)
+         LIMIT 1
+         FOR UPDATE`,
+        [claimId, req.user?.tenant_id || null],
+      );
+      if (claimQ.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ ok: false, error: 'Заявка не найдена' });
+      }
+      const claim = claimQ.rows[0];
+      const currentStatus = String(claim.status || '');
+      if (!CLAIM_STATUSES.has(currentStatus)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ ok: false, error: 'Некорректный статус заявки' });
+      }
+      if (currentStatus === 'settled' && decision !== 'settled') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          ok: false,
+          error: 'Заявка уже закрыта',
+        });
+      }
+
+      let nextApprovedAmount = toMoney(claim.approved_amount, 0);
+      let settledAt = claim.settled_at || null;
+      if (decision === 'approved_return' || decision === 'approved_discount') {
+        if (Number.isFinite(approvedAmountInput) && approvedAmountInput > 0) {
+          nextApprovedAmount = toMoney(approvedAmountInput);
+        } else {
+          nextApprovedAmount = toMoney(claim.requested_amount, 0);
+        }
+      } else if (decision === 'rejected') {
+        nextApprovedAmount = 0;
+      } else if (decision === 'settled') {
+        if (currentStatus !== 'approved_return' && currentStatus !== 'approved_discount') {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            ok: false,
+            error: 'Закрыть можно только подтвержденную заявку',
+          });
+        }
+        settledAt = new Date().toISOString();
+      }
+
+      const upd = await client.query(
+        `UPDATE customer_claims
+         SET status = $2,
+             approved_amount = $3,
+             resolution_note = CASE WHEN $4::text <> '' THEN $4::text ELSE resolution_note END,
+             handled_by = $5,
+             handled_at = now(),
+             settled_at = CASE
+               WHEN $2::text = 'settled' THEN now()
+               ELSE settled_at
+             END,
+             updated_at = now()
+         WHERE id = $1
+         RETURNING *`,
+        [
+          claimId,
+          decision,
+          nextApprovedAmount,
+          resolutionNote,
+          req.user?.id || null,
+        ],
+      );
+
+      await client.query('COMMIT');
+      const row = upd.rows[0];
+      emitCartUpdated(req, row.user_id, {
+        reason: 'claim_updated',
+        claim_id: row.id,
+      });
+      return res.json({
+        ok: true,
+        data: {
+          ...row,
+          approved_amount: toMoney(row.approved_amount),
+          requested_amount: toMoney(row.requested_amount),
+          settled_at: settledAt,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('cart.claims.review error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 module.exports = router;

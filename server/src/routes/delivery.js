@@ -817,6 +817,9 @@ async function fetchBatchDetails(queryable, batchId) {
       address_text: decodeAddressFromRow(row),
       processed_sum: toMoney(row.processed_sum),
       agreed_sum: toMoney(row.agreed_sum),
+      claim_return_sum: toMoney(row.claim_return_sum),
+      claim_discount_sum: toMoney(row.claim_discount_sum),
+      claims_total: toMoney(row.claims_total),
       items: Array.isArray(row.items) ? row.items : [],
     })),
   };
@@ -909,6 +912,34 @@ async function insertDeliveryBatchItems(
 }
 
 async function collectEligibleCustomers(queryable) {
+  const claimsQ = await queryable.query(
+    `SELECT user_id::text AS user_id,
+            COALESCE(
+              SUM(
+                CASE WHEN status = 'approved_return' THEN approved_amount ELSE 0 END
+              ),
+              0
+            )::numeric AS claim_return_sum,
+            COALESCE(
+              SUM(
+                CASE WHEN status = 'approved_discount' THEN approved_amount ELSE 0 END
+              ),
+              0
+            )::numeric AS claim_discount_sum,
+            COALESCE(SUM(approved_amount), 0)::numeric AS claims_total
+     FROM customer_claims
+     WHERE status IN ('approved_return', 'approved_discount')
+     GROUP BY user_id`,
+  );
+  const claimsByUser = new Map();
+  for (const row of claimsQ.rows) {
+    claimsByUser.set(String(row.user_id || ""), {
+      claim_return_sum: toMoney(row.claim_return_sum),
+      claim_discount_sum: toMoney(row.claim_discount_sum),
+      claims_total: toMoney(row.claims_total),
+    });
+  }
+
   const itemsQ = await queryable.query(
     `SELECT c.id AS cart_item_id,
             c.user_id::text AS user_id,
@@ -1002,7 +1033,23 @@ async function collectEligibleCustomers(queryable) {
       product_image_url: row.product_image_url,
     });
   }
-  return Array.from(grouped.values());
+  return Array.from(grouped.values()).map((entry) => {
+    const claimInfo = claimsByUser.get(String(entry.user_id)) || {
+      claim_return_sum: 0,
+      claim_discount_sum: 0,
+      claims_total: 0,
+    };
+    const rawProcessed = toMoney(entry.processed_sum);
+    const adjusted = toMoney(Math.max(0, rawProcessed - claimInfo.claims_total));
+    return {
+      ...entry,
+      raw_processed_sum: rawProcessed,
+      processed_sum: adjusted,
+      claim_return_sum: toMoney(claimInfo.claim_return_sum),
+      claim_discount_sum: toMoney(claimInfo.claim_discount_sum),
+      claims_total: toMoney(claimInfo.claims_total),
+    };
+  });
 }
 
 async function createDeliveryBatch(queryable, settings, createdBy) {
@@ -1068,16 +1115,16 @@ async function createDeliveryBatch(queryable, settings, createdBy) {
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
          id, batch_id, user_id, customer_name, customer_phone,
-         processed_sum, processed_items_count, shelf_number,
+         processed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
          address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
          lat, lng,
          call_status, delivery_status, created_at, updated_at
        )
        VALUES (
          $1, $2, $3, $4, $5,
-         $6, $7, $8,
-         $9, NULL, $10, $11, $12, $13, $14,
-         $15, $16,
+         $6, $7, $8, $9, $10, $11,
+         $12, NULL, $13, $14, $15, $16, $17,
+         $18, $19,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1087,6 +1134,9 @@ async function createDeliveryBatch(queryable, settings, createdBy) {
         candidate.customer_name,
         candidate.customer_phone,
         candidate.processed_sum,
+        candidate.claim_return_sum,
+        candidate.claim_discount_sum,
+        candidate.claims_total,
         candidate.processed_items_count,
         candidate.shelf_number,
         candidate.address_id,
@@ -1157,17 +1207,20 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
          SET customer_name = $2,
              customer_phone = $3,
              processed_sum = $4,
-             processed_items_count = $5,
-             shelf_number = $6,
-             address_id = $7,
+             claim_return_sum = $5,
+             claim_discount_sum = $6,
+             claims_total = $7,
+             processed_items_count = $8,
+             shelf_number = $9,
+             address_id = $10,
              address_text = NULL,
-             address_ciphertext = $8,
-             address_iv = $9,
-             address_tag = $10,
-             address_encryption_version = $11,
-             address_encrypted_at = $12,
-             lat = $13,
-             lng = $14,
+             address_ciphertext = $11,
+             address_iv = $12,
+             address_tag = $13,
+             address_encryption_version = $14,
+             address_encrypted_at = $15,
+             lat = $16,
+             lng = $17,
              call_status = 'pending',
              delivery_status = 'awaiting_call',
              courier_slot = NULL,
@@ -1188,6 +1241,9 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
           candidate.customer_name,
           candidate.customer_phone,
           candidate.processed_sum,
+          candidate.claim_return_sum,
+          candidate.claim_discount_sum,
+          candidate.claims_total,
           candidate.processed_items_count,
           candidate.shelf_number,
           candidate.address_id,
@@ -1216,16 +1272,16 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
          id, batch_id, user_id, customer_name, customer_phone,
-         processed_sum, processed_items_count, shelf_number,
+         processed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
          address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
          lat, lng,
          call_status, delivery_status, created_at, updated_at
        )
        VALUES (
          $1, $2, $3, $4, $5,
-         $6, $7, $8,
-         $9, NULL, $10, $11, $12, $13, $14,
-         $15, $16,
+         $6, $7, $8, $9, $10, $11,
+         $12, NULL, $13, $14, $15, $16, $17,
+         $18, $19,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1235,6 +1291,9 @@ async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) 
         candidate.customer_name,
         candidate.customer_phone,
         candidate.processed_sum,
+        candidate.claim_return_sum,
+        candidate.claim_discount_sum,
+        candidate.claims_total,
         candidate.processed_items_count,
         candidate.shelf_number,
         candidate.address_id,
@@ -3561,17 +3620,17 @@ router.post(
       await client.query(
         `INSERT INTO delivery_batch_customers (
            id, batch_id, user_id, customer_name, customer_phone,
-           processed_sum, agreed_sum, processed_items_count, shelf_number,
+           processed_sum, agreed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
            address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at, lat, lng,
            call_status, delivery_status, preferred_time_from, preferred_time_to,
            package_places, bulky_places, bulky_note, accepted_at, created_at, updated_at
          )
          VALUES (
            $1, $2, $3, $4, $5,
-           $6, $6, $7, $8,
-           $9, NULL, $10, $11, $12, $13, $14, $15, $16,
-           'accepted', 'preparing_delivery', $17, $18,
-           $19, $20, $21, now(), now(), now()
+           $6, $6, $7, $8, $9, $10, $11,
+           $12, NULL, $13, $14, $15, $16, $17, $18, $19,
+           'accepted', 'preparing_delivery', $20, $21,
+           $22, $23, $24, now(), now(), now()
          )`,
         [
           batchCustomerId,
@@ -3580,6 +3639,9 @@ router.post(
           eligible.customer_name,
           eligible.customer_phone,
           eligible.processed_sum,
+          eligible.claim_return_sum,
+          eligible.claim_discount_sum,
+          eligible.claims_total,
           eligible.processed_items_count,
           eligible.shelf_number,
           addressId,

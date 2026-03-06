@@ -6,6 +6,8 @@ import Carbon.HIToolbox
 class AppDelegate: FlutterAppDelegate {
   private let inputLanguageStreamHandler = InputLanguageStreamHandler()
   private var inputLanguageChannelConfigured = false
+  private var inputLanguageConfigureRetries = 0
+  private var inputLanguageRetryTimer: Timer?
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
     super.applicationDidFinishLaunching(notification)
@@ -13,6 +15,11 @@ class AppDelegate: FlutterAppDelegate {
     DispatchQueue.main.async { [weak self] in
       self?.configureInputLanguageChannels()
     }
+  }
+
+  override func applicationDidBecomeActive(_ notification: Notification) {
+    super.applicationDidBecomeActive(notification)
+    configureInputLanguageChannels()
   }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -26,6 +33,7 @@ class AppDelegate: FlutterAppDelegate {
   private func configureInputLanguageChannels() {
     guard !inputLanguageChannelConfigured else { return }
     guard let flutterViewController = mainFlutterWindow?.contentViewController as? FlutterViewController else {
+      scheduleInputLanguageChannelRetry()
       return
     }
 
@@ -48,7 +56,26 @@ class AppDelegate: FlutterAppDelegate {
       }
     }
 
+    inputLanguageRetryTimer?.invalidate()
+    inputLanguageRetryTimer = nil
+    inputLanguageConfigureRetries = 0
     inputLanguageChannelConfigured = true
+  }
+
+  private func scheduleInputLanguageChannelRetry() {
+    guard !inputLanguageChannelConfigured else { return }
+    guard inputLanguageRetryTimer == nil else { return }
+    guard inputLanguageConfigureRetries < 40 else { return }
+    inputLanguageConfigureRetries += 1
+    inputLanguageRetryTimer = Timer.scheduledTimer(
+      withTimeInterval: 0.25,
+      repeats: false
+    ) { [weak self] _ in
+      guard let self else { return }
+      self.inputLanguageRetryTimer?.invalidate()
+      self.inputLanguageRetryTimer = nil
+      self.configureInputLanguageChannels()
+    }
   }
 }
 

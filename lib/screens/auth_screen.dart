@@ -197,17 +197,13 @@ class _AuthScreenState extends State<AuthScreen> {
         );
         if (!mounted) return;
 
-        // Переход к шагу имени/телефона без очистки стека:
-        // так у пользователя всегда есть рабочая кнопка "Назад".
         setState(() => _loading = false);
-        await Navigator.of(context).push(
+        Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder: (_) =>
                 PhoneNameScreen(isRegisterFlow: true, registrationEmail: email),
           ),
         );
-
-        // После возврата остаемся на экране auth.
         return;
       } else {
         // Обычный логин

@@ -33,12 +33,64 @@ function maskAccessKey(raw) {
   return `${normalized.slice(0, 4)}-****-${normalized.slice(-4)}`;
 }
 
-function generateTenantCode(name) {
-  const base = String(name || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9а-яё]+/gi, "-")
+const cyrillicToLatin = {
+  а: "a",
+  б: "b",
+  в: "v",
+  г: "g",
+  д: "d",
+  е: "e",
+  ё: "e",
+  ж: "zh",
+  з: "z",
+  и: "i",
+  й: "y",
+  к: "k",
+  л: "l",
+  м: "m",
+  н: "n",
+  о: "o",
+  п: "p",
+  р: "r",
+  с: "s",
+  т: "t",
+  у: "u",
+  ф: "f",
+  х: "h",
+  ц: "ts",
+  ч: "ch",
+  ш: "sh",
+  щ: "sch",
+  ъ: "",
+  ы: "y",
+  ь: "",
+  э: "e",
+  ю: "yu",
+  я: "ya",
+};
+
+function normalizeTenantSlug(raw) {
+  const source = String(raw || "").toLowerCase();
+  let latin = "";
+  for (const ch of source) {
+    if (/[a-z0-9]/.test(ch)) {
+      latin += ch;
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(cyrillicToLatin, ch)) {
+      latin += cyrillicToLatin[ch];
+      continue;
+    }
+    latin += "-";
+  }
+  return latin
+    .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 40);
+}
+
+function generateTenantCode(name) {
+  const base = normalizeTenantSlug(name);
   const suffix = Math.floor(Math.random() * 9000) + 1000;
   return `${base || "tenant"}-${suffix}`;
 }

@@ -86,6 +86,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final Set<String> _messageIds = {};
   final Set<String> _placedCartItemIds = {};
+  final Set<String> _supportFeedbackBusyTicketIds = {};
   Map<String, dynamic>? _activePin;
 
   @override
@@ -629,7 +630,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _canCompose() {
     final role = authService.effectiveRole.toLowerCase().trim();
-    if (role == 'client') return false;
+    if (role == 'client') {
+      if (_isPublicChannel()) return false;
+      if ((widget.chatType ?? '').toLowerCase().trim() == 'channel') {
+        return false;
+      }
+      return true;
+    }
     if (_isPublicChannel()) {
       return role == 'admin' || role == 'tenant' || role == 'creator';
     }
@@ -641,7 +648,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_isPublicChannel()) {
       return 'В этом публичном канале писать может только администрация';
     }
-    return 'Отправка сообщений для клиента здесь недоступна';
+    return 'В этом чате отправка сообщений недоступна';
   }
 
   Future<void> _joinRoom() async {
@@ -1298,6 +1305,11 @@ class _ChatScreenState extends State<ChatScreen> {
     return metaMap['kind']?.toString() == 'delivery_offer';
   }
 
+  bool _isSupportFeedbackPrompt(Map<String, dynamic> message) {
+    final metaMap = _metaMapOf(message['meta']);
+    return metaMap['kind']?.toString() == 'support_feedback_prompt';
+  }
+
   bool _isAdminOrCreator() {
     final role = authService.effectiveRole.toLowerCase().trim();
     return role == 'admin' || role == 'tenant' || role == 'creator';
@@ -1488,6 +1500,44 @@ class _ChatScreenState extends State<ChatScreen> {
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
       );
+    }
+  }
+
+  Future<void> _respondToSupportFeedback(
+    Map<String, dynamic> meta, {
+    required bool resolved,
+  }) async {
+    final ticketId = (meta['support_ticket_id'] ?? '').toString().trim();
+    if (ticketId.isEmpty) return;
+    if (_supportFeedbackBusyTicketIds.contains(ticketId)) return;
+
+    setState(() => _supportFeedbackBusyTicketIds.add(ticketId));
+    try {
+      await authService.dio.post(
+        '/api/support/tickets/$ticketId/feedback',
+        data: {'resolved': resolved},
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        resolved ? 'Вопрос закрыт и отправлен в архив' : 'Вопрос снова открыт',
+        tone: AppNoticeTone.success,
+        duration: const Duration(seconds: 2),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка поддержки: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _supportFeedbackBusyTicketIds.remove(ticketId));
+      } else {
+        _supportFeedbackBusyTicketIds.remove(ticketId);
+      }
     }
   }
 
@@ -2304,17 +2354,25 @@ class _ChatScreenState extends State<ChatScreen> {
     final hasBuy = !isDeleted && !isReservedOrder && _isCatalogProduct(message);
     final isDeliveryOffer =
         !isDeleted && !hasBuy && !isReservedOrder && _isDeliveryOffer(message);
+    final isSupportFeedback =
+        !isDeleted &&
+        !hasBuy &&
+        !isReservedOrder &&
+        !isDeliveryOffer &&
+        _isSupportFeedbackPrompt(message);
     final isImageMessage =
         !isDeleted &&
         !hasBuy &&
         !isReservedOrder &&
         !isDeliveryOffer &&
+        !isSupportFeedback &&
         attachmentType == 'image';
     final isVoiceMessage =
         !isDeleted &&
         !hasBuy &&
         !isReservedOrder &&
         !isDeliveryOffer &&
+        !isSupportFeedback &&
         attachmentType == 'voice';
     final imageUrl = _resolveImageUrl(metaMap['image_url']?.toString());
     final captionText = _captionTextOf(message, metaMap);
@@ -2356,6 +2414,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final offerPreferredBefore = (metaMap['preferred_time_to'] ?? '')
         .toString()
         .trim();
+    final supportTicketId = (metaMap['support_ticket_id'] ?? '')
+        .toString()
+        .trim();
+    final supportFeedbackStatus = (metaMap['feedback_status'] ?? 'pending')
+        .toString()
+        .toLowerCase()
+        .trim();
+    final supportFeedbackBusy =
+        supportTicketId.isNotEmpty &&
+        _supportFeedbackBusyTicketIds.contains(supportTicketId);
 
     final bubbleColor = hasBuy
         ? theme.colorScheme.surfaceContainerLow
@@ -2378,6 +2446,7 @@ class _ChatScreenState extends State<ChatScreen> {
         !hasBuy &&
         !isReservedOrder &&
         !isDeliveryOffer &&
+        !isSupportFeedback &&
         !isImageMessage &&
         !isVoiceMessage;
     final isCreator = _isCreatorRole();
@@ -2571,6 +2640,56 @@ class _ChatScreenState extends State<ChatScreen> {
                       : offerStatus == 'declined'
                       ? 'Отказ'
                       : 'Ожидаем ответ',
+                ),
+              ],
+            ] else if (isSupportFeedback) ...[
+              Text(
+                text,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+              const SizedBox(height: 10),
+              if (_isClientRole() && supportFeedbackStatus == 'pending') ...[
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: supportFeedbackBusy
+                          ? null
+                          : () => _respondToSupportFeedback(
+                              metaMap,
+                              resolved: true,
+                            ),
+                      icon: const Icon(Icons.check_circle_outline),
+                      label: Text(
+                        supportFeedbackBusy ? 'Сохранение...' : 'Да, решили',
+                      ),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: supportFeedbackBusy
+                          ? null
+                          : () => _respondToSupportFeedback(
+                              metaMap,
+                              resolved: false,
+                            ),
+                      icon: const Icon(Icons.refresh_outlined),
+                      label: const Text('Нет, ещё вопрос'),
+                    ),
+                  ],
+                ),
+              ] else ...[
+                _catalogMetaBadge(
+                  theme,
+                  'Статус',
+                  supportFeedbackStatus == 'resolved'
+                      ? 'Закрыт'
+                      : supportFeedbackStatus == 'reopened'
+                      ? 'Открыт повторно'
+                      : 'Ожидаем ответ клиента',
                 ),
               ],
             ] else if (hasBuy) ...[

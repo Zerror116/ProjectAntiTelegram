@@ -245,11 +245,10 @@ function canPostChat(context, userRole) {
   if (!context) return false;
   const role = normalizeRole(userRole);
 
-  if (role === "client") {
-    return false;
-  }
-
   if (context.chat.type === "channel") {
+    if (role === "client") {
+      return false;
+    }
     if (context.isBlacklisted && !isAdminOrCreator(role)) {
       return false;
     }
@@ -289,6 +288,29 @@ function isAdminOrCreator(role) {
 function parseMeta(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   return raw;
+}
+
+function isStaffRole(role) {
+  const normalized = normalizeRole(role);
+  return (
+    normalized === "worker" ||
+    normalized === "admin" ||
+    normalized === "tenant" ||
+    normalized === "creator"
+  );
+}
+
+function supportTicketIdFromSettings(settings) {
+  const raw = String(settings?.support_ticket_id || "").trim();
+  return raw || null;
+}
+
+function isSupportTicketChatContext(context) {
+  if (!context || context.chat?.type === "channel") return false;
+  const kind = String(context.settings?.kind || "")
+    .toLowerCase()
+    .trim();
+  return kind === "support_ticket" || context.settings?.support_ticket === true;
 }
 
 function isSystemMessage(meta) {
@@ -412,6 +434,114 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
   }
 
   return responseMessage;
+}
+
+async function syncSupportTicketOnMessage({
+  chatId,
+  senderId,
+  senderRole,
+  tenantId = null,
+  supportTicketId = null,
+}) {
+  const ticketId = String(supportTicketId || "").trim();
+  if (!ticketId) return { promptMessageId: null };
+
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const ticketRes = await client.query(
+      `SELECT id,
+              chat_id,
+              customer_id,
+              assignee_id,
+              assigned_role,
+              status
+       FROM support_tickets
+       WHERE id = $1
+         AND chat_id = $2
+         AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+       LIMIT 1
+       FOR UPDATE`,
+      [ticketId, chatId, tenantId || null],
+    );
+
+    if (ticketRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return { promptMessageId: null };
+    }
+
+    const ticket = ticketRes.rows[0];
+    const senderIdText = String(senderId || "").trim();
+    const senderRoleNormalized = normalizeRole(senderRole);
+    const senderIsCustomer = String(ticket.customer_id || "") === senderIdText;
+    let promptMessageId = null;
+
+    if (senderIsCustomer) {
+      await client.query(
+        `UPDATE support_tickets
+         SET status = 'open',
+             archived_at = NULL,
+             archive_reason = NULL,
+             resolved_at = NULL,
+             resolved_by = NULL,
+             last_customer_message_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [ticket.id],
+      );
+    } else if (isStaffRole(senderRoleNormalized)) {
+      const shouldPrompt =
+        String(ticket.status || "").toLowerCase().trim() !==
+        "waiting_customer";
+
+      await client.query(
+        `UPDATE support_tickets
+         SET assignee_id = COALESCE(assignee_id, $1::uuid),
+             assigned_role = CASE
+               WHEN assignee_id IS NULL THEN $2
+               ELSE assigned_role
+             END,
+             status = 'waiting_customer',
+             archived_at = NULL,
+             archive_reason = NULL,
+             resolved_at = NULL,
+             resolved_by = NULL,
+             last_staff_message_at = now(),
+             updated_at = now()
+         WHERE id = $3`,
+        [
+          senderIdText || null,
+          senderRoleNormalized || "admin",
+          ticket.id,
+        ],
+      );
+
+      if (shouldPrompt) {
+        const promptText =
+          "Поддержка ответила на ваш вопрос. Решили проблему?";
+        const promptMeta = {
+          kind: "support_feedback_prompt",
+          support_ticket_id: ticket.id,
+          feedback_status: "pending",
+        };
+        const inserted = await client.query(
+          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+           RETURNING id`,
+          [uuidv4(), chatId, promptText, JSON.stringify(promptMeta)],
+        );
+        promptMessageId = inserted.rows[0]?.id || null;
+      }
+    }
+
+    await client.query("COMMIT");
+    return { promptMessageId };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 async function insertMessageWithDedup({
@@ -662,6 +792,7 @@ router.get("/", requireAuth, async (req, res) => {
          c.type <> 'channel'
          OR COALESCE((c.settings->>'hidden_in_chat_list')::boolean, false) = false
        )
+       AND COALESCE(c.settings->>'kind', '') <> 'system_duplicate'
        ORDER BY updated_at DESC NULLS LAST
        LIMIT 200`,
       [
@@ -1106,12 +1237,31 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     if (!messageId) {
       return res.status(500).json({ ok: false, error: "Не удалось создать сообщение" });
     }
+
+    let promptMessageId = null;
+    if (isSupportTicketChatContext(context)) {
+      const ticketId = supportTicketIdFromSettings(context.settings);
+      if (ticketId) {
+        const synced = await syncSupportTicketOnMessage({
+          chatId,
+          senderId: userId,
+          senderRole: role,
+          tenantId: req.user.tenant_id || null,
+          supportTicketId: ticketId,
+        });
+        promptMessageId = synced.promptMessageId || null;
+      }
+    }
+
     const responseMessage = await finalizeCreatedMessage(
       req,
       chatId,
       messageId,
       userId,
     );
+    if (promptMessageId) {
+      await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
+    }
     return res.status(201).json({ ok: true, data: responseMessage });
   } catch (err) {
     console.error("chats.postMessage error", err);
@@ -1231,12 +1381,30 @@ router.post(
         });
       }
 
+      let promptMessageId = null;
+      if (isSupportTicketChatContext(context)) {
+        const ticketId = supportTicketIdFromSettings(context.settings);
+        if (ticketId) {
+          const synced = await syncSupportTicketOnMessage({
+            chatId,
+            senderId: userId,
+            senderRole: role,
+            tenantId: req.user.tenant_id || null,
+            supportTicketId: ticketId,
+          });
+          promptMessageId = synced.promptMessageId || null;
+        }
+      }
+
       const responseMessage = await finalizeCreatedMessage(
         req,
         chatId,
         messageId,
         userId,
       );
+      if (promptMessageId) {
+        await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
+      }
       return res.status(201).json({ ok: true, data: responseMessage });
     } catch (err) {
       removeUploadedFiles(uploadedFiles);

@@ -464,16 +464,41 @@ bool _isAuthEndpoint(RequestOptions options) {
       path.contains('/register');
 }
 
-String? _encodeTenantCodeHeaderValue(String? tenantCode) {
-  final value = (tenantCode ?? '').trim().toLowerCase();
-  if (value.isEmpty) return null;
-  final encoded = Uri.encodeComponent(value);
-  if (encoded.isEmpty) return null;
-  return encoded;
+void _removeHeaderIgnoreCase(Map<String, dynamic> headers, String name) {
+  final target = name.toLowerCase();
+  final toDelete = <String>[];
+  for (final key in headers.keys) {
+    if (key.toLowerCase() == target) {
+      toDelete.add(key);
+    }
+  }
+  for (final key in toDelete) {
+    headers.remove(key);
+  }
+}
+
+bool _isAsciiHeaderValue(String value) {
+  return RegExp(r'^[\x20-\x7E]*$').hasMatch(value);
+}
+
+void _dropInvalidHeaderValues(Map<String, dynamic> headers) {
+  final toDelete = <String>[];
+  headers.forEach((key, value) {
+    if (value == null) return;
+    final text = value.toString();
+    if (!_isAsciiHeaderValue(text)) {
+      toDelete.add(key);
+    }
+  });
+  for (final key in toDelete) {
+    headers.remove(key);
+  }
 }
 
 void _attachAuthInterceptor() {
   debugPrint('_attachAuthInterceptor: attaching');
+  // Очистка старых/битых заголовков между перезапусками.
+  _removeHeaderIgnoreCase(dio.options.headers, 'X-Tenant-Code');
   dio.interceptors.add(
     InterceptorsWrapper(
       onRequest: (options, handler) async {
@@ -485,28 +510,19 @@ void _attachAuthInterceptor() {
           } else {
             options.headers.remove('Authorization');
           }
-          final tenantCode = await authService.getTenantCode();
-          final currentRole =
-              authService.currentUser?.role.toLowerCase().trim() ?? '';
-          if (currentRole == 'creator') {
-            options.headers.remove('X-Tenant-Code');
-          } else {
-            final encodedTenantCode = _encodeTenantCodeHeaderValue(tenantCode);
-            if (encodedTenantCode != null) {
-              options.headers['X-Tenant-Code'] = encodedTenantCode;
-            } else {
-              options.headers.remove('X-Tenant-Code');
-            }
-          }
+          await authService.getTenantCode();
+          _removeHeaderIgnoreCase(options.headers, 'X-Tenant-Code');
+          _removeHeaderIgnoreCase(options.headers, 'x-tenant-code');
           final viewRole = authService.viewRole?.trim();
+          _removeHeaderIgnoreCase(options.headers, 'X-View-Role');
           if ((authService.currentUser?.role.toLowerCase().trim() ?? '') ==
                   'creator' &&
               viewRole != null &&
               viewRole.isNotEmpty) {
             options.headers['X-View-Role'] = viewRole;
-          } else {
-            options.headers.remove('X-View-Role');
           }
+          // На macOS/http не-ASCII заголовки вызывают FormatException.
+          _dropInvalidHeaderValues(options.headers);
           return handler.next(options);
         } catch (e, st) {
           debugPrint('onRequest interceptor error: $e\n$st');
