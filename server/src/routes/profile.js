@@ -95,8 +95,9 @@ function normalizeRole(raw) {
   return String(raw || "").toLowerCase().trim();
 }
 
-function isTenantRole(role) {
-  return normalizeRole(role) === "tenant";
+function isTenantManager(user) {
+  const baseRole = normalizeRole(user?.base_role || user?.role || "");
+  return baseRole === "tenant" || baseRole === "creator";
 }
 
 function buildInviteLink(req, inviteCode, tenantCode = "") {
@@ -622,10 +623,10 @@ router.patch("/", authMiddleware, async (req, res) => {
 });
 
 router.get("/tenant/client-invite", authMiddleware, async (req, res) => {
-  if (!isTenantRole(req.user?.role)) {
+  if (!isTenantManager(req.user)) {
     return res.status(403).json({
       ok: false,
-      error: "Доступно только арендатору",
+      error: "Доступно только арендатору или создателю",
     });
   }
 
@@ -708,10 +709,10 @@ router.get("/tenant/client-invite", authMiddleware, async (req, res) => {
 });
 
 router.get("/tenant/clients", authMiddleware, async (req, res) => {
-  if (!isTenantRole(req.user?.role)) {
+  if (!isTenantManager(req.user)) {
     return res.status(403).json({
       ok: false,
-      error: "Доступно только арендатору",
+      error: "Доступно только арендатору или создателю",
     });
   }
 
@@ -758,10 +759,10 @@ router.get("/tenant/clients", authMiddleware, async (req, res) => {
 });
 
 router.patch("/tenant/clients/:userId/role", authMiddleware, async (req, res) => {
-  if (!isTenantRole(req.user?.role)) {
+  if (!isTenantManager(req.user)) {
     return res.status(403).json({
       ok: false,
-      error: "Доступно только арендатору",
+      error: "Доступно только арендатору или создателю",
     });
   }
 
