@@ -36,6 +36,23 @@ async function listSystemDuplicates(client, tenantId, keepId, systemKey) {
     return q.rows;
   }
 
+  if (systemKey === "posts_archive") {
+    const q = await client.query(
+      `SELECT id, title, settings
+       FROM chats
+       WHERE type = 'channel'
+         AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+         AND id <> $2
+         AND (
+           COALESCE(settings->>'system_key', '') = 'posts_archive'
+           OR COALESCE(settings->>'kind', '') = 'posts_archive'
+           OR LOWER(TRIM(title)) = 'архив постов'
+         )`,
+      [tenantId || null, keepId],
+    );
+    return q.rows;
+  }
+
   const q = await client.query(
     `SELECT id, title, settings
      FROM chats
@@ -98,7 +115,9 @@ async function consolidateSystemDuplicates(client, tenantId, keepId, systemKey) 
   const archivedSystemKey =
     systemKey === "main_channel"
       ? "archived_main_channel_duplicate"
-      : "archived_reserved_orders_duplicate";
+      : systemKey === "posts_archive"
+        ? "archived_posts_archive_duplicate"
+        : "archived_reserved_orders_duplicate";
 
   for (const row of duplicates) {
     const currentSettings = normalizeSettings(row.settings);
@@ -366,9 +385,92 @@ async function ensureReservedOrdersChannel(client, createdBy, tenantId = null) {
   return { channel: inserted.rows[0], created: true };
 }
 
+async function findPostsArchiveChannel(client, tenantId = null) {
+  return client.query(
+    `SELECT id, title, type, created_by, settings, created_at, updated_at
+     FROM chats
+     WHERE type = 'channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+       AND (
+         COALESCE(settings->>'system_key', '') = 'posts_archive'
+         OR COALESCE(settings->>'kind', '') = 'posts_archive'
+         OR LOWER(TRIM(title)) = 'архив постов'
+       )
+     ORDER BY
+       CASE WHEN COALESCE(settings->>'system_key', '') = 'posts_archive' THEN 0 ELSE 1 END,
+       updated_at DESC NULLS LAST,
+       created_at DESC
+     LIMIT 1`,
+    [tenantId || null],
+  );
+}
+
+async function ensurePostsArchiveChannel(client, createdBy, tenantId = null) {
+  const archiveQ = await findPostsArchiveChannel(client, tenantId);
+  const baseSettings = {
+    kind: "posts_archive",
+    system_key: "posts_archive",
+    tenant_id: tenantId || null,
+    visibility: "private",
+    admin_only: true,
+    worker_can_post: false,
+    is_post_channel: false,
+    hidden_in_chat_list: false,
+    description:
+      "Системный архив всех постов товаров. Доступен только администраторам и создателю.",
+  };
+
+  if (archiveQ.rowCount > 0) {
+    const current = archiveQ.rows[0];
+    const currentSettings = normalizeSettings(current.settings);
+    const nextSettings = mergeJson(currentSettings, baseSettings);
+    const updated = await client.query(
+      `UPDATE chats
+       SET title = $1,
+           settings = $2::jsonb,
+           tenant_id = $4,
+           updated_at = now()
+       WHERE id = $3
+       RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+      [
+        current.title || "Архив постов",
+        JSON.stringify(nextSettings),
+        current.id,
+        tenantId || null,
+      ],
+    );
+
+    await ensureStaffMembers(client, updated.rows[0].id, tenantId, {
+      removeNonStaff: true,
+      includeWorkers: false,
+    });
+    return { channel: updated.rows[0], created: false };
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, $2, 'channel', $3, $4, $5::jsonb, now(), now())
+     RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+    [
+      uuidv4(),
+      "Архив постов",
+      createdBy || null,
+      tenantId || null,
+      JSON.stringify(baseSettings),
+    ],
+  );
+
+  await ensureStaffMembers(client, inserted.rows[0].id, tenantId, {
+    removeNonStaff: true,
+    includeWorkers: false,
+  });
+  return { channel: inserted.rows[0], created: true };
+}
+
 async function ensureSystemChannels(client, createdBy, tenantId = null) {
   const main = await ensureMainChannel(client, createdBy, tenantId);
   const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
+  const postsArchive = await ensurePostsArchiveChannel(client, createdBy, tenantId);
   await consolidateSystemDuplicates(
     client,
     tenantId,
@@ -381,12 +483,20 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
     reserved.channel.id,
     "reserved_orders",
   );
+  await consolidateSystemDuplicates(
+    client,
+    tenantId,
+    postsArchive.channel.id,
+    "posts_archive",
+  );
   return {
     mainChannel: main.channel,
     reservedChannel: reserved.channel,
+    postsArchiveChannel: postsArchive.channel,
     created: {
       main: main.created,
       reserved: reserved.created,
+      posts_archive: postsArchive.created,
     },
   };
 }

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import 'bug_report_screen.dart';
+import 'privacy_policy_screen.dart';
 import 'support_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -76,6 +77,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  void _openPrivacyPolicy() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const PrivacyPolicyScreen()),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -112,6 +120,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 'Быстро отправить описание ошибки в отдельный служебный канал',
               ),
               onTap: _openBugReport,
+            ),
+            ListTile(
+              leading: const Icon(Icons.privacy_tip_outlined),
+              title: const Text('Политика конфиденциальности'),
+              subtitle: const Text(
+                'Как обрабатываются данные и ограничения ЛС',
+              ),
+              onTap: _openPrivacyPolicy,
             ),
           ],
         ),

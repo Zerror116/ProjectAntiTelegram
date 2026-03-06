@@ -320,6 +320,128 @@ function isSystemMessage(meta) {
   return kind.length > 0;
 }
 
+function normalizePhoneDigits(raw) {
+  return String(raw || "").replace(/\D/g, "").slice(-15);
+}
+
+async function resolveDirectTargetUser(client, requester, { userId, query }) {
+  const requesterId = String(requester?.id || "").trim();
+  const tenantId = requester?.tenant_id || null;
+  if (!requesterId) return null;
+
+  const byUserId = String(userId || "").trim();
+  if (byUserId) {
+    const q = await client.query(
+      `SELECT u.id,
+              u.email,
+              u.name,
+              u.tenant_id,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+       FROM users u
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE u.id = $1
+         AND u.id <> $2
+         AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
+       LIMIT 1`,
+      [byUserId, requesterId, tenantId],
+    );
+    return q.rowCount > 0 ? q.rows[0] : null;
+  }
+
+  const normalizedQuery = String(query || "").trim();
+  if (!normalizedQuery) return null;
+
+  const phoneDigits = normalizePhoneDigits(normalizedQuery);
+  const emailLike = normalizedQuery.includes("@");
+  const params = [requesterId, tenantId];
+
+  if (emailLike) {
+    params.push(normalizedQuery.toLowerCase());
+    const q = await client.query(
+      `SELECT u.id,
+              u.email,
+              u.name,
+              u.tenant_id,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+       FROM users u
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE LOWER(COALESCE(u.email, '')) = $3
+         AND u.id <> $1
+         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+       LIMIT 1`,
+      params,
+    );
+    return q.rowCount > 0 ? q.rows[0] : null;
+  }
+
+  if (phoneDigits.length >= 10) {
+    params.push(phoneDigits);
+    const q = await client.query(
+      `SELECT u.id,
+              u.email,
+              u.name,
+              u.tenant_id,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+       FROM users u
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE RIGHT(regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g'), 15) = RIGHT($3, 15)
+         AND u.id <> $1
+         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+       LIMIT 1`,
+      params,
+    );
+    return q.rowCount > 0 ? q.rows[0] : null;
+  }
+
+  params.push(`%${normalizedQuery}%`);
+  const byName = await client.query(
+    `SELECT u.id,
+            u.email,
+            u.name,
+            u.tenant_id,
+            p.phone,
+            u.avatar_url,
+            COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+            COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+            COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+     FROM users u
+     LEFT JOIN phones p ON p.user_id = u.id
+     WHERE COALESCE(u.name, '') ILIKE $3
+       AND u.id <> $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     ORDER BY u.updated_at DESC NULLS LAST, u.created_at DESC
+     LIMIT 1`,
+    params,
+  );
+  return byName.rowCount > 0 ? byName.rows[0] : null;
+}
+
+function mapPeerInfo(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    email: row.email || "",
+    name: row.name || "",
+    phone: row.phone || "",
+    avatar_url: row.avatar_url || null,
+    avatar_focus_x: Number(row.avatar_focus_x || 0),
+    avatar_focus_y: Number(row.avatar_focus_y || 0),
+    avatar_zoom: Number(row.avatar_zoom || 1),
+  };
+}
+
 function toChatMediaUrl(req, file) {
   if (!file || !file.filename) return null;
   if (file.fieldname === "image") {
@@ -436,15 +558,57 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
   return responseMessage;
 }
 
+function normalizeSupportText(value) {
+  return String(value || "").trim();
+}
+
+function isSupportCartSummaryQuestion(messageText) {
+  const normalized = normalizeSupportText(messageText).toLowerCase();
+  if (!normalized) return false;
+  return normalized.includes("сум") && normalized.includes("корз");
+}
+
+async function computeSupportCartSummary(client, userId) {
+  const rows = await client.query(
+    `SELECT c.status, c.quantity, p.price
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id
+     WHERE c.user_id = $1`,
+    [userId],
+  );
+
+  let total = 0;
+  let processed = 0;
+
+  for (const row of rows.rows) {
+    const quantity = Number(row.quantity || 0);
+    const price = Number(row.price || 0);
+    if (!Number.isFinite(quantity) || !Number.isFinite(price)) continue;
+    const line = price * quantity;
+    total += line;
+    if (
+      row.status === "processed" ||
+      row.status === "preparing_delivery" ||
+      row.status === "handing_to_courier" ||
+      row.status === "in_delivery"
+    ) {
+      processed += line;
+    }
+  }
+
+  return { total, processed };
+}
+
 async function syncSupportTicketOnMessage({
   chatId,
   senderId,
   senderRole,
   tenantId = null,
   supportTicketId = null,
+  messageText = "",
 }) {
   const ticketId = String(supportTicketId || "").trim();
-  if (!ticketId) return { promptMessageId: null };
+  if (!ticketId) return { promptMessageId: null, autoReplyMessageId: null };
 
   const client = await db.pool.connect();
   try {
@@ -467,7 +631,7 @@ async function syncSupportTicketOnMessage({
 
     if (ticketRes.rowCount === 0) {
       await client.query("ROLLBACK");
-      return { promptMessageId: null };
+      return { promptMessageId: null, autoReplyMessageId: null };
     }
 
     const ticket = ticketRes.rows[0];
@@ -475,6 +639,7 @@ async function syncSupportTicketOnMessage({
     const senderRoleNormalized = normalizeRole(senderRole);
     const senderIsCustomer = String(ticket.customer_id || "") === senderIdText;
     let promptMessageId = null;
+    let autoReplyMessageId = null;
 
     if (senderIsCustomer) {
       await client.query(
@@ -489,6 +654,26 @@ async function syncSupportTicketOnMessage({
          WHERE id = $1`,
         [ticket.id],
       );
+
+      if (isSupportCartSummaryQuestion(messageText)) {
+        const sums = await computeSupportCartSummary(client, ticket.customer_id);
+        const autoReplyText =
+          `Общая сумма вашей корзины: ${sums.total} RUB. ` +
+          `Обработано на сумму: ${sums.processed} RUB.`;
+        const autoReplyMeta = {
+          kind: "support_bot_cart_summary",
+          support_ticket_id: ticket.id,
+          total_amount: sums.total,
+          processed_amount: sums.processed,
+        };
+        const inserted = await client.query(
+          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+           RETURNING id`,
+          [uuidv4(), chatId, autoReplyText, JSON.stringify(autoReplyMeta)],
+        );
+        autoReplyMessageId = inserted.rows[0]?.id || null;
+      }
     } else if (isStaffRole(senderRoleNormalized)) {
       const shouldPrompt =
         String(ticket.status || "").toLowerCase().trim() !==
@@ -535,7 +720,7 @@ async function syncSupportTicketOnMessage({
     }
 
     await client.query("COMMIT");
-    return { promptMessageId };
+    return { promptMessageId, autoReplyMessageId };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -1239,6 +1424,7 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     }
 
     let promptMessageId = null;
+    let autoReplyMessageId = null;
     if (isSupportTicketChatContext(context)) {
       const ticketId = supportTicketIdFromSettings(context.settings);
       if (ticketId) {
@@ -1248,8 +1434,10 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
           senderRole: role,
           tenantId: req.user.tenant_id || null,
           supportTicketId: ticketId,
+          messageText: String(text || ""),
         });
         promptMessageId = synced.promptMessageId || null;
+        autoReplyMessageId = synced.autoReplyMessageId || null;
       }
     }
 
@@ -1261,6 +1449,9 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     );
     if (promptMessageId) {
       await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
+    }
+    if (autoReplyMessageId) {
+      await finalizeCreatedMessage(req, chatId, autoReplyMessageId, userId);
     }
     return res.status(201).json({ ok: true, data: responseMessage });
   } catch (err) {
@@ -1382,6 +1573,7 @@ router.post(
       }
 
       let promptMessageId = null;
+      let autoReplyMessageId = null;
       if (isSupportTicketChatContext(context)) {
         const ticketId = supportTicketIdFromSettings(context.settings);
         if (ticketId) {
@@ -1391,8 +1583,10 @@ router.post(
             senderRole: role,
             tenantId: req.user.tenant_id || null,
             supportTicketId: ticketId,
+            messageText: caption || text || "",
           });
           promptMessageId = synced.promptMessageId || null;
+          autoReplyMessageId = synced.autoReplyMessageId || null;
         }
       }
 
@@ -1404,6 +1598,9 @@ router.post(
       );
       if (promptMessageId) {
         await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
+      }
+      if (autoReplyMessageId) {
+        await finalizeCreatedMessage(req, chatId, autoReplyMessageId, userId);
       }
       return res.status(201).json({ ok: true, data: responseMessage });
     } catch (err) {
@@ -1688,6 +1885,238 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("chats.clearMessages error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.get("/contacts", requireAuth, async (req, res) => {
+  try {
+    const rows = await db.query(
+      `SELECT uc.contact_user_id,
+              uc.alias_name,
+              uc.created_at,
+              u.name,
+              u.email,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+       FROM user_contacts uc
+       JOIN users u ON u.id = uc.contact_user_id
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE uc.user_id = $1
+         AND ($2::uuid IS NULL OR uc.tenant_id = $2::uuid)
+       ORDER BY COALESCE(NULLIF(TRIM(uc.alias_name), ''), NULLIF(TRIM(u.name), ''), u.email) ASC`,
+      [req.user.id, req.user.tenant_id || null],
+    );
+    return res.json({ ok: true, data: rows.rows });
+  } catch (err) {
+    console.error("chats.contacts.list error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.post("/contacts", requireAuth, async (req, res) => {
+  const aliasName = String(req.body?.alias_name || "").trim().slice(0, 120);
+  const targetId = String(req.body?.user_id || "").trim();
+  const query = String(req.body?.query || "").trim();
+
+  if (!targetId && !query) {
+    return res.status(400).json({
+      ok: false,
+      error: "Нужен user_id или query",
+    });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const peer = await resolveDirectTargetUser(client, req.user, {
+      userId: targetId,
+      query,
+    });
+    if (!peer) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Контакт не найден" });
+    }
+    await client.query(
+      `INSERT INTO user_contacts (
+         id, tenant_id, user_id, contact_user_id, alias_name, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, now(), now())
+       ON CONFLICT (user_id, contact_user_id) DO UPDATE
+         SET alias_name = CASE
+               WHEN NULLIF($5::text, '') IS NULL THEN user_contacts.alias_name
+               ELSE $5::text
+             END,
+             updated_at = now()`,
+      [
+        uuidv4(),
+        req.user.tenant_id || null,
+        req.user.id,
+        peer.id,
+        aliasName,
+      ],
+    );
+    await client.query("COMMIT");
+    return res.status(201).json({
+      ok: true,
+      data: {
+        contact_user_id: peer.id,
+        alias_name: aliasName,
+        peer: mapPeerInfo(peer),
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("chats.contacts.create error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete("/contacts/:contactUserId", requireAuth, async (req, res) => {
+  try {
+    await db.query(
+      `DELETE FROM user_contacts
+       WHERE user_id = $1
+         AND contact_user_id = $2
+         AND ($3::uuid IS NULL OR tenant_id = $3::uuid)`,
+      [
+        req.user.id,
+        String(req.params?.contactUserId || "").trim(),
+        req.user.tenant_id || null,
+      ],
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("chats.contacts.delete error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.post("/direct/open", requireAuth, async (req, res) => {
+  const targetId = String(req.body?.user_id || "").trim();
+  const query = String(req.body?.query || "").trim();
+  if (!targetId && !query) {
+    return res.status(400).json({
+      ok: false,
+      error: "Нужен user_id или query",
+    });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const peer = await resolveDirectTargetUser(client, req.user, {
+      userId: targetId,
+      query,
+    });
+    if (!peer) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Пользователь не найден" });
+    }
+
+    await client.query(
+      `INSERT INTO user_contacts (
+         id, tenant_id, user_id, contact_user_id, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, now(), now())
+       ON CONFLICT (user_id, contact_user_id) DO NOTHING`,
+      [uuidv4(), req.user.tenant_id || null, req.user.id, peer.id],
+    );
+
+    const existing = await client.query(
+      `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at
+       FROM chats c
+       JOIN chat_members m1 ON m1.chat_id = c.id AND m1.user_id = $1
+       JOIN chat_members m2 ON m2.chat_id = c.id AND m2.user_id = $2
+       WHERE c.type = 'private'
+         AND ($3::uuid IS NULL OR c.tenant_id = $3::uuid)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM chat_members mx
+           WHERE mx.chat_id = c.id
+             AND mx.user_id <> ALL($4::uuid[])
+         )
+       ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC
+       LIMIT 1`,
+      [req.user.id, peer.id, req.user.tenant_id || null, [req.user.id, peer.id]],
+    );
+
+    let chat = null;
+    let created = false;
+    if (existing.rowCount > 0) {
+      chat = existing.rows[0];
+    } else {
+      const settings = {
+        kind: "direct_message",
+        visibility: "private",
+      };
+      const chatInsert = await client.query(
+        `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+         VALUES ($1, $2, 'private', $3, $4, $5::jsonb, now(), now())
+         RETURNING id, title, type, settings, created_at, updated_at`,
+        [
+          uuidv4(),
+          "Личные сообщения",
+          req.user.id,
+          req.user.tenant_id || null,
+          JSON.stringify(settings),
+        ],
+      );
+      chat = chatInsert.rows[0];
+      await client.query(
+        `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+         VALUES ($1, $2, $3, now(), 'member')
+         ON CONFLICT (chat_id, user_id) DO NOTHING`,
+        [uuidv4(), chat.id, req.user.id],
+      );
+      await client.query(
+        `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+         VALUES ($1, $2, $3, now(), 'member')
+         ON CONFLICT (chat_id, user_id) DO NOTHING`,
+        [uuidv4(), chat.id, peer.id],
+      );
+      created = true;
+    }
+
+    await client.query("COMMIT");
+
+    const io = req.app.get("io");
+    if (io) {
+      if (created) {
+        emitToTenant(io, req.user?.tenant_id || null, "chat:created", {
+          chatId: chat.id,
+          chat,
+        });
+      }
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+        chatId: chat.id,
+        chat,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        chat,
+        peer: mapPeerInfo(peer),
+        created,
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("chats.direct.open error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  } finally {
+    client.release();
   }
 });
 

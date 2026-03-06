@@ -119,6 +119,17 @@ class _SupportScreenState extends State<SupportScreen> {
     }
   }
 
+  void _applyQuickTemplate(String value, {bool sendNow = false}) {
+    _controller.text = value;
+    _controller.selection = TextSelection.fromPosition(
+      TextPosition(offset: _controller.text.length),
+    );
+    _inputFocusNode.requestFocus();
+    if (sendNow) {
+      _ask();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -175,6 +186,36 @@ class _SupportScreenState extends State<SupportScreen> {
                   size: 40,
                 ),
               ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ActionChip(
+                      label: const Text('Сумма корзины'),
+                      onPressed: _loading
+                          ? null
+                          : () => _applyQuickTemplate(
+                              'Подскажите, какая у меня сумма корзины?',
+                              sendNow: true,
+                            ),
+                    ),
+                    ActionChip(
+                      label: const Text('Вопрос по товару'),
+                      onPressed: _loading
+                          ? null
+                          : () => _applyQuickTemplate(
+                              'Вопрос по товару: ',
+                              sendNow: false,
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
             Padding(
               padding: const EdgeInsets.all(12),
               child: Row(
