@@ -18,10 +18,11 @@ import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
-const String _defaultApiBaseUrl = String.fromEnvironment(
+const String _rawApiBaseUrl = String.fromEnvironment(
   'FENIX_API_BASE_URL',
   defaultValue: 'http://127.0.0.1:3000',
 );
+final String _defaultApiBaseUrl = _resolveApiBaseUrl(_rawApiBaseUrl);
 final Dio dio = Dio(BaseOptions(baseUrl: _defaultApiBaseUrl));
 late final AuthService authService;
 
@@ -50,6 +51,50 @@ String? _socketBoundViewRole;
 enum AppNoticeTone { info, success, warning, error }
 
 enum AppUiSound { tap, sent, incoming, success, warning }
+
+String _resolveApiBaseUrl(String raw) {
+  const fallback = 'http://127.0.0.1:3000';
+  final source = raw.trim();
+  if (source.isEmpty) return fallback;
+
+  final candidate = source.contains('://') ? source : 'http://$source';
+  Uri uri;
+  try {
+    uri = Uri.parse(candidate);
+  } catch (_) {
+    debugPrint('Invalid FENIX_API_BASE_URL="$source", fallback to $fallback');
+    return fallback;
+  }
+
+  final scheme = uri.scheme.toLowerCase();
+  if (scheme != 'http' && scheme != 'https') {
+    debugPrint(
+      'Unsupported API scheme in FENIX_API_BASE_URL="$source", fallback to $fallback',
+    );
+    return fallback;
+  }
+
+  final host = uri.host.trim();
+  if (host.isEmpty) {
+    debugPrint(
+      'Empty API host in FENIX_API_BASE_URL="$source", fallback to $fallback',
+    );
+    return fallback;
+  }
+
+  // dart:io headers require ASCII-safe host for local dev URLs.
+  final isAsciiHost = RegExp(r'^[A-Za-z0-9.\-]+$').hasMatch(host);
+  if (!isAsciiHost) {
+    debugPrint(
+      'Non-ASCII API host "$host" in FENIX_API_BASE_URL, fallback to $fallback',
+    );
+    return fallback;
+  }
+
+  final portPart = uri.hasPort ? ':${uri.port}' : '';
+  final path = (uri.path == '/' ? '' : uri.path).trim();
+  return '$scheme://$host$portPart$path';
+}
 
 class _AppNoticePayload {
   final int id;

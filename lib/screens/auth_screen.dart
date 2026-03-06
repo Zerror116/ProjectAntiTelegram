@@ -88,7 +88,8 @@ class _AuthScreenState extends State<AuthScreen> {
           uri.queryParameters['tenant'] ??
           uri.queryParameters['tenant_code'] ??
           '';
-      if (direct.trim().isNotEmpty) return direct.trim().toLowerCase();
+      final normalizedDirect = _normalizeTenantCode(direct);
+      if (normalizedDirect.isNotEmpty) return normalizedDirect;
       if (uri.fragment.isNotEmpty) {
         final fragment = uri.fragment;
         final qIndex = fragment.indexOf('?');
@@ -96,15 +97,23 @@ class _AuthScreenState extends State<AuthScreen> {
           final inFragment = Uri.splitQueryString(
             fragment.substring(qIndex + 1),
           );
-          final value =
-              (inFragment['tenant'] ?? inFragment['tenant_code'] ?? '')
-                  .trim()
-                  .toLowerCase();
-          if (value.isNotEmpty) return value;
+          final normalizedFragment = _normalizeTenantCode(
+            inFragment['tenant'] ?? inFragment['tenant_code'] ?? '',
+          );
+          if (normalizedFragment.isNotEmpty) return normalizedFragment;
         }
       }
     } catch (_) {}
     return '';
+  }
+
+  String _normalizeTenantCode(String raw) {
+    final value = raw.trim().toLowerCase();
+    if (value.isEmpty) return '';
+    if (!RegExp(r'^[a-z0-9][a-z0-9_-]{1,63}$').hasMatch(value)) {
+      return '';
+    }
+    return value;
   }
 
   @override

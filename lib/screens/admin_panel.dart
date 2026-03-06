@@ -3823,7 +3823,10 @@ class _AdminPanelState extends State<AdminPanel>
     );
     final systemKey = (settings['system_key'] ?? '').toString();
     final isMain = systemKey == 'main_channel';
-    final canDelete = !isMain;
+    final isReserved = systemKey == 'reserved_orders';
+    final isPostsArchive = systemKey == 'posts_archive';
+    final isSystemChannel = systemKey.trim().isNotEmpty;
+    final canDelete = !isSystemChannel;
     final focusX = _toFocus(settings['avatar_focus_x']);
     final focusY = _toFocus(settings['avatar_focus_y']);
     final avatarZoom = _toAvatarZoom(settings['avatar_zoom']);
@@ -3854,6 +3857,10 @@ class _AdminPanelState extends State<AdminPanel>
         subtitle: Text(
           isMain
               ? 'Основной канал • всегда публичный'
+              : isReserved
+              ? 'Системный канал сборки заказов'
+              : isPostsArchive
+              ? 'Системный архив постов'
               : (visibility == 'private' ? 'Частный канал' : 'Публичный канал'),
         ),
         childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),

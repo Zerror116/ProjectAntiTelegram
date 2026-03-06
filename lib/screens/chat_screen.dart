@@ -87,6 +87,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final Set<String> _messageIds = {};
   final Set<String> _placedCartItemIds = {};
   final Set<String> _supportFeedbackBusyTicketIds = {};
+  final Map<String, GlobalKey> _messageItemKeys = {};
   Map<String, dynamic>? _activePin;
 
   @override
@@ -162,6 +163,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _messages = [];
           _incomingQueue.clear();
           _messageIds.clear();
+          _messageItemKeys.clear();
           _appearingMessageIds.clear();
         });
         return;
@@ -223,6 +225,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _searchController.dispose();
     _inputFocusNode.dispose();
     _scrollController.dispose();
+    _messageItemKeys.clear();
     super.dispose();
   }
 
@@ -389,6 +392,7 @@ class _ChatScreenState extends State<ChatScreen> {
           .toList();
       _incomingQueue.removeWhere((m) => m['id']?.toString() == messageId);
       _messageIds.remove(messageId);
+      _messageItemKeys.remove(messageId);
       _appearingMessageIds.remove(messageId);
     });
   }
@@ -558,6 +562,45 @@ class _ChatScreenState extends State<ChatScreen> {
     return (pin['message_id'] ?? '').toString() == messageId;
   }
 
+  GlobalKey _messageKeyFor(String messageId) {
+    return _messageItemKeys.putIfAbsent(messageId, GlobalKey.new);
+  }
+
+  Future<void> _jumpToPinnedMessage() async {
+    final pin = _activePin;
+    if (pin == null) return;
+    final messageId = (pin['message_id'] ?? '').toString().trim();
+    if (messageId.isEmpty) return;
+
+    if (_searchMode || _searchQuery.isNotEmpty) {
+      setState(() {
+        _searchMode = false;
+        _searchController.clear();
+        _searchQuery = '';
+      });
+    }
+
+    await Future<void>.delayed(const Duration(milliseconds: 16));
+    if (!mounted) return;
+
+    final targetContext = _messageItemKeys[messageId]?.currentContext;
+    if (targetContext == null) {
+      showGlobalAppNotice(
+        'Сообщение не найдено в текущем списке',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    if (!targetContext.mounted) return;
+
+    await Scrollable.ensureVisible(
+      targetContext,
+      duration: const Duration(milliseconds: 260),
+      alignment: 0.12,
+      curve: Curves.easeOutCubic,
+    );
+  }
+
   Future<void> _markChatAsRead() async {
     try {
       final resp = await authService.dio.post(
@@ -693,6 +736,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   .where((id) => id != null && id.isNotEmpty)
                   .cast<String>(),
             );
+          _messageItemKeys.removeWhere((id, _) => !_messageIds.contains(id));
         });
         _incomingTimer?.cancel();
         _incomingTimer = null;
@@ -2888,7 +2932,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final isAppearing =
         messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
 
-    return TweenAnimationBuilder<double>(
+    final animatedItem = TweenAnimationBuilder<double>(
       tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
       duration: const Duration(milliseconds: 380),
       curve: Curves.easeOutCubic,
@@ -2935,6 +2979,11 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ),
     );
+
+    if (hasMessageId) {
+      return KeyedSubtree(key: _messageKeyFor(messageId), child: animatedItem);
+    }
+    return animatedItem;
   }
 
   @override
@@ -2977,40 +3026,43 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           if (_activePin != null)
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-              padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.outlineVariant,
+            GestureDetector(
+              onTap: _jumpToPinnedMessage,
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: Theme.of(context).colorScheme.outlineVariant,
+                  ),
                 ),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.push_pin,
-                    size: 18,
-                    color: Theme.of(context).colorScheme.primary,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _pinPreviewText(),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodyMedium,
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.push_pin,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.primary,
                     ),
-                  ),
-                  if (_canPinMessages())
-                    IconButton(
-                      tooltip: 'Открепить',
-                      icon: const Icon(Icons.close, size: 18),
-                      onPressed: _unpinMessage,
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _pinPreviewText(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
                     ),
-                ],
+                    if (_canPinMessages())
+                      IconButton(
+                        tooltip: 'Открепить',
+                        icon: const Icon(Icons.close, size: 18),
+                        onPressed: _unpinMessage,
+                      ),
+                  ],
+                ),
               ),
             ),
           Expanded(

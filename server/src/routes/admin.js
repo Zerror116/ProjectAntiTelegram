@@ -298,6 +298,28 @@ function reservedOrderMessageText(order) {
   return lines.join("\n");
 }
 
+function archivedProductMessageText({
+  product,
+  sourceChannelTitle,
+  queuedByName,
+  queuedByEmail,
+  queuedByPhone,
+}) {
+  const creator = queuedByName || queuedByEmail || "Неизвестно";
+  const lines = [
+    "🗂 Архив поста товара",
+    `Название: ${product.title}`,
+    product.description ? `Описание: ${String(product.description).trim()}` : null,
+    `Цена: ${product.price} RUB`,
+    `Количество: ${product.quantity}`,
+    `ID товара: ${product.product_code ?? "—"}`,
+    `Канал публикации: ${sourceChannelTitle || "Основной канал"}`,
+    `Кто создал пост: ${creator}`,
+    queuedByPhone ? `Телефон создателя: ${queuedByPhone}` : null,
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
 function buildDemoProduct(index, imageUrl) {
   const nouns = [
     "Шампунь",
@@ -2905,10 +2927,15 @@ router.post(
         const q = await client.query(
           `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
                 p.title, p.description, p.price, p.quantity, p.image_url, p.product_code,
-                c.title AS channel_title
+                c.title AS channel_title,
+                u.name AS queued_by_name,
+                u.email AS queued_by_email,
+                ph.phone AS queued_by_phone
          FROM product_publication_queue q
          JOIN products p ON p.id = q.product_id
          JOIN chats c ON c.id = q.channel_id
+         LEFT JOIN users u ON u.id = q.queued_by
+         LEFT JOIN phones ph ON ph.user_id = q.queued_by
          WHERE q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
            AND q.id = ANY($1::uuid[])
@@ -2922,10 +2949,15 @@ router.post(
         const q = await client.query(
           `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
                 p.title, p.description, p.price, p.quantity, p.image_url, p.product_code,
-                c.title AS channel_title
+                c.title AS channel_title,
+                u.name AS queued_by_name,
+                u.email AS queued_by_email,
+                ph.phone AS queued_by_phone
          FROM product_publication_queue q
          JOIN products p ON p.id = q.product_id
          JOIN chats c ON c.id = q.channel_id
+         LEFT JOIN users u ON u.id = q.queued_by
+         LEFT JOIN phones ph ON ph.user_id = q.queued_by
          WHERE q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
            AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
@@ -2938,6 +2970,15 @@ router.post(
       }
 
       const published = [];
+      const archivePublished = [];
+      const ensuredSystem = await ensureSystemChannels(
+        client,
+        req.user.id || null,
+        req.user.tenant_id || null,
+      );
+      const postsArchiveChannelId = String(
+        ensuredSystem?.postsArchiveChannel?.id || "",
+      ).trim();
 
       for (const row of rows) {
         let code = row.product_code;
@@ -3007,6 +3048,54 @@ router.post(
         );
         const message = messageInsert.rows[0];
 
+        if (postsArchiveChannelId) {
+          const archiveMeta = {
+            kind: "catalog_product_archive",
+            product_id: product.id,
+            product_code: product.product_code,
+            price: Number(product.price),
+            quantity: Number(product.quantity),
+            image_url: product.image_url,
+            source_channel_id: row.channel_id,
+            source_channel_title: row.channel_title,
+            source_message_id: message.id,
+            queued_by: row.queued_by,
+            queued_by_name: row.queued_by_name || null,
+            queued_by_email: row.queued_by_email || null,
+            queued_by_phone: row.queued_by_phone || null,
+          };
+          const archiveMessageInsert = await client.query(
+            `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+             VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+             RETURNING id`,
+            [
+              uuidv4(),
+              postsArchiveChannelId,
+              archivedProductMessageText({
+                product,
+                sourceChannelTitle: row.channel_title,
+                queuedByName: row.queued_by_name,
+                queuedByEmail: row.queued_by_email,
+                queuedByPhone: row.queued_by_phone,
+              }),
+              JSON.stringify(archiveMeta),
+            ],
+          );
+          const archiveMessageId = String(
+            archiveMessageInsert.rows[0]?.id || "",
+          ).trim();
+          await client.query(
+            "UPDATE chats SET updated_at = now() WHERE id = $1",
+            [postsArchiveChannelId],
+          );
+          if (archiveMessageId) {
+            archivePublished.push({
+              channel_id: postsArchiveChannelId,
+              message_id: archiveMessageId,
+            });
+          }
+        }
+
         await client.query(
           `UPDATE product_publication_queue
          SET status = 'published',
@@ -3040,6 +3129,13 @@ router.post(
         published,
         req.user?.tenant_id || null,
       );
+      if (archivePublished.length > 0) {
+        schedulePublishedMessages(
+          req.app.get("io"),
+          archivePublished,
+          req.user?.tenant_id || null,
+        );
+      }
 
       return res.json({
         ok: true,

@@ -192,6 +192,125 @@ class _ChatsScreenState extends State<ChatsScreen> {
     return '$prefix: $text';
   }
 
+  String _extractDioError(Object error) {
+    final text = error.toString();
+    final marker = 'error:';
+    final idx = text.toLowerCase().indexOf(marker);
+    if (idx >= 0 && idx + marker.length < text.length) {
+      return text.substring(idx + marker.length).trim();
+    }
+    return text;
+  }
+
+  Future<void> _openDirectChatDialog() async {
+    final controller = TextEditingController();
+    bool submitting = false;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            Future<void> submit() async {
+              final query = controller.text.trim();
+              if (query.isEmpty) return;
+              setModalState(() => submitting = true);
+              try {
+                final resp = await authService.dio.post(
+                  '/api/chats/direct/open',
+                  data: {'query': query},
+                );
+                final data = resp.data;
+                if (data is! Map ||
+                    data['ok'] != true ||
+                    data['data'] is! Map) {
+                  throw Exception('Неверный ответ сервера');
+                }
+                final payload = Map<String, dynamic>.from(data['data']);
+                final chat = payload['chat'] is Map
+                    ? Map<String, dynamic>.from(payload['chat'])
+                    : <String, dynamic>{};
+                final peer = payload['peer'] is Map
+                    ? Map<String, dynamic>.from(payload['peer'])
+                    : <String, dynamic>{};
+                final chatId = (chat['id'] ?? '').toString();
+                if (chatId.isEmpty) {
+                  throw Exception('Не удалось открыть чат');
+                }
+                if (ctx.mounted) Navigator.of(ctx).pop();
+                final title = (peer['name'] ?? '').toString().trim().isNotEmpty
+                    ? (peer['name'] ?? '').toString().trim()
+                    : ((peer['email'] ?? '').toString().trim().isNotEmpty
+                          ? (peer['email'] ?? '').toString().trim()
+                          : 'Личные сообщения');
+                if (!mounted) return;
+                _markChatReadLocally(chatId);
+                await Navigator.push(
+                  this.context,
+                  MaterialPageRoute(
+                    builder: (_) => ChatScreen(
+                      chatId: chatId,
+                      chatTitle: title,
+                      chatType: 'private',
+                      chatSettings: chat['settings'] is Map
+                          ? Map<String, dynamic>.from(chat['settings'])
+                          : null,
+                    ),
+                  ),
+                );
+                _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
+              } catch (e) {
+                if (!mounted) return;
+                showGlobalAppNotice(
+                  'Ошибка ЛС: ${_extractDioError(e)}',
+                  tone: AppNoticeTone.error,
+                );
+              } finally {
+                if (ctx.mounted) {
+                  setModalState(() => submitting = false);
+                }
+              }
+            }
+
+            return AlertDialog(
+              title: const Text('Найти пользователя'),
+              content: SizedBox(
+                width: 420,
+                child: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Телефон, email или имя',
+                    hintText: 'Например: 7999..., user@mail.com',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => submit(),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: submitting ? null : () => Navigator.pop(ctx),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton.icon(
+                  onPressed: submitting ? null : submit,
+                  icon: submitting
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.forum_outlined),
+                  label: const Text('Открыть ЛС'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    controller.dispose();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -448,7 +567,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final theme = Theme.of(context);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Чаты')),
+      appBar: AppBar(
+        title: const Text('Чаты'),
+        actions: [
+          IconButton(
+            tooltip: 'Личные сообщения',
+            onPressed: _openDirectChatDialog,
+            icon: const Icon(Icons.person_add_alt_1_outlined),
+          ),
+        ],
+      ),
       body: SafeArea(
         child: RefreshIndicator(
           onRefresh: _loadChats,

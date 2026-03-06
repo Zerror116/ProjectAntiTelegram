@@ -121,6 +121,7 @@ async function ensureSystemChannelsReady(createdBy = null) {
     return {
       main_channel_id: ensured.mainChannel.id,
       reserved_channel_id: ensured.reservedChannel.id,
+      posts_archive_channel_id: ensured.postsArchiveChannel?.id || null,
       created: ensured.created,
     };
   } catch (err) {

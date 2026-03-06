@@ -691,14 +691,18 @@ router.post("/ask", authMiddleware, async (req, res) => {
     const assigneeName = normalizeText(
       result.ticket?.assignee_name || result.assignee?.name || result.assignee?.email || "",
     );
+    const productHint =
+      result.category === "product"
+        ? " Для ускорения приложите в чат фото товара и его название."
+        : "";
 
     return res.status(201).json({
       ok: true,
       data: {
         mode: "ticket",
         reply: assigneeName
-          ? `Вопрос передан в поддержку. Ответственный: ${assigneeName}.`
-          : "Вопрос передан в поддержку. Ответ придёт в отдельный чат.",
+          ? `Вопрос передан в поддержку. Ответственный: ${assigneeName}.${productHint}`
+          : `Вопрос передан в поддержку. Ответ придёт в отдельный чат.${productHint}`,
         chat_id: result.chat?.id || result.ticket?.chat_id,
         chat_title: result.chat?.title || "Поддержка",
         ticket: result.ticket,
