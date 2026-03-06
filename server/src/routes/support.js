@@ -91,23 +91,21 @@ async function ensureAdminCreatorMembers(client, chatId, tenantId = null) {
      WHERE cm.chat_id = $1
        AND cm.user_id = u.id
        AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
-       AND u.role NOT IN ('admin', 'creator')`,
+       AND u.role NOT IN ('admin', 'tenant', 'creator')`,
     [chatId, tenantId || null],
   );
 
   const staff = await client.query(
     `SELECT id, role
      FROM users
-     WHERE role IN ('admin', 'creator')
+     WHERE role IN ('admin', 'tenant', 'creator')
        AND ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
     [tenantId || null],
   );
 
   for (const user of staff.rows) {
-    const role =
-      String(user.role || "").toLowerCase() === "creator"
-        ? "owner"
-        : "moderator";
+    const normalizedRole = String(user.role || "").toLowerCase();
+    const role = normalizedRole === "creator" ? "owner" : "moderator";
     await client.query(
       `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
        VALUES ($1, $2, $3, now(), $4)

@@ -496,9 +496,23 @@ router.get(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Управление ролями доступно арендатору только во вкладке Профиль",
+      });
+    }
     try {
+      const role = String(req.user?.role || "")
+        .toLowerCase()
+        .trim();
+      const isCreator = role === "creator";
       const result = await db.query(
-        "SELECT id, email, role, created_at FROM users ORDER BY created_at DESC",
+        `SELECT id, email, role, created_at
+         FROM users
+         WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid)
+         ORDER BY created_at DESC`,
+        [isCreator ? null : req.user?.tenant_id || null],
       );
       return res.json({ ok: true, data: result.rows });
     } catch (err) {
@@ -514,6 +528,12 @@ router.post(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Управление ролями доступно арендатору только во вкладке Профиль",
+      });
+    }
     const { id } = req.params;
     const { role } = req.body || {};
     const allowed = ["client", "worker", "admin", "creator"];
@@ -529,10 +549,20 @@ router.post(
           .json({ error: "Только создатель способен на такое" });
       }
 
-      await db.query(
-        "UPDATE users SET role = $1, updated_at = now() WHERE id = $2",
-        [role, id],
+      const isCreator = String(req.user?.role || "")
+        .toLowerCase()
+        .trim() === "creator";
+      const updated = await db.query(
+        `UPDATE users
+         SET role = $1, updated_at = now()
+         WHERE id = $2
+           AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+         RETURNING id`,
+        [role, id, isCreator ? null : req.user?.tenant_id || null],
       );
+      if (updated.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Пользователь не найден" });
+      }
       return res.json({ ok: true });
     } catch (err) {
       console.error("admin.users.role error", err);
@@ -651,10 +681,16 @@ router.post(
           [tenantId, provision.dbName, provision.dbUrl],
         );
       } catch (provisionErr) {
-        console.error(
-          "admin.tenants.create isolated provision failed, fallback to shared",
-          provisionErr,
-        );
+        if (String(provisionErr?.code || "") === "42501") {
+          console.warn(
+            "admin.tenants.create: no CREATE DATABASE permission, fallback to shared mode",
+          );
+        } else {
+          console.error(
+            "admin.tenants.create isolated provision failed, fallback to shared",
+            provisionErr,
+          );
+        }
 
         const sharedClient = await db.platformConnect();
         try {
@@ -783,6 +819,18 @@ router.patch(
     }
 
     try {
+      const tenant = await getTenantById(tenantId);
+      if (!tenant) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      if (isProtectedTenantCode(tenant.code)) {
+        return res.status(403).json({
+          ok: false,
+          error: "Системного арендатора default нельзя блокировать",
+        });
+      }
       const updated = await db.platformQuery(
         `UPDATE tenants
          SET status = $1,
@@ -817,6 +865,18 @@ router.delete(
       return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
     }
     try {
+      const tenant = await getTenantById(tenantId);
+      if (!tenant) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      if (isProtectedTenantCode(tenant.code)) {
+        return res.status(403).json({
+          ok: false,
+          error: "Системного арендатора default нельзя удалять",
+        });
+      }
       const archived = await db.platformQuery(
         `UPDATE tenants
          SET status = 'blocked',
@@ -933,11 +993,40 @@ function inviteLinkForRequest(req, inviteCode, tenantCode = "") {
   return `${req.protocol}://${req.get("host")}/?invite=${encoded}${tenantPart}`;
 }
 
+function isTenantUser(user) {
+  const base = String(user?.base_role || user?.role || "")
+    .toLowerCase()
+    .trim();
+  return base === "tenant";
+}
+
+async function getTenantById(tenantId) {
+  const result = await db.platformQuery(
+    `SELECT id, code, name
+     FROM tenants
+     WHERE id = $1
+     LIMIT 1`,
+    [tenantId],
+  );
+  return result.rowCount > 0 ? result.rows[0] : null;
+}
+
+function isProtectedTenantCode(code) {
+  return String(code || "").toLowerCase().trim() === "default";
+}
+
 router.get(
   "/tenant/invites",
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Клиентские приглашения арендатора доступны только во вкладке Профиль",
+      });
+    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -992,6 +1081,13 @@ router.post(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Клиентские приглашения арендатора доступны только во вкладке Профиль",
+      });
+    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -1131,6 +1227,13 @@ router.patch(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Клиентские приглашения арендатора доступны только во вкладке Профиль",
+      });
+    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({
@@ -1194,6 +1297,13 @@ router.delete(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Клиентские приглашения арендатора доступны только во вкладке Профиль",
+      });
+    }
     const targetTenant = await resolveTargetTenantForInvite(req);
     if (!targetTenant?.id) {
       return res.status(403).json({

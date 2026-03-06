@@ -100,9 +100,12 @@ function normalizeSettings(raw) {
 }
 
 function normalizeRole(role) {
-  return String(role || "client")
+  const normalized = String(role || "client")
     .toLowerCase()
     .trim();
+  // Арендатор имеет права администратора внутри своего tenant.
+  if (normalized === "tenant") return "admin";
+  return normalized;
 }
 
 function normalizeVisibility(chatType, settings) {

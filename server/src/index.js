@@ -270,9 +270,10 @@ async function ensureCreator() {
 async function canUserAccessChat(user, chatId) {
   const userId = user?.id;
   const tenantId = user?.tenant_id || null;
-  const role = String(user?.role || "client")
+  const rawRole = String(user?.role || "client")
     .toLowerCase()
     .trim();
+  const role = rawRole === "tenant" ? "admin" : rawRole;
   if (!userId || !chatId) return false;
 
   const chatQ = await db.query(
@@ -414,10 +415,17 @@ async function canUserAccessChat(user, chatId) {
           socket.handshake.auth?.view_role || "",
         );
         if (!context.ok || !context.user?.id) {
-          console.warn(
-            `Socket ${socket.id} auth denied:`,
-            context.error || "Unauthorized",
-          );
+          const authError = context.error || "Unauthorized";
+          if (
+            String(authError).toLowerCase().includes("сессия истекла") ||
+            String(authError).toLowerCase().includes("revoked")
+          ) {
+            console.log(
+              `Socket ${socket.id} stale session rejected: ${authError}`,
+            );
+          } else {
+            console.warn(`Socket ${socket.id} auth denied:`, authError);
+          }
           return next(new Error(context.error || "Unauthorized"));
         }
         socket.user = context.user;

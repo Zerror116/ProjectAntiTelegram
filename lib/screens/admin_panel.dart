@@ -170,6 +170,7 @@ class _AdminPanelState extends State<AdminPanel>
 
   String _roleLabel(String role) {
     final normalized = role.toLowerCase().trim();
+    if (normalized == 'tenant') return 'Арендатор';
     if (normalized == 'admin') return 'Админ';
     if (normalized == 'worker') return 'Рабочий';
     return 'Клиент';
@@ -1121,7 +1122,9 @@ class _AdminPanelState extends State<AdminPanel>
 
   Future<void> _loadDeliveryDashboard() async {
     final effectiveRole = authService.effectiveRole.toLowerCase().trim();
-    if (effectiveRole != 'admin' && effectiveRole != 'creator') {
+    if (effectiveRole != 'admin' &&
+        effectiveRole != 'tenant' &&
+        effectiveRole != 'creator') {
       if (mounted) {
         setState(() {
           _deliveryLoading = false;

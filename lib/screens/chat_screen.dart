@@ -468,7 +468,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _canPinMessages() {
     final role = authService.effectiveRole.toLowerCase().trim();
-    return role == 'admin' || role == 'creator';
+    return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
   Future<void> _loadPinnedMessage() async {
@@ -631,7 +631,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final role = authService.effectiveRole.toLowerCase().trim();
     if (role == 'client') return false;
     if (_isPublicChannel()) {
-      return role == 'admin' || role == 'creator';
+      return role == 'admin' || role == 'tenant' || role == 'creator';
     }
     return true;
   }
@@ -1300,7 +1300,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _isAdminOrCreator() {
     final role = authService.effectiveRole.toLowerCase().trim();
-    return role == 'admin' || role == 'creator';
+    return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
   bool _isClientRole() {
