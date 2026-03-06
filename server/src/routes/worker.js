@@ -1047,8 +1047,8 @@ router.post(
         }
       }
 
-      const updatedMessages = [];
-      const hiddenMessages = [];
+      const queuedItems = [];
+      let reusedPendingCount = 0;
 
       for (const post of keepPosts) {
         const productId = String(post.product_id || '').trim();
@@ -1056,90 +1056,100 @@ router.post(
         const basePrice = Number(post.price || 0);
         if (!Number.isFinite(basePrice) || basePrice <= 0) continue;
 
-        const revisedPrice = roundPriceToStep(basePrice * (1 + percent / 100), 50, 50);
+        const revisedPrice = roundPriceToStep(
+          basePrice * (1 + percent / 100),
+          50,
+          50
+        );
         const nextQuantity = toPositiveInteger(post.quantity, 1);
+        const title = String(post.title || '').trim();
+        if (!title) continue;
+        const description = String(post.description || '').trim();
+        const imageUrl = normalizeImageUrl(post.image_url);
 
-        const updatedProductQ = await client.query(
-          `UPDATE products
-           SET price = $1,
-               quantity = $2,
-               updated_at = now()
-           WHERE id = $3::uuid
-           RETURNING id, product_code, title, description, price, quantity, image_url`,
-          [revisedPrice, nextQuantity, productId]
-        );
-        if (updatedProductQ.rowCount === 0) continue;
-        const product = updatedProductQ.rows[0];
+        const payload = {
+          title,
+          description,
+          price: revisedPrice,
+          quantity: nextQuantity,
+          image_url: imageUrl,
+          revision_auto: true,
+          source_message_id: String(post.message_id || '').trim() || null,
+          hide_old_versions: hideOldVersions,
+          revision_dates: selectedDates,
+        };
 
-        const updatedMessageQ = await client.query(
-          `UPDATE messages
-           SET text = $1,
-               meta = jsonb_strip_nulls(
-                 COALESCE(meta, '{}'::jsonb)
-                 || jsonb_build_object(
-                    'kind', 'catalog_product',
-                    'product_id', $2::text,
-                    'product_code', $3::int,
-                    'price', $4::numeric,
-                    'quantity', $5::int,
-                    'image_url', $6::text
-                  )
-               )
-           WHERE id = $7
-             AND chat_id = $8
-           RETURNING id, chat_id, sender_id, text, meta, created_at`,
-          [
-            productMessageText(product),
-            product.id,
-            product.product_code,
-            Number(product.price),
-            Number(product.quantity),
-            product.image_url,
-            post.message_id,
-            mainChannel.id,
-          ]
+        const existingPendingQ = await client.query(
+          `SELECT id
+           FROM product_publication_queue
+           WHERE product_id = $1::uuid
+             AND channel_id = $2::uuid
+             AND status = 'pending'
+             AND COALESCE(is_sent, false) = false
+           ORDER BY created_at DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [productId, mainChannel.id]
         );
-        if (updatedMessageQ.rowCount > 0) {
-          updatedMessages.push(updatedMessageQ.rows[0]);
+
+        if (existingPendingQ.rowCount > 0) {
+          reusedPendingCount += 1;
+          const queueId = existingPendingQ.rows[0].id;
+          await client.query(
+            `UPDATE product_publication_queue
+             SET payload = $1::jsonb,
+                 queued_by = $2,
+                 created_at = now(),
+                 approved_by = NULL,
+                 approved_at = NULL
+             WHERE id = $3`,
+            [JSON.stringify(payload), req.user.id, queueId]
+          );
+          queuedItems.push({
+            queue_id: queueId,
+            product_id: productId,
+            mode: 'updated_pending',
+          });
+        } else {
+          const insertedQueue = await client.query(
+            `INSERT INTO product_publication_queue (
+               id,
+               product_id,
+               channel_id,
+               queued_by,
+               status,
+               is_sent,
+               payload,
+               created_at
+             )
+             VALUES ($1, $2::uuid, $3::uuid, $4, 'pending', false, $5::jsonb, now())
+             RETURNING id`,
+            [
+              uuidv4(),
+              productId,
+              mainChannel.id,
+              req.user.id,
+              JSON.stringify(payload),
+            ]
+          );
+          queuedItems.push({
+            queue_id: insertedQueue.rows[0].id,
+            product_id: productId,
+            mode: 'created_pending',
+          });
         }
       }
 
+      // hide_old_versions applies later, when admin publishes queued posts.
+      // Keeping channel untouched here is intentional.
       if (hideMessageIds.length > 0) {
-        const hiddenQ = await client.query(
-          `UPDATE messages
-           SET meta = jsonb_set(
-             COALESCE(meta, '{}'::jsonb),
-             '{hidden_for_all}',
-             'true'::jsonb,
-             true
-           )
-           WHERE id = ANY($1::uuid[])
-             AND chat_id = $2
-             AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
-           RETURNING id, chat_id, sender_id, text, meta, created_at`,
-          [hideMessageIds, mainChannel.id]
-        );
-        hiddenMessages.push(...hiddenQ.rows);
+        // keep variable used for future compatibility in response/debug
       }
-
-      await client.query('UPDATE chats SET updated_at = now() WHERE id = $1', [mainChannel.id]);
       await client.query('COMMIT');
 
       const io = req.app.get('io');
       if (io) {
-        for (const message of updatedMessages) {
-          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
-            chatId: mainChannel.id,
-            message,
-          });
-        }
-        for (const message of hiddenMessages) {
-          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
-            chatId: mainChannel.id,
-            message,
-          });
-        }
-        if (updatedMessages.length > 0 || hiddenMessages.length > 0) {
+        if (queuedItems.length > 0) {
           emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
             chatId: mainChannel.id,
           });
@@ -1151,8 +1161,11 @@ router.post(
         data: {
           dates: selectedDates,
           percent,
-          updated_count: updatedMessages.length,
-          hidden_old_count: hiddenMessages.length,
+          updated_count: queuedItems.length,
+          hidden_old_count: 0,
+          queued_count: queuedItems.length,
+          reused_pending_count: reusedPendingCount,
+          queued_items: queuedItems,
         },
       });
     } catch (err) {
