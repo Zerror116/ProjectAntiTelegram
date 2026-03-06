@@ -111,6 +111,22 @@ function roundPriceToStep(value, step = 50, min = 50) {
   return Math.max(min, rounded);
 }
 
+function toShelfNumber(value, fallback = 1) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
+function formatProductLabel(productCode, shelfNumber) {
+  const code = Number(productCode);
+  const shelf = Number(shelfNumber);
+  const codePart = Number.isFinite(code) && code > 0 ? String(Math.floor(code)) : '—';
+  const shelfPart = Number.isFinite(shelf) && shelf > 0
+    ? String(Math.floor(shelf)).padStart(2, '0')
+    : '—';
+  return `${codePart}--${shelfPart}`;
+}
+
 function toBoolean(value, fallback = false) {
   if (typeof value === 'boolean') return value;
   const normalized = String(value ?? '').trim().toLowerCase();
@@ -135,6 +151,7 @@ function normalizeRevisionEntry(raw) {
   const description = String(item.description || '').trim();
   const price = Number(item.price);
   const quantity = Number(item.quantity);
+  const shelfNumber = Number(item.shelf_number);
   return {
     product_id: String(item.product_id || '').trim(),
     message_id: String(item.message_id || '').trim(),
@@ -142,6 +159,7 @@ function normalizeRevisionEntry(raw) {
     description,
     price,
     quantity,
+    shelf_number: shelfNumber,
     image_url: normalizeImageUrl(item.image_url),
   };
 }
@@ -174,6 +192,7 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
             m.meta,
             p.id AS product_id,
             p.product_code,
+            p.shelf_number AS product_shelf_number,
             p.title AS product_title,
             p.description AS product_description,
             p.price AS product_price,
@@ -204,6 +223,7 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
       meta,
       product_id: row.product_id || meta.product_id || null,
       product_code: row.product_code ?? meta.product_code ?? null,
+      shelf_number: Number(row.product_shelf_number ?? meta.shelf_number ?? 1),
       title: String(row.product_title || '').trim(),
       description: String(row.product_description || '').trim(),
       price: Number(row.product_price ?? fallbackPrice),
@@ -294,6 +314,7 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'c
       `WITH ranked AS (
          SELECT p.id,
                 p.product_code,
+                p.shelf_number,
                 p.title,
                 p.description,
                 p.price,
@@ -316,7 +337,7 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'c
                AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
            )
        )
-       SELECT id, product_code, title, description, price, quantity, image_url, status, created_at, updated_at
+       SELECT id, product_code, shelf_number, title, description, price, quantity, image_url, status, created_at, updated_at
        FROM ranked
        WHERE title_rank <= 2
        ORDER BY created_at DESC, updated_at DESC
@@ -345,6 +366,7 @@ router.post(
         description = '',
         price,
         quantity = 1,
+        shelf_number,
       } = req.body || {};
 
       const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
@@ -369,6 +391,12 @@ router.post(
         return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
       }
       const normalizedQuantity = Math.floor(rawQuantity);
+      const rawShelf = shelf_number == null || shelf_number === '' ? 1 : Number(shelf_number);
+      if (!Number.isFinite(rawShelf) || rawShelf <= 0) {
+        removeUploadedFile(req.file);
+        return res.status(400).json({ ok: false, error: 'Номер полки должен быть больше нуля' });
+      }
+      const normalizedShelfNumber = Math.floor(rawShelf);
       const normalizedDescription = String(description || '').trim();
       if (!hasAtLeastTwoLetters(normalizedDescription)) {
         removeUploadedFile(req.file);
@@ -397,15 +425,16 @@ router.post(
       const code = await allocateProductCode(client);
 
       const productInsert = await client.query(
-        `INSERT INTO products (id, title, description, price, quantity, image_url, created_by, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', now(), now())
-         RETURNING id, product_code, title, description, price, quantity, image_url, status`,
+        `INSERT INTO products (id, title, description, price, quantity, shelf_number, image_url, created_by, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', now(), now())
+         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
         [
           uuidv4(),
           normalizedTitle,
           normalizedDescription,
           normalizedPrice,
           normalizedQuantity,
+          normalizedShelfNumber,
           imageUrl,
           req.user.id,
         ]
@@ -416,7 +445,7 @@ router.post(
          SET product_code = $1,
              updated_at = now()
          WHERE id = $2
-         RETURNING id, product_code, title, description, price, quantity, image_url, status`,
+         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
         [code, productId]
       );
       const product = productCodeUpdate.rows[0];
@@ -426,6 +455,7 @@ router.post(
         description: product.description,
         price: Number(product.price),
         quantity: Number(product.quantity),
+        shelf_number: Number(product.shelf_number),
         image_url: product.image_url,
       };
 
@@ -443,6 +473,7 @@ router.post(
         data: {
           queue: queueInsert.rows[0],
           product,
+          product_label: formatProductLabel(product.product_code, product.shelf_number),
           message: 'Товар отправлен в очередь. Пост появится после подтверждения админом/создателем.',
         },
       });
@@ -475,6 +506,7 @@ router.post(
         description,
         price,
         quantity,
+        shelf_number,
       } = req.body || {};
 
       if (!channel_id) {
@@ -499,7 +531,7 @@ router.post(
       }
 
       const productQ = await client.query(
-        `SELECT id, product_code, title, description, price, quantity, image_url
+        `SELECT id, product_code, shelf_number, title, description, price, quantity, image_url
          FROM products
          WHERE id = $1
            AND EXISTS (
@@ -525,6 +557,10 @@ router.post(
         quantity != null && quantity !== ''
           ? Number(quantity)
           : Number(current.quantity || 1);
+      const nextShelfNumber =
+        shelf_number != null && shelf_number !== ''
+          ? Number(shelf_number)
+          : Number(current.shelf_number || 1);
       let nextImageUrl = current.image_url;
       if (req.file) {
         nextImageUrl = toAbsoluteImageUrl(req, req.file);
@@ -554,6 +590,13 @@ router.post(
           error: 'Количество должно быть больше нуля',
         });
       }
+      if (!Number.isFinite(nextShelfNumber) || nextShelfNumber <= 0) {
+        removeUploadedFile(req.file);
+        return res.status(400).json({
+          ok: false,
+          error: 'Номер полки должен быть больше нуля',
+        });
+      }
       if (!nextImageUrl) {
         removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
@@ -569,13 +612,23 @@ router.post(
              description = $2,
              price = $3,
              quantity = $4,
-             image_url = $5,
-             product_code = $6,
+             shelf_number = $5,
+             image_url = $6,
+             product_code = $7,
              status = 'draft',
              updated_at = now()
-         WHERE id = $7
-         RETURNING id, product_code, title, description, price, quantity, image_url, status`,
-        [nextTitle, nextDescription, nextPrice, Math.floor(nextQuantity), nextImageUrl, nextCode, productId]
+         WHERE id = $8
+         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+        [
+          nextTitle,
+          nextDescription,
+          nextPrice,
+          Math.floor(nextQuantity),
+          Math.floor(nextShelfNumber),
+          nextImageUrl,
+          nextCode,
+          productId,
+        ]
       );
       const product = upd.rows[0];
 
@@ -584,6 +637,7 @@ router.post(
         description: product.description,
         price: Number(product.price),
         quantity: Number(product.quantity),
+        shelf_number: Number(product.shelf_number),
         image_url: product.image_url,
       };
 
@@ -601,6 +655,7 @@ router.post(
         data: {
           queue: queueInsert.rows[0],
           product,
+          product_label: formatProductLabel(product.product_code, product.shelf_number),
           message: 'Товар переотправлен в очередь',
         },
       });
@@ -634,6 +689,7 @@ router.get(
                 q.created_at,
                 c.title AS channel_title,
                 p.product_code,
+                p.shelf_number AS product_shelf_number,
                 p.title AS product_title,
                 p.description AS product_description,
                 p.price AS product_price,
@@ -666,6 +722,7 @@ router.patch(
     const description = String(req.body?.description || '').trim();
     const price = Number(req.body?.price);
     const quantity = Number(req.body?.quantity);
+    const shelfNumber = Number(req.body?.shelf_number);
 
     if (!queueId) {
       return res.status(400).json({ ok: false, error: 'queueId обязателен' });
@@ -685,6 +742,9 @@ router.patch(
     if (!Number.isFinite(quantity) || quantity <= 0) {
       return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
     }
+    if (!Number.isFinite(shelfNumber) || shelfNumber <= 0) {
+      return res.status(400).json({ ok: false, error: 'Номер полки должен быть больше нуля' });
+    }
 
     try {
       const result = await db.query(
@@ -703,10 +763,11 @@ router.patch(
                description = $4,
                price = $5,
                quantity = $6,
+               shelf_number = $7,
                updated_at = now()
            FROM target t
            WHERE p.id = t.product_id
-           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.image_url
+           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url
          )
          UPDATE product_publication_queue q
          SET payload = jsonb_strip_nulls(
@@ -715,13 +776,22 @@ router.patch(
                  'description', $4,
                  'price', $5,
                  'quantity', $6,
+                 'shelf_number', $7,
                  'image_url', (SELECT image_url FROM product_upd LIMIT 1)
                )
              )
          WHERE q.id = $1
            AND EXISTS (SELECT 1 FROM target)
          RETURNING q.id`,
-        [queueId, req.user.id, title, description, price, Math.floor(quantity)]
+        [
+          queueId,
+          req.user.id,
+          title,
+          description,
+          price,
+          Math.floor(quantity),
+          Math.floor(shelfNumber),
+        ]
       );
       if (result.rowCount === 0) {
         return res.status(404).json({
@@ -839,6 +909,9 @@ router.post(
       if (!Number.isFinite(item.quantity) || item.quantity <= 0) {
         return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
       }
+      if (Number.isFinite(item.shelf_number) && item.shelf_number <= 0) {
+        return res.status(400).json({ ok: false, error: 'Номер полки должен быть больше нуля' });
+      }
     }
 
     const client = await db.pool.connect();
@@ -861,6 +934,7 @@ router.post(
                     m.meta,
                     p.id AS product_id,
                     p.product_code,
+                    p.shelf_number AS product_shelf_number,
                     p.title AS product_title,
                     p.description AS product_description,
                     p.price AS product_price,
@@ -881,6 +955,7 @@ router.post(
                     m.meta,
                     p.id AS product_id,
                     p.product_code,
+                    p.shelf_number AS product_shelf_number,
                     p.title AS product_title,
                     p.description AS product_description,
                     p.price AS product_price,
@@ -908,6 +983,10 @@ router.post(
         }
 
         const nextQuantity = Math.floor(item.quantity);
+        const nextShelfNumber =
+          Number.isFinite(item.shelf_number) && item.shelf_number > 0
+            ? Math.floor(item.shelf_number)
+            : toShelfNumber(target.product_shelf_number, 1);
         const nextPrice = roundPriceToStep(item.price, 50, 50);
         const nextImageUrl = item.image_url || normalizeImageUrl(target.product_image_url) || null;
 
@@ -917,12 +996,21 @@ router.post(
                description = $2,
                price = $3,
                quantity = $4,
-               image_url = $5,
+               shelf_number = $5,
+               image_url = $6,
                status = CASE WHEN status = 'archived' THEN 'published' ELSE status END,
                updated_at = now()
-           WHERE id = $6::uuid
-           RETURNING id, product_code, title, description, price, quantity, image_url`,
-          [item.title, item.description, nextPrice, nextQuantity, nextImageUrl, productId]
+           WHERE id = $7::uuid
+           RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
+          [
+            item.title,
+            item.description,
+            nextPrice,
+            nextQuantity,
+            nextShelfNumber,
+            nextImageUrl,
+            productId,
+          ]
         );
         if (productUpdate.rowCount === 0) {
           continue;
@@ -940,11 +1028,12 @@ router.post(
                     'product_code', $3::int,
                     'price', $4::numeric,
                     'quantity', $5::int,
-                    'image_url', $6::text
+                    'shelf_number', $6::int,
+                    'image_url', $7::text
                   )
                )
-           WHERE id = $7
-             AND chat_id = $8
+           WHERE id = $8
+             AND chat_id = $9
            RETURNING id, chat_id, sender_id, text, meta, created_at`,
           [
             productMessageText(product),
@@ -952,6 +1041,7 @@ router.post(
             product.product_code,
             Number(product.price),
             Number(product.quantity),
+            Number(product.shelf_number),
             product.image_url,
             target.message_id,
             mainChannel.id,
@@ -1062,6 +1152,7 @@ router.post(
           50
         );
         const nextQuantity = toPositiveInteger(post.quantity, 1);
+        const nextShelfNumber = toShelfNumber(post.shelf_number, 1);
         const title = String(post.title || '').trim();
         if (!title) continue;
         const description = String(post.description || '').trim();
@@ -1072,6 +1163,7 @@ router.post(
           description,
           price: revisedPrice,
           quantity: nextQuantity,
+          shelf_number: nextShelfNumber,
           image_url: imageUrl,
           revision_auto: true,
           source_message_id: String(post.message_id || '').trim() || null,

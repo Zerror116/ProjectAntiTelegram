@@ -566,6 +566,63 @@ class _ChatScreenState extends State<ChatScreen> {
     return _messageItemKeys.putIfAbsent(messageId, GlobalKey.new);
   }
 
+  Future<BuildContext?> _resolveMessageContextWithScroll(String messageId) async {
+    BuildContext? context = _messageItemKeys[messageId]?.currentContext;
+    if (context != null && context.mounted) return context;
+    if (!_scrollController.hasClients) return null;
+
+    final visibleMessages = _visibleMessages();
+    if (visibleMessages.isEmpty) return null;
+    final timeline = _buildTimeline(visibleMessages);
+    final messageRowIndex = timeline.indexWhere((row) {
+      if (row['type'] != 'message') return false;
+      final rowMessage = row['data'];
+      if (rowMessage is! Map) return false;
+      return (rowMessage['id'] ?? '').toString() == messageId;
+    });
+    if (messageRowIndex < 0) return null;
+
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    if (maxExtent <= 0) {
+      return _messageItemKeys[messageId]?.currentContext;
+    }
+
+    final targetFraction = timeline.length <= 1
+        ? 0.0
+        : (messageRowIndex / (timeline.length - 1)).clamp(0.0, 1.0);
+    final estimatedOffset = maxExtent * targetFraction;
+    final deltas = <double>[0, -0.06, 0.06, -0.14, 0.14, -0.25, 0.25];
+
+    final offsets = <double>[];
+    for (final delta in deltas) {
+      final candidate = (estimatedOffset + maxExtent * delta)
+          .clamp(0.0, maxExtent)
+          .toDouble();
+      if (!offsets.any((x) => (x - candidate).abs() < 2)) {
+        offsets.add(candidate);
+      }
+    }
+    for (final fallback in <double>[0.0, maxExtent, maxExtent * 0.5]) {
+      final candidate = fallback.clamp(0.0, maxExtent).toDouble();
+      if (!offsets.any((x) => (x - candidate).abs() < 2)) {
+        offsets.add(candidate);
+      }
+    }
+
+    for (final offset in offsets) {
+      if (!_scrollController.hasClients) break;
+      _scrollController.jumpTo(offset);
+      await Future<void>.delayed(const Duration(milliseconds: 34));
+      if (!mounted) return null;
+      context = _messageItemKeys[messageId]?.currentContext;
+      if (context != null && context.mounted) {
+        return context;
+      }
+    }
+
+    return _messageItemKeys[messageId]?.currentContext;
+  }
+
   Future<void> _jumpToPinnedMessage() async {
     final pin = _activePin;
     if (pin == null) return;
@@ -583,10 +640,30 @@ class _ChatScreenState extends State<ChatScreen> {
     await Future<void>.delayed(const Duration(milliseconds: 16));
     if (!mounted) return;
 
-    final targetContext = _messageItemKeys[messageId]?.currentContext;
+    BuildContext? targetContext = await _resolveMessageContextWithScroll(
+      messageId,
+    );
+    if (targetContext == null) {
+      try {
+        final resp = await authService.dio.get(
+          '/api/chats/${widget.chatId}/messages/$messageId',
+        );
+        final data = resp.data;
+        if (data is Map && data['ok'] == true && data['data'] is Map) {
+          _upsertMessage(
+            Map<String, dynamic>.from(data['data']),
+            autoScroll: false,
+          );
+          await Future<void>.delayed(const Duration(milliseconds: 16));
+          if (!mounted) return;
+          targetContext = await _resolveMessageContextWithScroll(messageId);
+        }
+      } catch (_) {}
+    }
+
     if (targetContext == null) {
       showGlobalAppNotice(
-        'Сообщение не найдено в текущем списке',
+        'Не удалось перейти: сообщение недоступно',
         tone: AppNoticeTone.warning,
       );
       return;
@@ -1779,6 +1856,14 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
+    final code = int.tryParse('${productCode ?? ''}') ?? 0;
+    final shelf = int.tryParse('${shelfNumber ?? ''}') ?? 0;
+    final codePart = code > 0 ? '$code' : '—';
+    final shelfPart = shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+    return '$codePart--$shelfPart';
+  }
+
   String? _resolveImageUrl(String? raw) {
     final value = raw?.trim();
     if (value == null || value.isEmpty) {
@@ -2421,7 +2506,14 @@ class _ChatScreenState extends State<ChatScreen> {
     final imageUrl = _resolveImageUrl(metaMap['image_url']?.toString());
     final captionText = _captionTextOf(message, metaMap);
     final catalogTexts = _extractCatalogTexts(text);
-    final productCode = metaMap['product_code']?.toString() ?? '—';
+    final productLabel = (() {
+      final fromMeta = metaMap['product_label']?.toString().trim() ?? '';
+      if (fromMeta.isNotEmpty) return fromMeta;
+      return _formatProductLabel(
+        metaMap['product_code'],
+        metaMap['product_shelf_number'] ?? metaMap['shelf_number'],
+      );
+    })();
     final price = metaMap['price']?.toString() ?? '—';
     final quantity = metaMap['quantity']?.toString() ?? '—';
     final quantityInt = int.tryParse(quantity) ?? 0;
@@ -2824,7 +2916,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  _catalogMetaBadge(theme, 'ID', productCode),
+                  _catalogMetaBadge(theme, 'ID', productLabel),
                   _catalogMetaBadge(theme, 'Цена', '$price RUB'),
                   _catalogMetaBadge(theme, 'Куплено', quantity),
                   _catalogMetaBadge(theme, 'Полка', shelf),

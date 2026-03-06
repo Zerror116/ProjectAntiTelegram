@@ -1184,6 +1184,75 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
   }
 });
 
+router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId, messageId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context)
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const messageQ = await db.query(
+      `SELECT m.id,
+              m.sender_id,
+              m.client_msg_id,
+              m.text,
+              m.meta,
+              m.created_at,
+              (m.sender_id::text = $3::text) AS from_me,
+              EXISTS(
+                SELECT 1
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id = $3::uuid
+              ) AS is_read_by_me,
+              EXISTS(
+                SELECT 1
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              ) AS read_by_others,
+              (
+                SELECT COUNT(*)
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              )::int AS read_count,
+              COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+              u.email AS sender_email,
+              u.avatar_url AS sender_avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.chat_id = $1
+         AND m.id = $2
+         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       LIMIT 1`,
+      [chatId, messageId, String(userId)],
+    );
+
+    if (messageQ.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "Сообщение не найдено",
+      });
+    }
+
+    return res.json({ ok: true, data: messageQ.rows[0] });
+  } catch (err) {
+    console.error("chats.messageById error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 router.get("/:chatId/pin", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
