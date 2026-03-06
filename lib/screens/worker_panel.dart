@@ -626,19 +626,26 @@ class _WorkerPanelState extends State<WorkerPanel>
             ? (data['data'] as Map)['updated_count']
             : null,
       );
-      final hiddenCount = _toIntValue(
+      final queuedCount = _toIntValue(
         data is Map && data['data'] is Map
-            ? (data['data'] as Map)['hidden_old_count']
+            ? (data['data'] as Map)['queued_count']
+            : updatedCount,
+      );
+      final reusedCount = _toIntValue(
+        data is Map && data['data'] is Map
+            ? (data['data'] as Map)['reused_pending_count']
             : null,
       );
       if (!mounted) return;
       setState(
         () => _message =
-            'Авто-ревизия выполнена: обновлено $updatedCount, скрыто старых версий $hiddenCount',
+            'Авто-ревизия: в очередь поставлено $queuedCount '
+            '(обновлено существующих в очереди: $reusedCount). '
+            'В канал уйдёт только после кнопки админа "Отправить посты на канал".',
       );
       showAppNotice(
         context,
-        'Авто-ревизия завершена',
+        'Авто-ревизия поставлена в очередь',
         tone: AppNoticeTone.success,
       );
       await playAppSound(AppUiSound.success);
@@ -1265,7 +1272,8 @@ class _WorkerPanelState extends State<WorkerPanel>
           )
         else
           DropdownButtonFormField<String>(
-            value: _selectedChannelId,
+            key: ValueKey<String?>(_selectedChannelId),
+            initialValue: _selectedChannelId,
             decoration: const InputDecoration(
               labelText: 'Канал для публикации',
               border: OutlineInputBorder(),

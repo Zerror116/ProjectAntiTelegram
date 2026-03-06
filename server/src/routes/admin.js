@@ -2912,10 +2912,27 @@ router.post(
   requireAuth,
   requireRole("admin", "creator"),
   async (req, res) => {
-    const channelId = req.body?.channel_id ? String(req.body.channel_id) : null;
-    const queueIds = Array.isArray(req.body?.queue_ids)
-      ? req.body.queue_ids.map((v) => String(v))
+    const rawChannelId = req.body?.channel_id
+      ? String(req.body.channel_id).trim()
+      : "";
+    if (rawChannelId && !isUuidLike(rawChannelId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Некорректный channel_id",
+      });
+    }
+    const channelId = rawChannelId || null;
+
+    const rawQueueIds = Array.isArray(req.body?.queue_ids)
+      ? req.body.queue_ids
       : [];
+    const queueIds = normalizeUuidList(rawQueueIds);
+    if (rawQueueIds.length > 0 && queueIds.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Некорректные queue_ids",
+      });
+    }
     const onlySelected = queueIds.length > 0;
 
     const client = await db.pool.connect();
@@ -2941,7 +2958,7 @@ router.post(
            AND q.id = ANY($1::uuid[])
            AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
          ORDER BY q.created_at ASC
-         FOR UPDATE`,
+         FOR UPDATE OF q`,
           [queueIds, req.user.tenant_id || null],
         );
         rows = q.rows;
@@ -2963,7 +2980,7 @@ router.post(
            AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
            AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
          ORDER BY q.created_at ASC
-         FOR UPDATE`,
+         FOR UPDATE OF q`,
           [channelId, req.user.tenant_id || null],
         );
         rows = q.rows;
@@ -2971,6 +2988,8 @@ router.post(
 
       const published = [];
       const archivePublished = [];
+      const hiddenRevisionMessages = [];
+      const skipped = [];
       const ensuredSystem = await ensureSystemChannels(
         client,
         req.user.id || null,
@@ -2997,8 +3016,27 @@ router.post(
         const nextDescription = String(
           payload.description || row.description || "",
         ).trim();
-        const nextPrice = Number(payload.price ?? row.price ?? 0);
-        const nextQuantity = Number(payload.quantity ?? row.quantity ?? 1);
+        if (!nextTitle) {
+          skipped.push({
+            queue_id: row.id,
+            reason: "Пустое название товара",
+          });
+          continue;
+        }
+
+        const rawNextPrice = Number(payload.price ?? row.price ?? 0);
+        const fallbackPrice = Number(row.price ?? 0);
+        const nextPrice = Number.isFinite(rawNextPrice) && rawNextPrice >= 0
+          ? rawNextPrice
+          : (Number.isFinite(fallbackPrice) && fallbackPrice >= 0 ? fallbackPrice : 0);
+
+        const rawNextQuantity = Number(payload.quantity ?? row.quantity ?? 1);
+        const fallbackQuantity = Number(row.quantity ?? 1);
+        const nextQuantity = Number.isFinite(rawNextQuantity) && rawNextQuantity > 0
+          ? Math.floor(rawNextQuantity)
+          : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
+            ? Math.floor(fallbackQuantity)
+            : 1);
         const nextImageUrl = payload.image_url || row.image_url || null;
 
         const productUpdate = await client.query(
@@ -3024,6 +3062,13 @@ router.post(
             row.product_id,
           ],
         );
+        if (productUpdate.rowCount === 0) {
+          skipped.push({
+            queue_id: row.id,
+            reason: "Товар не найден",
+          });
+          continue;
+        }
         const product = productUpdate.rows[0];
 
         const messageMeta = {
@@ -3047,6 +3092,33 @@ router.post(
           ],
         );
         const message = messageInsert.rows[0];
+
+        const shouldHidePrevious =
+          payload?.hide_old_versions === true ||
+          String(payload?.hide_old_versions || '').toLowerCase().trim() ===
+            'true';
+        const sourceMessageId = String(payload?.source_message_id || '').trim();
+        if (
+          shouldHidePrevious &&
+          isUuidLike(sourceMessageId) &&
+          sourceMessageId !== String(message.id)
+        ) {
+          const hiddenQ = await client.query(
+            `UPDATE messages
+             SET meta = jsonb_set(
+                   COALESCE(meta, '{}'::jsonb),
+                   '{hidden_for_all}',
+                   'true'::jsonb,
+                   true
+                 )
+             WHERE id = $1
+               AND chat_id = $2
+               AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+             RETURNING id, chat_id, sender_id, text, meta, created_at`,
+            [sourceMessageId, row.channel_id],
+          );
+          hiddenRevisionMessages.push(...hiddenQ.rows);
+        }
 
         if (postsArchiveChannelId) {
           const archiveMeta = {
@@ -3136,10 +3208,24 @@ router.post(
           req.user?.tenant_id || null,
         );
       }
+      const io = req.app.get("io");
+      if (io && hiddenRevisionMessages.length > 0) {
+        for (const message of hiddenRevisionMessages) {
+          io.to(`chat:${message.chat_id}`).emit("chat:message", {
+            chatId: message.chat_id,
+            message,
+          });
+          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+            chatId: message.chat_id,
+          });
+        }
+      }
 
       return res.json({
         ok: true,
         published_count: published.length,
+        skipped_count: skipped.length,
+        skipped,
         data: published,
       });
     } catch (err) {
