@@ -4,15 +4,534 @@ const { v4: uuidv4 } = require("uuid");
 const router = express.Router();
 const db = require("../db");
 const { authMiddleware } = require("../utils/auth");
+const { requireRole } = require("../utils/roles");
 const { emitToTenant } = require("../utils/socket");
 
-function buildCartSummaryReply(total, processed) {
-  return `Общая сумма вашей корзины: ${total} RUB. Обработано на сумму: ${processed} RUB.`;
+const TICKET_STATUSES = new Set([
+  "open",
+  "waiting_customer",
+  "resolved",
+  "archived",
+]);
+
+const STAFF_ROLES = new Set(["worker", "admin", "tenant", "creator"]);
+
+function normalizeRole(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .trim();
+}
+
+function isStaffRole(rawRole) {
+  return STAFF_ROLES.has(normalizeRole(rawRole));
+}
+
+function isAdminTierRole(rawRole) {
+  const role = normalizeRole(rawRole);
+  return role === "admin" || role === "tenant" || role === "creator";
 }
 
 function normalizeSettings(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   return raw;
+}
+
+function buildCartSummaryReply(total, processed) {
+  return `Общая сумма вашей корзины: ${total} RUB. Обработано на сумму: ${processed} RUB.`;
+}
+
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function isCartSummaryQuestion(message) {
+  const normalized = normalizeText(message).toLowerCase();
+  if (!normalized) return false;
+  return normalized.includes("сум") && normalized.includes("корз");
+}
+
+function inferSupportCategory(message) {
+  const normalized = normalizeText(message).toLowerCase();
+  if (!normalized) return "general";
+  if (normalized.includes("достав") || normalized.includes("курьер") || normalized.includes("адрес")) {
+    return "delivery";
+  }
+  if (
+    normalized.includes("товар") ||
+    normalized.includes("фото") ||
+    normalized.includes("брак") ||
+    normalized.includes("описан") ||
+    normalized.includes("цена")
+  ) {
+    return "product";
+  }
+  if (normalized.includes("корз") || normalized.includes("сум") || normalized.includes("оплат")) {
+    return "cart";
+  }
+  return "general";
+}
+
+function parseTicketStatuses(rawStatuses) {
+  const values = String(rawStatuses || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  const unique = [];
+  for (const value of values) {
+    if (!TICKET_STATUSES.has(value)) continue;
+    if (!unique.includes(value)) unique.push(value);
+  }
+  return unique;
+}
+
+async function hydrateMessageById(messageId, currentUserId = null) {
+  const result = await db.query(
+    `SELECT m.id,
+            m.client_msg_id,
+            m.chat_id,
+            m.sender_id,
+            m.text,
+            m.meta,
+            m.created_at,
+            COALESCE((m.sender_id::text = $2::text), false) AS from_me,
+            EXISTS(
+              SELECT 1
+              FROM message_reads mr
+              WHERE mr.message_id = m.id
+                AND mr.user_id = $2::uuid
+            ) AS is_read_by_me,
+            EXISTS(
+              SELECT 1
+              FROM message_reads mr
+              WHERE mr.message_id = m.id
+                AND mr.user_id <> m.sender_id
+            ) AS read_by_others,
+            (
+              SELECT COUNT(*)
+              FROM message_reads mr
+              WHERE mr.message_id = m.id
+                AND mr.user_id <> m.sender_id
+            )::int AS read_count,
+            COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+            u.email AS sender_email,
+            u.avatar_url AS sender_avatar_url,
+            COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+            COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+            COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+     FROM messages m
+     LEFT JOIN users u ON u.id = m.sender_id
+     WHERE m.id = $1
+     LIMIT 1`,
+    [messageId, currentUserId ? String(currentUserId) : null],
+  );
+  return result.rows[0] || null;
+}
+
+async function emitChatMessage(req, tenantId, chatId, messageId) {
+  const io = req.app.get("io");
+  if (!io || !messageId) return;
+
+  const message = await hydrateMessageById(messageId, null);
+  if (!message) return;
+
+  io.to(`chat:${chatId}`).emit("chat:message", {
+    chatId,
+    message,
+  });
+  emitToTenant(io, tenantId || null, "chat:updated", { chatId });
+}
+
+async function emitChatCreated(req, tenantId, chat) {
+  const io = req.app.get("io");
+  if (!io || !chat?.id) return;
+  emitToTenant(io, tenantId || null, "chat:created", {
+    chatId: chat.id,
+    chat,
+  });
+  emitToTenant(io, tenantId || null, "chat:updated", {
+    chatId: chat.id,
+    chat,
+  });
+}
+
+async function insertSupportMessage(client, { chatId, senderId = null, text, meta = {} }) {
+  const inserted = await client.query(
+    `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, now())
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [uuidv4(), chatId, senderId, String(text || ""), JSON.stringify(meta || {})],
+  );
+  await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
+  return inserted.rows[0];
+}
+
+async function ensureSupportStaffMembers(client, chatId, tenantId = null) {
+  const staffRes = await client.query(
+    `SELECT id, role
+     FROM users
+     WHERE role IN ('admin', 'tenant', 'creator')
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
+    [tenantId || null],
+  );
+
+  for (const row of staffRes.rows) {
+    const normalizedRole = normalizeRole(row.role);
+    const memberRole = normalizedRole === "creator" ? "owner" : "moderator";
+    await client.query(
+      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+       VALUES ($1, $2, $3, now(), $4)
+       ON CONFLICT (chat_id, user_id) DO UPDATE
+       SET role = EXCLUDED.role`,
+      [uuidv4(), chatId, row.id, memberRole],
+    );
+  }
+}
+
+async function ensureSupportMembers(
+  client,
+  {
+    chatId,
+    customerId,
+    assigneeId,
+    tenantId = null,
+  },
+) {
+  await client.query(
+    `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+     VALUES ($1, $2, $3, now(), 'member')
+     ON CONFLICT (chat_id, user_id) DO UPDATE SET role = 'member'`,
+    [uuidv4(), chatId, customerId],
+  );
+
+  if (assigneeId) {
+    await client.query(
+      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+       VALUES ($1, $2, $3, now(), 'moderator')
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET role = 'moderator'`,
+      [uuidv4(), chatId, assigneeId],
+    );
+  }
+
+  await ensureSupportStaffMembers(client, chatId, tenantId);
+}
+
+async function resolveProductCandidate(client, { tenantId = null, messageText }) {
+  const text = normalizeText(messageText);
+  if (!text) return null;
+  const queryText = `%${text.split(/\s+/).slice(0, 6).join(" ")}%`;
+  const productRes = await client.query(
+    `SELECT p.id,
+            p.title,
+            p.created_by
+     FROM products p
+     LEFT JOIN users u ON u.id = p.created_by
+     WHERE (p.title ILIKE $1 OR p.description ILIKE $1)
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     ORDER BY p.updated_at DESC NULLS LAST, p.created_at DESC
+     LIMIT 1`,
+    [queryText, tenantId || null],
+  );
+  if (productRes.rowCount === 0) return null;
+  return productRes.rows[0];
+}
+
+async function resolveAssignee(
+  client,
+  {
+    tenantId = null,
+    preferredUserId = null,
+    preferWorker = false,
+  },
+) {
+  if (preferredUserId) {
+    const preferred = await client.query(
+      `SELECT id, role, name, email
+       FROM users
+       WHERE id = $1
+         AND is_active = true
+         AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       LIMIT 1`,
+      [preferredUserId, tenantId || null],
+    );
+    if (preferred.rowCount > 0 && isStaffRole(preferred.rows[0].role)) {
+      return preferred.rows[0];
+    }
+  }
+
+  const roleOrder = preferWorker
+    ? ["worker", "admin", "tenant", "creator"]
+    : ["admin", "tenant", "creator", "worker"];
+
+  for (const role of roleOrder) {
+    const result = await client.query(
+      `SELECT id, role, name, email
+       FROM users
+       WHERE role = $1
+         AND is_active = true
+         AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       ORDER BY updated_at DESC NULLS LAST, created_at ASC
+       LIMIT 1`,
+      [role, tenantId || null],
+    );
+    if (result.rowCount > 0) return result.rows[0];
+  }
+
+  return null;
+}
+
+async function openOrReuseSupportTicket(client, user, messageText) {
+  const tenantId = user.tenant_id || null;
+  const category = inferSupportCategory(messageText);
+
+  let product = null;
+  if (category === "product") {
+    product = await resolveProductCandidate(client, {
+      tenantId,
+      messageText,
+    });
+  }
+
+  const assignee = await resolveAssignee(client, {
+    tenantId,
+    preferredUserId: product?.created_by || null,
+    preferWorker: category === "product",
+  });
+
+  const existingRes = await client.query(
+    `SELECT st.*,
+            c.title AS chat_title,
+            c.type AS chat_type,
+            c.settings AS chat_settings
+     FROM support_tickets st
+     JOIN chats c ON c.id = st.chat_id
+     WHERE st.customer_id = $1
+       AND st.category = $2
+       AND st.status IN ('open', 'waiting_customer', 'resolved')
+       AND ($3::uuid IS NULL OR st.tenant_id = $3::uuid)
+     ORDER BY st.updated_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [user.id, category, tenantId],
+  );
+
+  let chatId;
+  let ticketId;
+  let chatRecord;
+  let createdChat = false;
+  let createdTicket = false;
+
+  if (existingRes.rowCount > 0) {
+    const row = existingRes.rows[0];
+    chatId = row.chat_id;
+    ticketId = row.id;
+
+    await client.query(
+      `UPDATE support_tickets
+       SET assignee_id = COALESCE($1::uuid, assignee_id),
+           assigned_role = COALESCE($2, assigned_role),
+           product_id = COALESCE($3::uuid, product_id),
+           status = 'open',
+           archived_at = NULL,
+           archive_reason = NULL,
+           resolved_at = NULL,
+           resolved_by = NULL,
+           last_customer_message_at = now(),
+           updated_at = now()
+       WHERE id = $4`,
+      [
+        assignee?.id || null,
+        normalizeRole(assignee?.role || "") || null,
+        product?.id || null,
+        ticketId,
+      ],
+    );
+
+    await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
+
+    chatRecord = {
+      id: chatId,
+      title: row.chat_title,
+      type: row.chat_type,
+      settings: normalizeSettings(row.chat_settings),
+      updated_at: new Date().toISOString(),
+    };
+  } else {
+    chatId = uuidv4();
+    ticketId = uuidv4();
+    const settings = {
+      kind: "support_ticket",
+      support_ticket: true,
+      support_ticket_id: ticketId,
+      visibility: "private",
+      category,
+      description: "Диалог поддержки",
+    };
+
+    const createdChatRes = await client.query(
+      `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+       VALUES ($1, $2, 'private', $3, $4, $5::jsonb, now(), now())
+       RETURNING id, title, type, settings, created_at, updated_at`,
+      [chatId, "Поддержка", user.id, tenantId, JSON.stringify(settings)],
+    );
+
+    const ticketSubject =
+      category === "product"
+        ? "Вопрос по товару"
+        : category === "delivery"
+        ? "Вопрос по доставке"
+        : category === "cart"
+        ? "Вопрос по корзине"
+        : "Общий вопрос";
+
+    await client.query(
+      `INSERT INTO support_tickets (
+        id,
+        tenant_id,
+        chat_id,
+        customer_id,
+        assignee_id,
+        assigned_role,
+        category,
+        subject,
+        product_id,
+        status,
+        last_customer_message_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        $9,
+        'open',
+        now(),
+        now(),
+        now()
+      )`,
+      [
+        ticketId,
+        tenantId,
+        chatId,
+        user.id,
+        assignee?.id || null,
+        normalizeRole(assignee?.role || "admin") || "admin",
+        category,
+        ticketSubject,
+        product?.id || null,
+      ],
+    );
+
+    chatRecord = createdChatRes.rows[0];
+    createdChat = true;
+    createdTicket = true;
+  }
+
+  await ensureSupportMembers(client, {
+    chatId,
+    customerId: user.id,
+    assigneeId: assignee?.id || null,
+    tenantId,
+  });
+
+  const customerMeta = {
+    kind: "support_customer_message",
+    support_ticket_id: ticketId,
+    support_category: category,
+    product_id: product?.id || null,
+    product_title: product?.title || null,
+  };
+
+  const customerMessage = await insertSupportMessage(client, {
+    chatId,
+    senderId: user.id,
+    text: messageText,
+    meta: customerMeta,
+  });
+
+  let introMessage = null;
+  if (createdTicket) {
+    const assigneeName = normalizeText(assignee?.name || assignee?.email || "");
+    const intro = assigneeName
+      ? `Ваш вопрос принят. Ответственный: ${assigneeName}.`
+      : "Ваш вопрос принят. Ответим в этом чате.";
+    introMessage = await insertSupportMessage(client, {
+      chatId,
+      senderId: null,
+      text: intro,
+      meta: {
+        kind: "support_ticket_intro",
+        support_ticket_id: ticketId,
+        support_category: category,
+      },
+    });
+  }
+
+  const ticketRes = await client.query(
+    `SELECT st.id,
+            st.chat_id,
+            st.customer_id,
+            st.assignee_id,
+            st.assigned_role,
+            st.category,
+            st.subject,
+            st.product_id,
+            st.status,
+            st.created_at,
+            st.updated_at,
+            COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name,
+            COALESCE(NULLIF(BTRIM(au.name), ''), NULLIF(BTRIM(au.email), ''), '—') AS assignee_name
+     FROM support_tickets st
+     LEFT JOIN users cu ON cu.id = st.customer_id
+     LEFT JOIN users au ON au.id = st.assignee_id
+     WHERE st.id = $1
+     LIMIT 1`,
+    [ticketId],
+  );
+
+  return {
+    ticket: ticketRes.rowCount > 0 ? ticketRes.rows[0] : null,
+    chat: chatRecord,
+    category,
+    assignee,
+    createdChat,
+    createdTicket,
+    customerMessage,
+    introMessage,
+  };
+}
+
+async function computeCartSummary(userId) {
+  const result = await db.query(
+    `SELECT c.status, c.quantity, p.price
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id
+     WHERE c.user_id = $1`,
+    [userId],
+  );
+
+  let total = 0;
+  let processed = 0;
+
+  for (const row of result.rows) {
+    const line = Number(row.price) * Number(row.quantity);
+    total += line;
+    if (
+      row.status === "processed" ||
+      row.status === "preparing_delivery" ||
+      row.status === "handing_to_courier" ||
+      row.status === "in_delivery"
+    ) {
+      processed += line;
+    }
+  }
+
+  return { total, processed };
 }
 
 async function ensureBugReportsChannel(client, createdBy, tenantId = null) {
@@ -104,62 +623,85 @@ async function ensureAdminCreatorMembers(client, chatId, tenantId = null) {
   );
 
   for (const user of staff.rows) {
-    const normalizedRole = String(user.role || "").toLowerCase();
+    const normalizedRole = normalizeRole(user.role);
     const role = normalizedRole === "creator" ? "owner" : "moderator";
     await client.query(
       `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
        VALUES ($1, $2, $3, now(), $4)
-       ON CONFLICT (chat_id, user_id) DO NOTHING`,
+       ON CONFLICT (chat_id, user_id) DO UPDATE
+       SET role = EXCLUDED.role`,
       [uuidv4(), chatId, user.id, role],
     );
   }
 }
 
 router.post("/ask", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const message = String(req.body?.message || "")
-      .toLowerCase()
-      .trim();
+  const message = normalizeText(req.body?.message);
+  if (!message) {
+    return res.status(400).json({ ok: false, error: "Введите вопрос" });
+  }
 
-    const asksCartSum = message.includes("сум") && message.includes("корз");
-    if (!asksCartSum) {
+  try {
+    if (isCartSummaryQuestion(message)) {
+      const sums = await computeCartSummary(req.user.id);
       return res.json({
         ok: true,
         data: {
-          reply:
-            'Поддержка: пока доступны ответы по сумме корзины. Напишите вопрос со словами "сумма" и "корзина".',
+          mode: "quick_reply",
+          reply: buildCartSummaryReply(sums.total, sums.processed),
         },
       });
     }
 
-    const result = await db.query(
-      `SELECT c.status, c.quantity, p.price
-       FROM cart_items c
-       JOIN products p ON p.id = c.product_id
-       WHERE c.user_id = $1`,
-      [userId],
-    );
-
-    let total = 0;
-    let processed = 0;
-    for (const row of result.rows) {
-      const line = Number(row.price) * Number(row.quantity);
-      total += line;
-      if (
-        row.status === "processed" ||
-        row.status === "preparing_delivery" ||
-        row.status === "handing_to_courier" ||
-        row.status === "in_delivery"
-      ) {
-        processed += line;
-      }
+    const client = await db.pool.connect();
+    let result;
+    try {
+      await client.query("BEGIN");
+      result = await openOrReuseSupportTicket(client, req.user, message);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
     }
 
-    return res.json({
+    if (result.createdChat) {
+      await emitChatCreated(req, req.user.tenant_id || null, result.chat);
+    }
+
+    if (result.customerMessage?.id) {
+      await emitChatMessage(
+        req,
+        req.user.tenant_id || null,
+        result.customerMessage.chat_id,
+        result.customerMessage.id,
+      );
+    }
+
+    if (result.introMessage?.id) {
+      await emitChatMessage(
+        req,
+        req.user.tenant_id || null,
+        result.introMessage.chat_id,
+        result.introMessage.id,
+      );
+    }
+
+    const assigneeName = normalizeText(
+      result.ticket?.assignee_name || result.assignee?.name || result.assignee?.email || "",
+    );
+
+    return res.status(201).json({
       ok: true,
       data: {
-        reply: buildCartSummaryReply(total, processed),
+        mode: "ticket",
+        reply: assigneeName
+          ? `Вопрос передан в поддержку. Ответственный: ${assigneeName}.`
+          : "Вопрос передан в поддержку. Ответ придёт в отдельный чат.",
+        chat_id: result.chat?.id || result.ticket?.chat_id,
+        chat_title: result.chat?.title || "Поддержка",
+        ticket: result.ticket,
       },
     });
   } catch (err) {
@@ -167,6 +709,284 @@ router.post("/ask", authMiddleware, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Ошибка сервера" });
   }
 });
+
+router.get("/tickets", authMiddleware, async (req, res) => {
+  try {
+    const role = normalizeRole(req.user.role);
+    const includeArchived = String(req.query.include_archived || "") === "1";
+    const statuses = parseTicketStatuses(req.query.status);
+
+    let effectiveStatuses = statuses;
+    if (effectiveStatuses.length === 0) {
+      effectiveStatuses = includeArchived
+        ? ["open", "waiting_customer", "resolved", "archived"]
+        : ["open", "waiting_customer", "resolved"];
+      if (role === "client" && includeArchived) {
+        effectiveStatuses = ["open", "waiting_customer", "resolved", "archived"];
+      }
+    }
+
+    const params = [effectiveStatuses, req.user.tenant_id || null, req.user.id, role];
+
+    const list = await db.query(
+      `SELECT st.id,
+              st.chat_id,
+              st.customer_id,
+              st.assignee_id,
+              st.assigned_role,
+              st.category,
+              st.subject,
+              st.product_id,
+              st.status,
+              st.archive_reason,
+              st.created_at,
+              st.updated_at,
+              st.resolved_at,
+              st.archived_at,
+              c.title AS chat_title,
+              c.type AS chat_type,
+              c.settings AS chat_settings,
+              COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name,
+              cu.email AS customer_email,
+              COALESCE(NULLIF(BTRIM(au.name), ''), NULLIF(BTRIM(au.email), ''), '—') AS assignee_name,
+              au.email AS assignee_email
+       FROM support_tickets st
+       JOIN chats c ON c.id = st.chat_id
+       LEFT JOIN users cu ON cu.id = st.customer_id
+       LEFT JOIN users au ON au.id = st.assignee_id
+       WHERE st.status = ANY($1::text[])
+         AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
+         AND (
+           ($4 = 'client' AND st.customer_id = $3)
+           OR ($4 = 'worker' AND st.assignee_id = $3)
+           OR ($4 IN ('admin', 'tenant', 'creator'))
+         )
+       ORDER BY
+         CASE st.status
+           WHEN 'open' THEN 0
+           WHEN 'waiting_customer' THEN 1
+           WHEN 'resolved' THEN 2
+           ELSE 3
+         END,
+         st.updated_at DESC,
+         st.created_at DESC
+       LIMIT 300`,
+      params,
+    );
+
+    return res.json({ ok: true, data: list.rows });
+  } catch (err) {
+    console.error("support.tickets.list error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
+  const ticketId = normalizeText(req.params.ticketId);
+  const resolved = req.body?.resolved;
+  const comment = normalizeText(req.body?.comment);
+
+  if (!ticketId) {
+    return res.status(400).json({ ok: false, error: "ticketId обязателен" });
+  }
+  if (typeof resolved !== "boolean") {
+    return res.status(400).json({ ok: false, error: "resolved должен быть true/false" });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const ticketRes = await client.query(
+      `SELECT st.*, c.settings AS chat_settings
+       FROM support_tickets st
+       JOIN chats c ON c.id = st.chat_id
+       WHERE st.id = $1
+         AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
+       LIMIT 1
+       FOR UPDATE`,
+      [ticketId, req.user.tenant_id || null],
+    );
+
+    if (ticketRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Тикет не найден" });
+    }
+
+    const ticket = ticketRes.rows[0];
+    const role = normalizeRole(req.user.role);
+    const isCustomer = String(ticket.customer_id) === String(req.user.id);
+    const canModerate = isAdminTierRole(role);
+
+    if (!isCustomer && !canModerate) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ ok: false, error: "Недостаточно прав" });
+    }
+
+    let commentMessage = null;
+    if (comment) {
+      commentMessage = await insertSupportMessage(client, {
+        chatId: ticket.chat_id,
+        senderId: req.user.id,
+        text: comment,
+        meta: {
+          kind: "support_customer_feedback_comment",
+          support_ticket_id: ticket.id,
+          resolved,
+        },
+      });
+    }
+
+    const nextStatus = resolved ? "archived" : "open";
+    await client.query(
+      `UPDATE support_tickets
+       SET status = $1,
+           resolved_by = CASE WHEN $2::boolean THEN $3::uuid ELSE NULL END,
+           resolved_at = CASE WHEN $2::boolean THEN now() ELSE NULL END,
+           archived_at = CASE WHEN $2::boolean THEN now() ELSE NULL END,
+           archive_reason = CASE
+             WHEN $2::boolean THEN COALESCE(NULLIF($4, ''), 'customer_confirmed')
+             ELSE NULL
+           END,
+           updated_at = now()
+       WHERE id = $5`,
+      [
+        nextStatus,
+        resolved,
+        req.user.id,
+        resolved ? "customer_confirmed" : "",
+        ticket.id,
+      ],
+    );
+
+    const statusText = resolved
+      ? "Отлично, вопрос закрыт и отправлен в архив поддержки."
+      : "Поняли, вопрос снова открыт. Поддержка ответит в этом чате.";
+
+    const statusMessage = await insertSupportMessage(client, {
+      chatId: ticket.chat_id,
+      senderId: null,
+      text: statusText,
+      meta: {
+        kind: "support_feedback_result",
+        support_ticket_id: ticket.id,
+        feedback_status: resolved ? "resolved" : "reopened",
+      },
+    });
+
+    await client.query("COMMIT");
+
+    if (commentMessage?.id) {
+      await emitChatMessage(
+        req,
+        req.user.tenant_id || null,
+        commentMessage.chat_id,
+        commentMessage.id,
+      );
+    }
+
+    if (statusMessage?.id) {
+      await emitChatMessage(
+        req,
+        req.user.tenant_id || null,
+        statusMessage.chat_id,
+        statusMessage.id,
+      );
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        ticket_id: ticket.id,
+        status: nextStatus,
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("support.ticket.feedback error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  } finally {
+    client.release();
+  }
+});
+
+router.post(
+  "/tickets/:ticketId/archive",
+  authMiddleware,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const ticketId = normalizeText(req.params.ticketId);
+    const reason = normalizeText(req.body?.reason || "admin_archive");
+    if (!ticketId) {
+      return res.status(400).json({ ok: false, error: "ticketId обязателен" });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const ticketRes = await client.query(
+        `SELECT *
+         FROM support_tickets
+         WHERE id = $1
+           AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+         LIMIT 1
+         FOR UPDATE`,
+        [ticketId, req.user.tenant_id || null],
+      );
+      if (ticketRes.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Тикет не найден" });
+      }
+
+      const ticket = ticketRes.rows[0];
+      await client.query(
+        `UPDATE support_tickets
+         SET status = 'archived',
+             archive_reason = $1,
+             archived_at = now(),
+             updated_at = now()
+         WHERE id = $2`,
+        [reason || "admin_archive", ticket.id],
+      );
+
+      const statusMessage = await insertSupportMessage(client, {
+        chatId: ticket.chat_id,
+        senderId: null,
+        text: "Диалог перенесён в архив поддержки.",
+        meta: {
+          kind: "support_ticket_archived",
+          support_ticket_id: ticket.id,
+          archive_reason: reason || "admin_archive",
+        },
+      });
+
+      await client.query("COMMIT");
+
+      if (statusMessage?.id) {
+        await emitChatMessage(
+          req,
+          req.user.tenant_id || null,
+          statusMessage.chat_id,
+          statusMessage.id,
+        );
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          ticket_id: ticket.id,
+          status: "archived",
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("support.ticket.archive error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 // Отправить баг-репорт в отдельный приватный канал для admin/creator
 router.post("/bug-report", authMiddleware, async (req, res) => {

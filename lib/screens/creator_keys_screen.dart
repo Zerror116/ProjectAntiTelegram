@@ -114,7 +114,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           data['ok'] == true &&
           data['data'] is List &&
           mounted) {
-        final rows = List<Map<String, dynamic>>.from(data['data']);
+        final rows = List<Map<String, dynamic>>.from(
+          data['data'],
+        ).where((row) => row['is_deleted'] != true).toList();
         String selectedId = _selectedTenantId;
         String selectedCode = _selectedTenantCode;
         if (rows.isNotEmpty) {
@@ -286,7 +288,20 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         '/api/admin/tenants/$tenantId',
         options: _creatorRequestOptions(),
       );
-      if (mounted) setState(() => _message = 'Ключ арендатора удален');
+      if (!mounted) return;
+      setState(() {
+        _message = 'Ключ арендатора удален';
+        _tenants.removeWhere((row) => (row['id'] ?? '').toString() == tenantId);
+        if (_selectedTenantId == tenantId) {
+          if (_tenants.isNotEmpty) {
+            _selectedTenantId = (_tenants.first['id'] ?? '').toString();
+            _selectedTenantCode = (_tenants.first['code'] ?? '').toString();
+          } else {
+            _selectedTenantId = '';
+            _selectedTenantCode = '';
+          }
+        }
+      });
       await _loadTenants(silent: true);
     } catch (e) {
       if (!mounted) return;

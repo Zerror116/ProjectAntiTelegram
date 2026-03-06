@@ -15,6 +15,7 @@ import 'package:image/image.dart' as img;
 import 'package:latlong2/latlong.dart';
 
 import '../main.dart';
+import 'chat_screen.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/input_language_badge.dart';
 
@@ -69,6 +70,8 @@ class _AdminPanelState extends State<AdminPanel>
   bool _avatarUpdating = false;
   bool _deliveryLoading = false;
   bool _deliverySaving = false;
+  bool _supportLoading = false;
+  bool _supportArchiveBusy = false;
   bool _tenantsLoading = false;
   bool _tenantActionLoading = false;
   bool _invitesLoading = false;
@@ -87,6 +90,8 @@ class _AdminPanelState extends State<AdminPanel>
   List<Map<String, dynamic>> _lastPublished = [];
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
   List<Map<String, dynamic>> _deliveryBatches = [];
+  List<Map<String, dynamic>> _supportActiveTickets = [];
+  List<Map<String, dynamic>> _supportArchivedTickets = [];
   List<Map<String, dynamic>> _tenants = [];
   List<Map<String, dynamic>> _tenantInvites = [];
   Map<String, dynamic>? _deliveryActiveBatch;
@@ -106,7 +111,7 @@ class _AdminPanelState extends State<AdminPanel>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(length: 5, vsync: this);
     _reloadAll();
     _eventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
@@ -322,6 +327,7 @@ class _AdminPanelState extends State<AdminPanel>
     await _loadChannels();
     await _loadPendingPosts();
     await _loadDeliveryDashboard();
+    await _loadSupportTickets();
     if (_showKeysTab) {
       await _loadTenants();
       await _loadTenantInvites();
@@ -1189,6 +1195,135 @@ class _AdminPanelState extends State<AdminPanel>
         setState(() => _deliveryLoading = false);
       }
     }
+  }
+
+  String _supportCategoryLabel(String raw) {
+    switch (raw.trim().toLowerCase()) {
+      case 'product':
+        return 'Товар';
+      case 'delivery':
+        return 'Доставка';
+      case 'cart':
+        return 'Корзина';
+      default:
+        return 'Общий';
+    }
+  }
+
+  String _supportStatusLabel(String raw) {
+    switch (raw.trim().toLowerCase()) {
+      case 'open':
+        return 'Открыт';
+      case 'waiting_customer':
+        return 'Ждём клиента';
+      case 'resolved':
+        return 'Решён';
+      case 'archived':
+        return 'В архиве';
+      default:
+        return 'Неизвестно';
+    }
+  }
+
+  Future<void> _loadSupportTickets({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _supportLoading = true);
+    } else {
+      _supportLoading = true;
+    }
+    try {
+      final activeResp = await authService.dio.get(
+        '/api/support/tickets',
+        queryParameters: {'status': 'open,waiting_customer,resolved'},
+      );
+      final archivedResp = await authService.dio.get(
+        '/api/support/tickets',
+        queryParameters: {'status': 'archived', 'include_archived': 1},
+      );
+
+      final activeData = activeResp.data;
+      final archivedData = archivedResp.data;
+      if (!mounted) return;
+      setState(() {
+        _supportActiveTickets =
+            activeData is Map &&
+                activeData['ok'] == true &&
+                activeData['data'] is List
+            ? List<Map<String, dynamic>>.from(activeData['data'])
+            : [];
+        _supportArchivedTickets =
+            archivedData is Map &&
+                archivedData['ok'] == true &&
+                archivedData['data'] is List
+            ? List<Map<String, dynamic>>.from(archivedData['data'])
+            : [];
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка поддержки: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) {
+        setState(() => _supportLoading = false);
+      } else {
+        _supportLoading = false;
+      }
+    }
+  }
+
+  Future<void> _archiveSupportTicket(Map<String, dynamic> ticket) async {
+    final ticketId = (ticket['id'] ?? '').toString().trim();
+    if (ticketId.isEmpty) return;
+    setState(() {
+      _supportArchiveBusy = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/support/tickets/$ticketId/archive',
+        data: {'reason': 'admin_archive'},
+      );
+      await _loadSupportTickets(silent: true);
+      if (!mounted) return;
+      setState(() => _message = 'Тикет перенесён в архив');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _message = 'Ошибка архива поддержки: ${_extractDioError(e)}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _supportArchiveBusy = false);
+      } else {
+        _supportArchiveBusy = false;
+      }
+    }
+  }
+
+  Future<void> _openSupportChat(Map<String, dynamic> ticket) async {
+    final chatId = (ticket['chat_id'] ?? '').toString().trim();
+    if (chatId.isEmpty) return;
+    final chatTitle = (ticket['chat_title'] ?? 'Поддержка').toString();
+    final ticketId = (ticket['id'] ?? '').toString().trim();
+    final settings = _asMap(ticket['chat_settings']);
+    final normalizedSettings = <String, dynamic>{
+      ...settings,
+      'kind': settings['kind'] ?? 'support_ticket',
+      'support_ticket': true,
+      if (ticketId.isNotEmpty)
+        'support_ticket_id': settings['support_ticket_id'] ?? ticketId,
+    };
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: chatId,
+          chatTitle: chatTitle,
+          chatType: (ticket['chat_type'] ?? 'private').toString(),
+          chatSettings: normalizedSettings,
+        ),
+      ),
+    );
   }
 
   Future<void> _saveDeliverySettings() async {
@@ -4257,6 +4392,156 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  Widget _buildSupportTicketCard(
+    Map<String, dynamic> ticket, {
+    required bool archived,
+  }) {
+    final theme = Theme.of(context);
+    final ticketId = (ticket['id'] ?? '').toString().trim();
+    final customer = (ticket['customer_name'] ?? 'Клиент').toString();
+    final assignee = (ticket['assignee_name'] ?? '—').toString();
+    final category = _supportCategoryLabel(
+      (ticket['category'] ?? '').toString(),
+    );
+    final status = _supportStatusLabel((ticket['status'] ?? '').toString());
+    final subject = (ticket['subject'] ?? '').toString().trim();
+    final updatedAt = _formatDateTimeLabel(ticket['updated_at']);
+    final archiveReason = (ticket['archive_reason'] ?? '').toString().trim();
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    subject.isNotEmpty ? subject : 'Тикет поддержки',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                _buildModerationChip(status),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text('Категория: $category'),
+            Text('Клиент: $customer'),
+            Text('Ответственный: $assignee'),
+            if (updatedAt.isNotEmpty) Text('Обновлён: $updatedAt'),
+            if (archiveReason.isNotEmpty)
+              Text('Причина архива: $archiveReason'),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: () => _openSupportChat(ticket),
+                  icon: const Icon(Icons.forum_outlined),
+                  label: const Text('Открыть чат'),
+                ),
+                if (!archived)
+                  OutlinedButton.icon(
+                    onPressed: _supportArchiveBusy
+                        ? null
+                        : () => _archiveSupportTicket(ticket),
+                    icon: const Icon(Icons.archive_outlined),
+                    label: Text(
+                      _supportArchiveBusy ? 'Сохранение...' : 'В архив',
+                    ),
+                  ),
+                if (ticketId.isNotEmpty)
+                  _buildModerationChip('ID ${ticketId.substring(0, 8)}'),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSupportTab() {
+    return RefreshIndicator(
+      onRefresh: () => _loadSupportTickets(silent: true),
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Поддержка',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ),
+              IconButton(
+                onPressed: _supportLoading
+                    ? null
+                    : () => _loadSupportTickets(silent: true),
+                icon: const Icon(Icons.refresh),
+                tooltip: 'Обновить',
+              ),
+            ],
+          ),
+          if (_supportLoading &&
+              _supportActiveTickets.isEmpty &&
+              _supportArchivedTickets.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 12),
+              child: LinearProgressIndicator(),
+            ),
+          const SizedBox(height: 12),
+          Text(
+            'Активные тикеты',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          if (_supportActiveTickets.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(14),
+                child: Text('Активных тикетов пока нет'),
+              ),
+            )
+          else
+            ..._supportActiveTickets.map(
+              (ticket) => _buildSupportTicketCard(ticket, archived: false),
+            ),
+          const SizedBox(height: 16),
+          Text(
+            'Архив поддержки',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          if (_supportArchivedTickets.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(14),
+                child: Text('Архив поддержки пуст'),
+              ),
+            )
+          else
+            ..._supportArchivedTickets.map(
+              (ticket) => _buildSupportTicketCard(ticket, archived: true),
+            ),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
   Widget _buildDeliveryCustomerCard(
     String batchId,
     Map<String, dynamic> customer,
@@ -4979,12 +5264,14 @@ class _AdminPanelState extends State<AdminPanel>
       const Tab(text: 'Каналы'),
       const Tab(text: 'Модерация'),
       const Tab(text: 'Доставка'),
+      const Tab(text: 'Поддержка'),
     ];
     final tabViews = <Widget>[
       _buildCreateTab(),
       _buildSettingsTab(),
       _buildModerationTab(),
       _buildDeliveryTab(),
+      _buildSupportTab(),
     ];
 
     return Scaffold(

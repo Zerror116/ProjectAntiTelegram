@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../main.dart';
+import 'chat_screen.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
 import '../widgets/submit_on_enter.dart';
@@ -70,11 +71,45 @@ class _SupportScreenState extends State<SupportScreen> {
       );
       final data = resp.data;
       String reply = 'Не удалось получить ответ';
+      Map<String, dynamic> payload = const {};
       if (data is Map && data['ok'] == true && data['data'] is Map) {
-        reply = (data['data']['reply'] ?? reply).toString();
+        payload = Map<String, dynamic>.from(data['data']);
+        reply = (payload['reply'] ?? reply).toString();
       }
       setState(() => _messages.add({'from': 'bot', 'text': reply}));
       await playAppSound(AppUiSound.success);
+
+      final mode = (payload['mode'] ?? '').toString().trim().toLowerCase();
+      if (mode == 'ticket') {
+        final chatId = (payload['chat_id'] ?? '').toString().trim();
+        if (chatId.isNotEmpty && mounted) {
+          final chatTitle = (payload['chat_title'] ?? 'Поддержка').toString();
+          final ticket = payload['ticket'];
+          final supportTicketId = ticket is Map
+              ? (ticket['id'] ?? '').toString().trim()
+              : '';
+          final settings = <String, dynamic>{
+            'kind': 'support_ticket',
+            'support_ticket': true,
+            if (supportTicketId.isNotEmpty)
+              'support_ticket_id': supportTicketId,
+          };
+          if (!mounted) return;
+          await Future<void>.delayed(const Duration(milliseconds: 120));
+          if (!mounted) return;
+          await Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ChatScreen(
+                chatId: chatId,
+                chatTitle: chatTitle,
+                chatType: 'private',
+                chatSettings: settings,
+              ),
+            ),
+          );
+        }
+      }
     } catch (e) {
       setState(
         () => _messages.add({'from': 'bot', 'text': 'Ошибка поддержки: $e'}),

@@ -23,10 +23,13 @@ class _CartScreenState extends State<CartScreen> {
   String _error = '';
   List<Map<String, dynamic>> _items = [];
   List<Map<String, dynamic>> _recentDeliveries = [];
+  List<Map<String, dynamic>> _claims = [];
   double _total = 0;
   double _processed = 0;
+  double _claimsTotal = 0;
   StreamSubscription? _eventsSub;
   Timer? _reloadDebounceTimer;
+  bool _claimSubmitting = false;
 
   @override
   void initState() {
@@ -58,12 +61,18 @@ class _CartScreenState extends State<CartScreen> {
     _recentDeliveries = payload['recent_deliveries'] is List
         ? List<Map<String, dynamic>>.from(payload['recent_deliveries'])
         : [];
+    _claims = payload['claims'] is List
+        ? List<Map<String, dynamic>>.from(payload['claims'])
+        : [];
     _total = (payload['total_sum'] is num)
         ? (payload['total_sum'] as num).toDouble()
         : double.tryParse('${payload['total_sum'] ?? 0}') ?? 0;
     _processed = (payload['processed_sum'] is num)
         ? (payload['processed_sum'] as num).toDouble()
         : double.tryParse('${payload['processed_sum'] ?? 0}') ?? 0;
+    _claimsTotal = (payload['claims_total'] is num)
+        ? (payload['claims_total'] as num).toDouble()
+        : double.tryParse('${payload['claims_total'] ?? 0}') ?? 0;
   }
 
   void _scheduleReload({Duration delay = const Duration(milliseconds: 350)}) {
@@ -173,6 +182,50 @@ class _CartScreenState extends State<CartScreen> {
     return '$fixed RUB';
   }
 
+  Map<String, dynamic>? _claimForCartItem(String cartItemId) {
+    if (cartItemId.trim().isEmpty) return null;
+    for (final claim in _claims) {
+      final id = (claim['cart_item_id'] ?? '').toString();
+      if (id == cartItemId) return claim;
+    }
+    return null;
+  }
+
+  bool _canCreateNewClaim(String status) {
+    return status == 'rejected' || status == 'settled';
+  }
+
+  String _claimStatusText(String status) {
+    switch (status) {
+      case 'pending':
+        return 'Ожидает решения';
+      case 'approved_return':
+        return 'Подтвержден возврат';
+      case 'approved_discount':
+        return 'Подтверждена скидка';
+      case 'settled':
+        return 'Закрыта';
+      case 'rejected':
+      default:
+        return 'Отклонена';
+    }
+  }
+
+  Color _claimStatusColor(String status, ThemeData theme) {
+    switch (status) {
+      case 'pending':
+        return theme.colorScheme.primary;
+      case 'approved_return':
+      case 'approved_discount':
+        return Colors.green.shade700;
+      case 'settled':
+        return theme.colorScheme.secondary;
+      case 'rejected':
+      default:
+        return theme.colorScheme.error;
+    }
+  }
+
   String _formatDeliveryEta(DateTime dateTime) {
     return formatDateTimeValue(dateTime);
   }
@@ -274,6 +327,161 @@ class _CartScreenState extends State<CartScreen> {
     }
   }
 
+  Future<void> _submitClaim({
+    required String cartItemId,
+    required String claimType,
+    required String description,
+    required double requestedAmount,
+    String imageUrl = '',
+  }) async {
+    if (_claimSubmitting) return;
+    setState(() => _claimSubmitting = true);
+    try {
+      await authService.dio.post(
+        '/api/cart/claims',
+        data: {
+          'cart_item_id': cartItemId,
+          'claim_type': claimType,
+          'description': description.trim(),
+          'requested_amount': requestedAmount,
+          if (imageUrl.trim().isNotEmpty) 'image_url': imageUrl.trim(),
+        },
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Заявка отправлена в обработку',
+        tone: AppNoticeTone.success,
+      );
+      _scheduleReload(delay: const Duration(milliseconds: 100));
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка заявки: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) setState(() => _claimSubmitting = false);
+    }
+  }
+
+  Future<void> _openClaimDialog(Map<String, dynamic> item) async {
+    final cartItemId = (item['id'] ?? '').toString().trim();
+    if (cartItemId.isEmpty) return;
+    final lineTotal = (item['line_total'] is num)
+        ? (item['line_total'] as num).toDouble()
+        : double.tryParse('${item['line_total'] ?? 0}') ?? 0;
+    final amountCtrl = TextEditingController(
+      text: lineTotal > 0 ? lineTotal.toStringAsFixed(2) : '',
+    );
+    final descriptionCtrl = TextEditingController();
+    final imageCtrl = TextEditingController();
+    var claimType = 'return';
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: const Text('Сообщить о проблеме'),
+            content: SizedBox(
+              width: 440,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  DropdownButtonFormField<String>(
+                    initialValue: claimType,
+                    items: const [
+                      DropdownMenuItem(
+                        value: 'return',
+                        child: Text('Возврат'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'discount',
+                        child: Text('Скидка'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setDialogState(() => claimType = value);
+                    },
+                    decoration: const InputDecoration(labelText: 'Тип заявки'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: descriptionCtrl,
+                    minLines: 3,
+                    maxLines: 5,
+                    decoration: const InputDecoration(
+                      labelText: 'Опишите проблему',
+                      hintText: 'Например: треснутая крышка, брак упаковки...',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: amountCtrl,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    decoration: const InputDecoration(
+                      labelText: 'Сумма претензии (RUB)',
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: imageCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Ссылка на фото (необязательно)',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('Отправить'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (confirmed != true) return;
+
+      final description = descriptionCtrl.text.trim();
+      if (description.length < 5) {
+        if (mounted) {
+          showAppNotice(
+            context,
+            'Опишите проблему минимум в 5 символов',
+            tone: AppNoticeTone.warning,
+          );
+        }
+        return;
+      }
+      final requestedAmount = double.tryParse(
+            amountCtrl.text.trim().replaceAll(',', '.'),
+          ) ??
+          lineTotal;
+
+      await _submitClaim(
+        cartItemId: cartItemId,
+        claimType: claimType,
+        description: description,
+        requestedAmount: requestedAmount,
+        imageUrl: imageCtrl.text.trim(),
+      );
+    } finally {
+      amountCtrl.dispose();
+      descriptionCtrl.dispose();
+      imageCtrl.dispose();
+    }
+  }
+
   Widget _buildSummary() {
     final theme = Theme.of(context);
     final eta = _extractDeliveryEta();
@@ -359,6 +567,13 @@ class _CartScreenState extends State<CartScreen> {
             'Обработано: ${_formatMoney(_processed)}',
             style: const TextStyle(color: Colors.white70, fontSize: 14),
           ),
+          if (_claimsTotal > 0) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Сумма подтвержденных претензий: ${_formatMoney(_claimsTotal)}',
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+          ],
         ],
       ),
     );
@@ -534,6 +749,7 @@ class _CartScreenState extends State<CartScreen> {
           ),
           subtitle: Text('Сумма: $total • Товаров: $itemsCount'),
           children: items.map((item) {
+            final cartItemId = (item['id'] ?? '').toString().trim();
             final imageUrl = _resolveImageUrl(
               (item['image_url'] ?? '').toString(),
             );
@@ -543,35 +759,91 @@ class _CartScreenState extends State<CartScreen> {
             final lineTotal = (item['line_total'] is num)
                 ? (item['line_total'] as num).toDouble()
                 : double.tryParse('${item['line_total'] ?? 0}') ?? 0;
+            final claim = _claimForCartItem(cartItemId);
+            final claimStatus = (claim?['status'] ?? '').toString();
+            final canCreateClaim =
+                claim == null || _canCreateNewClaim(claimStatus);
+            final claimColor = _claimStatusColor(claimStatus, theme);
+            final approvedAmount = (claim?['approved_amount'] is num)
+                ? (claim?['approved_amount'] as num).toDouble()
+                : double.tryParse('${claim?['approved_amount'] ?? 0}') ?? 0;
             return Padding(
               padding: const EdgeInsets.only(bottom: 10),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              child: Column(
                 children: [
-                  _buildImage(imageUrl),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          (item['title'] ?? 'Товар').toString(),
-                          style: theme.textTheme.bodyLarge?.copyWith(
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _buildImage(imageUrl),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            _infoChip('Количество', '$quantity'),
-                            _infoChip('Сумма', _formatMoney(lineTotal)),
-                            _infoChip('Статус', 'Доставлено'),
+                            Text(
+                              (item['title'] ?? 'Товар').toString(),
+                              style: theme.textTheme.bodyLarge?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                _infoChip('Количество', '$quantity'),
+                                _infoChip('Сумма', _formatMoney(lineTotal)),
+                                _infoChip('Статус', 'Доставлено'),
+                                if (claim != null)
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 7,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: claimColor.withValues(alpha: 0.14),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Text(
+                                      'Заявка: ${_claimStatusText(claimStatus)}',
+                                      style: TextStyle(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: claimColor,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            if (claim != null && approvedAmount > 0)
+                              Text(
+                                'Подтверждено: ${_formatMoney(approvedAmount)}',
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
                           ],
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      TextButton.icon(
+                        onPressed: (canCreateClaim && !_claimSubmitting)
+                            ? () => _openClaimDialog(item)
+                            : null,
+                        icon: const Icon(Icons.report_problem_outlined),
+                        label: Text(
+                          canCreateClaim
+                              ? 'Сообщить о проблеме'
+                              : 'Заявка уже в работе',
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
