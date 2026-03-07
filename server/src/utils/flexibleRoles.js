@@ -11,6 +11,7 @@ const DEFAULT_ROLE_PERMISSIONS = {
   worker: {
     'chat.read': true,
     'chat.write.private': true,
+    'chat.write.support': true,
     'product.create': true,
     'product.requeue': true,
     'product.edit.own_pending': true,
@@ -18,6 +19,7 @@ const DEFAULT_ROLE_PERMISSIONS = {
   admin: {
     'chat.read': true,
     'chat.write.public': true,
+    'chat.write.support': true,
     'chat.pin': true,
     'chat.delete.all': true,
     'product.publish': true,
@@ -27,6 +29,7 @@ const DEFAULT_ROLE_PERMISSIONS = {
   tenant: {
     'chat.read': true,
     'chat.write.public': true,
+    'chat.write.support': true,
     'chat.pin': true,
     'chat.delete.all': true,
     'product.publish': true,
@@ -94,9 +97,11 @@ async function loadRoleTemplateByCode(queryable, role, tenantId = null) {
 async function resolvePermissionSet(user, queryable = db) {
   const role = normalizeRole(user?.role || user?.base_role || 'client');
   const baseRole = normalizeRole(user?.base_role || role);
+  const viewRole = normalizeRole(user?.view_role || '');
   const tenantId = user?.tenant_id || null;
 
-  if (baseRole === 'creator') {
+  // Создатель в "режиме просмотра" другой роли получает именно ее права.
+  if (baseRole === 'creator' && (!viewRole || viewRole === 'creator')) {
     return {
       role: 'creator',
       source: 'base_role',

@@ -5,12 +5,16 @@ const ExcelJS = require("exceljs");
 const router = express.Router();
 const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
+const requirePermission = require("../middleware/requirePermission");
 const db = require("../db");
+const { antifraudGuard } = require("../utils/antifraud");
 const {
   readEncryptedText,
   writeEncryptedTextParams,
 } = require("../utils/secureData");
 const { emitToTenant } = require("../utils/socket");
+
+const requireDeliveryManagePermission = requirePermission("delivery.manage");
 
 const SAMARA_CENTER = { lat: 53.195878, lng: 50.100202 };
 const DELIVERY_DAY_START_MINUTES = 10 * 60;
@@ -72,17 +76,41 @@ function toMoney(value, fallback = 0) {
   return Math.round(num * 100) / 100;
 }
 
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || "").trim(),
+  );
+}
+
 function normalizeJsonObject(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   return raw;
 }
 
-async function getDeliverySettings(queryable = db) {
+function resolveTenantScopeId(explicitTenantId = null) {
+  const rawExplicit = String(explicitTenantId || "").trim();
+  if (rawExplicit) return rawExplicit;
+  const context = typeof db.currentTenantContext === "function" ? db.currentTenantContext() : null;
+  const fromContext = String(context?.tenant?.id || "").trim();
+  return fromContext || null;
+}
+
+function deliverySettingsKey(tenantId = null) {
+  const normalized = resolveTenantScopeId(tenantId);
+  return normalized ? `delivery:${normalized}` : "delivery";
+}
+
+async function getDeliverySettings(queryable = db, tenantId = null) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const scopedKey = deliverySettingsKey(scopedTenantId);
+  const fallbackKey = "delivery";
   const result = await queryable.query(
-    `SELECT value
+    `SELECT key, value
      FROM system_settings
-     WHERE key = 'delivery'
+     WHERE key = ANY($1::text[])
+     ORDER BY CASE WHEN key = $2 THEN 0 ELSE 1 END
      LIMIT 1`,
+    [[scopedKey, fallbackKey], scopedKey],
   );
   const value = normalizeJsonObject(result.rows[0]?.value);
   return {
@@ -100,15 +128,16 @@ async function getDeliverySettings(queryable = db) {
   };
 }
 
-async function saveDeliverySettings(queryable, settings, userId) {
+async function saveDeliverySettings(queryable, settings, userId, tenantId = null) {
+  const key = deliverySettingsKey(tenantId);
   await queryable.query(
     `INSERT INTO system_settings (key, value, updated_at, updated_by)
-     VALUES ('delivery', $1::jsonb, now(), $2)
+     VALUES ($1, $2::jsonb, now(), $3)
      ON CONFLICT (key) DO UPDATE
        SET value = EXCLUDED.value,
            updated_at = now(),
            updated_by = EXCLUDED.updated_by`,
-    [JSON.stringify(settings), userId || null],
+    [key, JSON.stringify(settings), userId || null],
   );
 }
 
@@ -706,7 +735,8 @@ function mapBatchRow(row) {
   };
 }
 
-async function fetchBatchSummaries(queryable) {
+async function fetchBatchSummaries(queryable, tenantId = null) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
   const result = await queryable.query(
     `SELECT b.id,
             b.delivery_date,
@@ -721,12 +751,39 @@ async function fetchBatchSummaries(queryable) {
             b.courier_names,
             b.created_at,
             b.updated_at,
-            COUNT(c.id)::int AS customers_total,
-            COUNT(*) FILTER (WHERE c.call_status = 'accepted')::int AS accepted_total,
-            COUNT(*) FILTER (WHERE c.call_status = 'declined')::int AS declined_total,
-            COUNT(*) FILTER (WHERE c.courier_name IS NOT NULL AND c.courier_name <> '')::int AS assigned_total
+            COUNT(c.id) FILTER (WHERE ($1::uuid IS NULL OR cu.tenant_id = $1::uuid))::int AS customers_total,
+            COUNT(*) FILTER (
+              WHERE ($1::uuid IS NULL OR cu.tenant_id = $1::uuid)
+                AND c.call_status = 'accepted'
+            )::int AS accepted_total,
+            COUNT(*) FILTER (
+              WHERE ($1::uuid IS NULL OR cu.tenant_id = $1::uuid)
+                AND c.call_status = 'declined'
+            )::int AS declined_total,
+            COUNT(*) FILTER (
+              WHERE ($1::uuid IS NULL OR cu.tenant_id = $1::uuid)
+                AND c.courier_name IS NOT NULL
+                AND c.courier_name <> ''
+            )::int AS assigned_total
      FROM delivery_batches b
      LEFT JOIN delivery_batch_customers c ON c.batch_id = b.id
+     LEFT JOIN users cu ON cu.id = c.user_id
+     WHERE (
+       $1::uuid IS NULL
+       OR EXISTS (
+         SELECT 1
+         FROM users bu
+         WHERE bu.id = b.created_by
+           AND bu.tenant_id = $1::uuid
+       )
+       OR EXISTS (
+         SELECT 1
+         FROM delivery_batch_customers c2
+         JOIN users u2 ON u2.id = c2.user_id
+         WHERE c2.batch_id = b.id
+           AND u2.tenant_id = $1::uuid
+       )
+     )
      GROUP BY b.id
      ORDER BY
        CASE b.status
@@ -739,11 +796,13 @@ async function fetchBatchSummaries(queryable) {
        b.delivery_date DESC,
        b.created_at DESC
      LIMIT 20`,
+    [scopedTenantId],
   );
   return result.rows.map(mapBatchRow);
 }
 
-async function fetchBatchDetails(queryable, batchId) {
+async function fetchBatchDetails(queryable, batchId, tenantId = null) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
   const batchQ = await queryable.query(
     `SELECT b.id,
             b.delivery_date,
@@ -758,16 +817,43 @@ async function fetchBatchDetails(queryable, batchId) {
             b.courier_names,
             b.created_at,
             b.updated_at,
-            COUNT(c.id)::int AS customers_total,
-            COUNT(*) FILTER (WHERE c.call_status = 'accepted')::int AS accepted_total,
-            COUNT(*) FILTER (WHERE c.call_status = 'declined')::int AS declined_total,
-            COUNT(*) FILTER (WHERE c.courier_name IS NOT NULL AND c.courier_name <> '')::int AS assigned_total
+            COUNT(c.id) FILTER (WHERE ($2::uuid IS NULL OR cu.tenant_id = $2::uuid))::int AS customers_total,
+            COUNT(*) FILTER (
+              WHERE ($2::uuid IS NULL OR cu.tenant_id = $2::uuid)
+                AND c.call_status = 'accepted'
+            )::int AS accepted_total,
+            COUNT(*) FILTER (
+              WHERE ($2::uuid IS NULL OR cu.tenant_id = $2::uuid)
+                AND c.call_status = 'declined'
+            )::int AS declined_total,
+            COUNT(*) FILTER (
+              WHERE ($2::uuid IS NULL OR cu.tenant_id = $2::uuid)
+                AND c.courier_name IS NOT NULL
+                AND c.courier_name <> ''
+            )::int AS assigned_total
      FROM delivery_batches b
      LEFT JOIN delivery_batch_customers c ON c.batch_id = b.id
+     LEFT JOIN users cu ON cu.id = c.user_id
      WHERE b.id = $1
+       AND (
+         $2::uuid IS NULL
+         OR EXISTS (
+           SELECT 1
+           FROM users bu
+           WHERE bu.id = b.created_by
+             AND bu.tenant_id = $2::uuid
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM delivery_batch_customers c2
+           JOIN users u2 ON u2.id = c2.user_id
+           WHERE c2.batch_id = b.id
+             AND u2.tenant_id = $2::uuid
+         )
+       )
      GROUP BY b.id
      LIMIT 1`,
-    [batchId],
+    [batchId, scopedTenantId],
   );
   if (batchQ.rowCount === 0) return null;
 
@@ -795,9 +881,11 @@ async function fetchBatchDetails(queryable, batchId) {
               ),
               '[]'::json
             ) AS items
-     FROM delivery_batch_customers c
-     WHERE c.batch_id = $1
-     ORDER BY
+       FROM delivery_batch_customers c
+       JOIN users scope_u ON scope_u.id = c.user_id
+       WHERE c.batch_id = $1
+         AND ($2::uuid IS NULL OR scope_u.tenant_id = $2::uuid)
+       ORDER BY
        CASE c.call_status
          WHEN 'accepted' THEN 0
          WHEN 'pending' THEN 1
@@ -807,7 +895,7 @@ async function fetchBatchDetails(queryable, batchId) {
        c.route_order ASC NULLS LAST,
        c.processed_sum DESC,
        c.created_at ASC`,
-    [batchId],
+    [batchId, scopedTenantId],
   );
 
   return {
@@ -856,11 +944,28 @@ async function upsertUserShelf(queryable, userId, shelfNumber) {
   );
 }
 
-async function findDraftBatchId(queryable) {
+async function findDraftBatchId(queryable, tenantId = null) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
   const activeBatchQ = await queryable.query(
     `SELECT id
      FROM delivery_batches
      WHERE status IN ('calling', 'couriers_assigned')
+       AND (
+         $1::uuid IS NULL
+         OR EXISTS (
+           SELECT 1
+           FROM users bu
+           WHERE bu.id = delivery_batches.created_by
+             AND bu.tenant_id = $1::uuid
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM delivery_batch_customers c2
+           JOIN users u2 ON u2.id = c2.user_id
+           WHERE c2.batch_id = delivery_batches.id
+             AND u2.tenant_id = $1::uuid
+         )
+       )
      ORDER BY
        CASE status
          WHEN 'calling' THEN 0
@@ -869,6 +974,7 @@ async function findDraftBatchId(queryable) {
        END,
        created_at DESC
      LIMIT 1`,
+    [scopedTenantId],
   );
   if (activeBatchQ.rowCount === 0) return null;
   return String(activeBatchQ.rows[0].id);
@@ -911,9 +1017,10 @@ async function insertDeliveryBatchItems(
   }
 }
 
-async function collectEligibleCustomers(queryable) {
+async function collectEligibleCustomers(queryable, tenantId = null) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
   const claimsQ = await queryable.query(
-    `SELECT user_id::text AS user_id,
+    `SELECT cc.user_id::text AS user_id,
             COALESCE(
               SUM(
                 CASE WHEN status = 'approved_return' THEN approved_amount ELSE 0 END
@@ -927,9 +1034,12 @@ async function collectEligibleCustomers(queryable) {
               0
             )::numeric AS claim_discount_sum,
             COALESCE(SUM(approved_amount), 0)::numeric AS claims_total
-     FROM customer_claims
-     WHERE status IN ('approved_return', 'approved_discount')
-     GROUP BY user_id`,
+     FROM customer_claims cc
+     JOIN users u ON u.id = cc.user_id
+     WHERE cc.status IN ('approved_return', 'approved_discount')
+       AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+     GROUP BY cc.user_id`,
+    [scopedTenantId],
   );
   const claimsByUser = new Map();
   for (const row of claimsQ.rows) {
@@ -976,6 +1086,7 @@ async function collectEligibleCustomers(queryable) {
        LIMIT 1
      ) AS addr ON true
      WHERE c.status = 'processed'
+       AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
        AND NOT EXISTS (
          SELECT 1
          FROM delivery_batch_items di
@@ -983,6 +1094,15 @@ async function collectEligibleCustomers(queryable) {
          JOIN delivery_batches dbt ON dbt.id = di.batch_id
          WHERE di.cart_item_id = c.id
            AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
+           AND (
+             $1::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users ux
+               WHERE ux.id = dbc.user_id
+                 AND ux.tenant_id = $1::uuid
+             )
+           )
            AND (
              COALESCE(dbc.call_status, '') IN ('pending', 'accepted', 'declined')
              OR COALESCE(dbc.delivery_status, '') IN (
@@ -995,6 +1115,7 @@ async function collectEligibleCustomers(queryable) {
            )
        )
      ORDER BY c.user_id ASC, c.updated_at DESC, c.created_at DESC`,
+    [scopedTenantId],
   );
 
   const grouped = new Map();
@@ -1052,9 +1173,15 @@ async function collectEligibleCustomers(queryable) {
   });
 }
 
-async function createDeliveryBatch(queryable, settings, createdBy) {
+async function createDeliveryBatch(
+  queryable,
+  settings,
+  createdBy,
+  tenantId = null,
+) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
   const thresholdAmount = Math.max(0, toMoney(settings?.threshold_amount, 1500));
-  const existingDraftBatchId = await findDraftBatchId(queryable);
+  const existingDraftBatchId = await findDraftBatchId(queryable, scopedTenantId);
   if (existingDraftBatchId) {
     return {
       created: false,
@@ -1064,7 +1191,7 @@ async function createDeliveryBatch(queryable, settings, createdBy) {
     };
   }
 
-  const grouped = await collectEligibleCustomers(queryable);
+  const grouped = await collectEligibleCustomers(queryable, scopedTenantId);
   const candidates = grouped
     .filter((entry) => entry.processed_sum >= thresholdAmount)
     .sort((a, b) => b.processed_sum - a.processed_sum);
@@ -1161,8 +1288,14 @@ async function createDeliveryBatch(queryable, settings, createdBy) {
   };
 }
 
-async function addEligibleCustomersToBatch(queryable, batchId, thresholdAmount) {
-  const grouped = await collectEligibleCustomers(queryable);
+async function addEligibleCustomersToBatch(
+  queryable,
+  batchId,
+  thresholdAmount,
+  tenantId = null,
+) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const grouped = await collectEligibleCustomers(queryable, scopedTenantId);
   const candidates = grouped
     .filter((entry) => entry.processed_sum >= thresholdAmount)
     .sort((a, b) => b.processed_sum - a.processed_sum);
@@ -1824,8 +1957,8 @@ async function findUserByPhone(queryable, phone, tenantId = null) {
   return result.rows[0] || null;
 }
 
-async function collectEligibleCustomerForUser(queryable, userId) {
-  const customers = await collectEligibleCustomers(queryable);
+async function collectEligibleCustomerForUser(queryable, userId, tenantId = null) {
+  const customers = await collectEligibleCustomers(queryable, tenantId);
   return customers.find((entry) => String(entry.user_id) === String(userId)) || null;
 }
 
@@ -1833,15 +1966,17 @@ router.get(
   "/dashboard",
   requireAuth,
   requireRole("admin", "creator"),
-  async (_req, res) => {
+  requireDeliveryManagePermission,
+  async (req, res) => {
     try {
-      const settings = await getDeliverySettings();
-      const batches = await fetchBatchSummaries(db);
+      const tenantId = req.user?.tenant_id || null;
+      const settings = await getDeliverySettings(db, tenantId);
+      const batches = await fetchBatchSummaries(db, tenantId);
       const activeBatchSummary =
         batches.find((item) => item.status !== "completed" && item.status !== "cancelled") ||
         null;
       const activeBatch = activeBatchSummary
-        ? await fetchBatchDetails(db, activeBatchSummary.id)
+        ? await fetchBatchDetails(db, activeBatchSummary.id, tenantId)
         : null;
       return res.json({
         ok: true,
@@ -1862,6 +1997,7 @@ router.patch(
   "/settings",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const thresholdAmount = toMoney(req.body?.threshold_amount, NaN);
     if (!Number.isFinite(thresholdAmount) || thresholdAmount < 0) {
@@ -1914,7 +2050,12 @@ router.patch(
         route_origin_lat: Number.isFinite(routeOriginLat) ? routeOriginLat : null,
         route_origin_lng: Number.isFinite(routeOriginLng) ? routeOriginLng : null,
       };
-      await saveDeliverySettings(client, nextSettings, req.user.id);
+      await saveDeliverySettings(
+        client,
+        nextSettings,
+        req.user.id,
+        req.user?.tenant_id || null,
+      );
       const activeBatchUpdate = await client.query(
         `UPDATE delivery_batches
          SET route_origin_label = $1,
@@ -1926,6 +2067,22 @@ router.patch(
            SELECT id
            FROM delivery_batches
            WHERE status IN ('calling', 'couriers_assigned')
+             AND (
+               $5::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1
+                 FROM users bu
+                 WHERE bu.id = delivery_batches.created_by
+                   AND bu.tenant_id = $5::uuid
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM delivery_batch_customers c2
+                 JOIN users u2 ON u2.id = c2.user_id
+                 WHERE c2.batch_id = delivery_batches.id
+                   AND u2.tenant_id = $5::uuid
+               )
+             )
            ORDER BY
              CASE status
                WHEN 'calling' THEN 0
@@ -1941,6 +2098,7 @@ router.patch(
           routeOriginAddress || null,
           Number.isFinite(routeOriginLat) ? routeOriginLat : null,
           Number.isFinite(routeOriginLng) ? routeOriginLng : null,
+          req.user?.tenant_id || null,
         ],
       );
       if (activeBatchUpdate.rowCount > 0) {
@@ -1989,6 +2147,7 @@ router.post(
   "/slots",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const title = String(req.body?.title || "").trim();
     const fromTime = normalizeClockValue(req.body?.from_time);
@@ -2063,6 +2222,7 @@ router.patch(
   "/slots/:slotId",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const slotId = String(req.params?.slotId || "").trim();
     if (!slotId) {
@@ -2161,6 +2321,7 @@ router.delete(
   "/slots/:slotId",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const slotId = String(req.params?.slotId || "").trim();
     if (!slotId) {
@@ -2196,12 +2357,14 @@ router.post(
   "/batches/generate",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
 
-      const settings = await getDeliverySettings(client);
+      const tenantId = req.user?.tenant_id || null;
+      const settings = await getDeliverySettings(client, tenantId);
       const thresholdAmount = Math.max(
         0,
         toMoney(req.body?.threshold_amount, settings.threshold_amount),
@@ -2210,12 +2373,13 @@ router.post(
         ...settings,
         threshold_amount: thresholdAmount,
       };
-      await saveDeliverySettings(client, nextSettings, req.user.id);
+      await saveDeliverySettings(client, nextSettings, req.user.id, tenantId);
 
       const createdBatch = await createDeliveryBatch(
         client,
         nextSettings,
         req.user.id,
+        tenantId,
       );
 
       if (!createdBatch.created && !createdBatch.batchId) {
@@ -2234,7 +2398,9 @@ router.post(
       await client.query("COMMIT");
 
       const batchId = createdBatch.batchId;
-      const activeBatch = batchId ? await fetchBatchDetails(db, batchId) : null;
+      const activeBatch = batchId
+        ? await fetchBatchDetails(db, batchId, tenantId)
+        : null;
       return res.status(201).json({
         ok: true,
         data: {
@@ -2259,12 +2425,17 @@ router.post(
   "/broadcast",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
+  antifraudGuard("admin.delivery.broadcast", (req) => ({
+    threshold_amount: req.body?.threshold_amount ?? null,
+  })),
   async (req, res) => {
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
 
-      const settings = await getDeliverySettings(client);
+      const tenantId = req.user?.tenant_id || null;
+      const settings = await getDeliverySettings(client, tenantId);
       const thresholdAmount = Math.max(
         0,
         toMoney(req.body?.threshold_amount, settings.threshold_amount),
@@ -2273,9 +2444,9 @@ router.post(
         ...settings,
         threshold_amount: thresholdAmount,
       };
-      await saveDeliverySettings(client, nextSettings, req.user.id);
+      await saveDeliverySettings(client, nextSettings, req.user.id, tenantId);
 
-      let batchId = await findDraftBatchId(client);
+      let batchId = await findDraftBatchId(client, tenantId);
       let created = false;
       let eligibleTotal = 0;
       let addedToExistingBatch = 0;
@@ -2285,6 +2456,7 @@ router.post(
           client,
           nextSettings,
           req.user.id,
+          tenantId,
         );
         batchId = createdBatch.batchId;
         created = createdBatch.created;
@@ -2306,10 +2478,11 @@ router.post(
           client,
           batchId,
           thresholdAmount,
+          tenantId,
         );
       }
 
-      const batch = await fetchBatchDetails(client, batchId);
+      const batch = await fetchBatchDetails(client, batchId, tenantId);
       if (!batch) {
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
@@ -2404,7 +2577,11 @@ router.post(
         emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
-      const activeBatch = await fetchBatchDetails(db, batchId);
+      const activeBatch = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       return res.json({
         ok: true,
         data: {
@@ -2430,28 +2607,39 @@ router.post(
   "/reset",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
 
+      const tenantId = req.user?.tenant_id || null;
       const affectedUsersQ = await client.query(
-        `SELECT DISTINCT user_id::text AS user_id
-         FROM delivery_batch_customers`,
+        `SELECT DISTINCT c.user_id::text AS user_id
+         FROM delivery_batch_customers c
+         JOIN users u ON u.id = c.user_id
+         WHERE ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
+        [tenantId],
       );
       const affectedUsers = affectedUsersQ.rows.map((row) => String(row.user_id));
 
       await client.query(
-        `UPDATE cart_items
+        `UPDATE cart_items ci
          SET status = 'processed',
              updated_at = now()
-         WHERE status IN ('preparing_delivery', 'handing_to_courier', 'in_delivery')`,
+         FROM users u
+         WHERE ci.user_id = u.id
+           AND ci.status IN ('preparing_delivery', 'handing_to_courier', 'in_delivery')
+           AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
+        [tenantId],
       );
 
       const deliveryChatsQ = await client.query(
         `SELECT id
          FROM chats
-         WHERE COALESCE(settings->>'kind', '') = 'delivery_dialog'`,
+         WHERE COALESCE(settings->>'kind', '') = 'delivery_dialog'
+           AND ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
+        [tenantId],
       );
       const deliveryChatIds = deliveryChatsQ.rows.map((row) => String(row.id));
       if (deliveryChatIds.length > 0) {
@@ -2467,15 +2655,49 @@ router.post(
         ]);
       }
 
-      await client.query(`DELETE FROM delivery_batch_items`);
-      await client.query(`DELETE FROM delivery_batch_customers`);
-      await client.query(`DELETE FROM delivery_batches`);
+      const scopedCustomersQ = await client.query(
+        `SELECT c.id::text AS id, c.batch_id::text AS batch_id
+         FROM delivery_batch_customers c
+         JOIN users u ON u.id = c.user_id
+         WHERE ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
+        [tenantId],
+      );
+      const scopedCustomerIds = scopedCustomersQ.rows.map((row) => String(row.id));
+      const scopedBatchIds = Array.from(
+        new Set(scopedCustomersQ.rows.map((row) => String(row.batch_id || ""))),
+      ).filter(Boolean);
+
+      if (scopedCustomerIds.length > 0) {
+        await client.query(
+          `DELETE FROM delivery_batch_items
+           WHERE batch_customer_id = ANY($1::uuid[])`,
+          [scopedCustomerIds],
+        );
+        await client.query(
+          `DELETE FROM delivery_batch_customers
+           WHERE id = ANY($1::uuid[])`,
+          [scopedCustomerIds],
+        );
+      }
+      if (scopedBatchIds.length > 0) {
+        await client.query(
+          `DELETE FROM delivery_batches b
+           WHERE b.id = ANY($1::uuid[])
+             AND NOT EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c
+               WHERE c.batch_id = b.id
+             )`,
+          [scopedBatchIds],
+        );
+      }
 
       const demoUsersQ = await client.query(
         `SELECT id
          FROM users
-         WHERE email LIKE $1`,
-        [`${DEMO_USER_EMAIL_PREFIX}%`],
+         WHERE email LIKE $1
+           AND ($2::uuid IS NULL OR tenant_id = $2::uuid)`,
+        [`${DEMO_USER_EMAIL_PREFIX}%`, tenantId],
       );
       const demoUserIds = demoUsersQ.rows.map((row) => String(row.id));
       if (demoUserIds.length > 0) {
@@ -2507,8 +2729,27 @@ router.post(
       }
       await client.query(
         `DELETE FROM products
-         WHERE title LIKE $1`,
-        [`${DEMO_PRODUCT_TITLE_PREFIX}%`],
+         WHERE title LIKE $1
+           AND NOT EXISTS (
+             SELECT 1
+             FROM cart_items ci
+             WHERE ci.product_id = products.id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM product_publication_queue q
+             WHERE q.product_id = products.id
+           )
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = products.created_by
+                 AND u.tenant_id = $2::uuid
+             )
+           )`,
+        [`${DEMO_PRODUCT_TITLE_PREFIX}%`, tenantId],
       );
 
       await client.query("COMMIT");
@@ -2546,6 +2787,7 @@ router.post(
   "/demo-seed",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const requested = Number(req.body?.count ?? 10);
     const count = Math.max(1, Math.min(20, Math.floor(requested)));
@@ -2554,6 +2796,7 @@ router.post(
       await client.query("BEGIN");
       const demoProducts = await ensureDemoProducts(client);
       const seedId = Date.now();
+      const tenantId = req.user?.tenant_id || null;
       let createdUsers = 0;
 
       for (let i = 0; i < count; i += 1) {
@@ -2561,10 +2804,12 @@ router.post(
         const email = `${DEMO_USER_EMAIL_PREFIX}${seedId}.${i}@phoenix.local`;
         const phone = `7999${String(seedId).slice(-4)}${String(i + 10).padStart(3, "0")}`;
         const userInsert = await client.query(
-          `INSERT INTO users (id, email, password_hash, name, role, created_at, updated_at)
-           VALUES ($1, $2, NULL, $3, 'client', now(), now())
+          `INSERT INTO users (
+             id, email, password_hash, name, role, tenant_id, created_at, updated_at
+           )
+           VALUES ($1, $2, NULL, $3, 'client', $4, now(), now())
            RETURNING id`,
-          [uuidv4(), email, `${point.name} Тест`],
+          [uuidv4(), email, `${point.name} Тест`, tenantId],
         );
         const userId = String(userInsert.rows[0].id);
         await client.query(
@@ -2951,7 +3196,11 @@ router.post(
         emitDeliveryUpdated(io, customer.batch_id, req.user?.tenant_id || null);
       }
 
-      const activeBatch = await fetchBatchDetails(db, customer.batch_id);
+      const activeBatch = await fetchBatchDetails(
+        db,
+        customer.batch_id,
+        req.user?.tenant_id || null,
+      );
       return res.json({
         ok: true,
         data: {
@@ -2974,6 +3223,7 @@ router.post(
   "/batches/:batchId/customers/:customerId/decision",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const accepted = req.body?.accepted === true;
@@ -3024,11 +3274,13 @@ router.post(
                 b.status AS batch_status
          FROM delivery_batch_customers c
          JOIN delivery_batches b ON b.id = c.batch_id
+         JOIN users scope_u ON scope_u.id = c.user_id
          WHERE c.id = $1
            AND c.batch_id = $2
+           AND ($3::uuid IS NULL OR scope_u.tenant_id = $3::uuid)
          LIMIT 1
          FOR UPDATE`,
-        [customerId, batchId],
+        [customerId, batchId, req.user?.tenant_id || null],
       );
       if (customerQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -3298,7 +3550,11 @@ router.post(
       }
       emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
 
-      const activeBatch = await fetchBatchDetails(db, batchId);
+      const activeBatch = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       return res.json({
         ok: true,
         data: {
@@ -3320,6 +3576,7 @@ router.patch(
   "/batches/:batchId/customers/:customerId/logistics",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const packagePlaces = Number(req.body?.package_places);
@@ -3340,15 +3597,25 @@ router.patch(
 
     try {
       const updated = await db.query(
-        `UPDATE delivery_batch_customers
+        `UPDATE delivery_batch_customers c
          SET package_places = $1,
              bulky_places = $2,
              bulky_note = $3,
              updated_at = now()
-         WHERE batch_id = $4
-           AND id = $5
-         RETURNING id`,
-        [packagePlaces, bulkyPlaces, bulkyNote || null, batchId, customerId],
+         FROM users u
+         WHERE c.batch_id = $4
+           AND c.id = $5
+           AND u.id = c.user_id
+           AND ($6::uuid IS NULL OR u.tenant_id = $6::uuid)
+         RETURNING c.id`,
+        [
+          packagePlaces,
+          bulkyPlaces,
+          bulkyNote || null,
+          batchId,
+          customerId,
+          req.user?.tenant_id || null,
+        ],
       );
       if (updated.rowCount === 0) {
         return res.status(404).json({
@@ -3356,7 +3623,11 @@ router.patch(
           error: "Клиент в листе доставки не найден",
         });
       }
-      const activeBatch = await fetchBatchDetails(db, batchId);
+      const activeBatch = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       const io = req.app.get("io");
       emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       return res.json({ ok: true, data: { active_batch: activeBatch } });
@@ -3371,6 +3642,7 @@ router.post(
   "/batches/:batchId/customers/:customerId/reassign",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const courierName = String(req.body?.courier_name || "").trim();
@@ -3379,12 +3651,28 @@ router.post(
     try {
       await client.query("BEGIN");
       const batchQ = await client.query(
-        `SELECT id, status, courier_names
-         FROM delivery_batches
-         WHERE id = $1
+        `SELECT b.id, b.status, b.courier_names
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users bu
+               WHERE bu.id = b.created_by
+                 AND bu.tenant_id = $2::uuid
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
          LIMIT 1
          FOR UPDATE`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (batchQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -3454,7 +3742,11 @@ router.post(
       await rerouteAcceptedCustomers(client, batchId);
       await client.query("COMMIT");
 
-      const activeBatch = await fetchBatchDetails(db, batchId);
+      const activeBatch = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       const io = req.app.get("io");
       emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       return res.json({ ok: true, data: { active_batch: activeBatch } });
@@ -3468,10 +3760,177 @@ router.post(
   },
 );
 
+router.patch(
+  "/batches/:batchId/route-order",
+  requireAuth,
+  requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
+  async (req, res) => {
+    const batchId = String(req.params?.batchId || "").trim();
+    const ordersRaw = Array.isArray(req.body?.orders) ? req.body.orders : [];
+    if (!isUuidLike(batchId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный batchId" });
+    }
+    if (ordersRaw.length === 0) {
+      return res.status(400).json({ ok: false, error: "Нужен список orders" });
+    }
+
+    const normalized = [];
+    for (const raw of ordersRaw) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const customerId = String(raw.customer_id || "").trim();
+      const routeOrder = Number(raw.route_order);
+      const courierName = String(raw.courier_name || "").trim();
+      if (!isUuidLike(customerId)) continue;
+      if (!Number.isInteger(routeOrder) || routeOrder <= 0) continue;
+      normalized.push({
+        customer_id: customerId,
+        route_order: routeOrder,
+        courier_name: courierName || null,
+      });
+    }
+    if (normalized.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "В orders должны быть customer_id и route_order > 0",
+      });
+    }
+
+    const uniqueIds = new Set();
+    for (const row of normalized) {
+      if (uniqueIds.has(row.customer_id)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Один customer_id указан несколько раз",
+        });
+      }
+      uniqueIds.add(row.customer_id);
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const batchQ = await client.query(
+        `SELECT b.id, b.status
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
+         LIMIT 1
+         FOR UPDATE`,
+        [batchId, req.user?.tenant_id || null],
+      );
+      if (batchQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
+      }
+      const batchStatus = String(batchQ.rows[0].status || "");
+      if (!["calling", "couriers_assigned"].includes(batchStatus)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Ручное редактирование маршрута доступно только в активном листе",
+        });
+      }
+
+      const customerIds = normalized.map((item) => item.customer_id);
+      const existingQ = await client.query(
+        `SELECT c.id
+         FROM delivery_batch_customers c
+         WHERE c.batch_id = $1
+           AND c.id = ANY($2::uuid[])
+           AND c.call_status = 'accepted'
+         FOR UPDATE`,
+        [batchId, customerIds],
+      );
+      if (existingQ.rowCount !== customerIds.length) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error:
+            "Можно менять порядок только для подтвержденных клиентов текущего листа",
+        });
+      }
+
+      for (const row of normalized) {
+        await client.query(
+          `UPDATE delivery_batch_customers
+           SET route_order = $1,
+               courier_name = COALESCE($2, courier_name),
+               updated_at = now()
+           WHERE batch_id = $3
+             AND id = $4`,
+          [row.route_order, row.courier_name, batchId, row.customer_id],
+        );
+
+        await client.query(
+          `INSERT INTO delivery_route_overrides (
+             tenant_id,
+             batch_id,
+             customer_id,
+             courier_name,
+             route_order,
+             updated_by,
+             created_at,
+             updated_at
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+           ON CONFLICT (batch_id, customer_id) DO UPDATE
+             SET courier_name = EXCLUDED.courier_name,
+                 route_order = EXCLUDED.route_order,
+                 updated_by = EXCLUDED.updated_by,
+                 updated_at = now()`,
+          [
+            req.user?.tenant_id || null,
+            batchId,
+            row.customer_id,
+            row.courier_name,
+            row.route_order,
+            req.user?.id || null,
+          ],
+        );
+      }
+
+      await client.query("COMMIT");
+
+      const activeBatch = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
+      const io = req.app.get("io");
+      emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
+      return res.json({
+        ok: true,
+        data: {
+          active_batch: activeBatch,
+          updated_count: normalized.length,
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("delivery.routeOrder.patch error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
 router.post(
   "/batches/:batchId/customers/manual-add",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId } = req.params;
     const phone = String(req.body?.phone || "").trim();
@@ -3511,12 +3970,28 @@ router.post(
     try {
       await client.query("BEGIN");
       const batchQ = await client.query(
-        `SELECT id, status
-         FROM delivery_batches
-         WHERE id = $1
+        `SELECT b.id, b.status
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users bu
+               WHERE bu.id = b.created_by
+                 AND bu.tenant_id = $2::uuid
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
          LIMIT 1
          FOR UPDATE`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (batchQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -3563,7 +4038,11 @@ router.post(
         });
       }
 
-      const eligible = await collectEligibleCustomerForUser(client, user.user_id);
+      const eligible = await collectEligibleCustomerForUser(
+        client,
+        user.user_id,
+        req.user?.tenant_id || null,
+      );
       if (!eligible || !Array.isArray(eligible.items) || eligible.items.length === 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
@@ -3766,7 +4245,11 @@ router.post(
         emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
       }
 
-      const activeBatch = await fetchBatchDetails(db, batchId);
+      const activeBatch = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       return res.status(201).json({ ok: true, data: { active_batch: activeBatch } });
     } catch (err) {
       await client.query("ROLLBACK");
@@ -3782,6 +4265,7 @@ router.post(
   "/batches/:batchId/assign-couriers",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId } = req.params;
     const courierNames = Array.isArray(req.body?.courier_names)
@@ -3800,12 +4284,28 @@ router.post(
       await client.query("BEGIN");
 
       const batchQ = await client.query(
-        `SELECT id, status
-         FROM delivery_batches
-         WHERE id = $1
+        `SELECT b.id, b.status
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users bu
+               WHERE bu.id = b.created_by
+                 AND bu.tenant_id = $2::uuid
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
          LIMIT 1
          FOR UPDATE`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (batchQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -3828,8 +4328,17 @@ router.post(
          FROM delivery_batch_customers
          WHERE batch_id = $1
            AND call_status = 'accepted'
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = delivery_batch_customers.user_id
+                 AND u.tenant_id = $2::uuid
+             )
+           )
          ORDER BY customer_name ASC`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (customersQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -3855,7 +4364,11 @@ router.post(
 
       await client.query("COMMIT");
 
-      const detail = await fetchBatchDetails(db, batchId);
+      const detail = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       const io = req.app.get("io");
       if (io && detail) {
         for (const customer of detail.customers) {
@@ -3882,6 +4395,7 @@ router.post(
   "/batches/:batchId/confirm-handoff",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId } = req.params;
     const client = await db.pool.connect();
@@ -3889,12 +4403,28 @@ router.post(
       await client.query("BEGIN");
 
       const batchQ = await client.query(
-        `SELECT id
-         FROM delivery_batches
-         WHERE id = $1
+        `SELECT b.id
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users bu
+               WHERE bu.id = b.created_by
+                 AND bu.tenant_id = $2::uuid
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
          LIMIT 1
          FOR UPDATE`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (batchQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -3907,8 +4437,17 @@ router.post(
          WHERE batch_id = $1
            AND call_status = 'accepted'
            AND courier_name IS NOT NULL
-           AND courier_name <> ''`,
-        [batchId],
+           AND courier_name <> ''
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = delivery_batch_customers.user_id
+                 AND u.tenant_id = $2::uuid
+             )
+           )`,
+        [batchId, req.user?.tenant_id || null],
       );
       if ((Number(readyForHandoffQ.rows[0]?.total) || 0) <= 0) {
         await client.query("ROLLBACK");
@@ -3925,8 +4464,17 @@ router.post(
          WHERE batch_id = $1
            AND call_status = 'accepted'
            AND courier_name IS NOT NULL
-           AND courier_name <> ''`,
-        [batchId],
+           AND courier_name <> ''
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = delivery_batch_customers.user_id
+                 AND u.tenant_id = $2::uuid
+             )
+           )`,
+        [batchId, req.user?.tenant_id || null],
       );
 
       await client.query(
@@ -3941,8 +4489,17 @@ router.post(
              AND c.call_status = 'accepted'
              AND c.courier_name IS NOT NULL
              AND c.courier_name <> ''
+             AND (
+               $2::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1
+                 FROM users u
+                 WHERE u.id = c.user_id
+                   AND u.tenant_id = $2::uuid
+               )
+             )
         )`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
 
       await client.query(
@@ -3954,8 +4511,17 @@ router.post(
              AND c.call_status = 'accepted'
              AND c.courier_name IS NOT NULL
              AND c.courier_name <> ''
+             AND (
+               $2::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1
+                 FROM users u
+                 WHERE u.id = c.user_id
+                   AND u.tenant_id = $2::uuid
+               )
+             )
          )`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
 
       await client.query(
@@ -3969,7 +4535,11 @@ router.post(
 
       await client.query("COMMIT");
 
-      const detail = await fetchBatchDetails(db, batchId);
+      const detail = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       const io = req.app.get("io");
       if (io && detail) {
         for (const customer of detail.customers) {
@@ -4002,6 +4572,7 @@ router.post(
   "/batches/:batchId/complete",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId } = req.params;
     const client = await db.pool.connect();
@@ -4009,12 +4580,28 @@ router.post(
       await client.query("BEGIN");
 
       const batchQ = await client.query(
-        `SELECT id, status
-         FROM delivery_batches
-         WHERE id = $1
+        `SELECT b.id, b.status
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users bu
+               WHERE bu.id = b.created_by
+                 AND bu.tenant_id = $2::uuid
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
          LIMIT 1
          FOR UPDATE`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (batchQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -4038,8 +4625,17 @@ router.post(
          WHERE c.batch_id = $1
            AND c.call_status = 'accepted'
            AND c.courier_name IS NOT NULL
-           AND c.courier_name <> ''`,
-        [batchId],
+           AND c.courier_name <> ''
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = c.user_id
+                 AND u.tenant_id = $2::uuid
+             )
+           )`,
+        [batchId, req.user?.tenant_id || null],
       );
 
       await client.query(
@@ -4049,8 +4645,17 @@ router.post(
          WHERE batch_id = $1
            AND call_status = 'accepted'
            AND courier_name IS NOT NULL
-           AND courier_name <> ''`,
-        [batchId],
+           AND courier_name <> ''
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = delivery_batch_customers.user_id
+                 AND u.tenant_id = $2::uuid
+             )
+           )`,
+        [batchId, req.user?.tenant_id || null],
       );
 
       await client.query(
@@ -4065,8 +4670,17 @@ router.post(
              AND c.call_status = 'accepted'
              AND c.courier_name IS NOT NULL
              AND c.courier_name <> ''
+             AND (
+               $2::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1
+                 FROM users u
+                 WHERE u.id = c.user_id
+                   AND u.tenant_id = $2::uuid
+               )
+             )
          )`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
 
       await client.query(
@@ -4080,7 +4694,11 @@ router.post(
 
       await client.query("COMMIT");
 
-      const detail = await fetchBatchDetails(db, batchId);
+      const detail = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       const io = req.app.get("io");
       if (io) {
         for (const row of usersQ.rows) {
@@ -4108,6 +4726,7 @@ router.post(
   "/batches/:batchId/customers/:customerId/remove-from-route",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const client = await db.pool.connect();
@@ -4119,11 +4738,13 @@ router.post(
                 b.status AS batch_status
          FROM delivery_batch_customers c
          JOIN delivery_batches b ON b.id = c.batch_id
+         JOIN users scope_u ON scope_u.id = c.user_id
          WHERE c.id = $1
            AND c.batch_id = $2
+           AND ($3::uuid IS NULL OR scope_u.tenant_id = $3::uuid)
          LIMIT 1
          FOR UPDATE`,
-        [customerId, batchId],
+        [customerId, batchId, req.user?.tenant_id || null],
       );
       if (customerQ.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -4193,7 +4814,11 @@ router.post(
 
       await client.query("COMMIT");
 
-      const detail = await fetchBatchDetails(db, batchId);
+      const detail = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
       const io = req.app.get("io");
       if (io) {
         emitCartUpdated(io, customer.user_id, {
@@ -4225,15 +4850,32 @@ router.get(
   "/batches/:batchId/export",
   requireAuth,
   requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const { batchId } = req.params;
     try {
       const batchQ = await db.query(
-        `SELECT id, delivery_date
-         FROM delivery_batches
-         WHERE id = $1
+        `SELECT b.id, b.delivery_date
+         FROM delivery_batches b
+         WHERE b.id = $1
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users bu
+               WHERE bu.id = b.created_by
+                 AND bu.tenant_id = $2::uuid
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM delivery_batch_customers c2
+               JOIN users u2 ON u2.id = c2.user_id
+               WHERE c2.batch_id = b.id
+                 AND u2.tenant_id = $2::uuid
+             )
+           )
          LIMIT 1`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
       if (batchQ.rowCount === 0) {
         return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
@@ -4257,8 +4899,17 @@ router.get(
          FROM delivery_batch_customers
          WHERE batch_id = $1
            AND call_status = 'accepted'
+           AND (
+             $2::uuid IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM users u
+               WHERE u.id = delivery_batch_customers.user_id
+                 AND u.tenant_id = $2::uuid
+             )
+           )
          ORDER BY route_order ASC NULLS LAST, customer_name ASC`,
-        [batchId],
+        [batchId, req.user?.tenant_id || null],
       );
 
       const workbook = new ExcelJS.Workbook();

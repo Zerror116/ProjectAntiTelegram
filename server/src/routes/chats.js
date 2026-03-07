@@ -1,5 +1,6 @@
 // server/src/routes/chats.js
 const express = require("express");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
@@ -12,6 +13,7 @@ const { requireRole } = require("../utils/roles");
 const { requireChatPermission } = require("../utils/permissions");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 const { emitToTenant } = require("../utils/socket");
+const { guardAction } = require("../utils/antifraud");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -31,6 +33,25 @@ const chatVoiceUploadsDir = path.resolve(
 );
 fs.mkdirSync(chatImageUploadsDir, { recursive: true });
 fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
+
+const CHAT_MEDIA_TOKEN_TTL_SECONDS = Math.max(
+  60,
+  Number(process.env.CHAT_MEDIA_TOKEN_TTL_SECONDS || 2 * 60 * 60),
+);
+const CHAT_MEDIA_TOKEN_SECRET = String(
+  process.env.CHAT_MEDIA_TOKEN_SECRET || process.env.JWT_SECRET || "",
+).trim();
+
+if (process.env.NODE_ENV === "production" && !CHAT_MEDIA_TOKEN_SECRET) {
+  throw new Error(
+    "CHAT_MEDIA_TOKEN_SECRET (or JWT_SECRET) must be configured in production",
+  );
+}
+
+const CHAT_MEDIA_MARKERS = Object.freeze({
+  image: "/uploads/chat_media/images/",
+  voice: "/uploads/chat_media/voice/",
+});
 
 const chatMediaUpload = multer({
   storage: multer.diskStorage({
@@ -241,7 +262,7 @@ function canReadChat(context, userRole) {
   return true;
 }
 
-function canPostChat(context, userRole) {
+function canPostChat(context, userRole, permissions = {}) {
   if (!context) return false;
   const role = normalizeRole(userRole);
 
@@ -262,22 +283,48 @@ function canPostChat(context, userRole) {
 
     const adminOnly = isAdminOnlyChannel(context.chat, context.settings);
     if (adminOnly) {
-      return role === "admin" || role === "creator";
+      return (
+        role === "admin" ||
+        role === "creator" ||
+        hasPermission(permissions, "chat.write.public")
+      );
     }
-    // В публичных каналах постит только admin/creator
+    // В публичных каналах постит только staff с правом chat.write.public
     if (context.visibility === "public") {
-      return role === "admin" || role === "creator";
+      return (
+        role === "admin" ||
+        role === "creator" ||
+        hasPermission(permissions, "chat.write.public")
+      );
     }
-    // В приватных каналах: worker/admin/creator или участники
-    if (role === "worker" || role === "admin" || role === "creator")
+    // В приватных каналах: staff с chat.write.private или участники
+    if (
+      role === "worker" ||
+      role === "admin" ||
+      role === "creator" ||
+      hasPermission(permissions, "chat.write.private")
+    )
       return true;
     return context.isMember;
   }
 
+  if (isSupportTicketChatContext(context)) {
+    return (
+      hasPermission(permissions, "chat.write.support") ||
+      role === "worker" ||
+      role === "admin" ||
+      role === "creator"
+    );
+  }
   if (context.hasMembers) return context.isMember;
   // Открытые публичные чаты доступны только staff.
   // Клиенты пишут в поддержку и в приватные чаты, где они добавлены участниками.
-  return role === "worker" || role === "admin" || role === "creator";
+  return (
+    role === "worker" ||
+    role === "admin" ||
+    role === "creator" ||
+    hasPermission(permissions, "chat.write.private")
+  );
 }
 
 function isAdminOrCreator(role) {
@@ -453,6 +500,79 @@ function toChatMediaUrl(req, file) {
   return null;
 }
 
+function extractChatMediaRef(rawUrl) {
+  const url = String(rawUrl || "").trim();
+  if (!url) return null;
+  for (const [kind, marker] of Object.entries(CHAT_MEDIA_MARKERS)) {
+    const markerIndex = url.indexOf(marker);
+    if (markerIndex === -1) continue;
+    const filename = decodeURIComponent(
+      url.slice(markerIndex + marker.length).split(/[?#]/)[0].trim(),
+    );
+    if (!filename) return null;
+    const normalized = path.basename(filename);
+    if (
+      normalized !== filename ||
+      !/^[A-Za-z0-9._-]+$/.test(normalized) ||
+      normalized.startsWith(".")
+    ) {
+      return null;
+    }
+    return {
+      kind,
+      marker,
+      filename: normalized,
+      canonicalPath: `${marker}${normalized}`,
+    };
+  }
+  return null;
+}
+
+function signChatMediaAccess(pathValue, expUnixSeconds) {
+  return crypto
+    .createHmac("sha256", CHAT_MEDIA_TOKEN_SECRET || "dev-chat-media-secret")
+    .update(`${pathValue}:${expUnixSeconds}`)
+    .digest("hex");
+}
+
+function secureEqualHex(a, b) {
+  const left = Buffer.from(String(a || ""), "utf8");
+  const right = Buffer.from(String(b || ""), "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function buildSignedChatMediaUrl(req, rawUrl) {
+  const ref = extractChatMediaRef(rawUrl);
+  if (!ref) return rawUrl;
+  const exp = Math.floor(Date.now() / 1000) + CHAT_MEDIA_TOKEN_TTL_SECONDS;
+  const sig = signChatMediaAccess(ref.canonicalPath, exp);
+  return `${req.protocol}://${req.get("host")}/api/chats/media/${ref.kind}/${encodeURIComponent(ref.filename)}?exp=${exp}&sig=${sig}`;
+}
+
+function decorateMessageMediaUrls(req, rawMessage) {
+  if (!rawMessage || typeof rawMessage !== "object") return rawMessage;
+  const message = { ...rawMessage };
+  const meta = parseMeta(rawMessage.meta);
+  const nextMeta = { ...meta };
+  let changed = false;
+  for (const key of ["image_url", "voice_url"]) {
+    const value = String(nextMeta[key] || "").trim();
+    if (!value) continue;
+    const signed = buildSignedChatMediaUrl(req, value);
+    if (signed !== value) {
+      nextMeta[key] = signed;
+      changed = true;
+    }
+  }
+  if (changed) {
+    message.meta = nextMeta;
+  } else {
+    message.meta = meta;
+  }
+  return message;
+}
+
 function removeUploadedFile(file) {
   if (!file || !file.path) return;
   fs.unlink(file.path, () => {});
@@ -535,11 +655,16 @@ async function getHydratedMessageById(messageId, currentUserId) {
 }
 
 async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
-  const responseMessage = await getHydratedMessageById(messageId, currentUserId);
+  const responseMessageRaw = await getHydratedMessageById(
+    messageId,
+    currentUserId,
+  );
+  const responseMessage = decorateMessageMediaUrls(req, responseMessageRaw);
   if (!responseMessage) {
     throw new Error("Не удалось загрузить сообщение");
   }
-  const broadcastMessage = await getHydratedMessageById(messageId, null);
+  const broadcastMessageRaw = await getHydratedMessageById(messageId, null);
+  const broadcastMessage = decorateMessageMediaUrls(req, broadcastMessageRaw);
   if (!broadcastMessage) {
     throw new Error("Не удалось подготовить событие сообщения");
   }
@@ -838,7 +963,7 @@ async function canPinInChat(user) {
   return hasPermission(resolved.permissions, "chat.pin");
 }
 
-async function getActivePinForUser(chatId, userId) {
+async function getActivePinForUser(req, chatId, userId) {
   const pinQ = await db.query(
     `SELECT cp.id,
             cp.chat_id,
@@ -860,7 +985,10 @@ async function getActivePinForUser(chatId, userId) {
   );
   if (pinQ.rowCount === 0) return null;
   const pin = pinQ.rows[0];
-  const message = await getHydratedMessageById(pin.message_id, userId);
+  const message = decorateMessageMediaUrls(
+    req,
+    await getHydratedMessageById(pin.message_id, userId),
+  );
   if (!message) return null;
   return {
     id: pin.id,
@@ -1177,9 +1305,78 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
        LIMIT 1000`,
       [chatId, String(userId)],
     );
-    return res.json({ ok: true, data: rows });
+    const safeRows = rows.map((row) => decorateMessageMediaUrls(req, row));
+    return res.json({ ok: true, data: safeRows });
   } catch (err) {
     console.error("chats.messages error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.get("/media/:kind/:filename", async (req, res) => {
+  try {
+    const kind = String(req.params.kind || "").trim().toLowerCase();
+    if (kind !== "image" && kind !== "voice") {
+      return res.status(404).json({ ok: false, error: "Media not found" });
+    }
+
+    const rawFilename = decodeURIComponent(String(req.params.filename || ""));
+    const filename = path.basename(rawFilename);
+    if (
+      !filename ||
+      filename !== rawFilename ||
+      !/^[A-Za-z0-9._-]+$/.test(filename)
+    ) {
+      return res.status(400).json({ ok: false, error: "Invalid media name" });
+    }
+
+    const exp = Number(req.query.exp || 0);
+    const sig = String(req.query.sig || "").trim().toLowerCase();
+    if (!Number.isFinite(exp) || exp <= 0 || !sig) {
+      return res.status(403).json({ ok: false, error: "Missing media token" });
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (exp < nowSeconds) {
+      return res.status(403).json({ ok: false, error: "Media token expired" });
+    }
+
+    const marker = CHAT_MEDIA_MARKERS[kind];
+    const canonicalPath = `${marker}${filename}`;
+    const expectedSig = signChatMediaAccess(canonicalPath, exp);
+    if (!secureEqualHex(sig, expectedSig)) {
+      return res.status(403).json({ ok: false, error: "Invalid media token" });
+    }
+
+    const mediaField = kind === "image" ? "image_url" : "voice_url";
+    const refQ = await db.query(
+      `SELECT 1
+       FROM messages m
+       WHERE COALESCE(m.meta->>$1, '') LIKE $2
+       LIMIT 1`,
+      [mediaField, `%${canonicalPath}%`],
+    );
+    if (refQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Media reference not found" });
+    }
+
+    const baseDir = kind === "image" ? chatImageUploadsDir : chatVoiceUploadsDir;
+    const absoluteBaseDir = path.resolve(baseDir);
+    const absoluteFilePath = path.resolve(baseDir, filename);
+    if (
+      absoluteFilePath !== absoluteBaseDir &&
+      !absoluteFilePath.startsWith(`${absoluteBaseDir}${path.sep}`)
+    ) {
+      return res.status(400).json({ ok: false, error: "Invalid media path" });
+    }
+    if (!fs.existsSync(absoluteFilePath)) {
+      return res.status(404).json({ ok: false, error: "Media file not found" });
+    }
+
+    res.setHeader("Cache-Control", "private, max-age=60");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return res.sendFile(absoluteFilePath);
+  } catch (err) {
+    console.error("chats.media error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
@@ -1246,7 +1443,8 @@ router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       });
     }
 
-    return res.json({ ok: true, data: messageQ.rows[0] });
+    const safeMessage = decorateMessageMediaUrls(req, messageQ.rows[0]);
+    return res.json({ ok: true, data: safeMessage });
   } catch (err) {
     console.error("chats.messageById error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
@@ -1267,7 +1465,7 @@ router.get("/:chatId/pin", requireAuth, async (req, res) => {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
-    const pin = await getActivePinForUser(chatId, userId);
+    const pin = await getActivePinForUser(req, chatId, userId);
     return res.json({ ok: true, data: pin });
   } catch (err) {
     console.error("chats.getPin error", err);
@@ -1346,7 +1544,7 @@ router.post("/:chatId/pin/:messageId", requireAuth, async (req, res) => {
       [chatId, messageId, userId],
     );
 
-    const pin = await getActivePinForUser(chatId, userId);
+    const pin = await getActivePinForUser(req, chatId, userId);
     const io = req.app.get("io");
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:pinned", { chatId, pin });
@@ -1465,13 +1663,33 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     const { chatId } = req.params;
     const { text, client_msg_id } = req.body || {};
 
+    const antifraud = await guardAction({
+      queryable: db,
+      tenantId: req.user?.tenant_id || null,
+      userId,
+      actionKey: "chats.post_message",
+      details: {
+        chat_id: chatId,
+      },
+    });
+    if (!antifraud.allowed) {
+      return res.status(429).json({
+        ok: false,
+        error:
+            antifraud.reason ||
+            "Слишком много сообщений за короткое время. Повторите позже.",
+        blocked_until: antifraud.blockedUntil || null,
+      });
+    }
+
     if (!text || !text.trim())
       return res.status(400).json({ ok: false, error: "Text required" });
 
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
-    if (!canPostChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canPostChat(context, role, permissionSet.permissions)) {
       return res
         .status(403)
         .json({
@@ -1572,7 +1790,8 @@ router.post(
         removeUploadedFiles(uploadedFiles);
         return res.status(404).json({ ok: false, error: "Chat not found" });
       }
-      if (!canPostChat(context, role)) {
+      const permissionSet = await resolvePermissionSet(req.user, db);
+      if (!canPostChat(context, role, permissionSet.permissions)) {
         removeUploadedFiles(uploadedFiles);
         return res.status(403).json({
           ok: false,
@@ -1741,7 +1960,8 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
        RETURNING id`,
       [nextText, messageId],
     );
-    const updated = await getHydratedMessageById(upd.rows[0]?.id, userId);
+    const updatedRaw = await getHydratedMessageById(upd.rows[0]?.id, userId);
+    const updated = decorateMessageMediaUrls(req, updatedRaw);
     if (!updated) {
       return res.status(500).json({ ok: false, error: "Не удалось загрузить сообщение" });
     }

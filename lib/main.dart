@@ -34,12 +34,25 @@ final ValueNotifier<bool> notificationsEnabledNotifier = ValueNotifier(true);
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(
   ThemeMode.light,
 );
+final ValueNotifier<Color> lightThemeSeedNotifier = ValueNotifier(
+  const Color(0xFF2F6BFF),
+);
+final ValueNotifier<Color> darkThemeSeedNotifier = ValueNotifier(
+  const Color(0xFF7A4DFF),
+);
+final ValueNotifier<String> uiDensityNotifier = ValueNotifier('standard');
+final ValueNotifier<String> uiCardSizeNotifier = ValueNotifier('standard');
+final ValueNotifier<int> themeStyleVersionNotifier = ValueNotifier(0);
 final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
   null,
 );
 
 const _notificationsPrefPrefix = 'notifications_enabled_';
 const _themePrefPrefix = 'theme_mode_dark_';
+const _lightSeedPrefPrefix = 'theme_light_seed_';
+const _darkSeedPrefPrefix = 'theme_dark_seed_';
+const _uiDensityPrefPrefix = 'ui_density_';
+const _uiCardSizePrefPrefix = 'ui_card_size_';
 String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
 final AudioPlayer _appSoundPlayer = AudioPlayer();
@@ -123,15 +136,97 @@ String _settingsScopeUserId() {
   return 'guest';
 }
 
+Color _colorFromHex(String raw, Color fallback) {
+  final cleaned = raw.trim().replaceAll('#', '');
+  if (!RegExp(r'^[0-9a-fA-F]{6,8}$').hasMatch(cleaned)) return fallback;
+  final normalized = cleaned.length == 6 ? 'FF$cleaned' : cleaned;
+  final value = int.tryParse(normalized, radix: 16);
+  if (value == null) return fallback;
+  return Color(value);
+}
+
+String _colorToHex(Color color) {
+  return '#${color.toARGB32().toRadixString(16).padLeft(8, '0').substring(2).toUpperCase()}';
+}
+
+VisualDensity _resolveVisualDensity() {
+  switch (uiDensityNotifier.value) {
+    case 'compact':
+      return const VisualDensity(horizontal: -2, vertical: -2);
+    case 'comfortable':
+      return const VisualDensity(horizontal: 0, vertical: 0);
+    case 'spacious':
+      return const VisualDensity(horizontal: 1, vertical: 1);
+    case 'standard':
+    default:
+      return VisualDensity.standard;
+  }
+}
+
+double _resolveCardScale() {
+  switch (uiCardSizeNotifier.value) {
+    case 'compact':
+      return 0.9;
+    case 'large':
+      return 1.12;
+    case 'standard':
+    default:
+      return 1;
+  }
+}
+
+ThemeData _buildLightTheme() {
+  return AppTheme.light(
+    seedColor: lightThemeSeedNotifier.value,
+    visualDensity: _resolveVisualDensity(),
+    cardScale: _resolveCardScale(),
+  );
+}
+
+ThemeData _buildDarkTheme() {
+  return AppTheme.dark(
+    seedColor: darkThemeSeedNotifier.value,
+    visualDensity: _resolveVisualDensity(),
+    cardScale: _resolveCardScale(),
+  );
+}
+
 Future<void> refreshUserPreferences() async {
   final prefs = await SharedPreferences.getInstance();
   final scope = _settingsScopeUserId();
   final notifications =
       prefs.getBool('$_notificationsPrefPrefix$scope') ?? true;
   final darkMode = prefs.getBool('$_themePrefPrefix$scope') ?? false;
+  final lightSeedHex =
+      prefs.getString('$_lightSeedPrefPrefix$scope') ?? '#2F6BFF';
+  final darkSeedHex =
+      prefs.getString('$_darkSeedPrefPrefix$scope') ?? '#7A4DFF';
+  final density = prefs.getString('$_uiDensityPrefPrefix$scope') ?? 'standard';
+  final cardSize =
+      prefs.getString('$_uiCardSizePrefPrefix$scope') ?? 'standard';
 
   notificationsEnabledNotifier.value = notifications;
   themeModeNotifier.value = darkMode ? ThemeMode.dark : ThemeMode.light;
+  lightThemeSeedNotifier.value = _colorFromHex(
+    lightSeedHex,
+    const Color(0xFF2F6BFF),
+  );
+  darkThemeSeedNotifier.value = _colorFromHex(
+    darkSeedHex,
+    const Color(0xFF7A4DFF),
+  );
+  uiDensityNotifier.value = switch (density) {
+    'compact' => 'compact',
+    'comfortable' => 'comfortable',
+    'spacious' => 'spacious',
+    _ => 'standard',
+  };
+  uiCardSizeNotifier.value = switch (cardSize) {
+    'compact' => 'compact',
+    'large' => 'large',
+    _ => 'standard',
+  };
+  themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
 
 Future<void> setNotificationsEnabled(bool value) async {
@@ -146,6 +241,50 @@ Future<void> setDarkModeEnabled(bool value) async {
   final scope = _settingsScopeUserId();
   await prefs.setBool('$_themePrefPrefix$scope', value);
   themeModeNotifier.value = value ? ThemeMode.dark : ThemeMode.light;
+}
+
+Future<void> setThemeSeedColors({Color? lightSeed, Color? darkSeed}) async {
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  if (lightSeed != null) {
+    await prefs.setString(
+      '$_lightSeedPrefPrefix$scope',
+      _colorToHex(lightSeed),
+    );
+    lightThemeSeedNotifier.value = lightSeed;
+  }
+  if (darkSeed != null) {
+    await prefs.setString('$_darkSeedPrefPrefix$scope', _colorToHex(darkSeed));
+    darkThemeSeedNotifier.value = darkSeed;
+  }
+  themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
+}
+
+Future<void> setUiDensityPreset(String value) async {
+  final normalized = switch (value) {
+    'compact' => 'compact',
+    'comfortable' => 'comfortable',
+    'spacious' => 'spacious',
+    _ => 'standard',
+  };
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  await prefs.setString('$_uiDensityPrefPrefix$scope', normalized);
+  uiDensityNotifier.value = normalized;
+  themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
+}
+
+Future<void> setUiCardSizePreset(String value) async {
+  final normalized = switch (value) {
+    'compact' => 'compact',
+    'large' => 'large',
+    _ => 'standard',
+  };
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  await prefs.setString('$_uiCardSizePrefPrefix$scope', normalized);
+  uiCardSizeNotifier.value = normalized;
+  themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
 
 Future<void> _prepareAppSoundPlayer() async {
@@ -522,6 +661,18 @@ void _removeHeaderIgnoreCase(Map<String, dynamic> headers, String name) {
   }
 }
 
+void _removeTenantHeaders(Map<String, dynamic> headers) {
+  final toDelete = <String>[];
+  for (final key in headers.keys) {
+    if (key.toLowerCase().contains('tenant')) {
+      toDelete.add(key);
+    }
+  }
+  for (final key in toDelete) {
+    headers.remove(key);
+  }
+}
+
 bool _isAsciiHeaderValue(String value) {
   return RegExp(r'^[\x20-\x7E]*$').hasMatch(value);
 }
@@ -542,8 +693,9 @@ void _dropInvalidHeaderValues(Map<String, dynamic> headers) {
 
 void _attachAuthInterceptor() {
   debugPrint('_attachAuthInterceptor: attaching');
-  // Очистка старых/битых заголовков между перезапусками.
-  _removeHeaderIgnoreCase(dio.options.headers, 'X-Tenant-Code');
+  // Очистка старых/битых tenant-заголовков между перезапусками.
+  _removeTenantHeaders(dio.options.headers);
+  _dropInvalidHeaderValues(dio.options.headers);
   dio.interceptors.add(
     InterceptorsWrapper(
       onRequest: (options, handler) async {
@@ -556,8 +708,7 @@ void _attachAuthInterceptor() {
             options.headers.remove('Authorization');
           }
           await authService.getTenantCode();
-          _removeHeaderIgnoreCase(options.headers, 'X-Tenant-Code');
-          _removeHeaderIgnoreCase(options.headers, 'x-tenant-code');
+          _removeTenantHeaders(options.headers);
           final viewRole = authService.viewRole?.trim();
           _removeHeaderIgnoreCase(options.headers, 'X-View-Role');
           if ((authService.currentUser?.role.toLowerCase().trim() ?? '') ==
@@ -820,8 +971,8 @@ Future<void> main() async {
     final exception = details.exception;
     final stack = details.stack;
     final errorTheme = themeModeNotifier.value == ThemeMode.dark
-        ? AppTheme.dark()
-        : AppTheme.light();
+        ? _buildDarkTheme()
+        : _buildLightTheme();
     return MaterialApp(
       home: Scaffold(
         body: Center(
@@ -859,8 +1010,8 @@ Future<void> main() async {
         ),
       ),
       debugShowCheckedModeBanner: false,
-      theme: AppTheme.light(),
-      darkTheme: AppTheme.dark(),
+      theme: _buildLightTheme(),
+      darkTheme: _buildDarkTheme(),
       themeMode: themeModeNotifier.value,
       builder: (context, child) {
         return ScaffoldMessenger(
@@ -968,15 +1119,19 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   @override
   Widget build(BuildContext context) {
     if (_home == null) {
-      return ValueListenableBuilder<ThemeMode>(
-        valueListenable: themeModeNotifier,
-        builder: (context, mode, _) {
+      return AnimatedBuilder(
+        animation: Listenable.merge([
+          themeModeNotifier,
+          themeStyleVersionNotifier,
+        ]),
+        builder: (context, _) {
+          final mode = themeModeNotifier.value;
           return MaterialApp(
             navigatorKey: navigatorKey,
             title: 'Проект Феникс (diag)',
             themeMode: mode,
-            theme: AppTheme.light(),
-            darkTheme: AppTheme.dark(),
+            theme: _buildLightTheme(),
+            darkTheme: _buildDarkTheme(),
             home: Scaffold(
               appBar: AppBar(title: const Text('Загрузка...')),
               body: PhoenixLoadingView(
@@ -996,15 +1151,19 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       );
     }
 
-    return ValueListenableBuilder<ThemeMode>(
-      valueListenable: themeModeNotifier,
-      builder: (context, mode, _) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        themeModeNotifier,
+        themeStyleVersionNotifier,
+      ]),
+      builder: (context, _) {
+        final mode = themeModeNotifier.value;
         return MaterialApp(
           navigatorKey: navigatorKey,
           title: 'Проект Феникс',
           themeMode: mode,
-          theme: AppTheme.light(),
-          darkTheme: AppTheme.dark(),
+          theme: _buildLightTheme(),
+          darkTheme: _buildDarkTheme(),
           home: _home,
           routes: {
             '/auth': (_) => const AuthScreen(),

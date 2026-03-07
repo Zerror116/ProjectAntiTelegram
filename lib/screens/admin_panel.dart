@@ -47,9 +47,23 @@ class AdminPanel extends StatefulWidget {
   State<AdminPanel> createState() => _AdminPanelState();
 }
 
+class _AdminTabSpec {
+  const _AdminTabSpec({
+    required this.id,
+    required this.label,
+    required this.builder,
+  });
+
+  final String id;
+  final String label;
+  final Widget Function() builder;
+}
+
 class _AdminPanelState extends State<AdminPanel>
     with SingleTickerProviderStateMixin {
-  late final TabController _tabController;
+  TabController? _tabController;
+  StreamSubscription? _authSub;
+  List<_AdminTabSpec> _visibleTabs = const <_AdminTabSpec>[];
   final bool _showKeysTab = false;
   final _channelTitleCtrl = TextEditingController();
   final _channelDescriptionCtrl = TextEditingController();
@@ -62,6 +76,16 @@ class _AdminPanelState extends State<AdminPanel>
   final _inviteMaxUsesCtrl = TextEditingController();
   final _inviteExpiresDaysCtrl = TextEditingController(text: '30');
   final _inviteNotesCtrl = TextEditingController();
+  final _auditActionCtrl = TextEditingController();
+  final _notificationQuietFromCtrl = TextEditingController();
+  final _notificationQuietToCtrl = TextEditingController();
+  final _supportTemplateTitleCtrl = TextEditingController();
+  final _supportTemplateBodyCtrl = TextEditingController();
+  final _supportTemplateExtraCtrl = TextEditingController();
+  final _roleTemplateTitleCtrl = TextEditingController();
+  final _roleTemplateCodeCtrl = TextEditingController();
+  final _roleTemplateDescriptionCtrl = TextEditingController();
+  final _roleUserSearchCtrl = TextEditingController();
 
   bool _loading = true;
   bool _saving = false;
@@ -72,16 +96,32 @@ class _AdminPanelState extends State<AdminPanel>
   bool _deliverySaving = false;
   bool _supportLoading = false;
   bool _supportArchiveBusy = false;
+  bool _supportTemplatesLoading = false;
+  bool _supportTemplateSaving = false;
+  bool _supportQuickReplyBusy = false;
   bool _tenantsLoading = false;
   bool _tenantActionLoading = false;
   bool _invitesLoading = false;
   bool _inviteActionLoading = false;
+  bool _financeLoading = false;
+  bool _controlLoading = false;
+  bool _diagnosticsLoading = false;
+  bool _smartNotifyLoading = false;
+  bool _returnsActionBusy = false;
+  bool _demoModeBusy = false;
+  bool _roleTemplateSaving = false;
+  bool _roleAssignBusy = false;
+  bool _roleUsersLoading = false;
   StreamSubscription? _eventsSub;
 
   String _message = '';
   String _newChannelVisibility = 'public';
   String _deliveryViewMode = 'map';
   String _deliveryOriginLabel = 'Точка отправки';
+  String _financePeriod = 'month';
+  String _smartNotifyType = 'order';
+  String _smartNotifyPriority = 'high';
+  String _supportTemplateCategory = 'general';
   double? _deliveryOriginLat;
   double? _deliveryOriginLng;
 
@@ -92,9 +132,20 @@ class _AdminPanelState extends State<AdminPanel>
   List<Map<String, dynamic>> _deliveryBatches = [];
   List<Map<String, dynamic>> _supportActiveTickets = [];
   List<Map<String, dynamic>> _supportArchivedTickets = [];
+  List<Map<String, dynamic>> _supportTemplates = [];
+  List<Map<String, dynamic>> _auditLogs = [];
+  List<Map<String, dynamic>> _antifraudEvents = [];
+  List<Map<String, dynamic>> _antifraudBlocks = [];
+  List<Map<String, dynamic>> _returnsWorkflow = [];
+  List<Map<String, dynamic>> _roleUsers = [];
+  List<Map<String, dynamic>> _smartNotifyHistory = [];
   List<Map<String, dynamic>> _tenants = [];
   List<Map<String, dynamic>> _tenantInvites = [];
   Map<String, dynamic>? _deliveryActiveBatch;
+  Map<String, dynamic>? _financeData;
+  Map<String, dynamic>? _rolesDraft;
+  Map<String, dynamic>? _diagnosticsData;
+  Map<String, dynamic>? _smartNotifySettings;
   int _reservedPendingTotal = 0;
   int _reservedPendingUnits = 0;
   String _lastGeneratedTenantKey = '';
@@ -103,6 +154,8 @@ class _AdminPanelState extends State<AdminPanel>
   String _inviteRole = 'client';
   String _lastInviteCode = '';
   String _lastInviteLink = '';
+  final Map<String, String> _ticketTemplateById = {};
+  final Map<String, String> _roleSelectionByUserId = {};
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
   final Set<String> _overviewLoading = <String>{};
@@ -111,20 +164,27 @@ class _AdminPanelState extends State<AdminPanel>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this);
+    _rebuildVisibleTabs(force: true, notify: false);
     _reloadAll();
     _eventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
-      if (type == 'delivery:updated') {
+      if (type == 'delivery:updated' && _canViewDeliveryTab()) {
         unawaited(_loadDeliveryDashboard());
+      }
+    });
+    _authSub = authService.authStream.listen((_) {
+      final changed = _rebuildVisibleTabs();
+      if (changed) {
+        unawaited(_reloadAll());
       }
     });
   }
 
   @override
   void dispose() {
-    _tabController.dispose();
+    _tabController?.dispose();
     _eventsSub?.cancel();
+    _authSub?.cancel();
     _channelTitleCtrl.dispose();
     _channelDescriptionCtrl.dispose();
     _deliveryThresholdCtrl.dispose();
@@ -136,6 +196,16 @@ class _AdminPanelState extends State<AdminPanel>
     _inviteMaxUsesCtrl.dispose();
     _inviteExpiresDaysCtrl.dispose();
     _inviteNotesCtrl.dispose();
+    _auditActionCtrl.dispose();
+    _notificationQuietFromCtrl.dispose();
+    _notificationQuietToCtrl.dispose();
+    _supportTemplateTitleCtrl.dispose();
+    _supportTemplateBodyCtrl.dispose();
+    _supportTemplateExtraCtrl.dispose();
+    _roleTemplateTitleCtrl.dispose();
+    _roleTemplateCodeCtrl.dispose();
+    _roleTemplateDescriptionCtrl.dispose();
+    _roleUserSearchCtrl.dispose();
     super.dispose();
   }
 
@@ -179,6 +249,184 @@ class _AdminPanelState extends State<AdminPanel>
     if (normalized == 'admin') return 'Админ';
     if (normalized == 'worker') return 'Рабочий';
     return 'Клиент';
+  }
+
+  bool _isCreatorBase() {
+    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    return baseRole == 'creator';
+  }
+
+  bool _hasPermission(String key) {
+    return authService.hasPermission(key);
+  }
+
+  bool _ensurePermission(String key, String deniedMessage) {
+    if (_hasPermission(key)) return true;
+    if (mounted) {
+      setState(() => _message = deniedMessage);
+    }
+    return false;
+  }
+
+  bool _hasAnyPermission(List<String> keys) {
+    for (final key in keys) {
+      if (_hasPermission(key)) return true;
+    }
+    return false;
+  }
+
+  bool _canViewCreateTab() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasAnyPermission(const [
+      'product.publish',
+      'tenant.users.manage',
+      'delivery.manage',
+    ]);
+  }
+
+  bool _canViewChannelsTab() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasAnyPermission(const ['product.publish', 'tenant.users.manage']);
+  }
+
+  bool _canViewModerationTab() {
+    return _hasAnyPermission(const ['product.publish', 'reservation.fulfill']);
+  }
+
+  bool _canViewDeliveryTab() {
+    return _hasPermission('delivery.manage') || _isCreatorBase();
+  }
+
+  bool _canViewSupportTab() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasPermission('chat.write.support');
+  }
+
+  bool _canViewFinanceTab() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasPermission('finance.view');
+  }
+
+  bool _canViewControlTab() {
+    if (_isCreatorBase()) return true;
+    return _hasAnyPermission(const [
+      'tenant.users.manage',
+      'delivery.manage',
+      'audit.view',
+      'notifications.manage',
+      'antifraud.view',
+      'support.manage',
+    ]);
+  }
+
+  List<_AdminTabSpec> _buildVisibleTabs() {
+    final tabs = <_AdminTabSpec>[
+      if (_canViewCreateTab())
+        _AdminTabSpec(
+          id: 'create',
+          label: 'Создание',
+          builder: _buildCreateTab,
+        ),
+      if (_canViewChannelsTab())
+        _AdminTabSpec(
+          id: 'channels',
+          label: 'Каналы',
+          builder: _buildSettingsTab,
+        ),
+      if (_canViewModerationTab())
+        _AdminTabSpec(
+          id: 'moderation',
+          label: 'Модерация',
+          builder: _buildModerationTab,
+        ),
+      if (_canViewDeliveryTab())
+        _AdminTabSpec(
+          id: 'delivery',
+          label: 'Доставка',
+          builder: _buildDeliveryTab,
+        ),
+      if (_canViewSupportTab())
+        _AdminTabSpec(
+          id: 'support',
+          label: 'Поддержка',
+          builder: _buildSupportTab,
+        ),
+      if (_canViewFinanceTab())
+        _AdminTabSpec(
+          id: 'finance',
+          label: 'Финансы',
+          builder: _buildFinanceTab,
+        ),
+      if (_canViewControlTab())
+        _AdminTabSpec(
+          id: 'control',
+          label: 'Контроль',
+          builder: _buildControlTab,
+        ),
+    ];
+    if (tabs.isNotEmpty) return tabs;
+    return <_AdminTabSpec>[
+      _AdminTabSpec(
+        id: 'no_access',
+        label: 'Доступ',
+        builder: _buildNoAccessTab,
+      ),
+    ];
+  }
+
+  bool _rebuildVisibleTabs({bool force = false, bool notify = true}) {
+    final nextTabs = _buildVisibleTabs();
+    final prevTabs = _visibleTabs;
+    final unchanged =
+        !force &&
+        prevTabs.length == nextTabs.length &&
+        List.generate(prevTabs.length, (i) => prevTabs[i].id).join('|') ==
+            List.generate(nextTabs.length, (i) => nextTabs[i].id).join('|');
+    if (unchanged && _tabController != null) {
+      return false;
+    }
+
+    final oldId = (() {
+      final controller = _tabController;
+      if (controller == null || prevTabs.isEmpty) return null;
+      final safeIndex = controller.index.clamp(0, prevTabs.length - 1);
+      return prevTabs[safeIndex].id;
+    })();
+
+    _tabController?.dispose();
+    _visibleTabs = nextTabs;
+
+    final mappedIndex = oldId == null
+        ? 0
+        : nextTabs.indexWhere((tab) => tab.id == oldId);
+    final initialIndex = mappedIndex >= 0 ? mappedIndex : 0;
+
+    _tabController = TabController(
+      length: nextTabs.length,
+      vsync: this,
+      initialIndex: initialIndex,
+    );
+
+    if (notify && mounted) {
+      setState(() {});
+    }
+    return true;
+  }
+
+  void _animateToTab(String tabId) {
+    final controller = _tabController;
+    if (controller == null) return;
+    final nextIndex = _visibleTabs.indexWhere((tab) => tab.id == tabId);
+    if (nextIndex < 0) return;
+    controller.animateTo(nextIndex);
   }
 
   int _toInt(dynamic value, {int fallback = 0}) {
@@ -332,10 +580,34 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _reloadAll() async {
-    await _loadChannels();
-    await _loadPendingPosts();
-    await _loadDeliveryDashboard();
-    await _loadSupportTickets();
+    final canLoadChannels = _canViewCreateTab() || _canViewChannelsTab();
+    if (canLoadChannels) {
+      await _loadChannels();
+    } else if (mounted && _loading) {
+      setState(() => _loading = false);
+    }
+    if (_canViewModerationTab()) {
+      await _loadPendingPosts();
+    }
+    if (_canViewDeliveryTab()) {
+      await _loadDeliveryDashboard();
+    }
+    if (_canViewSupportTab()) {
+      await _loadSupportTickets();
+      await _loadSupportTemplates(silent: true);
+    }
+    if (_canViewFinanceTab()) {
+      await _loadFinanceSummary(silent: true);
+    }
+    if (_canViewControlTab()) {
+      await _loadControlCenter(silent: true);
+    }
+    if (_isCreatorBase() && _hasPermission('diagnostics.view')) {
+      await _loadDiagnostics(silent: true);
+    }
+    if (_isCreatorBase() && _hasPermission('notifications.manage')) {
+      await _loadSmartNotificationSettings(silent: true);
+    }
     if (_showKeysTab) {
       await _loadTenants();
       await _loadTenantInvites();
@@ -748,6 +1020,1085 @@ class _AdminPanelState extends State<AdminPanel>
         setState(
           () => _message = 'Ошибка загрузки очереди: ${_extractDioError(e)}',
         );
+      }
+    }
+  }
+
+  Future<void> _loadFinanceSummary({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _financeLoading = true);
+    } else {
+      _financeLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/finance/summary',
+        queryParameters: {'period': _financePeriod},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        if (!mounted) return;
+        setState(() => _financeData = Map<String, dynamic>.from(data['data']));
+      } else if (!silent && mounted) {
+        setState(() => _message = 'Не удалось загрузить финансы');
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(() => _message = 'Ошибка финансов: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _financeLoading = false);
+      } else {
+        _financeLoading = false;
+      }
+    }
+  }
+
+  Future<void> _loadSupportTemplates({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _supportTemplatesLoading = true);
+    } else {
+      _supportTemplatesLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/support/templates',
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        if (!mounted) return;
+        setState(() {
+          _supportTemplates = List<Map<String, dynamic>>.from(data['data']);
+        });
+      } else if (!silent && mounted) {
+        setState(() => _message = 'Не удалось загрузить шаблоны поддержки');
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message = 'Ошибка шаблонов поддержки: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _supportTemplatesLoading = false);
+      } else {
+        _supportTemplatesLoading = false;
+      }
+    }
+  }
+
+  Future<void> _createSupportTemplate() async {
+    final title = _supportTemplateTitleCtrl.text.trim();
+    final body = _supportTemplateBodyCtrl.text.trim();
+    if (title.isEmpty || body.isEmpty) {
+      setState(() => _message = 'Заполни название и текст шаблона');
+      return;
+    }
+    setState(() {
+      _supportTemplateSaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/ops/support/templates',
+        data: {
+          'title': title,
+          'body': body,
+          'category': _supportTemplateCategory,
+        },
+      );
+      _supportTemplateTitleCtrl.clear();
+      _supportTemplateBodyCtrl.clear();
+      await _loadSupportTemplates(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Шаблон поддержки сохранен');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка сохранения шаблона: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _supportTemplateSaving = false);
+      }
+    }
+  }
+
+  Future<void> _sendSupportQuickReply(Map<String, dynamic> ticket) async {
+    final ticketId = (ticket['id'] ?? '').toString().trim();
+    if (ticketId.isEmpty) return;
+    final templateId = (_ticketTemplateById[ticketId] ?? '').trim();
+    if (templateId.isEmpty) {
+      setState(() => _message = 'Выбери шаблон для быстрого ответа');
+      return;
+    }
+    final extra = _supportTemplateExtraCtrl.text.trim();
+    setState(() {
+      _supportQuickReplyBusy = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/ops/support/tickets/$ticketId/quick-reply',
+        data: {
+          'template_id': templateId,
+          if (extra.isNotEmpty) 'extra_text': extra,
+        },
+      );
+      _supportTemplateExtraCtrl.clear();
+      await _loadSupportTickets(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Быстрый ответ отправлен');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка быстрого ответа: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _supportQuickReplyBusy = false);
+      }
+    }
+  }
+
+  Future<void> _loadControlCenter({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _controlLoading = true);
+    } else {
+      _controlLoading = true;
+    }
+    try {
+      final responses = await Future.wait([
+        authService.dio.get(
+          '/api/admin/ops/audit/logs',
+          queryParameters: {
+            if (_auditActionCtrl.text.trim().isNotEmpty)
+              'action': _auditActionCtrl.text.trim(),
+            'limit': 80,
+          },
+        ),
+        authService.dio.get(
+          '/api/admin/ops/antifraud/events',
+          queryParameters: {'limit': 60},
+        ),
+        authService.dio.get(
+          '/api/admin/ops/antifraud/blocks',
+          queryParameters: {'active_only': 1},
+        ),
+        authService.dio.get('/api/admin/ops/returns/workflow'),
+      ]);
+      if (!mounted) return;
+      final auditData = responses[0].data;
+      final eventsData = responses[1].data;
+      final blocksData = responses[2].data;
+      final returnsData = responses[3].data;
+
+      dynamic rolesData = const <String, dynamic>{};
+      dynamic roleUsersData = const <String, dynamic>{};
+      try {
+        final rolesResp = await authService.dio.get(
+          '/api/admin/ops/roles/constructor-draft',
+        );
+        rolesData = rolesResp.data;
+      } catch (_) {}
+      try {
+        final usersResp = await authService.dio.get(
+          '/api/admin/ops/roles/users',
+          queryParameters: {
+            if (_roleUserSearchCtrl.text.trim().isNotEmpty)
+              'search': _roleUserSearchCtrl.text.trim(),
+            'limit': 200,
+          },
+        );
+        roleUsersData = usersResp.data;
+      } catch (_) {}
+      setState(() {
+        _auditLogs =
+            auditData is Map &&
+                auditData['ok'] == true &&
+                auditData['data'] is List
+            ? List<Map<String, dynamic>>.from(auditData['data'])
+            : <Map<String, dynamic>>[];
+        _antifraudEvents =
+            eventsData is Map &&
+                eventsData['ok'] == true &&
+                eventsData['data'] is List
+            ? List<Map<String, dynamic>>.from(eventsData['data'])
+            : <Map<String, dynamic>>[];
+        _antifraudBlocks =
+            blocksData is Map &&
+                blocksData['ok'] == true &&
+                blocksData['data'] is List
+            ? List<Map<String, dynamic>>.from(blocksData['data'])
+            : <Map<String, dynamic>>[];
+        _rolesDraft =
+            rolesData is Map &&
+                rolesData['ok'] == true &&
+                rolesData['data'] is Map
+            ? Map<String, dynamic>.from(rolesData['data'])
+            : null;
+        _roleUsers =
+            roleUsersData is Map &&
+                roleUsersData['ok'] == true &&
+                roleUsersData['data'] is List
+            ? List<Map<String, dynamic>>.from(roleUsersData['data'])
+            : <Map<String, dynamic>>[];
+        _returnsWorkflow =
+            returnsData is Map &&
+                returnsData['ok'] == true &&
+                returnsData['data'] is List
+            ? List<Map<String, dynamic>>.from(returnsData['data'])
+            : <Map<String, dynamic>>[];
+        for (final row in _roleUsers) {
+          final userId = (row['id'] ?? '').toString().trim();
+          if (userId.isEmpty) continue;
+          final templateId = (row['template_id'] ?? '').toString().trim();
+          _roleSelectionByUserId[userId] = templateId.isEmpty
+              ? 'none'
+              : templateId;
+        }
+      });
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message = 'Ошибка центра контроля: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _controlLoading = false);
+      } else {
+        _controlLoading = false;
+      }
+    }
+  }
+
+  Future<void> _exportAuditLogsCsv() async {
+    if (kIsWeb) {
+      setState(
+        () => _message = 'CSV экспорт аудита сейчас доступен в desktop версии',
+      );
+      return;
+    }
+    try {
+      final resp = await authService.dio.get<List<int>>(
+        '/api/admin/ops/audit/logs/export',
+        queryParameters: {
+          if (_auditActionCtrl.text.trim().isNotEmpty)
+            'action': _auditActionCtrl.text.trim(),
+        },
+        options: Options(responseType: ResponseType.bytes),
+      );
+      final bytes = resp.data;
+      if (bytes == null || bytes.isEmpty) {
+        throw Exception('Пустой CSV');
+      }
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Сохранить CSV журнала',
+        fileName: 'audit_log.csv',
+        type: FileType.custom,
+        allowedExtensions: const ['csv'],
+      );
+      if (path == null || path.trim().isEmpty) {
+        setState(() => _message = 'Сохранение CSV отменено');
+        return;
+      }
+      final file = File(path);
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(bytes, flush: true);
+      if (mounted) {
+        setState(() => _message = 'CSV сохранен: $path');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка CSV: ${_extractDioError(e)}');
+      }
+    }
+  }
+
+  Future<void> _releaseAntifraudBlock(String id) async {
+    setState(() => _message = '');
+    try {
+      await authService.dio.patch(
+        '/api/admin/ops/antifraud/blocks/$id/release',
+      );
+      await _loadControlCenter(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Блокировка снята');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка снятия блокировки: ${_extractDioError(e)}',
+        );
+      }
+    }
+  }
+
+  Future<void> _openRoleTemplateEditor({Map<String, dynamic>? template}) async {
+    if (!_ensurePermission(
+      'tenant.users.manage',
+      'Недостаточно прав для управления шаблонами ролей',
+    )) {
+      return;
+    }
+    final modules = _asMapList(_rolesDraft?['modules']);
+    if (modules.isEmpty) {
+      setState(() => _message = 'Список модулей прав пока недоступен');
+      return;
+    }
+
+    final isEdit = template != null;
+    final existingPermissions = _asMap(template?['permissions']);
+    _roleTemplateTitleCtrl.text = (template?['title'] ?? '').toString();
+    _roleTemplateCodeCtrl.text = (template?['code'] ?? '').toString();
+    _roleTemplateDescriptionCtrl.text = (template?['description'] ?? '')
+        .toString();
+
+    final selected = <String, bool>{};
+    for (final module in modules) {
+      final key = (module['key'] ?? '').toString();
+      if (key.isEmpty) continue;
+      selected[key] = existingPermissions[key] == true;
+    }
+    selected['all'] = existingPermissions['all'] == true;
+
+    final payload = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            return AlertDialog(
+              title: Text(isEdit ? 'Редактировать шаблон' : 'Новый шаблон'),
+              content: SizedBox(
+                width: 560,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextField(
+                        controller: _roleTemplateTitleCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Название',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: _roleTemplateTitleCtrl,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: _roleTemplateCodeCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Code (a-z,0-9,-,_)',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: _roleTemplateCodeCtrl,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: _roleTemplateDescriptionCtrl,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Описание',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: _roleTemplateDescriptionCtrl,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      SwitchListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Полный доступ (all)'),
+                        value: selected['all'] == true,
+                        onChanged: (v) {
+                          setDialogState(() {
+                            selected['all'] = v;
+                            if (v) {
+                              for (final module in modules) {
+                                final key = (module['key'] ?? '').toString();
+                                if (key.isNotEmpty) selected[key] = true;
+                              }
+                            }
+                          });
+                        },
+                      ),
+                      const Divider(height: 16),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: modules.map((module) {
+                          final key = (module['key'] ?? '').toString();
+                          final title = (module['title'] ?? key).toString();
+                          final on = selected[key] == true;
+                          return FilterChip(
+                            selected: on,
+                            label: Text(title),
+                            onSelected: (value) {
+                              setDialogState(() {
+                                selected[key] = value;
+                                if (!value) selected['all'] = false;
+                              });
+                            },
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final permissions = <String, dynamic>{};
+                    if (selected['all'] == true) {
+                      permissions['all'] = true;
+                    } else {
+                      for (final module in modules) {
+                        final key = (module['key'] ?? '').toString();
+                        if (key.isNotEmpty && selected[key] == true) {
+                          permissions[key] = true;
+                        }
+                      }
+                    }
+                    Navigator.pop(ctx, {
+                      'title': _roleTemplateTitleCtrl.text.trim(),
+                      'code': _roleTemplateCodeCtrl.text.trim(),
+                      'description': _roleTemplateDescriptionCtrl.text.trim(),
+                      'permissions': permissions,
+                    });
+                  },
+                  child: Text(isEdit ? 'Сохранить' : 'Создать'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (payload == null) return;
+    await _saveRoleTemplate(payload, id: (template?['id'] ?? '').toString());
+  }
+
+  Future<void> _saveRoleTemplate(
+    Map<String, dynamic> payload, {
+    String id = '',
+  }) async {
+    if (!_ensurePermission(
+      'tenant.users.manage',
+      'Недостаточно прав для сохранения шаблона ролей',
+    )) {
+      return;
+    }
+    if (_roleTemplateSaving) return;
+    setState(() {
+      _roleTemplateSaving = true;
+      _message = '';
+    });
+    try {
+      final isEdit = id.trim().isNotEmpty;
+      if (isEdit) {
+        await authService.dio.patch(
+          '/api/admin/ops/roles/templates/$id',
+          data: payload,
+        );
+      } else {
+        await authService.dio.post(
+          '/api/admin/ops/roles/templates',
+          data: payload,
+        );
+      }
+      await _loadControlCenter(silent: true);
+      if (mounted) {
+        setState(
+          () =>
+              _message = isEdit ? 'Шаблон роли обновлен' : 'Шаблон роли создан',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка шаблона ролей: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _roleTemplateSaving = false);
+      }
+    }
+  }
+
+  Future<void> _deleteRoleTemplate(Map<String, dynamic> template) async {
+    if (!_ensurePermission(
+      'tenant.users.manage',
+      'Недостаточно прав для удаления шаблона ролей',
+    )) {
+      return;
+    }
+    final id = (template['id'] ?? '').toString().trim();
+    if (id.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Удалить шаблон роли?'),
+        content: const Text(
+          'Шаблон будет удалён, а его назначения пользователям будут сброшены.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setState(() => _message = '');
+    try {
+      await authService.dio.delete('/api/admin/ops/roles/templates/$id');
+      await _loadControlCenter(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Шаблон роли удален');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка удаления шаблона: ${_extractDioError(e)}',
+        );
+      }
+    }
+  }
+
+  Future<void> _assignRoleTemplateToUser({
+    required String userId,
+    required String templateId,
+  }) async {
+    if (!_ensurePermission(
+      'tenant.users.manage',
+      'Недостаточно прав для назначения прав пользователю',
+    )) {
+      return;
+    }
+    if (userId.trim().isEmpty || _roleAssignBusy) return;
+    setState(() {
+      _roleAssignBusy = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/ops/roles/assign',
+        data: {
+          'user_id': userId,
+          'template_id': templateId == 'none' ? '' : templateId,
+        },
+      );
+      await _loadControlCenter(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Права пользователя обновлены');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка назначения прав: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _roleAssignBusy = false);
+      }
+    }
+  }
+
+  Future<void> _loadRoleUsersOnly() async {
+    if (!_ensurePermission(
+      'tenant.users.manage',
+      'Недостаточно прав для просмотра пользователей роли',
+    )) {
+      return;
+    }
+    if (_roleUsersLoading) return;
+    setState(() {
+      _roleUsersLoading = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/roles/users',
+        queryParameters: {
+          if (_roleUserSearchCtrl.text.trim().isNotEmpty)
+            'search': _roleUserSearchCtrl.text.trim(),
+          'limit': 200,
+        },
+      );
+      final data = resp.data;
+      final users = data is Map && data['ok'] == true && data['data'] is List
+          ? List<Map<String, dynamic>>.from(data['data'])
+          : <Map<String, dynamic>>[];
+      if (!mounted) return;
+      setState(() {
+        _roleUsers = users;
+        for (final row in users) {
+          final userId = (row['id'] ?? '').toString().trim();
+          if (userId.isEmpty) continue;
+          final templateId = (row['template_id'] ?? '').toString().trim();
+          _roleSelectionByUserId[userId] = templateId.isEmpty
+              ? 'none'
+              : templateId;
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () =>
+              _message = 'Ошибка списка пользователей: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _roleUsersLoading = false);
+      }
+    }
+  }
+
+  Future<void> _applyReturnsAction(
+    Map<String, dynamic> claim,
+    String action,
+  ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для управления возвратами',
+    )) {
+      return;
+    }
+    final claimId = (claim['id'] ?? '').toString().trim();
+    if (claimId.isEmpty) return;
+    String? amount;
+    if (action == 'approve_discount') {
+      amount = await _askText(
+        title: 'Сумма скидки',
+        label: 'Введите сумму скидки',
+        initial: (claim['requested_amount'] ?? '').toString(),
+      );
+      if (amount == null) return;
+    }
+    setState(() {
+      _returnsActionBusy = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/ops/returns/workflow/$claimId/action',
+        data: {
+          'action': action,
+          if (amount != null) 'approved_amount': double.tryParse(amount),
+        },
+      );
+      await _loadControlCenter(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Статус заявки обновлен');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка workflow: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _returnsActionBusy = false);
+      }
+    }
+  }
+
+  Future<void> _loadDiagnostics({bool silent = false}) async {
+    if (!_isCreatorBase()) return;
+    if (!silent && mounted) {
+      setState(() => _diagnosticsLoading = true);
+    } else {
+      _diagnosticsLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/diagnostics/center',
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        if (!mounted) return;
+        setState(
+          () => _diagnosticsData = Map<String, dynamic>.from(data['data']),
+        );
+      } else if (!silent && mounted) {
+        setState(() => _message = 'Не удалось загрузить диагностику');
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(() => _message = 'Ошибка диагностики: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _diagnosticsLoading = false);
+      } else {
+        _diagnosticsLoading = false;
+      }
+    }
+  }
+
+  Future<void> _loadSmartNotificationSettings({bool silent = false}) async {
+    if (!_isCreatorBase()) return;
+    if (!silent && mounted) {
+      setState(() => _smartNotifyLoading = true);
+    } else {
+      _smartNotifyLoading = true;
+    }
+    try {
+      final responses = await Future.wait([
+        authService.dio.get('/api/admin/ops/notifications/settings'),
+        authService.dio.get(
+          '/api/admin/ops/notifications/history',
+          queryParameters: {'limit': 30},
+        ),
+      ]);
+      final data = responses[0].data;
+      final historyData = responses[1].data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final settings = Map<String, dynamic>.from(data['data']);
+        final history =
+            historyData is Map &&
+                historyData['ok'] == true &&
+                historyData['data'] is List
+            ? List<Map<String, dynamic>>.from(historyData['data'])
+            : <Map<String, dynamic>>[];
+        if (!mounted) return;
+        setState(() {
+          _smartNotifySettings = settings;
+          _smartNotifyHistory = history;
+          _notificationQuietFromCtrl.text = (settings['quiet_from'] ?? '')
+              .toString();
+          _notificationQuietToCtrl.text = (settings['quiet_to'] ?? '')
+              .toString();
+        });
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message = 'Ошибка smart-уведомлений: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _smartNotifyLoading = false);
+      } else {
+        _smartNotifyLoading = false;
+      }
+    }
+  }
+
+  Future<void> _saveSmartNotificationSettings() async {
+    if (!_isCreatorBase()) return;
+    final current = _smartNotifySettings ?? const <String, dynamic>{};
+    final enabledTypes = _asMap(current['enabled_types']);
+    final priorities = _asMap(current['priorities']);
+    setState(() => _smartNotifyLoading = true);
+    try {
+      await authService.dio.put(
+        '/api/admin/ops/notifications/settings',
+        data: {
+          'enabled_types': {
+            'order': enabledTypes['order'] != false,
+            'support': enabledTypes['support'] != false,
+            'delivery': enabledTypes['delivery'] != false,
+          },
+          'priorities': {
+            'order': (priorities['order'] ?? 'high').toString(),
+            'support': (priorities['support'] ?? 'normal').toString(),
+            'delivery': (priorities['delivery'] ?? 'high').toString(),
+          },
+          'quiet_hours_enabled': current['quiet_hours_enabled'] == true,
+          'quiet_from': _notificationQuietFromCtrl.text.trim(),
+          'quiet_to': _notificationQuietToCtrl.text.trim(),
+          'test_mode': true,
+        },
+      );
+      await _loadSmartNotificationSettings(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Настройки smart-уведомлений сохранены');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка smart-настроек: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _smartNotifyLoading = false);
+    }
+  }
+
+  Future<void> _sendSmartNotificationTest() async {
+    if (!_isCreatorBase()) return;
+    setState(() => _smartNotifyLoading = true);
+    try {
+      await authService.dio.post(
+        '/api/admin/ops/notifications/test',
+        data: {
+          'type': _smartNotifyType,
+          'priority': _smartNotifyPriority,
+          'title': 'Тест: ${_smartNotifyType.toUpperCase()}',
+          'message':
+              'Проверка типа $_smartNotifyType с приоритетом $_smartNotifyPriority',
+        },
+      );
+      await _loadSmartNotificationSettings(silent: true);
+      if (mounted) {
+        setState(() => _message = 'Тестовое уведомление отправлено');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка теста уведомления: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _smartNotifyLoading = false);
+    }
+  }
+
+  Future<void> _runDemoModeSeed() async {
+    if (!_isCreatorBase()) return;
+    setState(() {
+      _demoModeBusy = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/ops/demo-mode/seed',
+        data: {'clients': 12, 'products': 20},
+      );
+      final data = resp.data;
+      final payload = data is Map && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
+      await _reloadAll();
+      if (mounted) {
+        setState(
+          () => _message =
+              'Демо-режим готов: клиенты ${payload['clients_created_or_reused'] ?? 0}, посты ${payload['products_queued'] ?? 0}',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка demo-режима: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) setState(() => _demoModeBusy = false);
+    }
+  }
+
+  Future<String?> _askText({
+    required String title,
+    required String label,
+    String initial = '',
+  }) async {
+    final ctrl = TextEditingController(text: initial);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: ctrl,
+          decoration: InputDecoration(labelText: label),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    return result;
+  }
+
+  Future<bool> _downloadOpsDocument({
+    required String kind,
+    required String format,
+    required String batchId,
+  }) async {
+    if (kind != 'finance_summary' && batchId.trim().isEmpty) return false;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get<List<int>>(
+        '/api/admin/ops/documents/export',
+        queryParameters: {
+          'kind': kind,
+          'format': format,
+          if (batchId.trim().isNotEmpty) 'batch_id': batchId,
+        },
+        options: Options(responseType: ResponseType.bytes),
+      );
+      final bytes = resp.data;
+      if (bytes == null || bytes.isEmpty) {
+        throw Exception('Пустой файл');
+      }
+      if (kIsWeb) {
+        throw Exception('Экспорт сейчас доступен в desktop версии');
+      }
+      final ext = format == 'pdf' ? 'pdf' : 'xlsx';
+      final filePath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Сохранить документ',
+        fileName: kind == 'finance_summary'
+            ? 'finance_summary.$ext'
+            : '${kind}_$batchId.$ext',
+        type: FileType.custom,
+        allowedExtensions: [ext],
+      );
+      if (filePath == null || filePath.trim().isEmpty) {
+        if (mounted) {
+          setState(() => _message = 'Сохранение документа отменено');
+        }
+        return false;
+      }
+      final file = File(filePath);
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(bytes, flush: true);
+      if (mounted) {
+        setState(() => _message = 'Документ сохранен: $filePath');
+      }
+      return true;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка документа: ${_extractDioError(e)}');
+      }
+      return false;
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _openRouteOrderEditor() async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для ручной правки маршрута',
+    )) {
+      return;
+    }
+    final activeBatch = _deliveryActiveBatch;
+    final batchId = (activeBatch?['id'] ?? '').toString();
+    if (batchId.isEmpty) return;
+    final customers = _asMapList(activeBatch?['customers'])
+        .where((item) => (item['call_status'] ?? '').toString() == 'accepted')
+        .toList();
+    if (customers.isEmpty) {
+      setState(() => _message = 'Нет подтвержденных клиентов для сортировки');
+      return;
+    }
+    customers.sort((a, b) {
+      final ar = _toInt(a['route_order'], fallback: 10000);
+      final br = _toInt(b['route_order'], fallback: 10000);
+      return ar.compareTo(br);
+    });
+
+    final reordered = await showDialog<List<Map<String, dynamic>>>(
+      context: context,
+      builder: (ctx) {
+        final local = customers
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList(growable: true);
+        return StatefulBuilder(
+          builder: (context, setLocalState) => AlertDialog(
+            title: const Text('Ручной порядок маршрута'),
+            content: SizedBox(
+              width: 520,
+              height: 480,
+              child: ReorderableListView.builder(
+                itemCount: local.length,
+                onReorder: (oldIndex, newIndex) {
+                  if (newIndex > oldIndex) newIndex -= 1;
+                  final item = local.removeAt(oldIndex);
+                  local.insert(newIndex, item);
+                  setLocalState(() {});
+                },
+                itemBuilder: (context, i) {
+                  final row = local[i];
+                  final name = (row['customer_name'] ?? 'Клиент').toString();
+                  final address = (row['address_text'] ?? '').toString();
+                  return ListTile(
+                    key: ValueKey(row['id']),
+                    leading: CircleAvatar(child: Text('${i + 1}')),
+                    title: Text(name),
+                    subtitle: Text(address),
+                    trailing: const Icon(Icons.drag_indicator),
+                  );
+                },
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, local),
+                child: const Text('Сохранить порядок'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    if (reordered == null) return;
+
+    setState(() => _deliverySaving = true);
+    try {
+      final payload = reordered.asMap().entries.map((entry) {
+        return {
+          'customer_id': (entry.value['id'] ?? '').toString(),
+          'route_order': entry.key + 1,
+        };
+      }).toList();
+      await authService.dio.patch(
+        '/api/admin/delivery/batches/$batchId/route-order',
+        data: {'orders': payload},
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Маршрут обновлен вручную');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка маршрута: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
       }
     }
   }
@@ -1335,6 +2686,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _saveDeliverySettings() async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для управления доставкой',
+    )) {
+      return;
+    }
     final threshold = int.tryParse(_deliveryThresholdCtrl.text.trim());
     if (threshold == null || threshold < 0) {
       setState(() => _message = 'Введите корректную сумму для доставки');
@@ -1370,6 +2727,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _generateDeliveryBatch() async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для запуска рассылки доставки',
+    )) {
+      return;
+    }
     final threshold = int.tryParse(_deliveryThresholdCtrl.text.trim());
     if (threshold == null || threshold < 0) {
       setState(() => _message = 'Введите корректную сумму для доставки');
@@ -1417,6 +2780,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _resetDeliveryTesting() async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для очистки доставки',
+    )) {
+      return;
+    }
     setState(() {
       _deliverySaving = true;
       _message = '';
@@ -1636,6 +3005,12 @@ class _AdminPanelState extends State<AdminPanel>
     Map<String, dynamic> customer, {
     required bool accepted,
   }) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для изменения решения по доставке',
+    )) {
+      return;
+    }
     final customerId = (customer['id'] ?? '').toString().trim();
     if (customerId.isEmpty) return;
 
@@ -1711,6 +3086,12 @@ class _AdminPanelState extends State<AdminPanel>
     String batchId,
     Map<String, dynamic> customer,
   ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для редактирования логистики',
+    )) {
+      return;
+    }
     final customerId = (customer['id'] ?? '').toString().trim();
     if (customerId.isEmpty) return;
     final result = await _askDeliveryLogisticsData(customer);
@@ -1741,6 +3122,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _manualAddDeliveryCustomer(String batchId) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для ручного добавления клиента',
+    )) {
+      return;
+    }
     final phoneCtrl = TextEditingController();
     final addressCtrl = TextEditingController();
     final afterCtrl = TextEditingController();
@@ -1966,6 +3353,12 @@ class _AdminPanelState extends State<AdminPanel>
     String batchId,
     Map<String, dynamic> customer,
   ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для смены курьера',
+    )) {
+      return;
+    }
     final courierNames = (_deliveryActiveBatch?['courier_names'] is List)
         ? List<String>.from(
             (_deliveryActiveBatch?['courier_names'] as List).map(
@@ -2049,6 +3442,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _assignCouriers(String batchId) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для распределения курьеров',
+    )) {
+      return;
+    }
     final courierNames = _courierNamesCtrl.text
         .split('\n')
         .map((line) => line.trim())
@@ -2093,6 +3492,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _confirmDeliveryHandoff(String batchId) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для передачи курьерам',
+    )) {
+      return;
+    }
     setState(() {
       _deliverySaving = true;
       _message = '';
@@ -2117,6 +3522,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _completeDeliveryBatch(String batchId) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для завершения доставки',
+    )) {
+      return;
+    }
     setState(() {
       _deliverySaving = true;
       _message = '';
@@ -2154,6 +3565,12 @@ class _AdminPanelState extends State<AdminPanel>
     String batchId,
     Map<String, dynamic> customer,
   ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для изменения маршрута',
+    )) {
+      return;
+    }
     final customerId = (customer['id'] ?? '').toString().trim();
     if (customerId.isEmpty) return;
     final name = (customer['customer_name'] ?? 'клиента').toString();
@@ -2243,7 +3660,7 @@ class _AdminPanelState extends State<AdminPanel>
         await _reloadAll();
         if (mounted) {
           setState(() => _message = 'Канал создан');
-          _tabController.animateTo(1);
+          _animateToTab('channels');
         }
       } else {
         setState(() => _message = 'Не удалось создать канал');
@@ -2809,6 +4226,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _dispatchClientOrders() async {
+    if (!_ensurePermission(
+      'reservation.fulfill',
+      'Недостаточно прав для отправки заказов клиентов',
+    )) {
+      return;
+    }
     setState(() {
       _dispatchingOrders = true;
       _message = '';
@@ -2862,6 +4285,12 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _publishPendingPosts() async {
+    if (!_ensurePermission(
+      'product.publish',
+      'Недостаточно прав для публикации постов',
+    )) {
+      return;
+    }
     setState(() {
       _publishing = true;
       _message = '';
@@ -3622,6 +5051,41 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  Widget _buildNoAccessTab() {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.lock_outline_rounded,
+              size: 46,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Недостаточно прав для раздела администрирования',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Обратитесь к арендатору или создателю, чтобы выдать нужные права.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildCreateTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -4221,7 +5685,9 @@ class _AdminPanelState extends State<AdminPanel>
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
-              onPressed: _publishing ? null : _publishPendingPosts,
+              onPressed: (_publishing || !_hasPermission('product.publish'))
+                  ? null
+                  : _publishPendingPosts,
               icon: _publishing
                   ? const SizedBox(
                       width: 16,
@@ -4241,7 +5707,10 @@ class _AdminPanelState extends State<AdminPanel>
           SizedBox(
             width: double.infinity,
             child: OutlinedButton.icon(
-              onPressed: _dispatchingOrders ? null : _dispatchClientOrders,
+              onPressed:
+                  (_dispatchingOrders || !_hasPermission('reservation.fulfill'))
+                  ? null
+                  : _dispatchClientOrders,
               icon: _dispatchingOrders
                   ? const SizedBox(
                       width: 16,
@@ -4511,6 +5980,53 @@ class _AdminPanelState extends State<AdminPanel>
                   _buildModerationChip('ID ${ticketId.substring(0, 8)}'),
               ],
             ),
+            if (!archived && _supportTemplates.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String>(
+                value: (_ticketTemplateById[ticketId] ?? '').isEmpty
+                    ? null
+                    : _ticketTemplateById[ticketId],
+                isExpanded: true,
+                items: _supportTemplates.map((template) {
+                  final id = (template['id'] ?? '').toString();
+                  final title = (template['title'] ?? 'Шаблон').toString();
+                  final category = (template['category'] ?? '').toString();
+                  return DropdownMenuItem<String>(
+                    value: id,
+                    child: Text('$title • ${_supportCategoryLabel(category)}'),
+                  );
+                }).toList(),
+                onChanged: (value) {
+                  setState(() => _ticketTemplateById[ticketId] = value ?? '');
+                },
+                decoration: const InputDecoration(
+                  labelText: 'Быстрый шаблон ответа',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _supportTemplateExtraCtrl,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                  labelText: 'Доп. текст (опционально)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton.icon(
+                  onPressed: _supportQuickReplyBusy
+                      ? null
+                      : () => _sendSupportQuickReply(ticket),
+                  icon: const Icon(Icons.flash_on_outlined),
+                  label: Text(
+                    _supportQuickReplyBusy ? 'Отправка...' : 'Отправить шаблон',
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -4519,7 +6035,10 @@ class _AdminPanelState extends State<AdminPanel>
 
   Widget _buildSupportTab() {
     return RefreshIndicator(
-      onRefresh: () => _loadSupportTickets(silent: true),
+      onRefresh: () async {
+        await _loadSupportTickets(silent: true);
+        await _loadSupportTemplates(silent: true);
+      },
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -4549,6 +6068,115 @@ class _AdminPanelState extends State<AdminPanel>
               padding: EdgeInsets.only(top: 12),
               child: LinearProgressIndicator(),
             ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Шаблоны автоответов',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: _supportTemplatesLoading
+                            ? null
+                            : () => _loadSupportTemplates(),
+                        icon: const Icon(Icons.refresh),
+                        tooltip: 'Обновить шаблоны',
+                      ),
+                    ],
+                  ),
+                  if (_supportTemplatesLoading)
+                    const LinearProgressIndicator(minHeight: 2),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _supportTemplateTitleCtrl,
+                          decoration: withInputLanguageBadge(
+                            const InputDecoration(
+                              labelText: 'Название шаблона',
+                              border: OutlineInputBorder(),
+                            ),
+                            controller: _supportTemplateTitleCtrl,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        width: 180,
+                        child: DropdownButtonFormField<String>(
+                          value: _supportTemplateCategory,
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'general',
+                              child: Text('Общее'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'product',
+                              child: Text('Товар'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'delivery',
+                              child: Text('Доставка'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'cart',
+                              child: Text('Корзина'),
+                            ),
+                          ],
+                          onChanged: (v) {
+                            if (v == null) return;
+                            setState(() => _supportTemplateCategory = v);
+                          },
+                          decoration: const InputDecoration(
+                            labelText: 'Категория',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _supportTemplateBodyCtrl,
+                    minLines: 2,
+                    maxLines: 4,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText:
+                            'Текст шаблона ({customer_name}, {cart_total}, {processed_total}, {delivery_status})',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _supportTemplateBodyCtrl,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: FilledButton.icon(
+                      onPressed: _supportTemplateSaving
+                          ? null
+                          : _createSupportTemplate,
+                      icon: const Icon(Icons.add_comment_outlined),
+                      label: Text(
+                        _supportTemplateSaving
+                            ? 'Сохранение...'
+                            : 'Сохранить шаблон',
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
           const SizedBox(height: 12),
           Text(
             'Активные тикеты',
@@ -4587,6 +6215,863 @@ class _AdminPanelState extends State<AdminPanel>
             ..._supportArchivedTickets.map(
               (ticket) => _buildSupportTicketCard(ticket, archived: true),
             ),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  Widget _metricCard({
+    required String title,
+    required String value,
+    IconData icon = Icons.insights_outlined,
+  }) {
+    final theme = Theme.of(context);
+    return Container(
+      width: 210,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: theme.colorScheme.primary),
+          const SizedBox(height: 8),
+          Text(
+            title,
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFinanceTab() {
+    final summary = _asMap(_financeData?['summary']);
+    final byDay = _asMapList(_financeData?['by_day']);
+    final periodLabels = {
+      'day': 'День',
+      'week': 'Неделя',
+      'month': 'Месяц',
+      'all': 'Все время',
+    };
+    return RefreshIndicator(
+      onRefresh: () => _loadFinanceSummary(),
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Финансовый модуль',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ),
+              IconButton(
+                onPressed: _financeLoading ? null : () => _loadFinanceSummary(),
+                icon: const Icon(Icons.refresh),
+              ),
+              IconButton(
+                onPressed: _financeLoading
+                    ? null
+                    : () => _downloadOpsDocument(
+                        kind: 'finance_summary',
+                        format: 'excel',
+                        batchId: '',
+                      ),
+                icon: const Icon(Icons.download_outlined),
+                tooltip: 'Экспорт XLSX',
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: periodLabels.entries.map((entry) {
+              return ChoiceChip(
+                selected: _financePeriod == entry.key,
+                label: Text(entry.value),
+                onSelected: _financeLoading
+                    ? null
+                    : (selected) {
+                        if (!selected) return;
+                        setState(() => _financePeriod = entry.key);
+                        _loadFinanceSummary();
+                      },
+              );
+            }).toList(),
+          ),
+          if (_financeLoading) ...[
+            const SizedBox(height: 12),
+            const LinearProgressIndicator(),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _metricCard(
+                title: 'Выручка',
+                value: _formatMoney(summary['revenue']),
+                icon: Icons.trending_up,
+              ),
+              _metricCard(
+                title: 'Маржа',
+                value: _formatMoney(summary['margin']),
+                icon: Icons.show_chart,
+              ),
+              _metricCard(
+                title: 'Прибыль',
+                value: _formatMoney(summary['profit']),
+                icon: Icons.account_balance_wallet_outlined,
+              ),
+              _metricCard(
+                title: 'Средний чек',
+                value: _formatMoney(summary['avg_check']),
+                icon: Icons.receipt_long_outlined,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Динамика по дням (последние 30 дней)',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          if (byDay.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(12),
+                child: Text('Нет данных для выбранного периода'),
+              ),
+            )
+          else
+            ...byDay.reversed.take(14).map((row) {
+              return Card(
+                child: ListTile(
+                  dense: true,
+                  title: Text((row['bucket'] ?? '').toString()),
+                  subtitle: Text(
+                    'Выручка: ${_formatMoney(row['revenue'])}\n'
+                    'Прибыль: ${_formatMoney(row['profit'])}',
+                  ),
+                  isThreeLine: true,
+                ),
+              );
+            }),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildControlTab() {
+    final rolesTemplates = _asMapList(_rolesDraft?['templates']);
+    final roleModules = _asMapList(_rolesDraft?['modules']);
+    final returnItems = _returnsWorkflow.take(20).toList();
+    final diagnostics = _asMap(_diagnosticsData);
+    final monitoring = _asMap(diagnostics['monitoring']);
+    final smartNotify = _asMap(_smartNotifySettings);
+    final canManageRoleTemplates =
+        _isCreatorBase() || _hasPermission('tenant.users.manage');
+    return RefreshIndicator(
+      onRefresh: () async {
+        await _loadControlCenter();
+        await _loadDiagnostics();
+        await _loadSmartNotificationSettings();
+      },
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Контроль и безопасность',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ),
+              IconButton(
+                onPressed: _controlLoading
+                    ? null
+                    : () async {
+                        await _loadControlCenter();
+                        await _loadDiagnostics();
+                      },
+                icon: const Icon(Icons.refresh),
+              ),
+            ],
+          ),
+          if (_controlLoading) ...[
+            const SizedBox(height: 8),
+            const LinearProgressIndicator(),
+          ],
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Audit log',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _auditActionCtrl,
+                          decoration: withInputLanguageBadge(
+                            const InputDecoration(
+                              labelText: 'Фильтр action',
+                              border: OutlineInputBorder(),
+                            ),
+                            controller: _auditActionCtrl,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      FilledButton.icon(
+                        onPressed: _controlLoading
+                            ? null
+                            : () => _loadControlCenter(),
+                        icon: const Icon(Icons.filter_alt_outlined),
+                        label: const Text('Применить'),
+                      ),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                        onPressed: _exportAuditLogsCsv,
+                        icon: const Icon(Icons.download_outlined),
+                        label: const Text('CSV'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  if (_auditLogs.isEmpty)
+                    const Text('Пока нет записей в журнале')
+                  else
+                    ..._auditLogs.take(8).map((log) {
+                      final created = _formatDateTimeLabel(log['created_at']);
+                      final action = (log['action'] ?? '—').toString();
+                      final actor = (log['actor_name'] ?? 'Система').toString();
+                      final entity = (log['entity_type'] ?? '').toString();
+                      return ListTile(
+                        dense: true,
+                        title: Text(action),
+                        subtitle: Text('$created • $actor • $entity'),
+                      );
+                    }),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Антифрод',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  if (_antifraudBlocks.isEmpty)
+                    const Text('Активных блокировок нет')
+                  else
+                    ..._antifraudBlocks.take(8).map((block) {
+                      final id = (block['id'] ?? '').toString();
+                      return ListTile(
+                        dense: true,
+                        title: Text(
+                          (block['user_name'] ?? 'Пользователь').toString(),
+                        ),
+                        subtitle: Text(
+                          '${(block['reason'] ?? '').toString()}\nДо: ${_formatDateTimeLabel(block['blocked_until'])}',
+                        ),
+                        isThreeLine: true,
+                        trailing: OutlinedButton(
+                          onPressed: id.isEmpty
+                              ? null
+                              : () => _releaseAntifraudBlock(id),
+                          child: const Text('Снять'),
+                        ),
+                      );
+                    }),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Событий антифрода за период: ${_antifraudEvents.length}',
+                    style: Theme.of(context).textTheme.labelLarge,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Роли и права-конструктор (черновик)',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    (_rolesDraft?['description'] ?? '').toString(),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  if (!canManageRoleTemplates)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        'У вас режим просмотра конструктора ролей. Для изменений требуется право tenant.users.manage.',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      FilledButton.icon(
+                        onPressed:
+                            (_roleTemplateSaving || !canManageRoleTemplates)
+                            ? null
+                            : () => _openRoleTemplateEditor(),
+                        icon: const Icon(Icons.add_circle_outline),
+                        label: const Text('Новый шаблон'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed:
+                            (_roleUsersLoading || !canManageRoleTemplates)
+                            ? null
+                            : () => _loadRoleUsersOnly(),
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('Обновить пользователей'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  if (rolesTemplates.isEmpty)
+                    const Text('Шаблоны ролей пока не найдены')
+                  else
+                    ...rolesTemplates.take(10).map((row) {
+                      final title = (row['title'] ?? 'Шаблон').toString();
+                      final code = (row['code'] ?? '').toString();
+                      final assigned = _toInt(row['assigned_users']);
+                      final perms = _asMap(row['permissions']);
+                      final isSystem = row['is_system'] == true;
+                      final enabledCount = perms['all'] == true
+                          ? roleModules.length
+                          : roleModules
+                                .where(
+                                  (module) =>
+                                      perms[(module['key'] ?? '').toString()] ==
+                                      true,
+                                )
+                                .length;
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: ListTile(
+                          dense: true,
+                          title: Text(
+                            '$title (${code.isEmpty ? 'custom' : code})',
+                          ),
+                          subtitle: Text(
+                            'Права: ${perms['all'] == true ? 'полный доступ' : '$enabledCount'} • Назначено: $assigned',
+                          ),
+                          trailing: Wrap(
+                            spacing: 6,
+                            children: [
+                              OutlinedButton(
+                                onPressed:
+                                    isSystem ||
+                                        _roleTemplateSaving ||
+                                        !canManageRoleTemplates
+                                    ? null
+                                    : () => _openRoleTemplateEditor(
+                                        template: row,
+                                      ),
+                                child: const Text('Изменить'),
+                              ),
+                              OutlinedButton(
+                                onPressed:
+                                    isSystem ||
+                                        _roleTemplateSaving ||
+                                        !canManageRoleTemplates
+                                    ? null
+                                    : () => _deleteRoleTemplate(row),
+                                child: const Text('Удалить'),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _roleUserSearchCtrl,
+                    decoration: withInputLanguageBadge(
+                      InputDecoration(
+                        labelText: 'Поиск пользователя (имя, email, телефон)',
+                        border: const OutlineInputBorder(),
+                        suffixIcon: IconButton(
+                          onPressed:
+                              _roleUsersLoading || !canManageRoleTemplates
+                              ? null
+                              : () => _loadRoleUsersOnly(),
+                          icon: const Icon(Icons.search),
+                        ),
+                      ),
+                      controller: _roleUserSearchCtrl,
+                    ),
+                    onSubmitted: (_) => _loadRoleUsersOnly(),
+                  ),
+                  const SizedBox(height: 8),
+                  if (_roleUsers.isEmpty)
+                    const Text('Пользователи не найдены')
+                  else
+                    ..._roleUsers.take(20).map((user) {
+                      final userId = (user['id'] ?? '').toString().trim();
+                      final userName = _displayName(
+                        user,
+                        fallback: 'Пользователь',
+                      );
+                      final roleName = _roleLabel(
+                        (user['role'] ?? '').toString(),
+                      );
+                      final phone = (user['phone'] ?? '').toString().trim();
+                      final email = (user['email'] ?? '').toString().trim();
+                      final selectedTemplate =
+                          _roleSelectionByUserId[userId] ?? 'none';
+                      final items = <DropdownMenuItem<String>>[
+                        const DropdownMenuItem<String>(
+                          value: 'none',
+                          child: Text('Без шаблона'),
+                        ),
+                        ...rolesTemplates.map((t) {
+                          final id = (t['id'] ?? '').toString().trim();
+                          final title = (t['title'] ?? 'Шаблон').toString();
+                          return DropdownMenuItem<String>(
+                            value: id,
+                            child: Text(title),
+                          );
+                        }),
+                      ];
+                      final currentValue =
+                          items.any((item) => item.value == selectedTemplate)
+                          ? selectedTemplate
+                          : 'none';
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '$userName • $roleName',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                phone.isNotEmpty
+                                    ? 'Телефон: $phone'
+                                    : (email.isNotEmpty
+                                          ? 'Email: $email'
+                                          : 'Контакт не указан'),
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: DropdownButtonFormField<String>(
+                                      value: currentValue,
+                                      isExpanded: true,
+                                      items: items,
+                                      onChanged: (value) {
+                                        if (value == null || userId.isEmpty) {
+                                          return;
+                                        }
+                                        setState(() {
+                                          _roleSelectionByUserId[userId] =
+                                              value;
+                                        });
+                                      },
+                                      decoration: const InputDecoration(
+                                        labelText: 'Шаблон прав',
+                                        border: OutlineInputBorder(),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  FilledButton(
+                                    onPressed:
+                                        userId.isEmpty ||
+                                            _roleAssignBusy ||
+                                            !canManageRoleTemplates
+                                        ? null
+                                        : () => _assignRoleTemplateToUser(
+                                            userId: userId,
+                                            templateId:
+                                                _roleSelectionByUserId[userId] ??
+                                                'none',
+                                          ),
+                                    child: const Text('Назначить'),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Возвраты и скидки (workflow прототип)',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  if (returnItems.isEmpty)
+                    const Text('Нет заявок на возврат/скидку')
+                  else
+                    ...returnItems.map((claim) {
+                      final status = (claim['workflow_status_label'] ?? '')
+                          .toString();
+                      final customer = (claim['customer_name'] ?? 'Клиент')
+                          .toString();
+                      final product = (claim['product_title'] ?? 'Товар')
+                          .toString();
+                      final actions = (claim['available_actions'] is List)
+                          ? List<String>.from(claim['available_actions'])
+                          : const <String>[];
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '$customer • $product',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                'Статус: $status • Запрошено: ${_formatMoney(claim['requested_amount'])}',
+                              ),
+                              const SizedBox(height: 6),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: actions.map((action) {
+                                  final title = action == 'approve_return'
+                                      ? 'Подтв. возврат'
+                                      : action == 'approve_discount'
+                                      ? 'Подтв. скидку'
+                                      : action == 'reject'
+                                      ? 'Отклонить'
+                                      : 'Закрыть';
+                                  return OutlinedButton(
+                                    onPressed:
+                                        (_returnsActionBusy ||
+                                            !_hasPermission('delivery.manage'))
+                                        ? null
+                                        : () => _applyReturnsAction(
+                                            claim,
+                                            action,
+                                          ),
+                                    child: Text(title),
+                                  );
+                                }).toList(),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+          ),
+          if (_isCreatorBase()) ...[
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Умные уведомления (тест)',
+                            style: TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: _smartNotifyLoading
+                              ? null
+                              : () => _loadSmartNotificationSettings(),
+                          icon: const Icon(Icons.refresh),
+                        ),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            value: _smartNotifyType,
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'order',
+                                child: Text('Заказ'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'support',
+                                child: Text('Поддержка'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'delivery',
+                                child: Text('Доставка'),
+                              ),
+                            ],
+                            onChanged: (v) {
+                              if (v == null) return;
+                              setState(() => _smartNotifyType = v);
+                            },
+                            decoration: const InputDecoration(
+                              labelText: 'Тип',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            value: _smartNotifyPriority,
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'low',
+                                child: Text('Низкий'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'normal',
+                                child: Text('Обычный'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'high',
+                                child: Text('Высокий'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'critical',
+                                child: Text('Критичный'),
+                              ),
+                            ],
+                            onChanged: (v) {
+                              if (v == null) return;
+                              setState(() => _smartNotifyPriority = v);
+                            },
+                            decoration: const InputDecoration(
+                              labelText: 'Приоритет',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _notificationQuietFromCtrl,
+                            decoration: withInputLanguageBadge(
+                              const InputDecoration(
+                                labelText: 'Тихие часы с (HH:mm)',
+                                border: OutlineInputBorder(),
+                              ),
+                              controller: _notificationQuietFromCtrl,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: TextField(
+                            controller: _notificationQuietToCtrl,
+                            decoration: withInputLanguageBadge(
+                              const InputDecoration(
+                                labelText: 'Тихие часы до (HH:mm)',
+                                border: OutlineInputBorder(),
+                              ),
+                              controller: _notificationQuietToCtrl,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    SwitchListTile(
+                      value: smartNotify['quiet_hours_enabled'] == true,
+                      onChanged: (v) {
+                        setState(() {
+                          _smartNotifySettings = {
+                            ...smartNotify,
+                            'quiet_hours_enabled': v,
+                          };
+                        });
+                      },
+                      title: const Text('Включить тихие часы'),
+                      subtitle: const Text(
+                        'В тесте уведомления будут помечаться как тихие внутри этого окна',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _smartNotifyLoading
+                              ? null
+                              : _saveSmartNotificationSettings,
+                          icon: const Icon(Icons.save_outlined),
+                          label: const Text('Сохранить'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _smartNotifyLoading
+                              ? null
+                              : _sendSmartNotificationTest,
+                          icon: const Icon(Icons.notifications_active_outlined),
+                          label: const Text('Тест отправки'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      'История тестовых уведомлений',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    if (_smartNotifyHistory.isEmpty)
+                      const Text('Пока нет событий')
+                    else
+                      ..._smartNotifyHistory.take(8).map((event) {
+                        final type = (event['event_type'] ?? '').toString();
+                        final priority = (event['priority'] ?? '').toString();
+                        final title = (event['title'] ?? 'Уведомление')
+                            .toString();
+                        final isQuiet = event['is_quiet'] == true;
+                        return ListTile(
+                          dense: true,
+                          title: Text(title),
+                          subtitle: Text(
+                            '${_formatDateTimeLabel(event['created_at'])} • $type • $priority${isQuiet ? ' • тихо' : ''}',
+                          ),
+                        );
+                      }),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Центр диагностики создателя',
+                      style: TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 8),
+                    if (_diagnosticsLoading)
+                      const LinearProgressIndicator()
+                    else ...[
+                      Text(
+                        'API uptime: ${_toInt(_asMap(diagnostics['api'])['uptime_sec'])} сек',
+                      ),
+                      Text(
+                        'DB latency: ${_toInt(_asMap(diagnostics['database'])['latency_ms'])} ms',
+                      ),
+                      Text(
+                        'Socket clients: ${_toInt(_asMap(diagnostics['socket'])['connected_clients'])}',
+                      ),
+                      Text(
+                        'Monitoring: критичные ${_toInt(monitoring['critical'])}, ошибки ${_toInt(monitoring['error'])}',
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'Демо-режим: тестовые клиенты, товары, корзины в 1 клик',
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    FilledButton.icon(
+                      onPressed: _demoModeBusy ? null : _runDemoModeSeed,
+                      icon: const Icon(Icons.auto_awesome_outlined),
+                      label: Text(_demoModeBusy ? 'Запуск...' : 'Запустить'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 24),
         ],
       ),
@@ -4984,6 +7469,13 @@ class _AdminPanelState extends State<AdminPanel>
                           label: const Text('Добавить клиента'),
                         ),
                         OutlinedButton.icon(
+                          onPressed: _deliverySaving
+                              ? null
+                              : _openRouteOrderEditor,
+                          icon: const Icon(Icons.drag_indicator_outlined),
+                          label: const Text('Ручной порядок'),
+                        ),
+                        OutlinedButton.icon(
                           onPressed:
                               _deliverySaving ||
                                   (activeBatch['status'] ?? '').toString() ==
@@ -5015,6 +7507,28 @@ class _AdminPanelState extends State<AdminPanel>
                                 ),
                           icon: const Icon(Icons.table_view_outlined),
                           label: const Text('Excel'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _deliverySaving
+                              ? null
+                              : () => _downloadOpsDocument(
+                                  kind: 'route_sheet',
+                                  format: 'pdf',
+                                  batchId: (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.picture_as_pdf_outlined),
+                          label: const Text('PDF маршрут'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _deliverySaving
+                              ? null
+                              : () => _downloadOpsDocument(
+                                  kind: 'packing_checklist',
+                                  format: 'excel',
+                                  batchId: (activeBatch['id'] ?? '').toString(),
+                                ),
+                          icon: const Icon(Icons.inventory_2_outlined),
+                          label: const Text('Чек-лист сборки'),
                         ),
                       ],
                     ),
@@ -5310,25 +7824,23 @@ class _AdminPanelState extends State<AdminPanel>
 
   @override
   Widget build(BuildContext context) {
-    final tabs = <Tab>[
-      const Tab(text: 'Создание'),
-      const Tab(text: 'Каналы'),
-      const Tab(text: 'Модерация'),
-      const Tab(text: 'Доставка'),
-      const Tab(text: 'Поддержка'),
-    ];
-    final tabViews = <Widget>[
-      _buildCreateTab(),
-      _buildSettingsTab(),
-      _buildModerationTab(),
-      _buildDeliveryTab(),
-      _buildSupportTab(),
-    ];
+    if (_tabController == null || _visibleTabs.isEmpty) {
+      _rebuildVisibleTabs(force: true, notify: false);
+    }
+    final controller = _tabController;
+    final tabs = _visibleTabs.map((tab) => Tab(text: tab.label)).toList();
+    final tabViews = _visibleTabs.map((tab) => tab.builder()).toList();
+    if (controller == null || tabs.isEmpty || tabViews.isEmpty) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Админ-панель')),
+        body: SafeArea(child: _buildNoAccessTab()),
+      );
+    }
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Админ-панель'),
-        bottom: TabBar(controller: _tabController, tabs: tabs),
+        bottom: TabBar(controller: controller, tabs: tabs),
       ),
       body: SafeArea(
         child: Column(
@@ -5342,7 +7854,7 @@ class _AdminPanelState extends State<AdminPanel>
                 ),
               ),
             Expanded(
-              child: TabBarView(controller: _tabController, children: tabViews),
+              child: TabBarView(controller: controller, children: tabViews),
             ),
           ],
         ),

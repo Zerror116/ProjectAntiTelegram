@@ -93,21 +93,35 @@ class _ProfileScreenState extends State<ProfileScreen> {
     return '$base/$value';
   }
 
-  bool get _isClientAccount =>
-      (authService.currentUser?.role ?? '').toLowerCase().trim() == 'client';
+  String get _effectiveRole => (authService.effectiveRole).toLowerCase().trim();
 
-  bool get _isTenantManagerAccount {
-    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
-    return role == 'tenant' || role == 'creator';
+  bool get _isClientAccount => _effectiveRole == 'client';
+
+  bool get _canManageTenantUsers {
+    return authService.hasPermission('tenant.users.manage');
   }
 
+  bool get _canManageTenantInvites {
+    return authService.hasPermission('tenant.invites.manage') ||
+        _canManageTenantUsers;
+  }
+
+  bool get _isTenantManagerAccount => _canManageTenantUsers;
+
   Options _tenantManagerRequestOptions() {
-    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
-    if (role == 'creator') {
-      return Options(headers: const {'X-View-Role': 'creator'});
-    }
+    final role = _effectiveRole;
     if (role == 'tenant') {
       return Options(headers: const {'X-View-Role': 'tenant'});
+    }
+    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    if (baseRole == 'creator') {
+      return Options(headers: const {'X-View-Role': 'creator'});
+    }
+    if (baseRole == 'tenant') {
+      return Options(headers: const {'X-View-Role': 'tenant'});
+    }
+    if (role == 'creator') {
+      return Options(headers: const {'X-View-Role': 'creator'});
     }
     return Options();
   }
@@ -594,6 +608,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _fetchPublicInviteCode() async {
+    if (!_canManageTenantInvites) return;
     if (_inviteBusy) return;
     setState(() {
       _inviteBusy = true;
@@ -614,7 +629,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
             try {
               final uri = Uri.parse(link);
               code =
-                  (uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '')
+                  (uri.queryParameters['invite'] ??
+                          uri.queryParameters['code'] ??
+                          '')
                       .trim()
                       .toUpperCase();
             } catch (_) {}
@@ -646,7 +663,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _loadTenantClients({String? searchOverride}) async {
-    if (!_isTenantManagerAccount) return;
+    if (!_canManageTenantUsers) return;
     final search = (searchOverride ?? _tenantClientSearchCtrl.text).trim();
     setState(() {
       _tenantClientsLoading = true;
@@ -678,6 +695,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _setTenantClientRole(String userId, String role) async {
+    if (!_canManageTenantUsers) return;
     final id = userId.trim();
     if (id.isEmpty) return;
     setState(() {
@@ -706,6 +724,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _openTenantRoleMenu(Map<String, dynamic> userRow) async {
+    if (!_canManageTenantUsers) return;
     final userId = (userRow['id'] ?? '').toString().trim();
     final currentRole = (userRow['role'] ?? 'client').toString().trim();
     if (userId.isEmpty) return;
@@ -1098,10 +1117,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
         : (_email.isNotEmpty ? _email : 'Без имени');
     final actualRole = authService.currentUser?.role ?? 'client';
     final effectiveRole = authService.effectiveRole;
-    final isTenantManagerAccount = _isTenantManagerAccount;
-    final canShareInvite = isTenantManagerAccount;
+    final canManageClients = _canManageTenantUsers;
+    final canShareInvite = _canManageTenantInvites;
     final isPlatformCreator =
         actualRole.toLowerCase().trim() == 'creator' &&
+        effectiveRole.toLowerCase().trim() == 'creator' &&
         (authService.currentUser?.email ?? '').toLowerCase().trim() ==
             _platformCreatorEmail;
     final tenantLabel =
@@ -1300,7 +1320,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                     ),
                   ],
-                  if (isTenantManagerAccount) ...[
+                  if (canManageClients) ...[
                     const SizedBox(height: 16),
                     _sectionCard(
                       child: Column(

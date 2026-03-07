@@ -1,6 +1,7 @@
 // server/src/routes/auth.js
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const validator = require('validator');
 const jwt = require('jsonwebtoken');
@@ -39,8 +40,21 @@ const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
 // Настройки для Creator
 const CREATOR_EMAIL = PLATFORM_CREATOR_EMAIL;
-const CREATOR_SECRET = process.env.CREATOR_SECRET || 'Макарова Лиза';
+const CREATOR_SECRET = String(process.env.CREATOR_SECRET || '').trim();
+const CREATOR_SECRET_HASH = String(process.env.CREATOR_SECRET_HASH || '')
+  .trim()
+  .toLowerCase();
 const MAX_ACCOUNTS_PER_DEVICE = 2;
+
+if (
+  process.env.NODE_ENV === 'production' &&
+  !CREATOR_SECRET &&
+  !CREATOR_SECRET_HASH
+) {
+  throw new Error(
+    'CREATOR_SECRET or CREATOR_SECRET_HASH must be configured in production',
+  );
+}
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
@@ -48,6 +62,30 @@ function signToken(payload) {
 
 function buildSessionExpiry() {
   return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+}
+
+function constantTimeEquals(leftValue, rightValue) {
+  const left = Buffer.from(String(leftValue || ''), 'utf8');
+  const right = Buffer.from(String(rightValue || ''), 'utf8');
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function sha256Hex(value) {
+  return crypto
+    .createHash('sha256')
+    .update(String(value || ''), 'utf8')
+    .digest('hex')
+    .toLowerCase();
+}
+
+function isValidCreatorSecret(inputSecret) {
+  if (CREATOR_SECRET_HASH) {
+    const inputHash = sha256Hex(inputSecret);
+    return constantTimeEquals(inputHash, CREATOR_SECRET_HASH);
+  }
+  if (!CREATOR_SECRET) return false;
+  return constantTimeEquals(inputSecret, CREATOR_SECRET);
 }
 
 function normalizeDeviceFingerprint(value) {
@@ -326,7 +364,13 @@ router.post('/register', async (req, res) => {
     const tenantMainChannelTitle = normalizeMainChannelTitle(main_channel_title);
 
     if (isPlatformCreator) {
-      if (typeof secret !== 'string' || secret !== CREATOR_SECRET) {
+      if (!CREATOR_SECRET && !CREATOR_SECRET_HASH) {
+        return res.status(503).json({
+          error:
+            'Регистрация создателя временно отключена: на сервере не задан секрет создателя.',
+        });
+      }
+      if (!isValidCreatorSecret(secret)) {
         return res.status(403).json({ error: 'Invalid secret for this email' });
       }
       role = 'creator';

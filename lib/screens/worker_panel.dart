@@ -19,9 +19,23 @@ class WorkerPanel extends StatefulWidget {
   State<WorkerPanel> createState() => _WorkerPanelState();
 }
 
+class _WorkerTabSpec {
+  const _WorkerTabSpec({
+    required this.id,
+    required this.label,
+    required this.builder,
+  });
+
+  final String id;
+  final String label;
+  final Widget Function() builder;
+}
+
 class _WorkerPanelState extends State<WorkerPanel>
     with SingleTickerProviderStateMixin {
-  late final TabController _tabController;
+  TabController? _tabController;
+  StreamSubscription? _authSub;
+  List<_WorkerTabSpec> _visibleTabs = const <_WorkerTabSpec>[];
   StreamSubscription? _chatEventsSub;
   Timer? _ownPostsRefreshDebounce;
 
@@ -108,13 +122,12 @@ class _WorkerPanelState extends State<WorkerPanel>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
-    _loadChannels();
-    _loadOwnQueuedPosts();
-    _loadRevisionDates();
+    _rebuildVisibleTabs(force: true, notify: false);
+    _loadVisibleTabData();
     _chatEventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
-      if (type == 'chat:created' || type == 'chat:deleted') {
+      if ((type == 'chat:created' || type == 'chat:deleted') &&
+          (_hasVisibleTab('new') || _hasVisibleTab('old'))) {
         _loadChannels();
       }
       if (type == 'chat:updated') {
@@ -122,10 +135,20 @@ class _WorkerPanelState extends State<WorkerPanel>
         _ownPostsRefreshDebounce = Timer(
           const Duration(milliseconds: 650),
           () async {
-            await _loadOwnQueuedPosts();
-            await _loadRevisionPosts();
+            if (_hasVisibleTab('own')) {
+              await _loadOwnQueuedPosts();
+            }
+            if (_hasVisibleTab('revision')) {
+              await _loadRevisionPosts();
+            }
           },
         );
+      }
+    });
+    _authSub = authService.authStream.listen((_) {
+      final changed = _rebuildVisibleTabs();
+      if (changed) {
+        _loadVisibleTabData();
       }
     });
   }
@@ -133,8 +156,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   @override
   void dispose() {
     _chatEventsSub?.cancel();
+    _authSub?.cancel();
     _ownPostsRefreshDebounce?.cancel();
-    _tabController.dispose();
+    _tabController?.dispose();
     _titleCtrl.dispose();
     _descriptionCtrl.dispose();
     _priceCtrl.dispose();
@@ -143,6 +167,135 @@ class _WorkerPanelState extends State<WorkerPanel>
     _searchCtrl.dispose();
     _revisionPercentCtrl.dispose();
     super.dispose();
+  }
+
+  bool _hasAnyPermission(List<String> keys) {
+    for (final key in keys) {
+      if (authService.hasPermission(key)) return true;
+    }
+    return false;
+  }
+
+  bool _canViewNewTab() {
+    if (authService.effectiveRole == 'creator') return true;
+    return _hasAnyPermission(const ['product.create']);
+  }
+
+  bool _canViewOldTab() {
+    if (authService.effectiveRole == 'creator') return true;
+    return _hasAnyPermission(const ['product.requeue', 'product.create']);
+  }
+
+  bool _canViewOwnTab() {
+    if (authService.effectiveRole == 'creator') return true;
+    return _hasAnyPermission(const [
+      'product.edit.own_pending',
+      'product.create',
+    ]);
+  }
+
+  bool _canViewRevisionTab() {
+    if (authService.effectiveRole == 'creator') return true;
+    return _hasAnyPermission(const [
+      'product.requeue',
+      'product.edit.own_pending',
+      'product.create',
+    ]);
+  }
+
+  List<_WorkerTabSpec> _buildVisibleTabs() {
+    final tabs = <_WorkerTabSpec>[
+      if (_canViewNewTab())
+        _WorkerTabSpec(
+          id: 'new',
+          label: 'Новый товар',
+          builder: _buildQueueTab,
+        ),
+      if (_canViewOldTab())
+        _WorkerTabSpec(
+          id: 'old',
+          label: 'Старые товары',
+          builder: _buildSearchTab,
+        ),
+      if (_canViewOwnTab())
+        _WorkerTabSpec(
+          id: 'own',
+          label: 'Свои посты',
+          builder: _buildOwnPostsTab,
+        ),
+      if (_canViewRevisionTab())
+        _WorkerTabSpec(
+          id: 'revision',
+          label: 'Ревизия',
+          builder: _buildRevisionTab,
+        ),
+    ];
+    if (tabs.isNotEmpty) return tabs;
+    return <_WorkerTabSpec>[
+      _WorkerTabSpec(
+        id: 'no_access',
+        label: 'Доступ',
+        builder: _buildNoAccessTab,
+      ),
+    ];
+  }
+
+  bool _rebuildVisibleTabs({bool force = false, bool notify = true}) {
+    final nextTabs = _buildVisibleTabs();
+    final prevTabs = _visibleTabs;
+    final unchanged =
+        !force &&
+        prevTabs.length == nextTabs.length &&
+        List.generate(prevTabs.length, (i) => prevTabs[i].id).join('|') ==
+            List.generate(nextTabs.length, (i) => nextTabs[i].id).join('|');
+    if (unchanged && _tabController != null) return false;
+
+    final oldId = (() {
+      final controller = _tabController;
+      if (controller == null || prevTabs.isEmpty) return null;
+      final safeIndex = controller.index.clamp(0, prevTabs.length - 1);
+      return prevTabs[safeIndex].id;
+    })();
+
+    _tabController?.dispose();
+    _visibleTabs = nextTabs;
+    final mappedIndex = oldId == null
+        ? 0
+        : nextTabs.indexWhere((tab) => tab.id == oldId);
+    final initialIndex = mappedIndex >= 0 ? mappedIndex : 0;
+    _tabController = TabController(
+      length: nextTabs.length,
+      vsync: this,
+      initialIndex: initialIndex,
+    );
+    if (notify && mounted) {
+      setState(() {});
+    }
+    return true;
+  }
+
+  bool _hasVisibleTab(String id) {
+    return _visibleTabs.any((tab) => tab.id == id);
+  }
+
+  void _animateToTab(String id) {
+    final controller = _tabController;
+    if (controller == null) return;
+    final index = _visibleTabs.indexWhere((tab) => tab.id == id);
+    if (index < 0) return;
+    controller.animateTo(index);
+  }
+
+  void _loadVisibleTabData() {
+    if (_hasVisibleTab('new') || _hasVisibleTab('old')) {
+      _loadChannels();
+    }
+    if (_hasVisibleTab('own')) {
+      _loadOwnQueuedPosts();
+    }
+    if (_hasVisibleTab('revision')) {
+      _loadRevisionDates();
+    }
   }
 
   String? _resolveImageUrl(String? raw) {
@@ -1030,7 +1183,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       _removeImageOnSubmit = false;
       _message = 'Данные товара подставлены. Проверьте и отправьте в очередь.';
     });
-    _tabController.animateTo(0);
+    _animateToTab('new');
   }
 
   Future<void> _requeueProduct(Map<String, dynamic> product) async {
@@ -2180,6 +2333,41 @@ class _WorkerPanelState extends State<WorkerPanel>
     );
   }
 
+  Widget _buildNoAccessTab() {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.lock_outline_rounded,
+              size: 44,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Нет прав для панели работника',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Попросите арендатора или администратора выдать доступ к товарам.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _statChip(String label) {
     final theme = Theme.of(context);
     return Container(
@@ -2199,18 +2387,23 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   @override
   Widget build(BuildContext context) {
+    if (_tabController == null || _visibleTabs.isEmpty) {
+      _rebuildVisibleTabs(force: true, notify: false);
+    }
+    final controller = _tabController;
+    final tabs = _visibleTabs.map((tab) => Tab(text: tab.label)).toList();
+    final tabViews = _visibleTabs.map((tab) => tab.builder()).toList();
+    if (controller == null || tabs.isEmpty || tabViews.isEmpty) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Панель работника')),
+        body: SafeArea(child: _buildNoAccessTab()),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Панель работника'),
-        bottom: TabBar(
-          controller: _tabController,
-          tabs: const [
-            Tab(text: 'Новый товар'),
-            Tab(text: 'Старые товары'),
-            Tab(text: 'Свои посты'),
-            Tab(text: 'Ревизия'),
-          ],
-        ),
+        bottom: TabBar(controller: controller, tabs: tabs),
       ),
       body: SafeArea(
         child: Column(
@@ -2227,15 +2420,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                 ),
               ),
             Expanded(
-              child: TabBarView(
-                controller: _tabController,
-                children: [
-                  _buildQueueTab(),
-                  _buildSearchTab(),
-                  _buildOwnPostsTab(),
-                  _buildRevisionTab(),
-                ],
-              ),
+              child: TabBarView(controller: controller, children: tabViews),
             ),
           ],
         ),

@@ -127,16 +127,48 @@ class _MainShellState extends State<MainShell> {
 
   bool _hasAdminTab() {
     const roles = {'admin', 'tenant', 'creator'};
-    return roles.contains(_effectiveRole());
+    final role = _effectiveRole();
+    if (!roles.contains(role)) return false;
+    if (_isCreatorNativeView()) return true;
+    return _hasAnyPermission(const [
+      'chat.write.public',
+      'chat.write.support',
+      'chat.pin',
+      'chat.delete.all',
+      'product.publish',
+      'reservation.fulfill',
+      'delivery.manage',
+      'tenant.users.manage',
+      'support.manage',
+      'finance.view',
+      'audit.view',
+      'antifraud.view',
+      'notifications.manage',
+      'diagnostics.view',
+    ]);
   }
 
   bool _hasWorkerTab() {
     const roles = {'worker', 'creator'};
-    return roles.contains(_effectiveRole());
+    final role = _effectiveRole();
+    if (!roles.contains(role)) return false;
+    if (_isCreatorNativeView()) return true;
+    return _hasAnyPermission(const [
+      'product.create',
+      'product.requeue',
+      'product.edit.own_pending',
+    ]);
   }
 
   bool _hasTestsTab() {
     return _isCreatorNativeView();
+  }
+
+  bool _hasAnyPermission(List<String> keys) {
+    for (final key in keys) {
+      if (authService.hasPermission(key)) return true;
+    }
+    return false;
   }
 
   bool _useCompactNavigation(BuildContext context) {

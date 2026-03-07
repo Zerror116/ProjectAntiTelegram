@@ -15,7 +15,9 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
   String _rolePreview = 'creator';
   bool _deliveryBusy = false;
   bool _demoPostsBusy = false;
+  bool _opsBusy = false;
   Map<String, dynamic>? _deliverySnapshot;
+  Map<String, dynamic>? _diagnosticsSnapshot;
 
   @override
   void initState() {
@@ -25,6 +27,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _loadDeliverySnapshot();
+      _loadDiagnosticsSnapshot();
     });
   }
 
@@ -226,11 +229,163 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     }
   }
 
+  Future<void> _loadDiagnosticsSnapshot() async {
+    setState(() => _opsBusy = true);
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/diagnostics/center',
+      );
+      final data = resp.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        setState(
+          () => _diagnosticsSnapshot = Map<String, dynamic>.from(data['data']),
+        );
+        showAppNotice(
+          context,
+          'Диагностика обновлена',
+          tone: AppNoticeTone.success,
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка диагностики: $e',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _opsBusy = false);
+      }
+    }
+  }
+
+  Future<void> _sendSmartNotificationPing() async {
+    setState(() => _opsBusy = true);
+    try {
+      await authService.dio.post(
+        '/api/admin/ops/notifications/test',
+        data: {
+          'type': 'order',
+          'priority': 'high',
+          'title': 'Тест smart-уведомления',
+          'message': 'Проверка приоритета и тихих часов',
+        },
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Smart-уведомление отправлено',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка smart-уведомления: $e',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _opsBusy = false);
+      }
+    }
+  }
+
+  Future<void> _seedFullDemoMode() async {
+    setState(() => _opsBusy = true);
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/ops/demo-mode/seed',
+        data: {'clients': 12, 'products': 20},
+      );
+      if (!mounted) return;
+      final data = resp.data;
+      final payload = data is Map && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
+      showAppNotice(
+        context,
+        'Demo seed: клиентов ${payload['clients_created_or_reused'] ?? 0}, постов ${payload['products_queued'] ?? 0}',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(context, 'Ошибка demo seed: $e', tone: AppNoticeTone.error);
+    } finally {
+      if (mounted) {
+        setState(() => _opsBusy = false);
+      }
+    }
+  }
+
   Widget _sectionTitle(String text) {
     final theme = Theme.of(context);
     return Text(
       text,
       style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+    );
+  }
+
+  Widget _opsCenterCard() {
+    final diagnostics = _diagnosticsSnapshot ?? const <String, dynamic>{};
+    final monitoring = diagnostics['monitoring'] is Map<String, dynamic>
+        ? Map<String, dynamic>.from(diagnostics['monitoring'])
+        : <String, dynamic>{};
+    final api = diagnostics['api'] is Map<String, dynamic>
+        ? Map<String, dynamic>.from(diagnostics['api'])
+        : <String, dynamic>{};
+    final database = diagnostics['database'] is Map<String, dynamic>
+        ? Map<String, dynamic>.from(diagnostics['database'])
+        : <String, dynamic>{};
+    final socket = diagnostics['socket'] is Map<String, dynamic>
+        ? Map<String, dynamic>.from(diagnostics['socket'])
+        : <String, dynamic>{};
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _opsBusy ? null : _loadDiagnosticsSnapshot,
+                icon: const Icon(Icons.monitor_heart_outlined),
+                label: const Text('Обновить диагностику'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _opsBusy ? null : _sendSmartNotificationPing,
+                icon: const Icon(Icons.notifications_active_outlined),
+                label: const Text('Тест smart-уведомления'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _opsBusy ? null : _seedFullDemoMode,
+                icon: const Icon(Icons.auto_awesome_outlined),
+                label: const Text('Demo режим 1-клик'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text('API uptime: ${(api['uptime_sec'] ?? 0).toString()} сек'),
+          Text('DB latency: ${(database['latency_ms'] ?? 0).toString()} ms'),
+          Text(
+            'Socket clients: ${(socket['connected_clients'] ?? 0).toString()}',
+          ),
+          Text(
+            'Monitoring: critical ${(monitoring['critical'] ?? 0).toString()}, error ${(monitoring['error'] ?? 0).toString()}',
+          ),
+        ],
+      ),
     );
   }
 
@@ -606,6 +761,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
             _sectionTitle('Публикация'),
             const SizedBox(height: 12),
             _demoPostsCard(),
+            const SizedBox(height: 24),
+            _sectionTitle('Операционный центр'),
+            const SizedBox(height: 12),
+            _opsCenterCard(),
             const SizedBox(height: 24),
             _sectionTitle('Загрузка'),
             const SizedBox(height: 12),

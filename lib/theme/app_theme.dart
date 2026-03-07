@@ -4,54 +4,81 @@ class AppTheme {
   static const _lightSeed = Color(0xFF2F6BFF);
   static const _darkSeed = Color(0xFF7A4DFF);
 
-  static ThemeData light() {
+  static ThemeData light({
+    Color? seedColor,
+    VisualDensity visualDensity = VisualDensity.standard,
+    double cardScale = 1,
+  }) {
+    final activeSeed = seedColor ?? _lightSeed;
     final scheme = ColorScheme.fromSeed(
-      seedColor: _lightSeed,
+      seedColor: activeSeed,
       brightness: Brightness.light,
     );
+    final adapted = seedColor == null
+        ? scheme.copyWith(
+            primary: const Color(0xFF2F6BFF),
+            secondary: const Color(0xFF4D8DFF),
+            tertiary: const Color(0xFF37A9FF),
+            surface: const Color(0xFFF3F7FF),
+            surfaceContainerLowest: const Color(0xFFFFFFFF),
+            surfaceContainerLow: const Color(0xFFEBF2FF),
+            surfaceContainer: const Color(0xFFE1ECFF),
+            surfaceContainerHigh: const Color(0xFFD6E5FF),
+            surfaceContainerHighest: const Color(0xFFC9DCFF),
+          )
+        : scheme;
     return _buildTheme(
-      scheme.copyWith(
-        primary: const Color(0xFF2F6BFF),
-        secondary: const Color(0xFF4D8DFF),
-        tertiary: const Color(0xFF37A9FF),
-        surface: const Color(0xFFF3F7FF),
-        surfaceContainerLowest: const Color(0xFFFFFFFF),
-        surfaceContainerLow: const Color(0xFFEBF2FF),
-        surfaceContainer: const Color(0xFFE1ECFF),
-        surfaceContainerHigh: const Color(0xFFD6E5FF),
-        surfaceContainerHighest: const Color(0xFFC9DCFF),
-      ),
+      adapted,
+      visualDensity: visualDensity,
+      cardScale: cardScale,
     );
   }
 
-  static ThemeData dark() {
+  static ThemeData dark({
+    Color? seedColor,
+    VisualDensity visualDensity = VisualDensity.standard,
+    double cardScale = 1,
+  }) {
+    final activeSeed = seedColor ?? _darkSeed;
     final scheme = ColorScheme.fromSeed(
-      seedColor: _darkSeed,
+      seedColor: activeSeed,
       brightness: Brightness.dark,
     );
+    final adapted = seedColor == null
+        ? scheme.copyWith(
+            primary: const Color(0xFFA88BFF),
+            secondary: const Color(0xFF8C70FF),
+            tertiary: const Color(0xFFD28CFF),
+            surface: const Color(0xFF15111E),
+            surfaceContainerLowest: const Color(0xFF0E0A16),
+            surfaceContainerLow: const Color(0xFF1C1628),
+            surfaceContainer: const Color(0xFF241C33),
+            surfaceContainerHigh: const Color(0xFF2D2440),
+            surfaceContainerHighest: const Color(0xFF39304E),
+          )
+        : scheme;
     return _buildTheme(
-      scheme.copyWith(
-        primary: const Color(0xFFA88BFF),
-        secondary: const Color(0xFF8C70FF),
-        tertiary: const Color(0xFFD28CFF),
-        surface: const Color(0xFF15111E),
-        surfaceContainerLowest: const Color(0xFF0E0A16),
-        surfaceContainerLow: const Color(0xFF1C1628),
-        surfaceContainer: const Color(0xFF241C33),
-        surfaceContainerHigh: const Color(0xFF2D2440),
-        surfaceContainerHighest: const Color(0xFF39304E),
-      ),
+      adapted,
+      visualDensity: visualDensity,
+      cardScale: cardScale,
     );
   }
 
-  static ThemeData _buildTheme(ColorScheme scheme) {
+  static ThemeData _buildTheme(
+    ColorScheme scheme, {
+    required VisualDensity visualDensity,
+    required double cardScale,
+  }) {
     final base = ThemeData(
       useMaterial3: true,
       colorScheme: scheme,
       scaffoldBackgroundColor: scheme.surface,
       canvasColor: scheme.surface,
       splashFactory: InkRipple.splashFactory,
+      visualDensity: visualDensity,
     );
+
+    final effectiveCardScale = cardScale.clamp(0.85, 1.25);
 
     return base.copyWith(
       appBarTheme: AppBarTheme(
@@ -65,7 +92,9 @@ class AppTheme {
         color: scheme.surfaceContainerLow,
         elevation: 0,
         margin: EdgeInsets.zero,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(18 * effectiveCardScale),
+        ),
       ),
       dialogTheme: DialogThemeData(
         backgroundColor: scheme.surfaceContainerLow,
