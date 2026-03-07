@@ -8,11 +8,9 @@ const { Server } = require("socket.io");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
+const helmet = require("helmet");
 const bodyParser = require("body-parser");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
-const validator = require("validator");
 
 const db = require("./db");
 
@@ -27,6 +25,7 @@ const chatsRouter = require("./routes/chats");
 const profileRouter = require("./routes/profile");
 const authRouter = require("./routes/auth");
 const adminRoutes = require("./routes/admin");
+const opsRoutes = require("./routes/ops");
 const deliveryRoutes = require("./routes/delivery");
 const workerRoutes = require("./routes/worker");
 const cartRoutes = require("./routes/cart");
@@ -40,14 +39,111 @@ const { tenantRoom } = require("./utils/socket");
 // MIDDLEWARE И КОНФИГУРАЦИЯ
 // ===================================
 
-// Общие middleware
 const uploadsRoot = path.resolve(__dirname, "..", "uploads");
 fs.mkdirSync(path.join(uploadsRoot, "products"), { recursive: true });
+fs.mkdirSync(path.join(uploadsRoot, "channels"), { recursive: true });
+fs.mkdirSync(path.join(uploadsRoot, "users"), { recursive: true });
+fs.mkdirSync(path.join(uploadsRoot, "chat_media", "images"), {
+  recursive: true,
+});
+fs.mkdirSync(path.join(uploadsRoot, "chat_media", "voice"), { recursive: true });
 
-app.use(cors());
+const DEFAULT_ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:8080",
+  "http://127.0.0.1:8080",
+];
+
+function normalizeOrigin(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  if (value === "*") return "*";
+  try {
+    return new URL(value).origin;
+  } catch (_) {
+    return "";
+  }
+}
+
+function parseAllowedOrigins(raw) {
+  const allowed = new Set();
+  for (const candidate of DEFAULT_ALLOWED_ORIGINS) {
+    const normalized = normalizeOrigin(candidate);
+    if (normalized) allowed.add(normalized);
+  }
+  for (const candidate of String(raw || "").split(",")) {
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    if (trimmed === "*") {
+      allowed.clear();
+      allowed.add("*");
+      return allowed;
+    }
+    const normalized = normalizeOrigin(trimmed);
+    if (normalized) allowed.add(normalized);
+  }
+  return allowed;
+}
+
+const allowedOrigins = parseAllowedOrigins(process.env.CORS_ORIGINS || "");
+const allowAnyOrigin = allowedOrigins.has("*");
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // mobile/desktop clients without browser Origin
+  if (allowAnyOrigin) return true;
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return false;
+  return allowedOrigins.has(normalized);
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Authorization",
+    "Content-Type",
+    "X-View-Role",
+    "X-Tenant-Code",
+  ],
+  exposedHeaders: ["Content-Disposition"],
+};
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  }),
+);
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use("/uploads", express.static(uploadsRoot));
+
+for (const publicDir of ["products", "channels", "users"]) {
+  const fullDir = path.join(uploadsRoot, publicDir);
+  app.use(
+    `/uploads/${publicDir}`,
+    express.static(fullDir, {
+      index: false,
+      fallthrough: false,
+      maxAge: "30d",
+      immutable: true,
+      setHeaders(res) {
+        res.setHeader("X-Content-Type-Options", "nosniff");
+      },
+    }),
+  );
+}
 
 // Логирование входящих запросов и времени обработки
 app.use((req, res, next) => {
@@ -64,15 +160,47 @@ app.use((req, res, next) => {
 
 // Лимитер для маршрутов аутентифика��ии (защита от brute-force)
 const authLimiter = rateLimit({
-  windowMs: 2 * 1000, // 2 секунды
-  max: 6, // максимум 6 запросов в окне
+  windowMs: 2 * 1000,
+  max: 6,
   message: { error: "Слишком быстро, чуть чуть подождите" },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
+const globalApiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_GLOBAL_MAX || 240),
+  message: { error: "Слишком много запросов. Попробуйте через минуту." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const heavyWriteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_HEAVY_MAX || 60),
+  message: {
+    error:
+      "Слишком много тяжелых операций (upload/publish/delivery/support). Повторите позже.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const writeMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const applyForWriteMethods = (limiter) => (req, res, next) => {
+  if (!writeMethods.has(req.method)) return next();
+  return limiter(req, res, next);
+};
+
+app.use("/api", globalApiLimiter);
 app.use("/api/auth/register", authLimiter);
 app.use("/api/auth/login", authLimiter);
+app.use("/api/chats", applyForWriteMethods(heavyWriteLimiter));
+app.use("/api/worker", applyForWriteMethods(heavyWriteLimiter));
+app.use("/api/admin/delivery", applyForWriteMethods(heavyWriteLimiter));
+app.use("/api/admin/ops", applyForWriteMethods(heavyWriteLimiter));
+app.use("/api/delivery", applyForWriteMethods(heavyWriteLimiter));
+app.use("/api/support", applyForWriteMethods(heavyWriteLimiter));
 
 // ===================================
 // РОУТЫ
@@ -89,51 +217,15 @@ app.use("/api/phones", phonesRouter);
 app.use("/api/profile", [profileUpdateRoutes, profileRouter]);
 app.use("/api/chats", chatsRouter);
 app.use("/api/admin", adminRoutes);
+app.use("/api/admin/ops", opsRoutes);
 app.use("/api/admin/delivery", deliveryRoutes);
 app.use("/api/delivery", deliveryRoutes);
 app.use("/api/worker", workerRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/support", supportRoutes);
 
-// ===================================
-// КОНФИГУРАЦИЯ И УТИЛИТЫ
-// ===================================
-
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "change_me_long_secret";
-const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || "10", 10);
-
-if (
-  process.env.NODE_ENV === "production" &&
-  JWT_SECRET === "change_me_long_secret"
-) {
-  throw new Error(
-    "JWT_SECRET must be configured in production (default fallback is forbidden).",
-  );
-}
-
-/**
- * Подписывает JWT токен
- */
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
-}
-
-/**
- * Ищет пользователя по email
- */
-async function findUserByEmail(email) {
-  try {
-    const res = await db.query(
-      "SELECT id, email, password_hash FROM users WHERE email = $1",
-      [email],
-    );
-    return res.rows[0] || null;
-  } catch (err) {
-    console.error("findUserByEmail error:", err);
-    return null;
-  }
-}
+const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
 
 // ===================================
 // HEALTH CHECK ENDPOINTS
@@ -382,9 +474,15 @@ async function canUserAccessChat(user, chatId) {
     // Инициализируем Socket.io
     const io = new Server(server, {
       cors: {
-        origin: "*",
+        origin(origin, callback) {
+          if (isOriginAllowed(origin)) {
+            callback(null, true);
+            return;
+          }
+          callback(new Error("Socket origin is not allowed"));
+        },
         methods: ["GET", "POST"],
-        credentials: false,
+        credentials: true,
       },
       allowEIO3: true,
       transports: ["websocket"],
@@ -578,7 +676,7 @@ async function canUserAccessChat(user, chatId) {
       console.log(`\n✅ Server listening on http://0.0.0.0:${PORT}`);
       console.log(`📝 Environment: ${process.env.NODE_ENV || "development"}`);
       console.log(
-        `🔐 JWT Secret: ${JWT_SECRET === "change_me_long_secret" ? "⚠️ DEFAULT (CHANGE ME!)" : "✅ Custom"}`,
+        `🔐 JWT Secret: ${JWT_SECRET ? "✅ Configured" : "⚠️ Not configured"}`,
       );
       console.log("\n");
     });

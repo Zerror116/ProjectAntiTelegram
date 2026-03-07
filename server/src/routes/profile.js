@@ -8,7 +8,15 @@ const { generateInviteCode, normalizeInviteCode } = require("../utils/tenants");
 const router = express.Router();
 const { pool } = require("../db");
 const authMiddleware = require("../middleware/requireAuth");
+const requirePermission = require("../middleware/requirePermission");
+const { resolvePermissionSet } = require("../utils/flexibleRoles");
 const SAMARA_TZ = "Europe/Samara";
+const requireTenantInvitesManagePermission = requirePermission(
+  "tenant.invites.manage",
+);
+const requireTenantUsersManagePermission = requirePermission(
+  "tenant.users.manage",
+);
 
 const profileUploadsDir = path.resolve(
   __dirname,
@@ -482,6 +490,7 @@ router.get("/", authMiddleware, async (req, res) => {
   try {
     const user = await loadUserProfile(req.user.id);
     const stats = await loadRoleStats(req.user.id, req.user.role);
+    const resolvedPermissions = await resolvePermissionSet(req.user, pool);
 
     if (!user) {
       return res.status(404).json({
@@ -492,7 +501,16 @@ router.get("/", authMiddleware, async (req, res) => {
 
     return res.json({
       ok: true,
-      user,
+      user: {
+        ...user,
+        permissions:
+          resolvedPermissions &&
+          resolvedPermissions.permissions &&
+          typeof resolvedPermissions.permissions === "object"
+            ? resolvedPermissions.permissions
+            : {},
+        permission_source: resolvedPermissions?.source || "default_map",
+      },
       stats,
     });
   } catch (err) {
@@ -622,205 +640,223 @@ router.patch("/", authMiddleware, async (req, res) => {
   }
 });
 
-router.get("/tenant/client-invite", authMiddleware, async (req, res) => {
-  if (!isTenantManager(req.user)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Доступно только арендатору или создателю",
-    });
-  }
-
-  const tenantId = String(req.user?.tenant_id || "").trim();
-  const tenantCode = String(req.user?.tenant_code || "").trim();
-  if (!tenantId || !tenantCode) {
-    return res.status(403).json({
-      ok: false,
-      error: "Аккаунт не привязан к группе арендатора",
-    });
-  }
-
-  try {
-    const existing = await pool.query(
-      `SELECT id, code, is_active, max_uses, used_count, expires_at
-       FROM tenant_invites
-       WHERE tenant_id = $1
-         AND role = 'client'
-         AND is_active = true
-         AND (expires_at IS NULL OR expires_at > now())
-         AND (max_uses IS NULL OR used_count < max_uses)
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [tenantId],
-    );
-
-    let inviteCode = "";
-    let inviteId = "";
-    if (existing.rowCount > 0) {
-      inviteCode = String(existing.rows[0].code || "").trim();
-      inviteId = String(existing.rows[0].id || "").trim();
-    } else {
-      let created = null;
-      for (let i = 0; i < 5; i += 1) {
-        const nextCode = normalizeInviteCode(generateInviteCode());
-        try {
-          const insert = await pool.query(
-            `INSERT INTO tenant_invites (
-               id, tenant_id, code, role, is_active, max_uses,
-               used_count, expires_at, created_by, notes, created_at, updated_at
-             )
-             VALUES (
-               $1, $2, $3, 'client', true, NULL,
-               0, NULL, $4, 'Публичная клиентская ссылка', now(), now()
-             )
-             RETURNING id, code`,
-            [uuidv4(), tenantId, nextCode, req.user.id],
-          );
-          created = insert.rows[0];
-          break;
-        } catch (err) {
-          if (String(err?.code || "") === "23505") continue;
-          throw err;
-        }
-      }
-
-      if (!created) {
-        return res.status(500).json({
-          ok: false,
-          error: "Не удалось создать клиентский код приглашения",
-        });
-      }
-      inviteCode = String(created.code || "").trim();
-      inviteId = String(created.id || "").trim();
-    }
-
-    return res.json({
-      ok: true,
-      data: {
-        invite_id: inviteId,
-        code: inviteCode,
-        tenant_code: tenantCode,
-        invite_link: buildInviteLink(req, inviteCode, tenantCode),
-      },
-    });
-  } catch (err) {
-    console.error("profile.tenant.clientInvite error", err);
-    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
-  }
-});
-
-router.get("/tenant/clients", authMiddleware, async (req, res) => {
-  if (!isTenantManager(req.user)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Доступно только арендатору или создателю",
-    });
-  }
-
-  const tenantId = String(req.user?.tenant_id || "").trim();
-  if (!tenantId) {
-    return res.status(403).json({
-      ok: false,
-      error: "Аккаунт не привязан к группе арендатора",
-    });
-  }
-
-  const rawSearch = String(req.query?.search || "").trim();
-  const search = rawSearch.slice(0, 80);
-  const digits = search.replace(/\D/g, "").slice(0, 20);
-
-  try {
-    const result = await pool.query(
-      `SELECT u.id,
-              u.name,
-              u.email,
-              u.role,
-              u.created_at,
-              p.phone
-       FROM users u
-       LEFT JOIN phones p ON p.user_id = u.id
-       WHERE u.tenant_id = $1::uuid
-         AND u.role = ANY($2::text[])
-         AND (
-           $3::text = ''
-           OR COALESCE(u.name, '') ILIKE '%' || $3 || '%'
-           OR COALESCE(u.email, '') ILIKE '%' || $3 || '%'
-           OR ($4::text <> '' AND COALESCE(p.phone, '') ILIKE '%' || $4 || '%')
-         )
-       ORDER BY u.created_at DESC
-       LIMIT 200`,
-      [tenantId, ["client", "worker", "admin"], search, digits],
-    );
-
-    return res.json({ ok: true, data: result.rows });
-  } catch (err) {
-    console.error("profile.tenant.clients error", err);
-    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
-  }
-});
-
-router.patch("/tenant/clients/:userId/role", authMiddleware, async (req, res) => {
-  if (!isTenantManager(req.user)) {
-    return res.status(403).json({
-      ok: false,
-      error: "Доступно только арендатору или создателю",
-    });
-  }
-
-  const tenantId = String(req.user?.tenant_id || "").trim();
-  const userId = String(req.params?.userId || "").trim();
-  const nextRole = normalizeRole(req.body?.role);
-
-  if (!tenantId) {
-    return res.status(403).json({
-      ok: false,
-      error: "Аккаунт не привязан к группе арендатора",
-    });
-  }
-  if (!userId) {
-    return res.status(400).json({ ok: false, error: "Некорректный userId" });
-  }
-  if (!["client", "worker", "admin"].includes(nextRole)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Разрешены роли: client, worker, admin",
-    });
-  }
-
-  try {
-    const targetQ = await pool.query(
-      `SELECT id, role
-       FROM users
-       WHERE id = $1::uuid
-         AND tenant_id = $2::uuid
-       LIMIT 1`,
-      [userId, tenantId],
-    );
-    if (targetQ.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "Пользователь не найден" });
-    }
-
-    const currentRole = normalizeRole(targetQ.rows[0].role);
-    if (currentRole === "creator" || currentRole === "tenant") {
+router.get(
+  "/tenant/client-invite",
+  authMiddleware,
+  requireTenantInvitesManagePermission,
+  async (req, res) => {
+    if (!isTenantManager(req.user)) {
       return res.status(403).json({
         ok: false,
-        error: "Нельзя менять роль этого пользователя",
+        error: "Доступно только арендатору или создателю",
       });
     }
 
-    const updated = await pool.query(
-      `UPDATE users
-       SET role = $1,
-           updated_at = now()
-       WHERE id = $2::uuid
-         AND tenant_id = $3::uuid
-       RETURNING id, role`,
-      [nextRole, userId, tenantId],
-    );
-    return res.json({ ok: true, data: updated.rows[0] });
-  } catch (err) {
-    console.error("profile.tenant.clients.role error", err);
-    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
-  }
-});
+    const tenantId = String(req.user?.tenant_id || "").trim();
+    const tenantCode = String(req.user?.tenant_code || "").trim();
+    if (!tenantId || !tenantCode) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+
+    try {
+      const existing = await pool.query(
+        `SELECT id, code, is_active, max_uses, used_count, expires_at
+         FROM tenant_invites
+         WHERE tenant_id = $1
+           AND role = 'client'
+           AND is_active = true
+           AND (expires_at IS NULL OR expires_at > now())
+           AND (max_uses IS NULL OR used_count < max_uses)
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [tenantId],
+      );
+
+      let inviteCode = "";
+      let inviteId = "";
+      if (existing.rowCount > 0) {
+        inviteCode = String(existing.rows[0].code || "").trim();
+        inviteId = String(existing.rows[0].id || "").trim();
+      } else {
+        let created = null;
+        for (let i = 0; i < 5; i += 1) {
+          const nextCode = normalizeInviteCode(generateInviteCode());
+          try {
+            const insert = await pool.query(
+              `INSERT INTO tenant_invites (
+                 id, tenant_id, code, role, is_active, max_uses,
+                 used_count, expires_at, created_by, notes, created_at, updated_at
+               )
+               VALUES (
+                 $1, $2, $3, 'client', true, NULL,
+                 0, NULL, $4, 'Публичная клиентская ссылка', now(), now()
+               )
+               RETURNING id, code`,
+              [uuidv4(), tenantId, nextCode, req.user.id],
+            );
+            created = insert.rows[0];
+            break;
+          } catch (err) {
+            if (String(err?.code || "") === "23505") continue;
+            throw err;
+          }
+        }
+
+        if (!created) {
+          return res.status(500).json({
+            ok: false,
+            error: "Не удалось создать клиентский код приглашения",
+          });
+        }
+        inviteCode = String(created.code || "").trim();
+        inviteId = String(created.id || "").trim();
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          invite_id: inviteId,
+          code: inviteCode,
+          tenant_code: tenantCode,
+          invite_link: buildInviteLink(req, inviteCode, tenantCode),
+        },
+      });
+    } catch (err) {
+      console.error("profile.tenant.clientInvite error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.get(
+  "/tenant/clients",
+  authMiddleware,
+  requireTenantUsersManagePermission,
+  async (req, res) => {
+    if (!isTenantManager(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Доступно только арендатору или создателю",
+      });
+    }
+
+    const tenantId = String(req.user?.tenant_id || "").trim();
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+
+    const rawSearch = String(req.query?.search || "").trim();
+    const search = rawSearch.slice(0, 80);
+    const digits = search.replace(/\D/g, "").slice(0, 20);
+
+    try {
+      const result = await pool.query(
+        `SELECT u.id,
+                u.name,
+                u.email,
+                u.role,
+                u.created_at,
+                p.phone
+         FROM users u
+         LEFT JOIN phones p ON p.user_id = u.id
+         WHERE u.tenant_id = $1::uuid
+           AND u.role = ANY($2::text[])
+           AND (
+             $3::text = ''
+             OR COALESCE(u.name, '') ILIKE '%' || $3 || '%'
+             OR COALESCE(u.email, '') ILIKE '%' || $3 || '%'
+             OR ($4::text <> '' AND COALESCE(p.phone, '') ILIKE '%' || $4 || '%')
+           )
+         ORDER BY u.created_at DESC
+         LIMIT 200`,
+        [tenantId, ["client", "worker", "admin"], search, digits],
+      );
+
+      return res.json({ ok: true, data: result.rows });
+    } catch (err) {
+      console.error("profile.tenant.clients error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/tenant/clients/:userId/role",
+  authMiddleware,
+  requireTenantUsersManagePermission,
+  async (req, res) => {
+    if (!isTenantManager(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Доступно только арендатору или создателю",
+      });
+    }
+
+    const tenantId = String(req.user?.tenant_id || "").trim();
+    const userId = String(req.params?.userId || "").trim();
+    const nextRole = normalizeRole(req.body?.role);
+
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: "Некорректный userId" });
+    }
+    if (!["client", "worker", "admin"].includes(nextRole)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Разрешены роли: client, worker, admin",
+      });
+    }
+
+    try {
+      const targetQ = await pool.query(
+        `SELECT id, role
+         FROM users
+         WHERE id = $1::uuid
+           AND tenant_id = $2::uuid
+         LIMIT 1`,
+        [userId, tenantId],
+      );
+      if (targetQ.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Пользователь не найден",
+        });
+      }
+
+      const currentRole = normalizeRole(targetQ.rows[0].role);
+      if (currentRole === "creator" || currentRole === "tenant") {
+        return res.status(403).json({
+          ok: false,
+          error: "Нельзя менять роль этого пользователя",
+        });
+      }
+
+      const updated = await pool.query(
+        `UPDATE users
+         SET role = $1,
+             updated_at = now()
+         WHERE id = $2::uuid
+           AND tenant_id = $3::uuid
+         RETURNING id, role`,
+        [nextRole, userId, tenantId],
+      );
+      return res.json({ ok: true, data: updated.rows[0] });
+    } catch (err) {
+      console.error("profile.tenant.clients.role error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
 
 module.exports = router;

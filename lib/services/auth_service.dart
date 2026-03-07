@@ -14,6 +14,7 @@ class User {
   final String? phone;
   final String? tenantCode;
   final String? tenantName;
+  final Map<String, dynamic> permissions;
 
   User({
     required this.id,
@@ -23,6 +24,7 @@ class User {
     this.phone,
     this.tenantCode,
     this.tenantName,
+    this.permissions = const <String, dynamic>{},
   });
 
   factory User.fromMap(Map<String, dynamic> m) {
@@ -44,6 +46,12 @@ class User {
             .trim();
         return raw.isEmpty ? null : raw;
       })(),
+      permissions: (() {
+        final raw = m['permissions'];
+        if (raw is Map<String, dynamic>) return raw;
+        if (raw is Map) return Map<String, dynamic>.from(raw);
+        return const <String, dynamic>{};
+      })(),
     );
   }
 
@@ -56,6 +64,7 @@ class User {
       'phone': phone,
       'tenant_code': tenantCode,
       'tenant_name': tenantName,
+      'permissions': permissions,
     };
   }
 }
@@ -85,6 +94,25 @@ class AuthService {
     return base;
   }
 
+  bool hasPermission(String key) {
+    final user = _currentUser;
+    if (user == null) return false;
+    final role = user.role.toLowerCase().trim();
+    if (role == 'creator' && (_viewRole == null || _viewRole == 'creator')) {
+      return true;
+    }
+    final perms = user.permissions;
+    if (perms['all'] == true) return true;
+    if (perms[key] == true) return true;
+
+    final parts = key.split('.').where((e) => e.isNotEmpty).toList();
+    for (var i = parts.length - 1; i > 0; i--) {
+      final wildcard = '${parts.sublist(0, i).join('.')}.*';
+      if (perms[wildcard] == true) return true;
+    }
+    return false;
+  }
+
   // Stream controller to notify listeners about auth changes (user or logout)
   final StreamController<User?> _authController =
       StreamController<User?>.broadcast();
@@ -94,6 +122,16 @@ class AuthService {
   bool _isLoggingOut = false;
   String? _deviceFingerprintCache;
   String? _tenantCodeCache;
+
+  String _normalizeTenantCodeScope(String? value) {
+    final lower = (value ?? '').trim().toLowerCase();
+    if (lower.isEmpty) return '';
+    final cleaned = lower
+        .replaceAll(RegExp(r'[^a-z0-9-]+'), '-')
+        .replaceAll(RegExp(r'-{2,}'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+    return cleaned;
+  }
 
   AuthService({required this.dio});
 
@@ -322,7 +360,7 @@ class AuthService {
   }
 
   Future<void> setTenantCode(String? tenantCode) async {
-    final normalized = tenantCode?.trim().toLowerCase() ?? '';
+    final normalized = _normalizeTenantCodeScope(tenantCode);
     final prefs = await SharedPreferences.getInstance();
     if (normalized.isEmpty) {
       _tenantCodeCache = null;
@@ -338,9 +376,18 @@ class AuthService {
       return _tenantCodeCache;
     }
     final prefs = await SharedPreferences.getInstance();
-    final stored = prefs.getString(_tenantCodeKey)?.trim() ?? '';
-    if (stored.isEmpty) return null;
-    _tenantCodeCache = stored.toLowerCase();
+    final storedRaw = prefs.getString(_tenantCodeKey)?.trim() ?? '';
+    final stored = _normalizeTenantCodeScope(storedRaw);
+    if (stored.isEmpty) {
+      if (storedRaw.isNotEmpty) {
+        await prefs.remove(_tenantCodeKey);
+      }
+      return null;
+    }
+    if (stored != storedRaw) {
+      await prefs.setString(_tenantCodeKey, stored);
+    }
+    _tenantCodeCache = stored;
     return _tenantCodeCache;
   }
 

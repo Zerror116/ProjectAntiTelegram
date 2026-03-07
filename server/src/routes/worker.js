@@ -9,8 +9,13 @@ const router = express.Router();
 const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
+const requirePermission = require('../middleware/requirePermission');
 const { ensureSystemChannels } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
+
+const requireProductCreatePermission = requirePermission('product.create');
+const requireProductRequeuePermission = requirePermission('product.requeue');
+const requireProductEditPendingPermission = requirePermission('product.edit.own_pending');
 
 const productUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
@@ -356,6 +361,7 @@ router.post(
   '/channels/:chatId/posts',
   authMiddleware,
   requireRole('worker', 'admin', 'creator'),
+  requireProductCreatePermission,
   uploadProductImage,
   async (req, res) => {
     const { chatId } = req.params;
@@ -495,6 +501,7 @@ router.post(
   '/products/:productId/requeue',
   authMiddleware,
   requireRole('worker', 'admin', 'creator'),
+  requireProductRequeuePermission,
   uploadProductImage,
   async (req, res) => {
     const { productId } = req.params;
@@ -676,6 +683,7 @@ router.get(
   '/queue/mine',
   authMiddleware,
   requireRole('worker', 'admin', 'creator'),
+  requireProductEditPendingPermission,
   async (req, res) => {
     try {
       const result = await db.query(
@@ -716,6 +724,7 @@ router.patch(
   '/queue/:queueId',
   authMiddleware,
   requireRole('worker', 'admin', 'creator'),
+  requireProductEditPendingPermission,
   async (req, res) => {
     const queueId = String(req.params.queueId || '').trim();
     const title = String(req.body?.title || '').trim();

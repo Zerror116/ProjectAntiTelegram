@@ -6,7 +6,12 @@ const router = express.Router();
 const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
+const requirePermission = require('../middleware/requirePermission');
 const { emitToTenant } = require('../utils/socket');
+const { guardAction } = require('../utils/antifraud');
+
+const requireReservationFulfillPermission = requirePermission('reservation.fulfill');
+const requireDeliveryManagePermission = requirePermission('delivery.manage');
 
 const CART_STATUSES = [
   'pending_processing',
@@ -62,6 +67,24 @@ router.post('/add', authMiddleware, async (req, res) => {
 
     if (!productId) {
       return res.status(400).json({ ok: false, error: 'product_id обязателен' });
+    }
+
+    const antifraud = await guardAction({
+      queryable: client,
+      tenantId: req.user?.tenant_id || null,
+      userId,
+      actionKey: 'cart.buy',
+      details: {
+        product_id: productId,
+        quantity,
+      },
+    });
+    if (!antifraud.allowed) {
+      return res.status(429).json({
+        ok: false,
+        error: antifraud.reason || 'Слишком много попыток покупки. Повторите позже.',
+        blocked_until: antifraud.blockedUntil || null,
+      });
     }
 
     await client.query('BEGIN');
@@ -726,7 +749,12 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
 });
 
 // Изменить статус товара в корзине (admin/creator)
-router.patch('/items/:id/status', authMiddleware, requireRole('admin', 'creator'), async (req, res) => {
+router.patch(
+  '/items/:id/status',
+  authMiddleware,
+  requireRole('admin', 'creator'),
+  requireReservationFulfillPermission,
+  async (req, res) => {
   try {
     const { id } = req.params;
     const status = String(req.body?.status || '').trim();
@@ -965,6 +993,7 @@ router.get(
   '/claims/admin',
   authMiddleware,
   requireRole('admin', 'creator', 'tenant'),
+  requireDeliveryManagePermission,
   async (req, res) => {
     try {
       const tenantId = req.user?.tenant_id || null;
@@ -1062,6 +1091,7 @@ router.patch(
   '/claims/:id/review',
   authMiddleware,
   requireRole('admin', 'creator', 'tenant'),
+  requireDeliveryManagePermission,
   async (req, res) => {
     const client = await db.pool.connect();
     try {

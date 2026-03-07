@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require("uuid");
 const router = express.Router();
 const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
+const requirePermission = require("../middleware/requirePermission");
 const db = require("../db");
 const { ensureSystemChannels } = require("../utils/systemChannels");
 const {
@@ -23,6 +24,13 @@ const {
 } = require("../utils/tenantDatabases");
 const { logMonitoringEvent } = require("../utils/monitoring");
 const { emitToTenant } = require("../utils/socket");
+const { antifraudGuard } = require("../utils/antifraud");
+
+const requireProductPublishPermission = requirePermission("product.publish");
+const requireReservationFulfillPermission = requirePermission(
+  "reservation.fulfill",
+);
+const PUBLISH_POST_INTERVAL_MS = 3000;
 
 const channelUploadsDir = path.resolve(
   __dirname,
@@ -120,7 +128,7 @@ function schedulePublishedMessages(io, published, tenantId = null) {
       } catch (err) {
         console.error("admin.publish_pending emit error", err);
       }
-    }, index * 1000);
+    }, index * PUBLISH_POST_INTERVAL_MS);
   });
 }
 
@@ -491,7 +499,7 @@ function publishDemoPostsSequentially({
       } finally {
         client.release();
       }
-    }, index * 1000);
+    }, index * PUBLISH_POST_INTERVAL_MS);
   }
 }
 
@@ -724,51 +732,16 @@ router.post(
           [tenantId, provision.dbName, provision.dbUrl],
         );
       } catch (provisionErr) {
-        if (String(provisionErr?.code || "") === "42501") {
-          console.warn(
-            "admin.tenants.create: no CREATE DATABASE permission, fallback to shared mode",
-          );
-        } else {
-          console.error(
-            "admin.tenants.create isolated provision failed, fallback to shared",
-            provisionErr,
-          );
-        }
-
-        const sharedClient = await db.platformConnect();
-        try {
-          await sharedClient.query("BEGIN");
-          await ensureSystemChannels(
-            sharedClient,
-            req.user.id || null,
-            tenantId || null,
-          );
-          const currentDbQ = await sharedClient.query(
-            "SELECT current_database() AS db_name",
-          );
-          dbName = String(currentDbQ.rows[0]?.db_name || "").trim() || null;
-          await sharedClient.query(
-            `UPDATE tenants
-             SET db_mode = 'shared',
-                 db_name = $2,
-                 db_url = NULL,
-                 updated_at = now()
-             WHERE id = $1`,
-            [tenantId, dbName],
-          );
-          await sharedClient.query("COMMIT");
-        } catch (sharedErr) {
-          try {
-            await sharedClient.query("ROLLBACK");
-          } catch (_) {}
-          throw sharedErr;
-        } finally {
-          sharedClient.release();
-        }
-
-        dbMode = "shared";
-        warning =
-          "Отдельную БД создать не удалось. Арендатор создан в общей БД (shared).";
+        console.error(
+          "admin.tenants.create isolated provision failed",
+          provisionErr,
+        );
+        await db.platformQuery(`DELETE FROM tenants WHERE id = $1`, [tenantId]);
+        return res.status(500).json({
+          ok: false,
+          error:
+            "Не удалось создать изолированную базу данных арендатора. Проверьте права PostgreSQL (CREATEDB).",
+        });
       }
 
       return res.status(201).json({
@@ -2331,6 +2304,7 @@ router.get(
   "/channels/pending_posts",
   requireAuth,
   requireRole("admin", "creator"),
+  requireProductPublishPermission,
   async (req, res) => {
     try {
       const result = await db.query(
@@ -2390,6 +2364,7 @@ router.patch(
   "/channels/pending_posts/:queueId",
   requireAuth,
   requireRole("admin", "creator"),
+  requireProductPublishPermission,
   async (req, res) => {
     const queueId = String(req.params.queueId || "").trim();
     const title = String(req.body?.title || "").trim();
@@ -2495,6 +2470,7 @@ router.post(
   "/orders/dispatch_reserved",
   requireAuth,
   requireRole("admin", "creator"),
+  requireReservationFulfillPermission,
   async (req, res) => {
     const client = await db.pool.connect();
     try {
@@ -2656,6 +2632,7 @@ router.post(
   "/orders/mark_placed",
   requireAuth,
   requireRole("admin", "creator"),
+  requireReservationFulfillPermission,
   async (req, res) => {
     const reservationId = String(req.body?.reservation_id || "").trim();
     const cartItemId = String(req.body?.cart_item_id || "").trim();
@@ -2944,6 +2921,11 @@ router.post(
   "/channels/publish_pending",
   requireAuth,
   requireRole("admin", "creator"),
+  requireProductPublishPermission,
+  antifraudGuard("admin.publish_pending", (req) => ({
+    channel_id: req.body?.channel_id || null,
+    queue_count: Array.isArray(req.body?.queue_ids) ? req.body.queue_ids.length : 0,
+  })),
   async (req, res) => {
     const rawChannelId = req.body?.channel_id
       ? String(req.body.channel_id).trim()
@@ -2977,11 +2959,15 @@ router.post(
         const lockedQ = await client.query(
           `SELECT q.id
            FROM product_publication_queue q
-           JOIN chats c ON c.id = q.channel_id
            WHERE q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
              AND q.id = ANY($1::uuid[])
-             AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+             AND EXISTS (
+               SELECT 1
+               FROM chats c
+               WHERE c.id = q.channel_id
+                 AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+             )
            ORDER BY q.created_at ASC
            FOR UPDATE OF q`,
           [queueIds, req.user.tenant_id || null],
@@ -3012,11 +2998,15 @@ router.post(
         const lockedQ = await client.query(
           `SELECT q.id
            FROM product_publication_queue q
-           JOIN chats c ON c.id = q.channel_id
            WHERE q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
              AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
-             AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+             AND EXISTS (
+               SELECT 1
+               FROM chats c
+               WHERE c.id = q.channel_id
+                 AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+             )
            ORDER BY q.created_at ASC
            FOR UPDATE OF q`,
           [channelId, req.user.tenant_id || null],
@@ -3355,7 +3345,7 @@ router.post(
         data: {
           count,
           scheduled: true,
-          interval_ms: 1000,
+          interval_ms: PUBLISH_POST_INTERVAL_MS,
           channel_id: mainChannel.id,
           channel_title: mainChannel.title,
         },

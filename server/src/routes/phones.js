@@ -2,7 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db'); // pg client instance
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const { authMiddleware: requireAuth, requireAdmin } = require('../utils/auth');
 
 // Клиент: отправляет номер после регистрации
@@ -98,12 +98,18 @@ router.post('/change', requireAuth, async (req, res) => {
 // Admin: получить список pending номеров
 router.get('/admin/pending', requireAuth, requireAdmin, async (req, res) => {
   try {
+    const tenantId = String(req.user?.tenant_id || '').trim();
+    if (!tenantId) {
+      return res.status(403).json({ error: 'Tenant scope required' });
+    }
     const { rows } = await db.query(
       `SELECT p.id, p.user_id, p.phone, p.created_at, u.email
        FROM phones p
        JOIN users u ON u.id = p.user_id
        WHERE p.status = 'pending_verification'
-       ORDER BY p.created_at ASC`
+         AND u.tenant_id = $1::uuid
+       ORDER BY p.created_at ASC`,
+      [tenantId]
     );
     res.json({ ok: true, data: rows });
   } catch (err) {
@@ -115,12 +121,23 @@ router.get('/admin/pending', requireAuth, requireAdmin, async (req, res) => {
 // Admin: подтвердить номер (пометить verified)
 router.post('/admin/verify', requireAuth, requireAdmin, async (req, res) => {
   try {
+    const tenantId = String(req.user?.tenant_id || '').trim();
+    if (!tenantId) {
+      return res.status(403).json({ error: 'Tenant scope required' });
+    }
     const { phoneId } = req.body;
     if (!phoneId) return res.status(400).json({ error: 'phoneId required' });
 
     const result = await db.query(
-      `UPDATE phones SET status='verified', verified_at = now() WHERE id=$1 RETURNING user_id, phone`,
-      [phoneId]
+      `UPDATE phones p
+       SET status='verified',
+           verified_at = now()
+       FROM users u
+       WHERE p.id = $1
+         AND u.id = p.user_id
+         AND u.tenant_id = $2::uuid
+       RETURNING p.user_id, p.phone`,
+      [phoneId, tenantId]
     );
     if (!result.rowCount) return res.status(404).json({ error: 'Phone not found' });
 
@@ -140,28 +157,60 @@ router.post('/admin/verify', requireAuth, requireAdmin, async (req, res) => {
 
 // Admin: удалить номер и аккаунт пользователя
 router.post('/admin/delete', requireAuth, requireAdmin, async (req, res) => {
+  const client = await db.pool.connect();
   try {
+    const tenantId = String(req.user?.tenant_id || '').trim();
+    if (!tenantId) {
+      return res.status(403).json({ error: 'Tenant scope required' });
+    }
     const { phoneId } = req.body;
     if (!phoneId) return res.status(400).json({ error: 'phoneId required' });
 
-    // Получаем данные для аудита
-    const { rows } = await db.query('SELECT user_id, phone FROM phones WHERE id=$1', [phoneId]);
-    if (!rows.length) return res.status(404).json({ error: 'Phone not found' });
-    const { user_id, phone } = rows[0];
+    await client.query('BEGIN');
 
-    // Удаляем пользователя (CASCADE удалит phones, devices, tokens)
-    await db.query('DELETE FROM users WHERE id=$1', [user_id]);
+    const rowsQ = await client.query(
+      `SELECT p.user_id, p.phone
+       FROM phones p
+       JOIN users u ON u.id = p.user_id
+       WHERE p.id = $1
+         AND u.tenant_id = $2::uuid
+       LIMIT 1
+       FOR UPDATE OF p`,
+      [phoneId, tenantId]
+    );
+    if (!rowsQ.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Phone not found' });
+    }
+    const { user_id, phone } = rowsQ.rows[0];
 
-    // audit
-    await db.query(
-      `INSERT INTO admin_actions (admin_id, action, target_user_id, target_phone, details) VALUES ($1,$2,$3,$4,$5)`,
+    const deleteQ = await client.query(
+      `DELETE FROM users
+       WHERE id = $1
+         AND tenant_id = $2::uuid`,
+      [user_id, tenantId]
+    );
+    if (!deleteQ.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    await client.query(
+      `INSERT INTO admin_actions (admin_id, action, target_user_id, target_phone, details)
+       VALUES ($1,$2,$3,$4,$5)`,
       [req.user.id, 'delete_phone_and_user', user_id, phone, JSON.stringify({ phoneId })]
     );
 
+    await client.query('COMMIT');
     res.json({ ok: true });
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
     console.error('phones.admin.delete error', err);
     res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 

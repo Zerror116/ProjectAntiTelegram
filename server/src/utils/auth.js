@@ -62,6 +62,12 @@ function decodeJwtPayloadUnsafe(token) {
   }
 }
 
+function isSharedTenantMode(tenantRow) {
+  return String(tenantRow?.db_mode || '')
+    .toLowerCase()
+    .trim() === 'shared';
+}
+
 async function resolveAuthContextFromToken(token, requestedViewRole = '') {
   const unsafePayload = decodeJwtPayloadUnsafe(token) || {};
   const tenantCodeHint = db.normalizeTenantCode(
@@ -167,6 +173,18 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
     }
     tenantRegistry = tenantRes.rows[0];
 
+    const normalizedTenantCode = String(tenantRegistry.code || '')
+      .toLowerCase()
+      .trim();
+    if (isSharedTenantMode(tenantRegistry) && normalizedTenantCode !== 'default') {
+      return {
+        ok: false,
+        status: 503,
+        error:
+          'Арендатор временно недоступен: требуется изолированная база данных. Обратитесь к создателю приложения.',
+      };
+    }
+
     const tenantState = isTenantActive({
       status: tenantRegistry.status,
       subscription_expires_at: tenantRegistry.subscription_expires_at,
@@ -213,7 +231,11 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
 async function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || req.headers.Authorization;
   if (NODE_ENV !== 'production') {
-    console.log('AUTH HEADER:', auth);
+    const safeAuth =
+      typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')
+        ? `Bearer ${String(auth.slice(7)).slice(0, 8)}...`
+        : auth;
+    console.log('AUTH HEADER:', safeAuth);
   }
 
   const token = getTokenFromHeader(auth);
