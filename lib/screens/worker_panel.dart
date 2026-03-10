@@ -43,7 +43,6 @@ class _WorkerPanelState extends State<WorkerPanel>
   final _descriptionCtrl = TextEditingController();
   final _priceCtrl = TextEditingController();
   final _quantityCtrl = TextEditingController(text: '1');
-  final _shelfCtrl = TextEditingController(text: '1');
   final _searchCtrl = TextEditingController();
   final _revisionPercentCtrl = TextEditingController(text: '10');
 
@@ -93,22 +92,23 @@ class _WorkerPanelState extends State<WorkerPanel>
     return parsed;
   }
 
-  int _resolveShelfNumberFromProduct(
-    Map<String, dynamic> product, {
-    int fallback = 1,
-  }) {
-    return _resolveShelfNumberFromValue(
-      product['shelf_number'] ?? product['product_shelf_number'],
-      fallback: fallback,
-    );
-  }
-
   String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
     final code = _toIntValue(productCode, 0);
     final shelf = _resolveShelfNumberFromValue(shelfNumber, fallback: 1);
     final codePart = code > 0 ? '$code' : '—';
     final shelfPart = shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
     return '$codePart--$shelfPart';
+  }
+
+  int? _extractShelfFromProductLabel(String? label) {
+    final raw = (label ?? '').trim();
+    if (raw.isEmpty) return null;
+    final parts = raw.split('--');
+    if (parts.length < 2) return null;
+    final shelfDigits = parts.last.replaceAll(RegExp(r'[^0-9]'), '');
+    final shelf = int.tryParse(shelfDigits);
+    if (shelf == null || shelf <= 0) return null;
+    return shelf;
   }
 
   List<Map<String, dynamic>> _channels = [];
@@ -163,7 +163,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     _descriptionCtrl.dispose();
     _priceCtrl.dispose();
     _quantityCtrl.dispose();
-    _shelfCtrl.dispose();
     _searchCtrl.dispose();
     _revisionPercentCtrl.dispose();
     super.dispose();
@@ -329,7 +328,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     _descriptionCtrl.clear();
     _priceCtrl.clear();
     _quantityCtrl.text = '1';
-    _shelfCtrl.text = '1';
     _pickedImage = null;
     _existingImageUrl = null;
     _removeImageOnSubmit = false;
@@ -554,14 +552,12 @@ class _WorkerPanelState extends State<WorkerPanel>
     required String description,
     required double price,
     required int quantity,
-    required int shelfNumber,
   }) async {
     final map = <String, dynamic>{
       'title': title,
       'description': description,
       'price': price,
       'quantity': quantity,
-      'shelf_number': shelfNumber,
     };
 
     if (_pickedImage != null) {
@@ -586,7 +582,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     required String description,
     required double price,
     required int quantity,
-    required int shelfNumber,
   }) async {
     final map = <String, dynamic>{
       'channel_id': channelId,
@@ -594,7 +589,6 @@ class _WorkerPanelState extends State<WorkerPanel>
       'description': description,
       'price': price,
       'quantity': quantity,
-      'shelf_number': shelfNumber,
     };
 
     if (_pickedImage != null) {
@@ -865,93 +859,79 @@ class _WorkerPanelState extends State<WorkerPanel>
     final quantityCtrl = TextEditingController(
       text: _toIntValue(post['quantity'], 1).toString(),
     );
-    final shelfCtrl = TextEditingController(
-      text: _resolveShelfNumberFromValue(post['shelf_number']).toString(),
-    );
 
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Ручная ревизия товара'),
-        content: SizedBox(
-          width: 460,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: titleCtrl,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Название',
-                    border: OutlineInputBorder(),
-                  ),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
                   controller: titleCtrl,
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: descriptionCtrl,
-                minLines: 3,
-                maxLines: 5,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Описание',
-                    border: OutlineInputBorder(),
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Название',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: titleCtrl,
                   ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
                   controller: descriptionCtrl,
+                  minLines: 3,
+                  maxLines: 5,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Описание',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: descriptionCtrl,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: priceCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(
-                        decimal: true,
-                      ),
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Цена',
-                          border: OutlineInputBorder(),
-                        ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    SizedBox(
+                      width: 180,
+                      child: TextField(
                         controller: priceCtrl,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Цена',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: priceCtrl,
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  SizedBox(
-                    width: 120,
-                    child: TextField(
-                      controller: quantityCtrl,
-                      keyboardType: TextInputType.number,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Кол-во',
-                          border: OutlineInputBorder(),
-                        ),
+                    SizedBox(
+                      width: 140,
+                      child: TextField(
                         controller: quantityCtrl,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  SizedBox(
-                    width: 120,
-                    child: TextField(
-                      controller: shelfCtrl,
-                      keyboardType: TextInputType.number,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Полка',
-                          border: OutlineInputBorder(),
+                        keyboardType: TextInputType.number,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Кол-во',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: quantityCtrl,
                         ),
-                        controller: shelfCtrl,
                       ),
                     ),
-                  ),
-                ],
-              ),
-            ],
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
         actions: [
@@ -972,7 +952,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
-    final shelfNumber = int.tryParse(shelfCtrl.text.trim()) ?? 0;
     final hasImage = (post['image_url'] ?? '').toString().trim().isNotEmpty;
     final validationError = _validateProductFields(
       title: title,
@@ -984,11 +963,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (validationError != null) {
       if (!mounted) return;
       setState(() => _message = validationError);
-      return;
-    }
-    if (shelfNumber <= 0) {
-      if (!mounted) return;
-      setState(() => _message = 'Номер полки должен быть больше нуля');
       return;
     }
 
@@ -1007,7 +981,6 @@ class _WorkerPanelState extends State<WorkerPanel>
               'description': description,
               'price': price,
               'quantity': quantity,
-              'shelf_number': shelfNumber,
               'image_url': (post['image_url'] ?? '').toString(),
             },
           ],
@@ -1043,7 +1016,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = _descriptionCtrl.text.trim();
     final priceText = _priceCtrl.text.trim().replaceAll(',', '.');
     final qtyText = _quantityCtrl.text.trim();
-    final shelfText = _shelfCtrl.text.trim();
     final hasImage =
         _pickedImage != null ||
         ((_existingImageUrl?.trim().isNotEmpty ?? false) &&
@@ -1055,11 +1027,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
     final price = double.tryParse(priceText);
     final quantity = int.tryParse(qtyText) ?? 1;
-    final shelfNumber = int.tryParse(shelfText) ?? 0;
-    if (shelfNumber <= 0) {
-      setState(() => _message = 'Номер полки должен быть больше нуля');
-      return;
-    }
     final validationError = _validateProductFields(
       title: title,
       description: description,
@@ -1083,7 +1050,6 @@ class _WorkerPanelState extends State<WorkerPanel>
         description: description,
         price: price!,
         quantity: quantity,
-        shelfNumber: shelfNumber,
       );
 
       final resp = await authService.dio.post(
@@ -1109,9 +1075,12 @@ class _WorkerPanelState extends State<WorkerPanel>
             );
           }
         }
+        final shelfNumber = _extractShelfFromProductLabel(productLabel);
         setState(() {
           if (productLabel != null && productLabel.isNotEmpty) {
-            _message = 'Товар отправлен в очередь. ID товара: $productLabel';
+            _message = shelfNumber != null
+                ? 'Товар отправлен в очередь. ID товара: $productLabel. Полка: $shelfNumber'
+                : 'Товар отправлен в очередь. ID товара: $productLabel';
           } else if (queueId != null) {
             _message = 'Товар отправлен в очередь. ID заявки: $queueId';
           } else {
@@ -1129,6 +1098,14 @@ class _WorkerPanelState extends State<WorkerPanel>
             tone: AppNoticeTone.success,
             duration: const Duration(milliseconds: 1400),
           );
+          if (shelfNumber != null) {
+            showAppNotice(
+              context,
+              'Положите товар на полку $shelfNumber',
+              tone: AppNoticeTone.warning,
+              duration: const Duration(milliseconds: 2300),
+            );
+          }
         }
         await playAppSound(AppUiSound.success);
       } else {
@@ -1176,7 +1153,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     _descriptionCtrl.text = (product['description'] ?? '').toString();
     _priceCtrl.text = (product['price'] ?? '').toString();
     _quantityCtrl.text = ((product['quantity'] ?? 1)).toString();
-    _shelfCtrl.text = _resolveShelfNumberFromProduct(product).toString();
     setState(() {
       _pickedImage = null;
       _existingImageUrl = (product['image_url'] ?? '').toString();
@@ -1221,14 +1197,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
     final fallbackQty = _toIntValue(product['quantity'], 1);
     final quantity = editedQty ?? fallbackQty;
-    final parsedShelfInput = int.tryParse(_shelfCtrl.text.trim());
-    final shelfNumber = parsedShelfInput != null && parsedShelfInput > 0
-        ? parsedShelfInput
-        : _resolveShelfNumberFromProduct(product);
-    if (shelfNumber <= 0) {
-      setState(() => _message = 'Номер полки должен быть больше нуля');
-      return;
-    }
     final existingImage = (product['image_url'] ?? '').toString().trim();
     final hasImage =
         _pickedImage != null ||
@@ -1259,7 +1227,6 @@ class _WorkerPanelState extends State<WorkerPanel>
         description: description,
         price: price,
         quantity: quantity,
-        shelfNumber: shelfNumber,
       );
 
       final resp = await authService.dio.post(
@@ -1280,9 +1247,12 @@ class _WorkerPanelState extends State<WorkerPanel>
             );
           }
         }
+        final shelfNumber = _extractShelfFromProductLabel(productLabel);
         setState(() {
           _message = productLabel != null && productLabel.isNotEmpty
-              ? 'Старый товар отправлен в очередь. ID товара: $productLabel'
+              ? (shelfNumber != null
+                    ? 'Старый товар отправлен в очередь. ID товара: $productLabel. Полка: $shelfNumber'
+                    : 'Старый товар отправлен в очередь. ID товара: $productLabel')
               : 'Старый товар отправлен в очередь повторно';
           _removeImageOnSubmit = false;
         });
@@ -1295,6 +1265,14 @@ class _WorkerPanelState extends State<WorkerPanel>
                 : 'Товар снова отправлен в очередь',
             tone: AppNoticeTone.success,
           );
+          if (shelfNumber != null) {
+            showAppNotice(
+              context,
+              'Положите товар на полку $shelfNumber',
+              tone: AppNoticeTone.warning,
+              duration: const Duration(milliseconds: 2300),
+            );
+          }
         }
         await playAppSound(AppUiSound.success);
       } else {
@@ -1324,7 +1302,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = (product['description'] ?? '').toString().trim();
     final price = _toDoubleValue(product['price'], 0);
     final quantity = _toIntValue(product['quantity'], 1);
-    final shelfNumber = _resolveShelfNumberFromProduct(product);
     final imageUrl = (product['image_url'] ?? '').toString().trim();
 
     final validationError = _validateProductFields(
@@ -1352,7 +1329,6 @@ class _WorkerPanelState extends State<WorkerPanel>
           'description': description,
           'price': price,
           'quantity': quantity,
-          'shelf_number': shelfNumber,
           'image_url': imageUrl,
         },
       );
@@ -1370,9 +1346,12 @@ class _WorkerPanelState extends State<WorkerPanel>
             );
           }
         }
+        final shelfNumber = _extractShelfFromProductLabel(productLabel);
         setState(() {
           _message = productLabel != null && productLabel.isNotEmpty
-              ? 'Дубль товара отправлен. ID товара: $productLabel'
+              ? (shelfNumber != null
+                    ? 'Дубль товара отправлен. ID товара: $productLabel. Полка: $shelfNumber'
+                    : 'Дубль товара отправлен. ID товара: $productLabel')
               : 'Дубль товара отправлен в очередь';
         });
         _loadOwnQueuedPosts();
@@ -1384,6 +1363,14 @@ class _WorkerPanelState extends State<WorkerPanel>
                 : 'Товар продублирован в очередь',
             tone: AppNoticeTone.success,
           );
+          if (shelfNumber != null) {
+            showAppNotice(
+              context,
+              'Положите товар на полку $shelfNumber',
+              tone: AppNoticeTone.warning,
+              duration: const Duration(milliseconds: 2300),
+            );
+          }
         }
         await playAppSound(AppUiSound.success);
       } else {
@@ -1594,22 +1581,14 @@ class _WorkerPanelState extends State<WorkerPanel>
                 ),
               ),
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              flex: 2,
-              child: TextField(
-                controller: _shelfCtrl,
-                keyboardType: TextInputType.number,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Полка',
-                    border: OutlineInputBorder(),
-                  ),
-                  controller: _shelfCtrl,
-                ),
-              ),
-            ),
           ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Номер полки назначается автоматически по дате.',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
         ),
         const SizedBox(height: 12),
         _buildPhotoPicker(),
@@ -1771,93 +1750,79 @@ class _WorkerPanelState extends State<WorkerPanel>
     final quantityCtrl = TextEditingController(
       text: (post['product_quantity'] ?? '1').toString(),
     );
-    final shelfCtrl = TextEditingController(
-      text: _resolveShelfNumberFromProduct(post).toString(),
-    );
 
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Изменить свой пост'),
-        content: SizedBox(
-          width: 460,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: titleCtrl,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Название товара',
-                    border: OutlineInputBorder(),
-                  ),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
                   controller: titleCtrl,
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: descriptionCtrl,
-                minLines: 3,
-                maxLines: 5,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Описание',
-                    border: OutlineInputBorder(),
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Название товара',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: titleCtrl,
                   ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
                   controller: descriptionCtrl,
+                  minLines: 3,
+                  maxLines: 5,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Описание',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: descriptionCtrl,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: priceCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(
-                        decimal: true,
-                      ),
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Цена',
-                          border: OutlineInputBorder(),
-                        ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    SizedBox(
+                      width: 180,
+                      child: TextField(
                         controller: priceCtrl,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Цена',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: priceCtrl,
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  SizedBox(
-                    width: 120,
-                    child: TextField(
-                      controller: quantityCtrl,
-                      keyboardType: TextInputType.number,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Кол-во',
-                          border: OutlineInputBorder(),
-                        ),
+                    SizedBox(
+                      width: 140,
+                      child: TextField(
                         controller: quantityCtrl,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  SizedBox(
-                    width: 120,
-                    child: TextField(
-                      controller: shelfCtrl,
-                      keyboardType: TextInputType.number,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Полка',
-                          border: OutlineInputBorder(),
+                        keyboardType: TextInputType.number,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Кол-во',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: quantityCtrl,
                         ),
-                        controller: shelfCtrl,
                       ),
                     ),
-                  ),
-                ],
-              ),
-            ],
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
         actions: [
@@ -1879,7 +1844,6 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
-    final shelfNumber = int.tryParse(shelfCtrl.text.trim()) ?? 0;
     final hasImage = ((post['product_image_url'] ?? '')
         .toString()
         .trim()
@@ -1896,11 +1860,6 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _message = validationError);
       return;
     }
-    if (shelfNumber <= 0) {
-      if (!mounted) return;
-      setState(() => _message = 'Номер полки должен быть больше нуля');
-      return;
-    }
 
     if (mounted) {
       setState(() => _savingOwnPost = true);
@@ -1913,7 +1872,6 @@ class _WorkerPanelState extends State<WorkerPanel>
           'description': description,
           'price': price,
           'quantity': quantity,
-          'shelf_number': shelfNumber,
         },
       );
       await _loadOwnQueuedPosts();
@@ -2387,6 +2345,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   @override
   Widget build(BuildContext context) {
+    final compact = MediaQuery.of(context).size.width < 700;
     if (_tabController == null || _visibleTabs.isEmpty) {
       _rebuildVisibleTabs(force: true, notify: false);
     }
@@ -2403,14 +2362,23 @@ class _WorkerPanelState extends State<WorkerPanel>
     return Scaffold(
       appBar: AppBar(
         title: const Text('Панель работника'),
-        bottom: TabBar(controller: controller, tabs: tabs),
+        bottom: TabBar(
+          controller: controller,
+          tabs: tabs,
+          isScrollable: compact,
+        ),
       ),
       body: SafeArea(
         child: Column(
           children: [
             if (_message.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                padding: EdgeInsets.fromLTRB(
+                  compact ? 10 : 16,
+                  12,
+                  compact ? 10 : 16,
+                  0,
+                ),
                 child: Text(
                   _message,
                   style: TextStyle(

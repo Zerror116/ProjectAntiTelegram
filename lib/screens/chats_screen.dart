@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
@@ -193,6 +194,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   String _extractDioError(Object error) {
+    if (error is DioException) {
+      final responseData = error.response?.data;
+      if (responseData is Map) {
+        final apiError = (responseData['error'] ?? '').toString().trim();
+        if (apiError.isNotEmpty) return apiError;
+      }
+      final message = error.message?.trim() ?? '';
+      if (message.isNotEmpty) return message;
+      return 'Ошибка сети';
+    }
     final text = error.toString();
     final marker = 'error:';
     final idx = text.toLowerCase().indexOf(marker);
@@ -202,23 +213,119 @@ class _ChatsScreenState extends State<ChatsScreen> {
     return text;
   }
 
+  String _peerDisplayName(Map<String, dynamic> peer) {
+    final alias = (peer['alias_name'] ?? '').toString().trim();
+    if (alias.isNotEmpty) return alias;
+    final name = (peer['name'] ?? '').toString().trim();
+    if (name.isNotEmpty) return name;
+    final email = (peer['email'] ?? '').toString().trim();
+    if (email.isNotEmpty) return email;
+    final phone = (peer['phone'] ?? '').toString().trim();
+    if (phone.isNotEmpty) return phone;
+    return 'Пользователь';
+  }
+
+  String _peerSubtitle(Map<String, dynamic> peer) {
+    final phone = (peer['phone'] ?? '').toString().trim();
+    final email = (peer['email'] ?? '').toString().trim();
+    if (phone.isNotEmpty && email.isNotEmpty) return '$phone • $email';
+    if (phone.isNotEmpty) return phone;
+    if (email.isNotEmpty) return email;
+    return '';
+  }
+
   Future<void> _openDirectChatDialog() async {
     final controller = TextEditingController();
+    final contacts = <Map<String, dynamic>>[];
     bool submitting = false;
+    bool loadingContacts = true;
+    bool contactsInitialized = false;
+    String contactsError = '';
+
     await showDialog<void>(
       context: context,
       builder: (ctx) {
         return StatefulBuilder(
           builder: (context, setModalState) {
-            Future<void> submit() async {
-              final query = controller.text.trim();
-              if (query.isEmpty) return;
+            Future<void> loadContacts({bool force = false}) async {
+              if (loadingContacts && !force) return;
+              setModalState(() {
+                loadingContacts = true;
+                contactsError = '';
+              });
+              try {
+                final resp = await authService.dio.get('/api/chats/contacts');
+                final data = resp.data;
+                if (data is! Map ||
+                    data['ok'] != true ||
+                    data['data'] is! List) {
+                  throw Exception('Неверный ответ сервера');
+                }
+                contacts
+                  ..clear()
+                  ..addAll(List<Map<String, dynamic>>.from(data['data']));
+                if (ctx.mounted) {
+                  setModalState(() {
+                    loadingContacts = false;
+                  });
+                }
+              } catch (e) {
+                if (!ctx.mounted) return;
+                setModalState(() {
+                  loadingContacts = false;
+                  contactsError = _extractDioError(e);
+                });
+              }
+            }
+
+            Future<void> openDirect({
+              String? query,
+              String? userId,
+              bool closeDialog = true,
+            }) async {
+              final normalizedQuery = (query ?? '').trim();
+              final normalizedUserId = (userId ?? '').trim();
+              if (normalizedQuery.isEmpty && normalizedUserId.isEmpty) return;
+
               setModalState(() => submitting = true);
+              var didCloseDialog = false;
               try {
                 final resp = await authService.dio.post(
                   '/api/chats/direct/open',
-                  data: {'query': query},
+                  data: {
+                    if (normalizedQuery.isNotEmpty) 'query': normalizedQuery,
+                    if (normalizedUserId.isNotEmpty)
+                      'user_id': normalizedUserId,
+                  },
+                  options: Options(
+                    validateStatus: (code) {
+                      if (code == null) return false;
+                      return code < 500;
+                    },
+                  ),
                 );
+                if (resp.statusCode == 404) {
+                  if (mounted) {
+                    showGlobalAppNotice(
+                      'Пользователь не найден в вашей группе',
+                      tone: AppNoticeTone.warning,
+                    );
+                  }
+                  return;
+                }
+                if (resp.statusCode == null ||
+                    resp.statusCode! < 200 ||
+                    resp.statusCode! >= 300) {
+                  throw Exception(
+                    _extractDioError(
+                      DioException(
+                        requestOptions: resp.requestOptions,
+                        response: resp,
+                        type: DioExceptionType.badResponse,
+                      ),
+                    ),
+                  );
+                }
                 final data = resp.data;
                 if (data is! Map ||
                     data['ok'] != true ||
@@ -236,7 +343,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 if (chatId.isEmpty) {
                   throw Exception('Не удалось открыть чат');
                 }
-                if (ctx.mounted) Navigator.of(ctx).pop();
+                if (closeDialog && ctx.mounted) {
+                  didCloseDialog = true;
+                  Navigator.of(ctx).pop();
+                }
                 final title = (peer['name'] ?? '').toString().trim().isNotEmpty
                     ? (peer['name'] ?? '').toString().trim()
                     : ((peer['email'] ?? '').toString().trim().isNotEmpty
@@ -265,42 +375,257 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   tone: AppNoticeTone.error,
                 );
               } finally {
-                if (ctx.mounted) {
+                if (!didCloseDialog && ctx.mounted) {
                   setModalState(() => submitting = false);
                 }
               }
             }
 
+            Future<void> addToContactsByQuery() async {
+              final query = controller.text.trim();
+              if (query.isEmpty) return;
+              setModalState(() => submitting = true);
+              try {
+                final resp = await authService.dio.post(
+                  '/api/chats/contacts',
+                  data: {'query': query},
+                  options: Options(
+                    validateStatus: (code) {
+                      if (code == null) return false;
+                      return code < 500;
+                    },
+                  ),
+                );
+                if (resp.statusCode == 404) {
+                  if (mounted) {
+                    showGlobalAppNotice(
+                      'Контакт не найден в вашей группе',
+                      tone: AppNoticeTone.warning,
+                    );
+                  }
+                  return;
+                }
+                if (resp.statusCode == null ||
+                    resp.statusCode! < 200 ||
+                    resp.statusCode! >= 300) {
+                  throw Exception(
+                    _extractDioError(
+                      DioException(
+                        requestOptions: resp.requestOptions,
+                        response: resp,
+                        type: DioExceptionType.badResponse,
+                      ),
+                    ),
+                  );
+                }
+                if (mounted) {
+                  showAppNotice(
+                    this.context,
+                    'Контакт добавлен',
+                    tone: AppNoticeTone.success,
+                  );
+                }
+                await loadContacts(force: true);
+              } catch (e) {
+                if (!mounted) return;
+                showGlobalAppNotice(
+                  'Ошибка добавления контакта: ${_extractDioError(e)}',
+                  tone: AppNoticeTone.error,
+                );
+              } finally {
+                if (ctx.mounted) setModalState(() => submitting = false);
+              }
+            }
+
+            Future<void> removeContact(String userId) async {
+              setModalState(() => submitting = true);
+              try {
+                final resp = await authService.dio.delete(
+                  '/api/chats/contacts/$userId',
+                  options: Options(
+                    validateStatus: (code) {
+                      if (code == null) return false;
+                      return code < 500;
+                    },
+                  ),
+                );
+                if (resp.statusCode == null ||
+                    resp.statusCode! < 200 ||
+                    resp.statusCode! >= 300) {
+                  throw Exception(
+                    _extractDioError(
+                      DioException(
+                        requestOptions: resp.requestOptions,
+                        response: resp,
+                        type: DioExceptionType.badResponse,
+                      ),
+                    ),
+                  );
+                }
+                contacts.removeWhere(
+                  (item) =>
+                      (item['contact_user_id'] ?? '').toString() == userId,
+                );
+                if (ctx.mounted) {
+                  setModalState(() {});
+                }
+              } catch (e) {
+                if (!mounted) return;
+                showGlobalAppNotice(
+                  'Ошибка удаления контакта: ${_extractDioError(e)}',
+                  tone: AppNoticeTone.error,
+                );
+              } finally {
+                if (ctx.mounted) setModalState(() => submitting = false);
+              }
+            }
+
+            if (!contactsInitialized) {
+              contactsInitialized = true;
+              unawaited(loadContacts(force: true));
+            }
+
             return AlertDialog(
               title: const Text('Найти пользователя'),
               content: SizedBox(
-                width: 420,
-                child: TextField(
-                  controller: controller,
-                  autofocus: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Телефон, email или имя',
-                    hintText: 'Например: 7999..., user@mail.com',
-                    border: OutlineInputBorder(),
+                width: 500,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 520),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextField(
+                        controller: controller,
+                        autofocus: true,
+                        decoration: const InputDecoration(
+                          labelText: 'Телефон, email или имя',
+                          hintText: 'Например: 7999..., user@mail.com',
+                          border: OutlineInputBorder(),
+                        ),
+                        onSubmitted: (_) => openDirect(query: controller.text),
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          FilledButton.icon(
+                            onPressed: submitting
+                                ? null
+                                : () => openDirect(query: controller.text),
+                            icon: const Icon(Icons.forum_outlined),
+                            label: const Text('Открыть ЛС'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: submitting ? null : addToContactsByQuery,
+                            icon: const Icon(Icons.person_add_alt_1_outlined),
+                            label: const Text('Добавить в контакты'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Text(
+                            'Контакты',
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                          const Spacer(),
+                          IconButton(
+                            tooltip: 'Обновить',
+                            onPressed: submitting
+                                ? null
+                                : () => loadContacts(force: true),
+                            icon: const Icon(Icons.refresh),
+                          ),
+                        ],
+                      ),
+                      Expanded(
+                        child: loadingContacts
+                            ? const Center(
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : contactsError.isNotEmpty
+                            ? Center(
+                                child: Text(
+                                  'Не удалось загрузить контакты: $contactsError',
+                                  textAlign: TextAlign.center,
+                                ),
+                              )
+                            : contacts.isEmpty
+                            ? const Center(child: Text('Контактов пока нет'))
+                            : ListView.separated(
+                                itemCount: contacts.length,
+                                separatorBuilder: (_, index) =>
+                                    const Divider(height: 1),
+                                itemBuilder: (context, index) {
+                                  final contact = contacts[index];
+                                  final contactUserId =
+                                      (contact['contact_user_id'] ?? '')
+                                          .toString()
+                                          .trim();
+                                  final title = _peerDisplayName(contact);
+                                  final subtitle = _peerSubtitle(contact);
+                                  return ListTile(
+                                    contentPadding: EdgeInsets.zero,
+                                    leading: AppAvatar(
+                                      title: title,
+                                      imageUrl: _resolveImageUrl(
+                                        (contact['avatar_url'] ?? '')
+                                            .toString()
+                                            .trim(),
+                                      ),
+                                      focusX: _toAvatarFocus(
+                                        contact['avatar_focus_x'],
+                                      ),
+                                      focusY: _toAvatarFocus(
+                                        contact['avatar_focus_y'],
+                                      ),
+                                      zoom: _toAvatarZoom(
+                                        contact['avatar_zoom'],
+                                      ),
+                                      radius: 18,
+                                    ),
+                                    title: Text(
+                                      title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    subtitle: subtitle.isEmpty
+                                        ? null
+                                        : Text(
+                                            subtitle,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                    onTap: submitting || contactUserId.isEmpty
+                                        ? null
+                                        : () =>
+                                              openDirect(userId: contactUserId),
+                                    trailing: IconButton(
+                                      tooltip: 'Удалить контакт',
+                                      onPressed:
+                                          submitting || contactUserId.isEmpty
+                                          ? null
+                                          : () => removeContact(contactUserId),
+                                      icon: const Icon(
+                                        Icons.person_remove_alt_1_outlined,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
                   ),
-                  onSubmitted: (_) => submit(),
                 ),
               ),
               actions: [
                 TextButton(
                   onPressed: submitting ? null : () => Navigator.pop(ctx),
                   child: const Text('Отмена'),
-                ),
-                FilledButton.icon(
-                  onPressed: submitting ? null : submit,
-                  icon: submitting
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.forum_outlined),
-                  label: const Text('Открыть ЛС'),
                 ),
               ],
             );

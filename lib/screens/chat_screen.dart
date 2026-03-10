@@ -69,6 +69,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _pinLoading = false;
 
   String _searchQuery = '';
+  List<String> _searchResultIds = const [];
+  int _searchResultIndex = -1;
   int _recordingSeconds = 0;
   String? _activeVoiceMessageId;
   Duration _activeVoicePosition = Duration.zero;
@@ -102,6 +104,7 @@ class _ChatScreenState extends State<ChatScreen> {
       final next = _searchController.text.trim();
       if (next == _searchQuery) return;
       setState(() => _searchQuery = next);
+      _recomputeSearchResults(keepCurrent: false);
     });
 
     _controller.addListener(() {
@@ -343,6 +346,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (inserted && msgId != null && msgId.isNotEmpty) {
       _markMessageAppearing(msgId);
     }
+    _recomputeSearchResults();
 
     if (autoScroll) {
       _scrollToBottom(animated: true);
@@ -395,6 +399,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _messageItemKeys.remove(messageId);
       _appearingMessageIds.remove(messageId);
     });
+    _recomputeSearchResults();
   }
 
   void _markMessageAppearing(String messageId) {
@@ -566,7 +571,9 @@ class _ChatScreenState extends State<ChatScreen> {
     return _messageItemKeys.putIfAbsent(messageId, GlobalKey.new);
   }
 
-  Future<BuildContext?> _resolveMessageContextWithScroll(String messageId) async {
+  Future<BuildContext?> _resolveMessageContextWithScroll(
+    String messageId,
+  ) async {
     BuildContext? context = _messageItemKeys[messageId]?.currentContext;
     if (context != null && context.mounted) return context;
     if (!_scrollController.hasClients) return null;
@@ -613,6 +620,20 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!_scrollController.hasClients) break;
       _scrollController.jumpTo(offset);
       await Future<void>.delayed(const Duration(milliseconds: 34));
+      if (!mounted) return null;
+      context = _messageItemKeys[messageId]?.currentContext;
+      if (context != null && context.mounted) {
+        return context;
+      }
+    }
+
+    // Fallback sweep for long chats where message tile heights vary a lot.
+    for (var i = 0; i <= 16; i++) {
+      if (!_scrollController.hasClients) break;
+      final fraction = i / 16;
+      final offset = (maxExtent * fraction).clamp(0.0, maxExtent).toDouble();
+      _scrollController.jumpTo(offset);
+      await Future<void>.delayed(const Duration(milliseconds: 28));
       if (!mounted) return null;
       context = _messageItemKeys[messageId]?.currentContext;
       if (context != null && context.mounted) {
@@ -817,6 +838,7 @@ class _ChatScreenState extends State<ChatScreen> {
         });
         _incomingTimer?.cancel();
         _incomingTimer = null;
+        _recomputeSearchResults(keepCurrent: false);
         _scrollToBottom(animated: false);
         _scheduleReadSync();
       }
@@ -1447,53 +1469,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return role == 'creator';
   }
 
-  Future<int?> _askShelfNumber() async {
-    final controller = TextEditingController();
-    final result = await showDialog<int>(
-      context: context,
-      builder: (ctx) {
-        final width = MediaQuery.of(ctx).size.width;
-        final dialogWidth = width < 420 ? width * 0.9 : 360.0;
-        return AlertDialog(
-          insetPadding: const EdgeInsets.symmetric(
-            horizontal: 24,
-            vertical: 24,
-          ),
-          title: const Text('Номер полки'),
-          content: SizedBox(
-            width: dialogWidth,
-            child: TextField(
-              controller: controller,
-              autofocus: true,
-              keyboardType: TextInputType.number,
-              decoration: withInputLanguageBadge(
-                const InputDecoration(
-                  hintText: 'Введите номер полки',
-                  border: OutlineInputBorder(),
-                ),
-                controller: controller,
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Отмена'),
-            ),
-            TextButton(
-              onPressed: () {
-                final value = int.tryParse(controller.text.trim());
-                Navigator.of(ctx).pop(value);
-              },
-              child: const Text('Сохранить'),
-            ),
-          ],
-        );
-      },
-    );
-    return result;
-  }
-
   Future<void> _respondToDeliveryOffer(
     Map<String, dynamic> meta, {
     required bool accepted,
@@ -1700,43 +1675,6 @@ class _ChatScreenState extends State<ChatScreen> {
         await playAppSound(AppUiSound.success);
       }
     } catch (e) {
-      int? shelfToSend;
-      try {
-        final responseData = (e as dynamic).response?.data;
-        final code = responseData is Map
-            ? responseData['code']?.toString()
-            : null;
-        if (code == 'SHELF_REQUIRED') {
-          shelfToSend = await _askShelfNumber();
-          if (shelfToSend == null || shelfToSend <= 0) {
-            return;
-          }
-          final retry = await authService.dio.post(
-            '/api/admin/orders/mark_placed',
-            data: {
-              if (reservationId != null && reservationId.isNotEmpty)
-                'reservation_id': reservationId,
-              if (cartItemId != null && cartItemId.isNotEmpty)
-                'cart_item_id': cartItemId,
-              'shelf_number': shelfToSend,
-            },
-          );
-          if ((retry.statusCode == 200 || retry.statusCode == 201) && mounted) {
-            setState(() {
-              if (cartItemId != null && cartItemId.isNotEmpty) {
-                _placedCartItemIds.add(cartItemId);
-              }
-            });
-            showAppNotice(
-              context,
-              'Готово. Полка: $shelfToSend',
-              tone: AppNoticeTone.success,
-            );
-            await playAppSound(AppUiSound.success);
-          }
-          return;
-        }
-      } catch (_) {}
       if (!mounted) return;
       showAppNotice(
         context,
@@ -1785,6 +1723,80 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages.where((m) => _messageMatchesSearch(m, _searchQuery)).toList()
           ..sort(_compareByCreatedAt);
     return filtered;
+  }
+
+  void _recomputeSearchResults({bool keepCurrent = true}) {
+    final query = _searchQuery.trim();
+    if (query.isEmpty) {
+      if (_searchResultIds.isEmpty && _searchResultIndex == -1) return;
+      if (!mounted) {
+        _searchResultIds = const [];
+        _searchResultIndex = -1;
+        return;
+      }
+      setState(() {
+        _searchResultIds = const [];
+        _searchResultIndex = -1;
+      });
+      return;
+    }
+
+    final matches = _visibleMessages()
+        .map((message) => (message['id'] ?? '').toString().trim())
+        .where((id) => id.isNotEmpty)
+        .toList(growable: false);
+    final currentId =
+        keepCurrent &&
+            _searchResultIndex >= 0 &&
+            _searchResultIndex < _searchResultIds.length
+        ? _searchResultIds[_searchResultIndex]
+        : null;
+
+    var nextIndex = matches.isEmpty ? -1 : 0;
+    if (currentId != null) {
+      final keepIndex = matches.indexOf(currentId);
+      if (keepIndex >= 0) {
+        nextIndex = keepIndex;
+      }
+    }
+
+    if (listEquals(matches, _searchResultIds) &&
+        nextIndex == _searchResultIndex) {
+      return;
+    }
+
+    if (!mounted) {
+      _searchResultIds = matches;
+      _searchResultIndex = nextIndex;
+      return;
+    }
+    setState(() {
+      _searchResultIds = matches;
+      _searchResultIndex = nextIndex;
+    });
+  }
+
+  Future<void> _jumpToSearchResult(int index) async {
+    if (index < 0 || index >= _searchResultIds.length) return;
+    final messageId = _searchResultIds[index];
+    final targetContext = await _resolveMessageContextWithScroll(messageId);
+    if (targetContext == null || !targetContext.mounted) return;
+    await Scrollable.ensureVisible(
+      targetContext,
+      duration: const Duration(milliseconds: 240),
+      alignment: 0.18,
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  void _moveSearchResult(int delta) {
+    if (_searchResultIds.isEmpty) return;
+    final length = _searchResultIds.length;
+    final base = _searchResultIndex < 0 ? 0 : _searchResultIndex;
+    final next = (base + delta) % length;
+    final normalized = next < 0 ? next + length : next;
+    setState(() => _searchResultIndex = normalized);
+    unawaited(_jumpToSearchResult(normalized));
   }
 
   List<Map<String, dynamic>> _buildTimeline(
@@ -1899,6 +1911,54 @@ class _ChatScreenState extends State<ChatScreen> {
       return '';
     }
     return text;
+  }
+
+  Widget _buildHighlightedText(
+    String source, {
+    TextStyle? style,
+    int? maxLines,
+    TextOverflow overflow = TextOverflow.clip,
+  }) {
+    final text = source;
+    final query = _searchQuery.trim();
+    if (query.isEmpty || text.isEmpty) {
+      return Text(text, style: style, maxLines: maxLines, overflow: overflow);
+    }
+
+    final lowerText = text.toLowerCase();
+    final lowerQuery = query.toLowerCase();
+    var cursor = 0;
+    final spans = <TextSpan>[];
+    final theme = Theme.of(context);
+
+    while (cursor < text.length) {
+      final matchIndex = lowerText.indexOf(lowerQuery, cursor);
+      if (matchIndex < 0) {
+        spans.add(TextSpan(text: text.substring(cursor)));
+        break;
+      }
+      if (matchIndex > cursor) {
+        spans.add(TextSpan(text: text.substring(cursor, matchIndex)));
+      }
+      final end = matchIndex + lowerQuery.length;
+      spans.add(
+        TextSpan(
+          text: text.substring(matchIndex, end),
+          style: TextStyle(
+            backgroundColor: theme.colorScheme.secondaryContainer,
+            color: theme.colorScheme.onSecondaryContainer,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      );
+      cursor = end;
+    }
+
+    return Text.rich(
+      TextSpan(style: style, children: spans),
+      maxLines: maxLines,
+      overflow: overflow,
+    );
   }
 
   String? _voiceUrlOf(Map<String, dynamic> meta) {
@@ -2732,7 +2792,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
               const SizedBox(height: 10),
-              Text(
+              _buildHighlightedText(
                 text,
                 style: TextStyle(color: theme.colorScheme.onSurfaceVariant),
               ),
@@ -2779,7 +2839,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ],
             ] else if (isSupportFeedback) ...[
-              Text(
+              _buildHighlightedText(
                 text,
                 style: TextStyle(
                   fontSize: 15,
@@ -2895,7 +2955,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               const SizedBox(height: 6),
               if (reservedDescription.isNotEmpty) ...[
-                Text(
+                _buildHighlightedText(
                   reservedDescription,
                   style: TextStyle(
                     color: theme.colorScheme.onSurfaceVariant,
@@ -2948,7 +3008,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
                 if (captionText.isNotEmpty) ...[
                   const SizedBox(height: 10),
-                  Text(captionText, style: TextStyle(color: textColor)),
+                  _buildHighlightedText(
+                    captionText,
+                    style: TextStyle(color: textColor),
+                  ),
                 ],
               ] else ...[
                 if (imageUrl != null) ...[
@@ -2957,7 +3020,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     const SizedBox(height: 10),
                 ],
                 if (isPlainMessage || captionText.isNotEmpty)
-                  Text(
+                  _buildHighlightedText(
                     isPlainMessage ? text : captionText,
                     style: TextStyle(
                       color: isDeleted
@@ -3101,6 +3164,34 @@ class _ChatScreenState extends State<ChatScreen> {
               )
             : Text(widget.chatTitle),
         actions: [
+          if (_searchMode && _searchQuery.isNotEmpty)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Text(
+                  _searchResultIds.isEmpty
+                      ? '0/0'
+                      : '${_searchResultIndex + 1}/${_searchResultIds.length}',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+            ),
+          if (_searchMode)
+            IconButton(
+              tooltip: 'Предыдущее совпадение',
+              icon: const Icon(Icons.keyboard_arrow_up),
+              onPressed: _searchResultIds.isEmpty
+                  ? null
+                  : () => _moveSearchResult(-1),
+            ),
+          if (_searchMode)
+            IconButton(
+              tooltip: 'Следующее совпадение',
+              icon: const Icon(Icons.keyboard_arrow_down),
+              onPressed: _searchResultIds.isEmpty
+                  ? null
+                  : () => _moveSearchResult(1),
+            ),
           IconButton(
             icon: Icon(_searchMode ? Icons.close : Icons.search),
             onPressed: () {
@@ -3111,6 +3202,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 }
                 _searchMode = !_searchMode;
               });
+              _recomputeSearchResults(keepCurrent: false);
             },
           ),
         ],

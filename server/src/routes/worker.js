@@ -122,6 +122,62 @@ function toShelfNumber(value, fallback = 1) {
   return Math.floor(n);
 }
 
+async function resolveAutoShelfNumber(
+  client,
+  tenantId = null,
+  dateValue = null,
+  fallback = 1
+) {
+  const dayQ = await client.query(
+    `SELECT to_char((COALESCE($1::timestamptz, now()) AT TIME ZONE $2)::date, 'YYYY-MM-DD') AS current_day`,
+    [dateValue, SAMARA_TZ]
+  );
+  const currentDay = String(dayQ.rows[0]?.current_day || '').trim();
+  if (!isIsoDay(currentDay)) return fallback;
+
+  let startDay = currentDay;
+  const mainQ = await client.query(
+    `SELECT id, settings
+     FROM chats
+     WHERE type = 'channel'
+       AND COALESCE(settings->>'system_key', '') = 'main_channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+     ORDER BY created_at ASC
+     LIMIT 1
+     FOR UPDATE`,
+    [tenantId || null]
+  );
+  if (mainQ.rowCount > 0) {
+    const main = mainQ.rows[0];
+    const settings = parseSettings(main.settings);
+    const savedStart = String(settings.shelf_cycle_start_day || '').trim();
+    if (isIsoDay(savedStart)) {
+      startDay = savedStart;
+    } else {
+      const nextSettings = {
+        ...settings,
+        shelf_cycle_start_day: currentDay,
+      };
+      await client.query(
+        `UPDATE chats
+         SET settings = $1::jsonb,
+             updated_at = now()
+         WHERE id = $2`,
+        [JSON.stringify(nextSettings), main.id]
+      );
+      startDay = currentDay;
+    }
+  }
+
+  const diffQ = await client.query(
+    `SELECT GREATEST(0, ($1::date - $2::date))::int AS diff_days`,
+    [currentDay, startDay]
+  );
+  const diffDays = Number(diffQ.rows[0]?.diff_days || 0);
+  if (!Number.isFinite(diffDays) || diffDays < 0) return fallback;
+  return (diffDays % 10) + 1;
+}
+
 function formatProductLabel(productCode, shelfNumber) {
   const code = Number(productCode);
   const shelf = Number(shelfNumber);
@@ -238,35 +294,87 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
   });
 }
 
-async function allocateProductCode(client) {
+async function allocateProductCode(client, tenantId = null) {
   await client.query('LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE');
 
   const reusable = await client.query(
-    `SELECT product_code
-     FROM products
-     WHERE status = 'archived'
-       AND reusable_at IS NOT NULL
-       AND reusable_at <= now()
-       AND product_code IS NOT NULL
-     ORDER BY reusable_at ASC
-     LIMIT 1
-     FOR UPDATE`
+    `SELECT p.id, p.product_code, p.reusable_at
+     FROM products p
+     WHERE p.status = 'archived'
+       AND p.reusable_at IS NOT NULL
+       AND p.reusable_at <= now()
+       AND p.product_code IS NOT NULL
+       AND p.product_code > 0
+       AND EXISTS (
+         SELECT 1
+         FROM product_publication_queue q
+         JOIN chats c ON c.id = q.channel_id
+         WHERE q.product_id = p.id
+           AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+       )
+     ORDER BY p.product_code ASC, p.reusable_at ASC
+     FOR UPDATE OF p`,
+    [tenantId || null],
   );
 
-  if (reusable.rowCount > 0) {
-    const code = reusable.rows[0].product_code;
-    await client.query(
-      `UPDATE products
-       SET product_code = NULL,
-           updated_at = now()
-       WHERE status = 'archived' AND product_code = $1`,
-      [code]
-    );
-    return code;
+  const reusableCodes = reusable.rows
+    .map((row) => Number(row.product_code))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const reusableCodeSet = new Set(reusableCodes);
+  const reusableByCode = new Map();
+  for (const row of reusable.rows) {
+    const code = Number(row.product_code);
+    if (!Number.isFinite(code) || code <= 0) continue;
+    if (!reusableByCode.has(code)) {
+      reusableByCode.set(code, row.id);
+    }
   }
 
-  const nextRes = await client.query('SELECT COALESCE(MAX(product_code), 0) + 1 AS next_code FROM products');
-  return Number(nextRes.rows[0].next_code);
+  const nextRes = await client.query(
+    `WITH used AS (
+       SELECT DISTINCT p.product_code
+       FROM products p
+       WHERE p.product_code IS NOT NULL
+         AND p.product_code > 0
+         AND NOT (p.product_code = ANY($2::int[]))
+         AND EXISTS (
+           SELECT 1
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.product_id = p.id
+             AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+         )
+     )
+     SELECT COALESCE(
+       (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM used WHERE product_code = 1)),
+       (
+         SELECT MIN(u1.product_code + 1)
+         FROM used u1
+         LEFT JOIN used u2
+           ON u2.product_code = u1.product_code + 1
+         WHERE u2.product_code IS NULL
+       ),
+       1
+     ) AS next_code`,
+    [tenantId || null, reusableCodes],
+  );
+  const nextCode = Number(nextRes.rows[0]?.next_code || 1);
+  if (!Number.isFinite(nextCode) || nextCode <= 0) return 1;
+
+  if (reusableCodeSet.has(nextCode)) {
+    const reusableProductId = reusableByCode.get(nextCode);
+    if (reusableProductId) {
+      await client.query(
+        `UPDATE products
+         SET product_code = NULL,
+             updated_at = now()
+         WHERE id = $1`,
+        [reusableProductId],
+      );
+    }
+  }
+
+  return nextCode;
 }
 
 async function getAllowedPostChannels(userRole, tenantId = null) {
@@ -372,7 +480,6 @@ router.post(
         description = '',
         price,
         quantity = 1,
-        shelf_number,
       } = req.body || {};
 
       const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
@@ -397,12 +504,12 @@ router.post(
         return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
       }
       const normalizedQuantity = Math.floor(rawQuantity);
-      const rawShelf = shelf_number == null || shelf_number === '' ? 1 : Number(shelf_number);
-      if (!Number.isFinite(rawShelf) || rawShelf <= 0) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Номер полки должен быть больше нуля' });
-      }
-      const normalizedShelfNumber = Math.floor(rawShelf);
+      const normalizedShelfNumber = await resolveAutoShelfNumber(
+        client,
+        req.user?.tenant_id || null,
+        null,
+        1
+      );
       const normalizedDescription = String(description || '').trim();
       if (!hasAtLeastTwoLetters(normalizedDescription)) {
         removeUploadedFile(req.file);
@@ -428,7 +535,7 @@ router.post(
         });
       }
 
-      const code = await allocateProductCode(client);
+      const code = await allocateProductCode(client, req.user?.tenant_id || null);
 
       const productInsert = await client.query(
         `INSERT INTO products (id, title, description, price, quantity, shelf_number, image_url, created_by, status, created_at, updated_at)
@@ -513,7 +620,6 @@ router.post(
         description,
         price,
         quantity,
-        shelf_number,
       } = req.body || {};
 
       if (!channel_id) {
@@ -564,10 +670,12 @@ router.post(
         quantity != null && quantity !== ''
           ? Number(quantity)
           : Number(current.quantity || 1);
-      const nextShelfNumber =
-        shelf_number != null && shelf_number !== ''
-          ? Number(shelf_number)
-          : Number(current.shelf_number || 1);
+      const nextShelfNumber = await resolveAutoShelfNumber(
+        client,
+        req.user?.tenant_id || null,
+        null,
+        1
+      );
       let nextImageUrl = current.image_url;
       if (req.file) {
         nextImageUrl = toAbsoluteImageUrl(req, req.file);
@@ -597,13 +705,6 @@ router.post(
           error: 'Количество должно быть больше нуля',
         });
       }
-      if (!Number.isFinite(nextShelfNumber) || nextShelfNumber <= 0) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({
-          ok: false,
-          error: 'Номер полки должен быть больше нуля',
-        });
-      }
       if (!nextImageUrl) {
         removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
@@ -611,7 +712,7 @@ router.post(
 
       const nextCode = current.product_code != null
         ? Number(current.product_code)
-        : await allocateProductCode(client);
+        : await allocateProductCode(client, req.user?.tenant_id || null);
 
       const upd = await client.query(
         `UPDATE products
@@ -731,7 +832,11 @@ router.patch(
     const description = String(req.body?.description || '').trim();
     const price = Number(req.body?.price);
     const quantity = Number(req.body?.quantity);
-    const shelfNumber = Number(req.body?.shelf_number);
+    const rawShelfNumber = Number(req.body?.shelf_number);
+    const shelfNumber =
+      Number.isFinite(rawShelfNumber) && rawShelfNumber > 0
+        ? Math.floor(rawShelfNumber)
+        : null;
 
     if (!queueId) {
       return res.status(400).json({ ok: false, error: 'queueId обязателен' });
@@ -751,9 +856,6 @@ router.patch(
     if (!Number.isFinite(quantity) || quantity <= 0) {
       return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
     }
-    if (!Number.isFinite(shelfNumber) || shelfNumber <= 0) {
-      return res.status(400).json({ ok: false, error: 'Номер полки должен быть больше нуля' });
-    }
 
     try {
       const result = await db.query(
@@ -772,7 +874,7 @@ router.patch(
                description = $4,
                price = $5,
                quantity = $6,
-               shelf_number = $7,
+               shelf_number = COALESCE($7::int, p.shelf_number),
                updated_at = now()
            FROM target t
            WHERE p.id = t.product_id
@@ -785,7 +887,7 @@ router.patch(
                  'description', $4,
                  'price', $5,
                  'quantity', $6,
-                 'shelf_number', $7,
+                 'shelf_number', (SELECT shelf_number FROM product_upd LIMIT 1),
                  'image_url', (SELECT image_url FROM product_upd LIMIT 1)
                )
              )
@@ -799,7 +901,7 @@ router.patch(
           description,
           price,
           Math.floor(quantity),
-          Math.floor(shelfNumber),
+          shelfNumber,
         ]
       );
       if (result.rowCount === 0) {

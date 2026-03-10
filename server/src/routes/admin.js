@@ -31,6 +31,7 @@ const requireReservationFulfillPermission = requirePermission(
   "reservation.fulfill",
 );
 const PUBLISH_POST_INTERVAL_MS = 3000;
+const SAMARA_TZ = "Europe/Samara";
 
 const channelUploadsDir = path.resolve(
   __dirname,
@@ -137,6 +138,10 @@ function normalizeVisibility(value) {
     .toLowerCase()
     .trim();
   return v === "private" ? "private" : "public";
+}
+
+function isIsoDay(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
 }
 
 function clampNumber(value, min, max, fallback = 0) {
@@ -299,6 +304,62 @@ function formatProductLabel(productCode, shelfNumber) {
   return `${codePart}--${shelfPart}`;
 }
 
+async function resolveAutoShelfNumber(
+  client,
+  tenantId = null,
+  dateValue = null,
+  fallback = 1,
+) {
+  const dayQ = await client.query(
+    `SELECT to_char((COALESCE($1::timestamptz, now()) AT TIME ZONE $2)::date, 'YYYY-MM-DD') AS current_day`,
+    [dateValue, SAMARA_TZ],
+  );
+  const currentDay = String(dayQ.rows[0]?.current_day || "").trim();
+  if (!isIsoDay(currentDay)) return fallback;
+
+  let startDay = currentDay;
+  const mainQ = await client.query(
+    `SELECT id, settings
+     FROM chats
+     WHERE type = 'channel'
+       AND COALESCE(settings->>'system_key', '') = 'main_channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+     ORDER BY created_at ASC
+     LIMIT 1
+     FOR UPDATE`,
+    [tenantId || null],
+  );
+  if (mainQ.rowCount > 0) {
+    const main = mainQ.rows[0];
+    const settings = normalizeSettings(main.settings);
+    const savedStart = String(settings.shelf_cycle_start_day || "").trim();
+    if (isIsoDay(savedStart)) {
+      startDay = savedStart;
+    } else {
+      const nextSettings = {
+        ...settings,
+        shelf_cycle_start_day: currentDay,
+      };
+      await client.query(
+        `UPDATE chats
+         SET settings = $1::jsonb,
+             updated_at = now()
+         WHERE id = $2`,
+        [JSON.stringify(nextSettings), main.id],
+      );
+      startDay = currentDay;
+    }
+  }
+
+  const diffQ = await client.query(
+    `SELECT GREATEST(0, ($1::date - $2::date))::int AS diff_days`,
+    [currentDay, startDay],
+  );
+  const diffDays = Number(diffQ.rows[0]?.diff_days || 0);
+  if (!Number.isFinite(diffDays) || diffDays < 0) return fallback;
+  return (diffDays % 10) + 1;
+}
+
 function reservedOrderMessageText(order) {
   const productLabel = formatProductLabel(
     order.product_code,
@@ -390,6 +451,7 @@ function publishDemoPostsSequentially({
   count,
   channelId,
   channelTitle,
+  tenantId,
   createdBy,
   imageUrl,
 }) {
@@ -398,7 +460,7 @@ function publishDemoPostsSequentially({
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const code = await allocateProductCode(client);
+        const code = await allocateProductCode(client, tenantId || null);
         const demo = buildDemoProduct(index, imageUrl);
         const productId = uuidv4();
         await client.query(
@@ -484,7 +546,7 @@ function publishDemoPostsSequentially({
             chatId: channelId,
             message: messageInsert.rows[0],
           });
-          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          emitToTenant(io, tenantId || null, "chat:updated", {
             chatId: channelId,
             chat: {
               id: channelId,
@@ -503,37 +565,87 @@ function publishDemoPostsSequentially({
   }
 }
 
-async function allocateProductCode(client) {
+async function allocateProductCode(client, tenantId = null) {
   await client.query("LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE");
 
   const reusable = await client.query(
-    `SELECT product_code
-     FROM products
-     WHERE status = 'archived'
-       AND reusable_at IS NOT NULL
-       AND reusable_at <= now()
-       AND product_code IS NOT NULL
-     ORDER BY reusable_at ASC
-     LIMIT 1
-     FOR UPDATE`,
+    `SELECT p.id, p.product_code, p.reusable_at
+     FROM products p
+     WHERE p.status = 'archived'
+       AND p.reusable_at IS NOT NULL
+       AND p.reusable_at <= now()
+       AND p.product_code IS NOT NULL
+       AND p.product_code > 0
+       AND EXISTS (
+         SELECT 1
+         FROM product_publication_queue q
+         JOIN chats c ON c.id = q.channel_id
+         WHERE q.product_id = p.id
+           AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+       )
+     ORDER BY p.product_code ASC, p.reusable_at ASC
+     FOR UPDATE OF p`,
+    [tenantId || null],
   );
 
-  if (reusable.rowCount > 0) {
-    const code = reusable.rows[0].product_code;
-    await client.query(
-      `UPDATE products
-       SET product_code = NULL,
-           updated_at = now()
-       WHERE status = 'archived' AND product_code = $1`,
-      [code],
-    );
-    return code;
+  const reusableCodes = reusable.rows
+    .map((row) => Number(row.product_code))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const reusableCodeSet = new Set(reusableCodes);
+  const reusableByCode = new Map();
+  for (const row of reusable.rows) {
+    const code = Number(row.product_code);
+    if (!Number.isFinite(code) || code <= 0) continue;
+    if (!reusableByCode.has(code)) {
+      reusableByCode.set(code, row.id);
+    }
   }
 
   const nextRes = await client.query(
-    "SELECT COALESCE(MAX(product_code), 0) + 1 AS next_code FROM products",
+    `WITH used AS (
+       SELECT DISTINCT p.product_code
+       FROM products p
+       WHERE p.product_code IS NOT NULL
+         AND p.product_code > 0
+         AND NOT (p.product_code = ANY($2::int[]))
+         AND EXISTS (
+           SELECT 1
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.product_id = p.id
+             AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+         )
+     )
+     SELECT COALESCE(
+       (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM used WHERE product_code = 1)),
+       (
+         SELECT MIN(u1.product_code + 1)
+         FROM used u1
+         LEFT JOIN used u2
+           ON u2.product_code = u1.product_code + 1
+         WHERE u2.product_code IS NULL
+       ),
+       1
+     ) AS next_code`,
+    [tenantId || null, reusableCodes],
   );
-  return Number(nextRes.rows[0].next_code);
+  const nextCode = Number(nextRes.rows[0]?.next_code || 1);
+  if (!Number.isFinite(nextCode) || nextCode <= 0) return 1;
+
+  if (reusableCodeSet.has(nextCode)) {
+    const reusableProductId = reusableByCode.get(nextCode);
+    if (reusableProductId) {
+      await client.query(
+        `UPDATE products
+         SET product_code = NULL,
+             updated_at = now()
+         WHERE id = $1`,
+        [reusableProductId],
+      );
+    }
+  }
+
+  return nextCode;
 }
 
 // Список пользователей
@@ -2371,7 +2483,11 @@ router.patch(
     const description = String(req.body?.description || "").trim();
     const price = Number(req.body?.price);
     const quantity = Number(req.body?.quantity);
-    const shelfNumber = Number(req.body?.shelf_number);
+    const rawShelfNumber = Number(req.body?.shelf_number);
+    const shelfNumber =
+      Number.isFinite(rawShelfNumber) && rawShelfNumber > 0
+        ? Math.floor(rawShelfNumber)
+        : null;
 
     if (!queueId) {
       return res.status(400).json({ ok: false, error: "queueId обязателен" });
@@ -2397,12 +2513,6 @@ router.patch(
         .status(400)
         .json({ ok: false, error: "Количество должно быть больше нуля" });
     }
-    if (!Number.isFinite(shelfNumber) || shelfNumber <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Номер полки должен быть больше нуля" });
-    }
-
     try {
       const updated = await db.query(
          `WITH target AS (
@@ -2421,7 +2531,7 @@ router.patch(
                description = $3,
                price = $4,
                quantity = $5,
-               shelf_number = $6,
+               shelf_number = COALESCE($6::int, p.shelf_number),
                 updated_at = now()
            FROM target t
            WHERE p.id = t.product_id
@@ -2434,7 +2544,7 @@ router.patch(
                  'description', $3,
                  'price', $4,
                  'quantity', $5,
-                 'shelf_number', $6,
+                 'shelf_number', (SELECT shelf_number FROM product_upd LIMIT 1),
                  'image_url', (SELECT image_url FROM product_upd LIMIT 1)
                )
              )
@@ -2447,7 +2557,7 @@ router.patch(
           description,
           price,
           Math.floor(quantity),
-          Math.floor(shelfNumber),
+          shelfNumber,
           req.user.tenant_id || null,
         ],
       );
@@ -2636,11 +2746,6 @@ router.post(
   async (req, res) => {
     const reservationId = String(req.body?.reservation_id || "").trim();
     const cartItemId = String(req.body?.cart_item_id || "").trim();
-    const shelfRaw = req.body?.shelf_number;
-    const shelfNumber =
-      shelfRaw == null || shelfRaw === ""
-        ? null
-        : Number.parseInt(String(shelfRaw), 10);
 
     if (!reservationId && !cartItemId) {
       return res
@@ -2709,15 +2814,12 @@ router.post(
 
       let finalShelf = shelfQ.rowCount > 0 ? Number(shelfQ.rows[0].shelf_number) : null;
       if (finalShelf == null) {
-        if (!Number.isFinite(shelfNumber) || Number(shelfNumber) <= 0) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            ok: false,
-            code: "SHELF_REQUIRED",
-            error: "Требуется номер полки",
-          });
-        }
-        finalShelf = Number(shelfNumber);
+        finalShelf = await resolveAutoShelfNumber(
+          client,
+          req.user?.tenant_id || null,
+          null,
+          1,
+        );
         await client.query(
           `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
            VALUES ($1, $2, now(), now())
@@ -3051,7 +3153,7 @@ router.post(
       for (const row of rows) {
         let code = row.product_code;
         if (!code) {
-          code = await allocateProductCode(client);
+          code = await allocateProductCode(client, req.user?.tenant_id || null);
         }
 
         const payload =
@@ -3086,10 +3188,15 @@ router.post(
           : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
             ? Math.floor(fallbackQuantity)
             : 1);
-        const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 1);
+        const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 0);
         const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
           ? Math.floor(rawNextShelf)
-          : 1;
+          : await resolveAutoShelfNumber(
+              client,
+              req.user?.tenant_id || null,
+              null,
+              1,
+            );
         const nextImageUrl = payload.image_url || row.image_url || null;
 
         const productUpdate = await client.query(
@@ -3336,6 +3443,7 @@ router.post(
         count,
         channelId: mainChannel.id,
         channelTitle: mainChannel.title,
+        tenantId: req.user?.tenant_id || null,
         createdBy: req.user.id,
         imageUrl,
       });

@@ -329,6 +329,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
   }
 
   Widget _opsCenterCard() {
+    final compact = MediaQuery.of(context).size.width < 680;
     final diagnostics = _diagnosticsSnapshot ?? const <String, dynamic>{};
     final monitoring = diagnostics['monitoring'] is Map<String, dynamic>
         ? Map<String, dynamic>.from(diagnostics['monitoring'])
@@ -345,7 +346,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(compact ? 12 : 16),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(20),
@@ -391,9 +392,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
   Widget _messagePreviewCard() {
     final theme = Theme.of(context);
+    final compact = MediaQuery.of(context).size.width < 680;
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(compact ? 12 : 16),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(20),
@@ -467,6 +469,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
   Widget _deliveryPreviewCard() {
     final theme = Theme.of(context);
+    final compact = MediaQuery.of(context).size.width < 680;
     final activeBatchRaw = _deliverySnapshot?['active_batch'];
     final activeBatch = activeBatchRaw is Map
         ? Map<String, dynamic>.from(activeBatchRaw)
@@ -480,7 +483,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(compact ? 12 : 16),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(20),
@@ -549,9 +552,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
   Widget _demoPostsCard() {
     final theme = Theme.of(context);
+    final compact = MediaQuery.of(context).size.width < 680;
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(16),
+      padding: EdgeInsets.all(compact ? 12 : 16),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(20),
@@ -614,47 +618,54 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     }
 
     final theme = Theme.of(context);
+    final compact = MediaQuery.of(context).size.width < 680;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Тесты')),
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.all(16),
+          padding: EdgeInsets.all(compact ? 10 : 16),
           children: [
             _sectionTitle('Сообщения'),
             const SizedBox(height: 12),
-            SegmentedButton<String>(
-              segments: const [
-                ButtonSegment(value: 'sending', label: Text('Отправляется')),
-                ButtonSegment(value: 'sent', label: Text('Отправлено')),
-                ButtonSegment(value: 'read', label: Text('Прочитано')),
-                ButtonSegment(value: 'error', label: Text('Ошибка')),
-              ],
-              selected: {_messageStatus},
-              onSelectionChanged: (selection) {
-                setState(() => _messageStatus = selection.first);
-              },
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(value: 'sending', label: Text('Отправляется')),
+                  ButtonSegment(value: 'sent', label: Text('Отправлено')),
+                  ButtonSegment(value: 'read', label: Text('Прочитано')),
+                  ButtonSegment(value: 'error', label: Text('Ошибка')),
+                ],
+                selected: {_messageStatus},
+                onSelectionChanged: (selection) {
+                  setState(() => _messageStatus = selection.first);
+                },
+              ),
             ),
             const SizedBox(height: 12),
             _messagePreviewCard(),
             const SizedBox(height: 24),
             _sectionTitle('Роли'),
             const SizedBox(height: 12),
-            SegmentedButton<String>(
-              segments: const [
-                ButtonSegment(value: 'creator', label: Text('Создатель')),
-                ButtonSegment(value: 'admin', label: Text('Админ')),
-                ButtonSegment(value: 'worker', label: Text('Рабочий')),
-                ButtonSegment(value: 'client', label: Text('Клиент')),
-              ],
-              selected: {_rolePreview},
-              onSelectionChanged: (selection) {
-                setState(() => _rolePreview = selection.first);
-              },
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(value: 'creator', label: Text('Создатель')),
+                  ButtonSegment(value: 'admin', label: Text('Админ')),
+                  ButtonSegment(value: 'worker', label: Text('Рабочий')),
+                  ButtonSegment(value: 'client', label: Text('Клиент')),
+                ],
+                selected: {_rolePreview},
+                onSelectionChanged: (selection) {
+                  setState(() => _rolePreview = selection.first);
+                },
+              ),
             ),
             const SizedBox(height: 12),
             Container(
-              padding: const EdgeInsets.all(16),
+              padding: EdgeInsets.all(compact ? 12 : 16),
               decoration: BoxDecoration(
                 color: theme.colorScheme.surfaceContainerLow,
                 borderRadius: BorderRadius.circular(20),
@@ -769,7 +780,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
             _sectionTitle('Загрузка'),
             const SizedBox(height: 12),
             Container(
-              padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+              padding: EdgeInsets.symmetric(
+                vertical: compact ? 18 : 24,
+                horizontal: compact ? 12 : 16,
+              ),
               decoration: BoxDecoration(
                 color: theme.colorScheme.surfaceContainerLow,
                 borderRadius: BorderRadius.circular(20),

@@ -3140,8 +3140,8 @@ class _AdminPanelState extends State<AdminPanel>
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Добавить клиента по телефону'),
-        content: SizedBox(
-          width: 460,
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
           child: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -4342,93 +4342,89 @@ class _AdminPanelState extends State<AdminPanel>
     final quantityCtrl = TextEditingController(
       text: (post['product_quantity'] ?? '').toString(),
     );
-    final shelfCtrl = TextEditingController(
-      text: _toInt(post['product_shelf_number'], fallback: 1).toString(),
-    );
 
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Изменить пост в модерации'),
-        content: SizedBox(
-          width: 460,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: titleCtrl,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Название товара',
-                    border: OutlineInputBorder(),
-                  ),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
                   controller: titleCtrl,
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: descriptionCtrl,
-                minLines: 3,
-                maxLines: 5,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Описание',
-                    border: OutlineInputBorder(),
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Название товара',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: titleCtrl,
                   ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
                   controller: descriptionCtrl,
+                  minLines: 3,
+                  maxLines: 5,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Описание',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: descriptionCtrl,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: priceCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(
-                        decimal: true,
-                      ),
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Цена',
-                          border: OutlineInputBorder(),
-                        ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: [
+                    SizedBox(
+                      width: 180,
+                      child: TextField(
                         controller: priceCtrl,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Цена',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: priceCtrl,
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  SizedBox(
-                    width: 120,
-                    child: TextField(
-                      controller: quantityCtrl,
-                      keyboardType: TextInputType.number,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Кол-во',
-                          border: OutlineInputBorder(),
-                        ),
+                    SizedBox(
+                      width: 140,
+                      child: TextField(
                         controller: quantityCtrl,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  SizedBox(
-                    width: 120,
-                    child: TextField(
-                      controller: shelfCtrl,
-                      keyboardType: TextInputType.number,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Полка',
-                          border: OutlineInputBorder(),
+                        keyboardType: TextInputType.number,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Кол-во',
+                            border: OutlineInputBorder(),
+                          ),
+                          controller: quantityCtrl,
                         ),
-                        controller: shelfCtrl,
                       ),
                     ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Полка назначается автоматически по дате.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
                   ),
-                ],
-              ),
-            ],
+                ),
+              ],
+            ),
           ),
         ),
         actions: [
@@ -4450,7 +4446,6 @@ class _AdminPanelState extends State<AdminPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim());
-    final shelfNumber = int.tryParse(shelfCtrl.text.trim());
 
     if (title.isEmpty) {
       setState(() => _message = 'Название товара обязательно');
@@ -4468,11 +4463,6 @@ class _AdminPanelState extends State<AdminPanel>
       setState(() => _message = 'Количество должно быть больше нуля');
       return;
     }
-    if (shelfNumber == null || shelfNumber <= 0) {
-      setState(() => _message = 'Номер полки должен быть больше нуля');
-      return;
-    }
-
     setState(() {
       _saving = true;
       _message = '';
@@ -4485,7 +4475,6 @@ class _AdminPanelState extends State<AdminPanel>
           'description': description,
           'price': price,
           'quantity': quantity,
-          'shelf_number': shelfNumber,
         },
       );
       await _loadPendingPosts();
@@ -4796,9 +4785,7 @@ class _AdminPanelState extends State<AdminPanel>
                                   ? Container(
                                       color: Colors.grey.shade200,
                                       alignment: Alignment.center,
-                                      child: const Icon(
-                                        Icons.image_not_supported_outlined,
-                                      ),
+                                      child: const Icon(Icons.photo_outlined),
                                     )
                                   : Image.network(
                                       url,
@@ -5518,9 +5505,7 @@ class _AdminPanelState extends State<AdminPanel>
                         child: url == null
                             ? Container(
                                 color: Colors.grey.shade200,
-                                child: const Icon(
-                                  Icons.image_not_supported_outlined,
-                                ),
+                                child: const Icon(Icons.photo_outlined),
                               )
                             : Image.network(url, fit: BoxFit.cover),
                       ),
@@ -5584,6 +5569,7 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Widget _buildSettingsTab() {
+    final compact = MediaQuery.of(context).size.width < 640;
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_channels.isEmpty) {
       return const Center(child: Text('Каналы пока не созданы'));
@@ -5592,9 +5578,9 @@ class _AdminPanelState extends State<AdminPanel>
     return RefreshIndicator(
       onRefresh: _reloadAll,
       child: ListView.separated(
-        padding: const EdgeInsets.all(16),
+        padding: EdgeInsets.all(compact ? 10 : 16),
         itemCount: _channels.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 12),
+        separatorBuilder: (_, __) => SizedBox(height: compact ? 8 : 12),
         itemBuilder: (context, index) => _buildChannelCard(_channels[index]),
       ),
     );
@@ -5619,10 +5605,11 @@ class _AdminPanelState extends State<AdminPanel>
 
   Widget _buildModerationTab() {
     final theme = Theme.of(context);
+    final compact = MediaQuery.of(context).size.width < 640;
     return RefreshIndicator(
       onRefresh: _loadPendingPosts,
       child: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: EdgeInsets.all(compact ? 10 : 16),
         children: [
           Wrap(
             spacing: 10,
@@ -5681,7 +5668,7 @@ class _AdminPanelState extends State<AdminPanel>
               ),
             ],
           ),
-          const SizedBox(height: 14),
+          SizedBox(height: compact ? 10 : 14),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
@@ -5772,7 +5759,7 @@ class _AdminPanelState extends State<AdminPanel>
                                               .surfaceContainerHighest,
                                           alignment: Alignment.center,
                                           child: const Icon(
-                                            Icons.image_not_supported_outlined,
+                                            Icons.photo_outlined,
                                           ),
                                         ),
                                   )
@@ -7824,6 +7811,7 @@ class _AdminPanelState extends State<AdminPanel>
 
   @override
   Widget build(BuildContext context) {
+    final compact = MediaQuery.of(context).size.width < 700;
     if (_tabController == null || _visibleTabs.isEmpty) {
       _rebuildVisibleTabs(force: true, notify: false);
     }
@@ -7840,14 +7828,23 @@ class _AdminPanelState extends State<AdminPanel>
     return Scaffold(
       appBar: AppBar(
         title: const Text('Админ-панель'),
-        bottom: TabBar(controller: controller, tabs: tabs),
+        bottom: TabBar(
+          controller: controller,
+          tabs: tabs,
+          isScrollable: compact,
+        ),
       ),
       body: SafeArea(
         child: Column(
           children: [
             if (_message.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                padding: EdgeInsets.fromLTRB(
+                  compact ? 10 : 16,
+                  12,
+                  compact ? 10 : 16,
+                  0,
+                ),
                 child: Text(
                   _message,
                   style: const TextStyle(color: Colors.red),
