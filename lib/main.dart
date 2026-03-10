@@ -42,6 +42,7 @@ final ValueNotifier<Color> darkThemeSeedNotifier = ValueNotifier(
 );
 final ValueNotifier<String> uiDensityNotifier = ValueNotifier('standard');
 final ValueNotifier<String> uiCardSizeNotifier = ValueNotifier('standard');
+final ValueNotifier<bool> performanceModeNotifier = ValueNotifier(false);
 final ValueNotifier<int> themeStyleVersionNotifier = ValueNotifier(0);
 final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
   null,
@@ -53,6 +54,7 @@ const _lightSeedPrefPrefix = 'theme_light_seed_';
 const _darkSeedPrefPrefix = 'theme_dark_seed_';
 const _uiDensityPrefPrefix = 'ui_density_';
 const _uiCardSizePrefPrefix = 'ui_card_size_';
+const _performanceModePrefPrefix = 'performance_mode_';
 String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
 final AudioPlayer _appSoundPlayer = AudioPlayer();
@@ -176,19 +178,56 @@ double _resolveCardScale() {
 }
 
 ThemeData _buildLightTheme() {
-  return AppTheme.light(
+  final base = AppTheme.light(
     seedColor: lightThemeSeedNotifier.value,
     visualDensity: _resolveVisualDensity(),
     cardScale: _resolveCardScale(),
   );
+  if (!performanceModeNotifier.value) return base;
+  return base.copyWith(
+    splashFactory: NoSplash.splashFactory,
+    pageTransitionsTheme: const PageTransitionsTheme(
+      builders: {
+        TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
+        TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+        TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
+        TargetPlatform.windows: FadeUpwardsPageTransitionsBuilder(),
+        TargetPlatform.linux: FadeUpwardsPageTransitionsBuilder(),
+      },
+    ),
+  );
 }
 
 ThemeData _buildDarkTheme() {
-  return AppTheme.dark(
+  final base = AppTheme.dark(
     seedColor: darkThemeSeedNotifier.value,
     visualDensity: _resolveVisualDensity(),
     cardScale: _resolveCardScale(),
   );
+  if (!performanceModeNotifier.value) return base;
+  return base.copyWith(
+    splashFactory: NoSplash.splashFactory,
+    pageTransitionsTheme: const PageTransitionsTheme(
+      builders: {
+        TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
+        TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+        TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
+        TargetPlatform.windows: FadeUpwardsPageTransitionsBuilder(),
+        TargetPlatform.linux: FadeUpwardsPageTransitionsBuilder(),
+      },
+    ),
+  );
+}
+
+void _applyPerformanceRuntimeTuning(bool enabled) {
+  final cache = PaintingBinding.instance.imageCache;
+  if (enabled) {
+    cache.maximumSizeBytes = 32 * 1024 * 1024;
+    cache.maximumSize = 220;
+    return;
+  }
+  cache.maximumSizeBytes = 100 * 1024 * 1024;
+  cache.maximumSize = 1000;
 }
 
 Future<void> refreshUserPreferences() async {
@@ -204,6 +243,8 @@ Future<void> refreshUserPreferences() async {
   final density = prefs.getString('$_uiDensityPrefPrefix$scope') ?? 'standard';
   final cardSize =
       prefs.getString('$_uiCardSizePrefPrefix$scope') ?? 'standard';
+  final performanceMode =
+      prefs.getBool('$_performanceModePrefPrefix$scope') ?? false;
 
   notificationsEnabledNotifier.value = notifications;
   themeModeNotifier.value = darkMode ? ThemeMode.dark : ThemeMode.light;
@@ -226,6 +267,8 @@ Future<void> refreshUserPreferences() async {
     'large' => 'large',
     _ => 'standard',
   };
+  performanceModeNotifier.value = performanceMode;
+  _applyPerformanceRuntimeTuning(performanceMode);
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
 
@@ -284,6 +327,15 @@ Future<void> setUiCardSizePreset(String value) async {
   final scope = _settingsScopeUserId();
   await prefs.setString('$_uiCardSizePrefPrefix$scope', normalized);
   uiCardSizeNotifier.value = normalized;
+  themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
+}
+
+Future<void> setPerformanceModeEnabled(bool value) async {
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  await prefs.setBool('$_performanceModePrefPrefix$scope', value);
+  performanceModeNotifier.value = value;
+  _applyPerformanceRuntimeTuning(value);
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
 
@@ -411,114 +463,134 @@ class _GlobalNoticeHost extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        child,
-        IgnorePointer(
-          ignoring: false,
-          child: SafeArea(
-            child: Align(
-              alignment: Alignment.topCenter,
-              child: ValueListenableBuilder<_AppNoticePayload?>(
-                valueListenable: _appNoticeNotifier,
-                builder: (context, notice, _) {
-                  return AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 220),
-                    switchInCurve: Curves.easeOut,
-                    switchOutCurve: Curves.easeIn,
-                    child: notice == null
-                        ? const SizedBox.shrink()
-                        : Padding(
-                            key: ValueKey(notice.id),
-                            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                            child: ConstrainedBox(
-                              constraints: const BoxConstraints(maxWidth: 760),
-                              child: Material(
-                                color: theme.colorScheme.surfaceContainerHigh,
-                                elevation: 8,
-                                borderRadius: BorderRadius.circular(16),
-                                child: InkWell(
-                                  borderRadius: BorderRadius.circular(16),
-                                  onTap: () => _appNoticeNotifier.value = null,
-                                  child: Padding(
-                                    padding: const EdgeInsets.fromLTRB(
-                                      14,
-                                      12,
-                                      14,
-                                      12,
-                                    ),
-                                    child: Builder(
-                                      builder: (context) {
-                                        final visuals = _noticeVisuals(
-                                          context,
-                                          notice.tone,
-                                        );
-                                        return Row(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Padding(
-                                              padding: const EdgeInsets.only(
-                                                top: 1,
-                                              ),
-                                              child: Icon(
-                                                visuals.icon,
-                                                color: visuals.accent,
-                                                size: 20,
-                                              ),
-                                            ),
-                                            const SizedBox(width: 10),
-                                            Expanded(
-                                              child: Column(
-                                                mainAxisSize: MainAxisSize.min,
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.start,
-                                                children: [
-                                                  if (notice.title != null)
-                                                    Text(
-                                                      notice.title!,
-                                                      style: theme
-                                                          .textTheme
-                                                          .labelLarge
-                                                          ?.copyWith(
-                                                            color: theme
-                                                                .colorScheme
-                                                                .onSurface,
-                                                            fontWeight:
-                                                                FontWeight.w700,
-                                                          ),
-                                                    ),
-                                                  Text(
-                                                    notice.message,
-                                                    style: theme
-                                                        .textTheme
-                                                        .bodyMedium
-                                                        ?.copyWith(
-                                                          color: theme
-                                                              .colorScheme
-                                                              .onSurface,
-                                                        ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (!constraints.hasBoundedWidth || !constraints.hasBoundedHeight) {
+          return child;
+        }
+        return Stack(
+          fit: StackFit.loose,
+          children: [
+            Positioned.fill(child: child),
+            IgnorePointer(
+              ignoring: false,
+              child: SafeArea(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: ValueListenableBuilder<_AppNoticePayload?>(
+                    valueListenable: _appNoticeNotifier,
+                    builder: (context, notice, _) {
+                      return AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 220),
+                        switchInCurve: Curves.easeOut,
+                        switchOutCurve: Curves.easeIn,
+                        child: notice == null
+                            ? const SizedBox.shrink()
+                            : Padding(
+                                key: ValueKey(notice.id),
+                                padding: const EdgeInsets.fromLTRB(
+                                  12,
+                                  8,
+                                  12,
+                                  0,
+                                ),
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(
+                                    maxWidth: 760,
+                                  ),
+                                  child: Material(
+                                    color:
+                                        theme.colorScheme.surfaceContainerHigh,
+                                    elevation: 8,
+                                    borderRadius: BorderRadius.circular(16),
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(16),
+                                      onTap: () =>
+                                          _appNoticeNotifier.value = null,
+                                      child: Padding(
+                                        padding: const EdgeInsets.fromLTRB(
+                                          14,
+                                          12,
+                                          14,
+                                          12,
+                                        ),
+                                        child: Builder(
+                                          builder: (context) {
+                                            final visuals = _noticeVisuals(
+                                              context,
+                                              notice.tone,
+                                            );
+                                            return Row(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Padding(
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                        top: 1,
+                                                      ),
+                                                  child: Icon(
+                                                    visuals.icon,
+                                                    color: visuals.accent,
+                                                    size: 20,
                                                   ),
-                                                ],
-                                              ),
-                                            ),
-                                          ],
-                                        );
-                                      },
+                                                ),
+                                                const SizedBox(width: 10),
+                                                Expanded(
+                                                  child: Column(
+                                                    mainAxisSize:
+                                                        MainAxisSize.min,
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
+                                                    children: [
+                                                      if (notice.title != null)
+                                                        Text(
+                                                          notice.title!,
+                                                          style: theme
+                                                              .textTheme
+                                                              .labelLarge
+                                                              ?.copyWith(
+                                                                color: theme
+                                                                    .colorScheme
+                                                                    .onSurface,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .w700,
+                                                              ),
+                                                        ),
+                                                      Text(
+                                                        notice.message,
+                                                        style: theme
+                                                            .textTheme
+                                                            .bodyMedium
+                                                            ?.copyWith(
+                                                              color: theme
+                                                                  .colorScheme
+                                                                  .onSurface,
+                                                            ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ],
+                                            );
+                                          },
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ),
                               ),
-                            ),
-                          ),
-                  );
-                },
+                      );
+                    },
+                  ),
+                ),
               ),
             ),
-          ),
-        ),
-      ],
+          ],
+        );
+      },
     );
   }
 }
@@ -893,6 +965,11 @@ Future<void> _initSocket() async {
       chatEventsController.add({'type': 'delivery:updated', 'data': data});
     });
 
+    socket?.on('claims:updated', (data) {
+      debugPrint('📬 Socket event claims:updated -> $data');
+      chatEventsController.add({'type': 'claims:updated', 'data': data});
+    });
+
     // Global message event (optional)
     socket?.on('chat:message:global', (data) {
       debugPrint('📬 Socket event chat:message:global -> $data');
@@ -1122,6 +1199,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       return AnimatedBuilder(
         animation: Listenable.merge([
           themeModeNotifier,
+          performanceModeNotifier,
           themeStyleVersionNotifier,
         ]),
         builder: (context, _) {
@@ -1130,6 +1208,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             navigatorKey: navigatorKey,
             title: 'Проект Феникс (diag)',
             themeMode: mode,
+            themeAnimationDuration: performanceModeNotifier.value
+                ? Duration.zero
+                : const Duration(milliseconds: 220),
             theme: _buildLightTheme(),
             darkTheme: _buildDarkTheme(),
             home: Scaffold(
@@ -1140,10 +1221,12 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
               ),
             ),
             builder: (context, child) {
+              final wrapped = TickerMode(
+                enabled: !performanceModeNotifier.value,
+                child: child ?? const SizedBox.shrink(),
+              );
               return ScaffoldMessenger(
-                child: _GlobalNoticeHost(
-                  child: child ?? const SizedBox.shrink(),
-                ),
+                child: _GlobalNoticeHost(child: wrapped),
               );
             },
           );
@@ -1154,6 +1237,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     return AnimatedBuilder(
       animation: Listenable.merge([
         themeModeNotifier,
+        performanceModeNotifier,
         themeStyleVersionNotifier,
       ]),
       builder: (context, _) {
@@ -1162,6 +1246,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           navigatorKey: navigatorKey,
           title: 'Проект Феникс',
           themeMode: mode,
+          themeAnimationDuration: performanceModeNotifier.value
+              ? Duration.zero
+              : const Duration(milliseconds: 220),
           theme: _buildLightTheme(),
           darkTheme: _buildDarkTheme(),
           home: _home,
@@ -1171,9 +1258,11 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             '/main': (_) => const MainShell(),
           },
           builder: (context, child) {
-            return ScaffoldMessenger(
-              child: _GlobalNoticeHost(child: child ?? const SizedBox.shrink()),
+            final wrapped = TickerMode(
+              enabled: !performanceModeNotifier.value,
+              child: child ?? const SizedBox.shrink(),
             );
+            return ScaffoldMessenger(child: _GlobalNoticeHost(child: wrapped));
           },
         );
       },

@@ -81,7 +81,6 @@ class _AdminPanelState extends State<AdminPanel>
   final _notificationQuietToCtrl = TextEditingController();
   final _supportTemplateTitleCtrl = TextEditingController();
   final _supportTemplateBodyCtrl = TextEditingController();
-  final _supportTemplateExtraCtrl = TextEditingController();
   final _roleTemplateTitleCtrl = TextEditingController();
   final _roleTemplateCodeCtrl = TextEditingController();
   final _roleTemplateDescriptionCtrl = TextEditingController();
@@ -121,7 +120,6 @@ class _AdminPanelState extends State<AdminPanel>
   String _financePeriod = 'month';
   String _smartNotifyType = 'order';
   String _smartNotifyPriority = 'high';
-  String _supportTemplateCategory = 'general';
   double? _deliveryOriginLat;
   double? _deliveryOriginLng;
 
@@ -170,6 +168,23 @@ class _AdminPanelState extends State<AdminPanel>
       final type = event['type']?.toString() ?? '';
       if (type == 'delivery:updated' && _canViewDeliveryTab()) {
         unawaited(_loadDeliveryDashboard());
+        return;
+      }
+      if (type == 'claims:updated' && _canViewSupportTab()) {
+        unawaited(_loadReturnsWorkflow(silent: true));
+        final data = event['data'];
+        if (mounted && data is Map) {
+          final status = (data['status'] ?? '').toString().trim();
+          final claimType = (data['claim_type'] ?? '').toString().trim();
+          showAppNotice(
+            context,
+            status == 'pending'
+                ? 'Новая заявка: ${claimType == 'discount' ? 'скидка' : 'возврат'}'
+                : 'Обновлен статус заявки по возврату/скидке',
+            tone: AppNoticeTone.warning,
+            duration: const Duration(seconds: 2),
+          );
+        }
       }
     });
     _authSub = authService.authStream.listen((_) {
@@ -201,7 +216,6 @@ class _AdminPanelState extends State<AdminPanel>
     _notificationQuietToCtrl.dispose();
     _supportTemplateTitleCtrl.dispose();
     _supportTemplateBodyCtrl.dispose();
-    _supportTemplateExtraCtrl.dispose();
     _roleTemplateTitleCtrl.dispose();
     _roleTemplateCodeCtrl.dispose();
     _roleTemplateDescriptionCtrl.dispose();
@@ -308,25 +322,6 @@ class _AdminPanelState extends State<AdminPanel>
     return _hasPermission('chat.write.support');
   }
 
-  bool _canViewFinanceTab() {
-    if (_isCreatorBase()) return true;
-    final role = authService.effectiveRole;
-    if (role == 'admin' || role == 'tenant') return true;
-    return _hasPermission('finance.view');
-  }
-
-  bool _canViewControlTab() {
-    if (_isCreatorBase()) return true;
-    return _hasAnyPermission(const [
-      'tenant.users.manage',
-      'delivery.manage',
-      'audit.view',
-      'notifications.manage',
-      'antifraud.view',
-      'support.manage',
-    ]);
-  }
-
   List<_AdminTabSpec> _buildVisibleTabs() {
     final tabs = <_AdminTabSpec>[
       if (_canViewCreateTab())
@@ -358,18 +353,6 @@ class _AdminPanelState extends State<AdminPanel>
           id: 'support',
           label: 'Поддержка',
           builder: _buildSupportTab,
-        ),
-      if (_canViewFinanceTab())
-        _AdminTabSpec(
-          id: 'finance',
-          label: 'Финансы',
-          builder: _buildFinanceTab,
-        ),
-      if (_canViewControlTab())
-        _AdminTabSpec(
-          id: 'control',
-          label: 'Контроль',
-          builder: _buildControlTab,
         ),
     ];
     if (tabs.isNotEmpty) return tabs;
@@ -595,12 +578,7 @@ class _AdminPanelState extends State<AdminPanel>
     if (_canViewSupportTab()) {
       await _loadSupportTickets();
       await _loadSupportTemplates(silent: true);
-    }
-    if (_canViewFinanceTab()) {
-      await _loadFinanceSummary(silent: true);
-    }
-    if (_canViewControlTab()) {
-      await _loadControlCenter(silent: true);
+      await _loadReturnsWorkflow(silent: true);
     }
     if (_isCreatorBase() && _hasPermission('diagnostics.view')) {
       await _loadDiagnostics(silent: true);
@@ -1103,11 +1081,7 @@ class _AdminPanelState extends State<AdminPanel>
     try {
       await authService.dio.post(
         '/api/admin/ops/support/templates',
-        data: {
-          'title': title,
-          'body': body,
-          'category': _supportTemplateCategory,
-        },
+        data: {'title': title, 'body': body, 'category': 'general'},
       );
       _supportTemplateTitleCtrl.clear();
       _supportTemplateBodyCtrl.clear();
@@ -1136,7 +1110,6 @@ class _AdminPanelState extends State<AdminPanel>
       setState(() => _message = 'Выбери шаблон для быстрого ответа');
       return;
     }
-    final extra = _supportTemplateExtraCtrl.text.trim();
     setState(() {
       _supportQuickReplyBusy = true;
       _message = '';
@@ -1144,12 +1117,8 @@ class _AdminPanelState extends State<AdminPanel>
     try {
       await authService.dio.post(
         '/api/admin/ops/support/tickets/$ticketId/quick-reply',
-        data: {
-          'template_id': templateId,
-          if (extra.isNotEmpty) 'extra_text': extra,
-        },
+        data: {'template_id': templateId},
       );
-      _supportTemplateExtraCtrl.clear();
       await _loadSupportTickets(silent: true);
       if (mounted) {
         setState(() => _message = 'Быстрый ответ отправлен');
@@ -1713,7 +1682,7 @@ class _AdminPanelState extends State<AdminPanel>
           if (amount != null) 'approved_amount': double.tryParse(amount),
         },
       );
-      await _loadControlCenter(silent: true);
+      await _loadReturnsWorkflow(silent: true);
       if (mounted) {
         setState(() => _message = 'Статус заявки обновлен');
       }
@@ -2629,6 +2598,36 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
+  Future<void> _loadReturnsWorkflow({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _returnsActionBusy = true);
+    } else {
+      _returnsActionBusy = true;
+    }
+    try {
+      final resp = await authService.dio.get('/api/admin/ops/returns/workflow');
+      final data = resp.data;
+      if (!mounted) return;
+      setState(() {
+        _returnsWorkflow =
+            data is Map && data['ok'] == true && data['data'] is List
+            ? List<Map<String, dynamic>>.from(data['data'])
+            : <Map<String, dynamic>>[];
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка возвратов/скидок: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _returnsActionBusy = false);
+      } else {
+        _returnsActionBusy = false;
+      }
+    }
+  }
+
   Future<void> _archiveSupportTicket(Map<String, dynamic> ticket) async {
     final ticketId = (ticket['id'] ?? '').toString().trim();
     if (ticketId.isEmpty) return;
@@ -2683,6 +2682,54 @@ class _AdminPanelState extends State<AdminPanel>
         ),
       ),
     );
+  }
+
+  Future<void> _openDirectChatWithUser(Map<String, dynamic> claim) async {
+    final userId = (claim['user_id'] ?? '').toString().trim();
+    if (userId.isEmpty) return;
+    try {
+      final resp = await authService.dio.post(
+        '/api/chats/direct/open',
+        data: {'user_id': userId},
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! Map) {
+        throw Exception('Не удалось открыть чат с клиентом');
+      }
+      final payload = Map<String, dynamic>.from(data['data']);
+      final chat = payload['chat'] is Map
+          ? Map<String, dynamic>.from(payload['chat'])
+          : <String, dynamic>{};
+      final peer = payload['peer'] is Map
+          ? Map<String, dynamic>.from(payload['peer'])
+          : <String, dynamic>{};
+      final chatId = (chat['id'] ?? '').toString().trim();
+      if (chatId.isEmpty) {
+        throw Exception('Не удалось открыть чат с клиентом');
+      }
+      final chatTitle = _displayName(peer, fallback: 'Личные сообщения');
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            chatId: chatId,
+            chatTitle: chatTitle,
+            chatType: (chat['type'] ?? '').toString(),
+            chatSettings: chat['settings'] is Map
+                ? Map<String, dynamic>.from(chat['settings'])
+                : null,
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось открыть ЛС: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
   }
 
   Future<void> _saveDeliverySettings() async {
@@ -5977,10 +6024,9 @@ class _AdminPanelState extends State<AdminPanel>
                 items: _supportTemplates.map((template) {
                   final id = (template['id'] ?? '').toString();
                   final title = (template['title'] ?? 'Шаблон').toString();
-                  final category = (template['category'] ?? '').toString();
                   return DropdownMenuItem<String>(
                     value: id,
-                    child: Text('$title • ${_supportCategoryLabel(category)}'),
+                    child: Text(title),
                   );
                 }).toList(),
                 onChanged: (value) {
@@ -5988,15 +6034,6 @@ class _AdminPanelState extends State<AdminPanel>
                 },
                 decoration: const InputDecoration(
                   labelText: 'Быстрый шаблон ответа',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: _supportTemplateExtraCtrl,
-                maxLines: 2,
-                decoration: const InputDecoration(
-                  labelText: 'Доп. текст (опционально)',
                   border: OutlineInputBorder(),
                 ),
               ),
@@ -6025,6 +6062,7 @@ class _AdminPanelState extends State<AdminPanel>
       onRefresh: () async {
         await _loadSupportTickets(silent: true);
         await _loadSupportTemplates(silent: true);
+        await _loadReturnsWorkflow(silent: true);
       },
       child: ListView(
         padding: const EdgeInsets.all(16),
@@ -6042,7 +6080,10 @@ class _AdminPanelState extends State<AdminPanel>
               IconButton(
                 onPressed: _supportLoading
                     ? null
-                    : () => _loadSupportTickets(silent: true),
+                    : () async {
+                        await _loadSupportTickets(silent: true);
+                        await _loadReturnsWorkflow(silent: true);
+                      },
                 icon: const Icon(Icons.refresh),
                 tooltip: 'Обновить',
               ),
@@ -6066,7 +6107,7 @@ class _AdminPanelState extends State<AdminPanel>
                     children: [
                       const Expanded(
                         child: Text(
-                          'Шаблоны автоответов',
+                          'Шаблоны ответов',
                           style: TextStyle(fontWeight: FontWeight.w700),
                         ),
                       ),
@@ -6082,54 +6123,15 @@ class _AdminPanelState extends State<AdminPanel>
                   if (_supportTemplatesLoading)
                     const LinearProgressIndicator(minHeight: 2),
                   const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _supportTemplateTitleCtrl,
-                          decoration: withInputLanguageBadge(
-                            const InputDecoration(
-                              labelText: 'Название шаблона',
-                              border: OutlineInputBorder(),
-                            ),
-                            controller: _supportTemplateTitleCtrl,
-                          ),
-                        ),
+                  TextField(
+                    controller: _supportTemplateTitleCtrl,
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Название шаблона',
+                        border: OutlineInputBorder(),
                       ),
-                      const SizedBox(width: 10),
-                      SizedBox(
-                        width: 180,
-                        child: DropdownButtonFormField<String>(
-                          value: _supportTemplateCategory,
-                          items: const [
-                            DropdownMenuItem(
-                              value: 'general',
-                              child: Text('Общее'),
-                            ),
-                            DropdownMenuItem(
-                              value: 'product',
-                              child: Text('Товар'),
-                            ),
-                            DropdownMenuItem(
-                              value: 'delivery',
-                              child: Text('Доставка'),
-                            ),
-                            DropdownMenuItem(
-                              value: 'cart',
-                              child: Text('Корзина'),
-                            ),
-                          ],
-                          onChanged: (v) {
-                            if (v == null) return;
-                            setState(() => _supportTemplateCategory = v);
-                          },
-                          decoration: const InputDecoration(
-                            labelText: 'Категория',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                      ),
-                    ],
+                      controller: _supportTemplateTitleCtrl,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   TextField(
@@ -6138,8 +6140,9 @@ class _AdminPanelState extends State<AdminPanel>
                     maxLines: 4,
                     decoration: withInputLanguageBadge(
                       const InputDecoration(
-                        labelText:
-                            'Текст шаблона ({customer_name}, {cart_total}, {processed_total}, {delivery_status})',
+                        labelText: 'Текст шаблона',
+                        hintText:
+                            'Можно использовать: {customer_name}, {cart_total}, {processed_total}, {delivery_status}',
                         border: OutlineInputBorder(),
                       ),
                       controller: _supportTemplateBodyCtrl,
@@ -6164,6 +6167,91 @@ class _AdminPanelState extends State<AdminPanel>
               ),
             ),
           ),
+          const SizedBox(height: 12),
+          Text(
+            'Возвраты и скидки',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          if (_returnsActionBusy && _returnsWorkflow.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+          const SizedBox(height: 8),
+          if (_returnsWorkflow.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(14),
+                child: Text('Заявок на возврат/скидку пока нет'),
+              ),
+            )
+          else
+            ..._returnsWorkflow.take(20).map((claim) {
+              final status = (claim['workflow_status_label'] ?? '')
+                  .toString()
+                  .trim();
+              final customer = (claim['customer_name'] ?? 'Клиент')
+                  .toString()
+                  .trim();
+              final product = (claim['product_title'] ?? 'Товар')
+                  .toString()
+                  .trim();
+              final claimType = (claim['claim_type'] ?? '').toString().trim();
+              final requested = _formatMoney(claim['requested_amount']);
+              final approved = _formatMoney(claim['approved_amount']);
+              final actions = (claim['available_actions'] is List)
+                  ? List<String>.from(claim['available_actions'])
+                  : const <String>[];
+              return Card(
+                margin: const EdgeInsets.only(bottom: 10),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '$customer • $product',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Тип: ${claimType == 'discount' ? 'Скидка' : 'Возврат'} • Статус: $status',
+                      ),
+                      Text('Запрошено: $requested • Подтверждено: $approved'),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          FilledButton.tonalIcon(
+                            onPressed: () => _openDirectChatWithUser(claim),
+                            icon: const Icon(Icons.forum_outlined),
+                            label: const Text('Связаться с клиентом'),
+                          ),
+                          ...actions.map((action) {
+                            final title = action == 'approve_return'
+                                ? 'Подтв. возврат'
+                                : action == 'approve_discount'
+                                ? 'Подтв. скидку'
+                                : action == 'reject'
+                                ? 'Отклонить'
+                                : 'Закрыть';
+                            return OutlinedButton(
+                              onPressed: _returnsActionBusy
+                                  ? null
+                                  : () => _applyReturnsAction(claim, action),
+                              child: Text(title),
+                            );
+                          }),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
           const SizedBox(height: 12),
           Text(
             'Активные тикеты',
@@ -6245,6 +6333,7 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  // ignore: unused_element
   Widget _buildFinanceTab() {
     final summary = _asMap(_financeData?['summary']);
     final byDay = _asMapList(_financeData?['by_day']);
@@ -6370,6 +6459,7 @@ class _AdminPanelState extends State<AdminPanel>
     );
   }
 
+  // ignore: unused_element
   Widget _buildControlTab() {
     final rolesTemplates = _asMapList(_rolesDraft?['templates']);
     final roleModules = _asMapList(_rolesDraft?['modules']);

@@ -2746,6 +2746,10 @@ router.post(
   async (req, res) => {
     const reservationId = String(req.body?.reservation_id || "").trim();
     const cartItemId = String(req.body?.cart_item_id || "").trim();
+    const shelfRaw = Number(req.body?.shelf_number);
+    const manualShelf = Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
+    const effectiveRole = String(req.user?.role || "").toLowerCase().trim();
+    const requiresManualShelf = effectiveRole === "admin" || effectiveRole === "tenant";
 
     if (!reservationId && !cartItemId) {
       return res
@@ -2803,6 +2807,14 @@ router.post(
         });
       }
 
+      if (requiresManualShelf && manualShelf == null) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Для администратора нужно вручную указать номер полки",
+        });
+      }
+
       const shelfQ = await client.query(
         `SELECT shelf_number
          FROM user_shelves
@@ -2812,7 +2824,10 @@ router.post(
         [item.user_id],
       );
 
-      let finalShelf = shelfQ.rowCount > 0 ? Number(shelfQ.rows[0].shelf_number) : null;
+      let finalShelf = manualShelf;
+      if (finalShelf == null) {
+        finalShelf = shelfQ.rowCount > 0 ? Number(shelfQ.rows[0].shelf_number) : null;
+      }
       if (finalShelf == null) {
         finalShelf = await resolveAutoShelfNumber(
           client,
@@ -2820,15 +2835,15 @@ router.post(
           null,
           1,
         );
-        await client.query(
-          `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
-           VALUES ($1, $2, now(), now())
-           ON CONFLICT (user_id) DO UPDATE
-             SET shelf_number = EXCLUDED.shelf_number,
-                 updated_at = now()`,
-          [item.user_id, finalShelf],
-        );
       }
+      await client.query(
+        `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
+         VALUES ($1, $2, now(), now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET shelf_number = EXCLUDED.shelf_number,
+               updated_at = now()`,
+        [item.user_id, finalShelf],
+      );
 
       await client.query(
         `UPDATE reservations

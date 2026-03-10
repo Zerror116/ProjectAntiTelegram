@@ -1,5 +1,8 @@
 // server/src/routes/cart.js
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
 const router = express.Router();
@@ -30,6 +33,28 @@ const CLAIM_STATUSES = new Set([
   'settled',
 ]);
 
+const claimsUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'claims');
+fs.mkdirSync(claimsUploadsDir, { recursive: true });
+
+const claimImageUploadEngine = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, claimsUploadsDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase();
+      const safeExt = ext && ext.length <= 10 ? ext : '.jpg';
+      cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
+    },
+  }),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (String(file.mimetype || '').startsWith('image/')) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('Можно загружать только изображения'));
+  },
+});
+
 function toMoney(value, fallback = 0) {
   const raw = Number(value);
   const normalized = Number.isFinite(raw) ? raw : Number(fallback || 0);
@@ -43,6 +68,45 @@ function emitCartUpdated(req, userId, payload = {}) {
     userId: String(userId),
     ...payload,
   });
+}
+
+function emitClaimUpdated(req, claim, reason = 'claim_updated') {
+  const io = req.app.get('io');
+  if (!io || !claim) return;
+  const payload = {
+    reason,
+    claim_id: String(claim.id || ''),
+    user_id: String(claim.user_id || ''),
+    status: String(claim.status || ''),
+    claim_type: String(claim.claim_type || ''),
+    approved_amount: toMoney(claim.approved_amount),
+    requested_amount: toMoney(claim.requested_amount),
+    updated_at: claim.updated_at || null,
+  };
+  emitToTenant(
+    io,
+    claim.tenant_id || req.user?.tenant_id || null,
+    'claims:updated',
+    payload,
+  );
+  if (claim.user_id) {
+    io.to(`user:${claim.user_id}`).emit('claims:updated', payload);
+  }
+}
+
+function uploadClaimImage(req, res, next) {
+  claimImageUploadEngine.single('image')(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ ok: false, error: 'Размер фото не должен превышать 8MB' });
+    }
+    return res.status(400).json({ ok: false, error: err.message || 'Некорректный файл' });
+  });
+}
+
+function toAbsoluteClaimImageUrl(req, file) {
+  if (!file || !file.filename) return '';
+  return `${req.protocol}://${req.get('host')}/uploads/claims/${file.filename}`;
 }
 
 function productMessageText(product) {
@@ -522,7 +586,7 @@ router.get('/', authMiddleware, async (req, res) => {
       .reduce((sum, item) => sum + item.line_total, 0);
     const approvedClaimsTotal = claimsQ.rows
       .filter((row) =>
-        ['approved_return', 'approved_discount'].includes(
+        ['approved_return', 'approved_discount', 'settled'].includes(
           String(row.status || ''),
         ),
       )
@@ -650,35 +714,83 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       [cartItemId]
     );
 
+    const itemQuantity = Number(item.quantity) || 0;
+    const requestedCancelRaw = Number(req.body?.quantity ?? itemQuantity);
+    const cancelQuantity = Number.isFinite(requestedCancelRaw) && requestedCancelRaw > 0
+      ? Math.min(itemQuantity, Math.floor(requestedCancelRaw))
+      : itemQuantity;
+    if (cancelQuantity <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Некорректное количество для отказа' });
+    }
+    const remainingQuantity = Math.max(0, itemQuantity - cancelQuantity);
+
     const restored = await client.query(
       `UPDATE products
        SET quantity = quantity + $1,
            updated_at = now()
        WHERE id = $2
        RETURNING id, product_code, title, description, price, quantity, image_url, status`,
-      [Number(item.quantity), item.product_id]
+      [cancelQuantity, item.product_id]
     );
     const updatedProduct = restored.rows[0];
 
     let removedReservedMessage = null;
+    let updatedReservedMessage = null;
     if (reservationQ.rowCount > 0) {
       const reservedMessageId = reservationQ.rows[0].reserved_channel_message_id;
-      if (reservedMessageId) {
-        const removedMsg = await client.query(
-          `DELETE FROM messages
-           WHERE id = $1
-           RETURNING id, chat_id`,
-          [reservedMessageId]
+      if (remainingQuantity <= 0) {
+        if (reservedMessageId) {
+          const removedMsg = await client.query(
+            `DELETE FROM messages
+             WHERE id = $1
+             RETURNING id, chat_id`,
+            [reservedMessageId]
+          );
+          if (removedMsg.rowCount > 0) {
+            removedReservedMessage = removedMsg.rows[0];
+          }
+        }
+        await client.query('DELETE FROM reservations WHERE id = $1', [reservationQ.rows[0].id]);
+      } else {
+        await client.query(
+          `UPDATE reservations
+           SET quantity = $1,
+               updated_at = now()
+           WHERE id = $2`,
+          [remainingQuantity, reservationQ.rows[0].id],
         );
-        if (removedMsg.rowCount > 0) {
-          removedReservedMessage = removedMsg.rows[0];
+        if (reservedMessageId) {
+          const updatedMsg = await client.query(
+            `UPDATE messages
+             SET meta = jsonb_set(
+                   COALESCE(meta, '{}'::jsonb),
+                   '{quantity}',
+                   to_jsonb($2::int),
+                   true
+                 )
+             WHERE id = $1
+             RETURNING id, chat_id, sender_id, text, meta, created_at`,
+            [reservedMessageId, remainingQuantity],
+          );
+          if (updatedMsg.rowCount > 0) {
+            updatedReservedMessage = updatedMsg.rows[0];
+          }
         }
       }
-
-      await client.query('DELETE FROM reservations WHERE id = $1', [reservationQ.rows[0].id]);
     }
 
-    await client.query('DELETE FROM cart_items WHERE id = $1', [cartItemId]);
+    if (remainingQuantity <= 0) {
+      await client.query('DELETE FROM cart_items WHERE id = $1', [cartItemId]);
+    } else {
+      await client.query(
+        `UPDATE cart_items
+         SET quantity = $1,
+             updated_at = now()
+         WHERE id = $2`,
+        [remainingQuantity, cartItemId],
+      );
+    }
 
     const msgUpdate = await client.query(
       `UPDATE messages
@@ -708,6 +820,15 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
           chatId: message.chat_id,
         });
       }
+      if (updatedReservedMessage) {
+        io.to(`chat:${updatedReservedMessage.chat_id}`).emit('chat:message', {
+          chatId: updatedReservedMessage.chat_id,
+          message: updatedReservedMessage,
+        });
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: updatedReservedMessage.chat_id,
+        });
+      }
       if (removedReservedMessage) {
         io.to(`chat:${removedReservedMessage.chat_id}`).emit('chat:message:deleted', {
           chatId: removedReservedMessage.chat_id,
@@ -722,9 +843,9 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
     emitCartUpdated(req, userId, {
       product_id: item.product_id,
       cart_item_id: cartItemId,
-      status: 'cancelled',
+      status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
       available_in_stock: Number(updatedProduct.quantity),
-      reason: 'item_cancelled',
+      reason: remainingQuantity > 0 ? 'item_cancelled_partial' : 'item_cancelled',
     });
 
     return res.json({
@@ -732,8 +853,9 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       data: {
         cart_item_id: cartItemId,
         product_id: item.product_id,
-        status: 'cancelled',
-        restored_quantity: Number(item.quantity),
+        status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
+        restored_quantity: cancelQuantity,
+        remaining_quantity: remainingQuantity,
         available_in_stock: Number(updatedProduct.quantity),
       },
     });
@@ -745,6 +867,23 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   } finally {
     client.release();
+  }
+});
+
+router.post('/claims/upload-image', authMiddleware, uploadClaimImage, async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: 'Файл не получен' });
+    }
+    return res.status(201).json({
+      ok: true,
+      data: {
+        image_url: toAbsoluteClaimImageUrl(req, req.file),
+      },
+    });
+  } catch (err) {
+    console.error('cart.claims.uploadImage error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });
 
@@ -917,6 +1056,7 @@ router.post('/claims', authMiddleware, async (req, res) => {
       reason: 'claim_created',
       claim_id: claim.id,
     });
+    emitClaimUpdated(req, claim, 'claim_created');
     return res.status(201).json({
       ok: true,
       data: {
@@ -1184,6 +1324,7 @@ router.patch(
         reason: 'claim_updated',
         claim_id: row.id,
       });
+      emitClaimUpdated(req, row, 'claim_updated');
       return res.json({
         ok: true,
         data: {

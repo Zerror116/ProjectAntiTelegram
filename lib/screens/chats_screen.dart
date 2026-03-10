@@ -28,7 +28,36 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   String _chatIdOf(Map<String, dynamic> chat) => (chat['id'] ?? '').toString();
 
+  bool _toBool(dynamic raw) {
+    if (raw is bool) return raw;
+    final value = '${raw ?? ''}'.toLowerCase().trim();
+    return value == 'true' || value == '1' || value == 'yes';
+  }
+
+  bool _isChatPinned(Map<String, dynamic> chat) {
+    return _toBool(chat['is_pinned']);
+  }
+
+  DateTime? _chatPinnedAt(Map<String, dynamic> chat) {
+    return _parseDate(chat['pinned_at']);
+  }
+
   int _compareChats(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final ap = _isChatPinned(a);
+    final bp = _isChatPinned(b);
+    if (ap != bp) return ap ? -1 : 1;
+    if (ap && bp) {
+      final apAt = _chatPinnedAt(a);
+      final bpAt = _chatPinnedAt(b);
+      if (apAt != null && bpAt != null) {
+        final cmp = bpAt.compareTo(apAt);
+        if (cmp != 0) return cmp;
+      } else if (apAt != null) {
+        return -1;
+      } else if (bpAt != null) {
+        return 1;
+      }
+    }
     final ad = _parseDate(a['updated_at'] ?? a['time']);
     final bd = _parseDate(b['updated_at'] ?? b['time']);
     if (ad == null && bd == null) return 0;
@@ -174,6 +203,168 @@ class _ChatsScreenState extends State<ChatsScreen> {
     return normalized;
   }
 
+  String _chatDisplayTitle(Map<String, dynamic> chat) {
+    final serverDisplay = (chat['display_title'] ?? '').toString().trim();
+    if (serverDisplay.isNotEmpty) return serverDisplay;
+
+    final peerDisplay = (chat['peer_display_name'] ?? '').toString().trim();
+    if (peerDisplay.isNotEmpty) return peerDisplay;
+
+    final peerName = (chat['peer_name'] ?? '').toString().trim();
+    if (peerName.isNotEmpty) return peerName;
+
+    final peerEmail = (chat['peer_email'] ?? '').toString().trim();
+    if (peerEmail.isNotEmpty) return peerEmail;
+
+    final peerPhone = (chat['peer_phone'] ?? '').toString().trim();
+    if (peerPhone.isNotEmpty) return peerPhone;
+
+    final title = (chat['title'] ?? chat['name'] ?? '').toString().trim();
+    if (title.isNotEmpty && title != 'Личные сообщения') return title;
+    return 'Пользователь';
+  }
+
+  bool _isMainChannel(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    final systemKey = (settings['system_key'] ?? '').toString().trim();
+    final kind = (settings['kind'] ?? '').toString().trim();
+    final title = (chat['title'] ?? '').toString().trim().toLowerCase();
+    return systemKey == 'main_channel' ||
+        kind == 'main_channel' ||
+        title == 'основной канал';
+  }
+
+  Future<void> _updateChatListPreferences(
+    Map<String, dynamic> chat, {
+    bool? hidden,
+    bool? pinned,
+  }) async {
+    final chatId = _chatIdOf(chat);
+    if (chatId.isEmpty) return;
+    if (hidden == true && _isMainChannel(chat)) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Основной канал нельзя удалить из списка',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    try {
+      final resp = await authService.dio.patch(
+        '/api/chats/$chatId/list-preferences',
+        data: {
+          if (hidden != null) 'hidden': hidden,
+          if (pinned != null) 'pinned': pinned,
+        },
+      );
+      final data = resp.data is Map && resp.data['data'] is Map
+          ? Map<String, dynamic>.from(resp.data['data'])
+          : <String, dynamic>{};
+      final isHidden = _toBool(data['hidden']);
+      final isPinned = _toBool(data['pinned']);
+      if (!mounted) return;
+      setState(() {
+        final index = _chats.indexWhere((row) => _chatIdOf(row) == chatId);
+        if (index < 0) return;
+        if (isHidden) {
+          _chats.removeAt(index);
+        } else {
+          _chats[index] = {
+            ..._chats[index],
+            'is_pinned': isPinned,
+            'pinned_at': data['pinned_at'],
+          };
+        }
+        _sortChats();
+      });
+      showGlobalAppNotice(
+        hidden == true
+            ? 'Чат удалён у вас из списка'
+            : (isPinned ? 'Чат закреплён' : 'Чат откреплён'),
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Ошибка действия с чатом: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  Future<void> _openChatActionsMenu(
+    Map<String, dynamic> chat, {
+    Offset? globalPosition,
+  }) async {
+    final isPinned = _isChatPinned(chat);
+    final canHide = !_isMainChannel(chat);
+    String? action;
+
+    if (globalPosition != null) {
+      final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+      if (overlay != null) {
+        action = await showMenu<String>(
+          context: context,
+          position: RelativeRect.fromRect(
+            Rect.fromLTWH(globalPosition.dx, globalPosition.dy, 1, 1),
+            Offset.zero & overlay.size,
+          ),
+          items: [
+            PopupMenuItem<String>(
+              value: isPinned ? 'unpin' : 'pin',
+              child: Text(isPinned ? 'Открепить у себя' : 'Закрепить у себя'),
+            ),
+            if (canHide)
+              const PopupMenuItem<String>(
+                value: 'hide',
+                child: Text('Удалить у себя'),
+              ),
+          ],
+        );
+      }
+    } else {
+      action = await showModalBottomSheet<String>(
+        context: context,
+        showDragHandle: true,
+        builder: (ctx) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: Icon(
+                  isPinned ? Icons.push_pin_outlined : Icons.push_pin,
+                ),
+                title: Text(
+                  isPinned ? 'Открепить у себя' : 'Закрепить у себя',
+                ),
+                onTap: () => Navigator.of(ctx).pop(isPinned ? 'unpin' : 'pin'),
+              ),
+              if (canHide)
+                ListTile(
+                  leading: const Icon(Icons.delete_outline),
+                  title: const Text('Удалить у себя'),
+                  onTap: () => Navigator.of(ctx).pop('hide'),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (action == null) return;
+    if (action == 'hide') {
+      await _updateChatListPreferences(chat, hidden: true);
+      return;
+    }
+    if (action == 'pin') {
+      await _updateChatListPreferences(chat, pinned: true);
+      return;
+    }
+    if (action == 'unpin') {
+      await _updateChatListPreferences(chat, pinned: false);
+    }
+  }
+
   String _lastMessagePreview(Map<String, dynamic> chat) {
     final rawText = (chat['last_message'] ?? chat['last'] ?? '').toString();
     final text = _compactMessage(rawText);
@@ -235,405 +426,33 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   Future<void> _openDirectChatDialog() async {
-    final controller = TextEditingController();
-    final contacts = <Map<String, dynamic>>[];
-    bool submitting = false;
-    bool loadingContacts = true;
-    bool contactsInitialized = false;
-    String contactsError = '';
-
-    await showDialog<void>(
+    final result = await showDialog<_DirectChatOpenResult>(
       context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (context, setModalState) {
-            Future<void> loadContacts({bool force = false}) async {
-              if (loadingContacts && !force) return;
-              setModalState(() {
-                loadingContacts = true;
-                contactsError = '';
-              });
-              try {
-                final resp = await authService.dio.get('/api/chats/contacts');
-                final data = resp.data;
-                if (data is! Map ||
-                    data['ok'] != true ||
-                    data['data'] is! List) {
-                  throw Exception('Неверный ответ сервера');
-                }
-                contacts
-                  ..clear()
-                  ..addAll(List<Map<String, dynamic>>.from(data['data']));
-                if (ctx.mounted) {
-                  setModalState(() {
-                    loadingContacts = false;
-                  });
-                }
-              } catch (e) {
-                if (!ctx.mounted) return;
-                setModalState(() {
-                  loadingContacts = false;
-                  contactsError = _extractDioError(e);
-                });
-              }
-            }
-
-            Future<void> openDirect({
-              String? query,
-              String? userId,
-              bool closeDialog = true,
-            }) async {
-              final normalizedQuery = (query ?? '').trim();
-              final normalizedUserId = (userId ?? '').trim();
-              if (normalizedQuery.isEmpty && normalizedUserId.isEmpty) return;
-
-              setModalState(() => submitting = true);
-              var didCloseDialog = false;
-              try {
-                final resp = await authService.dio.post(
-                  '/api/chats/direct/open',
-                  data: {
-                    if (normalizedQuery.isNotEmpty) 'query': normalizedQuery,
-                    if (normalizedUserId.isNotEmpty)
-                      'user_id': normalizedUserId,
-                  },
-                  options: Options(
-                    validateStatus: (code) {
-                      if (code == null) return false;
-                      return code < 500;
-                    },
-                  ),
-                );
-                if (resp.statusCode == 404) {
-                  if (mounted) {
-                    showGlobalAppNotice(
-                      'Пользователь не найден в вашей группе',
-                      tone: AppNoticeTone.warning,
-                    );
-                  }
-                  return;
-                }
-                if (resp.statusCode == null ||
-                    resp.statusCode! < 200 ||
-                    resp.statusCode! >= 300) {
-                  throw Exception(
-                    _extractDioError(
-                      DioException(
-                        requestOptions: resp.requestOptions,
-                        response: resp,
-                        type: DioExceptionType.badResponse,
-                      ),
-                    ),
-                  );
-                }
-                final data = resp.data;
-                if (data is! Map ||
-                    data['ok'] != true ||
-                    data['data'] is! Map) {
-                  throw Exception('Неверный ответ сервера');
-                }
-                final payload = Map<String, dynamic>.from(data['data']);
-                final chat = payload['chat'] is Map
-                    ? Map<String, dynamic>.from(payload['chat'])
-                    : <String, dynamic>{};
-                final peer = payload['peer'] is Map
-                    ? Map<String, dynamic>.from(payload['peer'])
-                    : <String, dynamic>{};
-                final chatId = (chat['id'] ?? '').toString();
-                if (chatId.isEmpty) {
-                  throw Exception('Не удалось открыть чат');
-                }
-                if (closeDialog && ctx.mounted) {
-                  didCloseDialog = true;
-                  Navigator.of(ctx).pop();
-                }
-                final title = (peer['name'] ?? '').toString().trim().isNotEmpty
-                    ? (peer['name'] ?? '').toString().trim()
-                    : ((peer['email'] ?? '').toString().trim().isNotEmpty
-                          ? (peer['email'] ?? '').toString().trim()
-                          : 'Личные сообщения');
-                if (!mounted) return;
-                _markChatReadLocally(chatId);
-                await Navigator.push(
-                  this.context,
-                  MaterialPageRoute(
-                    builder: (_) => ChatScreen(
-                      chatId: chatId,
-                      chatTitle: title,
-                      chatType: 'private',
-                      chatSettings: chat['settings'] is Map
-                          ? Map<String, dynamic>.from(chat['settings'])
-                          : null,
-                    ),
-                  ),
-                );
-                _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
-              } catch (e) {
-                if (!mounted) return;
-                showGlobalAppNotice(
-                  'Ошибка ЛС: ${_extractDioError(e)}',
-                  tone: AppNoticeTone.error,
-                );
-              } finally {
-                if (!didCloseDialog && ctx.mounted) {
-                  setModalState(() => submitting = false);
-                }
-              }
-            }
-
-            Future<void> addToContactsByQuery() async {
-              final query = controller.text.trim();
-              if (query.isEmpty) return;
-              setModalState(() => submitting = true);
-              try {
-                final resp = await authService.dio.post(
-                  '/api/chats/contacts',
-                  data: {'query': query},
-                  options: Options(
-                    validateStatus: (code) {
-                      if (code == null) return false;
-                      return code < 500;
-                    },
-                  ),
-                );
-                if (resp.statusCode == 404) {
-                  if (mounted) {
-                    showGlobalAppNotice(
-                      'Контакт не найден в вашей группе',
-                      tone: AppNoticeTone.warning,
-                    );
-                  }
-                  return;
-                }
-                if (resp.statusCode == null ||
-                    resp.statusCode! < 200 ||
-                    resp.statusCode! >= 300) {
-                  throw Exception(
-                    _extractDioError(
-                      DioException(
-                        requestOptions: resp.requestOptions,
-                        response: resp,
-                        type: DioExceptionType.badResponse,
-                      ),
-                    ),
-                  );
-                }
-                if (mounted) {
-                  showAppNotice(
-                    this.context,
-                    'Контакт добавлен',
-                    tone: AppNoticeTone.success,
-                  );
-                }
-                await loadContacts(force: true);
-              } catch (e) {
-                if (!mounted) return;
-                showGlobalAppNotice(
-                  'Ошибка добавления контакта: ${_extractDioError(e)}',
-                  tone: AppNoticeTone.error,
-                );
-              } finally {
-                if (ctx.mounted) setModalState(() => submitting = false);
-              }
-            }
-
-            Future<void> removeContact(String userId) async {
-              setModalState(() => submitting = true);
-              try {
-                final resp = await authService.dio.delete(
-                  '/api/chats/contacts/$userId',
-                  options: Options(
-                    validateStatus: (code) {
-                      if (code == null) return false;
-                      return code < 500;
-                    },
-                  ),
-                );
-                if (resp.statusCode == null ||
-                    resp.statusCode! < 200 ||
-                    resp.statusCode! >= 300) {
-                  throw Exception(
-                    _extractDioError(
-                      DioException(
-                        requestOptions: resp.requestOptions,
-                        response: resp,
-                        type: DioExceptionType.badResponse,
-                      ),
-                    ),
-                  );
-                }
-                contacts.removeWhere(
-                  (item) =>
-                      (item['contact_user_id'] ?? '').toString() == userId,
-                );
-                if (ctx.mounted) {
-                  setModalState(() {});
-                }
-              } catch (e) {
-                if (!mounted) return;
-                showGlobalAppNotice(
-                  'Ошибка удаления контакта: ${_extractDioError(e)}',
-                  tone: AppNoticeTone.error,
-                );
-              } finally {
-                if (ctx.mounted) setModalState(() => submitting = false);
-              }
-            }
-
-            if (!contactsInitialized) {
-              contactsInitialized = true;
-              unawaited(loadContacts(force: true));
-            }
-
-            return AlertDialog(
-              title: const Text('Найти пользователя'),
-              content: SizedBox(
-                width: 500,
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 520),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      TextField(
-                        controller: controller,
-                        autofocus: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Телефон, email или имя',
-                          hintText: 'Например: 7999..., user@mail.com',
-                          border: OutlineInputBorder(),
-                        ),
-                        onSubmitted: (_) => openDirect(query: controller.text),
-                      ),
-                      const SizedBox(height: 10),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          FilledButton.icon(
-                            onPressed: submitting
-                                ? null
-                                : () => openDirect(query: controller.text),
-                            icon: const Icon(Icons.forum_outlined),
-                            label: const Text('Открыть ЛС'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: submitting ? null : addToContactsByQuery,
-                            icon: const Icon(Icons.person_add_alt_1_outlined),
-                            label: const Text('Добавить в контакты'),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 14),
-                      Row(
-                        children: [
-                          Text(
-                            'Контакты',
-                            style: Theme.of(context).textTheme.titleSmall,
-                          ),
-                          const Spacer(),
-                          IconButton(
-                            tooltip: 'Обновить',
-                            onPressed: submitting
-                                ? null
-                                : () => loadContacts(force: true),
-                            icon: const Icon(Icons.refresh),
-                          ),
-                        ],
-                      ),
-                      Expanded(
-                        child: loadingContacts
-                            ? const Center(
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : contactsError.isNotEmpty
-                            ? Center(
-                                child: Text(
-                                  'Не удалось загрузить контакты: $contactsError',
-                                  textAlign: TextAlign.center,
-                                ),
-                              )
-                            : contacts.isEmpty
-                            ? const Center(child: Text('Контактов пока нет'))
-                            : ListView.separated(
-                                itemCount: contacts.length,
-                                separatorBuilder: (_, index) =>
-                                    const Divider(height: 1),
-                                itemBuilder: (context, index) {
-                                  final contact = contacts[index];
-                                  final contactUserId =
-                                      (contact['contact_user_id'] ?? '')
-                                          .toString()
-                                          .trim();
-                                  final title = _peerDisplayName(contact);
-                                  final subtitle = _peerSubtitle(contact);
-                                  return ListTile(
-                                    contentPadding: EdgeInsets.zero,
-                                    leading: AppAvatar(
-                                      title: title,
-                                      imageUrl: _resolveImageUrl(
-                                        (contact['avatar_url'] ?? '')
-                                            .toString()
-                                            .trim(),
-                                      ),
-                                      focusX: _toAvatarFocus(
-                                        contact['avatar_focus_x'],
-                                      ),
-                                      focusY: _toAvatarFocus(
-                                        contact['avatar_focus_y'],
-                                      ),
-                                      zoom: _toAvatarZoom(
-                                        contact['avatar_zoom'],
-                                      ),
-                                      radius: 18,
-                                    ),
-                                    title: Text(
-                                      title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    subtitle: subtitle.isEmpty
-                                        ? null
-                                        : Text(
-                                            subtitle,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                          ),
-                                    onTap: submitting || contactUserId.isEmpty
-                                        ? null
-                                        : () =>
-                                              openDirect(userId: contactUserId),
-                                    trailing: IconButton(
-                                      tooltip: 'Удалить контакт',
-                                      onPressed:
-                                          submitting || contactUserId.isEmpty
-                                          ? null
-                                          : () => removeContact(contactUserId),
-                                      icon: const Icon(
-                                        Icons.person_remove_alt_1_outlined,
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: submitting ? null : () => Navigator.pop(ctx),
-                  child: const Text('Отмена'),
-                ),
-              ],
-            );
-          },
-        );
-      },
+      builder: (_) => _DirectChatDialog(
+        extractDioError: _extractDioError,
+        peerDisplayName: _peerDisplayName,
+        peerSubtitle: _peerSubtitle,
+        resolveImageUrl: _resolveImageUrl,
+        toAvatarFocus: _toAvatarFocus,
+        toAvatarZoom: _toAvatarZoom,
+      ),
     );
-    controller.dispose();
+    if (!mounted || result == null) return;
+
+    _markChatReadLocally(result.chatId);
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: result.chatId,
+          chatTitle: result.chatTitle,
+          chatType: 'private',
+          chatSettings: result.chatSettings,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
   }
 
   @override
@@ -968,6 +787,408 @@ class _ChatsScreenState extends State<ChatsScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _DirectChatOpenResult {
+  final String chatId;
+  final String chatTitle;
+  final Map<String, dynamic>? chatSettings;
+
+  const _DirectChatOpenResult({
+    required this.chatId,
+    required this.chatTitle,
+    required this.chatSettings,
+  });
+}
+
+class _DirectChatDialog extends StatefulWidget {
+  final String Function(Object error) extractDioError;
+  final String Function(Map<String, dynamic> peer) peerDisplayName;
+  final String Function(Map<String, dynamic> peer) peerSubtitle;
+  final String? Function(String? raw) resolveImageUrl;
+  final double Function(Object? raw) toAvatarFocus;
+  final double Function(Object? raw) toAvatarZoom;
+
+  const _DirectChatDialog({
+    required this.extractDioError,
+    required this.peerDisplayName,
+    required this.peerSubtitle,
+    required this.resolveImageUrl,
+    required this.toAvatarFocus,
+    required this.toAvatarZoom,
+  });
+
+  @override
+  State<_DirectChatDialog> createState() => _DirectChatDialogState();
+}
+
+class _DirectChatDialogState extends State<_DirectChatDialog> {
+  final TextEditingController _controller = TextEditingController();
+  final List<Map<String, dynamic>> _contacts = [];
+
+  bool _submitting = false;
+  bool _loadingContacts = true;
+  String _contactsError = '';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadContacts(force: true));
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadContacts({bool force = false}) async {
+    if (_loadingContacts && !force) return;
+    setState(() {
+      _loadingContacts = true;
+      _contactsError = '';
+    });
+
+    try {
+      final resp = await authService.dio.get('/api/chats/contacts');
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) {
+        throw Exception('Неверный ответ сервера');
+      }
+      if (!mounted) return;
+      setState(() {
+        _contacts
+          ..clear()
+          ..addAll(List<Map<String, dynamic>>.from(data['data']));
+        _loadingContacts = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingContacts = false;
+        _contactsError = widget.extractDioError(e);
+      });
+    }
+  }
+
+  Future<void> _openDirect({String? query, String? userId}) async {
+    final normalizedQuery = (query ?? '').trim();
+    final normalizedUserId = (userId ?? '').trim();
+    if (_submitting) return;
+    if (normalizedQuery.isEmpty && normalizedUserId.isEmpty) return;
+
+    setState(() => _submitting = true);
+    var didCloseDialog = false;
+    try {
+      final resp = await authService.dio.post(
+        '/api/chats/direct/open',
+        data: {
+          if (normalizedQuery.isNotEmpty) 'query': normalizedQuery,
+          if (normalizedUserId.isNotEmpty) 'user_id': normalizedUserId,
+        },
+        options: Options(
+          validateStatus: (code) {
+            if (code == null) return false;
+            return code < 500;
+          },
+        ),
+      );
+
+      if (resp.statusCode == 404) {
+        showGlobalAppNotice(
+          'Пользователь не найден в вашей группе',
+          tone: AppNoticeTone.warning,
+        );
+        return;
+      }
+      if (resp.statusCode == null ||
+          resp.statusCode! < 200 ||
+          resp.statusCode! >= 300) {
+        throw Exception(
+          widget.extractDioError(
+            DioException(
+              requestOptions: resp.requestOptions,
+              response: resp,
+              type: DioExceptionType.badResponse,
+            ),
+          ),
+        );
+      }
+
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! Map) {
+        throw Exception('Неверный ответ сервера');
+      }
+      final payload = Map<String, dynamic>.from(data['data']);
+      final chat = payload['chat'] is Map
+          ? Map<String, dynamic>.from(payload['chat'])
+          : <String, dynamic>{};
+      final peer = payload['peer'] is Map
+          ? Map<String, dynamic>.from(payload['peer'])
+          : <String, dynamic>{};
+      final chatId = (chat['id'] ?? '').toString();
+      if (chatId.isEmpty) {
+        throw Exception('Не удалось открыть чат');
+      }
+      final chatTitle = (peer['name'] ?? '').toString().trim().isNotEmpty
+          ? (peer['name'] ?? '').toString().trim()
+          : ((peer['email'] ?? '').toString().trim().isNotEmpty
+                ? (peer['email'] ?? '').toString().trim()
+                : 'Личные сообщения');
+      final chatSettings = chat['settings'] is Map
+          ? Map<String, dynamic>.from(chat['settings'])
+          : null;
+
+      if (!mounted) return;
+      didCloseDialog = true;
+      Navigator.of(context).pop(
+        _DirectChatOpenResult(
+          chatId: chatId,
+          chatTitle: chatTitle,
+          chatSettings: chatSettings,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Ошибка ЛС: ${widget.extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (!didCloseDialog && mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
+  Future<void> _addToContactsByQuery() async {
+    final query = _controller.text.trim();
+    if (query.isEmpty || _submitting) return;
+    setState(() => _submitting = true);
+    try {
+      final resp = await authService.dio.post(
+        '/api/chats/contacts',
+        data: {'query': query},
+        options: Options(
+          validateStatus: (code) {
+            if (code == null) return false;
+            return code < 500;
+          },
+        ),
+      );
+      if (resp.statusCode == 404) {
+        showGlobalAppNotice(
+          'Контакт не найден в вашей группе',
+          tone: AppNoticeTone.warning,
+        );
+        return;
+      }
+      if (resp.statusCode == null ||
+          resp.statusCode! < 200 ||
+          resp.statusCode! >= 300) {
+        throw Exception(
+          widget.extractDioError(
+            DioException(
+              requestOptions: resp.requestOptions,
+              response: resp,
+              type: DioExceptionType.badResponse,
+            ),
+          ),
+        );
+      }
+      showGlobalAppNotice('Контакт добавлен', tone: AppNoticeTone.success);
+      await _loadContacts(force: true);
+    } catch (e) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Ошибка добавления контакта: ${widget.extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  Future<void> _removeContact(String userId) async {
+    if (userId.isEmpty || _submitting) return;
+    setState(() => _submitting = true);
+    try {
+      final resp = await authService.dio.delete(
+        '/api/chats/contacts/$userId',
+        options: Options(
+          validateStatus: (code) {
+            if (code == null) return false;
+            return code < 500;
+          },
+        ),
+      );
+      if (resp.statusCode == null ||
+          resp.statusCode! < 200 ||
+          resp.statusCode! >= 300) {
+        throw Exception(
+          widget.extractDioError(
+            DioException(
+              requestOptions: resp.requestOptions,
+              response: resp,
+              type: DioExceptionType.badResponse,
+            ),
+          ),
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _contacts.removeWhere(
+          (item) => (item['contact_user_id'] ?? '').toString() == userId,
+        );
+      });
+    } catch (e) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Ошибка удаления контакта: ${widget.extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dialogHeight = (MediaQuery.of(context).size.height * 0.72).clamp(
+      320.0,
+      540.0,
+    );
+
+    return AlertDialog(
+      title: const Text('Найти пользователя'),
+      content: SizedBox(
+        width: 500,
+        height: dialogHeight,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _controller,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Телефон, email или имя',
+                hintText: 'Например: 7999..., user@mail.com',
+                border: OutlineInputBorder(),
+              ),
+              onSubmitted: (_) => _openDirect(query: _controller.text),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: _submitting
+                      ? null
+                      : () => _openDirect(query: _controller.text),
+                  icon: const Icon(Icons.forum_outlined),
+                  label: const Text('Открыть ЛС'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _submitting ? null : _addToContactsByQuery,
+                  icon: const Icon(Icons.person_add_alt_1_outlined),
+                  label: const Text('Добавить в контакты'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Text('Контакты', style: Theme.of(context).textTheme.titleSmall),
+                const Spacer(),
+                IconButton(
+                  tooltip: 'Обновить',
+                  onPressed: _submitting
+                      ? null
+                      : () => _loadContacts(force: true),
+                  icon: const Icon(Icons.refresh),
+                ),
+              ],
+            ),
+            Expanded(
+              child: _loadingContacts
+                  ? const Center(
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : _contactsError.isNotEmpty
+                  ? Center(
+                      child: Text(
+                        'Не удалось загрузить контакты: $_contactsError',
+                        textAlign: TextAlign.center,
+                      ),
+                    )
+                  : _contacts.isEmpty
+                  ? const Center(child: Text('Контактов пока нет'))
+                  : ListView.separated(
+                      itemCount: _contacts.length,
+                      separatorBuilder: (_, index) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final contact = _contacts[index];
+                        final contactUserId = (contact['contact_user_id'] ?? '')
+                            .toString()
+                            .trim();
+                        final title = widget.peerDisplayName(contact);
+                        final subtitle = widget.peerSubtitle(contact);
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: AppAvatar(
+                            title: title,
+                            imageUrl: widget.resolveImageUrl(
+                              (contact['avatar_url'] ?? '').toString().trim(),
+                            ),
+                            focusX: widget.toAvatarFocus(
+                              contact['avatar_focus_x'],
+                            ),
+                            focusY: widget.toAvatarFocus(
+                              contact['avatar_focus_y'],
+                            ),
+                            zoom: widget.toAvatarZoom(contact['avatar_zoom']),
+                            radius: 18,
+                          ),
+                          title: Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: subtitle.isEmpty
+                              ? null
+                              : Text(
+                                  subtitle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                          onTap: _submitting || contactUserId.isEmpty
+                              ? null
+                              : () => _openDirect(userId: contactUserId),
+                          trailing: IconButton(
+                            tooltip: 'Удалить контакт',
+                            onPressed: _submitting || contactUserId.isEmpty
+                                ? null
+                                : () => _removeContact(contactUserId),
+                            icon: const Icon(
+                              Icons.person_remove_alt_1_outlined,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _submitting ? null : () => Navigator.of(context).pop(),
+          child: const Text('Отмена'),
+        ),
+      ],
     );
   }
 }

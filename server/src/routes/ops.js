@@ -1899,12 +1899,41 @@ router.post(
       },
     });
 
+    const updatedRow = updated.rows[0] || {};
+    const io = req.app.get('io');
+    if (io && updatedRow.id) {
+      const payload = {
+        reason: 'claim_updated',
+        claim_id: String(updatedRow.id),
+        user_id: String(updatedRow.user_id || ''),
+        status: String(updatedRow.status || ''),
+        claim_type: String(updatedRow.claim_type || ''),
+        approved_amount: toMoney(updatedRow.approved_amount),
+        requested_amount: toMoney(updatedRow.requested_amount),
+        updated_at: updatedRow.updated_at || null,
+      };
+      emitToTenant(
+        io,
+        updatedRow.tenant_id || req.user?.tenant_id || null,
+        'claims:updated',
+        payload,
+      );
+      if (updatedRow.user_id) {
+        io.to(`user:${updatedRow.user_id}`).emit('claims:updated', payload);
+        io.to(`user:${updatedRow.user_id}`).emit('cart:updated', {
+          userId: String(updatedRow.user_id),
+          reason: 'claim_updated',
+          claim_id: String(updatedRow.id),
+        });
+      }
+    }
+
     return res.json({
       ok: true,
       data: {
-        ...updated.rows[0],
-        requested_amount: toMoney(updated.rows[0]?.requested_amount),
-        approved_amount: toMoney(updated.rows[0]?.approved_amount),
+        ...updatedRow,
+        requested_amount: toMoney(updatedRow.requested_amount),
+        approved_amount: toMoney(updatedRow.approved_amount),
       },
     });
   } catch (err) {

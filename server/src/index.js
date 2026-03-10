@@ -43,6 +43,7 @@ const uploadsRoot = path.resolve(__dirname, "..", "uploads");
 fs.mkdirSync(path.join(uploadsRoot, "products"), { recursive: true });
 fs.mkdirSync(path.join(uploadsRoot, "channels"), { recursive: true });
 fs.mkdirSync(path.join(uploadsRoot, "users"), { recursive: true });
+fs.mkdirSync(path.join(uploadsRoot, "claims"), { recursive: true });
 fs.mkdirSync(path.join(uploadsRoot, "chat_media", "images"), {
   recursive: true,
 });
@@ -135,7 +136,7 @@ app.options("*", cors(corsOptions));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-for (const publicDir of ["products", "channels", "users"]) {
+for (const publicDir of ["products", "channels", "users", "claims"]) {
   const fullDir = path.join(uploadsRoot, publicDir);
   app.use(
     `/uploads/${publicDir}`,

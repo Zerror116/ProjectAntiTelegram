@@ -2,7 +2,10 @@
 import 'dart:async';
 
 import 'package:dio/dio.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
 import '../utils/date_time_utils.dart';
@@ -16,6 +19,7 @@ class CartScreen extends StatefulWidget {
 }
 
 class _CartScreenState extends State<CartScreen> {
+  final ImagePicker _imagePicker = ImagePicker();
   bool _loading = true;
   bool _cancelling = false;
   bool _reloading = false;
@@ -266,6 +270,68 @@ class _CartScreenState extends State<CartScreen> {
     return '$base/$value';
   }
 
+  Future<String> _uploadClaimImageBytes(
+    Uint8List bytes,
+    String filename,
+  ) async {
+    final formData = FormData.fromMap({
+      'image': MultipartFile.fromBytes(
+        bytes,
+        filename: filename.isEmpty ? 'claim-photo.jpg' : filename,
+      ),
+    });
+    final resp = await authService.dio.post(
+      '/api/cart/claims/upload-image',
+      data: formData,
+      options: Options(headers: const {'Content-Type': 'multipart/form-data'}),
+    );
+    final data = resp.data;
+    if (data is! Map || data['ok'] != true || data['data'] is! Map) {
+      throw Exception('Не удалось загрузить фото');
+    }
+    final payload = Map<String, dynamic>.from(data['data']);
+    final imageUrl = (payload['image_url'] ?? '').toString().trim();
+    if (imageUrl.isEmpty) {
+      throw Exception('Сервер не вернул ссылку на фото');
+    }
+    return imageUrl;
+  }
+
+  Future<String?> _pickAndUploadClaimImage({required bool useCamera}) async {
+    try {
+      if (!kIsWeb &&
+          (defaultTargetPlatform == TargetPlatform.android ||
+              defaultTargetPlatform == TargetPlatform.iOS)) {
+        final picked = await _imagePicker.pickImage(
+          source: useCamera ? ImageSource.camera : ImageSource.gallery,
+          imageQuality: 88,
+          maxWidth: 2200,
+        );
+        if (picked == null) return null;
+        final bytes = await picked.readAsBytes();
+        return await _uploadClaimImageBytes(bytes, picked.name);
+      }
+
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        withData: true,
+      );
+      if (result == null || result.files.isEmpty) return null;
+      final file = result.files.first;
+      final data = file.bytes;
+      if (data == null) return null;
+      return await _uploadClaimImageBytes(data, file.name);
+    } catch (e) {
+      if (!mounted) return null;
+      showAppNotice(
+        context,
+        'Ошибка загрузки фото: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+      return null;
+    }
+  }
+
   Future<void> _cancelItem(Map<String, dynamic> item) async {
     final status = (item['status'] ?? '').toString();
     if (!_canCancel(status)) {
@@ -280,14 +346,68 @@ class _CartScreenState extends State<CartScreen> {
 
     final itemId = (item['id'] ?? '').toString();
     if (itemId.isEmpty) return;
+    final itemQtyRaw = int.tryParse('${item['quantity'] ?? 1}') ?? 1;
+    final itemQty = itemQtyRaw > 0 ? itemQtyRaw : 1;
+    int cancelQty = itemQty;
+
+    if (itemQty > 1) {
+      int selectedQty = 1;
+      final pickedQty = await showDialog<int>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: const Text('Количество для отказа'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Вы купили $itemQty шт. Сколько хотите отменить?'),
+                const SizedBox(height: 10),
+                DropdownButtonFormField<int>(
+                  initialValue: selectedQty,
+                  items: List.generate(
+                    itemQty,
+                    (i) => DropdownMenuItem<int>(
+                      value: i + 1,
+                      child: Text('${i + 1}'),
+                    ),
+                  ),
+                  onChanged: (value) {
+                    if (value == null) return;
+                    setDialogState(() => selectedQty = value);
+                  },
+                  decoration: const InputDecoration(
+                    labelText: 'Количество',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(ctx).pop(selectedQty),
+                child: const Text('Далее'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (pickedQty == null) return;
+      cancelQty = pickedQty;
+    }
 
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Отказ от товара'),
-        content: const Text(
-          'Вы уверены, что хотите отказаться от этого товара?\n'
-          'Товар вернется в наличие.',
+        content: Text(
+          cancelQty >= itemQty
+              ? 'Вы уверены, что хотите отказаться от этого товара?\nТовар вернется в наличие.'
+              : 'Вы уверены, что хотите отказаться от $cancelQty шт.?\nОстальная часть останется в корзине.',
         ),
         actions: [
           TextButton(
@@ -305,11 +425,21 @@ class _CartScreenState extends State<CartScreen> {
 
     setState(() => _cancelling = true);
     try {
-      await authService.dio.delete('/api/cart/items/$itemId');
+      final resp = await authService.dio.delete(
+        '/api/cart/items/$itemId',
+        data: {'quantity': cancelQty},
+      );
+      final payload = resp.data is Map && resp.data['data'] is Map
+          ? Map<String, dynamic>.from(resp.data['data'])
+          : <String, dynamic>{};
+      final remaining =
+          int.tryParse('${payload['remaining_quantity'] ?? 0}') ?? 0;
       if (!mounted) return;
       showAppNotice(
         context,
-        'Товар удален из корзины',
+        remaining > 0
+            ? 'Отказ оформлен: -$cancelQty шт. (в корзине осталось $remaining)'
+            : 'Товар удален из корзины',
         tone: AppNoticeTone.success,
       );
       await playAppSound(AppUiSound.success);
@@ -376,8 +506,9 @@ class _CartScreenState extends State<CartScreen> {
       text: lineTotal > 0 ? lineTotal.toStringAsFixed(2) : '',
     );
     final descriptionCtrl = TextEditingController();
-    final imageCtrl = TextEditingController();
     var claimType = 'return';
+    var imageUrl = '';
+    var imageUploading = false;
     try {
       final confirmed = await showDialog<bool>(
         context: context,
@@ -392,10 +523,7 @@ class _CartScreenState extends State<CartScreen> {
                   DropdownButtonFormField<String>(
                     initialValue: claimType,
                     items: const [
-                      DropdownMenuItem(
-                        value: 'return',
-                        child: Text('Возврат'),
-                      ),
+                      DropdownMenuItem(value: 'return', child: Text('Возврат')),
                       DropdownMenuItem(
                         value: 'discount',
                         child: Text('Скидка'),
@@ -428,12 +556,72 @@ class _CartScreenState extends State<CartScreen> {
                     ),
                   ),
                   const SizedBox(height: 10),
-                  TextField(
-                    controller: imageCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'Ссылка на фото (необязательно)',
-                    ),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: imageUploading
+                            ? null
+                            : () async {
+                                setDialogState(() => imageUploading = true);
+                                final uploaded = await _pickAndUploadClaimImage(
+                                  useCamera: true,
+                                );
+                                if (!mounted || !ctx.mounted) return;
+                                setDialogState(() {
+                                  imageUploading = false;
+                                  if (uploaded != null && uploaded.isNotEmpty) {
+                                    imageUrl = uploaded;
+                                  }
+                                });
+                              },
+                        icon: const Icon(Icons.photo_camera_outlined),
+                        label: const Text('Сфоткать'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: imageUploading
+                            ? null
+                            : () async {
+                                setDialogState(() => imageUploading = true);
+                                final uploaded = await _pickAndUploadClaimImage(
+                                  useCamera: false,
+                                );
+                                if (!mounted || !ctx.mounted) return;
+                                setDialogState(() {
+                                  imageUploading = false;
+                                  if (uploaded != null && uploaded.isNotEmpty) {
+                                    imageUrl = uploaded;
+                                  }
+                                });
+                              },
+                        icon: const Icon(Icons.photo_library_outlined),
+                        label: const Text('Из галереи'),
+                      ),
+                      if (imageUrl.isNotEmpty)
+                        OutlinedButton.icon(
+                          onPressed: imageUploading
+                              ? null
+                              : () => setDialogState(() => imageUrl = ''),
+                          icon: const Icon(Icons.delete_outline),
+                          label: const Text('Убрать фото'),
+                        ),
+                    ],
                   ),
+                  if (imageUploading) ...[
+                    const SizedBox(height: 8),
+                    const LinearProgressIndicator(minHeight: 2),
+                  ],
+                  if (imageUrl.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Фото прикреплено',
+                      style: TextStyle(
+                        color: Theme.of(ctx).colorScheme.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -463,9 +651,8 @@ class _CartScreenState extends State<CartScreen> {
         }
         return;
       }
-      final requestedAmount = double.tryParse(
-            amountCtrl.text.trim().replaceAll(',', '.'),
-          ) ??
+      final requestedAmount =
+          double.tryParse(amountCtrl.text.trim().replaceAll(',', '.')) ??
           lineTotal;
 
       await _submitClaim(
@@ -473,12 +660,11 @@ class _CartScreenState extends State<CartScreen> {
         claimType: claimType,
         description: description,
         requestedAmount: requestedAmount,
-        imageUrl: imageCtrl.text.trim(),
+        imageUrl: imageUrl.trim(),
       );
     } finally {
       amountCtrl.dispose();
       descriptionCtrl.dispose();
-      imageCtrl.dispose();
     }
   }
 
