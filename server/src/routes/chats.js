@@ -453,7 +453,8 @@ async function resolveDirectTargetUser(client, requester, { userId, query }) {
   }
 
   params.push(`%${normalizedQuery}%`);
-  const byName = await client.query(
+  params.push(phoneDigits.length >= 4 ? phoneDigits : "");
+  const byText = await client.query(
     `SELECT u.id,
             u.email,
             u.name,
@@ -465,14 +466,21 @@ async function resolveDirectTargetUser(client, requester, { userId, query }) {
             COALESCE(u.avatar_zoom, 1) AS avatar_zoom
      FROM users u
      LEFT JOIN phones p ON p.user_id = u.id
-     WHERE COALESCE(u.name, '') ILIKE $3
+     WHERE (
+           COALESCE(u.name, '') ILIKE $3
+           OR COALESCE(u.email, '') ILIKE $3
+           OR (
+             $4::text <> ''
+             AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE '%' || $4 || '%'
+           )
+         )
        AND u.id <> $1
        AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
      ORDER BY u.updated_at DESC NULLS LAST, u.created_at DESC
      LIMIT 1`,
     params,
   );
-  return byName.rowCount > 0 ? byName.rows[0] : null;
+  return byText.rowCount > 0 ? byText.rows[0] : null;
 }
 
 function mapPeerInfo(row) {
@@ -2307,7 +2315,10 @@ router.post("/direct/open", requireAuth, async (req, res) => {
     });
     if (!peer) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "Пользователь не найден" });
+      return res.status(404).json({
+        ok: false,
+        error: "Пользователь не найден в вашей группе",
+      });
     }
 
     await client.query(

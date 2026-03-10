@@ -2373,7 +2373,24 @@ router.post('/demo-mode/seed', requireAuth, requireRole('creator'), async (req, 
       const user = users[i];
       const product = createdProducts[i % createdProducts.length];
       await client.query(
-        `INSERT INTO cart_items (
+        `WITH target AS (
+           SELECT id
+           FROM cart_items
+           WHERE user_id = $1
+             AND product_id = $2
+             AND status = 'processed'
+           ORDER BY updated_at DESC NULLS LAST, created_at DESC
+           LIMIT 1
+           FOR UPDATE
+         ),
+         updated AS (
+           UPDATE cart_items c
+           SET quantity = c.quantity + $3,
+               updated_at = now()
+           WHERE c.id IN (SELECT id FROM target)
+           RETURNING c.id
+         )
+         INSERT INTO cart_items (
            id,
            user_id,
            product_id,
@@ -2382,11 +2399,8 @@ router.post('/demo-mode/seed', requireAuth, requireRole('creator'), async (req, 
            created_at,
            updated_at
          )
-         VALUES (gen_random_uuid(), $1, $2, $3, 'processed', now(), now())
-         ON CONFLICT (user_id, product_id) DO UPDATE
-           SET quantity = cart_items.quantity + EXCLUDED.quantity,
-               status = 'processed',
-               updated_at = now()`,
+         SELECT gen_random_uuid(), $1, $2, $3, 'processed', now(), now()
+         WHERE NOT EXISTS (SELECT 1 FROM updated)`,
         [user.id, product.id, (i % 3) + 1],
       );
       demoCartItems += 1;

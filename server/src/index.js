@@ -55,6 +55,8 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5173",
   "http://localhost:8080",
   "http://127.0.0.1:8080",
+  "http://localhost",
+  "http://127.0.0.1",
 ];
 
 function normalizeOrigin(raw) {
@@ -94,6 +96,10 @@ const allowAnyOrigin = allowedOrigins.has("*");
 function isOriginAllowed(origin) {
   if (!origin) return true; // mobile/desktop clients without browser Origin
   if (allowAnyOrigin) return true;
+  const isLocalDev =
+    process.env.NODE_ENV !== "production" &&
+    /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+  if (isLocalDev) return true;
   const normalized = normalizeOrigin(origin);
   if (!normalized) return false;
   return allowedOrigins.has(normalized);
