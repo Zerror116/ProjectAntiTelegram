@@ -2707,7 +2707,7 @@ class _AdminPanelState extends State<AdminPanel>
       if (chatId.isEmpty) {
         throw Exception('Не удалось открыть чат с клиентом');
       }
-      final chatTitle = _displayName(peer, fallback: 'Личные сообщения');
+      final chatTitle = _displayName(peer, fallback: 'Пользователь');
       if (!mounted) return;
       await Navigator.push(
         context,

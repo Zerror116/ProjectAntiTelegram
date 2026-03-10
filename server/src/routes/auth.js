@@ -195,6 +195,30 @@ async function resolveTenantByAccessKey(accessKey) {
   return tenantRes.rowCount > 0 ? tenantRes.rows[0] : null;
 }
 
+async function resolveTenantByUserEmail(email) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) return null;
+
+  const tenantRes = await db.platformQuery(
+    `SELECT t.id,
+            t.code,
+            t.name,
+            t.status,
+            t.subscription_expires_at,
+            t.db_mode,
+            t.db_url,
+            t.db_name
+     FROM users u
+     JOIN tenants t ON t.id = u.tenant_id
+     WHERE lower(u.email) = $1
+     LIMIT 2`,
+    [normalizedEmail],
+  );
+
+  if (tenantRes.rowCount !== 1) return null;
+  return tenantRes.rows[0];
+}
+
 async function resolveTenantInviteByCode(inviteCode) {
   const normalized = normalizeInviteCode(inviteCode);
   if (!normalized) return null;
@@ -647,6 +671,10 @@ router.post('/login', async (req, res) => {
         if (normalizedAccessKey.startsWith('PHX')) {
           tenant = await resolveTenantByAccessKey(normalizedAccessKey);
         }
+      }
+
+      if (!tenant) {
+        tenant = await resolveTenantByUserEmail(normalizedEmail);
       }
 
       if (!tenant) {

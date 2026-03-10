@@ -124,13 +124,9 @@ class AuthService {
   String? _tenantCodeCache;
 
   String _normalizeTenantCodeScope(String? value) {
-    final lower = (value ?? '').trim().toLowerCase();
-    if (lower.isEmpty) return '';
-    final cleaned = lower
-        .replaceAll(RegExp(r'[^a-z0-9-]+'), '-')
-        .replaceAll(RegExp(r'-{2,}'), '-')
-        .replaceAll(RegExp(r'^-+|-+$'), '');
-    return cleaned;
+    final normalized = (value ?? '').trim().toLowerCase();
+    if (normalized.isEmpty) return '';
+    return normalized.replaceAll(RegExp(r'\s+'), '');
   }
 
   AuthService({required this.dio});
@@ -478,7 +474,22 @@ class AuthService {
   }) async {
     debugPrint('🔓 login called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
-    final tenantCode = await getTenantCode();
+    String? tenantCode = await getTenantCode();
+    if (tenantCode == null || tenantCode.trim().isEmpty) {
+      final targetEmail = email.trim().toLowerCase();
+      final sessions = await listSavedTenantSessions();
+      for (final row in sessions) {
+        final rowEmail = (row['email'] ?? '').toString().trim().toLowerCase();
+        if (rowEmail != targetEmail) continue;
+        final rememberedTenant = _normalizeTenantCodeScope(
+          (row['tenant_code'] ?? '').toString(),
+        );
+        if (rememberedTenant.isEmpty) continue;
+        tenantCode = rememberedTenant;
+        await setTenantCode(rememberedTenant);
+        break;
+      }
+    }
     final resp = await dio.post(
       '/api/auth/login',
       data: {

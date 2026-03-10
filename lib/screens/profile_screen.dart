@@ -109,8 +109,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
         _canManageTenantUsers;
   }
 
-  bool get _isTenantManagerAccount => _canManageTenantUsers;
-
   Options _tenantManagerRequestOptions() {
     final role = _effectiveRole;
     if (role == 'tenant') {
