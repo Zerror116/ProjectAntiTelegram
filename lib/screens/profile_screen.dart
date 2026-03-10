@@ -47,7 +47,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   final _addGroupCodeCtrl = TextEditingController();
   final _addGroupPasswordCtrl = TextEditingController();
   final _tenantClientSearchCtrl = TextEditingController();
+  Timer? _tenantClientSearchDebounce;
   bool _tenantClientsLoading = false;
+  bool _tenantClientsRequested = false;
   List<Map<String, dynamic>> _tenantClients = const [];
   String _tenantRoleUpdateUserId = '';
   List<Map<String, dynamic>> _savedTenantSessions = const [];
@@ -61,6 +63,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   @override
   void dispose() {
+    _tenantClientSearchDebounce?.cancel();
     _addGroupCodeCtrl.dispose();
     _addGroupPasswordCtrl.dispose();
     _tenantClientSearchCtrl.dispose();
@@ -201,10 +204,24 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } finally {
       if (mounted) setState(() => _loading = false);
       unawaited(_loadSavedSessions());
-      if (_isTenantManagerAccount) {
-        unawaited(_loadTenantClients());
-      }
     }
+  }
+
+  void _onTenantClientSearchChanged(String value) {
+    _tenantClientSearchDebounce?.cancel();
+    final query = value.trim();
+    if (query.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _tenantClientsRequested = false;
+        _tenantClients = const [];
+      });
+      return;
+    }
+    _tenantClientSearchDebounce = Timer(const Duration(milliseconds: 320), () {
+      if (!mounted) return;
+      unawaited(_loadTenantClients(searchOverride: query));
+    });
   }
 
   Future<void> _loadSavedSessions() async {
@@ -665,8 +682,18 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Future<void> _loadTenantClients({String? searchOverride}) async {
     if (!_canManageTenantUsers) return;
     final search = (searchOverride ?? _tenantClientSearchCtrl.text).trim();
+    if (search.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _tenantClientsLoading = false;
+        _tenantClientsRequested = false;
+        _tenantClients = const [];
+      });
+      return;
+    }
     setState(() {
       _tenantClientsLoading = true;
+      _tenantClientsRequested = true;
       _message = '';
     });
     try {
@@ -1353,6 +1380,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                     ),
                                     controller: _tenantClientSearchCtrl,
                                   ),
+                                  onChanged: _onTenantClientSearchChanged,
                                   onSubmitted: (_) => _loadTenantClients(),
                                 ),
                               ),
@@ -1377,7 +1405,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           const SizedBox(height: 12),
                           if (_tenantClients.isEmpty && !_tenantClientsLoading)
                             Text(
-                              'Список пока пуст.',
+                              _tenantClientSearchCtrl.text.trim().isEmpty
+                                  ? 'Начните вводить имя, email или телефон клиента.'
+                                  : (_tenantClientsRequested
+                                        ? 'По этому запросу клиенты не найдены.'
+                                        : 'Список пока пуст.'),
                               style: theme.textTheme.bodyMedium?.copyWith(
                                 color: theme.colorScheme.onSurfaceVariant,
                               ),

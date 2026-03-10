@@ -1025,6 +1025,26 @@ router.get("/", requireAuth, async (req, res) => {
               c.title,
               c.type,
               c.settings,
+              CASE
+                WHEN c.type = 'private'
+                  THEN COALESCE(
+                    NULLIF(BTRIM(peer.peer_display_name), ''),
+                    NULLIF(BTRIM(c.title), ''),
+                    'Личные сообщения'
+                  )
+                ELSE COALESCE(NULLIF(BTRIM(c.title), ''), 'Чат')
+              END AS display_title,
+              peer.peer_user_id,
+              peer.peer_display_name,
+              peer.peer_name,
+              peer.peer_email,
+              peer.peer_phone,
+              peer.peer_avatar_url,
+              peer.peer_avatar_focus_x,
+              peer.peer_avatar_focus_y,
+              peer.peer_avatar_zoom,
+              COALESCE(pref.pinned, false) AS is_pinned,
+              pref.pinned_at,
               last_msg.text AS last_message,
               last_msg.created_at AS updated_at,
               COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
@@ -1035,6 +1055,36 @@ router.get("/", requireAuth, async (req, res) => {
               COALESCE(last_user.avatar_focus_y, 0) AS last_message_sender_avatar_focus_y,
               COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
        FROM chats c
+       LEFT JOIN user_chat_preferences pref
+         ON pref.chat_id = c.id
+        AND pref.user_id = $1
+       LEFT JOIN LATERAL (
+         SELECT ou.id AS peer_user_id,
+                COALESCE(
+                  NULLIF(BTRIM(uc.alias_name), ''),
+                  NULLIF(BTRIM(ou.name), ''),
+                  NULLIF(BTRIM(ou.email), ''),
+                  NULLIF(BTRIM(op.phone), '')
+                ) AS peer_display_name,
+                ou.name AS peer_name,
+                ou.email AS peer_email,
+                op.phone AS peer_phone,
+                ou.avatar_url AS peer_avatar_url,
+                COALESCE(ou.avatar_focus_x, 0) AS peer_avatar_focus_x,
+                COALESCE(ou.avatar_focus_y, 0) AS peer_avatar_focus_y,
+                COALESCE(ou.avatar_zoom, 1) AS peer_avatar_zoom
+         FROM chat_members ocm
+         JOIN users ou ON ou.id = ocm.user_id
+         LEFT JOIN phones op ON op.user_id = ou.id
+         LEFT JOIN user_contacts uc
+           ON uc.user_id = $1
+          AND uc.contact_user_id = ou.id
+          AND ($6::uuid IS NULL OR uc.tenant_id = $6::uuid)
+         WHERE ocm.chat_id = c.id
+           AND ocm.user_id <> $1
+         ORDER BY ocm.joined_at ASC
+         LIMIT 1
+       ) AS peer ON true
        LEFT JOIN LATERAL (
          SELECT m.text, m.created_at, m.sender_id
          FROM messages m
@@ -1114,7 +1164,11 @@ router.get("/", requireAuth, async (req, res) => {
          OR COALESCE((c.settings->>'hidden_in_chat_list')::boolean, false) = false
        )
        AND COALESCE(c.settings->>'kind', '') <> 'system_duplicate'
-       ORDER BY updated_at DESC NULLS LAST
+       AND COALESCE(pref.hidden, false) = false
+       ORDER BY
+         COALESCE(pref.pinned, false) DESC,
+         pref.pinned_at DESC NULLS LAST,
+         updated_at DESC NULLS LAST
        LIMIT 200`,
       [
         userId,
@@ -1131,6 +1185,26 @@ router.get("/", requireAuth, async (req, res) => {
               c.title,
               c.type,
               c.settings,
+              CASE
+                WHEN c.type = 'private'
+                  THEN COALESCE(
+                    NULLIF(BTRIM(peer.peer_display_name), ''),
+                    NULLIF(BTRIM(c.title), ''),
+                    'Личные сообщения'
+                  )
+                ELSE COALESCE(NULLIF(BTRIM(c.title), ''), 'Чат')
+              END AS display_title,
+              peer.peer_user_id,
+              peer.peer_display_name,
+              peer.peer_name,
+              peer.peer_email,
+              peer.peer_phone,
+              peer.peer_avatar_url,
+              peer.peer_avatar_focus_x,
+              peer.peer_avatar_focus_y,
+              peer.peer_avatar_zoom,
+              COALESCE(pref.pinned, false) AS is_pinned,
+              pref.pinned_at,
               last_msg.text AS last_message,
               last_msg.created_at AS updated_at,
               COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
@@ -1142,6 +1216,36 @@ router.get("/", requireAuth, async (req, res) => {
               COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
        FROM chats c
        JOIN chat_members cm ON cm.chat_id = c.id
+       LEFT JOIN user_chat_preferences pref
+         ON pref.chat_id = c.id
+        AND pref.user_id = $1
+       LEFT JOIN LATERAL (
+         SELECT ou.id AS peer_user_id,
+                COALESCE(
+                  NULLIF(BTRIM(uc.alias_name), ''),
+                  NULLIF(BTRIM(ou.name), ''),
+                  NULLIF(BTRIM(ou.email), ''),
+                  NULLIF(BTRIM(op.phone), '')
+                ) AS peer_display_name,
+                ou.name AS peer_name,
+                ou.email AS peer_email,
+                op.phone AS peer_phone,
+                ou.avatar_url AS peer_avatar_url,
+                COALESCE(ou.avatar_focus_x, 0) AS peer_avatar_focus_x,
+                COALESCE(ou.avatar_focus_y, 0) AS peer_avatar_focus_y,
+                COALESCE(ou.avatar_zoom, 1) AS peer_avatar_zoom
+         FROM chat_members ocm
+         JOIN users ou ON ou.id = ocm.user_id
+         LEFT JOIN phones op ON op.user_id = ou.id
+         LEFT JOIN user_contacts uc
+           ON uc.user_id = $1
+          AND uc.contact_user_id = ou.id
+          AND ($3::uuid IS NULL OR uc.tenant_id = $3::uuid)
+         WHERE ocm.chat_id = c.id
+           AND ocm.user_id <> $1
+         ORDER BY ocm.joined_at ASC
+         LIMIT 1
+       ) AS peer ON true
        LEFT JOIN LATERAL (
          SELECT m.text, m.created_at, m.sender_id
          FROM messages m
@@ -1170,7 +1274,11 @@ router.get("/", requireAuth, async (req, res) => {
        WHERE c.type <> 'channel'
          AND cm.user_id = $1
          AND ($3::uuid IS NULL OR c.tenant_id = $3::uuid)
-       ORDER BY updated_at DESC NULLS LAST
+         AND COALESCE(pref.hidden, false) = false
+       ORDER BY
+         COALESCE(pref.pinned, false) DESC,
+         pref.pinned_at DESC NULLS LAST,
+         updated_at DESC NULLS LAST
        LIMIT 100`,
       [userId, userIdText, tenantId],
     );
@@ -2181,6 +2289,108 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("chats.clearMessages error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.patch("/:chatId/list-preferences", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+    const payload = req.body || {};
+    const hasHidden = Object.prototype.hasOwnProperty.call(payload, "hidden");
+    const hasPinned = Object.prototype.hasOwnProperty.call(payload, "pinned");
+
+    if (!hasHidden && !hasPinned) {
+      return res.status(400).json({
+        ok: false,
+        error: "Нужно передать hidden и/или pinned",
+      });
+    }
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    if (!canReadChat(context, role)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const settings = normalizeSettings(context.chat.settings);
+    const systemKey = String(settings.system_key || "")
+      .toLowerCase()
+      .trim();
+    const isMainChannel =
+      context.chat.type === "channel" && systemKey === "main_channel";
+    const hidden = hasHidden ? Boolean(payload.hidden) : null;
+    const pinned = hasPinned ? Boolean(payload.pinned) : null;
+
+    if (isMainChannel && hidden === true) {
+      return res.status(400).json({
+        ok: false,
+        error: "Основной канал нельзя скрывать",
+      });
+    }
+
+    const upsert = await db.query(
+      `INSERT INTO user_chat_preferences (
+         user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
+       )
+       VALUES (
+         $1,
+         $2,
+         COALESCE($3::boolean, false),
+         COALESCE($4::boolean, false),
+         CASE WHEN COALESCE($4::boolean, false) THEN now() ELSE NULL END,
+         now(),
+         now()
+       )
+       ON CONFLICT (user_id, chat_id) DO UPDATE
+         SET hidden = CASE
+               WHEN $3::boolean IS NULL THEN user_chat_preferences.hidden
+               ELSE $3::boolean
+             END,
+             pinned = CASE
+               WHEN $4::boolean IS NULL THEN user_chat_preferences.pinned
+               ELSE $4::boolean
+             END,
+             pinned_at = CASE
+               WHEN $4::boolean IS NULL THEN user_chat_preferences.pinned_at
+               WHEN $4::boolean = true THEN now()
+               ELSE NULL
+             END,
+             updated_at = now()
+       RETURNING user_id, chat_id, hidden, pinned, pinned_at, updated_at`,
+      [
+        userId,
+        chatId,
+        hasHidden ? hidden : null,
+        hasPinned ? pinned : null,
+      ],
+    );
+
+    const pref = upsert.rows[0];
+    if (pref && !pref.hidden && !pref.pinned) {
+      await db.query(
+        `DELETE FROM user_chat_preferences
+         WHERE user_id = $1
+           AND chat_id = $2`,
+        [userId, chatId],
+      );
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        chat_id: chatId,
+        hidden: Boolean(pref?.hidden),
+        pinned: Boolean(pref?.pinned),
+        pinned_at: pref?.pinned_at || null,
+      },
+    });
+  } catch (err) {
+    console.error("chats.listPreferences error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });

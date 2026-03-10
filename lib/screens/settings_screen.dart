@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import '../main.dart';
 import 'bug_report_screen.dart';
 import 'privacy_policy_screen.dart';
-import 'pwa_guide_screen.dart';
 import 'support_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -17,6 +16,7 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _notifications = true;
   bool _darkMode = false;
+  bool _performanceMode = false;
   String _density = 'standard';
   String _cardSize = 'standard';
   Color _lightSeed = const Color(0xFF2F6BFF);
@@ -27,6 +27,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final VoidCallback _cardSizeListener;
   late final VoidCallback _lightSeedListener;
   late final VoidCallback _darkSeedListener;
+  late final VoidCallback _performanceModeListener;
 
   bool get _canOpenSupport {
     return authService.hasPermission('chat.write.support');
@@ -45,6 +46,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _cardSize = uiCardSizeNotifier.value;
     _lightSeed = lightThemeSeedNotifier.value;
     _darkSeed = darkThemeSeedNotifier.value;
+    _performanceMode = performanceModeNotifier.value;
 
     _notificationsListener = () {
       if (!mounted) return;
@@ -70,6 +72,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) return;
       setState(() => _darkSeed = darkThemeSeedNotifier.value);
     };
+    _performanceModeListener = () {
+      if (!mounted) return;
+      setState(() => _performanceMode = performanceModeNotifier.value);
+    };
 
     notificationsEnabledNotifier.addListener(_notificationsListener);
     themeModeNotifier.addListener(_themeListener);
@@ -77,6 +83,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     uiCardSizeNotifier.addListener(_cardSizeListener);
     lightThemeSeedNotifier.addListener(_lightSeedListener);
     darkThemeSeedNotifier.addListener(_darkSeedListener);
+    performanceModeNotifier.addListener(_performanceModeListener);
   }
 
   @override
@@ -87,6 +94,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     uiCardSizeNotifier.removeListener(_cardSizeListener);
     lightThemeSeedNotifier.removeListener(_lightSeedListener);
     darkThemeSeedNotifier.removeListener(_darkSeedListener);
+    performanceModeNotifier.removeListener(_performanceModeListener);
     super.dispose();
   }
 
@@ -106,6 +114,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await setDarkModeEnabled(v);
     if (!mounted) return;
     setState(() => _darkMode = v);
+  }
+
+  Future<void> _togglePerformanceMode(bool v) async {
+    await setPerformanceModeEnabled(v);
+    if (!mounted) return;
+    setState(() => _performanceMode = v);
+    showAppNotice(
+      context,
+      v
+          ? 'Включен режим для старых устройств'
+          : 'Режим для старых устройств выключен',
+      tone: AppNoticeTone.info,
+    );
   }
 
   Future<void> _setDensity(String value) async {
@@ -193,13 +214,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  void _openPwaGuide() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const PwaGuideScreen()),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -221,6 +235,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onChanged: _toggleDarkMode,
               title: const Text('Тёмная тема'),
               subtitle: const Text('Переключить тему приложения'),
+            ),
+            SwitchListTile(
+              value: _performanceMode,
+              onChanged: _togglePerformanceMode,
+              title: const Text('Режим для старых устройств'),
+              subtitle: const Text(
+                'Снижает нагрузку: меньше анимаций и легче отрисовка',
+              ),
             ),
             const SizedBox(height: 8),
             DropdownButtonFormField<String>(
@@ -338,14 +360,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 'Как обрабатываются данные и ограничения ЛС',
               ),
               onTap: _openPrivacyPolicy,
-            ),
-            ListTile(
-              leading: const Icon(Icons.install_mobile_outlined),
-              title: const Text('PWA для iOS'),
-              subtitle: const Text(
-                'Установка на главный экран, офлайн-кэш и синхронизация',
-              ),
-              onTap: _openPwaGuide,
             ),
           ],
         ),

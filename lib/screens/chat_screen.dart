@@ -1458,6 +1458,11 @@ class _ChatScreenState extends State<ChatScreen> {
     return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
+  bool _requiresManualShelfOnPlaced() {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return role == 'admin' || role == 'tenant';
+  }
+
   bool _isClientRole() {
     return authService.effectiveRole.toLowerCase().trim() == 'client';
   }
@@ -1649,6 +1654,52 @@ class _ChatScreenState extends State<ChatScreen> {
         _placedCartItemIds.contains(cartItemId)) {
       return;
     }
+    int? manualShelf;
+    if (_requiresManualShelfOnPlaced()) {
+      final shelfCtrl = TextEditingController();
+      try {
+        manualShelf = await showDialog<int>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Укажите полку'),
+            content: TextField(
+              controller: shelfCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Номер полки',
+                hintText: 'Например: 3',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final parsed = int.tryParse(shelfCtrl.text.trim());
+                  if (parsed == null || parsed <= 0) {
+                    showAppNotice(
+                      context,
+                      'Введите корректный номер полки',
+                      tone: AppNoticeTone.warning,
+                      duration: const Duration(seconds: 2),
+                    );
+                    return;
+                  }
+                  Navigator.of(ctx).pop(parsed);
+                },
+                child: const Text('Сохранить'),
+              ),
+            ],
+          ),
+        );
+      } finally {
+        shelfCtrl.dispose();
+      }
+      if (manualShelf == null) return;
+    }
+
     setState(() => _markingPlaced = true);
     try {
       final resp = await authService.dio.post(
@@ -1658,6 +1709,7 @@ class _ChatScreenState extends State<ChatScreen> {
             'reservation_id': reservationId,
           if (cartItemId != null && cartItemId.isNotEmpty)
             'cart_item_id': cartItemId,
+          if (manualShelf != null) 'shelf_number': manualShelf,
         },
       );
       if ((resp.statusCode == 200 || resp.statusCode == 201) && mounted) {
