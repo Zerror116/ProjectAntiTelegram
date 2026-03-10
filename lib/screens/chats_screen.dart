@@ -234,6 +234,69 @@ class _ChatsScreenState extends State<ChatsScreen> {
         title == 'основной канал';
   }
 
+  Future<String> _resolveMainChannelIdFallback() async {
+    try {
+      final resp = await authService.dio.get('/api/chats');
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) {
+        return '';
+      }
+      final rows = List<Map<String, dynamic>>.from(data['data']);
+      final main = rows.firstWhere(
+        _isMainChannel,
+        orElse: () => const <String, dynamic>{},
+      );
+      return (main['id'] ?? '').toString().trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _openChat(Map<String, dynamic> chat) async {
+    var chatId = _chatIdOf(chat).trim();
+    if (chatId.isEmpty && _isMainChannel(chat)) {
+      chatId = await _resolveMainChannelIdFallback();
+    }
+    if (chatId.isEmpty) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Не удалось открыть чат: отсутствует ID канала',
+        tone: AppNoticeTone.error,
+      );
+      return;
+    }
+
+    final title = _chatDisplayTitle(chat);
+    final chatType = (chat['type'] ?? '').toString();
+    final chatSettings = chat['settings'] is Map
+        ? Map<String, dynamic>.from(chat['settings'])
+        : null;
+
+    _markChatReadLocally(chatId);
+    try {
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            chatId: chatId,
+            chatTitle: title,
+            chatType: chatType,
+            chatSettings: chatSettings,
+          ),
+        ),
+      );
+      if (!mounted) return;
+      _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
+    } catch (e) {
+      if (!mounted) return;
+      showGlobalAppNotice(
+        'Ошибка открытия чата: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
   Future<void> _updateChatListPreferences(
     Map<String, dynamic> chat, {
     bool? hidden,
@@ -301,7 +364,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
     String? action;
 
     if (globalPosition != null) {
-      final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+      final overlay =
+          Overlay.of(context).context.findRenderObject() as RenderBox?;
       if (overlay != null) {
         action = await showMenu<String>(
           context: context,
@@ -334,9 +398,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 leading: Icon(
                   isPinned ? Icons.push_pin_outlined : Icons.push_pin,
                 ),
-                title: Text(
-                  isPinned ? 'Открепить у себя' : 'Закрепить у себя',
-                ),
+                title: Text(isPinned ? 'Открепить у себя' : 'Закрепить у себя'),
                 onTap: () => Navigator.of(ctx).pop(isPinned ? 'unpin' : 'pin'),
               ),
               if (canHide)
@@ -575,17 +637,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   Widget _buildItem(Map<String, dynamic> chat) {
     final theme = Theme.of(context);
-    final title = (chat['title'] ?? chat['name'] ?? 'Чат').toString();
+    final title = _chatDisplayTitle(chat);
     final time = _formatTime(chat['updated_at'] ?? chat['time']);
     final settings = _settingsOf(chat);
-    final avatarUrl = _resolveImageUrl(
-      (settings['avatar_url'] ?? '').toString(),
+    final peerAvatarUrl = _resolveImageUrl(
+      (chat['peer_avatar_url'] ?? '').toString(),
     );
-    final avatarFocusX = _toAvatarFocus(settings['avatar_focus_x']);
-    final avatarFocusY = _toAvatarFocus(settings['avatar_focus_y']);
-    final avatarZoom = _toAvatarZoom(settings['avatar_zoom']);
+    final avatarUrl =
+        peerAvatarUrl ??
+        _resolveImageUrl((settings['avatar_url'] ?? '').toString());
+    final avatarFocusX = peerAvatarUrl != null
+        ? _toAvatarFocus(chat['peer_avatar_focus_x'])
+        : _toAvatarFocus(settings['avatar_focus_x']);
+    final avatarFocusY = peerAvatarUrl != null
+        ? _toAvatarFocus(chat['peer_avatar_focus_y'])
+        : _toAvatarFocus(settings['avatar_focus_y']);
+    final avatarZoom = peerAvatarUrl != null
+        ? _toAvatarZoom(chat['peer_avatar_zoom'])
+        : _toAvatarZoom(settings['avatar_zoom']);
     final preview = _lastMessagePreview(chat);
     final unreadCount = int.tryParse('${chat['unread_count'] ?? 0}') ?? 0;
+    final isPinned = _isChatPinned(chat);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
@@ -594,27 +666,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
         borderRadius: BorderRadius.circular(22),
         child: InkWell(
           borderRadius: BorderRadius.circular(22),
-          onTap: () {
-            final chatId = chat['id']?.toString() ?? '';
-            _markChatReadLocally(chatId);
-            final chatType = (chat['type'] ?? '').toString();
-            final chatSettings = chat['settings'] is Map
-                ? Map<String, dynamic>.from(chat['settings'])
-                : null;
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => ChatScreen(
-                  chatId: chatId,
-                  chatTitle: title,
-                  chatType: chatType,
-                  chatSettings: chatSettings,
-                ),
-              ),
-            ).then((_) {
-              _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
-            });
-          },
+          onTap: () => _openChat(chat),
+          onLongPress: () => _openChatActionsMenu(chat),
+          onSecondaryTapDown: (details) => _openChatActionsMenu(
+            chat,
+            globalPosition: details.globalPosition,
+          ),
           child: Ink(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
             decoration: BoxDecoration(
@@ -649,6 +706,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
                               ),
                             ),
                           ),
+                          if (isPinned) ...[
+                            const SizedBox(width: 8),
+                            Icon(
+                              Icons.push_pin,
+                              size: 16,
+                              color: theme.colorScheme.primary,
+                            ),
+                          ],
                           if (time.isNotEmpty) ...[
                             const SizedBox(width: 10),
                             Text(
@@ -709,6 +774,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final lightweightMode = performanceModeNotifier.value;
 
     return Scaffold(
       appBar: AppBar(
@@ -725,16 +791,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
         child: RefreshIndicator(
           onRefresh: _loadChats,
           child: Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  theme.colorScheme.surfaceContainerLowest,
-                  theme.colorScheme.surface,
-                ],
-              ),
-            ),
+            decoration: lightweightMode
+                ? BoxDecoration(color: theme.colorScheme.surface)
+                : BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        theme.colorScheme.surfaceContainerLowest,
+                        theme.colorScheme.surface,
+                      ],
+                    ),
+                  ),
             child: _loading
                 ? const PhoenixLoadingView(
                     title: 'Загружаем чаты',
@@ -936,7 +1004,7 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
           ? (peer['name'] ?? '').toString().trim()
           : ((peer['email'] ?? '').toString().trim().isNotEmpty
                 ? (peer['email'] ?? '').toString().trim()
-                : 'Личные сообщения');
+                : 'Пользователь');
       final chatSettings = chat['settings'] is Map
           ? Map<String, dynamic>.from(chat['settings'])
           : null;

@@ -1030,7 +1030,7 @@ router.get("/", requireAuth, async (req, res) => {
                   THEN COALESCE(
                     NULLIF(BTRIM(peer.peer_display_name), ''),
                     NULLIF(BTRIM(c.title), ''),
-                    'Личные сообщения'
+                    'Пользователь'
                   )
                 ELSE COALESCE(NULLIF(BTRIM(c.title), ''), 'Чат')
               END AS display_title,
@@ -1190,7 +1190,7 @@ router.get("/", requireAuth, async (req, res) => {
                   THEN COALESCE(
                     NULLIF(BTRIM(peer.peer_display_name), ''),
                     NULLIF(BTRIM(c.title), ''),
-                    'Личные сообщения'
+                    'Пользователь'
                   )
                 ELSE COALESCE(NULLIF(BTRIM(c.title), ''), 'Чат')
               END AS display_title,
@@ -2573,7 +2573,7 @@ router.post("/direct/open", requireAuth, async (req, res) => {
          RETURNING id, title, type, settings, created_at, updated_at`,
         [
           uuidv4(),
-          "Личные сообщения",
+          "Диалог",
           req.user.id,
           req.user.tenant_id || null,
           JSON.stringify(settings),
