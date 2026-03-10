@@ -2229,11 +2229,103 @@ router.get(
   }
 });
 
-async function allocateProductCode(client) {
-  const result = await client.query(
-    'SELECT COALESCE(MAX(product_code), 0) + 1 AS next_code FROM products',
+async function allocateProductCode(client, tenantId = null) {
+  await client.query("LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE");
+
+  const reusable = await client.query(
+    `SELECT p.id, p.product_code, p.reusable_at
+     FROM products p
+     WHERE p.status = 'archived'
+       AND p.reusable_at IS NOT NULL
+       AND p.reusable_at <= now()
+       AND p.product_code IS NOT NULL
+       AND p.product_code > 0
+       AND (
+         EXISTS (
+           SELECT 1
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.product_id = p.id
+             AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM users u
+           WHERE u.id = p.created_by
+             AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+         )
+       )
+     ORDER BY p.product_code ASC, p.reusable_at ASC
+     FOR UPDATE OF p`,
+    [tenantId || null],
   );
-  return Number(result.rows[0]?.next_code || 1);
+
+  const reusableCodes = reusable.rows
+    .map((row) => Number(row.product_code))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const reusableCodeSet = new Set(reusableCodes);
+  const reusableByCode = new Map();
+  for (const row of reusable.rows) {
+    const code = Number(row.product_code);
+    if (!Number.isFinite(code) || code <= 0) continue;
+    if (!reusableByCode.has(code)) {
+      reusableByCode.set(code, row.id);
+    }
+  }
+
+  const result = await client.query(
+    `WITH used AS (
+       SELECT DISTINCT p.product_code
+       FROM products p
+       WHERE p.product_code IS NOT NULL
+         AND p.product_code > 0
+         AND NOT (p.product_code = ANY($2::int[]))
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM product_publication_queue q
+             JOIN chats c ON c.id = q.channel_id
+             WHERE q.product_id = p.id
+              AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM users u
+             WHERE u.id = p.created_by
+               AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+           )
+         )
+     )
+     SELECT COALESCE(
+       (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM used WHERE product_code = 1)),
+       (
+         SELECT MIN(u1.product_code + 1)
+         FROM used u1
+         LEFT JOIN used u2
+           ON u2.product_code = u1.product_code + 1
+         WHERE u2.product_code IS NULL
+       ),
+       1
+     ) AS next_code`,
+    [tenantId || null, reusableCodes],
+  );
+  const nextCode = Number(result.rows[0]?.next_code || 1);
+  if (!Number.isFinite(nextCode) || nextCode <= 0) return 1;
+
+  if (reusableCodeSet.has(nextCode)) {
+    const reusableProductId = reusableByCode.get(nextCode);
+    if (reusableProductId) {
+      await client.query(
+        `UPDATE products
+         SET product_code = NULL,
+             updated_at = now()
+         WHERE id = $1`,
+        [reusableProductId],
+      );
+    }
+  }
+
+  return nextCode;
 }
 
 async function ensureDemoUsers(client, {
@@ -2300,7 +2392,10 @@ router.post('/demo-mode/seed', requireAuth, requireRole('creator'), async (req, 
 
     const createdProducts = [];
     for (let i = 0; i < demoProducts; i += 1) {
-      const productCode = await allocateProductCode(client);
+      const productCode = await allocateProductCode(
+        client,
+        req.user?.tenant_id || null,
+      );
       const shelf = (i % 10) + 1;
       const price = (Math.floor(Math.random() * 10) + 2) * 50;
       const costPrice = Math.max(50, Math.floor(price * 0.62));
