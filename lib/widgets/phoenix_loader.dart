@@ -14,6 +14,7 @@ class PhoenixLoader extends StatefulWidget {
 class _PhoenixLoaderState extends State<PhoenixLoader>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
+  bool _reducedMotion = false;
 
   @override
   void initState() {
@@ -21,7 +22,26 @@ class _PhoenixLoaderState extends State<PhoenixLoader>
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1700),
-    )..repeat();
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final nextReduced = MediaQuery.maybeOf(context)?.disableAnimations == true;
+    if (_reducedMotion == nextReduced) {
+      if (!nextReduced && !_controller.isAnimating) {
+        _controller.repeat();
+      }
+      return;
+    }
+    _reducedMotion = nextReduced;
+    if (_reducedMotion) {
+      _controller.stop();
+      _controller.value = 0;
+      return;
+    }
+    _controller.repeat();
   }
 
   @override
@@ -34,6 +54,27 @@ class _PhoenixLoaderState extends State<PhoenixLoader>
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final size = widget.size;
+    if (_reducedMotion) {
+      return SizedBox(
+        width: size,
+        height: size,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: theme.colorScheme.surfaceContainerLow,
+            border: Border.all(
+              color: theme.colorScheme.primary.withValues(alpha: 0.4),
+              width: 2.2,
+            ),
+          ),
+          child: Icon(
+            Icons.local_fire_department_rounded,
+            size: size * 0.42,
+            color: theme.colorScheme.primary,
+          ),
+        ),
+      );
+    }
 
     return AnimatedBuilder(
       animation: _controller,

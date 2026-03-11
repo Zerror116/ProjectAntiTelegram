@@ -13,6 +13,16 @@ const { guardAction } = require('../utils/antifraud');
 const { logMonitoringEvent } = require('../utils/monitoring');
 const { emitToTenant } = require('../utils/socket');
 const { ensureSystemChannels } = require('../utils/systemChannels');
+const {
+  renderSupportTemplateBody,
+  normalizeTriggerRule,
+  normalizePriority: normalizeSupportTemplatePriority,
+} = require('../utils/supportAutoReply');
+const {
+  encryptMessageText,
+  decryptMessageText,
+  decryptMessageRow,
+} = require('../utils/messageCrypto');
 
 const router = express.Router();
 const requireSupportWritePermission = requirePermission('chat.write.support');
@@ -348,13 +358,17 @@ function normalizeTemplateCategory(value) {
   return 'general';
 }
 
-function mapClaimWorkflowStatus(status) {
+function mapClaimWorkflowStatus(status, customerDiscountStatus = '') {
+  const decision = String(customerDiscountStatus || '').trim();
   switch (String(status || '').trim()) {
     case 'pending':
       return 'Новая заявка';
     case 'approved_return':
       return 'Подтвержден возврат';
     case 'approved_discount':
+      if (decision === 'pending') return 'Скидка предложена клиенту';
+      if (decision === 'accepted') return 'Скидка подтверждена клиентом';
+      if (decision === 'rejected') return 'Клиент отказался от скидки';
       return 'Подтверждена скидка';
     case 'rejected':
       return 'Отклонено';
@@ -365,31 +379,103 @@ function mapClaimWorkflowStatus(status) {
   }
 }
 
-function allowedClaimActions(status) {
+function allowedClaimActions(status, customerDiscountStatus = '') {
   const current = String(status || '').trim();
+  const decision = String(customerDiscountStatus || '').trim();
   if (current === 'pending') {
     return ['approve_return', 'approve_discount', 'reject'];
   }
-  if (current === 'approved_return' || current === 'approved_discount') {
+  if (current === 'approved_return') {
+    return ['settle'];
+  }
+  if (current === 'approved_discount') {
+    if (decision === 'pending') return [];
     return ['settle'];
   }
   return [];
+}
+
+function mapSupportTicketStatusLabel(status) {
+  switch (String(status || '').trim()) {
+    case 'open':
+      return 'Открыт';
+    case 'waiting_customer':
+      return 'Ждем клиента';
+    case 'resolved':
+      return 'Решен';
+    case 'archived':
+      return 'В архиве';
+    default:
+      return 'Неизвестно';
+  }
+}
+
+function mapClaimTypeLabel(claimType) {
+  return String(claimType || '').trim() === 'discount' ? 'Скидка' : 'Возврат';
+}
+
+function mapOpsEventPriority({
+  type,
+  status,
+  customerDiscountStatus = '',
+}) {
+  const normalizedType = String(type || '').trim();
+  const normalizedStatus = String(status || '').trim();
+  const discountDecision = String(customerDiscountStatus || '').trim();
+
+  if (normalizedType === 'support_ticket') {
+    if (normalizedStatus === 'open') return 'high';
+    if (normalizedStatus === 'waiting_customer') return 'normal';
+    if (normalizedStatus === 'resolved') return 'low';
+    return 'low';
+  }
+
+  if (normalizedType === 'claim') {
+    if (normalizedStatus === 'pending') return 'high';
+    if (
+      normalizedStatus === 'approved_discount' &&
+      discountDecision === 'pending'
+    ) {
+      return 'high';
+    }
+    if (normalizedStatus === 'approved_return') return 'normal';
+    if (normalizedStatus === 'approved_discount') return 'normal';
+    if (normalizedStatus === 'rejected') return 'normal';
+    if (normalizedStatus === 'settled') return 'low';
+  }
+
+  return 'normal';
 }
 
 async function resolveCartSumsForUser(userId) {
   const sumsQ = await db.query(
     `SELECT COALESCE(SUM(c.quantity * p.price), 0)::numeric(14,2) AS total,
             COALESCE(SUM(c.quantity * p.price) FILTER (
-              WHERE c.status IN ('processed', 'preparing_delivery', 'in_delivery', 'delivered')
+              WHERE c.status IN ('processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
             ), 0)::numeric(14,2) AS processed
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
-     WHERE c.user_id = $1`,
+     WHERE c.user_id = $1
+       AND c.status IN ('pending_processing', 'processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')`,
     [userId],
   );
+  const claimsQ = await db.query(
+    `SELECT COALESCE(SUM(approved_amount), 0)::numeric(14,2) AS claims_total
+     FROM customer_claims
+     WHERE user_id = $1
+       AND status IN ('approved_return', 'approved_discount', 'settled')`,
+    [userId],
+  );
+  const claimsTotal = toMoney(claimsQ.rows[0]?.claims_total);
+  const total = Math.max(0, toMoney(sumsQ.rows[0]?.total) - claimsTotal);
+  const processed = Math.max(
+    0,
+    toMoney(sumsQ.rows[0]?.processed) - claimsTotal,
+  );
   return {
-    total: toMoney(sumsQ.rows[0]?.total),
-    processed: toMoney(sumsQ.rows[0]?.processed),
+    total,
+    processed,
+    claims_total: claimsTotal,
   };
 }
 
@@ -413,22 +499,7 @@ async function hydrateSupportMessage(messageId) {
      LIMIT 1`,
     [messageId],
   );
-  return q.rows[0] || null;
-}
-
-function renderSupportTemplateBody(templateBody, context = {}) {
-  let text = String(templateBody || '');
-  const pairs = {
-    '{customer_name}': context.customer_name || '',
-    '{cart_total}': String(context.cart_total ?? ''),
-    '{processed_total}': String(context.processed_total ?? ''),
-    '{delivery_status}': context.delivery_status || '',
-    '{subject}': context.subject || '',
-  };
-  for (const [token, value] of Object.entries(pairs)) {
-    text = text.split(token).join(value);
-  }
-  return text;
+  return decryptMessageRow(q.rows[0] || null);
 }
 
 async function insertAuditFromReq(req, payload) {
@@ -462,7 +533,7 @@ router.get('/finance/summary', requireAuth, requireRole('admin', 'creator'), asy
   }
 });
 
-router.get('/audit/logs', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
+router.get('/audit/logs', requireAuth, requireRole('tenant', 'creator'), async (req, res) => {
   try {
     const action = String(req.query?.action || '').trim();
     const actorId = String(req.query?.actor_user_id || '').trim();
@@ -525,7 +596,7 @@ router.get('/audit/logs', requireAuth, requireRole('admin', 'creator'), async (r
   }
 });
 
-router.get('/audit/logs/export', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
+router.get('/audit/logs/export', requireAuth, requireRole('tenant', 'creator'), async (req, res) => {
   try {
     const action = String(req.query?.action || '').trim();
     const params = [req.user?.tenant_id || null];
@@ -1476,6 +1547,9 @@ router.get('/support/templates', requireAuth, requireRole('admin', 'creator', 'w
               title,
               body,
               category,
+              trigger_rule,
+              auto_reply_enabled,
+              priority,
               is_active,
               is_system,
               created_by,
@@ -1500,9 +1574,18 @@ router.post('/support/templates', requireAuth, requireRole('admin', 'creator'), 
     const title = String(req.body?.title || '').trim();
     const body = String(req.body?.body || '').trim();
     const category = normalizeTemplateCategory(req.body?.category);
+    const triggerRule = normalizeTriggerRule(req.body?.trigger_rule);
+    const autoReplyEnabled = req.body?.auto_reply_enabled === true;
+    const priority = normalizeSupportTemplatePriority(req.body?.priority, 100);
 
     if (!title || !body) {
       return res.status(400).json({ ok: false, error: 'title и body обязательны' });
+    }
+    if (autoReplyEnabled && !triggerRule) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Для автоответа укажите trigger_rule или "*" для fallback-режима',
+      });
     }
 
     const ins = await db.query(
@@ -1511,15 +1594,27 @@ router.post('/support/templates', requireAuth, requireRole('admin', 'creator'), 
          title,
          body,
          category,
+         trigger_rule,
+         auto_reply_enabled,
+         priority,
          is_active,
          is_system,
          created_by,
          created_at,
          updated_at
        )
-       VALUES ($1, $2, $3, $4, true, false, $5, now(), now())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, $8, now(), now())
        RETURNING *`,
-      [req.user?.tenant_id || null, title, body, category, req.user?.id || null],
+      [
+        req.user?.tenant_id || null,
+        title,
+        body,
+        category,
+        triggerRule,
+        autoReplyEnabled,
+        priority,
+        req.user?.id || null,
+      ],
     );
 
     await insertAuditFromReq(req, {
@@ -1559,6 +1654,34 @@ router.patch('/support/templates/:id', requireAuth, requireRole('admin', 'creato
     const title = String(req.body?.title || '').trim();
     const isActive = req.body?.is_active;
     const category = normalizeTemplateCategory(req.body?.category);
+    const hasTriggerRule = Object.prototype.hasOwnProperty.call(req.body || {}, 'trigger_rule');
+    const triggerRule = hasTriggerRule
+      ? normalizeTriggerRule(req.body?.trigger_rule)
+      : null;
+    const hasAutoReplyEnabled = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      'auto_reply_enabled',
+    );
+    const autoReplyEnabled = hasAutoReplyEnabled
+      ? req.body?.auto_reply_enabled === true
+      : null;
+    const hasPriority = Object.prototype.hasOwnProperty.call(req.body || {}, 'priority');
+    const priority = hasPriority
+      ? normalizeSupportTemplatePriority(req.body?.priority, 100)
+      : null;
+    const current = beforeQ.rows[0] || {};
+    const nextTriggerRule = hasTriggerRule
+      ? String(triggerRule || '').trim()
+      : String(current.trigger_rule || '').trim();
+    const nextAutoReplyEnabled = hasAutoReplyEnabled
+      ? autoReplyEnabled === true
+      : current.auto_reply_enabled === true;
+    if (nextAutoReplyEnabled && !nextTriggerRule) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Для автоответа укажите trigger_rule или "*" для fallback-режима',
+      });
+    }
 
     const updated = await db.query(
       `UPDATE support_reply_templates
@@ -1566,10 +1689,28 @@ router.patch('/support/templates/:id', requireAuth, requireRole('admin', 'creato
            body = COALESCE(NULLIF($2, ''), body),
            category = COALESCE(NULLIF($3, ''), category),
            is_active = CASE WHEN $4::boolean IS NULL THEN is_active ELSE $4::boolean END,
+           trigger_rule = CASE WHEN $6::boolean THEN $5 ELSE trigger_rule END,
+           auto_reply_enabled = CASE
+             WHEN $8::boolean THEN $7::boolean
+             ELSE auto_reply_enabled
+           END,
+           priority = CASE WHEN $10::boolean THEN $9::integer ELSE priority END,
            updated_at = now()
-       WHERE id = $5
+       WHERE id = $11
        RETURNING *`,
-      [title, body, category, typeof isActive === 'boolean' ? isActive : null, id],
+      [
+        title,
+        body,
+        category,
+        typeof isActive === 'boolean' ? isActive : null,
+        triggerRule,
+        hasTriggerRule,
+        autoReplyEnabled,
+        hasAutoReplyEnabled,
+        priority,
+        hasPriority,
+        id,
+      ],
     );
 
     await insertAuditFromReq(req, {
@@ -1623,35 +1764,51 @@ router.post(
   try {
     await client.query('BEGIN');
 
-    const ticketQ = await client.query(
+    const ticketLockQ = await client.query(
       `SELECT st.id,
               st.chat_id,
               st.customer_id,
               st.assignee_id,
               st.status,
               st.subject,
-              st.category,
-              c.title AS chat_title,
-              dbc.delivery_status,
-              COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name
+              st.category
        FROM support_tickets st
-       JOIN chats c ON c.id = st.chat_id
-       LEFT JOIN users cu ON cu.id = st.customer_id
-       LEFT JOIN delivery_batch_customers dbc ON dbc.user_id = st.customer_id
        WHERE st.id = $1
          AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
-       ORDER BY dbc.updated_at DESC NULLS LAST
        LIMIT 1
        FOR UPDATE`,
       [ticketId, req.user?.tenant_id || null],
     );
 
-    if (ticketQ.rowCount === 0) {
+    if (ticketLockQ.rowCount === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ ok: false, error: 'Тикет не найден' });
     }
 
-    const ticket = ticketQ.rows[0];
+    const ticketBase = ticketLockQ.rows[0];
+    const ticketMetaQ = await client.query(
+      `SELECT c.title AS chat_title,
+              COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name,
+              latest_dbc.delivery_status
+       FROM chats c
+       LEFT JOIN users cu ON cu.id = $2
+       LEFT JOIN LATERAL (
+         SELECT dbc.delivery_status
+         FROM delivery_batch_customers dbc
+         WHERE dbc.user_id = $2
+         ORDER BY dbc.updated_at DESC NULLS LAST, dbc.created_at DESC
+         LIMIT 1
+       ) latest_dbc ON true
+       WHERE c.id = $1
+       LIMIT 1`,
+      [ticketBase.chat_id, ticketBase.customer_id],
+    );
+    const ticket = {
+      ...ticketBase,
+      chat_title: ticketMetaQ.rows[0]?.chat_title || '',
+      customer_name: ticketMetaQ.rows[0]?.customer_name || 'Клиент',
+      delivery_status: ticketMetaQ.rows[0]?.delivery_status || null,
+    };
     const role = normalizeRole(req.user?.role);
     if (role === 'worker' && String(ticket.assignee_id || '') !== String(req.user?.id || '')) {
       await client.query('ROLLBACK');
@@ -1674,15 +1831,44 @@ router.post(
     }
 
     const sums = await resolveCartSumsForUser(ticket.customer_id);
+    const lastCustomerMessageQ = await client.query(
+      `SELECT text
+       FROM messages
+       WHERE chat_id = $1
+         AND sender_id = $2
+         AND NULLIF(BTRIM(text), '') IS NOT NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [ticket.chat_id, ticket.customer_id],
+    );
+    const lastCustomerMessage = String(
+      decryptMessageText(lastCustomerMessageQ.rows[0]?.text || ''),
+    ).trim();
+    const safeSubject = String(ticket.subject || '').trim();
+    const safeLastCustomerMessage = lastCustomerMessage || '—';
     const rendered = renderSupportTemplateBody(templateQ.rows[0].body, {
       customer_name: ticket.customer_name,
       cart_total: sums.total,
       processed_total: sums.processed,
+      claims_total: sums.claims_total,
       delivery_status: ticket.delivery_status || '—',
-      subject: ticket.subject || '',
+      subject: safeSubject.isNotEmpty ? safeSubject : '—',
+      message_text: safeLastCustomerMessage,
     });
 
-    const finalText = [rendered, extraText].filter((part) => part.trim().isNotEmpty).join('\n\n');
+    const finalText = [rendered, extraText]
+      .map((part) => String(part || '').trim())
+      .filter((part) => part.length > 0)
+      .join('\n\n')
+      .trim();
+    if (!finalText) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error:
+          'Шаблон пустой после подстановки. Добавьте текст в шаблон или дополнительный комментарий.',
+      });
+    }
 
     const msgIns = await client.query(
       `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
@@ -1692,7 +1878,7 @@ router.post(
         uuidv4(),
         ticket.chat_id,
         req.user?.id || null,
-        finalText,
+        encryptMessageText(finalText),
         JSON.stringify({
           kind: 'support_quick_reply',
           support_ticket_id: ticket.id,
@@ -1756,6 +1942,361 @@ router.post(
 });
 
 router.get(
+  '/notifications/center',
+  requireAuth,
+  requireRole('admin', 'tenant', 'creator'),
+  async (req, res) => {
+  try {
+    const tenantId = req.user?.tenant_id || null;
+    const limit = parsePositiveInt(req.query?.limit, 60, 10, 200);
+
+    const [supportSummaryQ, claimsSummaryQ, eventsQ] = await Promise.all([
+      db.query(
+        `SELECT COUNT(*) FILTER (WHERE status = 'open')::int AS support_open,
+                COUNT(*) FILTER (WHERE status = 'waiting_customer')::int AS support_waiting_customer,
+                COUNT(*) FILTER (WHERE status = 'resolved')::int AS support_resolved
+         FROM support_tickets
+         WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
+        [tenantId],
+      ),
+      db.query(
+        `SELECT COUNT(*) FILTER (WHERE status = 'pending')::int AS claims_pending,
+                COUNT(*) FILTER (WHERE status = 'approved_return')::int AS claims_approved_return,
+                COUNT(*) FILTER (
+                  WHERE status = 'approved_discount'
+                    AND COALESCE(customer_discount_status, '') = 'pending'
+                )::int AS claims_discount_waiting_customer,
+                COUNT(*) FILTER (WHERE status = 'rejected')::int AS claims_rejected
+         FROM customer_claims
+         WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
+        [tenantId],
+      ),
+      db.query(
+        `SELECT events.*
+         FROM (
+           SELECT st.id::text AS source_id,
+                  'support_ticket'::text AS event_type,
+                  st.status::text AS status,
+                  NULL::text AS claim_type,
+                  NULL::text AS customer_discount_status,
+                  COALESCE(NULLIF(BTRIM(st.subject), ''), 'Тикет поддержки') AS title,
+                  COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name,
+                  COALESCE(NULLIF(BTRIM(ch.title), ''), 'Поддержка') AS related_name,
+                  NULL::numeric AS amount,
+                  st.created_at,
+                  st.updated_at,
+                  COALESCE(st.updated_at, st.created_at) AS event_at
+           FROM support_tickets st
+           LEFT JOIN users cu ON cu.id = st.customer_id
+           LEFT JOIN chats ch ON ch.id = st.chat_id
+           WHERE ($1::uuid IS NULL OR st.tenant_id = $1::uuid)
+
+           UNION ALL
+
+           SELECT cc.id::text AS source_id,
+                  'claim'::text AS event_type,
+                  cc.status::text AS status,
+                  cc.claim_type::text AS claim_type,
+                  COALESCE(cc.customer_discount_status, '')::text AS customer_discount_status,
+                  COALESCE(NULLIF(BTRIM(p.title), ''), 'Претензия по товару') AS title,
+                  COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+                  COALESCE(NULLIF(BTRIM(p.title), ''), 'Товар') AS related_name,
+                  CASE
+                    WHEN COALESCE(cc.approved_amount, 0) > 0 THEN cc.approved_amount
+                    ELSE cc.requested_amount
+                  END::numeric AS amount,
+                  cc.created_at,
+                  cc.updated_at,
+                  COALESCE(cc.updated_at, cc.created_at) AS event_at
+           FROM customer_claims cc
+           LEFT JOIN users u ON u.id = cc.user_id
+           LEFT JOIN products p ON p.id = cc.product_id
+           WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+         ) events
+         ORDER BY events.event_at DESC
+         LIMIT $2::int`,
+        [tenantId, limit],
+      ),
+    ]);
+
+    const supportSummary = supportSummaryQ.rows[0] || {};
+    const claimsSummary = claimsSummaryQ.rows[0] || {};
+    const summary = {
+      support_open: Number(supportSummary.support_open || 0),
+      support_waiting_customer: Number(
+        supportSummary.support_waiting_customer || 0,
+      ),
+      support_resolved: Number(supportSummary.support_resolved || 0),
+      claims_pending: Number(claimsSummary.claims_pending || 0),
+      claims_approved_return: Number(claimsSummary.claims_approved_return || 0),
+      claims_discount_waiting_customer: Number(
+        claimsSummary.claims_discount_waiting_customer || 0,
+      ),
+      claims_rejected: Number(claimsSummary.claims_rejected || 0),
+    };
+    summary.total_attention =
+      summary.support_open +
+      summary.support_waiting_customer +
+      summary.claims_pending +
+      summary.claims_discount_waiting_customer;
+
+    const items = eventsQ.rows.map((row) => {
+      const eventType = String(row.event_type || '').trim();
+      const status = String(row.status || '').trim();
+      const customerDiscountStatus = String(
+        row.customer_discount_status || '',
+      ).trim();
+      const statusLabel = eventType === 'support_ticket'
+        ? mapSupportTicketStatusLabel(status)
+        : mapClaimWorkflowStatus(status, customerDiscountStatus);
+      const claimType = String(row.claim_type || '').trim();
+      const claimTypeLabel = claimType ? mapClaimTypeLabel(claimType) : '';
+      const amount = eventType === 'claim' ? toMoney(row.amount) : null;
+      const subtitleBase = `${String(row.customer_name || 'Клиент')} · ${statusLabel}`;
+      const subtitle = amount === null
+        ? subtitleBase
+        : `${subtitleBase} · ${amount.toFixed(2)} ₽`;
+
+      return {
+        id: String(row.source_id || ''),
+        type: eventType,
+        type_label: eventType === 'support_ticket'
+          ? 'Поддержка'
+          : 'Возврат/Скидка',
+        status,
+        status_label: statusLabel,
+        priority: mapOpsEventPriority({
+          type: eventType,
+          status,
+          customerDiscountStatus,
+        }),
+        title: eventType === 'claim'
+          ? `${claimTypeLabel}: ${String(row.related_name || row.title || 'Заявка')}`
+          : String(row.title || 'Тикет поддержки'),
+        subtitle,
+        customer_name: String(row.customer_name || ''),
+        related_name: String(row.related_name || ''),
+        claim_type: claimType || null,
+        claim_type_label: claimTypeLabel || null,
+        amount,
+        created_at: row.created_at || null,
+        updated_at: row.updated_at || null,
+        event_at: row.event_at || null,
+      };
+    });
+
+    await insertAuditFromReq(req, {
+      action: 'ops.notifications.center.view',
+      entityType: 'ops_notifications',
+      meta: { limit },
+    });
+
+    return res.json({ ok: true, data: { summary, items } });
+  } catch (err) {
+    console.error('ops.notifications.center error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get(
+  '/returns/analytics',
+  requireAuth,
+  requireRole('admin', 'tenant', 'creator'),
+  async (req, res) => {
+  try {
+    const tenantId = req.user?.tenant_id || null;
+    const days = parsePositiveInt(req.query?.days, 30, 1, 365);
+    const topProductsLimit = parsePositiveInt(req.query?.top_limit, 8, 3, 20);
+
+    const [summaryQ, byTypeQ, byStatusQ, byDayQ, topProductsQ] =
+      await Promise.all([
+        db.query(
+          `WITH base AS (
+             SELECT cc.*,
+                    CASE
+                      WHEN COALESCE(cc.approved_amount, 0) > 0 THEN cc.approved_amount
+                      ELSE cc.requested_amount
+                    END::numeric AS effective_amount
+             FROM customer_claims cc
+             WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+               AND cc.created_at >= now() - make_interval(days => $2::int)
+           )
+           SELECT COUNT(*)::int AS total_claims,
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_claims,
+                  COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected_claims,
+                  COUNT(*) FILTER (WHERE status = 'settled')::int AS settled_claims,
+                  COUNT(*) FILTER (
+                    WHERE status IN ('approved_return', 'approved_discount')
+                  )::int AS approved_active_claims,
+                  COALESCE(SUM(effective_amount) FILTER (
+                    WHERE status IN ('approved_return', 'approved_discount', 'settled')
+                  ), 0)::numeric(14,2) AS defect_sum,
+                  COALESCE(SUM(effective_amount) FILTER (
+                    WHERE claim_type = 'return'
+                      AND status IN ('approved_return', 'settled')
+                  ), 0)::numeric(14,2) AS returns_sum,
+                  COALESCE(SUM(effective_amount) FILTER (
+                    WHERE claim_type = 'discount'
+                      AND status IN ('approved_discount', 'settled')
+                  ), 0)::numeric(14,2) AS discounts_sum
+           FROM base`,
+          [tenantId, days],
+        ),
+        db.query(
+          `WITH base AS (
+             SELECT cc.*,
+                    CASE
+                      WHEN COALESCE(cc.approved_amount, 0) > 0 THEN cc.approved_amount
+                      ELSE cc.requested_amount
+                    END::numeric AS effective_amount
+             FROM customer_claims cc
+             WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+               AND cc.created_at >= now() - make_interval(days => $2::int)
+           )
+           SELECT claim_type,
+                  COUNT(*)::int AS total_claims,
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_claims,
+                  COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected_claims,
+                  COALESCE(SUM(effective_amount) FILTER (
+                    WHERE status IN ('approved_return', 'approved_discount', 'settled')
+                  ), 0)::numeric(14,2) AS approved_sum
+           FROM base
+           GROUP BY claim_type
+           ORDER BY claim_type ASC`,
+          [tenantId, days],
+        ),
+        db.query(
+          `WITH base AS (
+             SELECT cc.*,
+                    CASE
+                      WHEN COALESCE(cc.approved_amount, 0) > 0 THEN cc.approved_amount
+                      ELSE cc.requested_amount
+                    END::numeric AS effective_amount
+             FROM customer_claims cc
+             WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+               AND cc.created_at >= now() - make_interval(days => $2::int)
+           )
+           SELECT status,
+                  COUNT(*)::int AS total_claims,
+                  COALESCE(SUM(effective_amount), 0)::numeric(14,2) AS amount
+           FROM base
+           GROUP BY status
+           ORDER BY status ASC`,
+          [tenantId, days],
+        ),
+        db.query(
+          `WITH base AS (
+             SELECT cc.*,
+                    CASE
+                      WHEN COALESCE(cc.approved_amount, 0) > 0 THEN cc.approved_amount
+                      ELSE cc.requested_amount
+                    END::numeric AS effective_amount
+             FROM customer_claims cc
+             WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+               AND cc.created_at >= now() - make_interval(days => $2::int)
+           )
+           SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS bucket,
+                  COUNT(*)::int AS total_claims,
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_claims,
+                  COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected_claims,
+                  COALESCE(SUM(effective_amount) FILTER (
+                    WHERE status IN ('approved_return', 'approved_discount', 'settled')
+                  ), 0)::numeric(14,2) AS approved_sum
+           FROM base
+           GROUP BY 1
+           ORDER BY 1 ASC`,
+          [tenantId, days],
+        ),
+        db.query(
+          `WITH base AS (
+             SELECT cc.*,
+                    CASE
+                      WHEN COALESCE(cc.approved_amount, 0) > 0 THEN cc.approved_amount
+                      ELSE cc.requested_amount
+                    END::numeric AS effective_amount
+             FROM customer_claims cc
+             WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+               AND cc.created_at >= now() - make_interval(days => $2::int)
+           )
+           SELECT base.product_id,
+                  COALESCE(NULLIF(BTRIM(p.title), ''), 'Товар') AS product_title,
+                  COUNT(*)::int AS total_claims,
+                  COALESCE(SUM(base.effective_amount) FILTER (
+                    WHERE base.status IN ('approved_return', 'approved_discount', 'settled')
+                  ), 0)::numeric(14,2) AS approved_sum
+           FROM base
+           LEFT JOIN products p ON p.id = base.product_id
+           GROUP BY base.product_id, p.title
+           ORDER BY total_claims DESC, approved_sum DESC
+           LIMIT $3::int`,
+          [tenantId, days, topProductsLimit],
+        ),
+      ]);
+
+    const summaryRow = summaryQ.rows[0] || {};
+    const byType = byTypeQ.rows.map((row) => ({
+      claim_type: row.claim_type,
+      claim_type_label: mapClaimTypeLabel(row.claim_type),
+      total_claims: Number(row.total_claims || 0),
+      pending_claims: Number(row.pending_claims || 0),
+      rejected_claims: Number(row.rejected_claims || 0),
+      approved_sum: toMoney(row.approved_sum),
+    }));
+    const byStatus = byStatusQ.rows.map((row) => ({
+      status: row.status,
+      status_label: mapClaimWorkflowStatus(row.status),
+      total_claims: Number(row.total_claims || 0),
+      amount: toMoney(row.amount),
+    }));
+    const byDay = byDayQ.rows.map((row) => ({
+      bucket: row.bucket,
+      total_claims: Number(row.total_claims || 0),
+      pending_claims: Number(row.pending_claims || 0),
+      rejected_claims: Number(row.rejected_claims || 0),
+      approved_sum: toMoney(row.approved_sum),
+    }));
+    const topProducts = topProductsQ.rows.map((row) => ({
+      product_id: row.product_id,
+      product_title: row.product_title,
+      total_claims: Number(row.total_claims || 0),
+      approved_sum: toMoney(row.approved_sum),
+    }));
+
+    const data = {
+      period_days: days,
+      summary: {
+        total_claims: Number(summaryRow.total_claims || 0),
+        pending_claims: Number(summaryRow.pending_claims || 0),
+        rejected_claims: Number(summaryRow.rejected_claims || 0),
+        settled_claims: Number(summaryRow.settled_claims || 0),
+        approved_active_claims: Number(summaryRow.approved_active_claims || 0),
+        defect_sum: toMoney(summaryRow.defect_sum),
+        returns_sum: toMoney(summaryRow.returns_sum),
+        discounts_sum: toMoney(summaryRow.discounts_sum),
+      },
+      by_type: byType,
+      by_status: byStatus,
+      by_day: byDay,
+      top_products: topProducts,
+    };
+
+    await insertAuditFromReq(req, {
+      action: 'returns.analytics.view',
+      entityType: 'customer_claim',
+      meta: {
+        days,
+        top_limit: topProductsLimit,
+      },
+    });
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error('ops.returns.analytics error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get(
   '/returns/workflow',
   requireAuth,
   requireRole('admin', 'creator'),
@@ -1766,6 +2307,7 @@ router.get(
     const rows = await db.query(
       `SELECT cc.id,
               cc.user_id,
+              cc.user_id AS customer_id,
               cc.cart_item_id,
               cc.product_id,
               cc.delivery_batch_id,
@@ -1775,15 +2317,19 @@ router.get(
               cc.image_url,
               cc.requested_amount,
               cc.approved_amount,
+              cc.customer_discount_status,
               cc.resolution_note,
               cc.handled_by,
               cc.handled_at,
               cc.settled_at,
               cc.created_at,
               COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+              COALESCE(NULLIF(BTRIM(u.email), ''), '') AS customer_email,
+              COALESCE(NULLIF(BTRIM(pn.phone), ''), '') AS customer_phone,
               p.title AS product_title
        FROM customer_claims cc
        LEFT JOIN users u ON u.id = cc.user_id
+       LEFT JOIN phones pn ON pn.user_id = u.id
        LEFT JOIN products p ON p.id = cc.product_id
        WHERE ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
          AND ($2::text = '' OR cc.status = $2::text)
@@ -1796,8 +2342,14 @@ router.get(
       ...row,
       requested_amount: toMoney(row.requested_amount),
       approved_amount: toMoney(row.approved_amount),
-      workflow_status_label: mapClaimWorkflowStatus(row.status),
-      available_actions: allowedClaimActions(row.status),
+      workflow_status_label: mapClaimWorkflowStatus(
+        row.status,
+        row.customer_discount_status,
+      ),
+      available_actions: allowedClaimActions(
+        row.status,
+        row.customer_discount_status,
+      ),
     }));
 
     return res.json({
@@ -1830,6 +2382,12 @@ router.post(
     if (!id || !action) {
       return res.status(400).json({ ok: false, error: 'id и action обязательны' });
     }
+    if (action === 'reject' && resolutionNote.length < 3) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Укажите причину отказа (минимум 3 символа)',
+      });
+    }
 
     const actionMap = {
       approve_return: 'approved_return',
@@ -1843,7 +2401,7 @@ router.post(
     }
 
     const claimQ = await db.query(
-      `SELECT id, status, requested_amount
+      `SELECT id, status, requested_amount, customer_discount_status
        FROM customer_claims
        WHERE id = $1
          AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
@@ -1855,9 +2413,22 @@ router.post(
     }
 
     const currentStatus = String(claimQ.rows[0].status || '');
-    const allowed = allowedClaimActions(currentStatus);
+    const currentDiscountDecision = String(
+      claimQ.rows[0].customer_discount_status || '',
+    ).trim();
+    const allowed = allowedClaimActions(currentStatus, currentDiscountDecision);
     if (!allowed.includes(action)) {
       return res.status(400).json({ ok: false, error: 'Переход статуса запрещен' });
+    }
+    if (
+      nextStatus === 'settled' &&
+      currentStatus === 'approved_discount' &&
+      currentDiscountDecision === 'pending'
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Клиент еще не подтвердил скидку',
+      });
     }
 
     let approvedAmount = toMoney(claimQ.rows[0].requested_amount);
@@ -1867,6 +2438,12 @@ router.post(
         approvedAmount = toMoney(parsed);
       }
     }
+    const nextDiscountDecision =
+      nextStatus === 'approved_discount'
+        ? 'pending'
+        : nextStatus === 'settled' && currentStatus === 'approved_discount'
+          ? currentDiscountDecision || null
+          : null;
 
     const updated = await db.query(
       `UPDATE customer_claims
@@ -1876,14 +2453,22 @@ router.post(
              WHEN $2 = 'approved_return' THEN requested_amount
              ELSE approved_amount
            END,
+           customer_discount_status = $6::text,
            resolution_note = CASE WHEN NULLIF($4, '') IS NULL THEN resolution_note ELSE $4 END,
            handled_by = $5,
            handled_at = now(),
-           settled_at = CASE WHEN $2 = 'settled' THEN now() ELSE settled_at END,
+           settled_at = CASE WHEN $2 = 'settled' THEN now() ELSE NULL END,
            updated_at = now()
        WHERE id = $1
        RETURNING *`,
-      [id, nextStatus, approvedAmount, resolutionNote, req.user?.id || null],
+      [
+        id,
+        nextStatus,
+        approvedAmount,
+        resolutionNote,
+        req.user?.id || null,
+        nextDiscountDecision,
+      ],
     );
 
     await insertAuditFromReq(req, {
@@ -2146,7 +2731,7 @@ function buildRouteSheetPdfBuffer(batchData) {
 
     for (const customer of batchData.customers) {
       doc.fontSize(10).text(
-        `${customer.route_order || '-'} | ${customer.courier_code || customer.courier_name || '-'} | ${customer.customer_name || 'Клиент'} | ${customer.customer_phone || '-'} | ${customer.address_text || '-'} | ${toMoney(customer.agreed_sum || customer.processed_sum)} RUB`,
+        `${customer.route_order || '-'} | ${customer.courier_code || customer.courier_name || '-'} | ${customer.customer_name || 'Клиент'} | ${customer.customer_phone || '-'} | ${customer.address_text || '-'} | ${toMoney(customer.agreed_sum || customer.processed_sum)} ₽`,
       );
       doc.moveDown(0.2);
       if (doc.y > 760) {

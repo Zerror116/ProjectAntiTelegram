@@ -500,7 +500,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Порог: ${settings?['threshold_amount'] ?? '—'} RUB',
+            'Порог: ${settings?['threshold_amount'] ?? '—'} ₽',
             style: theme.textTheme.bodyMedium,
           ),
           const SizedBox(height: 6),

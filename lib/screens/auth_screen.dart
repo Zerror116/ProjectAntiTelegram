@@ -21,9 +21,11 @@ class _AuthScreenState extends State<AuthScreen> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   final _accessKeyController = TextEditingController();
+  final _otpController = TextEditingController();
   bool _loading = false;
   String _message = '';
   bool _isRegister = false;
+  bool _requiresTwoFactor = false;
 
   late final AuthService _authService;
 
@@ -31,6 +33,7 @@ class _AuthScreenState extends State<AuthScreen> {
   late final VoidCallback _emailListener;
   late final VoidCallback _passwordListener;
   late final VoidCallback _accessKeyListener;
+  late final VoidCallback _otpListener;
 
   @override
   void initState() {
@@ -41,9 +44,11 @@ class _AuthScreenState extends State<AuthScreen> {
     _emailListener = () => setState(() {});
     _passwordListener = () => setState(() {});
     _accessKeyListener = () => setState(() {});
+    _otpListener = () => setState(() {});
     _emailController.addListener(_emailListener);
     _passwordController.addListener(_passwordListener);
     _accessKeyController.addListener(_accessKeyListener);
+    _otpController.addListener(_otpListener);
 
     final tenantFromLink = _extractTenantFromUri();
     if (tenantFromLink.isNotEmpty) {
@@ -128,10 +133,14 @@ class _AuthScreenState extends State<AuthScreen> {
     try {
       _accessKeyController.removeListener(_accessKeyListener);
     } catch (_) {}
+    try {
+      _otpController.removeListener(_otpListener);
+    } catch (_) {}
 
     _emailController.dispose();
     _passwordController.dispose();
     _accessKeyController.dispose();
+    _otpController.dispose();
     super.dispose();
   }
 
@@ -216,7 +225,12 @@ class _AuthScreenState extends State<AuthScreen> {
         return;
       } else {
         // Обычный логин
-        await _authService.login(email: email, password: password);
+        await _authService.login(
+          email: email,
+          password: password,
+          otpCode: _requiresTwoFactor ? _otpController.text.trim() : null,
+        );
+        _requiresTwoFactor = false;
       }
 
       // После логина — проверяем профиль и переходим
@@ -261,17 +275,25 @@ class _AuthScreenState extends State<AuthScreen> {
     } on DioException catch (e) {
       String friendly = 'Ошибка';
       final status = e.response?.statusCode;
-      if (status == 401 || status == 403) {
+      final body = e.response?.data;
+      final bodyMap = body is Map ? Map<String, dynamic>.from(body) : null;
+      final twoFactorRequired =
+          bodyMap?['two_factor_required'] == true ||
+          bodyMap?['twoFactorRequired'] == true;
+      if (twoFactorRequired) {
+        _otpController.clear();
+        setState(() => _requiresTwoFactor = true);
         friendly =
-            'Пупупу, ошибочка — что-то не так с email или паролем. Пытаетесь кого-то взломать? 😉';
+            'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator.';
+      } else if (status == 401 || status == 403) {
+        friendly = 'Неверный email, пароль или код подтверждения';
       } else if (e.type == DioExceptionType.connectionTimeout ||
           e.type == DioExceptionType.sendTimeout ||
           e.type == DioExceptionType.receiveTimeout) {
         friendly = 'Время ожидания ответа сервера истекло. Попробуйте ещё раз.';
-      } else if (e.response != null && e.response?.data != null) {
-        final body = e.response?.data;
-        if (body is Map && (body['error'] != null || body['message'] != null)) {
-          friendly = (body['error'] ?? body['message']).toString();
+      } else if (bodyMap != null) {
+        if (bodyMap['error'] != null || bodyMap['message'] != null) {
+          friendly = (bodyMap['error'] ?? bodyMap['message']).toString();
         } else {
           friendly = e.response.toString();
         }
@@ -327,6 +349,29 @@ class _AuthScreenState extends State<AuthScreen> {
                       return null;
                     },
                   ),
+                  if (!_isRegister && _requiresTwoFactor) ...[
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _otpController,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Код 2FA',
+                          hintText: '6 цифр из Google Authenticator',
+                        ),
+                        controller: _otpController,
+                      ),
+                      keyboardType: TextInputType.number,
+                      validator: (v) {
+                        if (!_requiresTwoFactor) return null;
+                        final value = (v ?? '').replaceAll(RegExp(r'\s+'), '');
+                        if (value.isEmpty) return 'Введите код 2FA';
+                        if (!RegExp(r'^\d{6}$').hasMatch(value)) {
+                          return 'Код должен состоять из 6 цифр';
+                        }
+                        return null;
+                      },
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   if (_isRegister) ...[
                     TextFormField(
@@ -360,12 +405,12 @@ class _AuthScreenState extends State<AuthScreen> {
                     child: ElevatedButton(
                       onPressed: _loading ? null : _onSubmitPressed,
                       child: _loading
-                          ? const SizedBox(
+                          ? SizedBox(
                               width: 18,
                               height: 18,
                               child: CircularProgressIndicator(
                                 strokeWidth: 2,
-                                color: Colors.white,
+                                color: Theme.of(context).colorScheme.onPrimary,
                               ),
                             )
                           : Text(_isRegister ? 'Далее' : 'Войти'),
@@ -383,6 +428,8 @@ class _AuthScreenState extends State<AuthScreen> {
                   onPressed: () => setState(() {
                     _isRegister = !_isRegister;
                     _message = '';
+                    _requiresTwoFactor = false;
+                    _otpController.clear();
                   }),
                   child: Text(_isRegister ? 'Войти' : 'Зарегистрироваться'),
                 ),

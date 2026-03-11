@@ -23,6 +23,18 @@ function currentPool() {
   return scopedPool || platformPool;
 }
 
+function resolveTenantSettingValue(ctx = currentContext()) {
+  const tenantId = String(ctx?.tenant?.id || "").trim();
+  return tenantId;
+}
+
+async function applyClientContext(client, ctx = currentContext()) {
+  const tenantSetting = resolveTenantSettingValue(ctx);
+  await client.query("SELECT set_config('app.tenant_id', $1, false)", [
+    tenantSetting,
+  ]);
+}
+
 function normalizeTenantCode(raw) {
   return String(raw || '')
     .trim()
@@ -158,8 +170,50 @@ async function runWithPlatform(fn) {
   );
 }
 
-function query(text, params) {
-  return currentPool().query(text, params);
+async function connect() {
+  const pool = currentPool();
+  const ctx = currentContext();
+  const client = await pool.connect();
+  const originalQuery = client.query.bind(client);
+  const originalRelease = client.release.bind(client);
+  let contextReady = false;
+
+  const ensureContext = async () => {
+    if (contextReady) return;
+    await originalQuery("SELECT set_config('app.tenant_id', $1, false)", [
+      resolveTenantSettingValue(ctx),
+    ]);
+    contextReady = true;
+  };
+
+  client.query = async (...args) => {
+    await ensureContext();
+    return originalQuery(...args);
+  };
+
+  client.release = (...args) => {
+    client.query = originalQuery;
+    client.release = originalRelease;
+    return originalRelease(...args);
+  };
+
+  try {
+    await ensureContext();
+  } catch (err) {
+    client.release(err);
+    throw err;
+  }
+
+  return client;
+}
+
+async function query(text, params) {
+  const client = await connect();
+  try {
+    return await client.query(text, params);
+  } finally {
+    client.release();
+  }
 }
 
 function platformQuery(text, params) {
@@ -174,6 +228,8 @@ const poolProxy = new Proxy(
   {},
   {
     get(_target, prop) {
+      if (prop === "query") return query;
+      if (prop === "connect") return connect;
       const pool = currentPool();
       const value = pool[prop];
       if (typeof value === 'function') {
@@ -192,11 +248,13 @@ module.exports = {
   // Context-aware (tenant scoped when context present)
   query,
   pool: poolProxy,
+  connect,
 
   // Platform DB primitives (always central DB)
   platformPool,
   platformQuery,
   platformConnect,
+  applyClientContext,
 
   // Tenant helpers
   normalizeTenantCode,

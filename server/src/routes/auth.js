@@ -23,6 +23,14 @@ const {
   revokeSessionByRecordId,
   revokeUserSession,
 } = require('../utils/sessions');
+const {
+  isTwoFactorEligibleRole,
+  normalizeTotpCode,
+  generateTwoFactorSetup,
+  verifyTwoFactorCode,
+  encryptTwoFactorSecret,
+  decryptTwoFactorSecret,
+} = require('../utils/twoFactor');
 const { ensureSystemChannels } = require("../utils/systemChannels");
 require('dotenv').config();
 
@@ -86,6 +94,37 @@ function isValidCreatorSecret(inputSecret) {
   }
   if (!CREATOR_SECRET) return false;
   return constantTimeEquals(inputSecret, CREATOR_SECRET);
+}
+
+function requireTenantOrCreator(req, res, next) {
+  const role = String(req.user?.role || "")
+    .toLowerCase()
+    .trim();
+  const baseRole = String(req.user?.base_role || "")
+    .toLowerCase()
+    .trim();
+  const allowed =
+    role === "tenant" ||
+    role === "creator" ||
+    baseRole === "tenant" ||
+    baseRole === "creator";
+  if (!allowed) {
+    return res.status(403).json({
+      ok: false,
+      error: "Доступ к сессиям разрешён только арендатору и создателю",
+    });
+  }
+  return next();
+}
+
+function requireTwoFactorEligible(req, res, next) {
+  if (!isTwoFactorEligibleRole(req.user)) {
+    return res.status(403).json({
+      ok: false,
+      error: '2FA доступна только для admin/tenant/creator',
+    });
+  }
+  return next();
 }
 
 function normalizeDeviceFingerprint(value) {
@@ -180,6 +219,49 @@ async function upsertDevice(queryable, userId, deviceFingerprint) {
   return result.rows[0]?.id || null;
 }
 
+async function upsertTenantUserIndex({
+  tenantId,
+  userId,
+  email,
+  role = 'client',
+  isActive = true,
+}) {
+  const normalizedTenantId = String(tenantId || '').trim();
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedTenantId || !normalizedUserId || !normalizedEmail) return;
+
+  try {
+    await db.platformQuery(
+      `INSERT INTO tenant_user_index (
+         tenant_id,
+         user_id,
+         email,
+         role,
+         is_active,
+         created_at,
+         updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, now(), now())
+       ON CONFLICT (tenant_id, user_id) DO UPDATE
+       SET email = EXCLUDED.email,
+           role = EXCLUDED.role,
+           is_active = EXCLUDED.is_active,
+           updated_at = now()`,
+      [
+        normalizedTenantId,
+        normalizedUserId,
+        normalizedEmail,
+        String(role || 'client').toLowerCase().trim() || 'client',
+        isActive === true,
+      ],
+    );
+  } catch (err) {
+    if (String(err?.code || '') === '42P01') return;
+    throw err;
+  }
+}
+
 async function resolveTenantByAccessKey(accessKey) {
   const normalized = normalizeAccessKey(accessKey);
   if (!normalized) return null;
@@ -199,6 +281,44 @@ async function resolveTenantByUserEmail(email) {
   const normalizedEmail = String(email || '').trim().toLowerCase();
   if (!normalizedEmail) return null;
 
+  try {
+    const indexedTenantRes = await db.platformQuery(
+      `SELECT t.id,
+              t.code,
+              t.name,
+              t.status,
+              t.subscription_expires_at,
+              t.db_mode,
+              t.db_url,
+              t.db_name
+       FROM tenant_user_index tui
+       JOIN tenants t ON t.id = tui.tenant_id
+       WHERE lower(tui.email) = $1
+         AND tui.is_active = true
+       ORDER BY tui.updated_at DESC, tui.created_at DESC
+       LIMIT 2`,
+      [normalizedEmail],
+    );
+    if (indexedTenantRes.rowCount === 1) {
+      return indexedTenantRes.rows[0];
+    }
+    if (indexedTenantRes.rowCount > 1) {
+      const uniqueTenantIds = new Set(
+        indexedTenantRes.rows
+          .map((row) => String(row.id || '').trim())
+          .filter(Boolean),
+      );
+      if (uniqueTenantIds.size === 1) {
+        return indexedTenantRes.rows[0];
+      }
+      return null;
+    }
+  } catch (err) {
+    if (String(err?.code || '') !== '42P01') {
+      throw err;
+    }
+  }
+
   const tenantRes = await db.platformQuery(
     `SELECT t.id,
             t.code,
@@ -211,12 +331,75 @@ async function resolveTenantByUserEmail(email) {
      FROM users u
      JOIN tenants t ON t.id = u.tenant_id
      WHERE lower(u.email) = $1
+       AND u.is_active = true
      LIMIT 2`,
     [normalizedEmail],
   );
 
-  if (tenantRes.rowCount !== 1) return null;
-  return tenantRes.rows[0];
+  if (tenantRes.rowCount > 1) {
+    const uniqueTenantIds = new Set(
+      tenantRes.rows
+        .map((row) => String(row.id || '').trim())
+        .filter(Boolean),
+    );
+    if (uniqueTenantIds.size === 1) {
+      return tenantRes.rows[0];
+    }
+    return null;
+  }
+  if (tenantRes.rowCount === 1) return tenantRes.rows[0];
+
+  // Fallback for isolated tenant databases when tenant_user_index is missing
+  // or not yet populated: probe tenant scopes and find the single matching tenant.
+  const tenantCandidatesRes = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            db_mode,
+            db_url,
+            db_name
+     FROM tenants
+     WHERE COALESCE(status, 'active') <> 'deleted'
+     ORDER BY created_at DESC
+     LIMIT 200`,
+  );
+
+  if (tenantCandidatesRes.rowCount === 0) return null;
+
+  let matchedTenant = null;
+  for (const tenantRow of tenantCandidatesRes.rows) {
+    const tenantId = String(tenantRow?.id || '').trim();
+    if (!tenantId) continue;
+    try {
+      const hasUser = await db.runWithTenantRow(tenantRow, async (ctx) => {
+        const q = await ctx.client.query(
+          `SELECT u.id
+           FROM users u
+           WHERE lower(u.email) = $1
+             AND u.is_active = true
+             AND (u.tenant_id = $2::uuid OR u.tenant_id IS NULL)
+           LIMIT 1`,
+          [normalizedEmail, tenantId],
+        );
+        return q.rowCount > 0;
+      });
+      if (!hasUser) continue;
+      if (matchedTenant && String(matchedTenant.id || '') !== tenantId) {
+        // Ambiguous email across multiple tenants: force explicit tenant code.
+        return null;
+      }
+      matchedTenant = tenantRow;
+    } catch (err) {
+      console.error('auth.resolveTenantByUserEmail tenant scan error', {
+        tenant_id: tenantId,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  return matchedTenant;
 }
 
 async function resolveTenantInviteByCode(inviteCode) {
@@ -606,6 +789,19 @@ router.post('/register', async (req, res) => {
         console.error('auth.register invite usage update error', err);
       }
     }
+    if (!isPlatformCreator) {
+      try {
+        await upsertTenantUserIndex({
+          tenantId: registration.user?.tenant_id || tenant?.id || null,
+          userId: registration.user?.id || null,
+          email: registration.user?.email || normalizedEmail,
+          role: registration.user?.role || role,
+          isActive: true,
+        });
+      } catch (err) {
+        console.error('auth.register tenantUserIndex error', err);
+      }
+    }
 
     const token = signToken({
       id: registration.user.id,
@@ -651,7 +847,7 @@ router.post('/register', async (req, res) => {
  */
 router.post('/login', async (req, res) => {
   try {
-    const { email, password, device_fingerprint, access_key } = req.body || {};
+    const { email, password, device_fingerprint, access_key, otp_code } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const normalizedEmail = validator.normalizeEmail(email);
@@ -694,7 +890,9 @@ router.post('/login', async (req, res) => {
       try {
         await client.query('BEGIN');
         const userRes = await client.query(
-          `SELECT u.id, u.email, u.password_hash, u.role, u.tenant_id,
+          `SELECT u.id, u.email, u.password_hash, u.role, u.is_active, u.block_reason, u.tenant_id,
+                  u.two_factor_enabled,
+                  u.two_factor_secret,
                   t.code AS tenant_code, t.name AS tenant_name, t.status AS tenant_status,
                   t.subscription_expires_at
            FROM users u
@@ -714,8 +912,30 @@ router.post('/login', async (req, res) => {
           await client.query('ROLLBACK');
           return { ok: false, status: 401, error: 'Неверные данные' };
         }
+        if (user.is_active === false) {
+          await client.query('ROLLBACK');
+          const blockReason = String(user.block_reason || '').trim();
+          return {
+            ok: false,
+            status: 403,
+            error: blockReason || 'Вас заблокировали за нарушение правил',
+          };
+        }
 
         if (!isPlatformCreator) {
+          if (!user.tenant_id && tenant?.id) {
+            const patchedTenantRes = await client.query(
+              `UPDATE users
+               SET tenant_id = $1
+               WHERE id = $2
+                 AND tenant_id IS NULL
+               RETURNING tenant_id`,
+              [tenant.id, user.id],
+            );
+            if (patchedTenantRes.rowCount > 0) {
+              user.tenant_id = patchedTenantRes.rows[0]?.tenant_id || tenant.id;
+            }
+          }
           if (!user.tenant_id) {
             await client.query('ROLLBACK');
             return {
@@ -732,6 +952,32 @@ router.post('/login', async (req, res) => {
           if (!tenantState.ok) {
             await client.query('ROLLBACK');
             return { ok: false, status: 403, error: tenantState.error };
+          }
+        }
+
+        const requiresTwoFactor =
+          isTwoFactorEligibleRole(user) && user.two_factor_enabled === true;
+        if (requiresTwoFactor) {
+          const secret = decryptTwoFactorSecret(user.two_factor_secret);
+          if (!secret) {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 403,
+              error: '2FA включена, но ключ недоступен. Обратитесь к создателю приложения.',
+            };
+          }
+          const providedCode = normalizeTotpCode(
+            otp_code || req.body?.two_factor_code || req.body?.totp_code,
+          );
+          if (!verifyTwoFactorCode(secret, providedCode)) {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 401,
+              error: 'Требуется код 2FA из Google Authenticator',
+              twoFactorRequired: true,
+            };
           }
         }
 
@@ -768,9 +1014,26 @@ router.post('/login', async (req, res) => {
       loginInScope,
     );
     if (!result?.ok) {
-      return res.status(result?.status || 500).json({
+      const payload = {
         error: result?.error || 'Internal server error',
-      });
+      };
+      if (result?.twoFactorRequired) {
+        payload.two_factor_required = true;
+      }
+      return res.status(result?.status || 500).json(payload);
+    }
+    if (!isPlatformCreator) {
+      try {
+        await upsertTenantUserIndex({
+          tenantId: result.user?.tenant_id || tenant?.id || null,
+          userId: result.user?.id || null,
+          email: result.user?.email || normalizedEmail,
+          role: result.user?.role || 'client',
+          isActive: result.user?.is_active !== false,
+        });
+      } catch (err) {
+        console.error('auth.login tenantUserIndex error', err);
+      }
     }
 
     const effectiveTenantCode = tenant?.code || result.user.tenant_code || null;
@@ -918,7 +1181,7 @@ router.post('/logout', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/sessions', authMiddleware, async (req, res) => {
+router.get('/sessions', authMiddleware, requireTenantOrCreator, async (req, res) => {
   try {
     const rows = await listUserSessions({
       queryable: db,
@@ -932,7 +1195,7 @@ router.get('/sessions', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/sessions/revoke_others', authMiddleware, async (req, res) => {
+router.post('/sessions/revoke_others', authMiddleware, requireTenantOrCreator, async (req, res) => {
   try {
     const revoked = await revokeOtherUserSessions({
       queryable: db,
@@ -946,7 +1209,7 @@ router.post('/sessions/revoke_others', authMiddleware, async (req, res) => {
   }
 });
 
-router.delete('/sessions/:id', authMiddleware, async (req, res) => {
+router.delete('/sessions/:id', authMiddleware, requireTenantOrCreator, async (req, res) => {
   try {
     const sessionRecordId = String(req.params?.id || '').trim();
     if (!sessionRecordId) {
@@ -967,6 +1230,155 @@ router.delete('/sessions/:id', authMiddleware, async (req, res) => {
   }
 });
 
+router.get('/2fa/status', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const q = await db.query(
+      `SELECT two_factor_enabled, two_factor_enabled_at
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [req.user.id],
+    );
+    if (q.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    const row = q.rows[0];
+    return res.json({
+      ok: true,
+      data: {
+        enabled: row.two_factor_enabled === true,
+        enabled_at: row.two_factor_enabled_at || null,
+      },
+    });
+  } catch (err) {
+    console.error('auth.2fa.status error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/2fa/setup/start', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const q = await db.query(
+      `SELECT email, name
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [req.user.id],
+    );
+    if (q.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    const profile = q.rows[0];
+    const accountName =
+      String(profile.email || '').trim() ||
+      String(profile.name || '').trim() ||
+      `user-${req.user.id}`;
+    const setup = generateTwoFactorSetup({ accountName });
+    return res.json({
+      ok: true,
+      data: {
+        secret: setup.secret,
+        otpauth_url: setup.otpauthUrl,
+        issuer: setup.issuer,
+        account: accountName,
+      },
+    });
+  } catch (err) {
+    console.error('auth.2fa.setup.start error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/2fa/setup/confirm', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const secret = String(req.body?.secret || '').trim();
+    const code = normalizeTotpCode(req.body?.code || req.body?.otp_code);
+    if (!secret || !code) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Нужно передать secret и code',
+      });
+    }
+    const valid = verifyTwoFactorCode(secret, code);
+    if (!valid) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Неверный 2FA-код',
+      });
+    }
+    const encryptedSecret = encryptTwoFactorSecret(secret);
+    await db.query(
+      `UPDATE users
+       SET two_factor_enabled = true,
+           two_factor_secret = $2,
+           two_factor_enabled_at = now()
+       WHERE id = $1`,
+      [req.user.id, encryptedSecret],
+    );
+    return res.json({
+      ok: true,
+      data: { enabled: true },
+    });
+  } catch (err) {
+    console.error('auth.2fa.setup.confirm error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/2fa/disable', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const password = String(req.body?.password || '');
+    if (!password) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Введите пароль для отключения 2FA',
+      });
+    }
+    const code = normalizeTotpCode(req.body?.code || req.body?.otp_code);
+    const userQ = await db.query(
+      `SELECT password_hash, two_factor_enabled, two_factor_secret
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [req.user.id],
+    );
+    if (userQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    const user = userQ.rows[0];
+    const passOk = await bcrypt.compare(password, String(user.password_hash || ''));
+    if (!passOk) {
+      return res.status(403).json({ ok: false, error: 'Неверный пароль' });
+    }
+
+    if (user.two_factor_enabled === true) {
+      const secret = decryptTwoFactorSecret(user.two_factor_secret);
+      if (!secret || !verifyTwoFactorCode(secret, code)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Неверный 2FA-код',
+        });
+      }
+    }
+
+    await db.query(
+      `UPDATE users
+       SET two_factor_enabled = false,
+           two_factor_secret = NULL,
+           two_factor_enabled_at = NULL
+       WHERE id = $1`,
+      [req.user.id],
+    );
+    return res.json({
+      ok: true,
+      data: { enabled: false },
+    });
+  } catch (err) {
+    console.error('auth.2fa.disable error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
 /**
  * POST /api/auth/delete_account (защищённый)
  * Удаляет текущий аккаунт пользователя.
@@ -974,9 +1386,57 @@ router.delete('/sessions/:id', authMiddleware, async (req, res) => {
 router.post('/delete_account', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
+    const identifier = String(req.body?.identifier || '').trim();
+    const password = String(req.body?.password || '');
+    if (!identifier || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Для удаления аккаунта укажите email/номер и пароль',
+      });
+    }
+
+    const profileQ = await db.query(
+      `SELECT u.id, u.email, u.password_hash, p.phone
+       FROM users u
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE u.id = $1
+       LIMIT 1`,
+      [userId],
+    );
+    if (profileQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    const profile = profileQ.rows[0];
+
+    const passOk = await bcrypt.compare(password, String(profile.password_hash || ''));
+    if (!passOk) {
+      return res.status(403).json({ ok: false, error: 'Неверный пароль' });
+    }
+
+    const normalizedInput = identifier.toLowerCase();
+    const inputDigits = identifier.replace(/\D/g, '');
+    const email = String(profile.email || '').trim().toLowerCase();
+    const phoneDigits = String(profile.phone || '').replace(/\D/g, '');
+    const samePhone =
+      inputDigits.length >= 10 &&
+      phoneDigits.length >= 10 &&
+      (inputDigits === phoneDigits || inputDigits.slice(-10) === phoneDigits.slice(-10));
+    const matchesIdentifier = normalizedInput === email || samePhone;
+    if (!matchesIdentifier) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Подтверждение не совпадает с вашим email или номером телефона',
+      });
+    }
+
     const result = await db.query('DELETE FROM users WHERE id = $1 RETURNING id', [userId]);
     if (result.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    try {
+      await db.platformQuery('DELETE FROM tenant_user_index WHERE user_id = $1', [userId]);
+    } catch (cleanupErr) {
+      console.error('auth.delete_account tenantUserIndex cleanup error', cleanupErr);
     }
     return res.json({ ok: true });
   } catch (err) {

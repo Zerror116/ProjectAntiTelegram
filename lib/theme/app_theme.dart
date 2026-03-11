@@ -8,13 +8,16 @@ class AppTheme {
     Color? seedColor,
     VisualDensity visualDensity = VisualDensity.standard,
     double cardScale = 1,
+    bool highContrast = false,
   }) {
     final activeSeed = seedColor ?? _lightSeed;
+    final useFallbackPalette =
+        seedColor == null || activeSeed.toARGB32() == _lightSeed.toARGB32();
     final scheme = ColorScheme.fromSeed(
       seedColor: activeSeed,
       brightness: Brightness.light,
     );
-    final adapted = seedColor == null
+    final adapted = useFallbackPalette
         ? scheme.copyWith(
             primary: const Color(0xFF2F6BFF),
             onPrimary: Colors.white,
@@ -44,6 +47,7 @@ class AppTheme {
       adapted,
       visualDensity: visualDensity,
       cardScale: cardScale,
+      highContrast: highContrast,
     );
   }
 
@@ -51,13 +55,16 @@ class AppTheme {
     Color? seedColor,
     VisualDensity visualDensity = VisualDensity.standard,
     double cardScale = 1,
+    bool highContrast = false,
   }) {
     final activeSeed = seedColor ?? _darkSeed;
+    final useFallbackPalette =
+        seedColor == null || activeSeed.toARGB32() == _darkSeed.toARGB32();
     final scheme = ColorScheme.fromSeed(
       seedColor: activeSeed,
       brightness: Brightness.dark,
     );
-    final adapted = seedColor == null
+    final adapted = useFallbackPalette
         ? scheme.copyWith(
             primary: const Color(0xFFA88BFF),
             onPrimary: const Color(0xFF1B1332),
@@ -87,6 +94,7 @@ class AppTheme {
       adapted,
       visualDensity: visualDensity,
       cardScale: cardScale,
+      highContrast: highContrast,
     );
   }
 
@@ -94,10 +102,26 @@ class AppTheme {
     ColorScheme scheme, {
     required VisualDensity visualDensity,
     required double cardScale,
+    required bool highContrast,
   }) {
+    final bool isDark = scheme.brightness == Brightness.dark;
+    final onSurfaceColor = isDark
+        ? (highContrast ? const Color(0xFFFFFFFF) : const Color(0xFFF4EEFF))
+        : (highContrast ? const Color(0xFF111827) : scheme.onSurface);
+    final onSurfaceVariantColor = isDark
+        ? (highContrast ? const Color(0xFFE8DEFF) : const Color(0xFFD5CCE9))
+        : (highContrast ? const Color(0xFF334155) : scheme.onSurfaceVariant);
+    final fieldFillColor = highContrast
+        ? (isDark ? const Color(0xFF2A2140) : const Color(0xFFFFFFFF))
+        : scheme.surfaceContainerLowest;
+    final cardColor = highContrast
+        ? (isDark ? const Color(0xFF2B2340) : const Color(0xFFF9FBFF))
+        : scheme.surfaceContainerLow;
+
     final base = ThemeData(
       useMaterial3: true,
       colorScheme: scheme,
+      brightness: scheme.brightness,
       scaffoldBackgroundColor: scheme.surface,
       canvasColor: scheme.surface,
       splashFactory: InkRipple.splashFactory,
@@ -105,27 +129,31 @@ class AppTheme {
     );
 
     final effectiveCardScale = cardScale.clamp(0.85, 1.25);
+    final inputBorder = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(16),
+      borderSide: BorderSide(color: scheme.outlineVariant),
+    );
 
     return base.copyWith(
       textTheme: base.textTheme.apply(
-        bodyColor: scheme.onSurface,
-        displayColor: scheme.onSurface,
+        bodyColor: onSurfaceColor,
+        displayColor: onSurfaceColor,
       ),
       primaryTextTheme: base.primaryTextTheme.apply(
         bodyColor: scheme.onPrimary,
         displayColor: scheme.onPrimary,
       ),
-      iconTheme: IconThemeData(color: scheme.onSurfaceVariant),
+      iconTheme: IconThemeData(color: onSurfaceVariantColor),
       primaryIconTheme: IconThemeData(color: scheme.onPrimary),
       appBarTheme: AppBarTheme(
         centerTitle: true,
         elevation: 0,
         backgroundColor: scheme.surface,
-        foregroundColor: scheme.onSurface,
+        foregroundColor: onSurfaceColor,
         surfaceTintColor: Colors.transparent,
       ),
       cardTheme: CardThemeData(
-        color: scheme.surfaceContainerLow,
+        color: cardColor,
         elevation: 0,
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(
@@ -147,31 +175,74 @@ class AppTheme {
         behavior: SnackBarBehavior.floating,
         backgroundColor: scheme.surfaceContainerHigh,
         contentTextStyle: TextStyle(
-          color: scheme.onSurface,
+          color: onSurfaceColor,
           fontWeight: FontWeight.w600,
         ),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
       ),
-      inputDecorationTheme: InputDecorationTheme(
-        filled: true,
-        fillColor: scheme.surfaceContainerLowest,
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide(color: scheme.outlineVariant),
-        ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide(color: scheme.outlineVariant),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide(color: scheme.primary, width: 1.3),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          foregroundColor: scheme.onPrimary,
+          backgroundColor: scheme.primary,
         ),
       ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          foregroundColor: scheme.onPrimary,
+          backgroundColor: scheme.primary,
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: onSurfaceColor,
+          side: BorderSide(color: scheme.outline),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(foregroundColor: scheme.primary),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: fieldFillColor,
+        border: inputBorder,
+        enabledBorder: inputBorder,
+        focusedBorder: inputBorder.copyWith(
+          borderSide: BorderSide(
+            color: scheme.primary,
+            width: highContrast ? 1.6 : 1.3,
+          ),
+        ),
+        errorBorder: inputBorder.copyWith(
+          borderSide: BorderSide(
+            color: scheme.error,
+            width: highContrast ? 1.3 : 1.1,
+          ),
+        ),
+        focusedErrorBorder: inputBorder.copyWith(
+          borderSide: BorderSide(
+            color: scheme.error,
+            width: highContrast ? 1.6 : 1.3,
+          ),
+        ),
+        labelStyle: TextStyle(color: onSurfaceVariantColor),
+        floatingLabelStyle: TextStyle(
+          color: scheme.primary,
+          fontWeight: FontWeight.w600,
+        ),
+        hintStyle: TextStyle(color: onSurfaceVariantColor),
+        helperStyle: TextStyle(color: onSurfaceVariantColor),
+        prefixIconColor: onSurfaceVariantColor,
+        suffixIconColor: onSurfaceVariantColor,
+      ),
       listTileTheme: ListTileThemeData(
-        iconColor: scheme.onSurfaceVariant,
-        textColor: scheme.onSurface,
+        iconColor: onSurfaceVariantColor,
+        textColor: onSurfaceColor,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      ),
+      bottomNavigationBarTheme: BottomNavigationBarThemeData(
+        backgroundColor: scheme.surfaceContainerLow,
+        selectedItemColor: scheme.primary,
+        unselectedItemColor: onSurfaceVariantColor,
       ),
       dividerColor: scheme.outlineVariant,
       progressIndicatorTheme: ProgressIndicatorThemeData(

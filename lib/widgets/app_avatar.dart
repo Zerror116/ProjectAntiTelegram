@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../main.dart';
 
 class AppAvatar extends StatelessWidget {
   final String title;
@@ -41,14 +42,23 @@ class AppAvatar extends StatelessWidget {
     final fill =
         backgroundColor ??
         Theme.of(context).colorScheme.surfaceContainerHighest;
+    final normalizedImageUrl = (imageUrl ?? '').trim();
+    final isGif = normalizedImageUrl
+        .toLowerCase()
+        .split('?')
+        .first
+        .endsWith('.gif');
+    final lowPerformanceMode = performanceModeNotifier.value;
 
-    if (imageUrl == null || imageUrl!.trim().isEmpty) {
+    if (normalizedImageUrl.isEmpty || (lowPerformanceMode && isGif)) {
       return CircleAvatar(
         radius: radius,
         backgroundColor: fill,
         child: initials == '?'
             ? Icon(
-                fallbackIcon,
+                lowPerformanceMode && isGif
+                    ? Icons.gif_box_outlined
+                    : fallbackIcon,
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               )
             : Text(
@@ -77,7 +87,7 @@ class AppAvatar extends StatelessWidget {
               focusY.clamp(-1.0, 1.0),
             ),
             child: Image.network(
-              imageUrl!,
+              normalizedImageUrl,
               fit: BoxFit.cover,
               alignment: Alignment(
                 focusX.clamp(-1.0, 1.0),

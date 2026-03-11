@@ -34,6 +34,7 @@ class _CartScreenState extends State<CartScreen> {
   StreamSubscription? _eventsSub;
   Timer? _reloadDebounceTimer;
   bool _claimSubmitting = false;
+  final Set<String> _claimDecisionBusyIds = <String>{};
 
   @override
   void initState() {
@@ -183,7 +184,7 @@ class _CartScreenState extends State<CartScreen> {
         ? value.toDouble()
         : double.tryParse('$value') ?? 0;
     final fixed = n.toStringAsFixed(2);
-    return '$fixed RUB';
+    return '$fixed ₽';
   }
 
   Map<String, dynamic>? _claimForCartItem(String cartItemId) {
@@ -195,17 +196,27 @@ class _CartScreenState extends State<CartScreen> {
     return null;
   }
 
-  bool _canCreateNewClaim(String status) {
-    return status == 'rejected' || status == 'settled';
+  String _claimDiscountDecision(Map<String, dynamic> claim) {
+    return (claim['customer_discount_status'] ?? '').toString().trim();
   }
 
-  String _claimStatusText(String status) {
+  bool _isDiscountDecisionPending(Map<String, dynamic>? claim) {
+    if (claim == null) return false;
+    final status = (claim['status'] ?? '').toString().trim();
+    if (status != 'approved_discount') return false;
+    return _claimDiscountDecision(claim) == 'pending';
+  }
+
+  String _claimStatusText(String status, {Map<String, dynamic>? claim}) {
     switch (status) {
       case 'pending':
         return 'Ожидает решения';
       case 'approved_return':
         return 'Подтвержден возврат';
       case 'approved_discount':
+        if (_isDiscountDecisionPending(claim)) {
+          return 'Скидка предложена (ожидает вас)';
+        }
         return 'Подтверждена скидка';
       case 'settled':
         return 'Закрыта';
@@ -399,6 +410,7 @@ class _CartScreenState extends State<CartScreen> {
       if (pickedQty == null) return;
       cancelQty = pickedQty;
     }
+    if (!mounted) return;
 
     final confirm = await showDialog<bool>(
       context: context,
@@ -496,6 +508,43 @@ class _CartScreenState extends State<CartScreen> {
     }
   }
 
+  Future<void> _respondToDiscountClaim({
+    required String claimId,
+    required bool accept,
+  }) async {
+    final id = claimId.trim();
+    if (id.isEmpty || _claimDecisionBusyIds.contains(id)) return;
+    setState(() => _claimDecisionBusyIds.add(id));
+    try {
+      await authService.dio.post(
+        '/api/cart/claims/$id/decision',
+        data: {'action': accept ? 'accept_discount' : 'reject_discount'},
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        accept
+            ? 'Скидка подтверждена'
+            : 'Скидка отклонена. Возврат оформлен автоматически',
+        tone: AppNoticeTone.success,
+      );
+      _scheduleReload(delay: const Duration(milliseconds: 120));
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _claimDecisionBusyIds.remove(id));
+      } else {
+        _claimDecisionBusyIds.remove(id);
+      }
+    }
+  }
+
   Future<void> _openClaimDialog(Map<String, dynamic> item) async {
     final cartItemId = (item['id'] ?? '').toString().trim();
     if (cartItemId.isEmpty) return;
@@ -552,7 +601,7 @@ class _CartScreenState extends State<CartScreen> {
                       decimal: true,
                     ),
                     decoration: const InputDecoration(
-                      labelText: 'Сумма претензии (RUB)',
+                      labelText: 'Сумма претензии (₽)',
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -670,24 +719,41 @@ class _CartScreenState extends State<CartScreen> {
 
   Widget _buildSummary() {
     final theme = Theme.of(context);
+    final reducedVisuals =
+        performanceModeNotifier.value ||
+        (MediaQuery.maybeOf(context)?.disableAnimations == true);
     final eta = _extractDeliveryEta();
+    final titleColor = reducedVisuals
+        ? theme.colorScheme.onSurface
+        : theme.colorScheme.onPrimary;
+    final secondaryColor = reducedVisuals
+        ? theme.colorScheme.onSurfaceVariant
+        : theme.colorScheme.onPrimary.withValues(alpha: 0.82);
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [theme.colorScheme.primary, theme.colorScheme.tertiary],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
+        color: reducedVisuals ? theme.colorScheme.surfaceContainerLow : null,
+        gradient: reducedVisuals
+            ? null
+            : LinearGradient(
+                colors: [theme.colorScheme.primary, theme.colorScheme.tertiary],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
         borderRadius: BorderRadius.circular(18),
-        boxShadow: [
-          BoxShadow(
-            color: theme.colorScheme.primary.withValues(alpha: 0.22),
-            blurRadius: 24,
-            offset: const Offset(0, 14),
-          ),
-        ],
+        border: reducedVisuals
+            ? Border.all(color: theme.colorScheme.outlineVariant)
+            : null,
+        boxShadow: reducedVisuals
+            ? const []
+            : [
+                BoxShadow(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.22),
+                  blurRadius: 24,
+                  offset: const Offset(0, 14),
+                ),
+              ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -695,11 +761,11 @@ class _CartScreenState extends State<CartScreen> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Expanded(
+              Expanded(
                 child: Text(
                   'Ваша корзина',
                   style: TextStyle(
-                    color: Colors.white,
+                    color: titleColor,
                     fontSize: 18,
                     fontWeight: FontWeight.w700,
                   ),
@@ -712,17 +778,23 @@ class _CartScreenState extends State<CartScreen> {
                     vertical: 8,
                   ),
                   decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.16),
+                    color: reducedVisuals
+                        ? theme.colorScheme.surface
+                        : theme.colorScheme.onPrimary.withValues(alpha: 0.16),
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.white24),
+                    border: Border.all(
+                      color: reducedVisuals
+                          ? theme.colorScheme.outlineVariant
+                          : theme.colorScheme.onPrimary.withValues(alpha: 0.24),
+                    ),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
-                      const Text(
+                      Text(
                         'Предварительное время доставки',
                         style: TextStyle(
-                          color: Colors.white70,
+                          color: secondaryColor,
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
                         ),
@@ -731,8 +803,8 @@ class _CartScreenState extends State<CartScreen> {
                       const SizedBox(height: 4),
                       Text(
                         _formatDeliveryEta(eta),
-                        style: const TextStyle(
-                          color: Colors.white,
+                        style: TextStyle(
+                          color: titleColor,
                           fontSize: 13,
                           fontWeight: FontWeight.w800,
                         ),
@@ -746,18 +818,18 @@ class _CartScreenState extends State<CartScreen> {
           const SizedBox(height: 10),
           Text(
             'Общая сумма: ${_formatMoney(_total)}',
-            style: const TextStyle(color: Colors.white, fontSize: 15),
+            style: TextStyle(color: titleColor, fontSize: 15),
           ),
           const SizedBox(height: 4),
           Text(
             'Обработано: ${_formatMoney(_processed)}',
-            style: const TextStyle(color: Colors.white70, fontSize: 14),
+            style: TextStyle(color: secondaryColor, fontSize: 14),
           ),
           if (_claimsTotal > 0) ...[
             const SizedBox(height: 4),
             Text(
-              'Сумма подтвержденных претензий: ${_formatMoney(_claimsTotal)}',
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
+              'Сумма брака: ${_formatMoney(_claimsTotal)}',
+              style: TextStyle(color: secondaryColor, fontSize: 13),
             ),
           ],
         ],
@@ -947,12 +1019,15 @@ class _CartScreenState extends State<CartScreen> {
                 : double.tryParse('${item['line_total'] ?? 0}') ?? 0;
             final claim = _claimForCartItem(cartItemId);
             final claimStatus = (claim?['status'] ?? '').toString();
-            final canCreateClaim =
-                claim == null || _canCreateNewClaim(claimStatus);
+            final canCreateClaim = claim == null;
             final claimColor = _claimStatusColor(claimStatus, theme);
             final approvedAmount = (claim?['approved_amount'] is num)
                 ? (claim?['approved_amount'] as num).toDouble()
                 : double.tryParse('${claim?['approved_amount'] ?? 0}') ?? 0;
+            final discountDecisionPending = _isDiscountDecisionPending(claim);
+            final claimId = (claim?['id'] ?? '').toString().trim();
+            final claimDecisionBusy =
+                claimId.isNotEmpty && _claimDecisionBusyIds.contains(claimId);
             return Padding(
               padding: const EdgeInsets.only(bottom: 10),
               child: Column(
@@ -991,7 +1066,7 @@ class _CartScreenState extends State<CartScreen> {
                                       borderRadius: BorderRadius.circular(10),
                                     ),
                                     child: Text(
-                                      'Заявка: ${_claimStatusText(claimStatus)}',
+                                      'Заявка: ${_claimStatusText(claimStatus, claim: claim)}',
                                       style: TextStyle(
                                         fontSize: 12.5,
                                         fontWeight: FontWeight.w700,
@@ -1026,11 +1101,45 @@ class _CartScreenState extends State<CartScreen> {
                         label: Text(
                           canCreateClaim
                               ? 'Сообщить о проблеме'
-                              : 'Заявка уже в работе',
+                              : 'Повторная заявка недоступна',
                         ),
                       ),
                     ],
                   ),
+                  if (discountDecisionPending && claimId.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          FilledButton.icon(
+                            onPressed: claimDecisionBusy
+                                ? null
+                                : () => _respondToDiscountClaim(
+                                    claimId: claimId,
+                                    accept: true,
+                                  ),
+                            icon: const Icon(Icons.check_circle_outline),
+                            label: Text(
+                              claimDecisionBusy
+                                  ? 'Сохранение...'
+                                  : 'Принять скидку',
+                            ),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: claimDecisionBusy
+                                ? null
+                                : () => _respondToDiscountClaim(
+                                    claimId: claimId,
+                                    accept: false,
+                                  ),
+                            icon: const Icon(Icons.restart_alt_outlined),
+                            label: const Text('Отказаться → возврат'),
+                          ),
+                        ],
+                      ),
+                    ),
                 ],
               ),
             );

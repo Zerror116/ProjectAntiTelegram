@@ -14,6 +14,13 @@ const { requireChatPermission } = require("../utils/permissions");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 const { emitToTenant } = require("../utils/socket");
 const { guardAction } = require("../utils/antifraud");
+const { createRateGuard } = require("../utils/rateGuard");
+const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
+const {
+  encryptMessageText,
+  decryptMessageText,
+  decryptMessageRow,
+} = require("../utils/messageCrypto");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -94,6 +101,31 @@ const chatMediaUpload = multer({
     }
     cb(new Error("Некорректный тип вложения"));
   },
+});
+
+const directSearchRateGuard = createRateGuard({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_DIRECT_SEARCH_MAX || 35),
+  blockMs: 30 * 1000,
+  message: "Слишком часто ищете пользователей. Повторите через несколько секунд.",
+  keyResolver: (req) =>
+    [
+      req.ip || "",
+      req.user?.tenant_id || "",
+      req.user?.id || "",
+      "direct-search",
+    ].join("|"),
+});
+
+const directOpenRateGuard = createRateGuard({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_DIRECT_OPEN_MAX || 20),
+  blockMs: 45 * 1000,
+  message: "Слишком много попыток открыть ЛС. Повторите позже.",
+  keyResolver: (req) =>
+    [req.ip || "", req.user?.tenant_id || "", req.user?.id || "", "direct-open"].join(
+      "|",
+    ),
 });
 
 function uploadChatMedia(req, res, next) {
@@ -368,7 +400,173 @@ function isSystemMessage(meta) {
 }
 
 function normalizePhoneDigits(raw) {
-  return String(raw || "").replace(/\D/g, "").slice(-15);
+  return String(raw || "").replace(/\D/g, "").slice(0, 15);
+}
+
+function normalizePhoneCore10(raw) {
+  const digits = normalizePhoneDigits(raw);
+  if (digits.length < 10) return "";
+  return digits.slice(-10);
+}
+
+function escapeLikePattern(raw) {
+  return String(raw || "").replace(/[\\%_]/g, "\\$&");
+}
+
+function looksLikeEmail(raw) {
+  const value = String(raw || "").trim();
+  return value.includes("@") && value.length >= 5;
+}
+
+function parseBoolean(raw) {
+  if (raw === true || raw === false) return raw;
+  if (raw === 1 || raw === "1") return true;
+  if (raw === 0 || raw === "0") return false;
+  const value = String(raw || "")
+    .toLowerCase()
+    .trim();
+  return value === "true" || value === "t" || value === "yes";
+}
+
+async function searchDirectTargets(client, requester, { query, limit = 8 }) {
+  const requesterId = String(requester?.id || "").trim();
+  const tenantId = requester?.tenant_id || null;
+  const normalizedQuery = String(query || "").trim();
+  if (!requesterId || !normalizedQuery) {
+    return { tooShort: true, rows: [], exact: null };
+  }
+
+  const phoneDigits = normalizePhoneDigits(normalizedQuery);
+  const phoneDigitsAlt =
+    phoneDigits.startsWith("8") && phoneDigits.length > 1
+      ? `7${phoneDigits.slice(1)}`
+      : "";
+  const phoneCore10 = normalizePhoneCore10(normalizedQuery);
+  const isEmailQuery = looksLikeEmail(normalizedQuery);
+  const isDigitsOnlyQuery = /^[0-9]+$/.test(normalizedQuery);
+  const isFullPhoneQuery = phoneDigits.length >= 10;
+  const canSearchText = normalizedQuery.length >= 3;
+  const canSearchPhone = phoneDigits.length >= 4;
+
+  if (!isEmailQuery && !canSearchText && !canSearchPhone) {
+    return { tooShort: true, rows: [], exact: null };
+  }
+
+  const queryEscaped = escapeLikePattern(normalizedQuery);
+  const queryContains = `%${queryEscaped}%`;
+  const queryPrefix = `${queryEscaped}%`;
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 8, 20));
+  const lowerQuery = normalizedQuery.toLowerCase();
+
+  const rowsQ = await client.query(
+    `WITH scope_users AS (
+       SELECT u.id,
+              u.email,
+              u.name,
+              u.tenant_id,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom,
+              uc.alias_name,
+              uc.created_at AS contact_created_at,
+              uc.updated_at AS contact_updated_at,
+              COALESCE(uc.updated_at, uc.created_at) AS contact_recent_at,
+              (uc.contact_user_id IS NOT NULL) AS is_in_contacts,
+              regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') AS phone_digits,
+              RIGHT(regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g'), 10) AS phone_core10
+       FROM users u
+       LEFT JOIN phones p ON p.user_id = u.id
+       LEFT JOIN user_contacts uc
+         ON uc.user_id = $1
+        AND uc.contact_user_id = u.id
+        AND ($2::uuid IS NULL OR uc.tenant_id = $2::uuid)
+       WHERE u.id <> $1
+         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     ),
+     ranked AS (
+       SELECT su.*,
+              CASE
+                WHEN $4::boolean AND LOWER(COALESCE(su.email, '')) = $3::text THEN 900
+                WHEN $6::boolean AND su.phone_core10 = $11::text THEN 890
+                WHEN (NOT $12::boolean) AND COALESCE(su.name, '') ILIKE $8::text ESCAPE '\\' THEN 780
+                WHEN (NOT $12::boolean) AND COALESCE(su.email, '') ILIKE $8::text ESCAPE '\\' THEN 770
+                WHEN $9::boolean AND (
+                  su.phone_digits LIKE ($5::text || '%')
+                  OR ($13::text <> '' AND su.phone_digits LIKE ($13::text || '%'))
+                ) THEN 760
+                WHEN (NOT $12::boolean) AND COALESCE(su.name, '') ILIKE $7::text ESCAPE '\\' THEN 680
+                WHEN (NOT $12::boolean) AND COALESCE(su.email, '') ILIKE $7::text ESCAPE '\\' THEN 670
+                ELSE 0
+              END AS score
+       FROM scope_users su
+     )
+     SELECT id,
+            email,
+            name,
+            tenant_id,
+            phone,
+            avatar_url,
+            avatar_focus_x,
+            avatar_focus_y,
+            avatar_zoom,
+            alias_name,
+            contact_created_at,
+            contact_updated_at,
+            contact_recent_at,
+            is_in_contacts,
+            phone_digits,
+            phone_core10,
+            score
+     FROM ranked
+     WHERE score > 0
+     ORDER BY score DESC,
+              is_in_contacts DESC,
+              contact_recent_at DESC NULLS LAST,
+              COALESCE(NULLIF(TRIM(name), ''), NULLIF(TRIM(email), ''), id::text) ASC
+     LIMIT $10`,
+    [
+      requesterId,
+      tenantId,
+      lowerQuery,
+      isEmailQuery,
+      phoneDigits,
+      isFullPhoneQuery,
+      queryContains,
+      queryPrefix,
+      canSearchPhone,
+      safeLimit,
+      phoneCore10,
+      isDigitsOnlyQuery,
+      phoneDigitsAlt,
+    ],
+  );
+
+  const rows = rowsQ.rows || [];
+  let exact = null;
+  if (isEmailQuery) {
+    exact =
+      rows.find(
+        (row) =>
+          String(row.email || "")
+            .toLowerCase()
+            .trim() === lowerQuery,
+      ) || null;
+  }
+  if (!exact && isFullPhoneQuery) {
+    exact =
+      rows.find((row) => {
+        const rowCore10 = String(row.phone_core10 || "").trim();
+        if (rowCore10.length === 10 && phoneCore10.length === 10) {
+          return rowCore10 === phoneCore10;
+        }
+        const rowDigits = normalizePhoneDigits(row.phone);
+        return rowDigits.length >= 10 && rowDigits === phoneDigits;
+      }) || null;
+  }
+
+  return { tooShort: false, rows, exact };
 }
 
 async function resolveDirectTargetUser(client, requester, { userId, query }) {
@@ -396,105 +594,92 @@ async function resolveDirectTargetUser(client, requester, { userId, query }) {
        LIMIT 1`,
       [byUserId, requesterId, tenantId],
     );
-    return q.rowCount > 0 ? q.rows[0] : null;
+    if (q.rowCount > 0) return q.rows[0];
+
+    // Fallback for legacy rows where users.tenant_id was not populated.
+    // Access is constrained by tenant-related support/claim records.
+    if (tenantId) {
+      const legacyQ = await client.query(
+        `SELECT u.id,
+                u.email,
+                u.name,
+                u.tenant_id,
+                p.phone,
+                u.avatar_url,
+                COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+                COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+                COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+         FROM users u
+         LEFT JOIN phones p ON p.user_id = u.id
+         WHERE u.id = $1
+           AND u.id <> $2
+           AND u.tenant_id IS NULL
+           AND (
+             EXISTS (
+               SELECT 1
+               FROM support_tickets st
+               WHERE st.customer_id = u.id
+                 AND (
+                   st.tenant_id = $3::uuid
+                   OR st.tenant_id IS NULL
+                 )
+               LIMIT 1
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM customer_claims cc
+               WHERE cc.user_id = u.id
+                 AND (
+                   cc.tenant_id = $3::uuid
+                   OR cc.tenant_id IS NULL
+                 )
+               LIMIT 1
+             )
+           )
+         LIMIT 1`,
+        [byUserId, requesterId, tenantId],
+      );
+      if (legacyQ.rowCount > 0) return legacyQ.rows[0];
+    }
+    return null;
   }
 
   const normalizedQuery = String(query || "").trim();
   if (!normalizedQuery) return null;
-
-  const phoneDigits = normalizePhoneDigits(normalizedQuery);
-  const emailLike = normalizedQuery.includes("@");
-  const params = [requesterId, tenantId];
-
-  if (emailLike) {
-    params.push(normalizedQuery.toLowerCase());
-    const q = await client.query(
-      `SELECT u.id,
-              u.email,
-              u.name,
-              u.tenant_id,
-              p.phone,
-              u.avatar_url,
-              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
-              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
-              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
-       FROM users u
-       LEFT JOIN phones p ON p.user_id = u.id
-       WHERE LOWER(COALESCE(u.email, '')) = $3
-         AND u.id <> $1
-         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
-       LIMIT 1`,
-      params,
-    );
-    return q.rowCount > 0 ? q.rows[0] : null;
-  }
-
-  if (phoneDigits.length >= 10) {
-    params.push(phoneDigits);
-    const q = await client.query(
-      `SELECT u.id,
-              u.email,
-              u.name,
-              u.tenant_id,
-              p.phone,
-              u.avatar_url,
-              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
-              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
-              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
-       FROM users u
-       LEFT JOIN phones p ON p.user_id = u.id
-       WHERE RIGHT(regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g'), 15) = RIGHT($3, 15)
-         AND u.id <> $1
-         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
-       LIMIT 1`,
-      params,
-    );
-    return q.rowCount > 0 ? q.rows[0] : null;
-  }
-
-  params.push(`%${normalizedQuery}%`);
-  params.push(phoneDigits.length >= 4 ? phoneDigits : "");
-  const byText = await client.query(
-    `SELECT u.id,
-            u.email,
-            u.name,
-            u.tenant_id,
-            p.phone,
-            u.avatar_url,
-            COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
-            COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
-            COALESCE(u.avatar_zoom, 1) AS avatar_zoom
-     FROM users u
-     LEFT JOIN phones p ON p.user_id = u.id
-     WHERE (
-           COALESCE(u.name, '') ILIKE $3
-           OR COALESCE(u.email, '') ILIKE $3
-           OR (
-             $4::text <> ''
-             AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE '%' || $4 || '%'
-           )
-         )
-       AND u.id <> $1
-       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
-     ORDER BY u.updated_at DESC NULLS LAST, u.created_at DESC
-     LIMIT 1`,
-    params,
-  );
-  return byText.rowCount > 0 ? byText.rows[0] : null;
+  const search = await searchDirectTargets(client, requester, {
+    query: normalizedQuery,
+    limit: 10,
+  });
+  if (search.tooShort) return null;
+  const isFullIdentifierQuery =
+    looksLikeEmail(normalizedQuery) ||
+    normalizePhoneDigits(normalizedQuery).length >= 10;
+  if (search.exact) return search.exact;
+  if (isFullIdentifierQuery) return null;
+  return search.rows[0] || null;
 }
 
-function mapPeerInfo(row) {
+function mapPeerInfo(row, { includeEmail = false } = {}) {
   if (!row) return null;
-  return {
+  const isInContacts = parseBoolean(row.is_in_contacts);
+  const payload = {
     id: row.id,
-    email: row.email || "",
     name: row.name || "",
     phone: row.phone || "",
     avatar_url: row.avatar_url || null,
     avatar_focus_x: Number(row.avatar_focus_x || 0),
     avatar_focus_y: Number(row.avatar_focus_y || 0),
     avatar_zoom: Number(row.avatar_zoom || 1),
+    alias_name: row.alias_name || "",
+    is_in_contacts: isInContacts,
+    contact_created_at: row.contact_created_at || null,
+    contact_updated_at: row.contact_updated_at || null,
+    recent_at: row.recent_at || row.contact_recent_at || null,
   };
+  if (includeEmail) {
+    payload.email = row.email || "";
+  }
+  return payload;
 }
 
 function toChatMediaUrl(req, file) {
@@ -657,9 +842,33 @@ async function getHydratedMessageById(messageId, currentUserId) {
      LEFT JOIN users u ON u.id = m.sender_id
      WHERE m.id = $1
      LIMIT 1`,
-    [messageId, currentUserId ? String(currentUserId) : null],
+      [messageId, currentUserId ? String(currentUserId) : null],
   );
-  return result.rows[0] || null;
+  return decryptMessageRow(result.rows[0] || null);
+}
+
+async function unhideChatInListForIncomingMessage(chatId, senderUserId = null) {
+  const senderId = String(senderUserId || "").trim();
+  if (senderId) {
+    await db.query(
+      `UPDATE user_chat_preferences
+       SET hidden = false,
+           updated_at = now()
+       WHERE chat_id = $1
+         AND hidden = true
+         AND user_id <> $2`,
+      [chatId, senderId],
+    );
+    return;
+  }
+  await db.query(
+    `UPDATE user_chat_preferences
+     SET hidden = false,
+         updated_at = now()
+     WHERE chat_id = $1
+       AND hidden = true`,
+    [chatId],
+  );
 }
 
 async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
@@ -677,6 +886,7 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
     throw new Error("Не удалось подготовить событие сообщения");
   }
 
+  await unhideChatInListForIncomingMessage(chatId, currentUserId || null);
   await db.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
 
   const io = req.app.get("io");
@@ -706,7 +916,15 @@ async function computeSupportCartSummary(client, userId) {
     `SELECT c.status, c.quantity, p.price
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
-     WHERE c.user_id = $1`,
+     WHERE c.user_id = $1
+       AND c.status IN ('pending_processing', 'processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')`,
+    [userId],
+  );
+  const claimsRows = await client.query(
+    `SELECT COALESCE(SUM(approved_amount), 0)::numeric AS claims_total
+     FROM customer_claims
+     WHERE user_id = $1
+       AND status IN ('approved_return', 'approved_discount', 'settled')`,
     [userId],
   );
 
@@ -729,7 +947,18 @@ async function computeSupportCartSummary(client, userId) {
     }
   }
 
-  return { total, processed };
+  const claimsTotal = Number(claimsRows.rows[0]?.claims_total || 0);
+  const normalizedClaimsTotal = Number(claimsTotal.toFixed(2));
+  const adjustedTotal = Math.max(0, Number((total - normalizedClaimsTotal).toFixed(2)));
+  const adjustedProcessed = Math.max(
+    0,
+    Number((processed - normalizedClaimsTotal).toFixed(2)),
+  );
+  return {
+    total: adjustedTotal,
+    processed: adjustedProcessed,
+    claims_total: normalizedClaimsTotal,
+  };
 }
 
 async function syncSupportTicketOnMessage({
@@ -752,6 +981,8 @@ async function syncSupportTicketOnMessage({
               customer_id,
               assignee_id,
               assigned_role,
+              category,
+              subject,
               status
        FROM support_tickets
        WHERE id = $1
@@ -788,22 +1019,54 @@ async function syncSupportTicketOnMessage({
         [ticket.id],
       );
 
-      if (isSupportCartSummaryQuestion(messageText)) {
+      const autoTemplateReply = await buildSupportTemplateAutoReply(client, {
+        tenantId,
+        category: ticket.category || "general",
+        customerId: ticket.customer_id,
+        subject: ticket.subject || "",
+        messageText,
+      });
+
+      if (autoTemplateReply?.text) {
+        const encryptedText = encryptMessageText(autoTemplateReply.text);
+        const inserted = await client.query(
+          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+           RETURNING id`,
+          [
+            uuidv4(),
+            chatId,
+            encryptedText,
+            JSON.stringify({
+              kind: "support_bot_template_reply",
+              support_ticket_id: ticket.id,
+              support_category: ticket.category || "general",
+              template_id: autoTemplateReply.template.id,
+              template_title: autoTemplateReply.template.title,
+              trigger_rule: autoTemplateReply.template.trigger_rule,
+            }),
+          ],
+        );
+        autoReplyMessageId = inserted.rows[0]?.id || null;
+      } else if (isSupportCartSummaryQuestion(messageText)) {
         const sums = await computeSupportCartSummary(client, ticket.customer_id);
         const autoReplyText =
-          `Общая сумма вашей корзины: ${sums.total} RUB. ` +
-          `Обработано на сумму: ${sums.processed} RUB.`;
+          `Общая сумма вашей корзины: ${sums.total} ₽. ` +
+          `Обработано на сумму: ${sums.processed} ₽. ` +
+          `Сумма брака: ${sums.claims_total} ₽.`;
         const autoReplyMeta = {
           kind: "support_bot_cart_summary",
           support_ticket_id: ticket.id,
           total_amount: sums.total,
           processed_amount: sums.processed,
+          claims_total: sums.claims_total,
         };
+        const encryptedText = encryptMessageText(autoReplyText);
         const inserted = await client.query(
           `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
            VALUES ($1, $2, NULL, $3, $4::jsonb, now())
            RETURNING id`,
-          [uuidv4(), chatId, autoReplyText, JSON.stringify(autoReplyMeta)],
+          [uuidv4(), chatId, encryptedText, JSON.stringify(autoReplyMeta)],
         );
         autoReplyMessageId = inserted.rows[0]?.id || null;
       }
@@ -842,11 +1105,12 @@ async function syncSupportTicketOnMessage({
           support_ticket_id: ticket.id,
           feedback_status: "pending",
         };
+        const encryptedText = encryptMessageText(promptText);
         const inserted = await client.query(
           `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
            VALUES ($1, $2, NULL, $3, $4::jsonb, now())
            RETURNING id`,
-          [uuidv4(), chatId, promptText, JSON.stringify(promptMeta)],
+          [uuidv4(), chatId, encryptedText, JSON.stringify(promptMeta)],
         );
         promptMessageId = inserted.rows[0]?.id || null;
       }
@@ -869,6 +1133,7 @@ async function insertMessageWithDedup({
   text,
   metaJson = null,
 }) {
+  const encryptedText = encryptMessageText(text);
   const hasMeta = metaJson != null;
   const insertWithConflictSql = hasMeta
     ? `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, meta, created_at)
@@ -880,8 +1145,8 @@ async function insertMessageWithDedup({
        ON CONFLICT (client_msg_id) WHERE client_msg_id IS NOT NULL DO NOTHING
        RETURNING id`;
   const insertWithConflictParams = hasMeta
-    ? [uuidv4(), clientMsgId, chatId, senderId, text, metaJson]
-    : [uuidv4(), clientMsgId, chatId, senderId, text];
+    ? [uuidv4(), clientMsgId, chatId, senderId, encryptedText, metaJson]
+    : [uuidv4(), clientMsgId, chatId, senderId, encryptedText];
 
   const insertDirectSql = hasMeta
     ? `INSERT INTO messages (id, client_msg_id, chat_id, sender_id, text, meta, created_at)
@@ -891,8 +1156,8 @@ async function insertMessageWithDedup({
        VALUES ($1, $2, $3, $4, $5, now())
        RETURNING id`;
   const insertDirectParams = hasMeta
-    ? [uuidv4(), clientMsgId, chatId, senderId, text, metaJson]
-    : [uuidv4(), clientMsgId, chatId, senderId, text];
+    ? [uuidv4(), clientMsgId, chatId, senderId, encryptedText, metaJson]
+    : [uuidv4(), clientMsgId, chatId, senderId, encryptedText];
 
   if (!clientMsgId) {
     if (hasMeta) {
@@ -900,14 +1165,14 @@ async function insertMessageWithDedup({
         `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
          VALUES ($1, $2, $3, $4, $5::jsonb, now())
          RETURNING id`,
-        [uuidv4(), chatId, senderId, text, metaJson],
+        [uuidv4(), chatId, senderId, encryptedText, metaJson],
       );
     }
     return db.query(
       `INSERT INTO messages (id, chat_id, sender_id, text, created_at)
        VALUES ($1, $2, $3, $4, now())
        RETURNING id`,
-      [uuidv4(), chatId, senderId, text],
+      [uuidv4(), chatId, senderId, encryptedText],
     );
   }
 
@@ -938,6 +1203,7 @@ async function markChatMessagesRead(chatId, userId) {
      WHERE m.chat_id = $1
        AND m.sender_id IS NOT NULL
        AND m.sender_id <> $2
+       AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
        AND NOT EXISTS (
          SELECT 1
@@ -1037,7 +1303,6 @@ router.get("/", requireAuth, async (req, res) => {
               peer.peer_user_id,
               peer.peer_display_name,
               peer.peer_name,
-              peer.peer_email,
               peer.peer_phone,
               peer.peer_avatar_url,
               peer.peer_avatar_focus_x,
@@ -1063,11 +1328,9 @@ router.get("/", requireAuth, async (req, res) => {
                 COALESCE(
                   NULLIF(BTRIM(uc.alias_name), ''),
                   NULLIF(BTRIM(ou.name), ''),
-                  NULLIF(BTRIM(ou.email), ''),
                   NULLIF(BTRIM(op.phone), '')
                 ) AS peer_display_name,
                 ou.name AS peer_name,
-                ou.email AS peer_email,
                 op.phone AS peer_phone,
                 ou.avatar_url AS peer_avatar_url,
                 COALESCE(ou.avatar_focus_x, 0) AS peer_avatar_focus_x,
@@ -1197,7 +1460,6 @@ router.get("/", requireAuth, async (req, res) => {
               peer.peer_user_id,
               peer.peer_display_name,
               peer.peer_name,
-              peer.peer_email,
               peer.peer_phone,
               peer.peer_avatar_url,
               peer.peer_avatar_focus_x,
@@ -1224,11 +1486,9 @@ router.get("/", requireAuth, async (req, res) => {
                 COALESCE(
                   NULLIF(BTRIM(uc.alias_name), ''),
                   NULLIF(BTRIM(ou.name), ''),
-                  NULLIF(BTRIM(ou.email), ''),
                   NULLIF(BTRIM(op.phone), '')
                 ) AS peer_display_name,
                 ou.name AS peer_name,
-                ou.email AS peer_email,
                 op.phone AS peer_phone,
                 ou.avatar_url AS peer_avatar_url,
                 COALESCE(ou.avatar_focus_x, 0) AS peer_avatar_focus_x,
@@ -1288,6 +1548,9 @@ router.get("/", requireAuth, async (req, res) => {
       if (!byId.has(row.id)) byId.set(row.id, row);
     }
     const chats = Array.from(byId.values());
+    for (const chat of chats) {
+      chat.last_message = decryptMessageText(chat.last_message);
+    }
 
     return res.json({ ok: true, data: chats });
   } catch (err) {
@@ -1421,7 +1684,9 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
        LIMIT 1000`,
       [chatId, String(userId)],
     );
-    const safeRows = rows.map((row) => decorateMessageMediaUrls(req, row));
+    const safeRows = rows.map((row) =>
+      decorateMessageMediaUrls(req, decryptMessageRow(row)),
+    );
     return res.json({ ok: true, data: safeRows });
   } catch (err) {
     console.error("chats.messages error", err);
@@ -1559,7 +1824,10 @@ router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       });
     }
 
-    const safeMessage = decorateMessageMediaUrls(req, messageQ.rows[0]);
+    const safeMessage = decorateMessageMediaUrls(
+      req,
+      decryptMessageRow(messageQ.rows[0]),
+    );
     return res.json({ ok: true, data: safeMessage });
   } catch (err) {
     console.error("chats.messageById error", err);
@@ -2074,7 +2342,7 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
            )
        WHERE id = $2
        RETURNING id`,
-      [nextText, messageId],
+      [encryptMessageText(nextText), messageId],
     );
     const updatedRaw = await getHydratedMessageById(upd.rows[0]?.id, userId);
     const updated = decorateMessageMediaUrls(req, updatedRaw);
@@ -2370,6 +2638,25 @@ router.patch("/:chatId/list-preferences", requireAuth, async (req, res) => {
       ],
     );
 
+    if (hasHidden && hidden === true) {
+      await db.query(
+        `UPDATE messages
+         SET meta = jsonb_set(
+           COALESCE(meta, '{}'::jsonb),
+           '{hidden_for}',
+           CASE
+             WHEN COALESCE(meta->'hidden_for', '[]'::jsonb) ? $2::text
+               THEN COALESCE(meta->'hidden_for', '[]'::jsonb)
+             ELSE COALESCE(meta->'hidden_for', '[]'::jsonb) || to_jsonb($2::text)
+           END,
+           true
+         )
+         WHERE chat_id = $1
+           AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false`,
+        [chatId, String(userId)],
+      );
+    }
+
     const pref = upsert.rows[0];
     if (pref && !pref.hidden && !pref.pinned) {
       await db.query(
@@ -2401,19 +2688,41 @@ router.get("/contacts", requireAuth, async (req, res) => {
       `SELECT uc.contact_user_id,
               uc.alias_name,
               uc.created_at,
+              uc.updated_at,
               u.name,
-              u.email,
               p.phone,
               u.avatar_url,
               COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
               COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
-              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom,
+              true AS is_in_contacts,
+              COALESCE(pc.last_interaction_at, uc.updated_at, uc.created_at) AS recent_at
        FROM user_contacts uc
        JOIN users u ON u.id = uc.contact_user_id
        LEFT JOIN phones p ON p.user_id = u.id
+       LEFT JOIN LATERAL (
+         SELECT c.updated_at AS last_interaction_at
+         FROM chats c
+         JOIN chat_members cm_self
+           ON cm_self.chat_id = c.id
+          AND cm_self.user_id = $1
+         JOIN chat_members cm_peer
+           ON cm_peer.chat_id = c.id
+          AND cm_peer.user_id = uc.contact_user_id
+         WHERE c.type = 'private'
+           AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+         ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC
+         LIMIT 1
+       ) pc ON true
        WHERE uc.user_id = $1
          AND ($2::uuid IS NULL OR uc.tenant_id = $2::uuid)
-       ORDER BY COALESCE(NULLIF(TRIM(uc.alias_name), ''), NULLIF(TRIM(u.name), ''), u.email) ASC`,
+       ORDER BY recent_at DESC NULLS LAST,
+                COALESCE(
+                  NULLIF(TRIM(uc.alias_name), ''),
+                  NULLIF(TRIM(u.name), ''),
+                  NULLIF(TRIM(p.phone), ''),
+                  u.id::text
+                ) ASC`,
       [req.user.id, req.user.tenant_id || null],
     );
     return res.json({ ok: true, data: rows.rows });
@@ -2446,32 +2755,74 @@ router.post("/contacts", requireAuth, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, error: "Контакт не найден" });
     }
-    await client.query(
-      `INSERT INTO user_contacts (
-         id, tenant_id, user_id, contact_user_id, alias_name, created_at, updated_at
-       )
-       VALUES ($1, $2, $3, $4, $5, now(), now())
-       ON CONFLICT (user_id, contact_user_id) DO UPDATE
-         SET alias_name = CASE
-               WHEN NULLIF($5::text, '') IS NULL THEN user_contacts.alias_name
-               ELSE $5::text
-             END,
-             updated_at = now()`,
-      [
-        uuidv4(),
-        req.user.tenant_id || null,
-        req.user.id,
-        peer.id,
-        aliasName,
-      ],
+    const existingQ = await client.query(
+      `SELECT alias_name, created_at, updated_at
+       FROM user_contacts
+       WHERE user_id = $1
+         AND contact_user_id = $2
+         AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+       LIMIT 1`,
+      [req.user.id, peer.id, req.user.tenant_id || null],
     );
+
+    let created = false;
+    let savedAlias = aliasName;
+    let contactCreatedAt = null;
+    let contactUpdatedAt = null;
+
+    if (existingQ.rowCount === 0) {
+      const inserted = await client.query(
+        `INSERT INTO user_contacts (
+           id, tenant_id, user_id, contact_user_id, alias_name, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, now(), now())
+         RETURNING alias_name, created_at, updated_at`,
+        [
+          uuidv4(),
+          req.user.tenant_id || null,
+          req.user.id,
+          peer.id,
+          aliasName,
+        ],
+      );
+      created = true;
+      savedAlias = String(inserted.rows[0]?.alias_name || "").trim();
+      contactCreatedAt = inserted.rows[0]?.created_at || null;
+      contactUpdatedAt = inserted.rows[0]?.updated_at || null;
+    } else {
+      savedAlias = String(existingQ.rows[0]?.alias_name || "").trim();
+      contactCreatedAt = existingQ.rows[0]?.created_at || null;
+      contactUpdatedAt = existingQ.rows[0]?.updated_at || null;
+
+      if (aliasName && aliasName !== savedAlias) {
+        const updated = await client.query(
+          `UPDATE user_contacts
+           SET alias_name = $4, updated_at = now()
+           WHERE user_id = $1
+             AND contact_user_id = $2
+             AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+           RETURNING alias_name, created_at, updated_at`,
+          [req.user.id, peer.id, req.user.tenant_id || null, aliasName],
+        );
+        savedAlias = String(updated.rows[0]?.alias_name || "").trim();
+        contactCreatedAt = updated.rows[0]?.created_at || contactCreatedAt;
+        contactUpdatedAt = updated.rows[0]?.updated_at || contactUpdatedAt;
+      }
+    }
     await client.query("COMMIT");
-    return res.status(201).json({
+    return res.status(created ? 201 : 200).json({
       ok: true,
       data: {
         contact_user_id: peer.id,
-        alias_name: aliasName,
-        peer: mapPeerInfo(peer),
+        alias_name: savedAlias,
+        created,
+        peer: mapPeerInfo({
+          ...peer,
+          alias_name: savedAlias,
+          is_in_contacts: true,
+          contact_created_at: contactCreatedAt,
+          contact_updated_at: contactUpdatedAt,
+        }),
       },
     });
   } catch (err) {
@@ -2505,13 +2856,86 @@ router.delete("/contacts/:contactUserId", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/direct/open", requireAuth, async (req, res) => {
+router.get("/direct/search", requireAuth, directSearchRateGuard, async (req, res) => {
+  const query = String(req.query?.query || req.query?.q || "").trim();
+  const limitRaw = Number(req.query?.limit || 8);
+  const limit = Number.isFinite(limitRaw) ? limitRaw : 8;
+
+  if (!query) {
+    return res.json({
+      ok: true,
+      data: {
+        query: "",
+        too_short: true,
+        exact: null,
+        candidates: [],
+        message: "Введите минимум 3 символа или полный email/номер",
+      },
+    });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    const search = await searchDirectTargets(client, req.user, {
+      query,
+      limit,
+    });
+    if (search.tooShort) {
+      return res.json({
+        ok: true,
+        data: {
+          query,
+          too_short: true,
+          exact: null,
+          candidates: [],
+          message: "Введите минимум 3 символа или полный email/номер",
+        },
+      });
+    }
+
+    const exact = search.exact ? mapPeerInfo(search.exact) : null;
+    const candidates = search.rows.map(mapPeerInfo);
+    const hasFullIdentifier =
+      looksLikeEmail(query) || normalizePhoneDigits(query).length >= 10;
+
+    let message = "";
+    if (!exact && candidates.length === 0) {
+      message = "Пользователь не найден в вашей группе";
+    } else if (!exact && hasFullIdentifier) {
+      message = "Точное совпадение не найдено. Проверьте email или номер.";
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        query,
+        too_short: false,
+        exact,
+        candidates,
+        message,
+      },
+    });
+  } catch (err) {
+    console.error("chats.direct.search error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) => {
   const targetId = String(req.body?.user_id || "").trim();
   const query = String(req.body?.query || "").trim();
   if (!targetId && !query) {
     return res.status(400).json({
       ok: false,
       error: "Нужен user_id или query",
+    });
+  }
+  if (targetId && String(req.user?.id || "").trim() === targetId) {
+    return res.status(400).json({
+      ok: false,
+      error: "Нельзя открыть ЛС с самим собой",
     });
   }
 
@@ -2530,15 +2954,6 @@ router.post("/direct/open", requireAuth, async (req, res) => {
         error: "Пользователь не найден в вашей группе",
       });
     }
-
-    await client.query(
-      `INSERT INTO user_contacts (
-         id, tenant_id, user_id, contact_user_id, created_at, updated_at
-       )
-       VALUES ($1, $2, $3, $4, now(), now())
-       ON CONFLICT (user_id, contact_user_id) DO NOTHING`,
-      [uuidv4(), req.user.tenant_id || null, req.user.id, peer.id],
-    );
 
     const existing = await client.query(
       `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at
@@ -2595,6 +3010,39 @@ router.post("/direct/open", requireAuth, async (req, res) => {
       created = true;
     }
 
+    await client.query(
+      `INSERT INTO user_chat_preferences (
+         user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
+       )
+       VALUES ($1, $2, false, false, NULL, now(), now())
+       ON CONFLICT (user_id, chat_id) DO UPDATE
+       SET hidden = false,
+           updated_at = now()`,
+      [req.user.id, chat.id],
+    );
+    if (created) {
+      await client.query(
+        `INSERT INTO user_chat_preferences (
+           user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
+         )
+         VALUES ($1, $2, false, false, NULL, now(), now())
+         ON CONFLICT (user_id, chat_id) DO NOTHING`,
+        [peer.id, chat.id],
+      );
+    }
+
+    const contactInfoQ = await client.query(
+      `SELECT alias_name, created_at, updated_at
+       FROM user_contacts
+       WHERE user_id = $1
+         AND contact_user_id = $2
+         AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+       LIMIT 1`,
+      [req.user.id, peer.id, req.user.tenant_id || null],
+    );
+    const contactInfo =
+      contactInfoQ.rowCount > 0 ? contactInfoQ.rows[0] : null;
+
     await client.query("COMMIT");
 
     const io = req.app.get("io");
@@ -2615,7 +3063,13 @@ router.post("/direct/open", requireAuth, async (req, res) => {
       ok: true,
       data: {
         chat,
-        peer: mapPeerInfo(peer),
+        peer: mapPeerInfo({
+          ...peer,
+          alias_name: contactInfo?.alias_name || "",
+          is_in_contacts: Boolean(contactInfo),
+          contact_created_at: contactInfo?.created_at || null,
+          contact_updated_at: contactInfo?.updated_at || null,
+        }),
         created,
       },
     });

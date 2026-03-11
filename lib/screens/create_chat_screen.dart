@@ -60,10 +60,11 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
       // Попытка извлечь сообщение ошибки из ответа
       String msg = 'Ошибка создания чата';
       if (data is Map) {
-        if (data['error'] != null)
+        if (data['error'] != null) {
           msg = data['error'].toString();
-        else if (data['message'] != null)
+        } else if (data['message'] != null) {
           msg = data['message'].toString();
+        }
       }
       setState(() => _error = msg);
     } catch (e) {
@@ -129,12 +130,12 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
                   padding: const EdgeInsets.symmetric(vertical: 14),
                 ),
                 child: _loading
-                    ? const SizedBox(
+                    ? SizedBox(
                         width: 18,
                         height: 18,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: Colors.white,
+                          color: Theme.of(context).colorScheme.onPrimary,
                         ),
                       )
                     : const Text('Создать'),

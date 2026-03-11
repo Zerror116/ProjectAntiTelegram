@@ -13,6 +13,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:image/image.dart' as img;
 import 'package:latlong2/latlong.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import 'chat_screen.dart';
@@ -39,6 +40,29 @@ const String _mapAttributionText = String.fromEnvironment(
   'FENIX_MAP_ATTRIBUTION',
   defaultValue: '© OpenStreetMap contributors © CARTO',
 );
+const List<Map<String, String>> _supportTemplateTokens = [
+  {'token': '{customer_name}', 'title': 'Имя клиента'},
+  {'token': '{cart_total}', 'title': 'Сумма корзины'},
+  {'token': '{processed_total}', 'title': 'Обработано'},
+  {'token': '{claims_total}', 'title': 'Сумма брака'},
+  {'token': '{delivery_status}', 'title': 'Статус доставки'},
+  {'token': '{subject}', 'title': 'Тема заявки'},
+  {'token': '{message_text}', 'title': 'Текст сообщения клиента'},
+];
+const List<String> _supportTriggerExamples = [
+  'время+доставки',
+  'когда+доставка',
+  'статус+доставки',
+  'сумма+корзины',
+  'фото+товара',
+];
+const String _supportDraftTitleKey = 'admin.support_template.draft.title';
+const String _supportDraftBodyKey = 'admin.support_template.draft.body';
+const String _supportDraftTriggerKey = 'admin.support_template.draft.trigger';
+const String _supportDraftProbeKey = 'admin.support_template.draft.probe';
+const String _supportDraftPriorityKey = 'admin.support_template.draft.priority';
+const String _supportDraftAutoReplyKey = 'admin.support_template.draft.auto';
+const String _supportDraftElseKey = 'admin.support_template.draft.else';
 
 class AdminPanel extends StatefulWidget {
   const AdminPanel({super.key});
@@ -81,10 +105,14 @@ class _AdminPanelState extends State<AdminPanel>
   final _notificationQuietToCtrl = TextEditingController();
   final _supportTemplateTitleCtrl = TextEditingController();
   final _supportTemplateBodyCtrl = TextEditingController();
+  final _supportTemplateTriggerCtrl = TextEditingController();
+  final _supportTemplateTriggerProbeCtrl = TextEditingController();
+  final _supportTemplatePriorityCtrl = TextEditingController(text: '100');
   final _roleTemplateTitleCtrl = TextEditingController();
   final _roleTemplateCodeCtrl = TextEditingController();
   final _roleTemplateDescriptionCtrl = TextEditingController();
   final _roleUserSearchCtrl = TextEditingController();
+  final _clientCartSearchCtrl = TextEditingController();
 
   bool _loading = true;
   bool _saving = false;
@@ -98,6 +126,14 @@ class _AdminPanelState extends State<AdminPanel>
   bool _supportTemplatesLoading = false;
   bool _supportTemplateSaving = false;
   bool _supportQuickReplyBusy = false;
+  bool _supportTemplateAutoReply = true;
+  bool _supportTemplateElseFallback = false;
+  bool _supportNotificationsLoading = false;
+  bool _returnsAnalyticsLoading = false;
+  bool _supportDraftRestoreInProgress = false;
+  bool _clientCartSearchLoading = false;
+  bool _clientCartLoading = false;
+  bool _clientCartActionBusy = false;
   bool _tenantsLoading = false;
   bool _tenantActionLoading = false;
   bool _invitesLoading = false;
@@ -131,6 +167,9 @@ class _AdminPanelState extends State<AdminPanel>
   List<Map<String, dynamic>> _supportActiveTickets = [];
   List<Map<String, dynamic>> _supportArchivedTickets = [];
   List<Map<String, dynamic>> _supportTemplates = [];
+  List<Map<String, dynamic>> _supportNotificationItems = [];
+  List<Map<String, dynamic>> _clientCartUsers = [];
+  List<Map<String, dynamic>> _selectedClientCartItems = [];
   List<Map<String, dynamic>> _auditLogs = [];
   List<Map<String, dynamic>> _antifraudEvents = [];
   List<Map<String, dynamic>> _antifraudBlocks = [];
@@ -144,6 +183,9 @@ class _AdminPanelState extends State<AdminPanel>
   Map<String, dynamic>? _rolesDraft;
   Map<String, dynamic>? _diagnosticsData;
   Map<String, dynamic>? _smartNotifySettings;
+  Map<String, dynamic>? _selectedClientCartUser;
+  Map<String, dynamic>? _supportNotificationSummary;
+  Map<String, dynamic>? _returnsAnalytics;
   int _reservedPendingTotal = 0;
   int _reservedPendingUnits = 0;
   String _lastGeneratedTenantKey = '';
@@ -154,6 +196,7 @@ class _AdminPanelState extends State<AdminPanel>
   String _lastInviteLink = '';
   final Map<String, String> _ticketTemplateById = {};
   final Map<String, String> _roleSelectionByUserId = {};
+  Timer? _supportDraftSaveTimer;
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
   final Set<String> _overviewLoading = <String>{};
@@ -162,6 +205,8 @@ class _AdminPanelState extends State<AdminPanel>
   @override
   void initState() {
     super.initState();
+    _bindSupportTemplateDraftAutosave();
+    unawaited(_restoreSupportTemplateDraft());
     _rebuildVisibleTabs(force: true, notify: false);
     _reloadAll();
     _eventsSub = chatEventsController.stream.listen((event) {
@@ -172,6 +217,8 @@ class _AdminPanelState extends State<AdminPanel>
       }
       if (type == 'claims:updated' && _canViewSupportTab()) {
         unawaited(_loadReturnsWorkflow(silent: true));
+        unawaited(_loadSupportNotificationCenter(silent: true));
+        unawaited(_loadReturnsAnalytics(silent: true));
         final data = event['data'];
         if (mounted && data is Map) {
           final status = (data['status'] ?? '').toString().trim();
@@ -200,6 +247,8 @@ class _AdminPanelState extends State<AdminPanel>
     _tabController?.dispose();
     _eventsSub?.cancel();
     _authSub?.cancel();
+    _unbindSupportTemplateDraftAutosave();
+    _supportDraftSaveTimer?.cancel();
     _channelTitleCtrl.dispose();
     _channelDescriptionCtrl.dispose();
     _deliveryThresholdCtrl.dispose();
@@ -216,10 +265,14 @@ class _AdminPanelState extends State<AdminPanel>
     _notificationQuietToCtrl.dispose();
     _supportTemplateTitleCtrl.dispose();
     _supportTemplateBodyCtrl.dispose();
+    _supportTemplateTriggerCtrl.dispose();
+    _supportTemplateTriggerProbeCtrl.dispose();
+    _supportTemplatePriorityCtrl.dispose();
     _roleTemplateTitleCtrl.dispose();
     _roleTemplateCodeCtrl.dispose();
     _roleTemplateDescriptionCtrl.dispose();
     _roleUserSearchCtrl.dispose();
+    _clientCartSearchCtrl.dispose();
     super.dispose();
   }
 
@@ -322,8 +375,27 @@ class _AdminPanelState extends State<AdminPanel>
     return _hasPermission('chat.write.support');
   }
 
+  bool _canViewClientCartsTab() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasAnyPermission(const ['delivery.manage', 'tenant.users.manage']);
+  }
+
   List<_AdminTabSpec> _buildVisibleTabs() {
     final tabs = <_AdminTabSpec>[
+      if (_canViewClientCartsTab())
+        _AdminTabSpec(
+          id: 'client_carts',
+          label: 'Корзины',
+          builder: _buildClientCartsTab,
+        ),
+      if (_canViewModerationTab())
+        _AdminTabSpec(
+          id: 'moderation',
+          label: 'Модерация',
+          builder: _buildModerationTab,
+        ),
       if (_canViewCreateTab())
         _AdminTabSpec(
           id: 'create',
@@ -335,12 +407,6 @@ class _AdminPanelState extends State<AdminPanel>
           id: 'channels',
           label: 'Каналы',
           builder: _buildSettingsTab,
-        ),
-      if (_canViewModerationTab())
-        _AdminTabSpec(
-          id: 'moderation',
-          label: 'Модерация',
-          builder: _buildModerationTab,
         ),
       if (_canViewDeliveryTab())
         _AdminTabSpec(
@@ -415,6 +481,17 @@ class _AdminPanelState extends State<AdminPanel>
   int _toInt(dynamic value, {int fallback = 0}) {
     if (value is int) return value;
     return int.tryParse('${value ?? ''}') ?? fallback;
+  }
+
+  double _toDouble(dynamic value, {double fallback = 0}) {
+    if (value is num) {
+      final parsed = value.toDouble();
+      if (parsed.isFinite) return parsed;
+      return fallback;
+    }
+    final parsed = double.tryParse('${value ?? ''}');
+    if (parsed == null || !parsed.isFinite) return fallback;
+    return parsed;
   }
 
   String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
@@ -562,6 +639,123 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
+  List<TextEditingController> _supportDraftControllers() => [
+    _supportTemplateTitleCtrl,
+    _supportTemplateBodyCtrl,
+    _supportTemplateTriggerCtrl,
+    _supportTemplateTriggerProbeCtrl,
+    _supportTemplatePriorityCtrl,
+  ];
+
+  void _bindSupportTemplateDraftAutosave() {
+    for (final controller in _supportDraftControllers()) {
+      controller.addListener(_scheduleSupportTemplateDraftSave);
+    }
+  }
+
+  void _unbindSupportTemplateDraftAutosave() {
+    for (final controller in _supportDraftControllers()) {
+      controller.removeListener(_scheduleSupportTemplateDraftSave);
+    }
+  }
+
+  void _scheduleSupportTemplateDraftSave() {
+    if (_supportDraftRestoreInProgress) return;
+    _supportDraftSaveTimer?.cancel();
+    _supportDraftSaveTimer = Timer(const Duration(milliseconds: 550), () {
+      unawaited(_saveSupportTemplateDraft());
+    });
+  }
+
+  Future<void> _saveSupportTemplateDraft() async {
+    if (_supportDraftRestoreInProgress) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final title = _supportTemplateTitleCtrl.text.trim();
+      final body = _supportTemplateBodyCtrl.text.trim();
+      final trigger = _supportTemplateTriggerCtrl.text.trim();
+      final probe = _supportTemplateTriggerProbeCtrl.text.trim();
+      final priorityRaw = _supportTemplatePriorityCtrl.text.trim();
+      final priority = priorityRaw.isEmpty ? '100' : priorityRaw;
+
+      final hasDraft =
+          title.isNotEmpty ||
+          body.isNotEmpty ||
+          trigger.isNotEmpty ||
+          probe.isNotEmpty ||
+          priority != '100' ||
+          !_supportTemplateAutoReply ||
+          _supportTemplateElseFallback;
+      if (!hasDraft) {
+        await _clearSupportTemplateDraft();
+        return;
+      }
+
+      await prefs.setString(_supportDraftTitleKey, title);
+      await prefs.setString(_supportDraftBodyKey, body);
+      await prefs.setString(_supportDraftTriggerKey, trigger);
+      await prefs.setString(_supportDraftProbeKey, probe);
+      await prefs.setString(_supportDraftPriorityKey, priority);
+      await prefs.setBool(_supportDraftAutoReplyKey, _supportTemplateAutoReply);
+      await prefs.setBool(_supportDraftElseKey, _supportTemplateElseFallback);
+    } catch (_) {
+      // Draft autosave is a helper feature; ignore storage failures.
+    }
+  }
+
+  Future<void> _clearSupportTemplateDraft() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_supportDraftTitleKey);
+      await prefs.remove(_supportDraftBodyKey);
+      await prefs.remove(_supportDraftTriggerKey);
+      await prefs.remove(_supportDraftProbeKey);
+      await prefs.remove(_supportDraftPriorityKey);
+      await prefs.remove(_supportDraftAutoReplyKey);
+      await prefs.remove(_supportDraftElseKey);
+    } catch (_) {
+      // Ignore local draft cleanup errors.
+    }
+  }
+
+  Future<void> _restoreSupportTemplateDraft() async {
+    _supportDraftRestoreInProgress = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final title = prefs.getString(_supportDraftTitleKey) ?? '';
+      final body = prefs.getString(_supportDraftBodyKey) ?? '';
+      final trigger = prefs.getString(_supportDraftTriggerKey) ?? '';
+      final probe = prefs.getString(_supportDraftProbeKey) ?? '';
+      final priority = prefs.getString(_supportDraftPriorityKey) ?? '100';
+      final autoReply = prefs.getBool(_supportDraftAutoReplyKey);
+      final elseFallback = prefs.getBool(_supportDraftElseKey);
+
+      _supportTemplateTitleCtrl.text = title;
+      _supportTemplateBodyCtrl.text = body;
+      _supportTemplateTriggerCtrl.text = trigger;
+      _supportTemplateTriggerProbeCtrl.text = probe;
+      _supportTemplatePriorityCtrl.text = priority;
+
+      if (!mounted) return;
+      setState(() {
+        if (autoReply != null) {
+          _supportTemplateAutoReply = autoReply;
+        }
+        if (elseFallback != null) {
+          _supportTemplateElseFallback = elseFallback;
+          if (elseFallback &&
+              !_isFallbackTriggerRule(_supportTemplateTriggerCtrl.text)) {
+            _supportTemplateTriggerCtrl.text = '*';
+          }
+        }
+      });
+    } catch (_) {
+      // Ignore draft restore issues.
+    } finally {
+      _supportDraftRestoreInProgress = false;
+    }
+  }
+
   Future<void> _reloadAll() async {
     final canLoadChannels = _canViewCreateTab() || _canViewChannelsTab();
     if (canLoadChannels) {
@@ -579,12 +773,11 @@ class _AdminPanelState extends State<AdminPanel>
       await _loadSupportTickets();
       await _loadSupportTemplates(silent: true);
       await _loadReturnsWorkflow(silent: true);
+      await _loadSupportNotificationCenter(silent: true);
+      await _loadReturnsAnalytics(silent: true);
     }
     if (_isCreatorBase() && _hasPermission('diagnostics.view')) {
       await _loadDiagnostics(silent: true);
-    }
-    if (_isCreatorBase() && _hasPermission('notifications.manage')) {
-      await _loadSmartNotificationSettings(silent: true);
     }
     if (_showKeysTab) {
       await _loadTenants();
@@ -1070,8 +1263,21 @@ class _AdminPanelState extends State<AdminPanel>
   Future<void> _createSupportTemplate() async {
     final title = _supportTemplateTitleCtrl.text.trim();
     final body = _supportTemplateBodyCtrl.text.trim();
+    final rawTriggerRule = _supportTemplateTriggerCtrl.text.trim();
+    final fallbackMode =
+        _supportTemplateElseFallback || _isFallbackTriggerRule(rawTriggerRule);
+    final triggerRule = fallbackMode ? '*' : rawTriggerRule;
+    final priority =
+        int.tryParse(_supportTemplatePriorityCtrl.text.trim()) ?? 100;
     if (title.isEmpty || body.isEmpty) {
       setState(() => _message = 'Заполни название и текст шаблона');
+      return;
+    }
+    if (_supportTemplateAutoReply && triggerRule.isEmpty) {
+      setState(
+        () => _message =
+            'Для автоответа укажи триггер (например: время+доставки)',
+      );
       return;
     }
     setState(() {
@@ -1081,13 +1287,29 @@ class _AdminPanelState extends State<AdminPanel>
     try {
       await authService.dio.post(
         '/api/admin/ops/support/templates',
-        data: {'title': title, 'body': body, 'category': 'general'},
+        data: {
+          'title': title,
+          'body': body,
+          'category': 'general',
+          'trigger_rule': triggerRule,
+          'auto_reply_enabled': _supportTemplateAutoReply,
+          'priority': priority,
+        },
       );
       _supportTemplateTitleCtrl.clear();
       _supportTemplateBodyCtrl.clear();
+      _supportTemplateTriggerCtrl.clear();
+      _supportTemplateTriggerProbeCtrl.clear();
+      _supportTemplatePriorityCtrl.text = '100';
+      _supportDraftSaveTimer?.cancel();
+      await _clearSupportTemplateDraft();
       await _loadSupportTemplates(silent: true);
       if (mounted) {
-        setState(() => _message = 'Шаблон поддержки сохранен');
+        setState(() {
+          _supportTemplateAutoReply = true;
+          _supportTemplateElseFallback = false;
+          _message = 'Шаблон поддержки сохранен';
+        });
       }
     } catch (e) {
       if (mounted) {
@@ -1100,6 +1322,166 @@ class _AdminPanelState extends State<AdminPanel>
         setState(() => _supportTemplateSaving = false);
       }
     }
+  }
+
+  void _insertTokenToController(
+    TextEditingController controller,
+    String token,
+  ) {
+    final text = controller.text;
+    final selection = controller.selection;
+    final hasSelection =
+        selection.start >= 0 &&
+        selection.end >= 0 &&
+        selection.start <= text.length &&
+        selection.end <= text.length;
+
+    final start = hasSelection
+        ? math.min(selection.start, selection.end)
+        : text.length;
+    final end = hasSelection
+        ? math.max(selection.start, selection.end)
+        : text.length;
+    final nextText = text.replaceRange(start, end, token);
+    final nextOffset = start + token.length;
+
+    controller.value = controller.value.copyWith(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: nextOffset),
+      composing: TextRange.empty,
+    );
+  }
+
+  void _insertSupportTemplateToken(String token, {bool toTitle = false}) {
+    final controller = toTitle
+        ? _supportTemplateTitleCtrl
+        : _supportTemplateBodyCtrl;
+    _insertTokenToController(controller, token);
+  }
+
+  String _normalizeSupportMatchText(String raw) {
+    return raw
+        .toLowerCase()
+        .replaceAll('ё', 'е')
+        .replaceAll(RegExp(r'[^a-z0-9а-я]+'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  String _normalizeSupportStem(String word) {
+    final normalized = _normalizeSupportMatchText(word).replaceAll(' ', '');
+    if (normalized.isEmpty) return '';
+    return normalized.length <= 4 ? normalized : normalized.substring(0, 4);
+  }
+
+  bool _supportWordMatches(String messageWord, String termWord) {
+    final left = messageWord.trim();
+    final right = termWord.trim();
+    if (left.isEmpty || right.isEmpty) return false;
+    if (left == right) return true;
+    if (left.contains(right) || right.contains(left)) return true;
+    return _normalizeSupportStem(left) == _normalizeSupportStem(right);
+  }
+
+  bool _supportTermMatches(String normalizedMessage, String term) {
+    final normalizedTerm = _normalizeSupportMatchText(term);
+    if (normalizedTerm.isEmpty) return false;
+    if (normalizedMessage.contains(normalizedTerm)) return true;
+
+    final messageWords = normalizedMessage
+        .split(' ')
+        .where((word) => word.trim().isNotEmpty)
+        .toList();
+    final termWords = normalizedTerm
+        .split(' ')
+        .where((word) => word.trim().isNotEmpty)
+        .toList();
+    if (messageWords.isEmpty || termWords.isEmpty) return false;
+
+    return termWords.every(
+      (termWord) => messageWords.any(
+        (messageWord) => _supportWordMatches(messageWord, termWord),
+      ),
+    );
+  }
+
+  bool _isFallbackTriggerRule(String rawRule) {
+    final normalized = rawRule.toLowerCase().trim();
+    return normalized == '*' ||
+        normalized == 'else' ||
+        normalized == 'fallback' ||
+        normalized == 'иначе';
+  }
+
+  List<List<String>> _parseSupportTriggerGroups(String rawRule) {
+    if (_isFallbackTriggerRule(rawRule)) return const <List<String>>[];
+    final rule = rawRule.trim();
+    if (rule.isEmpty) return const <List<String>>[];
+    return rule
+        .split(RegExp(r'[|\n;]'))
+        .map((group) => group.trim())
+        .where((group) => group.isNotEmpty)
+        .map(
+          (group) => group
+              .split('+')
+              .map((term) => _normalizeSupportMatchText(term))
+              .where((term) => term.isNotEmpty)
+              .toList(),
+        )
+        .where((group) => group.isNotEmpty)
+        .toList();
+  }
+
+  bool _supportTriggerMatches(String rawRule, String messageText) {
+    if (_isFallbackTriggerRule(rawRule)) return true;
+    final groups = _parseSupportTriggerGroups(rawRule);
+    if (groups.isEmpty) return false;
+    final normalizedMessage = _normalizeSupportMatchText(messageText);
+    if (normalizedMessage.isEmpty) return false;
+    for (final group in groups) {
+      final allTermsFound = group.every(
+        (term) => _supportTermMatches(normalizedMessage, term),
+      );
+      if (allTermsFound) return true;
+    }
+    return false;
+  }
+
+  void _setSupportTemplateFallback(bool value) {
+    setState(() {
+      _supportTemplateElseFallback = value;
+      if (value) {
+        _supportTemplateTriggerCtrl.text = '*';
+        _supportTemplateTriggerCtrl.selection = TextSelection.collapsed(
+          offset: _supportTemplateTriggerCtrl.text.length,
+        );
+      } else if (_isFallbackTriggerRule(_supportTemplateTriggerCtrl.text)) {
+        _supportTemplateTriggerCtrl.clear();
+      }
+    });
+    _scheduleSupportTemplateDraftSave();
+  }
+
+  void _appendSupportTriggerExample(String triggerRule) {
+    if (_supportTemplateElseFallback) return;
+    final token = triggerRule.trim();
+    if (token.isEmpty) return;
+    final current = _supportTemplateTriggerCtrl.text.trim();
+    if (current.isEmpty) {
+      _supportTemplateTriggerCtrl.text = token;
+      _supportTemplateTriggerCtrl.selection = TextSelection.collapsed(
+        offset: _supportTemplateTriggerCtrl.text.length,
+      );
+      _scheduleSupportTemplateDraftSave();
+      return;
+    }
+    if (current.split('|').map((s) => s.trim()).contains(token)) return;
+    final next = '$current|$token';
+    _supportTemplateTriggerCtrl.text = next;
+    _supportTemplateTriggerCtrl.selection = TextSelection.collapsed(
+      offset: next.length,
+    );
+    _scheduleSupportTemplateDraftSave();
   }
 
   Future<void> _sendSupportQuickReply(Map<String, dynamic> ticket) async {
@@ -1120,6 +1502,7 @@ class _AdminPanelState extends State<AdminPanel>
         data: {'template_id': templateId},
       );
       await _loadSupportTickets(silent: true);
+      await _loadSupportNotificationCenter(silent: true);
       if (mounted) {
         setState(() => _message = 'Быстрый ответ отправлен');
       }
@@ -1662,6 +2045,7 @@ class _AdminPanelState extends State<AdminPanel>
     final claimId = (claim['id'] ?? '').toString().trim();
     if (claimId.isEmpty) return;
     String? amount;
+    String? resolutionNote;
     if (action == 'approve_discount') {
       amount = await _askText(
         title: 'Сумма скидки',
@@ -1669,6 +2053,20 @@ class _AdminPanelState extends State<AdminPanel>
         initial: (claim['requested_amount'] ?? '').toString(),
       );
       if (amount == null) return;
+    }
+    if (action == 'reject') {
+      resolutionNote = await _askText(
+        title: 'Причина отказа',
+        label: 'Напишите причину отказа',
+      );
+      if (resolutionNote == null || resolutionNote.trim().length < 3) {
+        if (mounted) {
+          setState(
+            () => _message = 'Причина отказа должна быть не короче 3 символов',
+          );
+        }
+        return;
+      }
     }
     setState(() {
       _returnsActionBusy = true;
@@ -1680,9 +2078,12 @@ class _AdminPanelState extends State<AdminPanel>
         data: {
           'action': action,
           if (amount != null) 'approved_amount': double.tryParse(amount),
+          if (resolutionNote != null) 'resolution_note': resolutionNote.trim(),
         },
       );
       await _loadReturnsWorkflow(silent: true);
+      await _loadSupportNotificationCenter(silent: true);
+      await _loadReturnsAnalytics(silent: true);
       if (mounted) {
         setState(() => _message = 'Статус заявки обновлен');
       }
@@ -1911,6 +2312,238 @@ class _AdminPanelState extends State<AdminPanel>
     return result;
   }
 
+  Future<void> _searchClientCartsByPhone() async {
+    final query = _clientCartSearchCtrl.text.trim();
+    final digits = query.replaceAll(RegExp(r'\D'), '');
+    if (digits.length < 4) {
+      setState(() => _message = 'Введите минимум 4 цифры номера');
+      return;
+    }
+    setState(() {
+      _clientCartSearchLoading = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get(
+        '/api/cart/admin/clients/by-phone',
+        queryParameters: {'q': digits, 'limit': 30},
+      );
+      final data = resp.data;
+      final users = data is Map && data['ok'] == true && data['data'] is List
+          ? List<Map<String, dynamic>>.from(data['data'])
+          : <Map<String, dynamic>>[];
+      if (!mounted) return;
+      setState(() {
+        _clientCartUsers = users;
+        final selectedId = (_selectedClientCartUser?['id'] ?? '').toString();
+        if (selectedId.isEmpty ||
+            !users.any((user) => (user['id'] ?? '').toString() == selectedId)) {
+          _selectedClientCartUser = null;
+          _selectedClientCartItems = [];
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка поиска клиента: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _clientCartSearchLoading = false);
+      }
+    }
+  }
+
+  Future<void> _loadSelectedClientCart(String userId) async {
+    final id = userId.trim();
+    if (id.isEmpty) return;
+    setState(() {
+      _clientCartLoading = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get(
+        '/api/cart/admin/clients/$id/cart',
+      );
+      final data = resp.data;
+      final payload = data is Map && data['ok'] == true && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
+      if (!mounted) return;
+      setState(() {
+        _selectedClientCartUser = payload['user'] is Map
+            ? Map<String, dynamic>.from(payload['user'])
+            : null;
+        _selectedClientCartItems = payload['items'] is List
+            ? List<Map<String, dynamic>>.from(payload['items'])
+            : <Map<String, dynamic>>[];
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка корзины клиента: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _clientCartLoading = false);
+      }
+    }
+  }
+
+  Future<void> _editSelectedCartItem(Map<String, dynamic> item) async {
+    final itemId = (item['id'] ?? '').toString().trim();
+    if (itemId.isEmpty || _clientCartActionBusy) return;
+    final currentPrice = (item['custom_price'] ?? item['price'] ?? '')
+        .toString()
+        .trim();
+    final currentDescription =
+        (item['custom_description'] ?? item['description'] ?? '').toString();
+    final nextPrice = await _askText(
+      title: 'Цена для позиции',
+      label: 'Введите цену (пусто = цена товара)',
+      initial: currentPrice,
+    );
+    if (nextPrice == null) return;
+    final nextDescription = await _askText(
+      title: 'Описание для позиции',
+      label: 'Введите описание (пусто = описание товара)',
+      initial: currentDescription,
+    );
+    if (nextDescription == null) return;
+
+    setState(() => _clientCartActionBusy = true);
+    try {
+      final parsedPrice = nextPrice.trim().isEmpty
+          ? null
+          : double.tryParse(nextPrice.replaceAll(',', '.'));
+      await authService.dio.patch(
+        '/api/cart/admin/cart-items/$itemId',
+        data: {
+          'custom_price': parsedPrice,
+          'custom_description': nextDescription.trim().isEmpty
+              ? null
+              : nextDescription.trim(),
+        },
+      );
+      final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+      if (userId.isNotEmpty) {
+        await _loadSelectedClientCart(userId);
+      }
+      if (!mounted) return;
+      setState(() => _message = 'Позиция обновлена');
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка редактирования: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _clientCartActionBusy = false);
+    }
+  }
+
+  Future<void> _removeSelectedCartItem(Map<String, dynamic> item) async {
+    final itemId = (item['id'] ?? '').toString().trim();
+    final title = (item['title'] ?? 'Товар').toString().trim();
+    if (itemId.isEmpty || _clientCartActionBusy) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Удалить позицию'),
+        content: Text('Удалить "$title" из корзины клиента?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() => _clientCartActionBusy = true);
+    try {
+      await authService.dio.delete('/api/cart/admin/cart-items/$itemId');
+      final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+      if (userId.isNotEmpty) {
+        await _loadSelectedClientCart(userId);
+      }
+      if (!mounted) return;
+      setState(() => _message = 'Позиция удалена');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка удаления: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _clientCartActionBusy = false);
+    }
+  }
+
+  Future<void> _clearSelectedClientCart() async {
+    final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+    if (userId.isEmpty || _clientCartActionBusy) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Расформировать корзину'),
+        content: const Text('Полностью очистить корзину выбранного клиента?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Очистить'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() => _clientCartActionBusy = true);
+    try {
+      await authService.dio.post('/api/cart/admin/clients/$userId/cart/clear');
+      await _loadSelectedClientCart(userId);
+      if (!mounted) return;
+      setState(() => _message = 'Корзина клиента очищена');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка очистки: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _clientCartActionBusy = false);
+    }
+  }
+
+  Future<void> _blockSelectedClient() async {
+    final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+    if (userId.isEmpty || _clientCartActionBusy) return;
+    final reason = await _askText(
+      title: 'Блокировка клиента',
+      label: 'Причина блокировки',
+      initial: 'Вас заблокировали за нарушение правил',
+    );
+    if (reason == null || reason.trim().isEmpty) return;
+    setState(() => _clientCartActionBusy = true);
+    try {
+      await authService.dio.post(
+        '/api/cart/admin/clients/$userId/block',
+        data: {'reason': reason.trim()},
+      );
+      await _loadSelectedClientCart(userId);
+      await _searchClientCartsByPhone();
+      if (!mounted) return;
+      setState(() => _message = 'Клиент заблокирован');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка блокировки: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _clientCartActionBusy = false);
+    }
+  }
+
   Future<bool> _downloadOpsDocument({
     required String kind,
     required String format,
@@ -2076,7 +2709,7 @@ class _AdminPanelState extends State<AdminPanel>
     final n = (value is num)
         ? value.toDouble()
         : double.tryParse('$value') ?? 0;
-    return '${n.toStringAsFixed(2)} RUB';
+    return '${n.toStringAsFixed(2)} ₽';
   }
 
   String _formatDateTimeLabel(dynamic raw) {
@@ -2598,6 +3231,78 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
+  Future<void> _loadSupportNotificationCenter({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _supportNotificationsLoading = true);
+    } else {
+      _supportNotificationsLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/notifications/center',
+        queryParameters: {'limit': 60},
+      );
+      final data = resp.data;
+      if (!mounted) return;
+      setState(() {
+        final payload = data is Map && data['ok'] == true && data['data'] is Map
+            ? Map<String, dynamic>.from(data['data'])
+            : <String, dynamic>{};
+        _supportNotificationSummary = payload['summary'] is Map
+            ? Map<String, dynamic>.from(payload['summary'])
+            : <String, dynamic>{};
+        _supportNotificationItems = payload['items'] is List
+            ? List<Map<String, dynamic>>.from(payload['items'])
+            : <Map<String, dynamic>>[];
+      });
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message = 'Ошибка центра уведомлений: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _supportNotificationsLoading = false);
+      } else {
+        _supportNotificationsLoading = false;
+      }
+    }
+  }
+
+  Future<void> _loadReturnsAnalytics({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _returnsAnalyticsLoading = true);
+    } else {
+      _returnsAnalyticsLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/returns/analytics',
+        queryParameters: {'days': 30, 'top_limit': 8},
+      );
+      final data = resp.data;
+      if (!mounted) return;
+      setState(() {
+        _returnsAnalytics = data is Map && data['ok'] == true && data['data'] is Map
+            ? Map<String, dynamic>.from(data['data'])
+            : <String, dynamic>{};
+      });
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message = 'Ошибка аналитики возвратов: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _returnsAnalyticsLoading = false);
+      } else {
+        _returnsAnalyticsLoading = false;
+      }
+    }
+  }
+
   Future<void> _loadReturnsWorkflow({bool silent = false}) async {
     if (!silent && mounted) {
       setState(() => _returnsActionBusy = true);
@@ -2641,6 +3346,7 @@ class _AdminPanelState extends State<AdminPanel>
         data: {'reason': 'admin_archive'},
       );
       await _loadSupportTickets(silent: true);
+      await _loadSupportNotificationCenter(silent: true);
       if (!mounted) return;
       setState(() => _message = 'Тикет перенесён в архив');
     } catch (e) {
@@ -2685,13 +3391,55 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _openDirectChatWithUser(Map<String, dynamic> claim) async {
-    final userId = (claim['user_id'] ?? '').toString().trim();
-    if (userId.isEmpty) return;
-    try {
-      final resp = await authService.dio.post(
-        '/api/chats/direct/open',
-        data: {'user_id': userId},
+    final userId = (claim['user_id'] ?? claim['customer_id'] ?? '')
+        .toString()
+        .trim();
+    final currentUserId = authService.currentUser?.id.trim() ?? '';
+    if (userId.isNotEmpty &&
+        currentUserId.isNotEmpty &&
+        userId == currentUserId) {
+      showAppNotice(
+        context,
+        'Это ваша заявка. ЛС с самим собой не открывается.',
+        tone: AppNoticeTone.warning,
       );
+      return;
+    }
+    final customerEmail = (claim['customer_email'] ?? '').toString().trim();
+    final customerPhone = (claim['customer_phone'] ?? '').toString().trim();
+    final fallbackQuery = customerPhone.isNotEmpty
+        ? customerPhone
+        : customerEmail;
+    if (userId.isEmpty && fallbackQuery.isEmpty) {
+      showAppNotice(
+        context,
+        'Не удалось определить клиента для открытия ЛС',
+        tone: AppNoticeTone.error,
+      );
+      return;
+    }
+    try {
+      Response<dynamic> resp;
+      try {
+        resp = await authService.dio.post(
+          '/api/chats/direct/open',
+          data: userId.isNotEmpty
+              ? {'user_id': userId}
+              : {'query': fallbackQuery},
+        );
+      } on DioException catch (e) {
+        final statusCode = e.response?.statusCode ?? 0;
+        if (statusCode == 404 &&
+            userId.isNotEmpty &&
+            fallbackQuery.isNotEmpty) {
+          resp = await authService.dio.post(
+            '/api/chats/direct/open',
+            data: {'query': fallbackQuery},
+          );
+        } else {
+          rethrow;
+        }
+      }
       final data = resp.data;
       if (data is! Map || data['ok'] != true || data['data'] is! Map) {
         throw Exception('Не удалось открыть чат с клиентом');
@@ -3823,6 +4571,7 @@ class _AdminPanelState extends State<AdminPanel>
     required double initialFocusX,
     required double initialFocusY,
     required double initialZoom,
+    bool keepOriginalFile = false,
   }) async {
     final imageFile = File(filePath);
     final sourceBytes = await imageFile.readAsBytes();
@@ -3959,8 +4708,8 @@ class _AdminPanelState extends State<AdminPanel>
                                     offset: offset,
                                     child: Transform.scale(
                                       scale: zoom,
-                                      child: Image.file(
-                                        imageFile,
+                                      child: Image.memory(
+                                        sourceBytes,
                                         width: previewSize,
                                         height: previewSize,
                                         fit: BoxFit.cover,
@@ -4077,6 +4826,35 @@ class _AdminPanelState extends State<AdminPanel>
                   onPressed: exporting
                       ? null
                       : () async {
+                          final renderedWidth = source.width * baseScale * zoom;
+                          final renderedHeight =
+                              source.height * baseScale * zoom;
+                          final maxX = math.max(
+                            0.0,
+                            (renderedWidth - cutoutSize) / 2,
+                          );
+                          final maxY = math.max(
+                            0.0,
+                            (renderedHeight - cutoutSize) / 2,
+                          );
+                          final resolvedFocusX = maxX <= 0
+                              ? 0.0
+                              : (offset.dx / maxX).clamp(-1.0, 1.0).toDouble();
+                          final resolvedFocusY = maxY <= 0
+                              ? 0.0
+                              : (offset.dy / maxY).clamp(-1.0, 1.0).toDouble();
+
+                          if (keepOriginalFile) {
+                            if (!ctx.mounted) return;
+                            Navigator.of(ctx).pop(
+                              _AvatarPlacementResult(
+                                focusX: resolvedFocusX,
+                                focusY: resolvedFocusY,
+                                zoom: zoom,
+                              ),
+                            );
+                            return;
+                          }
                           setModalState(() {
                             exporting = true;
                             localError = '';
@@ -4093,7 +4871,12 @@ class _AdminPanelState extends State<AdminPanel>
                             );
                             if (!ctx.mounted) return;
                             Navigator.of(ctx).pop(
-                              _AvatarPlacementResult(croppedPath: croppedPath),
+                              _AvatarPlacementResult(
+                                croppedPath: croppedPath,
+                                focusX: 0,
+                                focusY: 0,
+                                zoom: 1,
+                              ),
                             );
                           } catch (_) {
                             setModalState(() {
@@ -4136,12 +4919,15 @@ class _AdminPanelState extends State<AdminPanel>
       return;
     }
 
+    final selectedName = (picked.files.single.name).toLowerCase().trim();
+    final isGif = selectedName.endsWith('.gif');
     final settings = _settingsOf(channel);
     final placement = await _showAvatarPlacementDialog(
       filePath: path,
       initialFocusX: _toFocus(settings['avatar_focus_x']),
       initialFocusY: _toFocus(settings['avatar_focus_y']),
       initialZoom: _toAvatarZoom(settings['avatar_zoom']),
+      keepOriginalFile: isGif,
     );
     if (placement == null) return;
 
@@ -4150,7 +4936,7 @@ class _AdminPanelState extends State<AdminPanel>
       _message = '';
     });
     try {
-      final uploadPath = placement.croppedPath;
+      final uploadPath = placement.croppedPath ?? path;
       final fileName = uploadPath.split(Platform.pathSeparator).last;
       final form = FormData.fromMap({
         'avatar': await MultipartFile.fromFile(uploadPath, filename: fileName),
@@ -4161,14 +4947,27 @@ class _AdminPanelState extends State<AdminPanel>
       );
       _emitChatUpdatedIfPresent(resp.data);
 
+      final focusX = isGif ? placement.focusX : 0;
+      final focusY = isGif ? placement.focusY : 0;
+      final avatarZoom = isGif ? placement.zoom : 1;
       await authService.dio.patch(
         '/api/admin/channels/$channelId',
-        data: {'avatar_focus_x': 0, 'avatar_focus_y': 0, 'avatar_zoom': 1},
+        data: {
+          'avatar_focus_x': focusX,
+          'avatar_focus_y': focusY,
+          'avatar_zoom': avatarZoom,
+        },
       );
 
       await _loadChannels();
       await _loadChannelOverview(channelId, force: true, silent: true);
-      if (mounted) setState(() => _message = 'Аватарка канала обновлена');
+      if (mounted) {
+        setState(
+          () => _message = isGif
+              ? 'GIF-аватарка канала обновлена'
+              : 'Аватарка канала обновлена',
+        );
+      }
     } catch (e) {
       if (mounted) {
         setState(
@@ -4177,9 +4976,11 @@ class _AdminPanelState extends State<AdminPanel>
       }
     } finally {
       if (mounted) setState(() => _avatarUpdating = false);
-      try {
-        await File(placement.croppedPath).delete();
-      } catch (_) {}
+      if (placement.croppedPath != null) {
+        try {
+          await File(placement.croppedPath!).delete();
+        } catch (_) {}
+      }
     }
   }
 
@@ -5848,7 +6649,7 @@ class _AdminPanelState extends State<AdminPanel>
                                 children: [
                                   _buildModerationChip('ID $productLabel'),
                                   _buildModerationChip(
-                                    '${_toInt(p['product_price'])} RUB',
+                                    '${_toInt(p['product_price'])} ₽',
                                   ),
                                   _buildModerationChip(
                                     'x${_toInt(p['product_quantity'])}',
@@ -6058,11 +6859,31 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Widget _buildSupportTab() {
+    final triggerRuleInput = _supportTemplateTriggerCtrl.text.trim();
+    final triggerRuleForPreview = _supportTemplateElseFallback
+        ? '*'
+        : triggerRuleInput;
+    final parsedTriggerGroups = _parseSupportTriggerGroups(
+      triggerRuleForPreview,
+    );
+    final triggerProbeText = _supportTemplateTriggerProbeCtrl.text.trim();
+    final showTriggerProbeResult =
+        triggerProbeText.isNotEmpty &&
+        (_supportTemplateElseFallback || parsedTriggerGroups.isNotEmpty);
+    final triggerProbeMatches = showTriggerProbeResult
+        ? _supportTriggerMatches(triggerRuleForPreview, triggerProbeText)
+        : false;
+    final notificationsSummary = _asMap(_supportNotificationSummary);
+    final returnsSummary = _asMap(_returnsAnalytics?['summary']);
+    final returnsTopProducts = _asMapList(_returnsAnalytics?['top_products']);
+
     return RefreshIndicator(
       onRefresh: () async {
         await _loadSupportTickets(silent: true);
         await _loadSupportTemplates(silent: true);
         await _loadReturnsWorkflow(silent: true);
+        await _loadSupportNotificationCenter(silent: true);
+        await _loadReturnsAnalytics(silent: true);
       },
       child: ListView(
         padding: const EdgeInsets.all(16),
@@ -6083,6 +6904,8 @@ class _AdminPanelState extends State<AdminPanel>
                     : () async {
                         await _loadSupportTickets(silent: true);
                         await _loadReturnsWorkflow(silent: true);
+                        await _loadSupportNotificationCenter(silent: true);
+                        await _loadReturnsAnalytics(silent: true);
                       },
                 icon: const Icon(Icons.refresh),
                 tooltip: 'Обновить',
@@ -6096,6 +6919,157 @@ class _AdminPanelState extends State<AdminPanel>
               padding: EdgeInsets.only(top: 12),
               child: LinearProgressIndicator(),
             ),
+          const SizedBox(height: 12),
+          Text(
+            'Центр уведомлений',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          if (_supportNotificationsLoading && _supportNotificationItems.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _buildModerationChip(
+                        'Внимание: ${_toInt(notificationsSummary['total_attention'])}',
+                      ),
+                      _buildModerationChip(
+                        'Открытые тикеты: ${_toInt(notificationsSummary['support_open'])}',
+                      ),
+                      _buildModerationChip(
+                        'Ждут клиента: ${_toInt(notificationsSummary['support_waiting_customer'])}',
+                      ),
+                      _buildModerationChip(
+                        'Новые претензии: ${_toInt(notificationsSummary['claims_pending'])}',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  if (_supportNotificationItems.isEmpty)
+                    Text(
+                      'Уведомлений пока нет',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    )
+                  else
+                    ..._supportNotificationItems.take(8).map((event) {
+                      final title = (event['title'] ?? 'Событие').toString();
+                      final subtitle = (event['subtitle'] ?? '').toString();
+                      final typeLabel = (event['type_label'] ?? 'Система')
+                          .toString();
+                      final statusLabel = (event['status_label'] ?? '')
+                          .toString();
+                      final priority = (event['priority'] ?? 'normal')
+                          .toString();
+                      final timeLabel = _formatDateTimeLabel(event['event_at']);
+                      Color priorityColor;
+                      if (priority == 'high') {
+                        priorityColor = Theme.of(context).colorScheme.error;
+                      } else if (priority == 'low') {
+                        priorityColor = Theme.of(context).colorScheme.outline;
+                      } else {
+                        priorityColor = Theme.of(context).colorScheme.primary;
+                      }
+
+                      return ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(title),
+                        subtitle: Text(
+                          [
+                            typeLabel,
+                            if (statusLabel.isNotEmpty) statusLabel,
+                            if (subtitle.isNotEmpty) subtitle,
+                            if (timeLabel.isNotEmpty) timeLabel,
+                          ].join(' • '),
+                        ),
+                        leading: Icon(
+                          event['type'] == 'claim'
+                              ? Icons.assignment_return_outlined
+                              : Icons.support_agent_outlined,
+                          color: priorityColor,
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Аналитика возвратов и брака (30 дней)',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          if (_returnsAnalyticsLoading && _returnsAnalytics == null)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _buildModerationChip(
+                        'Всего заявок: ${_toInt(returnsSummary['total_claims'])}',
+                      ),
+                      _buildModerationChip(
+                        'Ожидают: ${_toInt(returnsSummary['pending_claims'])}',
+                      ),
+                      _buildModerationChip(
+                        'Отклонено: ${_toInt(returnsSummary['rejected_claims'])}',
+                      ),
+                      _buildModerationChip(
+                        'Сумма брака: ${_formatMoney(returnsSummary['defect_sum'])}',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Возвраты: ${_formatMoney(returnsSummary['returns_sum'])} • '
+                    'Скидки: ${_formatMoney(returnsSummary['discounts_sum'])}',
+                  ),
+                  const SizedBox(height: 8),
+                  if (returnsTopProducts.isEmpty)
+                    Text(
+                      'Топ проблемных товаров пока пуст',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    )
+                  else
+                    ...returnsTopProducts.take(5).map((row) {
+                      return ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text((row['product_title'] ?? 'Товар').toString()),
+                        subtitle: Text(
+                          'Заявок: ${_toInt(row['total_claims'])} • '
+                          'Сумма: ${_formatMoney(row['approved_sum'])}',
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+          ),
           const SizedBox(height: 12),
           Card(
             child: Padding(
@@ -6141,12 +7115,224 @@ class _AdminPanelState extends State<AdminPanel>
                     decoration: withInputLanguageBadge(
                       const InputDecoration(
                         labelText: 'Текст шаблона',
-                        hintText:
-                            'Можно использовать: {customer_name}, {cart_total}, {processed_total}, {delivery_status}',
+                        hintText: 'Можно использовать команды из списка ниже',
                         border: OutlineInputBorder(),
                       ),
                       controller: _supportTemplateBodyCtrl,
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                  SwitchListTile.adaptive(
+                    value: _supportTemplateElseFallback,
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Шаблон по умолчанию (ELSE)'),
+                    subtitle: const Text(
+                      'Сработает, если другие триггеры не совпали',
+                    ),
+                    onChanged: _supportTemplateSaving
+                        ? null
+                        : _setSupportTemplateFallback,
+                  ),
+                  TextField(
+                    controller: _supportTemplateTriggerCtrl,
+                    enabled: !_supportTemplateElseFallback,
+                    onChanged: (_) {
+                      if (!_supportTemplateElseFallback &&
+                          _isFallbackTriggerRule(
+                            _supportTemplateTriggerCtrl.text,
+                          )) {
+                        _setSupportTemplateFallback(true);
+                        return;
+                      }
+                      setState(() {});
+                    },
+                    decoration: withInputLanguageBadge(
+                      InputDecoration(
+                        labelText: 'Триггер (if)',
+                        hintText: 'Пример: время+доставки|когда+доставка',
+                        helperText: _supportTemplateElseFallback
+                            ? 'Режим ELSE включен: этот шаблон ответит, если другие правила не подошли.'
+                            : 'Формат: слово+слово|другая+группа',
+                        border: const OutlineInputBorder(),
+                      ),
+                      controller: _supportTemplateTriggerCtrl,
+                    ),
+                  ),
+                  if (!_supportTemplateElseFallback) ...[
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _supportTriggerExamples
+                          .map(
+                            (example) => ActionChip(
+                              onPressed: _supportTemplateSaving
+                                  ? null
+                                  : () => _appendSupportTriggerExample(example),
+                              avatar: const Icon(Icons.rule, size: 16),
+                              label: Text(example),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Логика: "+" = и, "|" = или. Пример: время+доставки|когда+доставка',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    if (parsedTriggerGroups.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: parsedTriggerGroups
+                            .asMap()
+                            .entries
+                            .map(
+                              (entry) => Chip(
+                                avatar: const Icon(
+                                  Icons.account_tree,
+                                  size: 16,
+                                ),
+                                label: Text(
+                                  'IF ${entry.key + 1}: ${entry.value.join(' + ')}',
+                                ),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                    ],
+                  ],
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _supportTemplateTriggerProbeCtrl,
+                    onChanged: (_) => setState(() {}),
+                    decoration: withInputLanguageBadge(
+                      const InputDecoration(
+                        labelText: 'Проверка триггера',
+                        hintText: 'Введите пример сообщения клиента',
+                        border: OutlineInputBorder(),
+                      ),
+                      controller: _supportTemplateTriggerProbeCtrl,
+                    ),
+                  ),
+                  if (triggerProbeText.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      showTriggerProbeResult
+                          ? (triggerProbeMatches
+                                ? (_supportTemplateElseFallback
+                                      ? 'Результат: сработает как ELSE (fallback).'
+                                      : 'Результат: триггер совпал, шаблон сработает.')
+                                : 'Результат: триггер не совпал.')
+                          : 'Результат: добавьте триггер или включите режим ELSE.',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: showTriggerProbeResult
+                            ? (triggerProbeMatches
+                                  ? Theme.of(context).colorScheme.primary
+                                  : Theme.of(context).colorScheme.error)
+                            : Theme.of(context).colorScheme.onSurfaceVariant,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: SwitchListTile.adaptive(
+                          value: _supportTemplateAutoReply,
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Автоответ по триггеру'),
+                          onChanged: _supportTemplateSaving
+                              ? null
+                              : (value) {
+                                  setState(
+                                    () => _supportTemplateAutoReply = value,
+                                  );
+                                  _scheduleSupportTemplateDraftSave();
+                                },
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        width: 140,
+                        child: TextField(
+                          controller: _supportTemplatePriorityCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: withInputLanguageBadge(
+                            const InputDecoration(
+                              labelText: 'Приоритет',
+                              hintText: '100',
+                              border: OutlineInputBorder(),
+                            ),
+                            controller: _supportTemplatePriorityCtrl,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Команды для вставки',
+                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _supportTemplateTokens.map((item) {
+                      final token = (item['token'] ?? '').trim();
+                      final title = (item['title'] ?? token).trim();
+                      return ActionChip(
+                        onPressed: _supportTemplateSaving
+                            ? null
+                            : () => _insertSupportTemplateToken(token),
+                        avatar: const Icon(Icons.functions, size: 16),
+                        label: Text(token),
+                        tooltip: title,
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Нажмите на команду, чтобы вставить её в текст по курсору',
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                              ),
+                        ),
+                      ),
+                      PopupMenuButton<String>(
+                        tooltip: 'Вставить в название',
+                        onSelected: (token) {
+                          if (_supportTemplateSaving) return;
+                          _insertSupportTemplateToken(token, toTitle: true);
+                        },
+                        itemBuilder: (context) =>
+                            _supportTemplateTokens.map((item) {
+                              final token = (item['token'] ?? '').trim();
+                              final title = (item['title'] ?? token).trim();
+                              return PopupMenuItem<String>(
+                                value: token,
+                                child: Text('$title: $token'),
+                              );
+                            }).toList(),
+                        child: const Chip(
+                          avatar: Icon(Icons.title, size: 16),
+                          label: Text('Вставить в название'),
+                        ),
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 8),
                   Align(
@@ -6199,6 +7385,12 @@ class _AdminPanelState extends State<AdminPanel>
                   .toString()
                   .trim();
               final claimType = (claim['claim_type'] ?? '').toString().trim();
+              final discountDecision = (claim['customer_discount_status'] ?? '')
+                  .toString()
+                  .trim();
+              final resolutionNote = (claim['resolution_note'] ?? '')
+                  .toString()
+                  .trim();
               final requested = _formatMoney(claim['requested_amount']);
               final approved = _formatMoney(claim['approved_amount']);
               final actions = (claim['available_actions'] is List)
@@ -6219,7 +7411,27 @@ class _AdminPanelState extends State<AdminPanel>
                       Text(
                         'Тип: ${claimType == 'discount' ? 'Скидка' : 'Возврат'} • Статус: $status',
                       ),
+                      if (claimType == 'discount' &&
+                          discountDecision.isNotEmpty)
+                        Text(
+                          discountDecision == 'pending'
+                              ? 'Решение клиента: ожидается'
+                              : discountDecision == 'accepted'
+                              ? 'Решение клиента: скидка принята'
+                              : discountDecision == 'rejected'
+                              ? 'Решение клиента: скидка отклонена'
+                              : 'Решение клиента: $discountDecision',
+                        ),
                       Text('Запрошено: $requested • Подтверждено: $approved'),
+                      if (resolutionNote.isNotEmpty)
+                        Text(
+                          'Комментарий: $resolutionNote',
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
                       const SizedBox(height: 8),
                       Wrap(
                         spacing: 8,
@@ -6290,6 +7502,284 @@ class _AdminPanelState extends State<AdminPanel>
             ..._supportArchivedTickets.map(
               (ticket) => _buildSupportTicketCard(ticket, archived: true),
             ),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildClientCartsTab() {
+    final selectedUser = _selectedClientCartUser;
+    final selectedUserId = (selectedUser?['id'] ?? '').toString().trim();
+    final selectedUserName = _displayName(
+      selectedUser ?? const <String, dynamic>{},
+      fallback: 'Клиент',
+    );
+    final selectedUserPhone = (selectedUser?['phone'] ?? '').toString().trim();
+    final selectedUserEmail = (selectedUser?['email'] ?? '').toString().trim();
+    final selectedUserBlocked = selectedUser?['is_active'] == false;
+    final total = _selectedClientCartItems.fold<double>(
+      0,
+      (sum, item) =>
+          sum +
+          (_toDouble(item['line_total']) > 0
+              ? _toDouble(item['line_total'])
+              : (_toDouble(item['price']) * _toInt(item['quantity']))),
+    );
+
+    return RefreshIndicator(
+      onRefresh: () async {
+        if (_clientCartSearchCtrl.text.trim().isNotEmpty) {
+          await _searchClientCartsByPhone();
+        }
+        if (selectedUserId.isNotEmpty) {
+          await _loadSelectedClientCart(selectedUserId);
+        }
+      },
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text(
+            'Корзины клиентов',
+            style: Theme.of(
+              context,
+            ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _clientCartSearchCtrl,
+            keyboardType: TextInputType.phone,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Последние 4 цифры номера',
+                hintText: 'Например: 1234',
+                border: OutlineInputBorder(),
+              ),
+              controller: _clientCartSearchCtrl,
+            ),
+            onSubmitted: (_) => _searchClientCartsByPhone(),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.icon(
+                onPressed: _clientCartSearchLoading
+                    ? null
+                    : _searchClientCartsByPhone,
+                icon: _clientCartSearchLoading
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Icon(Icons.search),
+                label: const Text('Найти клиентов'),
+              ),
+              if (selectedUserId.isNotEmpty)
+                OutlinedButton.icon(
+                  onPressed: _clientCartLoading
+                      ? null
+                      : () => _loadSelectedClientCart(selectedUserId),
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Обновить корзину'),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (_clientCartUsers.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(14),
+                child: Text(
+                  'После ввода номера здесь появятся найденные клиенты',
+                ),
+              ),
+            )
+          else
+            ..._clientCartUsers.map((user) {
+              final userId = (user['id'] ?? '').toString().trim();
+              final isSelected = userId.isNotEmpty && userId == selectedUserId;
+              final title = _displayName(user, fallback: 'Клиент');
+              final subtitleParts = <String>[
+                if ((user['phone'] ?? '').toString().trim().isNotEmpty)
+                  (user['phone'] ?? '').toString().trim(),
+                if ((user['email'] ?? '').toString().trim().isNotEmpty)
+                  (user['email'] ?? '').toString().trim(),
+              ];
+              return Card(
+                color: isSelected
+                    ? Theme.of(
+                        context,
+                      ).colorScheme.primaryContainer.withValues(alpha: 0.35)
+                    : null,
+                child: ListTile(
+                  leading: const Icon(Icons.person_outline),
+                  title: Text(title),
+                  subtitle: Text(
+                    subtitleParts.isEmpty
+                        ? 'Без контактов'
+                        : subtitleParts.join(' • '),
+                  ),
+                  trailing: user['is_active'] == false
+                      ? const Icon(Icons.block, color: Colors.red)
+                      : const Icon(Icons.chevron_right),
+                  onTap: userId.isEmpty
+                      ? null
+                      : () => _loadSelectedClientCart(userId),
+                ),
+              );
+            }),
+          if (selectedUserId.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      selectedUserName,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                      ),
+                    ),
+                    if (selectedUserPhone.isNotEmpty ||
+                        selectedUserEmail.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          [
+                            if (selectedUserPhone.isNotEmpty) selectedUserPhone,
+                            if (selectedUserEmail.isNotEmpty) selectedUserEmail,
+                          ].join(' • '),
+                        ),
+                      ),
+                    if (selectedUserBlocked)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 6),
+                        child: Text(
+                          'Клиент заблокирован',
+                          style: TextStyle(
+                            color: Colors.red,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Позиций: ${_selectedClientCartItems.length} • Сумма: ${_formatMoney(total)}',
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        OutlinedButton.icon(
+                          onPressed:
+                              _clientCartActionBusy ||
+                                  _selectedClientCartItems.isEmpty
+                              ? null
+                              : _clearSelectedClientCart,
+                          icon: const Icon(Icons.delete_sweep_outlined),
+                          label: const Text('Расформировать корзину'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed:
+                              _clientCartActionBusy || selectedUserBlocked
+                              ? null
+                              : _blockSelectedClient,
+                          icon: const Icon(Icons.block_outlined),
+                          label: const Text('Заблокировать клиента'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_clientCartLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: LinearProgressIndicator(minHeight: 2),
+              ),
+            if (_selectedClientCartItems.isEmpty && !_clientCartLoading)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Text('У клиента нет активных товаров в корзине'),
+                ),
+              )
+            else
+              ..._selectedClientCartItems.map((item) {
+                final title = (item['title'] ?? 'Товар').toString().trim();
+                final qty = _toInt(item['quantity']);
+                final status = (item['status'] ?? '').toString().trim();
+                final price = _toDouble(item['price']);
+                final lineTotal = _toDouble(item['line_total']) > 0
+                    ? _toDouble(item['line_total'])
+                    : price * qty;
+                final linkedToDelivery = item['linked_to_delivery'] == true;
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 4),
+                        Text('Количество: $qty • Статус: $status'),
+                        Text(
+                          'Цена: ${_formatMoney(price)} • Сумма: ${_formatMoney(lineTotal)}',
+                        ),
+                        if (linkedToDelivery)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 4),
+                            child: Text(
+                              'Товар уже в маршруте доставки',
+                              style: TextStyle(
+                                color: Colors.orange,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            OutlinedButton.icon(
+                              onPressed: _clientCartActionBusy
+                                  ? null
+                                  : () => _editSelectedCartItem(item),
+                              icon: const Icon(Icons.edit_outlined),
+                              label: const Text('Изменить цену/описание'),
+                            ),
+                            OutlinedButton.icon(
+                              onPressed:
+                                  _clientCartActionBusy || linkedToDelivery
+                                  ? null
+                                  : () => _removeSelectedCartItem(item),
+                              icon: const Icon(Icons.delete_outline),
+                              label: const Text('Удалить товар'),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+          ],
           const SizedBox(height: 24),
         ],
       ),
@@ -7364,7 +8854,7 @@ class _AdminPanelState extends State<AdminPanel>
               const InputDecoration(
                 labelText: 'Сумма для попадания в доставку',
                 border: OutlineInputBorder(),
-                helperText: 'Сумма в RUB',
+                helperText: 'Сумма в ₽',
               ),
               controller: _deliveryThresholdCtrl,
             ),
@@ -7951,9 +9441,17 @@ class _AdminPanelState extends State<AdminPanel>
 }
 
 class _AvatarPlacementResult {
-  const _AvatarPlacementResult({required this.croppedPath});
+  const _AvatarPlacementResult({
+    this.croppedPath,
+    required this.focusX,
+    required this.focusY,
+    required this.zoom,
+  });
 
-  final String croppedPath;
+  final String? croppedPath;
+  final double focusX;
+  final double focusY;
+  final double zoom;
 }
 
 class _CircleCutoutPainter extends CustomPainter {

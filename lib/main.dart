@@ -50,8 +50,6 @@ final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
 
 const _notificationsPrefPrefix = 'notifications_enabled_';
 const _themePrefPrefix = 'theme_mode_dark_';
-const _lightSeedPrefPrefix = 'theme_light_seed_';
-const _darkSeedPrefPrefix = 'theme_dark_seed_';
 const _uiDensityPrefPrefix = 'ui_density_';
 const _uiCardSizePrefPrefix = 'ui_card_size_';
 const _performanceModePrefPrefix = 'performance_mode_';
@@ -138,50 +136,21 @@ String _settingsScopeUserId() {
   return 'guest';
 }
 
-Color _colorFromHex(String raw, Color fallback) {
-  final cleaned = raw.trim().replaceAll('#', '');
-  if (!RegExp(r'^[0-9a-fA-F]{6,8}$').hasMatch(cleaned)) return fallback;
-  final normalized = cleaned.length == 6 ? 'FF$cleaned' : cleaned;
-  final value = int.tryParse(normalized, radix: 16);
-  if (value == null) return fallback;
-  return Color(value);
-}
-
-String _colorToHex(Color color) {
-  return '#${color.toARGB32().toRadixString(16).padLeft(8, '0').substring(2).toUpperCase()}';
-}
-
 VisualDensity _resolveVisualDensity() {
-  switch (uiDensityNotifier.value) {
-    case 'compact':
-      return const VisualDensity(horizontal: -2, vertical: -2);
-    case 'comfortable':
-      return const VisualDensity(horizontal: 0, vertical: 0);
-    case 'spacious':
-      return const VisualDensity(horizontal: 1, vertical: 1);
-    case 'standard':
-    default:
-      return VisualDensity.standard;
-  }
+  return VisualDensity.standard;
 }
 
 double _resolveCardScale() {
-  switch (uiCardSizeNotifier.value) {
-    case 'compact':
-      return 0.9;
-    case 'large':
-      return 1.12;
-    case 'standard':
-    default:
-      return 1;
-  }
+  return 1;
 }
 
 ThemeData _buildLightTheme() {
+  final highContrast = performanceModeNotifier.value;
   final base = AppTheme.light(
     seedColor: lightThemeSeedNotifier.value,
     visualDensity: _resolveVisualDensity(),
     cardScale: _resolveCardScale(),
+    highContrast: highContrast,
   );
   if (!performanceModeNotifier.value) return base;
   return base.copyWith(
@@ -189,8 +158,8 @@ ThemeData _buildLightTheme() {
     pageTransitionsTheme: const PageTransitionsTheme(
       builders: {
         TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
-        TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
-        TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
+        TargetPlatform.iOS: FadeUpwardsPageTransitionsBuilder(),
+        TargetPlatform.macOS: FadeUpwardsPageTransitionsBuilder(),
         TargetPlatform.windows: FadeUpwardsPageTransitionsBuilder(),
         TargetPlatform.linux: FadeUpwardsPageTransitionsBuilder(),
       },
@@ -199,10 +168,12 @@ ThemeData _buildLightTheme() {
 }
 
 ThemeData _buildDarkTheme() {
+  final highContrast = performanceModeNotifier.value;
   final base = AppTheme.dark(
     seedColor: darkThemeSeedNotifier.value,
     visualDensity: _resolveVisualDensity(),
     cardScale: _resolveCardScale(),
+    highContrast: highContrast,
   );
   if (!performanceModeNotifier.value) return base;
   return base.copyWith(
@@ -210,11 +181,29 @@ ThemeData _buildDarkTheme() {
     pageTransitionsTheme: const PageTransitionsTheme(
       builders: {
         TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
-        TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
-        TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
+        TargetPlatform.iOS: FadeUpwardsPageTransitionsBuilder(),
+        TargetPlatform.macOS: FadeUpwardsPageTransitionsBuilder(),
         TargetPlatform.windows: FadeUpwardsPageTransitionsBuilder(),
         TargetPlatform.linux: FadeUpwardsPageTransitionsBuilder(),
       },
+    ),
+  );
+}
+
+Widget _wrapAppRoot(BuildContext context, Widget child) {
+  final reduced = performanceModeNotifier.value;
+  final host = _GlobalNoticeHost(child: child);
+  if (!reduced) {
+    return ScaffoldMessenger(child: host);
+  }
+  final media = MediaQuery.maybeOf(context);
+  if (media == null) {
+    return ScaffoldMessenger(child: host);
+  }
+  return ScaffoldMessenger(
+    child: MediaQuery(
+      data: media.copyWith(disableAnimations: true),
+      child: host,
     ),
   );
 }
@@ -236,37 +225,19 @@ Future<void> refreshUserPreferences() async {
   final notifications =
       prefs.getBool('$_notificationsPrefPrefix$scope') ?? true;
   final darkMode = prefs.getBool('$_themePrefPrefix$scope') ?? false;
-  final lightSeedHex =
-      prefs.getString('$_lightSeedPrefPrefix$scope') ?? '#2F6BFF';
-  final darkSeedHex =
-      prefs.getString('$_darkSeedPrefPrefix$scope') ?? '#7A4DFF';
-  final density = prefs.getString('$_uiDensityPrefPrefix$scope') ?? 'standard';
-  final cardSize =
-      prefs.getString('$_uiCardSizePrefPrefix$scope') ?? 'standard';
   final performanceMode =
       prefs.getBool('$_performanceModePrefPrefix$scope') ?? false;
 
   notificationsEnabledNotifier.value = notifications;
   themeModeNotifier.value = darkMode ? ThemeMode.dark : ThemeMode.light;
-  lightThemeSeedNotifier.value = _colorFromHex(
-    lightSeedHex,
-    const Color(0xFF2F6BFF),
-  );
-  darkThemeSeedNotifier.value = _colorFromHex(
-    darkSeedHex,
-    const Color(0xFF7A4DFF),
-  );
-  uiDensityNotifier.value = switch (density) {
-    'compact' => 'compact',
-    'comfortable' => 'comfortable',
-    'spacious' => 'spacious',
-    _ => 'standard',
-  };
-  uiCardSizeNotifier.value = switch (cardSize) {
-    'compact' => 'compact',
-    'large' => 'large',
-    _ => 'standard',
-  };
+  // Цветовая схема фиксирована: только светлая/тёмная тема без кастомных цветов.
+  lightThemeSeedNotifier.value = const Color(0xFF2F6BFF);
+  darkThemeSeedNotifier.value = const Color(0xFF7A4DFF);
+  // Плотность/масштаб карточек больше не настраиваются пользователем.
+  uiDensityNotifier.value = 'standard';
+  uiCardSizeNotifier.value = 'standard';
+  await prefs.remove('$_uiDensityPrefPrefix$scope');
+  await prefs.remove('$_uiCardSizePrefPrefix$scope');
   performanceModeNotifier.value = performanceMode;
   _applyPerformanceRuntimeTuning(performanceMode);
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
@@ -286,47 +257,19 @@ Future<void> setDarkModeEnabled(bool value) async {
   themeModeNotifier.value = value ? ThemeMode.dark : ThemeMode.light;
 }
 
-Future<void> setThemeSeedColors({Color? lightSeed, Color? darkSeed}) async {
-  final prefs = await SharedPreferences.getInstance();
-  final scope = _settingsScopeUserId();
-  if (lightSeed != null) {
-    await prefs.setString(
-      '$_lightSeedPrefPrefix$scope',
-      _colorToHex(lightSeed),
-    );
-    lightThemeSeedNotifier.value = lightSeed;
-  }
-  if (darkSeed != null) {
-    await prefs.setString('$_darkSeedPrefPrefix$scope', _colorToHex(darkSeed));
-    darkThemeSeedNotifier.value = darkSeed;
-  }
-  themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
-}
-
 Future<void> setUiDensityPreset(String value) async {
-  final normalized = switch (value) {
-    'compact' => 'compact',
-    'comfortable' => 'comfortable',
-    'spacious' => 'spacious',
-    _ => 'standard',
-  };
   final prefs = await SharedPreferences.getInstance();
   final scope = _settingsScopeUserId();
-  await prefs.setString('$_uiDensityPrefPrefix$scope', normalized);
-  uiDensityNotifier.value = normalized;
+  await prefs.remove('$_uiDensityPrefPrefix$scope');
+  uiDensityNotifier.value = 'standard';
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
 
 Future<void> setUiCardSizePreset(String value) async {
-  final normalized = switch (value) {
-    'compact' => 'compact',
-    'large' => 'large',
-    _ => 'standard',
-  };
   final prefs = await SharedPreferences.getInstance();
   final scope = _settingsScopeUserId();
-  await prefs.setString('$_uiCardSizePrefPrefix$scope', normalized);
-  uiCardSizeNotifier.value = normalized;
+  await prefs.remove('$_uiCardSizePrefPrefix$scope');
+  uiCardSizeNotifier.value = 'standard';
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
 
@@ -463,6 +406,9 @@ class _GlobalNoticeHost extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        (MediaQuery.maybeOf(context)?.disableAnimations == true);
     return LayoutBuilder(
       builder: (context, constraints) {
         if (!constraints.hasBoundedWidth || !constraints.hasBoundedHeight) {
@@ -481,7 +427,9 @@ class _GlobalNoticeHost extends StatelessWidget {
                     valueListenable: _appNoticeNotifier,
                     builder: (context, notice, _) {
                       return AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
+                        duration: reducedMotion
+                            ? Duration.zero
+                            : const Duration(milliseconds: 220),
                         switchInCurve: Curves.easeOut,
                         switchOutCurve: Curves.easeIn,
                         child: notice == null
@@ -1221,13 +1169,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
               ),
             ),
             builder: (context, child) {
-              final wrapped = TickerMode(
-                enabled: !performanceModeNotifier.value,
-                child: child ?? const SizedBox.shrink(),
-              );
-              return ScaffoldMessenger(
-                child: _GlobalNoticeHost(child: wrapped),
-              );
+              return _wrapAppRoot(context, child ?? const SizedBox.shrink());
             },
           );
         },
@@ -1258,11 +1200,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             '/main': (_) => const MainShell(),
           },
           builder: (context, child) {
-            final wrapped = TickerMode(
-              enabled: !performanceModeNotifier.value,
-              child: child ?? const SizedBox.shrink(),
-            );
-            return ScaffoldMessenger(child: _GlobalNoticeHost(child: wrapped));
+            return _wrapAppRoot(context, child ?? const SizedBox.shrink());
           },
         );
       },

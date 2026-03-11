@@ -6,6 +6,12 @@ const db = require("../db");
 const { authMiddleware } = require("../utils/auth");
 const { requireRole } = require("../utils/roles");
 const { emitToTenant } = require("../utils/socket");
+const { createRateGuard } = require("../utils/rateGuard");
+const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
+const {
+  encryptMessageText,
+  decryptMessageRow,
+} = require("../utils/messageCrypto");
 
 const TICKET_STATUSES = new Set([
   "open",
@@ -15,6 +21,28 @@ const TICKET_STATUSES = new Set([
 ]);
 
 const STAFF_ROLES = new Set(["worker", "admin", "tenant", "creator"]);
+
+const supportAskRateGuard = createRateGuard({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_SUPPORT_ASK_MAX || 18),
+  blockMs: 45 * 1000,
+  message: "Слишком много сообщений в поддержку. Повторите немного позже.",
+  keyResolver: (req) =>
+    [req.ip || "", req.user?.tenant_id || "", req.user?.id || "", "support-ask"].join(
+      "|",
+    ),
+});
+
+const supportBugRateGuard = createRateGuard({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_BUG_REPORT_MAX || 8),
+  blockMs: 60 * 1000,
+  message: "Слишком много баг-репортов за минуту. Попробуйте позже.",
+  keyResolver: (req) =>
+    [req.ip || "", req.user?.tenant_id || "", req.user?.id || "", "support-bug"].join(
+      "|",
+    ),
+});
 
 function normalizeRole(raw) {
   return String(raw || "")
@@ -36,8 +64,14 @@ function normalizeSettings(raw) {
   return raw;
 }
 
-function buildCartSummaryReply(total, processed) {
-  return `Общая сумма вашей корзины: ${total} RUB. Обработано на сумму: ${processed} RUB.`;
+function toMoney(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(2));
+}
+
+function buildCartSummaryReply(total, processed, claimsTotal) {
+  return `Общая сумма вашей корзины: ${total} ₽. Обработано на сумму: ${processed} ₽. Сумма брака: ${claimsTotal} ₽.`;
 }
 
 function normalizeText(value) {
@@ -124,7 +158,7 @@ async function hydrateMessageById(messageId, currentUserId = null) {
      LIMIT 1`,
     [messageId, currentUserId ? String(currentUserId) : null],
   );
-  return result.rows[0] || null;
+  return decryptMessageRow(result.rows[0] || null);
 }
 
 async function emitChatMessage(req, tenantId, chatId, messageId) {
@@ -155,14 +189,19 @@ async function emitChatCreated(req, tenantId, chat) {
 }
 
 async function insertSupportMessage(client, { chatId, senderId = null, text, meta = {} }) {
+  const plainText = String(text || "");
+  const encryptedText = encryptMessageText(plainText);
   const inserted = await client.query(
     `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
      VALUES ($1, $2, $3, $4, $5::jsonb, now())
      RETURNING id, chat_id, sender_id, text, meta, created_at`,
-    [uuidv4(), chatId, senderId, String(text || ""), JSON.stringify(meta || {})],
+    [uuidv4(), chatId, senderId, encryptedText, JSON.stringify(meta || {})],
   );
   await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
-  return inserted.rows[0];
+  return {
+    ...inserted.rows[0],
+    text: plainText,
+  };
 }
 
 async function ensureSupportStaffMembers(client, chatId, tenantId = null) {
@@ -319,11 +358,13 @@ async function openOrReuseSupportTicket(client, user, messageText) {
   let chatRecord;
   let createdChat = false;
   let createdTicket = false;
+  let ticketSubject = "";
 
   if (existingRes.rowCount > 0) {
     const row = existingRes.rows[0];
     chatId = row.chat_id;
     ticketId = row.id;
+    ticketSubject = String(row.subject || "");
 
     await client.query(
       `UPDATE support_tickets
@@ -374,7 +415,7 @@ async function openOrReuseSupportTicket(client, user, messageText) {
       [chatId, "Поддержка", user.id, tenantId, JSON.stringify(settings)],
     );
 
-    const ticketSubject =
+    ticketSubject =
       category === "product"
         ? "Вопрос по товару"
         : category === "delivery"
@@ -454,8 +495,32 @@ async function openOrReuseSupportTicket(client, user, messageText) {
     meta: customerMeta,
   });
 
+  let autoReplyMessage = null;
+  const autoReply = await buildSupportTemplateAutoReply(client, {
+    tenantId,
+    category,
+    customerId: user.id,
+    subject: ticketSubject,
+    messageText,
+  });
+  if (autoReply?.text) {
+    autoReplyMessage = await insertSupportMessage(client, {
+      chatId,
+      senderId: null,
+      text: autoReply.text,
+      meta: {
+        kind: "support_bot_template_reply",
+        support_ticket_id: ticketId,
+        support_category: category,
+        template_id: autoReply.template.id,
+        template_title: autoReply.template.title,
+        trigger_rule: autoReply.template.trigger_rule,
+      },
+    });
+  }
+
   let introMessage = null;
-  if (createdTicket) {
+  if (createdTicket && !autoReplyMessage) {
     const assigneeName = normalizeText(assignee?.name || assignee?.email || "");
     const intro = assigneeName
       ? `Ваш вопрос принят. Ответственный: ${assigneeName}.`
@@ -502,24 +567,34 @@ async function openOrReuseSupportTicket(client, user, messageText) {
     createdChat,
     createdTicket,
     customerMessage,
+    autoReplyMessage,
     introMessage,
   };
 }
 
 async function computeCartSummary(userId) {
-  const result = await db.query(
+  const cartRows = await db.query(
     `SELECT c.status, c.quantity, p.price
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
-     WHERE c.user_id = $1`,
+     WHERE c.user_id = $1
+       AND c.status IN ('pending_processing', 'processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')`,
+    [userId],
+  );
+  const claimsRows = await db.query(
+    `SELECT COALESCE(SUM(approved_amount), 0)::numeric AS claims_total
+     FROM customer_claims
+     WHERE user_id = $1
+       AND status IN ('approved_return', 'approved_discount', 'settled')`,
     [userId],
   );
 
   let total = 0;
   let processed = 0;
 
-  for (const row of result.rows) {
-    const line = Number(row.price) * Number(row.quantity);
+  for (const row of cartRows.rows) {
+    const line = Number(row.price || 0) * Number(row.quantity || 0);
+    if (!Number.isFinite(line)) continue;
     total += line;
     if (
       row.status === "processed" ||
@@ -531,7 +606,14 @@ async function computeCartSummary(userId) {
     }
   }
 
-  return { total, processed };
+  const claimsTotal = toMoney(claimsRows.rows[0]?.claims_total);
+  const adjustedTotal = Math.max(0, toMoney(total - claimsTotal));
+  const adjustedProcessed = Math.max(0, toMoney(processed - claimsTotal));
+  return {
+    total: adjustedTotal,
+    processed: adjustedProcessed,
+    claims_total: claimsTotal,
+  };
 }
 
 async function ensureBugReportsChannel(client, createdBy, tenantId = null) {
@@ -635,7 +717,7 @@ async function ensureAdminCreatorMembers(client, chatId, tenantId = null) {
   }
 }
 
-router.post("/ask", authMiddleware, async (req, res) => {
+router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
   const message = normalizeText(req.body?.message);
   if (!message) {
     return res.status(400).json({ ok: false, error: "Введите вопрос" });
@@ -648,7 +730,13 @@ router.post("/ask", authMiddleware, async (req, res) => {
         ok: true,
         data: {
           mode: "quick_reply",
-          reply: buildCartSummaryReply(sums.total, sums.processed),
+          source: "cart_summary",
+          reply: buildCartSummaryReply(sums.total, sums.processed, sums.claims_total),
+          totals: {
+            cart_total: sums.total,
+            processed_total: sums.processed,
+            claims_total: sums.claims_total,
+          },
         },
       });
     }
@@ -686,6 +774,29 @@ router.post("/ask", authMiddleware, async (req, res) => {
         result.introMessage.chat_id,
         result.introMessage.id,
       );
+    }
+    if (result.autoReplyMessage?.id) {
+      await emitChatMessage(
+        req,
+        req.user.tenant_id || null,
+        result.autoReplyMessage.chat_id,
+        result.autoReplyMessage.id,
+      );
+    }
+
+    const autoReplyText = normalizeText(result.autoReplyMessage?.text || "");
+    if (autoReplyText) {
+      return res.status(201).json({
+        ok: true,
+        data: {
+          mode: "quick_reply",
+          reply: autoReplyText,
+          source: "template_auto_reply",
+          chat_id: result.chat?.id || result.ticket?.chat_id || null,
+          chat_title: result.chat?.title || "Поддержка",
+          ticket: result.ticket,
+        },
+      });
     }
 
     const assigneeName = normalizeText(
@@ -993,7 +1104,7 @@ router.post(
 );
 
 // Отправить баг-репорт в отдельный приватный канал для admin/creator
-router.post("/bug-report", authMiddleware, async (req, res) => {
+router.post("/bug-report", authMiddleware, supportBugRateGuard, async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) {
     return res
@@ -1056,7 +1167,13 @@ router.post("/bug-report", authMiddleware, async (req, res) => {
       `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
        VALUES ($1, $2, $3, $4, $5::jsonb, now())
        RETURNING id, chat_id, sender_id, text, meta, created_at`,
-      [uuidv4(), channel.id, reporter.id, text, JSON.stringify(meta)],
+      [
+        uuidv4(),
+        channel.id,
+        reporter.id,
+        encryptMessageText(text),
+        JSON.stringify(meta),
+      ],
     );
 
     await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
@@ -1077,7 +1194,10 @@ router.post("/bug-report", authMiddleware, async (req, res) => {
       });
       io.to(`chat:${channel.id}`).emit("chat:message", {
         chatId: channel.id,
-        message: messageInsert.rows[0],
+        message: {
+          ...messageInsert.rows[0],
+          text,
+        },
       });
     }
 

@@ -13,6 +13,10 @@ const {
   writeEncryptedTextParams,
 } = require("../utils/secureData");
 const { emitToTenant } = require("../utils/socket");
+const {
+  encryptMessageText,
+  decryptMessageRow,
+} = require("../utils/messageCrypto");
 
 const requireDeliveryManagePermission = requirePermission("delivery.manage");
 
@@ -1759,7 +1763,7 @@ async function hydrateSystemMessage(queryable, messageId) {
      LIMIT 1`,
     [messageId],
   );
-  return result.rows[0] || null;
+  return decryptMessageRow(result.rows[0] || null);
 }
 
 function buildDeliveryOfferText(customer, batch) {
@@ -1768,7 +1772,7 @@ function buildDeliveryOfferText(customer, batch) {
   return [
     batch.delivery_label || "Доставка",
     `Номер телефона: ${phone}`,
-    `Обработано товара на сумму: ${amount} RUB`,
+    `Обработано товара на сумму: ${amount} ₽`,
     "Согласны принять доставку?",
     "Если да, нажмите кнопку подтверждения и отправьте адрес доставки.",
     "Доставка обычно идет с 10:00 до 16:00. При желании укажите время 'после' или 'до'.",
@@ -2523,7 +2527,7 @@ router.post(
           [
             uuidv4(),
             chat.id,
-            buildDeliveryOfferText(customer, batch),
+            encryptMessageText(buildDeliveryOfferText(customer, batch)),
             JSON.stringify(meta),
           ],
         );
@@ -3123,13 +3127,15 @@ router.post(
         [
           uuidv4(),
           chat.id,
-          accepted
-            ? buildDeliveryAcceptedText(
-                nextAddressText,
-                preferredWindow.fromText,
-                preferredWindow.toText,
-              )
-            : buildDeliveryDeclinedText(),
+          encryptMessageText(
+            accepted
+              ? buildDeliveryAcceptedText(
+                  nextAddressText,
+                  preferredWindow.fromText,
+                  preferredWindow.toText,
+                )
+              : buildDeliveryDeclinedText(),
+          ),
           JSON.stringify({
             kind: "delivery_offer_result",
             delivery_batch_id: customer.batch_id,
@@ -3461,13 +3467,15 @@ router.post(
         [
           uuidv4(),
           chat.id,
-          accepted
-            ? buildDeliveryAcceptedText(
-                nextAddressText,
-                preferredWindow.fromText,
-                preferredWindow.toText,
-              )
-            : buildDeliveryDeclinedText(),
+          encryptMessageText(
+            accepted
+              ? buildDeliveryAcceptedText(
+                  nextAddressText,
+                  preferredWindow.fromText,
+                  preferredWindow.toText,
+                )
+              : buildDeliveryDeclinedText(),
+          ),
           JSON.stringify({
             kind: "delivery_offer_result",
             delivery_batch_id: customer.batch_id,
@@ -4195,10 +4203,12 @@ router.post(
         [
           uuidv4(),
           chat.id,
-          buildDeliveryAcceptedText(
-            geocoded.address_text,
-            preferredWindow.fromText,
-            preferredWindow.toText,
+          encryptMessageText(
+            buildDeliveryAcceptedText(
+              geocoded.address_text,
+              preferredWindow.fromText,
+              preferredWindow.toText,
+            ),
           ),
           JSON.stringify({
             kind: "delivery_offer_result",

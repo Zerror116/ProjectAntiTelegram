@@ -12,6 +12,7 @@ const { requireRole } = require('../utils/roles');
 const requirePermission = require('../middleware/requirePermission');
 const { emitToTenant } = require('../utils/socket');
 const { guardAction } = require('../utils/antifraud');
+const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
 
 const requireReservationFulfillPermission = requirePermission('reservation.fulfill');
 const requireDeliveryManagePermission = requirePermission('delivery.manage');
@@ -59,6 +60,16 @@ function toMoney(value, fallback = 0) {
   const raw = Number(value);
   const normalized = Number.isFinite(raw) ? raw : Number(fallback || 0);
   return Math.round(normalized * 100) / 100;
+}
+
+function normalizePhoneDigits(raw) {
+  return String(raw || '').replace(/\D/g, '').slice(0, 20);
+}
+
+function normalizeNullableText(raw, { max = 1000 } = {}) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  return text.slice(0, max);
 }
 
 function emitCartUpdated(req, userId, payload = {}) {
@@ -113,11 +124,175 @@ function productMessageText(product) {
   const lines = [
     `🛒 ${product.title}`,
     product.description ? String(product.description).trim() : null,
-    `Цена: ${product.price} RUB`,
+    `Цена: ${product.price} ₽`,
     `Количество в наличии: ${product.quantity}`,
     'Нажмите "Купить", чтобы добавить в корзину',
   ].filter(Boolean);
   return lines.join('\n');
+}
+
+async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQuantity }) {
+  const itemQ = await client.query(
+    `SELECT c.id,
+            c.user_id,
+            c.product_id,
+            c.quantity,
+            c.status,
+            p.id AS p_id,
+            p.product_code,
+            p.title,
+            p.description,
+            p.price,
+            p.quantity AS product_quantity,
+            p.image_url,
+            p.status AS product_status
+     FROM cart_items c
+     JOIN users u ON u.id = c.user_id
+     JOIN products p ON p.id = c.product_id
+     WHERE c.id = $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     LIMIT 1
+     FOR UPDATE OF c, p`,
+    [cartItemId, tenantId || null],
+  );
+  if (itemQ.rowCount === 0) {
+    return { ok: false, error: 'not_found' };
+  }
+
+  const item = itemQ.rows[0];
+  const itemStatus = String(item.status || '').trim();
+  if (itemStatus === 'delivered') {
+    return { ok: false, error: 'delivered' };
+  }
+
+  const linkedToDeliveryBatchQ = await client.query(
+    `SELECT di.id
+     FROM delivery_batch_items di
+     WHERE di.cart_item_id = $1
+     LIMIT 1
+     FOR UPDATE`,
+    [cartItemId],
+  );
+  if (linkedToDeliveryBatchQ.rowCount > 0) {
+    return { ok: false, error: 'in_delivery_batch' };
+  }
+
+  const reservationQ = await client.query(
+    `SELECT id, reserved_channel_message_id
+     FROM reservations
+     WHERE cart_item_id = $1
+     LIMIT 1
+     FOR UPDATE`,
+    [cartItemId],
+  );
+
+  const itemQuantity = Number(item.quantity) || 0;
+  const requestedCancelRaw = Number(requestedQuantity ?? itemQuantity);
+  const cancelQuantity =
+    Number.isFinite(requestedCancelRaw) && requestedCancelRaw > 0
+      ? Math.min(itemQuantity, Math.floor(requestedCancelRaw))
+      : itemQuantity;
+  if (cancelQuantity <= 0) {
+    return { ok: false, error: 'invalid_quantity' };
+  }
+  const remainingQuantity = Math.max(0, itemQuantity - cancelQuantity);
+
+  const restored = await client.query(
+    `UPDATE products
+     SET quantity = quantity + $1,
+         updated_at = now()
+     WHERE id = $2
+     RETURNING id, product_code, title, description, price, quantity, image_url, status`,
+    [cancelQuantity, item.product_id],
+  );
+  const updatedProduct = restored.rows[0];
+
+  let removedReservedMessage = null;
+  let updatedReservedMessage = null;
+  if (reservationQ.rowCount > 0) {
+    const reservedMessageId = reservationQ.rows[0].reserved_channel_message_id;
+    if (remainingQuantity <= 0) {
+      if (reservedMessageId) {
+        const removedMsg = await client.query(
+          `DELETE FROM messages
+           WHERE id = $1
+           RETURNING id, chat_id`,
+          [reservedMessageId],
+        );
+        if (removedMsg.rowCount > 0) {
+          removedReservedMessage = removedMsg.rows[0];
+        }
+      }
+      await client.query('DELETE FROM reservations WHERE id = $1', [reservationQ.rows[0].id]);
+    } else {
+      await client.query(
+        `UPDATE reservations
+         SET quantity = $1,
+             updated_at = now()
+         WHERE id = $2`,
+        [remainingQuantity, reservationQ.rows[0].id],
+      );
+      if (reservedMessageId) {
+        const updatedMsg = await client.query(
+          `UPDATE messages
+           SET meta = jsonb_set(
+                 COALESCE(meta, '{}'::jsonb),
+                 '{quantity}',
+                 to_jsonb($2::int),
+                 true
+               )
+           WHERE id = $1
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [reservedMessageId, remainingQuantity],
+        );
+        if (updatedMsg.rowCount > 0) {
+          updatedReservedMessage = updatedMsg.rows[0];
+        }
+      }
+    }
+  }
+
+  if (remainingQuantity <= 0) {
+    await client.query('DELETE FROM cart_items WHERE id = $1', [cartItemId]);
+  } else {
+    await client.query(
+      `UPDATE cart_items
+       SET quantity = $1,
+           updated_at = now()
+       WHERE id = $2`,
+      [remainingQuantity, cartItemId],
+    );
+  }
+
+  const msgUpdate = await client.query(
+    `UPDATE messages
+     SET text = $1,
+         meta = jsonb_set(
+           COALESCE(meta, '{}'::jsonb),
+           '{quantity}',
+           to_jsonb($2::int),
+           true
+         )
+     WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
+       AND COALESCE(meta->>'product_id', '') = $3
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [
+      encryptMessageText(productMessageText(updatedProduct)),
+      Number(updatedProduct.quantity),
+      String(item.product_id),
+    ],
+  );
+
+  return {
+    ok: true,
+    item,
+    updatedProduct,
+    cancelQuantity,
+    remainingQuantity,
+    updatedCatalogMessages: msgUpdate.rows || [],
+    updatedReservedMessage,
+    removedReservedMessage,
+  };
 }
 
 // Добавить товар в корзину
@@ -331,7 +506,11 @@ router.post('/add', authMiddleware, async (req, res) => {
        WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
          AND COALESCE(meta->>'product_id', '') = $3
        RETURNING id, chat_id, sender_id, text, meta, created_at`,
-      [productMessageText(updatedProduct), Number(updatedProduct.quantity), productId]
+      [
+        encryptMessageText(productMessageText(updatedProduct)),
+        Number(updatedProduct.quantity),
+        productId,
+      ]
     );
 
     await client.query('COMMIT');
@@ -341,7 +520,7 @@ router.post('/add', authMiddleware, async (req, res) => {
       for (const message of msgUpdate.rows) {
         io.to(`chat:${message.chat_id}`).emit('chat:message', {
           chatId: message.chat_id,
-          message,
+          message: decryptMessageRow(message),
         });
         emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
           chatId: message.chat_id,
@@ -389,8 +568,10 @@ router.get('/', authMiddleware, async (req, res) => {
               c.updated_at,
               p.product_code,
               p.title,
-              p.description,
-              p.price,
+              COALESCE(c.custom_description, p.description) AS description,
+              COALESCE(c.custom_price, p.price) AS price,
+              c.custom_price,
+              c.custom_description,
               p.image_url,
               delivery.delivery_date,
               delivery.courier_name,
@@ -463,8 +644,10 @@ router.get('/', authMiddleware, async (req, res) => {
               c.updated_at,
               p.product_code,
               p.title,
-              p.description,
-              p.price,
+              COALESCE(c.custom_description, p.description) AS description,
+              COALESCE(c.custom_price, p.price) AS price,
+              c.custom_price,
+              c.custom_description,
               p.image_url
        FROM latest_batches lb
        JOIN delivery_batch_items di ON di.batch_id = lb.id
@@ -488,6 +671,7 @@ router.get('/', authMiddleware, async (req, res) => {
               cc.image_url,
               cc.requested_amount,
               cc.approved_amount,
+              cc.customer_discount_status,
               cc.resolution_note,
               cc.handled_by,
               cc.handled_at,
@@ -804,7 +988,11 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
        WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
          AND COALESCE(meta->>'product_id', '') = $3
        RETURNING id, chat_id, sender_id, text, meta, created_at`,
-      [productMessageText(updatedProduct), Number(updatedProduct.quantity), String(item.product_id)]
+      [
+        encryptMessageText(productMessageText(updatedProduct)),
+        Number(updatedProduct.quantity),
+        String(item.product_id),
+      ]
     );
 
     await client.query('COMMIT');
@@ -814,7 +1002,7 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       for (const message of msgUpdate.rows) {
         io.to(`chat:${message.chat_id}`).emit('chat:message', {
           chatId: message.chat_id,
-          message,
+          message: decryptMessageRow(message),
         });
         emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
           chatId: message.chat_id,
@@ -823,7 +1011,7 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       if (updatedReservedMessage) {
         io.to(`chat:${updatedReservedMessage.chat_id}`).emit('chat:message', {
           chatId: updatedReservedMessage.chat_id,
-          message: updatedReservedMessage,
+          message: decryptMessageRow(updatedReservedMessage),
         });
         emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
           chatId: updatedReservedMessage.chat_id,
@@ -902,12 +1090,15 @@ router.patch(
     }
 
     const upd = await db.query(
-      `UPDATE cart_items
+      `UPDATE cart_items c
        SET status = $1,
            updated_at = now()
-       WHERE id = $2
-       RETURNING id, user_id, product_id, quantity, status, created_at, updated_at`,
-      [status, id]
+       FROM users u
+       WHERE c.id = $2
+         AND u.id = c.user_id
+         AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
+       RETURNING c.id, c.user_id, c.product_id, c.quantity, c.status, c.created_at, c.updated_at`,
+      [status, id, req.user?.tenant_id || null]
     );
     if (upd.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Позиция не найдена' });
@@ -925,6 +1116,555 @@ router.patch(
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });
+
+router.get(
+  '/admin/clients/by-phone',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    try {
+      const tenantId = req.user?.tenant_id || null;
+      const query = String(req.query?.q || '').trim();
+      const digits = normalizePhoneDigits(query);
+      const limitRaw = Number(req.query?.limit);
+      const limit = Number.isFinite(limitRaw)
+        ? Math.max(1, Math.min(50, Math.floor(limitRaw)))
+        : 20;
+
+      if (digits.length < 4) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Введите минимум 4 цифры номера',
+        });
+      }
+
+      const foundQ = await db.query(
+        `SELECT u.id,
+                u.name,
+                u.email,
+                u.role,
+                u.is_active,
+                u.block_reason,
+                u.created_at,
+                p.phone,
+                regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') AS phone_digits
+         FROM users u
+         LEFT JOIN phones p ON p.user_id = u.id
+         WHERE u.id <> $1
+           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+           AND u.role = 'client'
+           AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE ('%' || $3::text)
+         ORDER BY u.created_at DESC
+         LIMIT $4`,
+        [req.user?.id || null, tenantId, digits, limit],
+      );
+
+      return res.json({
+        ok: true,
+        data: foundQ.rows.map((row) => ({
+          id: row.id,
+          name: row.name || '',
+          email: row.email || '',
+          role: row.role || '',
+          phone: row.phone || '',
+          is_active: row.is_active !== false,
+          block_reason: row.block_reason || '',
+          created_at: row.created_at || null,
+        })),
+      });
+    } catch (err) {
+      console.error('cart.admin.clientsByPhone error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
+
+router.get(
+  '/admin/clients/:userId/cart',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    try {
+      const userId = String(req.params?.userId || '').trim();
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'userId обязателен' });
+      }
+
+      const tenantId = req.user?.tenant_id || null;
+      const userQ = await db.query(
+        `SELECT u.id,
+                u.name,
+                u.email,
+                u.role,
+                u.is_active,
+                u.block_reason,
+                p.phone
+         FROM users u
+         LEFT JOIN phones p ON p.user_id = u.id
+         WHERE u.id = $1
+           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+         LIMIT 1`,
+        [userId, tenantId],
+      );
+      if (userQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: 'Клиент не найден' });
+      }
+
+      const itemsQ = await db.query(
+        `SELECT c.id,
+                c.user_id,
+                c.product_id,
+                c.quantity,
+                c.status,
+                c.created_at,
+                c.updated_at,
+                c.custom_price,
+                c.custom_description,
+                p.product_code,
+                p.title,
+                COALESCE(c.custom_description, p.description) AS description,
+                COALESCE(c.custom_price, p.price) AS price,
+                p.image_url,
+                EXISTS (
+                  SELECT 1
+                  FROM delivery_batch_items di
+                  WHERE di.cart_item_id = c.id
+                ) AS linked_to_delivery
+         FROM cart_items c
+         JOIN products p ON p.id = c.product_id
+         WHERE c.user_id = $1
+           AND c.status <> 'delivered'
+         ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
+        [userId],
+      );
+
+      const items = itemsQ.rows.map((row) => {
+        const quantity = Number(row.quantity) || 0;
+        const price = toMoney(row.price, 0);
+        return {
+          ...row,
+          quantity,
+          price,
+          line_total: toMoney(price * quantity, 0),
+        };
+      });
+
+      return res.json({
+        ok: true,
+        data: {
+          user: userQ.rows[0],
+          items,
+          total_sum: toMoney(items.reduce((sum, item) => sum + toMoney(item.line_total), 0)),
+        },
+      });
+    } catch (err) {
+      console.error('cart.admin.clientCart error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
+
+router.patch(
+  '/admin/cart-items/:id',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    try {
+      const id = String(req.params?.id || '').trim();
+      if (!id) {
+        return res.status(400).json({ ok: false, error: 'id обязателен' });
+      }
+
+      const body = req.body || {};
+      const hasCustomPrice = Object.prototype.hasOwnProperty.call(body, 'custom_price');
+      const hasCustomDescription = Object.prototype.hasOwnProperty.call(body, 'custom_description');
+      if (!hasCustomPrice && !hasCustomDescription) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Передайте custom_price и/или custom_description',
+        });
+      }
+
+      let customPrice = null;
+      if (hasCustomPrice) {
+        const raw = body.custom_price;
+        if (raw === null || String(raw).trim() === '') {
+          customPrice = null;
+        } else {
+          const parsed = Number(raw);
+          if (!Number.isFinite(parsed) || parsed < 0) {
+            return res.status(400).json({
+              ok: false,
+              error: 'custom_price должен быть положительным числом',
+            });
+          }
+          customPrice = toMoney(parsed, 0);
+        }
+      }
+
+      const customDescription = hasCustomDescription
+        ? normalizeNullableText(body.custom_description, { max: 2000 })
+        : null;
+
+      const upd = await db.query(
+        `UPDATE cart_items c
+         SET custom_price = CASE
+               WHEN $3::boolean THEN $4::numeric(12,2)
+               ELSE c.custom_price
+             END,
+             custom_description = CASE
+               WHEN $5::boolean THEN $6::text
+               ELSE c.custom_description
+             END,
+             updated_at = now()
+         FROM users u, products p
+         WHERE c.id = $1
+           AND u.id = c.user_id
+           AND p.id = c.product_id
+           AND c.status <> 'delivered'
+           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+         RETURNING c.id,
+                   c.user_id,
+                   c.product_id,
+                   c.quantity,
+                   c.status,
+                   c.custom_price,
+                   c.custom_description,
+                   COALESCE(c.custom_price, p.price) AS price,
+                   COALESCE(c.custom_description, p.description) AS description,
+                   p.title,
+                   p.image_url,
+                   c.updated_at`,
+        [
+          id,
+          req.user?.tenant_id || null,
+          hasCustomPrice,
+          customPrice,
+          hasCustomDescription,
+          customDescription,
+        ],
+      );
+
+      if (upd.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: 'Позиция не найдена' });
+      }
+
+      const row = upd.rows[0];
+      emitCartUpdated(req, row.user_id, {
+        reason: 'admin_cart_item_updated',
+        cart_item_id: row.id,
+      });
+      return res.json({
+        ok: true,
+        data: {
+          ...row,
+          price: toMoney(row.price, 0),
+          line_total: toMoney((Number(row.quantity) || 0) * toMoney(row.price, 0), 0),
+        },
+      });
+    } catch (err) {
+      console.error('cart.admin.updateCartItem error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
+
+router.delete(
+  '/admin/cart-items/:id',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      const id = String(req.params?.id || '').trim();
+      if (!id) {
+        return res.status(400).json({ ok: false, error: 'id обязателен' });
+      }
+
+      await client.query('BEGIN');
+      const adjustResult = await adjustCartItemByAdmin(client, {
+        cartItemId: id,
+        tenantId: req.user?.tenant_id || null,
+        requestedQuantity: req.body?.quantity,
+      });
+      if (!adjustResult.ok) {
+        await client.query('ROLLBACK');
+        if (adjustResult.error === 'not_found') {
+          return res.status(404).json({ ok: false, error: 'Позиция не найдена' });
+        }
+        if (adjustResult.error === 'delivered') {
+          return res.status(400).json({
+            ok: false,
+            error: 'Нельзя удалить доставленный товар',
+          });
+        }
+        if (adjustResult.error === 'in_delivery_batch') {
+          return res.status(409).json({
+            ok: false,
+            error: 'Товар уже участвует в маршруте доставки. Сначала снимите его с маршрута.',
+          });
+        }
+        if (adjustResult.error === 'invalid_quantity') {
+          return res.status(400).json({
+            ok: false,
+            error: 'Некорректное количество для удаления',
+          });
+        }
+        return res.status(400).json({ ok: false, error: 'Невозможно удалить позицию' });
+      }
+
+      await client.query('COMMIT');
+
+      const io = req.app.get('io');
+      if (io) {
+        for (const message of adjustResult.updatedCatalogMessages || []) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message', {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+        }
+        if (adjustResult.updatedReservedMessage) {
+          io.to(`chat:${adjustResult.updatedReservedMessage.chat_id}`).emit('chat:message', {
+            chatId: adjustResult.updatedReservedMessage.chat_id,
+            message: decryptMessageRow(adjustResult.updatedReservedMessage),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: adjustResult.updatedReservedMessage.chat_id,
+          });
+        }
+        if (adjustResult.removedReservedMessage) {
+          io.to(`chat:${adjustResult.removedReservedMessage.chat_id}`).emit('chat:message:deleted', {
+            chatId: adjustResult.removedReservedMessage.chat_id,
+            messageId: adjustResult.removedReservedMessage.id,
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: adjustResult.removedReservedMessage.chat_id,
+          });
+        }
+      }
+
+      emitCartUpdated(req, adjustResult.item.user_id, {
+        reason: adjustResult.remainingQuantity > 0
+          ? 'admin_item_removed_partial'
+          : 'admin_item_removed',
+        cart_item_id: adjustResult.item.id,
+        product_id: adjustResult.item.product_id,
+        status: adjustResult.remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
+      });
+
+      return res.json({
+        ok: true,
+        data: {
+          cart_item_id: adjustResult.item.id,
+          product_id: adjustResult.item.product_id,
+          removed_quantity: adjustResult.cancelQuantity,
+          remaining_quantity: adjustResult.remainingQuantity,
+          available_in_stock: Number(adjustResult.updatedProduct.quantity || 0),
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('cart.admin.deleteCartItem error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  '/admin/clients/:userId/cart/clear',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      const userId = String(req.params?.userId || '').trim();
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'userId обязателен' });
+      }
+
+      const targetQ = await client.query(
+        `SELECT id
+         FROM users
+         WHERE id = $1
+           AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+         LIMIT 1`,
+        [userId, req.user?.tenant_id || null],
+      );
+      if (targetQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: 'Клиент не найден' });
+      }
+
+      await client.query('BEGIN');
+      const cartIdsQ = await client.query(
+        `SELECT c.id
+         FROM cart_items c
+         WHERE c.user_id = $1
+           AND c.status <> 'delivered'
+         ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
+        [userId],
+      );
+
+      let removedCount = 0;
+      let removedUnits = 0;
+      const blockedItemIds = [];
+      const updatedCatalogMessages = [];
+      let updatedReservedMessages = [];
+      let removedReservedMessages = [];
+      for (const row of cartIdsQ.rows) {
+        const itemId = String(row.id || '').trim();
+        if (!itemId) continue;
+        const adjustResult = await adjustCartItemByAdmin(client, {
+          cartItemId: itemId,
+          tenantId: req.user?.tenant_id || null,
+          requestedQuantity: null,
+        });
+        if (!adjustResult.ok) {
+          blockedItemIds.push(itemId);
+          continue;
+        }
+        removedCount += 1;
+        removedUnits += Number(adjustResult.cancelQuantity || 0);
+        updatedCatalogMessages.push(...(adjustResult.updatedCatalogMessages || []));
+        if (adjustResult.updatedReservedMessage) {
+          updatedReservedMessages.push(adjustResult.updatedReservedMessage);
+        }
+        if (adjustResult.removedReservedMessage) {
+          removedReservedMessages.push(adjustResult.removedReservedMessage);
+        }
+      }
+
+      await client.query('COMMIT');
+
+      const io = req.app.get('io');
+      if (io) {
+        for (const message of updatedCatalogMessages) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message', {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+        }
+        for (const message of updatedReservedMessages) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message', {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+        }
+        for (const message of removedReservedMessages) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message:deleted', {
+            chatId: message.chat_id,
+            messageId: message.id,
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+        }
+      }
+
+      emitCartUpdated(req, userId, {
+        reason: 'admin_cart_cleared',
+      });
+
+      return res.json({
+        ok: true,
+        data: {
+          user_id: userId,
+          removed_items: removedCount,
+          removed_units: removedUnits,
+          blocked_item_ids: blockedItemIds,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('cart.admin.clearClientCart error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  '/admin/clients/:userId/block',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    try {
+      const userId = String(req.params?.userId || '').trim();
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'userId обязателен' });
+      }
+      if (userId === String(req.user?.id || '')) {
+        return res.status(400).json({ ok: false, error: 'Нельзя блокировать самого себя' });
+      }
+
+      const reasonText = normalizeNullableText(req.body?.reason, { max: 500 });
+      const reason = reasonText || 'Вас заблокировали за нарушение правил';
+      const updated = await db.query(
+        `UPDATE users
+         SET is_active = false,
+             block_reason = $3,
+             updated_at = now()
+         WHERE id = $1
+           AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+           AND role = 'client'
+         RETURNING id, email, name, role, is_active, block_reason`,
+        [userId, req.user?.tenant_id || null, reason],
+      );
+
+      if (updated.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+      }
+      try {
+        await db.platformQuery(
+          `UPDATE tenant_user_index
+           SET is_active = false,
+               email = COALESCE(NULLIF(lower($3::text), ''), email),
+               role = COALESCE(NULLIF(BTRIM($4::text), ''), role),
+               updated_at = now()
+           WHERE tenant_id = $1
+             AND user_id = $2`,
+          [
+            req.user?.tenant_id || null,
+            userId,
+            updated.rows[0]?.email || null,
+            updated.rows[0]?.role || null,
+          ],
+        );
+      } catch (syncErr) {
+        if (String(syncErr?.code || '') !== '42P01') {
+          console.error('cart.admin.blockClient tenantUserIndex sync error', syncErr);
+        }
+      }
+
+      const io = req.app.get('io');
+      if (io) {
+        io.to(`user:${userId}`).emit('auth:blocked', {
+          reason,
+        });
+      }
+
+      return res.json({ ok: true, data: updated.rows[0] });
+    } catch (err) {
+      console.error('cart.admin.blockClient error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
 
 // Создать заявку на брак/скидку по доставленному товару
 router.post('/claims', authMiddleware, async (req, res) => {
@@ -961,7 +1701,8 @@ router.post('/claims', authMiddleware, async (req, res) => {
               c.quantity,
               c.status,
               p.title,
-              p.price,
+              COALESCE(c.custom_price, p.price) AS price,
+              COALESCE(c.custom_description, p.description) AS description,
               p.image_url
        FROM cart_items c
        JOIN products p ON p.id = c.product_id
@@ -991,7 +1732,6 @@ router.post('/claims', authMiddleware, async (req, res) => {
       `SELECT id, status
        FROM customer_claims
        WHERE cart_item_id = $1
-         AND status IN ('pending', 'approved_return', 'approved_discount')
        ORDER BY created_at DESC
        LIMIT 1`,
       [cartItemId],
@@ -1000,7 +1740,7 @@ router.post('/claims', authMiddleware, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({
         ok: false,
-        error: 'По этому товару уже есть активная заявка',
+        error: 'По этому товару заявка уже была создана ранее',
       });
     }
 
@@ -1072,7 +1812,7 @@ router.post('/claims', authMiddleware, async (req, res) => {
     if (String(err?.code || '') === '23505') {
       return res.status(400).json({
         ok: false,
-        error: 'По этому товару уже есть активная заявка',
+        error: 'По этому товару заявка уже была создана ранее',
       });
     }
     console.error('cart.claims.create error', err);
@@ -1098,6 +1838,7 @@ router.get('/claims', authMiddleware, async (req, res) => {
               cc.image_url,
               cc.requested_amount,
               cc.approved_amount,
+              cc.customer_discount_status,
               cc.resolution_note,
               cc.handled_by,
               cc.handled_at,
@@ -1154,6 +1895,7 @@ router.get(
                 cc.image_url,
                 cc.requested_amount,
                 cc.approved_amount,
+                cc.customer_discount_status,
                 cc.resolution_note,
                 cc.handled_by,
                 cc.handled_at,
@@ -1245,6 +1987,12 @@ router.patch(
       if (!decision) {
         return res.status(400).json({ ok: false, error: 'Некорректное решение' });
       }
+      if (decision === 'rejected' && resolutionNote.length < 3) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Укажите причину отказа (минимум 3 символа)',
+        });
+      }
 
       await client.query('BEGIN');
       const claimQ = await client.query(
@@ -1276,20 +2024,34 @@ router.patch(
 
       let nextApprovedAmount = toMoney(claim.approved_amount, 0);
       let settledAt = claim.settled_at || null;
+      let nextCustomerDiscountStatus = claim.customer_discount_status || null;
       if (decision === 'approved_return' || decision === 'approved_discount') {
         if (Number.isFinite(approvedAmountInput) && approvedAmountInput > 0) {
           nextApprovedAmount = toMoney(approvedAmountInput);
         } else {
           nextApprovedAmount = toMoney(claim.requested_amount, 0);
         }
+        nextCustomerDiscountStatus =
+          decision === 'approved_discount' ? 'pending' : null;
       } else if (decision === 'rejected') {
         nextApprovedAmount = 0;
+        nextCustomerDiscountStatus = null;
       } else if (decision === 'settled') {
         if (currentStatus !== 'approved_return' && currentStatus !== 'approved_discount') {
           await client.query('ROLLBACK');
           return res.status(400).json({
             ok: false,
             error: 'Закрыть можно только подтвержденную заявку',
+          });
+        }
+        if (
+          currentStatus === 'approved_discount' &&
+          String(claim.customer_discount_status || '').trim() === 'pending'
+        ) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            ok: false,
+            error: 'Клиент еще не подтвердил скидку',
           });
         }
         settledAt = new Date().toISOString();
@@ -1299,12 +2061,13 @@ router.patch(
         `UPDATE customer_claims
          SET status = $2,
              approved_amount = $3,
+             customer_discount_status = $6::text,
              resolution_note = CASE WHEN $4::text <> '' THEN $4::text ELSE resolution_note END,
              handled_by = $5,
              handled_at = now(),
              settled_at = CASE
                WHEN $2::text = 'settled' THEN now()
-               ELSE settled_at
+               ELSE NULL
              END,
              updated_at = now()
          WHERE id = $1
@@ -1315,6 +2078,7 @@ router.patch(
           nextApprovedAmount,
           resolutionNote,
           req.user?.id || null,
+          nextCustomerDiscountStatus,
         ],
       );
 
@@ -1345,5 +2109,119 @@ router.patch(
     }
   },
 );
+
+router.post('/claims/:id/decision', authMiddleware, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const userId = String(req.user?.id || '').trim();
+    const claimId = String(req.params?.id || '').trim();
+    const action = String(req.body?.action || '')
+      .trim()
+      .toLowerCase();
+    if (!claimId) {
+      return res.status(400).json({ ok: false, error: 'id заявки обязателен' });
+    }
+    if (action !== 'accept_discount' && action !== 'reject_discount') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Разрешены действия: accept_discount, reject_discount',
+      });
+    }
+
+    await client.query('BEGIN');
+    const claimQ = await client.query(
+      `SELECT cc.*
+       FROM customer_claims cc
+       WHERE cc.id = $1
+         AND cc.user_id = $2
+         AND ($3::uuid IS NULL OR cc.tenant_id = $3::uuid)
+       LIMIT 1
+       FOR UPDATE`,
+      [claimId, userId, req.user?.tenant_id || null],
+    );
+    if (claimQ.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Заявка не найдена' });
+    }
+
+    const claim = claimQ.rows[0];
+    if (String(claim.status || '') !== 'approved_discount') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'Эта заявка не ожидает решения по скидке',
+      });
+    }
+    if (String(claim.customer_discount_status || '') !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'Решение по скидке уже принято',
+      });
+    }
+
+    const acceptDiscount = action === 'accept_discount';
+    const nextStatus = acceptDiscount ? 'settled' : 'approved_return';
+    const nextDecision = acceptDiscount ? 'accepted' : 'rejected';
+    const note = acceptDiscount
+      ? ''
+      : 'Клиент отказался от скидки. Автоматически оформлен возврат.';
+
+    const upd = await client.query(
+      `UPDATE customer_claims
+       SET status = $2,
+           customer_discount_status = $3,
+           approved_amount = CASE
+             WHEN $2::text = 'approved_return' THEN requested_amount
+             ELSE approved_amount
+           END,
+           resolution_note = CASE
+             WHEN $4::text <> '' THEN BTRIM(CONCAT_WS(E'\n', NULLIF(BTRIM(resolution_note), ''), $4::text))
+             ELSE resolution_note
+           END,
+           settled_at = CASE
+             WHEN $2::text = 'settled' THEN now()
+             ELSE NULL
+           END,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [claimId, nextStatus, nextDecision, note],
+    );
+
+    await client.query('COMMIT');
+    const updatedClaim = upd.rows[0];
+    emitCartUpdated(req, userId, {
+      reason: acceptDiscount
+        ? 'claim_discount_accepted'
+        : 'claim_discount_rejected_auto_return',
+      claim_id: updatedClaim.id,
+    });
+    emitClaimUpdated(
+      req,
+      updatedClaim,
+      acceptDiscount
+        ? 'claim_discount_accepted'
+        : 'claim_discount_rejected_auto_return',
+    );
+
+    return res.json({
+      ok: true,
+      data: {
+        ...updatedClaim,
+        approved_amount: toMoney(updatedClaim.approved_amount),
+        requested_amount: toMoney(updatedClaim.requested_amount),
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('cart.claims.customerDecision error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
 
 module.exports = router;
