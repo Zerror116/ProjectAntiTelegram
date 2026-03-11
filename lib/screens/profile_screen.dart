@@ -493,31 +493,35 @@ class _ProfileScreenState extends State<ProfileScreen> {
       return;
     }
 
+    final selectedName = (picked.files.single.name).toLowerCase().trim();
+    final isGif = selectedName.endsWith('.gif');
     AvatarCropResult? placement;
-    try {
-      if (!mounted) return;
-      placement = await showAvatarCropDialog(
-        context: context,
-        filePath: path,
-        initialFocusX: _avatarFocusX,
-        initialFocusY: _avatarFocusY,
-        initialZoom: _avatarZoom,
-      );
-    } catch (e) {
-      if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка подготовки фото: ${_extractDioMessage(e)}',
-      );
-      return;
+    if (!isGif) {
+      try {
+        if (!mounted) return;
+        placement = await showAvatarCropDialog(
+          context: context,
+          filePath: path,
+          initialFocusX: _avatarFocusX,
+          initialFocusY: _avatarFocusY,
+          initialZoom: _avatarZoom,
+        );
+      } catch (e) {
+        if (!mounted) return;
+        setState(
+          () => _message = 'Ошибка подготовки фото: ${_extractDioMessage(e)}',
+        );
+        return;
+      }
+      if (placement == null) return;
     }
-    if (placement == null) return;
 
     setState(() {
       _avatarBusy = true;
       _message = '';
     });
     try {
-      final uploadPath = placement.croppedPath;
+      final uploadPath = placement?.croppedPath ?? path;
       final fileName = uploadPath.split(Platform.pathSeparator).last;
       final form = FormData.fromMap({
         'avatar': await MultipartFile.fromFile(uploadPath, filename: fileName),
@@ -540,9 +544,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
       );
     } finally {
       if (mounted) setState(() => _avatarBusy = false);
-      try {
-        await File(placement.croppedPath).delete();
-      } catch (_) {}
+      if (placement != null) {
+        try {
+          await File(placement.croppedPath).delete();
+        } catch (_) {}
+      }
     }
   }
 
@@ -583,31 +589,82 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _deleteAccount() async {
-    final confirm = await showDialog<bool>(
+    final identifierCtrl = TextEditingController();
+    final passwordCtrl = TextEditingController();
+    bool obscure = true;
+    final confirmPayload = await showDialog<Map<String, String>>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Удалить аккаунт'),
-        content: const Text('Вы уверены? Это действие необратимо.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
+      builder: (_) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('Удалить аккаунт'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Для подтверждения введите ваш email или номер телефона и пароль.',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: identifierCtrl,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(
+                  labelText: 'Email или номер телефона',
+                  hintText: 'user@mail.com / 79991234567',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: passwordCtrl,
+                obscureText: obscure,
+                decoration: InputDecoration(
+                  labelText: 'Пароль',
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      obscure
+                          ? Icons.visibility_off_outlined
+                          : Icons.visibility,
+                    ),
+                    onPressed: () {
+                      setDialogState(() => obscure = !obscure);
+                    },
+                  ),
+                ),
+              ),
+            ],
           ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Удалить', style: TextStyle(color: Colors.red)),
-          ),
-        ],
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Отмена'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(dialogContext, {
+                  'identifier': identifierCtrl.text.trim(),
+                  'password': passwordCtrl.text,
+                });
+              },
+              child: const Text('Удалить', style: TextStyle(color: Colors.red)),
+            ),
+          ],
+        ),
       ),
     );
-    if (confirm != true) return;
+    final identifier = (confirmPayload?['identifier'] ?? '').trim();
+    final password = confirmPayload?['password'] ?? '';
+    identifierCtrl.dispose();
+    passwordCtrl.dispose();
+    if (identifier.isEmpty || password.isEmpty) return;
 
     setState(() {
       _deletingAccount = true;
       _message = '';
     });
     try {
-      final resp = await authService.dio.post('/api/auth/delete_account');
+      final resp = await authService.dio.post(
+        '/api/auth/delete_account',
+        data: {'identifier': identifier, 'password': password},
+      );
       if (resp.statusCode == 200) {
         await authService.clearToken();
         return;
@@ -904,7 +961,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   String _formatMoneyCompact(dynamic raw) {
     final value = double.tryParse('${raw ?? ''}') ?? 0;
-    return '${value.toStringAsFixed(value.truncateToDouble() == value ? 0 : 2)} RUB';
+    return '${value.toStringAsFixed(value.truncateToDouble() == value ? 0 : 2)} ₽';
   }
 
   Map<String, dynamic> _statsMap(dynamic raw) {

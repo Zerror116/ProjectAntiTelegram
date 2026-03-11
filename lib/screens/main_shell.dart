@@ -118,6 +118,10 @@ class _MainShellState extends State<MainShell> {
         ? 'profile'
         : previousIds[_index.clamp(0, previousIds.length - 1)];
     final nextIds = _destinationIdsForRole(nextRole);
+    if (currentId == 'profile') {
+      final profileSameIndex = nextIds.indexOf('profile');
+      if (profileSameIndex >= 0) return profileSameIndex;
+    }
     final sameTabIndex = nextIds.indexOf(currentId);
     if (sameTabIndex >= 0) return sameTabIndex;
     final profileIndex = nextIds.indexOf('profile');
@@ -140,11 +144,6 @@ class _MainShellState extends State<MainShell> {
       'delivery.manage',
       'tenant.users.manage',
       'support.manage',
-      'finance.view',
-      'audit.view',
-      'antifraud.view',
-      'notifications.manage',
-      'diagnostics.view',
     ]);
   }
 

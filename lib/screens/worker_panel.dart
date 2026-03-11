@@ -48,6 +48,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   final ImagePicker _imagePicker = ImagePicker();
   XFile? _pickedImage;
+  Uint8List? _pickedImageBytes;
   String? _existingImageUrl;
   bool _removeImageOnSubmit = false;
 
@@ -329,6 +330,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _priceCtrl.clear();
     _quantityCtrl.text = '1';
     _pickedImage = null;
+    _pickedImageBytes = null;
     _existingImageUrl = null;
     _removeImageOnSubmit = false;
   }
@@ -495,11 +497,21 @@ class _WorkerPanelState extends State<WorkerPanel>
             final result = await FilePicker.platform.pickFiles(
               type: FileType.image,
               allowMultiple: false,
-              withData: false,
+              withData: kIsWeb,
             );
-            final path = result?.files.single.path;
+            final selected = result?.files.single;
+            final path = selected?.path;
             if (path != null && path.isNotEmpty) {
-              picked = XFile(path);
+              picked = XFile(path, name: selected?.name ?? '');
+            } else {
+              final bytes = selected?.bytes;
+              if (bytes != null && bytes.isNotEmpty) {
+                picked = XFile.fromData(
+                  bytes,
+                  name: selected?.name ?? 'image.jpg',
+                  mimeType: selected?.extension,
+                );
+              }
             }
           }
         } catch (_) {
@@ -520,9 +532,18 @@ class _WorkerPanelState extends State<WorkerPanel>
         });
         return;
       }
+      Uint8List? pickedBytes;
+      if (kIsWeb) {
+        try {
+          pickedBytes = await picked.readAsBytes();
+        } catch (_) {
+          pickedBytes = null;
+        }
+      }
       if (!mounted) return;
       setState(() {
         _pickedImage = picked;
+        _pickedImageBytes = pickedBytes;
         _removeImageOnSubmit = false;
         _message = '';
       });
@@ -542,9 +563,26 @@ class _WorkerPanelState extends State<WorkerPanel>
   void _clearSelectedImage() {
     setState(() {
       _pickedImage = null;
+      _pickedImageBytes = null;
       _existingImageUrl = null;
       _removeImageOnSubmit = true;
     });
+  }
+
+  Future<MultipartFile?> _buildPickedImageMultipart() async {
+    final picked = _pickedImage;
+    if (picked == null) return null;
+    final fileName = picked.name.trim().isNotEmpty ? picked.name : 'image.jpg';
+
+    if (kIsWeb) {
+      final bytes = _pickedImageBytes ?? await picked.readAsBytes();
+      if (bytes.isEmpty) return null;
+      return MultipartFile.fromBytes(bytes, filename: fileName);
+    }
+
+    final path = picked.path;
+    if (path.isEmpty) return null;
+    return MultipartFile.fromFile(path, filename: fileName);
   }
 
   Future<FormData> _buildCreateProductPayload({
@@ -561,10 +599,10 @@ class _WorkerPanelState extends State<WorkerPanel>
     };
 
     if (_pickedImage != null) {
-      map['image'] = await MultipartFile.fromFile(
-        _pickedImage!.path,
-        filename: _pickedImage!.name,
-      );
+      final imageFile = await _buildPickedImageMultipart();
+      if (imageFile != null) {
+        map['image'] = imageFile;
+      }
     } else {
       final imageUrl = _normalizedImageUrlFromForm();
       if (imageUrl != null) {
@@ -592,10 +630,10 @@ class _WorkerPanelState extends State<WorkerPanel>
     };
 
     if (_pickedImage != null) {
-      map['image'] = await MultipartFile.fromFile(
-        _pickedImage!.path,
-        filename: _pickedImage!.name,
-      );
+      final imageFile = await _buildPickedImageMultipart();
+      if (imageFile != null) {
+        map['image'] = imageFile;
+      }
     } else if (_removeImageOnSubmit) {
       map['image_url'] = '';
     } else {
@@ -1385,10 +1423,45 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Widget _buildPhotoPicker() {
     final theme = Theme.of(context);
-    final localPath = _pickedImage?.path;
+    final localPath = _pickedImage?.path.trim();
+    final localBytes = _pickedImageBytes;
     final remoteUrl = _resolveImageUrl(_existingImageUrl);
-    final hasImage = localPath != null || remoteUrl != null;
+    final hasImage =
+        (localBytes != null && localBytes.isNotEmpty) ||
+        (localPath != null && localPath.isNotEmpty) ||
+        remoteUrl != null;
     const previewWidth = 220.0;
+    Widget imageErrorPlaceholder() => Container(
+      color: theme.colorScheme.surfaceContainerHighest,
+      alignment: Alignment.center,
+      child: Icon(
+        Icons.broken_image_outlined,
+        color: theme.colorScheme.onSurfaceVariant,
+      ),
+    );
+    Widget buildLocalPathPreview(String path) {
+      if (kIsWeb) {
+        final lower = path.toLowerCase();
+        final canUseNetworkLikePath =
+            lower.startsWith('http://') ||
+            lower.startsWith('https://') ||
+            lower.startsWith('blob:') ||
+            lower.startsWith('data:');
+        if (!canUseNetworkLikePath) {
+          return imageErrorPlaceholder();
+        }
+        return Image.network(
+          path,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
+        );
+      }
+      return Image(
+        image: FileImage(File(path)),
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
+      );
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1407,19 +1480,15 @@ class _WorkerPanelState extends State<WorkerPanel>
                 borderRadius: BorderRadius.circular(12),
                 child: AspectRatio(
                   aspectRatio: 4 / 3,
-                  child: localPath != null
-                      ? Image.file(File(localPath), fit: BoxFit.cover)
+                  child: (localBytes != null && localBytes.isNotEmpty)
+                      ? Image.memory(localBytes, fit: BoxFit.cover)
+                      : (localPath != null && localPath.isNotEmpty)
+                      ? buildLocalPathPreview(localPath)
                       : Image.network(
                           remoteUrl!,
                           fit: BoxFit.cover,
-                          errorBuilder: (_, error, stackTrace) => Container(
-                            color: theme.colorScheme.surfaceContainerHighest,
-                            alignment: Alignment.center,
-                            child: Icon(
-                              Icons.broken_image_outlined,
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
+                          errorBuilder: (context, error, stackTrace) =>
+                              imageErrorPlaceholder(),
                         ),
                 ),
               ),
@@ -1598,12 +1667,12 @@ class _WorkerPanelState extends State<WorkerPanel>
           child: ElevatedButton.icon(
             onPressed: _posting ? null : _queueProduct,
             icon: _posting
-                ? const SizedBox(
+                ? SizedBox(
                     width: 16,
                     height: 16,
                     child: CircularProgressIndicator(
                       strokeWidth: 2,
-                      color: Colors.white,
+                      color: Theme.of(context).colorScheme.onPrimary,
                     ),
                   )
                 : const Icon(Icons.send),
@@ -1688,7 +1757,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               title: Text((p['title'] ?? 'Товар').toString()),
               subtitle: Text(
                 'ID: $label\n'
-                'Цена: ${p['price']} RUB\n'
+                'Цена: ${p['price']} ₽\n'
                 '${(p['description'] ?? '').toString()}',
               ),
               isThreeLine: true,
@@ -1989,7 +2058,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                                 'ID ${_formatProductLabel(post['product_code'], post['product_shelf_number'])}',
                               ),
                               _statChip(
-                                '${_toDoubleValue(post['product_price']).toStringAsFixed(0)} RUB',
+                                '${_toDoubleValue(post['product_price']).toStringAsFixed(0)} ₽',
                               ),
                               _statChip(
                                 'x${_toIntValue(post['product_quantity'])}',
@@ -2111,12 +2180,12 @@ class _WorkerPanelState extends State<WorkerPanel>
                 child: ElevatedButton.icon(
                   onPressed: _runningRevision ? null : _runAutoRevision,
                   icon: _runningRevision
-                      ? const SizedBox(
+                      ? SizedBox(
                           width: 16,
                           height: 16,
                           child: CircularProgressIndicator(
                             strokeWidth: 2,
-                            color: Colors.white,
+                            color: Theme.of(context).colorScheme.onPrimary,
                           ),
                         )
                       : const Icon(Icons.auto_fix_high_outlined),
@@ -2257,7 +2326,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                             children: [
                               _statChip('ID $productLabel'),
                               _statChip(
-                                '${_toDoubleValue(post['price']).toStringAsFixed(0)} RUB',
+                                '${_toDoubleValue(post['price']).toStringAsFixed(0)} ₽',
                               ),
                               _statChip('x${_toIntValue(post['quantity'], 1)}'),
                             ],

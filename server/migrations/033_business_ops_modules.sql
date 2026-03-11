@@ -122,7 +122,7 @@ VALUES
   (
     NULL,
     'Сумма корзины',
-    'Проверили: общая сумма вашей корзины {cart_total} RUB, обработано {processed_total} RUB.',
+    'Проверили: общая сумма вашей корзины {cart_total} ₽, обработано {processed_total} ₽.',
     'cart',
     true
   ),

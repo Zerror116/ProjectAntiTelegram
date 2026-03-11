@@ -32,6 +32,9 @@ const cartRoutes = require("./routes/cart");
 const supportRoutes = require("./routes/support");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
+const {
+  runMessageEncryptionBackfill,
+} = require("./utils/messageEncryptionBackfill");
 const { logMonitoringEvent } = require("./utils/monitoring");
 const { tenantRoom } = require("./utils/socket");
 
@@ -685,6 +688,9 @@ async function canUserAccessChat(user, chatId) {
       console.log(
         `🔐 JWT Secret: ${JWT_SECRET ? "✅ Configured" : "⚠️ Not configured"}`,
       );
+      void runMessageEncryptionBackfill({ logger: console }).catch((err) => {
+        console.error("message encryption backfill startup error:", err);
+      });
       console.log("\n");
     });
   } catch (err) {

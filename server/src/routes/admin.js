@@ -25,6 +25,10 @@ const {
 const { logMonitoringEvent } = require("../utils/monitoring");
 const { emitToTenant } = require("../utils/socket");
 const { antifraudGuard } = require("../utils/antifraud");
+const {
+  encryptMessageText,
+  decryptMessageRow,
+} = require("../utils/messageCrypto");
 
 const requireProductPublishPermission = requirePermission("product.publish");
 const requireReservationFulfillPermission = requirePermission(
@@ -123,7 +127,7 @@ function schedulePublishedMessages(io, published, tenantId = null) {
         if (msgRes.rowCount === 0) return;
         io.to(`chat:${item.channel_id}`).emit("chat:message", {
           chatId: item.channel_id,
-          message: msgRes.rows[0],
+          message: decryptMessageRow(msgRes.rows[0]),
         });
         emitToTenant(io, tenantId, "chat:updated", { chatId: item.channel_id });
       } catch (err) {
@@ -287,7 +291,7 @@ function productMessageText(product) {
   const lines = [
     `🛒 ${product.title}`,
     product.description ? String(product.description).trim() : null,
-    `Цена: ${product.price} RUB`,
+    `Цена: ${product.price} ₽`,
     `Количество в наличии: ${product.quantity}`,
     'Нажмите "Купить", чтобы добавить в корзину',
   ].filter(Boolean);
@@ -373,7 +377,7 @@ function reservedOrderMessageText(order) {
     `Клиент: ${order.client_name || "—"}`,
     `Телефон: ${order.client_phone || "—"}`,
     `ID товара: ${productLabel}`,
-    `Цена: ${order.product_price} RUB`,
+    `Цена: ${order.product_price} ₽`,
     `Куплено: ${order.quantity}`,
     `Полка товара: ${order.product_shelf_number ?? "не назначена"}`,
     `Полка клиента: ${order.shelf_number ?? "не назначена"}`,
@@ -395,7 +399,7 @@ function archivedProductMessageText({
     "🗂 Архив поста товара",
     `Название: ${product.title}`,
     product.description ? `Описание: ${String(product.description).trim()}` : null,
-    `Цена: ${product.price} RUB`,
+    `Цена: ${product.price} ₽`,
     `Количество: ${product.quantity}`,
     `ID товара: ${productLabel}`,
     `Канал публикации: ${sourceChannelTitle || "Основной канал"}`,
@@ -506,12 +510,14 @@ function publishDemoPostsSequentially({
           [
             uuidv4(),
             channelId,
-            productMessageText({
+            encryptMessageText(
+              productMessageText({
               title: demo.title,
               description: demo.description,
               price: demo.price,
               quantity: demo.quantity,
-            }),
+              }),
+            ),
             JSON.stringify(messageMeta),
           ],
         );
@@ -544,7 +550,7 @@ function publishDemoPostsSequentially({
         if (io) {
           io.to(`chat:${channelId}`).emit("chat:message", {
             chatId: channelId,
-            message: messageInsert.rows[0],
+            message: decryptMessageRow(messageInsert.rows[0]),
           });
           emitToTenant(io, tenantId || null, "chat:updated", {
             chatId: channelId,
@@ -848,12 +854,43 @@ router.post(
           "admin.tenants.create isolated provision failed",
           provisionErr,
         );
-        await db.platformQuery(`DELETE FROM tenants WHERE id = $1`, [tenantId]);
-        return res.status(500).json({
-          ok: false,
-          error:
-            "Не удалось создать изолированную базу данных арендатора. Проверьте права PostgreSQL (CREATEDB).",
-        });
+        dbMode = "shared";
+        dbName = null;
+        warning =
+          "Изолированная БД не создана (проверьте CREATEDB). Арендатор переведен в shared-режим.";
+        try {
+          await db.platformQuery(
+            `UPDATE tenants
+             SET db_mode = 'shared',
+                 db_name = NULL,
+                 db_url = NULL,
+                 updated_at = now()
+             WHERE id = $1`,
+            [tenantId],
+          );
+          const sharedClient = await db.platformConnect();
+          try {
+            await sharedClient.query("BEGIN");
+            await ensureSystemChannels(sharedClient, req.user.id, tenantId);
+            await sharedClient.query("COMMIT");
+          } catch (sharedErr) {
+            await sharedClient.query("ROLLBACK");
+            throw sharedErr;
+          } finally {
+            sharedClient.release();
+          }
+        } catch (fallbackErr) {
+          console.error(
+            "admin.tenants.create shared fallback failed",
+            fallbackErr,
+          );
+          await db.platformQuery(`DELETE FROM tenants WHERE id = $1`, [tenantId]);
+          return res.status(500).json({
+            ok: false,
+            error:
+              "Не удалось создать арендатора: изолированная и shared инициализация завершились ошибкой.",
+          });
+        }
       }
 
       return res.status(201).json({
@@ -2654,7 +2691,7 @@ router.post(
             uuidv4(),
             reservedChannel.id,
             req.user.id,
-            reservedOrderMessageText(row),
+            encryptMessageText(reservedOrderMessageText(row)),
             JSON.stringify(meta),
           ],
         );
@@ -2710,7 +2747,7 @@ router.post(
           if (msgRes.rowCount > 0) {
             io.to(`chat:${reservedChannel.id}`).emit("chat:message", {
               chatId: reservedChannel.id,
-              message: msgRes.rows[0],
+              message: decryptMessageRow(msgRes.rows[0]),
             });
             emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
               chatId: reservedChannel.id,
@@ -2986,7 +3023,7 @@ router.post(
         for (const message of updatedReservedMessages.rows) {
           io.to(`chat:${reservedChannel.id}`).emit("chat:message", {
             chatId: reservedChannel.id,
-            message,
+            message: decryptMessageRow(message),
           });
           emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
             chatId: reservedChannel.id,
@@ -3004,7 +3041,7 @@ router.post(
         for (const hiddenMessage of hiddenCatalogMessages) {
           io.to(`chat:${hiddenMessage.chat_id}`).emit("chat:message", {
             chatId: hiddenMessage.chat_id,
-            message: hiddenMessage,
+            message: decryptMessageRow(hiddenMessage),
           });
           emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
             chatId: hiddenMessage.chat_id,
@@ -3269,7 +3306,7 @@ router.post(
           [
             uuidv4(),
             row.channel_id,
-            productMessageText(product),
+            encryptMessageText(productMessageText(product)),
             JSON.stringify(messageMeta),
           ],
         );
@@ -3330,13 +3367,15 @@ router.post(
             [
               uuidv4(),
               postsArchiveChannelId,
-              archivedProductMessageText({
-                product,
-                sourceChannelTitle: row.channel_title,
-                queuedByName: row.queued_by_name,
-                queuedByEmail: row.queued_by_email,
-                queuedByPhone: row.queued_by_phone,
-              }),
+              encryptMessageText(
+                archivedProductMessageText({
+                  product,
+                  sourceChannelTitle: row.channel_title,
+                  queuedByName: row.queued_by_name,
+                  queuedByEmail: row.queued_by_email,
+                  queuedByPhone: row.queued_by_phone,
+                }),
+              ),
               JSON.stringify(archiveMeta),
             ],
           );
@@ -3405,7 +3444,7 @@ router.post(
         for (const message of hiddenRevisionMessages) {
           io.to(`chat:${message.chat_id}`).emit("chat:message", {
             chatId: message.chat_id,
-            message,
+            message: decryptMessageRow(message),
           });
           emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
             chatId: message.chat_id,

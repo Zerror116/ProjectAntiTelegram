@@ -471,6 +471,7 @@ class AuthService {
     required String email,
     required String password,
     String? accessKey,
+    String? otpCode,
   }) async {
     debugPrint('🔓 login called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
@@ -497,6 +498,8 @@ class AuthService {
         'password': password,
         if (accessKey != null && accessKey.trim().isNotEmpty)
           'access_key': accessKey.trim(),
+        if (otpCode != null && otpCode.trim().isNotEmpty)
+          'otp_code': otpCode.trim(),
         if (tenantCode != null && tenantCode.trim().isNotEmpty)
           'tenant_code': tenantCode.trim(),
         if (fingerprint != null) 'device_fingerprint': fingerprint,
@@ -514,6 +517,44 @@ class AuthService {
       'access': resp.data['token'] ?? resp.data['access'],
       'user': _currentUser?.toMap(),
     };
+  }
+
+  Future<Map<String, dynamic>> getTwoFactorStatus() async {
+    final resp = await dio.get('/api/auth/2fa/status');
+    final data = resp.data;
+    if (data is Map && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data']);
+    }
+    return const <String, dynamic>{};
+  }
+
+  Future<Map<String, dynamic>> startTwoFactorSetup() async {
+    final resp = await dio.post('/api/auth/2fa/setup/start');
+    final data = resp.data;
+    if (data is Map && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data']);
+    }
+    throw Exception('Сервер не вернул данные для настройки 2FA');
+  }
+
+  Future<void> confirmTwoFactorSetup({
+    required String secret,
+    required String code,
+  }) async {
+    await dio.post(
+      '/api/auth/2fa/setup/confirm',
+      data: {'secret': secret.trim(), 'code': code.trim()},
+    );
+  }
+
+  Future<void> disableTwoFactor({
+    required String password,
+    required String code,
+  }) async {
+    await dio.post(
+      '/api/auth/2fa/disable',
+      data: {'password': password, 'code': code.trim()},
+    );
   }
 
   /// Регистрация (полная: email+password+name+phone + optional secret)

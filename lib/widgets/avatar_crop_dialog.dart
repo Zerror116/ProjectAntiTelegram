@@ -237,8 +237,8 @@ Future<AvatarCropResult?> showAvatarCropDialog({
                                   offset: offset,
                                   child: Transform.scale(
                                     scale: zoom,
-                                    child: Image.file(
-                                      imageFile,
+                                    child: Image.memory(
+                                      sourceBytes,
                                       width: previewSize,
                                       height: previewSize,
                                       fit: BoxFit.cover,

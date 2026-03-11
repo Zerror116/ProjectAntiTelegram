@@ -12,6 +12,7 @@ const { requireRole } = require('../utils/roles');
 const requirePermission = require('../middleware/requirePermission');
 const { ensureSystemChannels } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
+const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
 
 const requireProductCreatePermission = requirePermission('product.create');
 const requireProductRequeuePermission = requirePermission('product.requeue');
@@ -199,7 +200,7 @@ function productMessageText(product) {
   const lines = [
     `🛒 ${product.title}`,
     product.description ? String(product.description).trim() : null,
-    `Цена: ${product.price} RUB`,
+    `Цена: ${product.price} ₽`,
     `Количество в наличии: ${product.quantity}`,
     'Нажмите "Купить", чтобы добавить в корзину',
   ].filter(Boolean);
@@ -1145,9 +1146,9 @@ router.post(
                )
            WHERE id = $8
              AND chat_id = $9
-           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          RETURNING id, chat_id, sender_id, text, meta, created_at`,
           [
-            productMessageText(product),
+            encryptMessageText(productMessageText(product)),
             product.id,
             product.product_code,
             Number(product.price),
@@ -1171,7 +1172,7 @@ router.post(
         for (const message of updatedMessages) {
           io.to(`chat:${mainChannel.id}`).emit('chat:message', {
             chatId: mainChannel.id,
-            message,
+            message: decryptMessageRow(message),
           });
         }
         if (updatedMessages.length > 0) {

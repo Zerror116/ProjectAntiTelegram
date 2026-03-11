@@ -116,7 +116,7 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
 
   const lookupUser = async () =>
     await db.query(
-      `SELECT u.id, u.email, u.role, u.is_active, u.tenant_id,
+      `SELECT u.id, u.email, u.role, u.is_active, u.block_reason, u.tenant_id,
               t.code AS tenant_code,
               t.name AS tenant_name,
               t.status AS tenant_status,
@@ -138,7 +138,14 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
 
   const row = userRes.rows[0];
   if (row.is_active === false) {
-    return { ok: false, status: 403, error: 'Аккаунт отключён' };
+    const blockReason = String(row.block_reason || '').trim();
+    return {
+      ok: false,
+      status: 403,
+      error:
+        blockReason ||
+        'Вас заблокировали за нарушение правил',
+    };
   }
 
   const baseRole = (row.role || 'client').toString().toLowerCase().trim() || 'client';

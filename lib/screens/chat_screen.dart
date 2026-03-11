@@ -769,6 +769,21 @@ class _ChatScreenState extends State<ChatScreen> {
     return visibility != 'private';
   }
 
+  bool _isSupportTicketChat() {
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
+    return kind == 'support_ticket' || settings['support_ticket'] == true;
+  }
+
+  bool _isDirectMessageChat() {
+    if ((widget.chatType ?? '').toLowerCase().trim() != 'private') return false;
+    if (_isSupportTicketChat()) return false;
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
+    if (kind == 'direct_message') return true;
+    return kind.isEmpty;
+  }
+
   bool _canCompose() {
     final role = authService.effectiveRole.toLowerCase().trim();
     if (role == 'client') {
@@ -1702,14 +1717,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() => _markingPlaced = true);
     try {
+      final reservationIdValue = (reservationId ?? '').trim();
+      final cartItemIdValue = (cartItemId ?? '').trim();
+      final manualShelfValue = '${manualShelf ?? ''}'.trim();
       final resp = await authService.dio.post(
         '/api/admin/orders/mark_placed',
         data: {
-          if (reservationId != null && reservationId.isNotEmpty)
-            'reservation_id': reservationId,
-          if (cartItemId != null && cartItemId.isNotEmpty)
-            'cart_item_id': cartItemId,
-          if (manualShelf != null) 'shelf_number': manualShelf,
+          if (reservationIdValue.isNotEmpty)
+            'reservation_id': reservationIdValue,
+          if (cartItemIdValue.isNotEmpty) 'cart_item_id': cartItemIdValue,
+          if (manualShelfValue.isNotEmpty) 'shelf_number': manualShelfValue,
         },
       );
       if ((resp.statusCode == 200 || resp.statusCode == 201) && mounted) {
@@ -2583,6 +2600,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildMessageItem(Map<String, dynamic> message) {
     final theme = Theme.of(context);
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        (MediaQuery.maybeOf(context)?.disableAnimations == true);
     final fromMe = _isOwnMessage(message);
     final messageId = message['id']?.toString().trim() ?? '';
     final hasMessageId = messageId.isNotEmpty;
@@ -2782,7 +2802,9 @@ class _ChatScreenState extends State<ChatScreen> {
         canOpenImage: canOpenImage,
       ),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 220),
+        duration: reducedMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 220),
         curve: Curves.easeOut,
         constraints: BoxConstraints(
           maxWidth: maxBubbleWidth > 620 ? 620 : maxBubbleWidth,
@@ -2839,7 +2861,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   _catalogMetaBadge(
                     theme,
                     'Обработано',
-                    '$offerProcessedSum RUB',
+                    '$offerProcessedSum ₽',
                   ),
                 ],
               ),
@@ -2968,7 +2990,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  _catalogMetaBadge(theme, 'Цена', '$price RUB'),
+                  _catalogMetaBadge(theme, 'Цена', '$price ₽'),
                   _catalogMetaBadge(theme, 'В наличии', quantity),
                 ],
               ),
@@ -3029,7 +3051,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 runSpacing: 8,
                 children: [
                   _catalogMetaBadge(theme, 'ID', productLabel),
-                  _catalogMetaBadge(theme, 'Цена', '$price RUB'),
+                  _catalogMetaBadge(theme, 'Цена', '$price ₽'),
                   _catalogMetaBadge(theme, 'Куплено', quantity),
                   _catalogMetaBadge(theme, 'Полка', shelf),
                 ],
@@ -3109,7 +3131,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         style: TextStyle(
                           color: fromMe
                               ? theme.colorScheme.onPrimaryContainer.withValues(
-                                  alpha: 0.76,
+                                  alpha: reducedMotion ? 0.92 : 0.76,
                                 )
                               : theme.colorScheme.onSurfaceVariant,
                           fontSize: 11,
@@ -3139,53 +3161,60 @@ class _ChatScreenState extends State<ChatScreen> {
     final isAppearing =
         messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
 
-    final animatedItem = TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
-      duration: const Duration(milliseconds: 380),
-      curve: Curves.easeOutCubic,
-      builder: (context, value, child) {
-        final dx = fromMe ? 18 * (1 - value) : -28 * (1 - value);
-        final dy = 10 * (1 - value);
-        return Opacity(
-          opacity: value.clamp(0, 1),
-          child: Transform.translate(offset: Offset(dx, dy), child: child),
-        );
-      },
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-        child: Row(
-          mainAxisAlignment: fromMe
-              ? MainAxisAlignment.end
-              : MainAxisAlignment.start,
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            if (!fromMe && showAvatar) ...[
-              AppAvatar(
-                title: senderName,
-                imageUrl: senderAvatarUrl,
-                focusX: senderAvatarFocusX,
-                focusY: senderAvatarFocusY,
-                zoom: senderAvatarZoom,
-                radius: 18,
-              ),
-              const SizedBox(width: 10),
-            ],
-            Flexible(child: bubble),
-            if (fromMe && showAvatar) ...[
-              const SizedBox(width: 10),
-              AppAvatar(
-                title: senderName,
-                imageUrl: senderAvatarUrl,
-                focusX: senderAvatarFocusX,
-                focusY: senderAvatarFocusY,
-                zoom: senderAvatarZoom,
-                radius: 18,
-              ),
-            ],
+    final bubbleRow = Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+      child: Row(
+        mainAxisAlignment: fromMe
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          if (!fromMe && showAvatar) ...[
+            AppAvatar(
+              title: senderName,
+              imageUrl: senderAvatarUrl,
+              focusX: senderAvatarFocusX,
+              focusY: senderAvatarFocusY,
+              zoom: senderAvatarZoom,
+              radius: 18,
+            ),
+            const SizedBox(width: 10),
           ],
-        ),
+          Flexible(child: bubble),
+          if (fromMe && showAvatar) ...[
+            const SizedBox(width: 10),
+            AppAvatar(
+              title: senderName,
+              imageUrl: senderAvatarUrl,
+              focusX: senderAvatarFocusX,
+              focusY: senderAvatarFocusY,
+              zoom: senderAvatarZoom,
+              radius: 18,
+            ),
+          ],
+        ],
       ),
     );
+
+    final animatedItem = reducedMotion
+        ? bubbleRow
+        : TweenAnimationBuilder<double>(
+            tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
+            duration: const Duration(milliseconds: 380),
+            curve: Curves.easeOutCubic,
+            builder: (context, value, child) {
+              final dx = fromMe ? 18 * (1 - value) : -28 * (1 - value);
+              final dy = 10 * (1 - value);
+              return Opacity(
+                opacity: value.clamp(0, 1),
+                child: Transform.translate(
+                  offset: Offset(dx, dy),
+                  child: child,
+                ),
+              );
+            },
+            child: bubbleRow,
+          );
 
     if (hasMessageId) {
       return KeyedSubtree(key: _messageKeyFor(messageId), child: animatedItem);
@@ -3261,6 +3290,36 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
+          if (_isDirectMessageChat())
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.errorContainer,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Theme.of(context).colorScheme.error),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.warning_amber_rounded,
+                    color: Theme.of(context).colorScheme.onErrorContainer,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Внимание: не отправляйте личные данные, фото документов, карты и пароли. Личные сообщения пока в доработке, поэтому это небезопасно.',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onErrorContainer,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           if (_activePin != null)
             GestureDetector(
               onTap: _jumpToPinnedMessage,
