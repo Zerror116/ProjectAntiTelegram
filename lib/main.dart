@@ -22,8 +22,16 @@ const String _rawApiBaseUrl = String.fromEnvironment(
   'FENIX_API_BASE_URL',
   defaultValue: 'http://127.0.0.1:3000',
 );
-final String _defaultApiBaseUrl = _resolveApiBaseUrl(_rawApiBaseUrl);
-final Dio dio = Dio(BaseOptions(baseUrl: _defaultApiBaseUrl));
+final String _initialApiBaseUrl = _resolveApiBaseUrl(_rawApiBaseUrl);
+String _runtimeApiBaseUrl = _initialApiBaseUrl;
+final Dio dio = Dio(
+  BaseOptions(
+    baseUrl: _runtimeApiBaseUrl,
+    connectTimeout: const Duration(seconds: 8),
+    sendTimeout: const Duration(seconds: 20),
+    receiveTimeout: const Duration(seconds: 20),
+  ),
+);
 late final AuthService authService;
 
 // Socket and event bus for chat events
@@ -60,6 +68,7 @@ bool _appSoundPlayerPrepared = false;
 bool _socketInitInProgress = false;
 String? _socketBoundUserId;
 String? _socketBoundViewRole;
+String _lastConnectivityHint = '';
 
 enum AppNoticeTone { info, success, warning, error }
 
@@ -109,6 +118,73 @@ String _resolveApiBaseUrl(String raw) {
   return '$scheme://$host$portPart$path';
 }
 
+void _setRuntimeApiBaseUrl(String next) {
+  final normalized = _resolveApiBaseUrl(next);
+  if (_runtimeApiBaseUrl == normalized && dio.options.baseUrl == normalized) {
+    return;
+  }
+  _runtimeApiBaseUrl = normalized;
+  dio.options.baseUrl = normalized;
+  debugPrint('API base URL switched to $_runtimeApiBaseUrl');
+}
+
+List<String> _buildApiBaseCandidates() {
+  final current = _resolveApiBaseUrl(dio.options.baseUrl);
+  final out = <String>[current];
+  Uri? uri;
+  try {
+    uri = Uri.parse(current);
+  } catch (_) {}
+
+  final host = uri?.host.toLowerCase().trim() ?? '';
+  final port = uri?.hasPort == true ? uri!.port : 3000;
+  final scheme = (uri?.scheme.isNotEmpty ?? false) ? uri!.scheme : 'http';
+  final path = (uri?.path ?? '').trim();
+  final pathPart = path.isEmpty || path == '/' ? '' : path;
+
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    if (host == '127.0.0.1' || host == 'localhost') {
+      out.add('$scheme://10.0.2.2:$port$pathPart');
+      out.add('$scheme://10.0.3.2:$port$pathPart');
+    }
+  }
+
+  const fallbackRaw = String.fromEnvironment(
+    'FENIX_API_FALLBACK_BASE_URL',
+    defaultValue: '',
+  );
+  final fallback = fallbackRaw.trim();
+  if (fallback.isNotEmpty) {
+    out.add(_resolveApiBaseUrl(fallback));
+  }
+
+  final unique = <String>{};
+  final ordered = <String>[];
+  for (final item in out) {
+    final normalized = _resolveApiBaseUrl(item);
+    if (unique.add(normalized)) ordered.add(normalized);
+  }
+  return ordered;
+}
+
+String _buildConnectivityHint() {
+  final base = _runtimeApiBaseUrl;
+  final uri = Uri.tryParse(base);
+  final host = uri?.host.toLowerCase().trim() ?? '';
+  final port = uri?.hasPort == true ? uri!.port : 3000;
+
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    if (host == '127.0.0.1' || host == 'localhost') {
+      return 'Android использует свой localhost.\n'
+          '1) Подключите телефон по USB и выполните:\n'
+          '   adb reverse tcp:$port tcp:$port\n'
+          '2) Или запустите с LAN IP Mac:\n'
+          '   flutter run --dart-define=FENIX_API_BASE_URL=http://<IP_Mac>:$port';
+    }
+  }
+  return 'Проверьте, что сервер запущен и доступен по адресу $base';
+}
+
 class _AppNoticePayload {
   final int id;
   final String message;
@@ -129,6 +205,28 @@ final ValueNotifier<_AppNoticePayload?> _appNoticeNotifier =
     ValueNotifier<_AppNoticePayload?>(null);
 int _appNoticeSeq = 0;
 Timer? _appNoticeTimer;
+
+class _SubscriptionUiPayload {
+  final bool blocked;
+  final String? blockedTitle;
+  final String? blockedMessage;
+  final String? warningMessage;
+  final DateTime? warningExpiresAt;
+
+  const _SubscriptionUiPayload({
+    required this.blocked,
+    this.blockedTitle,
+    this.blockedMessage,
+    this.warningMessage,
+    this.warningExpiresAt,
+  });
+
+  static const empty = _SubscriptionUiPayload(blocked: false);
+}
+
+final ValueNotifier<_SubscriptionUiPayload> _subscriptionUiNotifier =
+    ValueNotifier<_SubscriptionUiPayload>(_SubscriptionUiPayload.empty);
+DateTime? _stickySubscriptionWarningExpiresAt;
 
 String _settingsScopeUserId() {
   final id = authService.currentUser?.id;
@@ -210,6 +308,7 @@ Widget _wrapAppRoot(BuildContext context, Widget child) {
 
 void _applyPerformanceRuntimeTuning(bool enabled) {
   final cache = PaintingBinding.instance.imageCache;
+  final isAndroid = !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
   if (enabled) {
     cache.maximumSizeBytes = 24 * 1024 * 1024;
     cache.maximumSize = 160;
@@ -217,8 +316,8 @@ void _applyPerformanceRuntimeTuning(bool enabled) {
     cache.clear();
     return;
   }
-  cache.maximumSizeBytes = 110 * 1024 * 1024;
-  cache.maximumSize = 1200;
+  cache.maximumSizeBytes = isAndroid ? 72 * 1024 * 1024 : 110 * 1024 * 1024;
+  cache.maximumSize = isAndroid ? 800 : 1200;
 }
 
 Future<void> refreshUserPreferences() async {
@@ -227,8 +326,10 @@ Future<void> refreshUserPreferences() async {
   final notifications =
       prefs.getBool('$_notificationsPrefPrefix$scope') ?? true;
   final darkMode = prefs.getBool('$_themePrefPrefix$scope') ?? false;
-  final performanceMode =
-      prefs.getBool('$_performanceModePrefPrefix$scope') ?? false;
+  final performanceRaw = prefs.getBool('$_performanceModePrefPrefix$scope');
+  final defaultPerformanceMode =
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  final performanceMode = performanceRaw ?? defaultPerformanceMode;
 
   notificationsEnabledNotifier.value = notifications;
   themeModeNotifier.value = darkMode ? ThemeMode.dark : ThemeMode.light;
@@ -240,6 +341,9 @@ Future<void> refreshUserPreferences() async {
   uiCardSizeNotifier.value = 'standard';
   await prefs.remove('$_uiDensityPrefPrefix$scope');
   await prefs.remove('$_uiCardSizePrefPrefix$scope');
+  if (performanceRaw == null && defaultPerformanceMode) {
+    await prefs.setBool('$_performanceModePrefPrefix$scope', true);
+  }
   performanceModeNotifier.value = performanceMode;
   _applyPerformanceRuntimeTuning(performanceMode);
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
@@ -341,6 +445,209 @@ Duration _normalizeNoticeDuration(Duration duration) {
   return const Duration(seconds: 5);
 }
 
+bool _isSubscriptionRestrictedRole(String role) {
+  final normalized = role.toLowerCase().trim();
+  return normalized == 'tenant' ||
+      normalized == 'admin' ||
+      normalized == 'worker';
+}
+
+bool _isSubscriptionWarningRole(String role) {
+  return role.toLowerCase().trim() == 'tenant';
+}
+
+const Duration _subscriptionExpiredGraceBeforeBlock = Duration(seconds: 8);
+
+DateTime? _parseSubscriptionDateTime(String? raw) {
+  final value = (raw ?? '').trim();
+  if (value.isEmpty) return null;
+  final parsed = DateTime.tryParse(value);
+  if (parsed == null) return null;
+  return parsed.toLocal();
+}
+
+String _twoDigits(int value) {
+  return value.toString().padLeft(2, '0');
+}
+
+String _formatSubscriptionDateTime(DateTime dt) {
+  return '${_twoDigits(dt.day)}.${_twoDigits(dt.month)}.${dt.year} '
+      '${_twoDigits(dt.hour)}:${_twoDigits(dt.minute)}';
+}
+
+String _formatCountdown(Duration remaining) {
+  final totalSeconds = remaining.inSeconds < 0 ? 0 : remaining.inSeconds;
+  final hours = totalSeconds ~/ 3600;
+  final minutes = (totalSeconds % 3600) ~/ 60;
+  final seconds = totalSeconds % 60;
+  return '${_twoDigits(hours)}:${_twoDigits(minutes)}:${_twoDigits(seconds)}';
+}
+
+String _extractApiErrorMessage(DioException err) {
+  final data = err.response?.data;
+  if (data is Map) {
+    final raw = (data['error'] ?? data['message'] ?? '').toString().trim();
+    if (raw.isNotEmpty) return raw;
+  }
+  return (err.message ?? '').trim();
+}
+
+bool _isSubscriptionErrorText(String message) {
+  final normalized = message.toLowerCase();
+  return normalized.contains('подписк') ||
+      normalized.contains('tenant_expired') ||
+      normalized.contains('tenant_blocked');
+}
+
+String _normalizeSubscriptionBlockedMessage(String source) {
+  final normalized = source.toLowerCase();
+  if (normalized.contains('ист') || normalized.contains('expired')) {
+    return 'Срок подписки истек. Свяжитесь с Вазгеном.';
+  }
+  return 'Подписка отключена. Свяжитесь с Вазгеном.';
+}
+
+void _updateSubscriptionUiState({
+  String? forcedBlockedMessage,
+  bool promoteWarningDeadline = false,
+}) {
+  final user = authService.currentUser;
+  if (user == null) {
+    _stickySubscriptionWarningExpiresAt = null;
+    _subscriptionUiNotifier.value = _SubscriptionUiPayload.empty;
+    return;
+  }
+
+  final role = user.role.toLowerCase().trim();
+  if (!_isSubscriptionRestrictedRole(role)) {
+    _stickySubscriptionWarningExpiresAt = null;
+    _subscriptionUiNotifier.value = _SubscriptionUiPayload.empty;
+    return;
+  }
+
+  final status = (user.tenantStatus ?? '').toLowerCase().trim();
+  final previous = _subscriptionUiNotifier.value;
+  final parsedExpiresAt = _parseSubscriptionDateTime(
+    user.subscriptionExpiresAt,
+  );
+  if (_isSubscriptionWarningRole(role) && parsedExpiresAt != null) {
+    final sticky = _stickySubscriptionWarningExpiresAt;
+    if (sticky == null) {
+      _stickySubscriptionWarningExpiresAt = parsedExpiresAt;
+    } else if (promoteWarningDeadline) {
+      // Явное обновление от сокета (например, продление подписки) может
+      // увеличивать дедлайн.
+      _stickySubscriptionWarningExpiresAt = parsedExpiresAt;
+    } else if (parsedExpiresAt.isBefore(sticky)) {
+      // Фоновый poll может прийти со старым дедлайном; держим самый "срочный".
+      _stickySubscriptionWarningExpiresAt = parsedExpiresAt;
+    }
+  }
+  DateTime? expiresAt = parsedExpiresAt;
+  final now = DateTime.now();
+  final stickyDeadline = _stickySubscriptionWarningExpiresAt;
+  if (_isSubscriptionWarningRole(role) && stickyDeadline != null) {
+    if (expiresAt == null) {
+      expiresAt = stickyDeadline;
+    } else if (!promoteWarningDeadline && expiresAt.isAfter(stickyDeadline)) {
+      // Не даём фоновому refresh "повышать" дедлайн и скрывать предупреждение.
+      expiresAt = stickyDeadline;
+    }
+  }
+
+  final blockedByStatus = status.isNotEmpty && status != 'active';
+  if (expiresAt == null &&
+      _isSubscriptionWarningRole(role) &&
+      !blockedByStatus &&
+      previous.warningExpiresAt != null) {
+    // Если сервер временно не вернул subscription_expires_at, сохраняем
+    // последний известный дедлайн, чтобы предупреждение не "мигало".
+    expiresAt = previous.warningExpiresAt;
+  }
+  if (expiresAt == null &&
+      _isSubscriptionWarningRole(role) &&
+      !blockedByStatus &&
+      _stickySubscriptionWarningExpiresAt != null) {
+    expiresAt = _stickySubscriptionWarningExpiresAt;
+  }
+  final isExpiryReached = expiresAt != null && !expiresAt.isAfter(now);
+  final expiryGraceActive =
+      isExpiryReached &&
+      now.difference(expiresAt) < _subscriptionExpiredGraceBeforeBlock;
+  final blockedByExpiry = isExpiryReached && !expiryGraceActive;
+  final forced = (forcedBlockedMessage ?? '').trim();
+
+  final blocked = forced.isNotEmpty || blockedByStatus || blockedByExpiry;
+
+  String? blockedTitle;
+  String? blockedMessage;
+  if (blocked) {
+    blockedTitle = blockedByExpiry
+        ? 'Срок подписки истек'
+        : 'Подписка отключена';
+    blockedMessage = forced.isNotEmpty
+        ? forced
+        : '${blockedByExpiry ? 'Срок подписки истек.' : 'Подписка отключена.'} Свяжитесь с Вазгеном.';
+  }
+
+  String? warningMessage;
+  DateTime? warningExpiresAt;
+  if (!blocked && expiresAt != null && _isSubscriptionWarningRole(role)) {
+    final remaining = expiresAt.difference(now);
+    if (remaining <= const Duration(days: 1) && remaining > Duration.zero) {
+      warningMessage =
+          'Подписка истекает ${_formatSubscriptionDateTime(expiresAt)}. Продлите заранее.';
+      warningExpiresAt = expiresAt;
+    } else if (remaining <= Duration.zero && expiryGraceActive) {
+      warningMessage = 'Ну, у вас предупреждал...';
+      warningExpiresAt = expiresAt;
+    }
+  }
+
+  if (_isSubscriptionWarningRole(role)) {
+    _stickySubscriptionWarningExpiresAt = warningExpiresAt ?? expiresAt;
+  }
+
+  _subscriptionUiNotifier.value = _SubscriptionUiPayload(
+    blocked: blocked,
+    blockedTitle: blockedTitle,
+    blockedMessage: blockedMessage,
+    warningMessage: warningMessage,
+    warningExpiresAt: warningExpiresAt,
+  );
+}
+
+void _applySubscriptionSocketUpdate(dynamic raw) {
+  if (raw is! Map) return;
+  final current = authService.currentUser;
+  if (current == null) return;
+  if (!_isSubscriptionRestrictedRole(current.role)) return;
+
+  final map = Map<String, dynamic>.from(current.toMap());
+  final nextStatus = (raw['status'] ?? raw['tenant_status'] ?? '')
+      .toString()
+      .trim();
+  final nextExpiry =
+      (raw['subscription_expires_at'] ?? raw['subscriptionExpiresAt'] ?? '')
+          .toString()
+          .trim();
+
+  if (nextStatus.isNotEmpty) {
+    map['tenant_status'] = nextStatus;
+  }
+  final hasExpiryField =
+      raw.containsKey('subscription_expires_at') ||
+      raw.containsKey('subscriptionExpiresAt');
+  if (hasExpiryField) {
+    map['subscription_expires_at'] = nextExpiry;
+  }
+
+  authService.updateCurrentUserFromMap(map);
+  _updateSubscriptionUiState(
+    promoteWarningDeadline: hasExpiryField && nextExpiry.isNotEmpty,
+  );
+}
+
 void _showGlobalNotice(
   String message, {
   String? title,
@@ -371,6 +678,12 @@ class _GlobalNoticeHost extends StatelessWidget {
   final Widget child;
 
   const _GlobalNoticeHost({required this.child});
+
+  double _subscriptionWarningBottomOffset(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final safeBottom = media.viewPadding.bottom;
+    return safeBottom + kBottomNavigationBarHeight + 12;
+  }
 
   ({IconData icon, Color accent}) _noticeVisuals(
     BuildContext context,
@@ -538,6 +851,189 @@ class _GlobalNoticeHost extends StatelessWidget {
                 ),
               ),
             ),
+            ValueListenableBuilder<_SubscriptionUiPayload>(
+              valueListenable: _subscriptionUiNotifier,
+              builder: (context, state, _) {
+                if (state.blocked || state.warningMessage == null) {
+                  return const SizedBox.shrink();
+                }
+                return Positioned(
+                  left: 12,
+                  right: 12,
+                  bottom: _subscriptionWarningBottomOffset(context),
+                  child: IgnorePointer(
+                    ignoring: true,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 760),
+                      child: Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 760),
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.errorContainer,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: theme.colorScheme.error,
+                              ),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(
+                                12,
+                                10,
+                                12,
+                                10,
+                              ),
+                              child: StreamBuilder<int>(
+                                stream: Stream<int>.periodic(
+                                  const Duration(seconds: 1),
+                                  (tick) => tick,
+                                ),
+                                builder: (context, _) {
+                                  final expiresAt = state.warningExpiresAt;
+                                  Duration? remaining;
+                                  if (expiresAt != null) {
+                                    remaining = expiresAt.difference(
+                                      DateTime.now(),
+                                    );
+                                  }
+                                  final countdown = remaining == null
+                                      ? null
+                                      : _formatCountdown(remaining);
+                                  final subtitle = remaining == null
+                                      ? null
+                                      : remaining <= Duration.zero
+                                      ? 'Срок подписки истек'
+                                      : 'До отключения: $countdown';
+
+                                  return Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Icon(
+                                        Icons.warning_amber_rounded,
+                                        size: 18,
+                                        color:
+                                            theme.colorScheme.onErrorContainer,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              state.warningMessage!,
+                                              style: theme.textTheme.bodySmall
+                                                  ?.copyWith(
+                                                    color: theme
+                                                        .colorScheme
+                                                        .onErrorContainer,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                            ),
+                                            if (subtitle != null) ...[
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                subtitle,
+                                                style: theme
+                                                    .textTheme
+                                                    .labelSmall
+                                                    ?.copyWith(
+                                                      color: theme
+                                                          .colorScheme
+                                                          .onErrorContainer,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                    ),
+                                              ),
+                                            ],
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+            ValueListenableBuilder<_SubscriptionUiPayload>(
+              valueListenable: _subscriptionUiNotifier,
+              builder: (context, state, _) {
+                if (!state.blocked) return const SizedBox.shrink();
+                return Positioned.fill(
+                  child: Material(
+                    color: theme.colorScheme.scrim.withValues(alpha: 0.78),
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 520),
+                        child: Padding(
+                          padding: const EdgeInsets.all(20),
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.surface,
+                              borderRadius: BorderRadius.circular(24),
+                              border: Border.all(
+                                color: theme.colorScheme.errorContainer,
+                              ),
+                              boxShadow: const [
+                                BoxShadow(
+                                  blurRadius: 26,
+                                  offset: Offset(0, 16),
+                                  color: Color(0x33000000),
+                                ),
+                              ],
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(
+                                22,
+                                22,
+                                22,
+                                22,
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.lock_outline_rounded,
+                                    size: 44,
+                                    color: theme.colorScheme.error,
+                                  ),
+                                  const SizedBox(height: 14),
+                                  Text(
+                                    state.blockedTitle ?? 'Подписка отключена',
+                                    textAlign: TextAlign.center,
+                                    style: theme.textTheme.titleLarge?.copyWith(
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    state.blockedMessage ??
+                                        'Подписка отключена. Свяжитесь с Вазгеном.',
+                                    textAlign: TextAlign.center,
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                      height: 1.35,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
           ],
         );
       },
@@ -627,36 +1123,64 @@ Future<void> disconnectSocket() async {
 }
 
 Future<bool> ensureDatabaseExists() async {
-  try {
-    debugPrint('ensureDatabaseExists: checking /health');
-    final health = await dio.get('/health');
-    debugPrint(
-      'ensureDatabaseExists: /health status=${health.statusCode}, data=${health.data}',
-    );
-    if (health.statusCode == 200) {
-      final data = health.data;
-      if (data is Map && data['ok'] == true) return true;
-      return true;
+  final candidates = _buildApiBaseCandidates();
+  Object? lastError;
+
+  for (final base in candidates) {
+    _setRuntimeApiBaseUrl(base);
+    try {
+      debugPrint('ensureDatabaseExists: checking /health at $base');
+      final health = await dio.get(
+        '/health',
+        options: Options(
+          sendTimeout: const Duration(seconds: 4),
+          receiveTimeout: const Duration(seconds: 4),
+        ),
+      );
+      debugPrint(
+        'ensureDatabaseExists: /health[$base] status=${health.statusCode}, data=${health.data}',
+      );
+      if (health.statusCode == 200) {
+        final data = health.data;
+        _lastConnectivityHint = '';
+        if (data is Map && data['ok'] == true) return true;
+        return true;
+      }
+    } catch (e) {
+      lastError = e;
+      debugPrint('ensureDatabaseExists: /health[$base] failed: $e');
     }
-  } catch (e) {
-    debugPrint('ensureDatabaseExists: /health failed: $e');
+
+    try {
+      debugPrint('ensureDatabaseExists: fallback /api/setup at $base');
+      final resp = await dio.post(
+        '/api/setup',
+        options: Options(
+          sendTimeout: const Duration(seconds: 6),
+          receiveTimeout: const Duration(seconds: 6),
+        ),
+      );
+      debugPrint(
+        'ensureDatabaseExists: /api/setup[$base] status=${resp.statusCode}, data=${resp.data}',
+      );
+      if (resp.statusCode == 200) {
+        final data = resp.data;
+        _lastConnectivityHint = '';
+        if (data is Map && data['ok'] == true) return true;
+      }
+    } catch (e) {
+      lastError = e;
+      debugPrint('ensureDatabaseExists fallback[$base] error: $e');
+    }
   }
 
-  try {
-    debugPrint('ensureDatabaseExists: fallback /api/setup');
-    final resp = await dio.post('/api/setup');
+  _lastConnectivityHint = _buildConnectivityHint();
+  if (lastError != null) {
     debugPrint(
-      'ensureDatabaseExists: /api/setup status=${resp.statusCode}, data=${resp.data}',
+      'ensureDatabaseExists: all candidates failed, lastError=$lastError',
     );
-    if (resp.statusCode == 200) {
-      final data = resp.data;
-      if (data is Map && data['ok'] == true) return true;
-    }
-    return false;
-  } catch (e) {
-    debugPrint('ensureDatabaseExists fallback error: $e');
-    return false;
   }
+  return false;
 }
 
 bool _isAuthEndpoint(RequestOptions options) {
@@ -747,6 +1271,24 @@ void _attachAuthInterceptor() {
           return handler.next(options);
         }
       },
+      onResponse: (response, handler) {
+        try {
+          final path = response.requestOptions.path.toLowerCase().trim();
+          final isProfileResponse =
+              path == '/api/profile' || path.endsWith('/api/profile');
+          if (isProfileResponse &&
+              response.statusCode == 200 &&
+              response.data is Map &&
+              response.data['user'] is Map) {
+            final userMap = Map<String, dynamic>.from(response.data['user']);
+            authService.updateCurrentUserFromMap(userMap);
+            _updateSubscriptionUiState();
+          }
+        } catch (e, st) {
+          debugPrint('onResponse interceptor error: $e\n$st');
+        }
+        handler.next(response);
+      },
       onError: (err, handler) async {
         final status = err.response?.statusCode;
         final req = err.requestOptions;
@@ -759,6 +1301,17 @@ void _attachAuthInterceptor() {
         // - 401 (403 = ошибка прав, не разлогиниваем)
         // - не auth endpoint
         // - запрос содержал токен
+        if ((status == 402 || status == 403) && !_isAuthEndpoint(req)) {
+          final errorMessage = _extractApiErrorMessage(err);
+          if (_isSubscriptionErrorText(errorMessage)) {
+            _updateSubscriptionUiState(
+              forcedBlockedMessage: _normalizeSubscriptionBlockedMessage(
+                errorMessage,
+              ),
+            );
+          }
+        }
+
         if (status == 401 && !_isAuthEndpoint(req) && hasBearerToken) {
           if (_handlingAuthFailure) {
             debugPrint(
@@ -840,7 +1393,7 @@ Future<void> _initSocket() async {
 
     // Build options
     socket = io.io(
-      _defaultApiBaseUrl,
+      _runtimeApiBaseUrl,
       io.OptionBuilder()
           .setTransports(['websocket'])
           .disableAutoConnect()
@@ -905,6 +1458,11 @@ Future<void> _initSocket() async {
       chatEventsController.add({'type': 'chat:message:read', 'data': data});
     });
 
+    socket?.on('tenant:subscription:update', (data) {
+      debugPrint('📬 Socket event tenant:subscription:update -> $data');
+      _applySubscriptionSocketUpdate(data);
+    });
+
     socket?.on('cart:updated', (data) {
       debugPrint('📬 Socket event cart:updated -> $data');
       chatEventsController.add({'type': 'cart:updated', 'data': data});
@@ -942,7 +1500,10 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   if (!dbReady) return const SetupFailedScreen();
 
   // ✅ ИСПРАВЛЕНИЕ: Используй tryRefreshOnStartup вместо setAuthHeaderFromStorage
-  final logged = await authService.tryRefreshOnStartup();
+  final logged = await authService.tryRefreshOnStartup().timeout(
+    const Duration(seconds: 14),
+    onTimeout: () => false,
+  );
   debugPrint('determineInitialScreen: tryRefreshOnStartup -> $logged');
 
   if (logged) {
@@ -954,7 +1515,13 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
 
   try {
-    final resp = await dio.get('/api/profile');
+    final resp = await dio.get(
+      '/api/profile',
+      options: Options(
+        sendTimeout: const Duration(seconds: 8),
+        receiveTimeout: const Duration(seconds: 8),
+      ),
+    );
     debugPrint(
       'determineInitialScreen: /api/profile status=${resp.statusCode}',
     );
@@ -1061,6 +1628,8 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Widget? _home;
   String? _status;
   StreamSubscription<User?>? _authSub;
+  Timer? _subscriptionProbeTimer;
+  bool _subscriptionProbeBusy = false;
 
   void _showAuthScreen() {
     if (!mounted) return;
@@ -1086,7 +1655,55 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     try {
       _authSub?.cancel();
     } catch (_) {}
+    _subscriptionProbeTimer?.cancel();
     super.dispose();
+  }
+
+  void _restartSubscriptionProbe() {
+    _subscriptionProbeTimer?.cancel();
+    _subscriptionProbeTimer = Timer.periodic(
+      const Duration(seconds: 10),
+      (_) => unawaited(_probeSubscriptionState()),
+    );
+    unawaited(_probeSubscriptionState());
+  }
+
+  Future<void> _probeSubscriptionState() async {
+    if (!mounted || _subscriptionProbeBusy) return;
+    final user = authService.currentUser;
+    if (user == null) {
+      _updateSubscriptionUiState();
+      return;
+    }
+    if (!_isSubscriptionRestrictedRole(user.role)) {
+      _updateSubscriptionUiState();
+      return;
+    }
+
+    _subscriptionProbeBusy = true;
+    try {
+      final resp = await dio.get('/api/profile');
+      if (resp.statusCode == 200 &&
+          resp.data is Map &&
+          resp.data['user'] is Map) {
+        final userMap = Map<String, dynamic>.from(resp.data['user']);
+        authService.updateCurrentUserFromMap(userMap);
+        _updateSubscriptionUiState();
+      }
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      final message = _extractApiErrorMessage(e);
+      if ((status == 402 || status == 403) &&
+          _isSubscriptionErrorText(message)) {
+        _updateSubscriptionUiState(
+          forcedBlockedMessage: _normalizeSubscriptionBlockedMessage(message),
+        );
+      }
+    } catch (_) {
+      // ignore
+    } finally {
+      _subscriptionProbeBusy = false;
+    }
   }
 
   Future<void> _startInit() async {
@@ -1107,6 +1724,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           _lastPlayedMessageId = null;
           activeChatIdNotifier.value = null;
           await refreshUserPreferences();
+          _updateSubscriptionUiState();
           _showAuthScreen();
         } else {
           _handlingAuthFailure = false;
@@ -1117,8 +1735,10 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             debugPrint('Failed to init socket after login: $e');
           }
           await refreshUserPreferences();
+          _updateSubscriptionUiState();
         }
       });
+      _restartSubscriptionProbe();
 
       await refreshUserPreferences();
       unawaited(_prepareAppSoundPlayer());
@@ -1130,7 +1750,10 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     final dbReady = await ensureDatabaseExists();
 
     setState(() => _status = 'Инициализация: определение стартового экрана');
-    final initial = await determineInitialScreen(dbReady);
+    final initial = await determineInitialScreen(
+      dbReady,
+    ).timeout(const Duration(seconds: 25), onTimeout: () => const AuthScreen());
+    _updateSubscriptionUiState();
     await refreshUserPreferences();
 
     debugPrint(
@@ -1214,6 +1837,8 @@ class SetupFailedScreen extends StatelessWidget {
   const SetupFailedScreen({super.key});
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final hint = _lastConnectivityHint.trim();
     return Scaffold(
       appBar: AppBar(title: const Text('Ошибка инициализации')),
       body: Center(
@@ -1226,6 +1851,27 @@ class SetupFailedScreen extends StatelessWidget {
                 'Не удалось инициализировать базу данных на сервере.',
                 textAlign: TextAlign.center,
               ),
+              const SizedBox(height: 8),
+              Text(
+                'Текущий API: $_runtimeApiBaseUrl',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              if (hint.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
+                  ),
+                  child: Text(hint, style: theme.textTheme.bodySmall),
+                ),
+              ],
               const SizedBox(height: 12),
               ElevatedButton(
                 onPressed: () async {

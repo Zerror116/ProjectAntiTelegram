@@ -9,14 +9,9 @@ const router = express.Router();
 const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
-const requirePermission = require('../middleware/requirePermission');
 const { ensureSystemChannels } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
-
-const requireProductCreatePermission = requirePermission('product.create');
-const requireProductRequeuePermission = requirePermission('product.requeue');
-const requireProductEditPendingPermission = requirePermission('product.edit.own_pending');
 
 const productUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
@@ -207,6 +202,107 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || '').trim(),
+  );
+}
+
+function normalizeUserRoleForInsert(rawRole) {
+  const role = String(rawRole || '').toLowerCase().trim();
+  if (['client', 'worker', 'admin', 'tenant', 'creator'].includes(role)) {
+    return role;
+  }
+  return 'client';
+}
+
+async function resolveActorUserId(queryable, user) {
+  const tokenUserId = String(user?.id || '').trim();
+  const tokenEmail = String(user?.email || '').trim();
+  const normalizedEmail = tokenEmail.toLowerCase();
+  const normalizedName = String(user?.name || '').trim();
+  const role = normalizeUserRoleForInsert(user?.base_role || user?.role);
+  const tenantId = isUuid(user?.tenant_id) ? String(user.tenant_id).trim() : null;
+
+  if (isUuid(tokenUserId)) {
+    const byId = await queryable.query(
+      `SELECT id
+       FROM users
+       WHERE id = $1::uuid
+       LIMIT 1`,
+      [tokenUserId],
+    );
+    if (byId.rowCount > 0) return byId.rows[0].id;
+  }
+
+  if (normalizedEmail) {
+    const byEmail = await queryable.query(
+      `SELECT id
+       FROM users
+       WHERE lower(email) = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [normalizedEmail],
+    );
+    if (byEmail.rowCount > 0) return byEmail.rows[0].id;
+  }
+
+  if (!isUuid(tokenUserId)) {
+    throw new Error('Unable to resolve local actor user id');
+  }
+
+  try {
+    const inserted = await queryable.query(
+      `INSERT INTO users (
+         id,
+         email,
+         role,
+         name,
+         is_active,
+         tenant_id,
+         created_at,
+         updated_at
+       )
+       VALUES (
+         $1::uuid,
+         NULLIF($2::text, ''),
+         $3::text,
+         NULLIF($4::text, ''),
+         true,
+         $5::uuid,
+         now(),
+         now()
+       )
+       ON CONFLICT (id)
+       DO UPDATE SET
+         email = COALESCE(users.email, EXCLUDED.email),
+         role = COALESCE(NULLIF(users.role, ''), EXCLUDED.role),
+         name = COALESCE(users.name, EXCLUDED.name),
+         tenant_id = COALESCE(users.tenant_id, EXCLUDED.tenant_id),
+         is_active = true,
+         updated_at = now()
+       RETURNING id`,
+      [tokenUserId, normalizedEmail, role, normalizedName, tenantId],
+    );
+    if (inserted.rowCount > 0) return inserted.rows[0].id;
+  } catch (err) {
+    if (String(err?.code || '') === '23505' && normalizedEmail) {
+      const byEmail = await queryable.query(
+        `SELECT id
+         FROM users
+         WHERE lower(email) = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [normalizedEmail],
+      );
+      if (byEmail.rowCount > 0) return byEmail.rows[0].id;
+    }
+    throw err;
+  }
+
+  return tokenUserId;
+}
+
 function normalizeRevisionEntry(raw) {
   const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const title = String(item.title || '').trim();
@@ -296,6 +392,7 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
 }
 
 async function allocateProductCode(client, tenantId = null) {
+  void tenantId;
   await client.query('LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE');
 
   const reusable = await client.query(
@@ -306,16 +403,8 @@ async function allocateProductCode(client, tenantId = null) {
        AND p.reusable_at <= now()
        AND p.product_code IS NOT NULL
        AND p.product_code > 0
-       AND EXISTS (
-         SELECT 1
-         FROM product_publication_queue q
-         JOIN chats c ON c.id = q.channel_id
-         WHERE q.product_id = p.id
-           AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
-       )
      ORDER BY p.product_code ASC, p.reusable_at ASC
      FOR UPDATE OF p`,
-    [tenantId || null],
   );
 
   const reusableCodes = reusable.rows
@@ -337,14 +426,7 @@ async function allocateProductCode(client, tenantId = null) {
        FROM products p
        WHERE p.product_code IS NOT NULL
          AND p.product_code > 0
-         AND NOT (p.product_code = ANY($2::int[]))
-         AND EXISTS (
-           SELECT 1
-           FROM product_publication_queue q
-           JOIN chats c ON c.id = q.channel_id
-           WHERE q.product_id = p.id
-             AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
-         )
+         AND NOT (p.product_code = ANY($1::int[]))
      )
      SELECT COALESCE(
        (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM used WHERE product_code = 1)),
@@ -357,7 +439,7 @@ async function allocateProductCode(client, tenantId = null) {
        ),
        1
      ) AS next_code`,
-    [tenantId || null, reusableCodes],
+    [reusableCodes],
   );
   const nextCode = Number(nextRes.rows[0]?.next_code || 1);
   if (!Number.isFinite(nextCode) || nextCode <= 0) return 1;
@@ -408,7 +490,7 @@ async function getAllowedPostChannels(userRole, tenantId = null) {
 }
 
 // Список каналов, доступных для очереди публикаций
-router.get('/channels', authMiddleware, requireRole('worker', 'admin', 'creator'), async (req, res) => {
+router.get('/channels', authMiddleware, requireRole('worker', 'admin', 'tenant', 'creator'), async (req, res) => {
   try {
     const data = await getAllowedPostChannels(req.user?.role, req.user?.tenant_id || null);
     return res.json({ ok: true, data });
@@ -419,7 +501,7 @@ router.get('/channels', authMiddleware, requireRole('worker', 'admin', 'creator'
 });
 
 // Поиск старых товаров по названию/описанию
-router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'creator'), async (req, res) => {
+router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'tenant', 'creator'), async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ ok: true, data: [] });
@@ -469,13 +551,13 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'c
 router.post(
   '/channels/:chatId/posts',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
-  requireProductCreatePermission,
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   uploadProductImage,
   async (req, res) => {
     const { chatId } = req.params;
     const client = await db.pool.connect();
     try {
+      const actorUserId = await resolveActorUserId(client, req.user);
       const {
         title,
         description = '',
@@ -523,18 +605,10 @@ router.post(
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(
         client,
-        req.user.id,
+        actorUserId,
         req.user.tenant_id,
       );
-      if (String(chatId) !== String(mainChannel.id)) {
-        await client.query('ROLLBACK');
-        removeUploadedFile(req.file);
-        return res.status(403).json({
-          ok: false,
-          error: 'Публикация доступна только в Основной канал',
-          data: { main_channel_id: mainChannel.id },
-        });
-      }
+      const targetChannelId = String(mainChannel.id);
 
       const code = await allocateProductCode(client, req.user?.tenant_id || null);
 
@@ -550,7 +624,7 @@ router.post(
           normalizedQuantity,
           normalizedShelfNumber,
           imageUrl,
-          req.user.id,
+          actorUserId,
         ]
       );
       const productId = productInsert.rows[0].id;
@@ -577,7 +651,7 @@ router.post(
         `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
          VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
          RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-        [uuidv4(), product.id, mainChannel.id, req.user.id, JSON.stringify(payload)]
+        [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
       );
 
       await client.query('COMMIT');
@@ -608,13 +682,13 @@ router.post(
 router.post(
   '/products/:productId/requeue',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
-  requireProductRequeuePermission,
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   uploadProductImage,
   async (req, res) => {
     const { productId } = req.params;
     const client = await db.pool.connect();
     try {
+      const actorUserId = await resolveActorUserId(client, req.user);
       const {
         channel_id,
         title,
@@ -631,18 +705,10 @@ router.post(
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(
         client,
-        req.user.id,
+        actorUserId,
         req.user.tenant_id,
       );
-      if (String(channel_id) !== String(mainChannel.id)) {
-        await client.query('ROLLBACK');
-        removeUploadedFile(req.file);
-        return res.status(403).json({
-          ok: false,
-          error: 'Переотправка доступна только в Основной канал',
-          data: { main_channel_id: mainChannel.id },
-        });
-      }
+      const targetChannelId = String(mainChannel.id);
 
       const productQ = await client.query(
         `SELECT id, product_code, shelf_number, title, description, price, quantity, image_url
@@ -754,7 +820,7 @@ router.post(
         `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
          VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
          RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-        [uuidv4(), product.id, mainChannel.id, req.user.id, JSON.stringify(payload)]
+        [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
       );
 
       await client.query('COMMIT');
@@ -784,10 +850,10 @@ router.post(
 router.get(
   '/queue/mine',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
-  requireProductEditPendingPermission,
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     try {
+      const actorUserId = await resolveActorUserId(db, req.user);
       const result = await db.query(
         `SELECT q.id,
                 q.product_id,
@@ -812,7 +878,7 @@ router.get(
            AND q.status = 'pending'
            AND COALESCE(q.is_sent, false) = false
          ORDER BY q.created_at DESC`,
-        [req.user.id]
+        [actorUserId]
       );
       return res.json({ ok: true, data: result.rows });
     } catch (err) {
@@ -825,8 +891,7 @@ router.get(
 router.patch(
   '/queue/:queueId',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
-  requireProductEditPendingPermission,
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const queueId = String(req.params.queueId || '').trim();
     const title = String(req.body?.title || '').trim();
@@ -859,6 +924,7 @@ router.patch(
     }
 
     try {
+      const actorUserId = await resolveActorUserId(db, req.user);
       const result = await db.query(
         `WITH target AS (
            SELECT q.id, q.product_id
@@ -897,7 +963,7 @@ router.patch(
          RETURNING q.id`,
         [
           queueId,
-          req.user.id,
+          actorUserId,
           title,
           description,
           price,
@@ -922,14 +988,15 @@ router.patch(
 router.get(
   '/revision/dates',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const client = await db.pool.connect();
     try {
+      const actorUserId = await resolveActorUserId(client, req.user);
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(
         client,
-        req.user.id,
+        actorUserId,
         req.user.tenant_id || null
       );
       const days = await fetchRevisionDays(client, mainChannel.id, 2);
@@ -950,15 +1017,16 @@ router.get(
 router.get(
   '/revision/posts',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const selectedDates = parseRevisionDates(req.query?.dates);
     const client = await db.pool.connect();
     try {
+      const actorUserId = await resolveActorUserId(client, req.user);
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(
         client,
-        req.user.id,
+        actorUserId,
         req.user.tenant_id || null
       );
       const fallbackDays = selectedDates.length > 0
@@ -988,7 +1056,7 @@ router.get(
 router.post(
   '/revision/manual',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const entries = Array.isArray(req.body?.entries) ? req.body.entries : [];
     if (!entries.length) {
@@ -1028,10 +1096,11 @@ router.post(
 
     const client = await db.pool.connect();
     try {
+      const actorUserId = await resolveActorUserId(client, req.user);
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(
         client,
-        req.user.id,
+        actorUserId,
         req.user.tenant_id || null
       );
 
@@ -1203,7 +1272,7 @@ router.post(
 router.post(
   '/revision/auto',
   authMiddleware,
-  requireRole('worker', 'admin', 'creator'),
+  requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const dates = parseRevisionDates(req.body?.dates);
     const percent = Number(req.body?.percent);
@@ -1218,10 +1287,11 @@ router.post(
 
     const client = await db.pool.connect();
     try {
+      const actorUserId = await resolveActorUserId(client, req.user);
       await client.query('BEGIN');
       const { mainChannel } = await ensureSystemChannels(
         client,
-        req.user.id,
+        actorUserId,
         req.user.tenant_id || null
       );
       const selectedDates = dates.length > 0
@@ -1307,7 +1377,7 @@ router.post(
                  approved_by = NULL,
                  approved_at = NULL
              WHERE id = $3`,
-            [JSON.stringify(payload), req.user.id, queueId]
+            [JSON.stringify(payload), actorUserId, queueId]
           );
           queuedItems.push({
             queue_id: queueId,
@@ -1332,7 +1402,7 @@ router.post(
               uuidv4(),
               productId,
               mainChannel.id,
-              req.user.id,
+              actorUserId,
               JSON.stringify(payload),
             ]
           );

@@ -68,7 +68,32 @@ function isSharedTenantMode(tenantRow) {
     .trim() === 'shared';
 }
 
-async function resolveAuthContextFromToken(token, requestedViewRole = '') {
+function isSubscriptionRestrictedRole(role) {
+  const normalized = String(role || '').toLowerCase().trim();
+  return normalized === 'tenant' || normalized === 'admin' || normalized === 'worker';
+}
+
+function isSubscriptionRestrictionReason(reason) {
+  const normalized = String(reason || '').toLowerCase().trim();
+  return normalized === 'tenant_blocked' ||
+    normalized === 'tenant_expired' ||
+    normalized === 'tenant_expiry_invalid';
+}
+
+function isProfileProbeRequest(req) {
+  const method = String(req?.method || '').toUpperCase().trim();
+  if (method !== 'GET') return false;
+  const baseUrl = String(req?.baseUrl || '').toLowerCase().trim();
+  const path = String(req?.path || '').toLowerCase().trim();
+  return baseUrl === '/api/profile' && (path === '' || path === '/');
+}
+
+async function resolveAuthContextFromToken(
+  token,
+  requestedViewRole = '',
+  options = {},
+) {
+  const ignoreTenantSubscription = options?.ignoreTenantSubscription === true;
   const unsafePayload = decodeJwtPayloadUnsafe(token) || {};
   const tenantCodeHint = db.normalizeTenantCode(
     unsafePayload.tenant_code ||
@@ -192,16 +217,21 @@ async function resolveAuthContextFromToken(token, requestedViewRole = '') {
       };
     }
 
-    const tenantState = isTenantActive({
-      status: tenantRegistry.status,
-      subscription_expires_at: tenantRegistry.subscription_expires_at,
-    });
-    if (!tenantState.ok) {
-      return {
-        ok: false,
-        status: tenantState.reason === 'tenant_expired' ? 402 : 403,
-        error: tenantState.error,
-      };
+    const shouldEnforceTenantSubscription =
+      !ignoreTenantSubscription && isSubscriptionRestrictedRole(baseRole);
+    if (shouldEnforceTenantSubscription) {
+      const tenantState = isTenantActive({
+        status: tenantRegistry.status,
+        subscription_expires_at: tenantRegistry.subscription_expires_at,
+      });
+      if (!tenantState.ok) {
+        return {
+          ok: false,
+          status: tenantState.reason === 'tenant_expired' ? 402 : 403,
+          reason: tenantState.reason,
+          error: tenantState.error,
+        };
+      }
     }
   }
 
@@ -250,15 +280,32 @@ async function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
-    const context = await resolveAuthContextFromToken(
+    let context = await resolveAuthContextFromToken(
       token,
       req.headers['x-view-role'],
     );
+    if (!context.ok &&
+        isSubscriptionRestrictionReason(context.reason) &&
+        isProfileProbeRequest(req)) {
+      const blockedReason = context.reason;
+      context = await resolveAuthContextFromToken(
+        token,
+        req.headers['x-view-role'],
+        { ignoreTenantSubscription: true },
+      );
+      if (context.ok) {
+        req.subscriptionRestricted = true;
+        req.subscriptionRestrictionReason = blockedReason || 'tenant_subscription';
+      }
+    }
     if (!context.ok) {
       if (NODE_ENV !== 'production') {
         console.error('Token verify failed or access blocked:', context.error);
       }
-      return res.status(context.status || 401).json({ error: context.error || 'Unauthorized' });
+      return res.status(context.status || 401).json({
+        error: context.error || 'Unauthorized',
+        code: context.reason || null,
+      });
     }
     req.user = context.user;
     if (context.user?.is_platform_creator === true) {

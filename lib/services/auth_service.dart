@@ -14,6 +14,8 @@ class User {
   final String? phone;
   final String? tenantCode;
   final String? tenantName;
+  final String? tenantStatus;
+  final String? subscriptionExpiresAt;
   final Map<String, dynamic> permissions;
 
   User({
@@ -24,6 +26,8 @@ class User {
     this.phone,
     this.tenantCode,
     this.tenantName,
+    this.tenantStatus,
+    this.subscriptionExpiresAt,
     this.permissions = const <String, dynamic>{},
   });
 
@@ -46,6 +50,19 @@ class User {
             .trim();
         return raw.isEmpty ? null : raw;
       })(),
+      tenantStatus: (() {
+        final raw = (m['tenant_status'] ?? m['tenantStatus'] ?? '')
+            .toString()
+            .trim();
+        return raw.isEmpty ? null : raw;
+      })(),
+      subscriptionExpiresAt: (() {
+        final raw =
+            (m['subscription_expires_at'] ?? m['subscriptionExpiresAt'] ?? '')
+                .toString()
+                .trim();
+        return raw.isEmpty ? null : raw;
+      })(),
       permissions: (() {
         final raw = m['permissions'];
         if (raw is Map<String, dynamic>) return raw;
@@ -64,6 +81,8 @@ class User {
       'phone': phone,
       'tenant_code': tenantCode,
       'tenant_name': tenantName,
+      'tenant_status': tenantStatus,
+      'subscription_expires_at': subscriptionExpiresAt,
       'permissions': permissions,
     };
   }
@@ -403,10 +422,30 @@ class AuthService {
       final raw = tenant['name'].toString().trim();
       tenantNameFromResponse = raw.isEmpty ? null : raw;
     }
+    String? tenantStatusFromResponse;
+    if (tenant is Map && tenant['status'] != null) {
+      final raw = tenant['status'].toString().trim();
+      tenantStatusFromResponse = raw.isEmpty ? null : raw;
+    }
+    String? subscriptionExpiresAtFromResponse;
+    if (tenant is Map && tenant['subscription_expires_at'] != null) {
+      final raw = tenant['subscription_expires_at'].toString().trim();
+      subscriptionExpiresAtFromResponse = raw.isEmpty ? null : raw;
+    }
     if (userMap != null &&
         tenantNameFromResponse != null &&
         (userMap['tenant_name'] ?? '').toString().trim().isEmpty) {
       userMap['tenant_name'] = tenantNameFromResponse;
+    }
+    if (userMap != null &&
+        tenantStatusFromResponse != null &&
+        (userMap['tenant_status'] ?? '').toString().trim().isEmpty) {
+      userMap['tenant_status'] = tenantStatusFromResponse;
+    }
+    if (userMap != null &&
+        subscriptionExpiresAtFromResponse != null &&
+        (userMap['subscription_expires_at'] ?? '').toString().trim().isEmpty) {
+      userMap['subscription_expires_at'] = subscriptionExpiresAtFromResponse;
     }
 
     if (token == null) throw Exception('No token in response');
@@ -724,6 +763,10 @@ class AuthService {
     await setToken(token, user);
   }
 
+  void updateCurrentUserFromMap(Map<String, dynamic> userMap) {
+    _currentUser = User.fromMap(userMap);
+  }
+
   /// Попытка обновить токен при старте (восстановить сессию)
   Future<bool> tryRefreshOnStartup() async {
     try {
@@ -738,7 +781,13 @@ class AuthService {
       _setAuthHeader(token);
 
       // Проверяем, валиден ли токен, запрашивая профиль
-      final resp = await dio.get('/api/profile');
+      final resp = await dio.get(
+        '/api/profile',
+        options: Options(
+          sendTimeout: const Duration(seconds: 8),
+          receiveTimeout: const Duration(seconds: 8),
+        ),
+      );
       debugPrint('📡 Profile check: status=${resp.statusCode}');
 
       if (resp.statusCode == 200 && resp.data is Map) {
@@ -759,9 +808,17 @@ class AuthService {
         }
       }
       return false;
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      debugPrint('❌ tryRefreshOnStartup dio error: $e');
+      // Временная недоступность сервера не должна выбрасывать пользователя из сессии.
+      // Очищаем токен только если сервер явно вернул auth-ошибку.
+      if (status == 401 || status == 403) {
+        await clearToken();
+      }
+      return false;
     } catch (e) {
       debugPrint('❌ tryRefreshOnStartup error: $e');
-      await clearToken();
       return false;
     }
   }
