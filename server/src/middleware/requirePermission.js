@@ -33,6 +33,9 @@ module.exports = function requirePermission(...permissionsArgs) {
       if (baseRole === 'creator' && (!viewRole || viewRole === 'creator') && role === 'creator') {
         return next();
       }
+      if (role === 'tenant') {
+        return next();
+      }
 
       const resolved = await resolvePermissionSet(req.user, db);
       req.permissionSet = resolved;

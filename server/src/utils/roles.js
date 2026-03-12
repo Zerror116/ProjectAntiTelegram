@@ -9,8 +9,10 @@ function normalizeAllowed(allowed) {
       .map((item) => normalizeRole(item))
       .filter(Boolean),
   );
-  // Арендатору доступны админские операции.
-  if (normalized.has("admin")) normalized.add("tenant");
+  // Арендатору доступны админские и рабочие операции.
+  if (normalized.has("admin") || normalized.has("worker")) {
+    normalized.add("tenant");
+  }
   return normalized;
 }
 

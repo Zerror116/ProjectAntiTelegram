@@ -120,6 +120,9 @@ class AuthService {
     if (role == 'creator' && (_viewRole == null || _viewRole == 'creator')) {
       return true;
     }
+    if (effectiveRole.toLowerCase().trim() == 'tenant') {
+      return true;
+    }
     final perms = user.permissions;
     if (perms['all'] == true) return true;
     if (perms[key] == true) return true;

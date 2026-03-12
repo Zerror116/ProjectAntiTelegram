@@ -12,6 +12,7 @@ const { requireRole } = require('../utils/roles');
 const { ensureSystemChannels } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
+const { runInRequestTenantScope } = require('../utils/requestScope');
 
 const productUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
@@ -554,126 +555,133 @@ router.post(
   requireRole('worker', 'admin', 'tenant', 'creator'),
   uploadProductImage,
   async (req, res) => {
-    const { chatId } = req.params;
-    const client = await db.pool.connect();
     try {
-      const actorUserId = await resolveActorUserId(client, req.user);
-      const {
-        title,
-        description = '',
-        price,
-        quantity = 1,
-      } = req.body || {};
+      return await runInRequestTenantScope(req, async () => {
+        const client = await db.pool.connect();
+        try {
+          const actorUserId = await resolveActorUserId(client, req.user);
+          const {
+            title,
+            description = '',
+            price,
+            quantity = 1,
+          } = req.body || {};
 
-      const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
-      const normalizedTitle = String(title || '').trim();
-      if (!normalizedTitle) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
-      }
-      if (!imageUrl) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
-      }
+          const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
+          const normalizedTitle = String(title || '').trim();
+          if (!normalizedTitle) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
+          }
+          if (!imageUrl) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
+          }
 
-      const normalizedPrice = toPositiveNumber(price, -1);
-      if (normalizedPrice <= 0) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Цена товара должна быть больше нуля' });
-      }
-      const rawQuantity = quantity == null || quantity === '' ? 1 : Number(quantity);
-      if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
-      }
-      const normalizedQuantity = Math.floor(rawQuantity);
-      const normalizedShelfNumber = await resolveAutoShelfNumber(
-        client,
-        req.user?.tenant_id || null,
-        null,
-        1
-      );
-      const normalizedDescription = String(description || '').trim();
-      if (!hasAtLeastTwoLetters(normalizedDescription)) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({
-          ok: false,
-          error: 'Описание должно содержать минимум 2 буквы',
-        });
-      }
+          const normalizedPrice = toPositiveNumber(price, -1);
+          if (normalizedPrice <= 0) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Цена товара должна быть больше нуля' });
+          }
+          const rawQuantity = quantity == null || quantity === '' ? 1 : Number(quantity);
+          if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
+          }
+          const normalizedQuantity = Math.floor(rawQuantity);
+          const normalizedShelfNumber = await resolveAutoShelfNumber(
+            client,
+            req.user?.tenant_id || null,
+            null,
+            1
+          );
+          const normalizedDescription = String(description || '').trim();
+          if (!hasAtLeastTwoLetters(normalizedDescription)) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({
+              ok: false,
+              error: 'Описание должно содержать минимум 2 буквы',
+            });
+          }
 
-      await client.query('BEGIN');
-      const { mainChannel } = await ensureSystemChannels(
-        client,
-        actorUserId,
-        req.user.tenant_id,
-      );
-      const targetChannelId = String(mainChannel.id);
+          await client.query('BEGIN');
+          const { mainChannel } = await ensureSystemChannels(
+            client,
+            actorUserId,
+            req.user.tenant_id,
+          );
+          const targetChannelId = String(mainChannel.id);
 
-      const code = await allocateProductCode(client, req.user?.tenant_id || null);
+          const code = await allocateProductCode(client, req.user?.tenant_id || null);
 
-      const productInsert = await client.query(
-        `INSERT INTO products (id, title, description, price, quantity, shelf_number, image_url, created_by, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', now(), now())
-         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
-        [
-          uuidv4(),
-          normalizedTitle,
-          normalizedDescription,
-          normalizedPrice,
-          normalizedQuantity,
-          normalizedShelfNumber,
-          imageUrl,
-          actorUserId,
-        ]
-      );
-      const productId = productInsert.rows[0].id;
-      const productCodeUpdate = await client.query(
-        `UPDATE products
-         SET product_code = $1,
-             updated_at = now()
-         WHERE id = $2
-         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
-        [code, productId]
-      );
-      const product = productCodeUpdate.rows[0];
+          const productInsert = await client.query(
+            `INSERT INTO products (id, title, description, price, quantity, shelf_number, image_url, created_by, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', now(), now())
+             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+            [
+              uuidv4(),
+              normalizedTitle,
+              normalizedDescription,
+              normalizedPrice,
+              normalizedQuantity,
+              normalizedShelfNumber,
+              imageUrl,
+              actorUserId,
+            ]
+          );
+          const productId = productInsert.rows[0].id;
+          const productCodeUpdate = await client.query(
+            `UPDATE products
+             SET product_code = $1,
+                 updated_at = now()
+             WHERE id = $2
+             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+            [code, productId]
+          );
+          const product = productCodeUpdate.rows[0];
 
-      const payload = {
-        title: product.title,
-        description: product.description,
-        price: Number(product.price),
-        quantity: Number(product.quantity),
-        shelf_number: Number(product.shelf_number),
-        image_url: product.image_url,
-      };
+          const payload = {
+            title: product.title,
+            description: product.description,
+            price: Number(product.price),
+            quantity: Number(product.quantity),
+            shelf_number: Number(product.shelf_number),
+            image_url: product.image_url,
+          };
 
-      const queueInsert = await client.query(
-        `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
-         VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
-         RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-        [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
-      );
+          const queueInsert = await client.query(
+            `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
+             VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
+             RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
+            [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
+          );
 
-      await client.query('COMMIT');
+          await client.query('COMMIT');
 
-      return res.status(201).json({
-        ok: true,
-        data: {
-          queue: queueInsert.rows[0],
-          product,
-          product_label: formatProductLabel(product.product_code, product.shelf_number),
-          message: 'Товар отправлен в очередь. Пост появится после подтверждения админом/создателем.',
-        },
+          return res.status(201).json({
+            ok: true,
+            data: {
+              queue: queueInsert.rows[0],
+              product,
+              product_label: formatProductLabel(product.product_code, product.shelf_number),
+              message: 'Товар отправлен в очередь. Пост появится после подтверждения админом/создателем.',
+            },
+          });
+        } catch (err) {
+          try {
+            await client.query('ROLLBACK');
+          } catch (_) {}
+          removeUploadedFile(req.file);
+          console.error('worker.channels.post_product error', err);
+          return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+        } finally {
+          client.release();
+        }
       });
     } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (_) {}
       removeUploadedFile(req.file);
-      console.error('worker.channels.post_product error', err);
+      console.error('worker.channels.post_product scope error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
-    } finally {
-      client.release();
     }
   }
 );
@@ -686,163 +694,219 @@ router.post(
   uploadProductImage,
   async (req, res) => {
     const { productId } = req.params;
-    const client = await db.pool.connect();
     try {
-      const actorUserId = await resolveActorUserId(client, req.user);
-      const {
-        channel_id,
-        title,
-        description,
-        price,
-        quantity,
-      } = req.body || {};
+      return await runInRequestTenantScope(req, async () => {
+        const client = await db.pool.connect();
+        try {
+          const actorUserId = await resolveActorUserId(client, req.user);
+          const {
+            channel_id,
+            title,
+            description,
+            price,
+            quantity,
+            merge_pending,
+          } = req.body || {};
+          const shouldMergePending =
+            merge_pending === true || String(merge_pending || '').toLowerCase() === 'true';
 
-      if (!channel_id) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'channel_id обязателен' });
-      }
+          if (!channel_id) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'channel_id обязателен' });
+          }
 
-      await client.query('BEGIN');
-      const { mainChannel } = await ensureSystemChannels(
-        client,
-        actorUserId,
-        req.user.tenant_id,
-      );
-      const targetChannelId = String(mainChannel.id);
+          await client.query('BEGIN');
+          const { mainChannel } = await ensureSystemChannels(
+            client,
+            actorUserId,
+            req.user.tenant_id,
+          );
+          const targetChannelId = String(mainChannel.id);
 
-      const productQ = await client.query(
-        `SELECT id, product_code, shelf_number, title, description, price, quantity, image_url
-         FROM products
-         WHERE id = $1
-           AND EXISTS (
-             SELECT 1
-             FROM product_publication_queue q
-             JOIN chats c ON c.id = q.channel_id
-             WHERE q.product_id = products.id
-               AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
-           )
-         LIMIT 1`,
-        [productId, req.user?.tenant_id || null]
-      );
-      if (productQ.rowCount === 0) {
-        removeUploadedFile(req.file);
-        return res.status(404).json({ ok: false, error: 'Товар не найден' });
-      }
-      const current = productQ.rows[0];
+          const productQ = await client.query(
+            `SELECT id, product_code, shelf_number, title, description, price, quantity, image_url
+             FROM products
+             WHERE id = $1
+               AND EXISTS (
+                 SELECT 1
+                 FROM product_publication_queue q
+                 JOIN chats c ON c.id = q.channel_id
+                 WHERE q.product_id = products.id
+                   AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+               )
+             LIMIT 1`,
+            [productId, req.user?.tenant_id || null]
+          );
+          if (productQ.rowCount === 0) {
+            removeUploadedFile(req.file);
+            return res.status(404).json({ ok: false, error: 'Товар не найден' });
+          }
+          const current = productQ.rows[0];
 
-      const nextTitle = String(title || current.title || '').trim();
-      const nextDescription = String(description ?? current.description ?? '').trim();
-      const nextPrice = price != null ? toPositiveNumber(price, -1) : Number(current.price);
-      const nextQuantity =
-        quantity != null && quantity !== ''
-          ? Number(quantity)
-          : Number(current.quantity || 1);
-      const nextShelfNumber = await resolveAutoShelfNumber(
-        client,
-        req.user?.tenant_id || null,
-        null,
-        1
-      );
-      let nextImageUrl = current.image_url;
-      if (req.file) {
-        nextImageUrl = toAbsoluteImageUrl(req, req.file);
-      } else if (Object.prototype.hasOwnProperty.call(req.body || {}, 'image_url')) {
-        nextImageUrl = normalizeImageUrl(req.body.image_url);
-      }
+          const nextTitle = String(title || current.title || '').trim();
+          const nextDescription = String(description ?? current.description ?? '').trim();
+          const nextPrice = price != null ? toPositiveNumber(price, -1) : Number(current.price);
+          const nextQuantity =
+            quantity != null && quantity !== ''
+              ? Number(quantity)
+              : Number(current.quantity || 1);
+          const nextShelfNumber = await resolveAutoShelfNumber(
+            client,
+            req.user?.tenant_id || null,
+            null,
+            1
+          );
+          let nextImageUrl = current.image_url;
+          if (req.file) {
+            nextImageUrl = toAbsoluteImageUrl(req, req.file);
+          } else if (Object.prototype.hasOwnProperty.call(req.body || {}, 'image_url')) {
+            nextImageUrl = normalizeImageUrl(req.body.image_url);
+          }
 
-      if (!nextTitle) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
-      }
-      if (!hasAtLeastTwoLetters(nextDescription)) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({
-          ok: false,
-          error: 'Описание должно содержать минимум 2 буквы',
-        });
-      }
-      if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Цена товара должна быть больше нуля' });
-      }
-      if (!Number.isFinite(nextQuantity) || nextQuantity <= 0) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({
-          ok: false,
-          error: 'Количество должно быть больше нуля',
-        });
-      }
-      if (!nextImageUrl) {
-        removeUploadedFile(req.file);
-        return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
-      }
+          if (!nextTitle) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
+          }
+          if (!hasAtLeastTwoLetters(nextDescription)) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({
+              ok: false,
+              error: 'Описание должно содержать минимум 2 буквы',
+            });
+          }
+          if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Цена товара должна быть больше нуля' });
+          }
+          if (!Number.isFinite(nextQuantity) || nextQuantity <= 0) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({
+              ok: false,
+              error: 'Количество должно быть больше нуля',
+            });
+          }
+          if (!nextImageUrl) {
+            removeUploadedFile(req.file);
+            return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
+          }
 
-      const nextCode = current.product_code != null
-        ? Number(current.product_code)
-        : await allocateProductCode(client, req.user?.tenant_id || null);
+          const nextCode = current.product_code != null
+            ? Number(current.product_code)
+            : await allocateProductCode(client, req.user?.tenant_id || null);
 
-      const upd = await client.query(
-        `UPDATE products
-         SET title = $1,
-             description = $2,
-             price = $3,
-             quantity = $4,
-             shelf_number = $5,
-             image_url = $6,
-             product_code = $7,
-             status = 'draft',
-             updated_at = now()
-         WHERE id = $8
-         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
-        [
-          nextTitle,
-          nextDescription,
-          nextPrice,
-          Math.floor(nextQuantity),
-          Math.floor(nextShelfNumber),
-          nextImageUrl,
-          nextCode,
-          productId,
-        ]
-      );
-      const product = upd.rows[0];
+          const upd = await client.query(
+            `UPDATE products
+             SET title = $1,
+                 description = $2,
+                 price = $3,
+                 quantity = $4,
+                 shelf_number = $5,
+                 image_url = $6,
+                 product_code = $7,
+                 status = 'draft',
+                 updated_at = now()
+             WHERE id = $8
+             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+            [
+              nextTitle,
+              nextDescription,
+              nextPrice,
+              Math.floor(nextQuantity),
+              Math.floor(nextShelfNumber),
+              nextImageUrl,
+              nextCode,
+              productId,
+            ]
+          );
+          const product = upd.rows[0];
 
-      const payload = {
-        title: product.title,
-        description: product.description,
-        price: Number(product.price),
-        quantity: Number(product.quantity),
-        shelf_number: Number(product.shelf_number),
-        image_url: product.image_url,
-      };
+          const payload = {
+            title: product.title,
+            description: product.description,
+            price: Number(product.price),
+            quantity: Number(product.quantity),
+            shelf_number: Number(product.shelf_number),
+            image_url: product.image_url,
+          };
 
-      const queueInsert = await client.query(
-        `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
-         VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
-         RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-        [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
-      );
+          let queueRow;
+          if (shouldMergePending) {
+            const existingPending = await client.query(
+              `SELECT id
+               FROM product_publication_queue
+               WHERE product_id = $1
+                 AND channel_id = $2
+                 AND queued_by = $3
+                 AND status = 'pending'
+                 AND COALESCE(is_sent, false) = false
+               ORDER BY created_at DESC
+               LIMIT 1`,
+              [product.id, targetChannelId, actorUserId]
+            );
 
-      await client.query('COMMIT');
+            if (existingPending.rowCount > 0) {
+              const queueId = existingPending.rows[0].id;
+              const mergedQueue = await client.query(
+                `UPDATE product_publication_queue
+                 SET payload = $2::jsonb,
+                     created_at = now()
+                 WHERE id = $1
+                 RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
+                [queueId, JSON.stringify(payload)]
+              );
+              queueRow = mergedQueue.rows[0];
 
-      return res.status(201).json({
-        ok: true,
-        data: {
-          queue: queueInsert.rows[0],
-          product,
-          product_label: formatProductLabel(product.product_code, product.shelf_number),
-          message: 'Товар переотправлен в очередь',
-        },
+              await client.query(
+                `UPDATE product_publication_queue
+                 SET status = 'archived',
+                     is_sent = true
+                 WHERE product_id = $1
+                   AND channel_id = $2
+                   AND queued_by = $3
+                   AND status = 'pending'
+                   AND COALESCE(is_sent, false) = false
+                   AND id <> $4`,
+                [product.id, targetChannelId, actorUserId, queueId]
+              );
+            }
+          }
+
+          if (!queueRow) {
+            const queueInsert = await client.query(
+              `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
+               VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
+               RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
+              [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
+            );
+            queueRow = queueInsert.rows[0];
+          }
+
+          await client.query('COMMIT');
+
+          return res.status(201).json({
+            ok: true,
+            data: {
+              queue: queueRow,
+              product,
+              product_label: formatProductLabel(product.product_code, product.shelf_number),
+              message: 'Товар переотправлен в очередь',
+            },
+          });
+        } catch (err) {
+          try {
+            await client.query('ROLLBACK');
+          } catch (_) {}
+          removeUploadedFile(req.file);
+          console.error('worker.products.requeue error', err);
+          return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+        } finally {
+          client.release();
+        }
       });
     } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (_) {}
       removeUploadedFile(req.file);
-      console.error('worker.products.requeue error', err);
+      console.error('worker.products.requeue scope error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
-    } finally {
-      client.release();
     }
   }
 );
@@ -853,33 +917,35 @@ router.get(
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     try {
-      const actorUserId = await resolveActorUserId(db, req.user);
-      const result = await db.query(
-        `SELECT q.id,
-                q.product_id,
-                q.channel_id,
-                q.queued_by,
-                q.status,
-                q.is_sent,
-                q.payload,
-                q.created_at,
-                c.title AS channel_title,
-                p.product_code,
-                p.shelf_number AS product_shelf_number,
-                p.title AS product_title,
-                p.description AS product_description,
-                p.price AS product_price,
-                p.quantity AS product_quantity,
-                p.image_url AS product_image_url
-         FROM product_publication_queue q
-         JOIN products p ON p.id = q.product_id
-         JOIN chats c ON c.id = q.channel_id
-         WHERE q.queued_by = $1
-           AND q.status = 'pending'
-           AND COALESCE(q.is_sent, false) = false
-         ORDER BY q.created_at DESC`,
-        [actorUserId]
-      );
+      const result = await runInRequestTenantScope(req, async () => {
+        const actorUserId = await resolveActorUserId(db, req.user);
+        return db.query(
+          `SELECT q.id,
+                  q.product_id,
+                  q.channel_id,
+                  q.queued_by,
+                  q.status,
+                  q.is_sent,
+                  q.payload,
+                  q.created_at,
+                  c.title AS channel_title,
+                  p.product_code,
+                  p.shelf_number AS product_shelf_number,
+                  p.title AS product_title,
+                  p.description AS product_description,
+                  p.price AS product_price,
+                  p.quantity AS product_quantity,
+                  p.image_url AS product_image_url
+           FROM product_publication_queue q
+           JOIN products p ON p.id = q.product_id
+           JOIN chats c ON c.id = q.channel_id
+           WHERE q.queued_by = $1
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+           ORDER BY q.created_at DESC`,
+          [actorUserId]
+        );
+      });
       return res.json({ ok: true, data: result.rows });
     } catch (err) {
       console.error('worker.queue.mine error', err);
@@ -924,53 +990,55 @@ router.patch(
     }
 
     try {
-      const actorUserId = await resolveActorUserId(db, req.user);
-      const result = await db.query(
-        `WITH target AS (
-           SELECT q.id, q.product_id
-           FROM product_publication_queue q
-           WHERE q.id = $1
-             AND q.queued_by = $2
-             AND q.status = 'pending'
-             AND COALESCE(q.is_sent, false) = false
-           LIMIT 1
-         ),
-         product_upd AS (
-           UPDATE products p
-           SET title = $3,
-               description = $4,
-               price = $5,
-               quantity = $6,
-               shelf_number = COALESCE($7::int, p.shelf_number),
-               updated_at = now()
-           FROM target t
-           WHERE p.id = t.product_id
-           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url
-         )
-         UPDATE product_publication_queue q
-         SET payload = jsonb_strip_nulls(
-               jsonb_build_object(
-                 'title', $3,
-                 'description', $4,
-                 'price', $5,
-                 'quantity', $6,
-                 'shelf_number', (SELECT shelf_number FROM product_upd LIMIT 1),
-                 'image_url', (SELECT image_url FROM product_upd LIMIT 1)
+      const result = await runInRequestTenantScope(req, async () => {
+        const actorUserId = await resolveActorUserId(db, req.user);
+        return db.query(
+          `WITH target AS (
+             SELECT q.id, q.product_id
+             FROM product_publication_queue q
+             WHERE q.id = $1
+               AND q.queued_by = $2
+               AND q.status = 'pending'
+               AND COALESCE(q.is_sent, false) = false
+             LIMIT 1
+           ),
+           product_upd AS (
+             UPDATE products p
+             SET title = $3,
+                 description = $4,
+                 price = $5,
+                 quantity = $6,
+                 shelf_number = COALESCE($7::int, p.shelf_number),
+                 updated_at = now()
+             FROM target t
+             WHERE p.id = t.product_id
+             RETURNING p.id, p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url
+           )
+           UPDATE product_publication_queue q
+           SET payload = jsonb_strip_nulls(
+                 jsonb_build_object(
+                   'title', $3,
+                   'description', $4,
+                   'price', $5,
+                   'quantity', $6,
+                   'shelf_number', (SELECT shelf_number FROM product_upd LIMIT 1),
+                   'image_url', (SELECT image_url FROM product_upd LIMIT 1)
+                 )
                )
-             )
-         WHERE q.id = $1
-           AND EXISTS (SELECT 1 FROM target)
-         RETURNING q.id`,
-        [
-          queueId,
-          actorUserId,
-          title,
-          description,
-          price,
-          Math.floor(quantity),
-          shelfNumber,
-        ]
-      );
+           WHERE q.id = $1
+             AND EXISTS (SELECT 1 FROM target)
+           RETURNING q.id`,
+          [
+            queueId,
+            actorUserId,
+            title,
+            description,
+            price,
+            Math.floor(quantity),
+            shelfNumber,
+          ]
+        );
+      });
       if (result.rowCount === 0) {
         return res.status(404).json({
           ok: false,
