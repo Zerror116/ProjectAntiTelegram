@@ -29,6 +29,10 @@ function hashAccessKey(raw) {
 function maskAccessKey(raw) {
   const normalized = normalizeAccessKey(raw);
   if (!normalized) return "";
+  const tenantPatternMatch = normalized.match(/^([A-Z]{3})-([A-Z0-9]{1,32})-KEY$/);
+  if (tenantPatternMatch) {
+    return `${tenantPatternMatch[1]}-****-KEY`;
+  }
   if (normalized.length <= 8) return `${normalized.slice(0, 2)}****`;
   return `${normalized.slice(0, 4)}-****-${normalized.slice(-4)}`;
 }
@@ -104,6 +108,11 @@ function generateAccessKey() {
   return `PHX-${middle}-KEY`;
 }
 
+function isTenantAccessKey(raw) {
+  const normalized = normalizeAccessKey(raw);
+  return /^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$/.test(normalized);
+}
+
 function generateInviteCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const chunk = (size) =>
@@ -161,6 +170,7 @@ module.exports = {
   normalizeInviteCode,
   hashAccessKey,
   maskAccessKey,
+  isTenantAccessKey,
   generateAccessKey,
   generateInviteCode,
   generateTenantCode,

@@ -16,7 +16,7 @@ class CreatorKeysScreen extends StatefulWidget {
 class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   static const String _platformCreatorEmail = 'zerotwo02166@gmail.com';
   static final RegExp _tenantAccessKeyTemplateRegExp = RegExp(
-    r'^[A-Z]{3}-[A-Z]{3,24}-KEY$',
+    r'^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$',
   );
 
   final _tenantNameCtrl = TextEditingController();
@@ -74,26 +74,18 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     return e.toString();
   }
 
-  String _normalizeTenantAccessKeyDraft(String raw) {
-    final upper = raw.toUpperCase().trim();
-    if (upper.isEmpty) return '';
-    final lettersOnly = upper.replaceAll(RegExp(r'[^A-Z]'), '');
-    if (lettersOnly.length >= 9 && lettersOnly.endsWith('KEY')) {
-      final prefix = lettersOnly.substring(0, 3);
-      final middle = lettersOnly.substring(3, lettersOnly.length - 3);
-      final isPrefixValid = RegExp(r'^[A-Z]{3}$').hasMatch(prefix);
-      final isMiddleValid = RegExp(r'^[A-Z]{3,24}$').hasMatch(middle);
-      if (isPrefixValid && isMiddleValid) {
-        return '$prefix-$middle-KEY';
-      }
-    }
-    return upper.replaceAll(RegExp(r'[^A-Z-]'), '');
-  }
-
-  String _visibleKeyMask(Object? raw) {
-    final value = (raw ?? '').toString().trim();
-    if (value.isEmpty) return '—';
-    return value;
+  String _composeTenantAccessKey({
+    required String prefix,
+    required String middle,
+  }) {
+    final cleanPrefix = prefix.toUpperCase().replaceAll(RegExp(r'[^A-Z]'), '');
+    final cleanMiddle = middle.toUpperCase().replaceAll(
+      RegExp(r'[^A-Z0-9]'),
+      '',
+    );
+    final candidate = '$cleanPrefix-$cleanMiddle-KEY';
+    if (_tenantAccessKeyTemplateRegExp.hasMatch(candidate)) return candidate;
+    return '';
   }
 
   int _tenantMonthsOrDefault() {
@@ -339,9 +331,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   Future<void> _changeTenantAccessKey(
     String tenantId,
     String tenantName,
-    String currentMask,
+    String currentKey,
   ) async {
-    final keyCtrl = TextEditingController();
+    final detectedPrefix = RegExp(
+      r'^([A-Z]{3})-',
+    ).firstMatch(currentKey.toUpperCase().trim())?.group(1);
+    final prefixCtrl = TextEditingController(text: detectedPrefix ?? 'PHX');
+    final middleCtrl = TextEditingController();
     final nextKey = await showDialog<String>(
       context: context,
       builder: (ctx) {
@@ -357,24 +353,75 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                   'Арендатор: ${tenantName.isEmpty ? 'Без названия' : tenantName}',
                 ),
                 const SizedBox(height: 4),
-                Text('Текущая маска: $currentMask'),
+                Text('Текущий ключ: $currentKey'),
                 const SizedBox(height: 10),
-                TextField(
-                  controller: keyCtrl,
-                  textCapitalization: TextCapitalization.characters,
-                  decoration: withInputLanguageBadge(
-                    InputDecoration(
-                      labelText: 'Новый ключ',
-                      hintText: 'PHX-ZERROR-KEY',
-                      border: const OutlineInputBorder(),
-                      errorText: errorText.isEmpty ? null : errorText,
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 92,
+                      child: TextField(
+                        controller: prefixCtrl,
+                        textCapitalization: TextCapitalization.characters,
+                        maxLength: 3,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.allow(
+                            RegExp(r'[A-Za-z]'),
+                          ),
+                        ],
+                        decoration: const InputDecoration(
+                          labelText: 'Код',
+                          hintText: 'PHX',
+                          counterText: '',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
                     ),
-                    controller: keyCtrl,
-                  ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: middleCtrl,
+                        textCapitalization: TextCapitalization.characters,
+                        maxLength: 32,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.allow(
+                            RegExp(r'[A-Za-z0-9]'),
+                          ),
+                        ],
+                        decoration: InputDecoration(
+                          labelText: 'Шифр',
+                          hintText: 'ABCDEF',
+                          counterText: '',
+                          border: const OutlineInputBorder(),
+                          errorText: errorText.isEmpty ? null : errorText,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 92,
+                      child: TextFormField(
+                        initialValue: 'KEY',
+                        enabled: false,
+                        readOnly: true,
+                        decoration: InputDecoration(
+                          labelText: 'Ключ',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Шаблон: (PHX)(ZERROR)(KEY)\nПервые 3 буквы + несколько букв + обязательный KEY в конце.',
+                  'Формат ключа: (PHX)(ВАШКОД)(KEY)\nСлева 3 буквы, справа всегда KEY, по центру буквы/цифры.',
+                  style: TextStyle(
+                    color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Примеры кода: PHX, ARX, RTX, RSO, PFO.',
                   style: TextStyle(
                     color: Theme.of(ctx).colorScheme.onSurfaceVariant,
                   ),
@@ -388,16 +435,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
               ),
               FilledButton.tonal(
                 onPressed: () {
-                  final normalized = _normalizeTenantAccessKeyDraft(
-                    keyCtrl.text,
+                  final normalized = _composeTenantAccessKey(
+                    prefix: prefixCtrl.text,
+                    middle: middleCtrl.text,
                   );
                   if (normalized.isEmpty) {
-                    setDialogState(() => errorText = 'Введите ключ по шаблону');
-                    return;
-                  }
-                  if (!_tenantAccessKeyTemplateRegExp.hasMatch(normalized)) {
                     setDialogState(
-                      () => errorText = 'Формат должен быть XXX-XXXXXXX-KEY',
+                      () => errorText = 'Формат: XXX-<буквы/цифры>-KEY',
                     );
                     return;
                   }
@@ -410,7 +454,8 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         );
       },
     );
-    keyCtrl.dispose();
+    prefixCtrl.dispose();
+    middleCtrl.dispose();
     if (nextKey == null) return;
 
     setState(() {
@@ -569,7 +614,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         final name = (tenant['name'] ?? '').toString();
         final code = (tenant['code'] ?? '').toString();
         final status = (tenant['status'] ?? '').toString();
-        final keyMask = _visibleKeyMask(tenant['access_key_mask']);
+        final keyValue = (tenant['access_key_value'] ?? '').toString().trim();
+        final keyShown = keyValue.isNotEmpty
+            ? keyValue
+            : 'Полный ключ не сохранен. Нажмите "Изменить ключ".';
         final subscription = formatDateTimeValue(
           tenant['subscription_expires_at'],
           fallback: '',
@@ -624,7 +672,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text('Код: $code'),
-                Text('Маска ключа: $keyMask'),
+                Text('Ключ: $keyShown'),
                 if (subscription.isNotEmpty) Text('Подписка до: $subscription'),
                 const SizedBox(height: 10),
                 Wrap(
@@ -655,7 +703,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                     OutlinedButton.icon(
                       onPressed: _tenantActionLoading
                           ? null
-                          : () => _changeTenantAccessKey(id, name, keyMask),
+                          : () => _changeTenantAccessKey(id, name, keyShown),
                       icon: const Icon(Icons.key_outlined),
                       label: const Text('Изменить ключ'),
                     ),

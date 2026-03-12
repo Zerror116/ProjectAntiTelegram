@@ -14,9 +14,6 @@ const SAMARA_TZ = "Europe/Samara";
 const requireTenantInvitesManagePermission = requirePermission(
   "tenant.invites.manage",
 );
-const requireTenantUsersManagePermission = requirePermission(
-  "tenant.users.manage",
-);
 
 const profileUploadsDir = path.resolve(
   __dirname,
@@ -129,6 +126,8 @@ async function loadUserProfile(userId) {
        u.role,
        t.code AS tenant_code,
        t.name AS tenant_name,
+       t.status AS tenant_status,
+       t.subscription_expires_at,
        u.avatar_url,
        COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
        COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
@@ -156,6 +155,8 @@ async function loadUserProfile(userId) {
     role: row.role || "client",
     tenant_code: row.tenant_code || null,
     tenant_name: row.tenant_name || null,
+    tenant_status: row.tenant_status || null,
+    subscription_expires_at: row.subscription_expires_at || null,
     avatar_url: row.avatar_url || null,
     avatar_focus_x: Number(row.avatar_focus_x || 0),
     avatar_focus_y: Number(row.avatar_focus_y || 0),
@@ -797,7 +798,6 @@ router.get(
 router.get(
   "/tenant/clients",
   authMiddleware,
-  requireTenantUsersManagePermission,
   async (req, res) => {
     if (!isTenantManager(req.user)) {
       return res.status(403).json({
@@ -852,7 +852,6 @@ router.get(
 router.patch(
   "/tenant/clients/:userId/role",
   authMiddleware,
-  requireTenantUsersManagePermission,
   async (req, res) => {
     if (!isTenantManager(req.user)) {
       return res.status(403).json({

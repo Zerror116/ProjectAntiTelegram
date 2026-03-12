@@ -15,6 +15,7 @@ const {
   generateInviteCode,
   hashAccessKey,
   isTenantActive,
+  isTenantAccessKey,
 } = require('../utils/tenants');
 const {
   createUserSession,
@@ -796,7 +797,7 @@ router.post('/register', async (req, res) => {
       const rawInputCode = String(access_key || '').trim();
       const rawAccessKey = normalizeAccessKey(rawInputCode);
       const rawInviteCode = normalizeInviteCode(invite_code || access_key);
-      const looksLikeAccessKey = rawAccessKey.startsWith('PHX');
+      const looksLikeAccessKey = isTenantAccessKey(rawAccessKey);
 
       if (looksLikeAccessKey) {
         tenant = await resolveTenantByAccessKey(rawAccessKey);
@@ -849,9 +850,12 @@ router.post('/register', async (req, res) => {
         });
       }
 
-      const tenantState = isTenantActive(tenant);
-      if (!tenantState.ok) {
-        return res.status(403).json({ error: tenantState.error });
+      const shouldEnforceTenantSubscription = role !== 'client';
+      if (shouldEnforceTenantSubscription) {
+        const tenantState = isTenantActive(tenant);
+        if (!tenantState.ok) {
+          return res.status(403).json({ error: tenantState.error });
+        }
       }
     }
 
@@ -1076,7 +1080,7 @@ router.post('/login', async (req, res) => {
         tenant = await db.resolveTenantByCode(tenantCodeHint);
       } else {
         const normalizedAccessKey = normalizeAccessKey(access_key);
-        if (normalizedAccessKey.startsWith('PHX')) {
+        if (isTenantAccessKey(normalizedAccessKey)) {
           tenant = await resolveTenantByAccessKey(normalizedAccessKey);
         }
       }
@@ -1090,10 +1094,6 @@ router.post('/login', async (req, res) => {
           error:
             'Не определен арендатор. Войдите по приглашению вашей группы или укажите код арендатора.',
         });
-      }
-      const tenantState = isTenantActive(tenant);
-      if (!tenantState.ok) {
-        return res.status(403).json({ error: tenantState.error });
       }
     }
 
@@ -1156,14 +1156,25 @@ router.post('/login', async (req, res) => {
               error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
             };
           }
-          const tenantState = isTenantActive({
-            status: user.tenant_status || tenant?.status,
-            subscription_expires_at:
-              user.subscription_expires_at || tenant?.subscription_expires_at,
-          });
-          if (!tenantState.ok) {
-            await client.query('ROLLBACK');
-            return { ok: false, status: 403, error: tenantState.error };
+          const userRole = String(user.role || '').toLowerCase().trim();
+          const shouldEnforceTenantSubscription =
+            userRole === 'tenant' ||
+            userRole === 'admin' ||
+            userRole === 'worker';
+          if (shouldEnforceTenantSubscription) {
+            const tenantState = isTenantActive({
+              status: user.tenant_status || tenant?.status,
+              subscription_expires_at:
+                user.subscription_expires_at || tenant?.subscription_expires_at,
+            });
+            if (!tenantState.ok) {
+              await client.query('ROLLBACK');
+              return {
+                ok: false,
+                status: tenantState.reason === 'tenant_expired' ? 402 : 403,
+                error: tenantState.error,
+              };
+            }
           }
         }
 
@@ -1337,6 +1348,7 @@ router.post('/login', async (req, res) => {
             id: result.user.tenant_id,
             code: effectiveTenantCode,
             name: result.user.tenant_name || tenant?.name || null,
+            status: result.user.tenant_status || tenant?.status || null,
             subscription_expires_at:
               result.user.subscription_expires_at || tenant?.subscription_expires_at || null,
           }

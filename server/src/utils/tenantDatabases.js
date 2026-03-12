@@ -23,6 +23,20 @@ function buildDatabaseUrlWithName(baseDbUrl, dbName) {
   return base.toString();
 }
 
+async function resolveShadowCreatedBy(pool, createdBy) {
+  const userId = String(createdBy || '').trim();
+  if (!userId) return null;
+  const q = await pool.query(
+    `SELECT id
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId],
+  );
+  if (q.rowCount > 0) return q.rows[0].id;
+  return null;
+}
+
 async function upsertTenantShadowRow({
   dbUrl,
   tenantId,
@@ -30,6 +44,7 @@ async function upsertTenantShadowRow({
   tenantName,
   accessKeyHash,
   accessKeyMask,
+  accessKeyValue,
   status,
   subscriptionExpiresAt,
   createdBy,
@@ -38,6 +53,7 @@ async function upsertTenantShadowRow({
   const pool = new Pool({ connectionString: dbUrl });
   try {
     await pool.query('BEGIN');
+    const shadowCreatedBy = await resolveShadowCreatedBy(pool, createdBy);
     await pool.query(
       `INSERT INTO tenants (
          id,
@@ -45,6 +61,7 @@ async function upsertTenantShadowRow({
          name,
          access_key_hash,
          access_key_mask,
+         access_key_value,
          status,
          subscription_expires_at,
          last_payment_confirmed_at,
@@ -57,9 +74,9 @@ async function upsertTenantShadowRow({
          updated_at
        )
        VALUES (
-         $1, $2, $3, $4, $5,
-         $6, $7, now(),
-         $8, $9,
+         $1, $2, $3, $4, $5, $6,
+         $7, $8, now(),
+         $9, $10,
          'isolated', current_database(), NULL,
          now(), now()
        )
@@ -69,6 +86,7 @@ async function upsertTenantShadowRow({
          name = EXCLUDED.name,
          access_key_hash = EXCLUDED.access_key_hash,
          access_key_mask = EXCLUDED.access_key_mask,
+         access_key_value = EXCLUDED.access_key_value,
          status = EXCLUDED.status,
          subscription_expires_at = EXCLUDED.subscription_expires_at,
          last_payment_confirmed_at = now(),
@@ -83,14 +101,15 @@ async function upsertTenantShadowRow({
         tenantName,
         accessKeyHash,
         accessKeyMask,
+        accessKeyValue || null,
         status,
         subscriptionExpiresAt,
-        createdBy || null,
+        shadowCreatedBy,
         notes || null,
       ],
     );
 
-    const ensured = await ensureSystemChannels(pool, createdBy || null, tenantId);
+    const ensured = await ensureSystemChannels(pool, shadowCreatedBy, tenantId);
     await pool.query('COMMIT');
 
     return {
@@ -113,6 +132,7 @@ async function provisionIsolatedTenantDatabase({
   tenantName,
   accessKeyHash,
   accessKeyMask,
+  accessKeyValue,
   status = 'active',
   subscriptionExpiresAt,
   createdBy,
@@ -132,6 +152,7 @@ async function provisionIsolatedTenantDatabase({
     tenantName,
     accessKeyHash,
     accessKeyMask,
+    accessKeyValue,
     status,
     subscriptionExpiresAt,
     createdBy,

@@ -99,7 +99,10 @@ class _MainShellState extends State<MainShell> {
         normalized == 'admin' ||
         normalized == 'tenant' ||
         normalized == 'creator';
-    final showWorker = normalized == 'worker' || normalized == 'creator';
+    final showWorker =
+        normalized == 'worker' ||
+        normalized == 'tenant' ||
+        normalized == 'creator';
     final showTests = _isCreatorNativeView();
     return <String>[
       'chats',
@@ -148,9 +151,10 @@ class _MainShellState extends State<MainShell> {
   }
 
   bool _hasWorkerTab() {
-    const roles = {'worker', 'creator'};
+    const roles = {'worker', 'tenant', 'creator'};
     final role = _effectiveRole();
     if (!roles.contains(role)) return false;
+    if (role == 'tenant') return true;
     if (_isCreatorNativeView()) return true;
     return _hasAnyPermission(const [
       'product.create',

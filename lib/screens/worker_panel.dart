@@ -89,6 +89,19 @@ class _WorkerPanelState extends State<WorkerPanel>
     return parsed ?? fallback;
   }
 
+  String _extractRequestError(Object error) {
+    if (error is DioException) {
+      final data = error.response?.data;
+      if (data is Map) {
+        final raw = (data['error'] ?? data['message'] ?? '').toString().trim();
+        if (raw.isNotEmpty) return raw;
+      }
+      final message = (error.message ?? '').trim();
+      if (message.isNotEmpty) return message;
+    }
+    return error.toString();
+  }
+
   int _resolveShelfNumberFromValue(dynamic value, {int fallback = 1}) {
     final parsed = _toIntValue(value, fallback);
     if (parsed <= 0) return fallback;
@@ -178,18 +191,23 @@ class _WorkerPanelState extends State<WorkerPanel>
     return false;
   }
 
+  bool _hasFullWorkerMenuAccess() {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return role == 'creator' || role == 'tenant';
+  }
+
   bool _canViewNewTab() {
-    if (authService.effectiveRole == 'creator') return true;
+    if (_hasFullWorkerMenuAccess()) return true;
     return _hasAnyPermission(const ['product.create']);
   }
 
   bool _canViewOldTab() {
-    if (authService.effectiveRole == 'creator') return true;
+    if (_hasFullWorkerMenuAccess()) return true;
     return _hasAnyPermission(const ['product.requeue', 'product.create']);
   }
 
   bool _canViewOwnTab() {
-    if (authService.effectiveRole == 'creator') return true;
+    if (_hasFullWorkerMenuAccess()) return true;
     return _hasAnyPermission(const [
       'product.edit.own_pending',
       'product.create',
@@ -197,7 +215,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   bool _canViewRevisionTab() {
-    if (authService.effectiveRole == 'creator') return true;
+    if (_hasFullWorkerMenuAccess()) return true;
     return _hasAnyPermission(const [
       'product.requeue',
       'product.edit.own_pending',
@@ -673,7 +691,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         setState(() => _message = 'Не удалось загрузить каналы');
       }
     } catch (e) {
-      setState(() => _message = 'Ошибка загрузки каналов: $e');
+      setState(() => _message = 'Ошибка загрузки каналов: ${_extractRequestError(e)}');
     } finally {
       if (mounted) setState(() => _loadingChannels = false);
     }
@@ -694,7 +712,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       }
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = 'Ошибка загрузки своих постов: $e');
+      setState(() => _message = 'Ошибка загрузки своих постов: ${_extractRequestError(e)}');
     } finally {
       if (mounted) {
         setState(() => _loadingOwnPosts = false);
@@ -1155,7 +1173,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         setState(() => _message = 'Не удалось отправить товар в очередь');
       }
     } catch (e) {
-      setState(() => _message = 'Ошибка отправки: $e');
+      setState(() => _message = 'Ошибка отправки: ${_extractRequestError(e)}');
     } finally {
       if (mounted) setState(() => _posting = false);
     }

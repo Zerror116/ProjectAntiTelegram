@@ -68,6 +68,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _voiceRecording = false;
   bool _voiceSending = false;
   bool _pinLoading = false;
+  bool _hasDraftText = false;
 
   String _searchQuery = '';
   List<String> _searchResultIds = const [];
@@ -108,9 +109,11 @@ class _ChatScreenState extends State<ChatScreen> {
       _recomputeSearchResults(keepCurrent: false);
     });
 
+    _hasDraftText = _controller.text.trim().isNotEmpty;
     _controller.addListener(() {
-      if (_inputFocusNode.hasFocus) {
-        _scrollToBottom(animated: true);
+      final nextHasDraft = _controller.text.trim().isNotEmpty;
+      if (nextHasDraft != _hasDraftText && mounted) {
+        setState(() => _hasDraftText = nextHasDraft);
       }
     });
 
@@ -3486,7 +3489,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : Icon(
-                          _controller.text.trim().isNotEmpty
+                          _hasDraftText
                               ? Icons.send
                               : (_voiceRecording
                                     ? Icons.stop_circle_outlined
@@ -3494,7 +3497,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                   onPressed: !canCompose || _mediaUploading
                       ? null
-                      : (_controller.text.trim().isNotEmpty
+                      : (_hasDraftText
                             ? _send
                             : _toggleVoiceComposerAction),
                 ),

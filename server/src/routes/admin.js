@@ -37,7 +37,31 @@ const requireReservationFulfillPermission = requirePermission(
 );
 const PUBLISH_POST_INTERVAL_MS = 3000;
 const SAMARA_TZ = "Europe/Samara";
-const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z]{3,24}-KEY$/;
+const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$/;
+
+function buildIsolatedProvisionWarning(err) {
+  const code = String(err?.code || "").trim();
+  if (code === "42501") {
+    return "Изолированная БД не создана (проверьте CREATEDB). Арендатор переведен в shared-режим.";
+  }
+  if (code === "23503") {
+    return "Изолированная БД создана частично, но не удалось связать служебные данные. Арендатор переведен в shared-режим.";
+  }
+  return "Изолированная БД не создана. Арендатор переведен в shared-режим.";
+}
+
+function emitTenantSubscriptionUpdate(io, tenantId, row, source = "admin") {
+  if (!io) return;
+  const targetTenantId = String(tenantId || row?.id || "").trim();
+  if (!targetTenantId) return;
+  emitToTenant(io, targetTenantId, "tenant:subscription:update", {
+    tenant_id: targetTenantId,
+    status: row?.status || null,
+    subscription_expires_at: row?.subscription_expires_at || null,
+    source,
+    at: new Date().toISOString(),
+  });
+}
 
 const channelUploadsDir = path.resolve(
   __dirname,
@@ -747,7 +771,9 @@ router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => 
       .trim()
       .toLowerCase() === "1";
     const result = await db.platformQuery(
-      `SELECT id, code, name, status, COALESCE(access_key_mask, '—') AS access_key_mask,
+      `SELECT id, code, name, status,
+              COALESCE(access_key_mask, '—') AS access_key_mask,
+              COALESCE(NULLIF(access_key_value, ''), NULL) AS access_key_value,
               subscription_expires_at, last_payment_confirmed_at, notes,
               db_mode, db_name, is_deleted,
               created_at, updated_at
@@ -800,21 +826,23 @@ router.post(
       const created = await client.query(
         `INSERT INTO tenants (
            id, code, name, access_key_hash, access_key_mask,
+           access_key_value,
            status, subscription_expires_at, last_payment_confirmed_at,
            created_by, notes, db_mode, db_name, db_url, created_at, updated_at
          )
          VALUES (
-           $1, $2, $3, $4, $5,
-           'active', now() + make_interval(months => $6::int), now(),
-           $7, $8, 'isolated', NULL, NULL, now(), now()
+           $1, $2, $3, $4, $5, $6,
+           'active', now() + make_interval(months => $7::int), now(),
+           $8, $9, 'isolated', NULL, NULL, now(), now()
          )
-         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, notes, created_at`,
+         RETURNING id, code, name, status, access_key_mask, access_key_value, subscription_expires_at, notes, created_at`,
         [
           tenantId,
           code,
           name,
           accessKeyHash,
           accessKeyMask,
+          accessKey,
           months,
           req.user.id,
           notes,
@@ -835,6 +863,7 @@ router.post(
           tenantName: name,
           accessKeyHash,
           accessKeyMask,
+          accessKeyValue: accessKey,
           status: "active",
           subscriptionExpiresAt: createdRow.subscription_expires_at,
           createdBy: req.user.id,
@@ -858,8 +887,7 @@ router.post(
         );
         dbMode = "shared";
         dbName = null;
-        warning =
-          "Изолированная БД не создана (проверьте CREATEDB). Арендатор переведен в shared-режим.";
+        warning = buildIsolatedProvisionWarning(provisionErr);
         try {
           await db.platformQuery(
             `UPDATE tenants
@@ -959,6 +987,13 @@ router.post(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден" });
       }
+      const io = req.app.get("io");
+      emitTenantSubscriptionUpdate(
+        io,
+        tenantId,
+        updated.rows[0],
+        "confirm_payment",
+      );
       return res.json({ ok: true, data: updated.rows[0] });
     } catch (err) {
       console.error("admin.tenants.confirmPayment error", err);
@@ -1019,6 +1054,13 @@ router.patch(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден" });
       }
+      const io = req.app.get("io");
+      emitTenantSubscriptionUpdate(
+        io,
+        tenantId,
+        updated.rows[0],
+        "status_change",
+      );
       return res.json({ ok: true, data: updated.rows[0] });
     } catch (err) {
       console.error("admin.tenants.updateStatus error", err);
@@ -1054,7 +1096,7 @@ router.patch(
       return res.status(400).json({
         ok: false,
         error:
-          "Ключ должен быть в формате XXX-XXXXXXX-KEY (первые 3 буквы, затем буквы, в конце KEY)",
+          "Ключ должен быть в формате XXX-XXXXXXX-KEY (3 буквы слева, в центре буквы/цифры, справа KEY)",
       });
     }
 
@@ -1070,11 +1112,17 @@ router.patch(
         `UPDATE tenants
          SET access_key_hash = $1,
              access_key_mask = $2,
+             access_key_value = $3,
              updated_at = now()
-         WHERE id = $3
+         WHERE id = $4
            AND COALESCE(is_deleted, false) = false
-         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
-        [hashAccessKey(accessKey), maskAccessKey(accessKey), tenantId],
+         RETURNING id, code, name, status, access_key_mask, access_key_value, subscription_expires_at, updated_at`,
+        [
+          hashAccessKey(accessKey),
+          maskAccessKey(accessKey),
+          accessKey,
+          tenantId,
+        ],
       );
       if (updated.rowCount === 0) {
         return res
@@ -1136,6 +1184,8 @@ router.delete(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден или уже удален" });
       }
+      const io = req.app.get("io");
+      emitTenantSubscriptionUpdate(io, tenantId, archived.rows[0], "delete");
       return res.json({ ok: true, data: archived.rows[0] });
     } catch (err) {
       console.error("admin.tenants.delete error", err);
@@ -1161,11 +1211,11 @@ function parseNullablePositiveInt(raw, { min = 1, max = 100000 } = {}) {
 function normalizeTenantAccessKeyInput(raw) {
   const normalized = normalizeAccessKey(raw);
   if (!normalized) return "";
-  const lettersOnly = normalized.replace(/[^A-Z]/g, "");
-  if (lettersOnly.length >= 9 && lettersOnly.endsWith("KEY")) {
-    const prefix = lettersOnly.slice(0, 3);
-    const middle = lettersOnly.slice(3, -3);
-    if (/^[A-Z]{3}$/.test(prefix) && /^[A-Z]{3,24}$/.test(middle)) {
+  const compact = normalized.replace(/[^A-Z0-9]/g, "");
+  if (compact.length >= 7 && compact.endsWith("KEY")) {
+    const prefix = compact.slice(0, 3);
+    const middle = compact.slice(3, -3);
+    if (/^[A-Z]{3}$/.test(prefix) && /^[A-Z0-9]{1,32}$/.test(middle)) {
       return `${prefix}-${middle}-KEY`;
     }
   }
@@ -3540,6 +3590,366 @@ router.post(
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("admin.channels.publish_pending error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/test/tenants/matrix",
+  requireAuth,
+  async (req, res) => {
+    if (String(req.user?.base_role || req.user?.role || "") !== "creator") {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({
+        ok: false,
+        error: "Доступно только создателю платформы",
+      });
+    }
+
+    const includeDeleted = req.body?.include_deleted === true;
+    const includeDefault = req.body?.include_default === true;
+
+    const where = [
+      includeDeleted
+        ? "1=1"
+        : "COALESCE(t.is_deleted, false) = false",
+      includeDefault ? "1=1" : "lower(t.code) <> 'default'",
+    ].join(" AND ");
+
+    const client = await db.platformConnect();
+    try {
+      const q = await client.query(
+        `SELECT t.id,
+                t.code,
+                t.name,
+                t.status,
+                t.db_mode,
+                t.db_name,
+                t.is_deleted,
+                t.subscription_expires_at,
+                t.last_payment_confirmed_at,
+                t.created_at,
+                t.updated_at,
+                COALESCE(uc.user_count, 0)::int AS user_count,
+                COALESCE(uc.client_count, 0)::int AS client_count,
+                COALESCE(uc.staff_count, 0)::int AS staff_count,
+                COALESCE(cc.chat_count, 0)::int AS chat_count,
+                COALESCE(cc.channel_count, 0)::int AS channel_count,
+                COALESCE(cc.private_chat_count, 0)::int AS private_chat_count,
+                EXISTS (
+                  SELECT 1
+                    FROM chats cm
+                   WHERE cm.tenant_id = t.id
+                     AND lower(COALESCE(cm.type, '')) = 'channel'
+                     AND (
+                       lower(COALESCE(cm.settings->>'system_key', '')) = 'main_channel'
+                       OR lower(COALESCE(cm.settings->>'kind', '')) = 'main_channel'
+                       OR COALESCE(cm.settings->>'is_main_channel', '') = 'true'
+                       OR lower(COALESCE(cm.title, '')) LIKE 'основной канал%'
+                     )
+                ) AS has_main_channel
+           FROM tenants t
+      LEFT JOIN (
+             SELECT tenant_id,
+                    COUNT(*)::int AS user_count,
+                    COUNT(*) FILTER (
+                      WHERE lower(COALESCE(role, '')) = 'client'
+                    )::int AS client_count,
+                    COUNT(*) FILTER (
+                      WHERE lower(COALESCE(role, '')) IN ('creator', 'tenant', 'admin', 'worker')
+                    )::int AS staff_count
+               FROM users
+           GROUP BY tenant_id
+      ) uc
+             ON uc.tenant_id = t.id
+      LEFT JOIN (
+             SELECT tenant_id,
+                    COUNT(*)::int AS chat_count,
+                    COUNT(*) FILTER (
+                      WHERE lower(COALESCE(type, '')) = 'channel'
+                    )::int AS channel_count,
+                    COUNT(*) FILTER (
+                      WHERE lower(COALESCE(type, '')) = 'private'
+                    )::int AS private_chat_count
+               FROM chats
+           GROUP BY tenant_id
+      ) cc
+             ON cc.tenant_id = t.id
+          WHERE ${where}
+       ORDER BY lower(t.code) ASC, t.created_at ASC`,
+      );
+
+      const now = Date.now();
+      let active = 0;
+      let blocked = 0;
+      let expiringSoon = 0;
+      let expired = 0;
+      let missingMainChannel = 0;
+      let missingStaff = 0;
+      let isolated = 0;
+      let shared = 0;
+
+      for (const row of q.rows) {
+        const status = String(row.status || "")
+          .toLowerCase()
+          .trim();
+        if (status === "active") active += 1;
+        if (status === "blocked") blocked += 1;
+
+        const expiresAtRaw = row.subscription_expires_at
+          ? new Date(row.subscription_expires_at).getTime()
+          : NaN;
+        if (Number.isFinite(expiresAtRaw)) {
+          if (expiresAtRaw <= now) {
+            expired += 1;
+          } else if (expiresAtRaw - now <= 24 * 60 * 60 * 1000) {
+            expiringSoon += 1;
+          }
+        }
+
+        if (!row.has_main_channel) missingMainChannel += 1;
+        if (Number(row.staff_count || 0) <= 0) missingStaff += 1;
+
+        const dbMode = String(row.db_mode || "")
+          .toLowerCase()
+          .trim();
+        if (dbMode === "isolated") isolated += 1;
+        if (dbMode === "shared") shared += 1;
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          include_deleted: includeDeleted,
+          include_default: includeDefault,
+          total: q.rows.length,
+          summary: {
+            active,
+            blocked,
+            expiring_soon_24h: expiringSoon,
+            expired,
+            missing_main_channel: missingMainChannel,
+            missing_staff: missingStaff,
+            isolated,
+            shared,
+          },
+          rows: q.rows,
+        },
+      });
+    } catch (err) {
+      console.error("admin.test.tenants.matrix error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/test/tenants/subscriptions",
+  requireAuth,
+  async (req, res) => {
+    if (String(req.user?.base_role || req.user?.role || "") !== "creator") {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({
+        ok: false,
+        error: "Доступно только создателю платформы",
+      });
+    }
+
+    const mode = String(req.body?.mode || "")
+      .toLowerCase()
+      .trim();
+    const includeDefault = req.body?.include_default === true;
+    const dryRun = req.body?.dry_run === true;
+    const warningHoursRaw = Number(req.body?.warning_hours);
+    const warningHours = Number.isFinite(warningHoursRaw)
+      ? Math.max(1, Math.min(72, Math.floor(warningHoursRaw)))
+      : 20;
+
+    const allowedModes = new Set([
+      "block_all",
+      "activate_all",
+      "warn_soon_all",
+      "expire_all",
+      "restore_snapshot",
+    ]);
+    if (!allowedModes.has(mode)) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Некорректный mode. Разрешено: block_all, activate_all, warn_soon_all, expire_all, restore_snapshot",
+      });
+    }
+
+    let snapshotRows = [];
+    if (mode === "restore_snapshot") {
+      const rawSnapshot = Array.isArray(req.body?.snapshot)
+        ? req.body.snapshot
+        : [];
+      snapshotRows = rawSnapshot
+        .map((row) => {
+          const id = String(row?.id || "").trim();
+          const status = String(row?.status || "")
+            .toLowerCase()
+            .trim();
+          const expiresRaw = String(
+            row?.subscription_expires_at || row?.subscriptionExpiresAt || "",
+          ).trim();
+          if (!isUuidLike(id)) return null;
+          if (status !== "active" && status !== "blocked") return null;
+          return {
+            id,
+            status,
+            subscription_expires_at: expiresRaw || null,
+          };
+        })
+        .filter(Boolean);
+      if (snapshotRows.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Для restore_snapshot нужен непустой snapshot",
+        });
+      }
+    }
+
+    const whereSql = includeDefault
+      ? "COALESCE(is_deleted, false) = false"
+      : "COALESCE(is_deleted, false) = false AND lower(code) <> 'default'";
+
+    const client = await db.platformConnect();
+    try {
+      await client.query("BEGIN");
+
+      const beforeQ = await client.query(
+        `SELECT id, code, name, status, subscription_expires_at
+         FROM tenants
+         WHERE ${whereSql}
+         ORDER BY created_at DESC`,
+      );
+      const before = beforeQ.rows;
+
+      if (!dryRun && before.length > 0) {
+        if (mode === "block_all") {
+          await client.query(
+            `UPDATE tenants
+             SET status = 'blocked',
+                 updated_at = now()
+             WHERE ${whereSql}`,
+          );
+        } else if (mode === "activate_all") {
+          await client.query(
+            `UPDATE tenants
+             SET status = 'active',
+                 updated_at = now()
+             WHERE ${whereSql}`,
+          );
+        } else if (mode === "warn_soon_all") {
+          await client.query(
+            `UPDATE tenants
+             SET status = 'active',
+                 subscription_expires_at = now() + make_interval(hours => $1::int),
+                 updated_at = now()
+             WHERE ${whereSql}`,
+            [warningHours],
+          );
+        } else if (mode === "expire_all") {
+          await client.query(
+            `UPDATE tenants
+             SET status = 'active',
+                 subscription_expires_at = now() - interval '5 minutes',
+                 updated_at = now()
+             WHERE ${whereSql}`,
+          );
+        } else if (mode === "restore_snapshot") {
+          await client.query(
+            `WITH payload AS (
+               SELECT *
+               FROM jsonb_to_recordset($1::jsonb)
+                 AS p(id uuid, status text, subscription_expires_at timestamptz)
+             )
+             UPDATE tenants t
+             SET status = lower(p.status),
+                 subscription_expires_at = p.subscription_expires_at,
+                 updated_at = now()
+             FROM payload p
+             WHERE t.id = p.id
+               AND ${whereSql}`,
+            [JSON.stringify(snapshotRows)],
+          );
+        }
+      }
+
+      const afterQ = await client.query(
+        `SELECT id, code, name, status, subscription_expires_at
+         FROM tenants
+         WHERE ${whereSql}
+         ORDER BY created_at DESC`,
+      );
+      const after = afterQ.rows;
+
+      const beforeById = new Map(before.map((row) => [String(row.id), row]));
+      let changed = 0;
+      const changedRows = [];
+      for (const row of after) {
+        const prev = beforeById.get(String(row.id));
+        if (!prev) continue;
+        const prevStatus = String(prev.status || "");
+        const nextStatus = String(row.status || "");
+        const prevExpiry = String(prev.subscription_expires_at || "");
+        const nextExpiry = String(row.subscription_expires_at || "");
+        if (prevStatus !== nextStatus || prevExpiry !== nextExpiry) {
+          changed += 1;
+          changedRows.push(row);
+        }
+      }
+
+      const activeCount = after.filter(
+        (row) => String(row.status || "").toLowerCase().trim() === "active",
+      ).length;
+      const blockedCount = after.length - activeCount;
+
+      await client.query("COMMIT");
+
+      if (!dryRun && changedRows.length > 0) {
+        const io = req.app.get("io");
+        for (const row of changedRows) {
+          emitTenantSubscriptionUpdate(
+            io,
+            row.id,
+            row,
+            `test_bulk:${mode}`,
+          );
+        }
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          mode,
+          include_default: includeDefault,
+          dry_run: dryRun,
+          warning_hours: warningHours,
+          total: after.length,
+          changed,
+          active_count: activeCount,
+          blocked_count: blockedCount,
+          before,
+          after,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("admin.test.tenants.subscriptions error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();

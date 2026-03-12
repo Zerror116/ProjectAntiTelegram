@@ -101,6 +101,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool get _isClientAccount => _effectiveRole == 'client';
 
   bool get _canManageTenantUsers {
+    final effectiveRole = _effectiveRole;
+    if (effectiveRole == 'tenant' || effectiveRole == 'creator') {
+      return true;
+    }
+    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    if (baseRole == 'tenant' || baseRole == 'creator') {
+      return true;
+    }
     return authService.hasPermission('tenant.users.manage');
   }
 
