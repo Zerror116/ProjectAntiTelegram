@@ -37,6 +37,10 @@ const {
 } = require("./utils/messageEncryptionBackfill");
 const { logMonitoringEvent } = require("./utils/monitoring");
 const { tenantRoom } = require("./utils/socket");
+const {
+  rewriteSignedUploadsInPayload,
+  signedUploadGuard,
+} = require("./utils/signedUploads");
 
 // ===================================
 // MIDDLEWARE И КОНФИГУРАЦИЯ
@@ -143,16 +147,67 @@ for (const publicDir of ["products", "channels", "users", "claims"]) {
   const fullDir = path.join(uploadsRoot, publicDir);
   app.use(
     `/uploads/${publicDir}`,
+    signedUploadGuard(publicDir),
     express.static(fullDir, {
       index: false,
       fallthrough: false,
-      maxAge: "30d",
-      immutable: true,
+      maxAge: "5m",
+      immutable: false,
       setHeaders(res) {
         res.setHeader("X-Content-Type-Options", "nosniff");
+        res.setHeader("Cache-Control", "private, max-age=300");
       },
     }),
   );
+}
+
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (payload) =>
+    originalJson(rewriteSignedUploadsInPayload(payload, { req }));
+  next();
+});
+
+function patchSocketEmittersWithSignedUploads(io) {
+  const baseUrl = String(
+    process.env.PUBLIC_BASE_URL || process.env.API_PUBLIC_BASE_URL || "",
+  ).trim();
+  const rewrite = (value) =>
+    rewriteSignedUploadsInPayload(value, {
+      baseUrl,
+    });
+
+  const patchEmitter = (emitter) => {
+    if (!emitter || emitter.__signedUploadsPatched === true) return emitter;
+    if (typeof emitter.emit !== "function") return emitter;
+    const originalEmit = emitter.emit.bind(emitter);
+    emitter.emit = (event, ...args) => {
+      const signedArgs = args.map(rewrite);
+      return originalEmit(event, ...signedArgs);
+    };
+    Object.defineProperty(emitter, "__signedUploadsPatched", {
+      value: true,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    return emitter;
+  };
+
+  patchEmitter(io);
+
+  const originalTo = io.to.bind(io);
+  io.to = (...rooms) => patchEmitter(originalTo(...rooms));
+
+  const originalIn = io.in.bind(io);
+  io.in = (...rooms) => patchEmitter(originalIn(...rooms));
+
+  const originalExcept = io.except.bind(io);
+  io.except = (...rooms) => patchEmitter(originalExcept(...rooms));
+
+  if (io.sockets) {
+    patchEmitter(io.sockets);
+  }
 }
 
 // Логирование входящих запросов и времени обработки
@@ -500,6 +555,7 @@ async function canUserAccessChat(user, chatId) {
 
     // Делаем io доступным в express
     app.set("io", io);
+    patchSocketEmittersWithSignedUploads(io);
     console.log("✅ Socket.io initialized");
     if (typeof deliveryRoutes.startBackgroundTasks === "function") {
       deliveryRoutes.startBackgroundTasks(io);

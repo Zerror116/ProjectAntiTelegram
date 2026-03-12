@@ -28,6 +28,14 @@ const DELIVERY_STOP_SERVICE_MINUTES = 12;
 const DELIVERY_STOP_BUFFER_MINUTES = 8;
 const DELIVERY_DIALOG_AUTO_DELETE_MS = 60 * 1000;
 const DELIVERY_DIALOG_CLEANUP_INTERVAL_MS = 15 * 1000;
+const CART_RETENTION_WARNING_DAYS = 30;
+const CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE = [
+  "pending_processing",
+  "processed",
+  "preparing_delivery",
+  "handing_to_courier",
+  "in_delivery",
+];
 const DEMO_USER_EMAIL_PREFIX = "phantom.delivery.";
 const DEMO_PRODUCT_TITLE_PREFIX = "[DEMO DELIVERY]";
 const GEOCODER_SEARCH_URL =
@@ -933,6 +941,132 @@ function emitDeliveryUpdated(io, batchId, tenantId = null) {
   });
 }
 
+async function getCartRetentionSnapshot(queryable, userId, tenantId = null) {
+  if (!userId) return null;
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const snapshotQ = await queryable.query(
+    `SELECT MIN(c.created_at) AS oldest_created_at,
+            COUNT(*)::int AS items_count,
+            COALESCE(
+              SUM((COALESCE(c.custom_price, p.price) * c.quantity)),
+              0
+            )::numeric AS total_sum
+     FROM cart_items c
+     JOIN users u ON u.id = c.user_id
+     JOIN products p ON p.id = c.product_id
+     WHERE c.user_id = $1
+       AND c.status = ANY($2::text[])
+       AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)`,
+    [userId, CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE, scopedTenantId],
+  );
+  const row = snapshotQ.rows[0] || {};
+  if (!row.oldest_created_at || Number(row.items_count || 0) <= 0) return null;
+  const oldestCreatedAt = new Date(row.oldest_created_at);
+  if (Number.isNaN(oldestCreatedAt.getTime())) return null;
+  const daysHeld = Math.max(
+    0,
+    Math.floor((Date.now() - oldestCreatedAt.getTime()) / (24 * 60 * 60 * 1000)),
+  );
+  return {
+    oldest_created_at: oldestCreatedAt.toISOString(),
+    items_count: Number(row.items_count || 0),
+    total_sum: toMoney(row.total_sum),
+    days_held: daysHeld,
+    is_stale: daysHeld >= CART_RETENTION_WARNING_DAYS,
+  };
+}
+
+async function autoDismantleStaleCart(queryable, { userId, tenantId = null }) {
+  const retention = await getCartRetentionSnapshot(queryable, userId, tenantId);
+  if (!retention || !retention.is_stale) {
+    return { applied: false, retention };
+  }
+
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const itemsQ = await queryable.query(
+    `SELECT c.id::text AS id,
+            c.product_id::text AS product_id,
+            c.quantity
+     FROM cart_items c
+     JOIN users u ON u.id = c.user_id
+     WHERE c.user_id = $1
+       AND c.status = ANY($2::text[])
+       AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
+     FOR UPDATE`,
+    [userId, CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE, scopedTenantId],
+  );
+  if (itemsQ.rowCount === 0) {
+    return { applied: false, retention };
+  }
+
+  const itemIds = itemsQ.rows
+    .map((row) => String(row.id || "").trim())
+    .filter((id) => id.length > 0);
+  if (itemIds.length === 0) {
+    return { applied: false, retention };
+  }
+
+  const productTotals = new Map();
+  for (const row of itemsQ.rows) {
+    const productId = String(row.product_id || "").trim();
+    const quantity = Number(row.quantity) || 0;
+    if (!productId || quantity <= 0) continue;
+    productTotals.set(productId, (productTotals.get(productId) || 0) + quantity);
+  }
+
+  const reservationQ = await queryable.query(
+    `SELECT id::text AS id, reserved_channel_message_id::text AS reserved_channel_message_id
+     FROM reservations
+     WHERE cart_item_id = ANY($1::uuid[])
+     FOR UPDATE`,
+    [itemIds],
+  );
+  const reservedMessageIds = reservationQ.rows
+    .map((row) => String(row.reserved_channel_message_id || "").trim())
+    .filter((id) => id.length > 0);
+  if (reservedMessageIds.length > 0) {
+    await queryable.query(
+      `DELETE FROM messages
+       WHERE id = ANY($1::uuid[])`,
+      [reservedMessageIds],
+    );
+  }
+  await queryable.query(
+    `DELETE FROM reservations
+     WHERE cart_item_id = ANY($1::uuid[])`,
+    [itemIds],
+  );
+
+  await queryable.query(
+    `DELETE FROM delivery_batch_items
+     WHERE cart_item_id = ANY($1::uuid[])`,
+    [itemIds],
+  );
+
+  for (const [productId, quantity] of productTotals.entries()) {
+    await queryable.query(
+      `UPDATE products
+       SET quantity = quantity + $1,
+           updated_at = now()
+       WHERE id = $2`,
+      [quantity, productId],
+    );
+  }
+
+  await queryable.query(
+    `DELETE FROM cart_items
+     WHERE id = ANY($1::uuid[])`,
+    [itemIds],
+  );
+
+  return {
+    applied: true,
+    retention,
+    removed_items_count: itemIds.length,
+    restored_products_count: productTotals.size,
+  };
+}
+
 async function upsertUserShelf(queryable, userId, shelfNumber) {
   const normalizedShelf = Number(shelfNumber);
   if (!userId || !Number.isInteger(normalizedShelf) || normalizedShelf <= 0) {
@@ -1803,6 +1937,21 @@ function buildDeliveryAcceptedText(addressText, preferredFrom, preferredTo) {
 
 function buildDeliveryDeclinedText() {
   return "Хорошо, свяжемся с вами в следующий раз.";
+}
+
+function buildDeliveryAutoDismantledText(autoResult) {
+  const removedCount = Number(autoResult?.removed_items_count || 0);
+  const daysHeld = Number(autoResult?.retention?.days_held || 0);
+  return [
+    "Доставка отклонена.",
+    `Корзина была расформирована автоматически, так как держалась больше ${Math.max(
+      CART_RETENTION_WARNING_DAYS,
+      daysHeld,
+    )} дней.`,
+    removedCount > 0
+      ? `Удалено позиций: ${removedCount}.`
+      : "Позиции корзины были очищены.",
+  ].join("\n");
 }
 
 function formatDeliveryPreferenceLabel(preferredFrom, preferredTo) {
@@ -3082,6 +3231,29 @@ router.post(
           [customerId],
         );
       }
+      let autoDismantleResult = { applied: false, retention: null };
+      if (declined) {
+        autoDismantleResult = await autoDismantleStaleCart(client, {
+          userId: customer.user_id,
+          tenantId: req.user?.tenant_id || null,
+        });
+        if (autoDismantleResult.applied) {
+          const note =
+            "Авторасформировка корзины после отказа от доставки (корзина старше 30 дней).";
+          await client.query(
+            `UPDATE delivery_batch_customers
+             SET call_status = 'removed',
+                 delivery_status = 'returned_to_cart',
+                 notes = CASE
+                   WHEN COALESCE(BTRIM(notes), '') = '' THEN $2
+                   ELSE CONCAT(notes, E'\n', $2)
+                 END,
+                 updated_at = now()
+             WHERE id = $1`,
+            [customerId, note],
+          );
+        }
+      }
 
       const updatedOfferMessagesQ = await client.query(
         `UPDATE messages
@@ -3128,7 +3300,9 @@ router.post(
           uuidv4(),
           chat.id,
           encryptMessageText(
-            accepted
+            autoDismantleResult.applied
+              ? buildDeliveryAutoDismantledText(autoDismantleResult)
+              : accepted
               ? buildDeliveryAcceptedText(
                   nextAddressText,
                   preferredWindow.fromText,
@@ -3140,10 +3314,15 @@ router.post(
             kind: "delivery_offer_result",
             delivery_batch_id: customer.batch_id,
             delivery_customer_id: customerId,
-            offer_status: accepted ? "accepted" : "declined",
+            offer_status: accepted
+              ? "accepted"
+              : autoDismantleResult.applied
+              ? "declined_auto_dismantled"
+              : "declined",
             address_text: nextAddressText || "",
             preferred_time_from: preferredWindow.fromText || "",
             preferred_time_to: preferredWindow.toText || "",
+            auto_dismantled: autoDismantleResult.applied,
           }),
         ],
       );
@@ -3183,10 +3362,23 @@ router.post(
             message: followUpMessage,
           });
         }
-        emitCartUpdated(io, customer.user_id, {
-          status: accepted ? "preparing_delivery" : "processed",
-          reason: accepted ? "delivery_confirmed" : "delivery_declined",
-        });
+        if (accepted) {
+          emitCartUpdated(io, customer.user_id, {
+            status: "preparing_delivery",
+            reason: "delivery_confirmed",
+          });
+        } else if (autoDismantleResult.applied) {
+          emitCartUpdated(io, customer.user_id, {
+            status: "empty",
+            reason: "cart_auto_dismantled",
+            auto_dismantled: true,
+          });
+        } else {
+          emitCartUpdated(io, customer.user_id, {
+            status: "processed",
+            reason: "delivery_declined",
+          });
+        }
         io.to(`user:${customer.user_id}`).emit("chat:updated", {
           chatId: chat.id,
           chat: {
@@ -3211,7 +3403,15 @@ router.post(
         ok: true,
         data: {
           customer_id: customerId,
-          status: accepted ? "accepted" : "declined",
+          status: accepted
+            ? "accepted"
+            : autoDismantleResult.applied
+            ? "declined_auto_dismantled"
+            : "declined",
+          auto_dismantled: autoDismantleResult.applied,
+          removed_items_count: Number(
+            autoDismantleResult?.removed_items_count || 0,
+          ),
           active_batch: activeBatch,
         },
       });
@@ -3422,6 +3622,29 @@ router.post(
           [customerId],
         );
       }
+      let autoDismantleResult = { applied: false, retention: null };
+      if (declined) {
+        autoDismantleResult = await autoDismantleStaleCart(client, {
+          userId: customer.user_id,
+          tenantId: req.user?.tenant_id || null,
+        });
+        if (autoDismantleResult.applied) {
+          const note =
+            "Авторасформировка корзины после отказа от доставки (корзина старше 30 дней).";
+          await client.query(
+            `UPDATE delivery_batch_customers
+             SET call_status = 'removed',
+                 delivery_status = 'returned_to_cart',
+                 notes = CASE
+                   WHEN COALESCE(BTRIM(notes), '') = '' THEN $2
+                   ELSE CONCAT(notes, E'\n', $2)
+                 END,
+                 updated_at = now()
+             WHERE id = $1`,
+            [customerId, note],
+          );
+        }
+      }
 
       const updatedOfferMessagesQ = await client.query(
         `UPDATE messages
@@ -3468,7 +3691,9 @@ router.post(
           uuidv4(),
           chat.id,
           encryptMessageText(
-            accepted
+            autoDismantleResult.applied
+              ? buildDeliveryAutoDismantledText(autoDismantleResult)
+              : accepted
               ? buildDeliveryAcceptedText(
                   nextAddressText,
                   preferredWindow.fromText,
@@ -3480,11 +3705,16 @@ router.post(
             kind: "delivery_offer_result",
             delivery_batch_id: customer.batch_id,
             delivery_customer_id: customerId,
-            offer_status: accepted ? "accepted" : "declined",
+            offer_status: accepted
+              ? "accepted"
+              : autoDismantleResult.applied
+              ? "declined_auto_dismantled"
+              : "declined",
             address_text: nextAddressText || "",
             preferred_time_from: preferredWindow.fromText || "",
             preferred_time_to: preferredWindow.toText || "",
             responded_by: "admin",
+            auto_dismantled: autoDismantleResult.applied,
           }),
         ],
       );
@@ -3550,6 +3780,12 @@ router.post(
           status: "preparing_delivery",
           reason: "delivery_confirmed",
         });
+      } else if (autoDismantleResult.applied) {
+        emitCartUpdated(io, customer.user_id, {
+          status: "empty",
+          reason: "cart_auto_dismantled",
+          auto_dismantled: true,
+        });
       } else {
         emitCartUpdated(io, customer.user_id, {
           status: "processed",
@@ -3567,6 +3803,15 @@ router.post(
         ok: true,
         data: {
           customer_id: customerId,
+          status: accepted
+            ? "accepted"
+            : autoDismantleResult.applied
+            ? "declined_auto_dismantled"
+            : "declined",
+          auto_dismantled: autoDismantleResult.applied,
+          removed_items_count: Number(
+            autoDismantleResult?.removed_items_count || 0,
+          ),
           active_batch: activeBatch,
         },
       });

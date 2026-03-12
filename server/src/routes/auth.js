@@ -30,6 +30,9 @@ const {
   verifyTwoFactorCode,
   encryptTwoFactorSecret,
   decryptTwoFactorSecret,
+  normalizeBackupCode,
+  hashBackupCode,
+  generateBackupCodes,
 } = require('../utils/twoFactor');
 const { ensureSystemChannels } = require("../utils/systemChannels");
 require('dotenv').config();
@@ -53,6 +56,8 @@ const CREATOR_SECRET_HASH = String(process.env.CREATOR_SECRET_HASH || '')
   .trim()
   .toLowerCase();
 const MAX_ACCOUNTS_PER_DEVICE = 2;
+const TRUST_DEVICE_2FA_DAYS = 30;
+const BACKUP_CODES_DEFAULT_COUNT = 10;
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -132,6 +137,23 @@ function normalizeDeviceFingerprint(value) {
   return normalized ? normalized.slice(0, 255) : null;
 }
 
+function parseBooleanFlag(raw) {
+  if (raw === true || raw === false) return raw;
+  if (raw === 1 || raw === "1") return true;
+  if (raw === 0 || raw === "0") return false;
+  const normalized = String(raw || "")
+    .toLowerCase()
+    .trim();
+  return normalized === "true" || normalized === "yes" || normalized === "y";
+}
+
+function maskDeviceFingerprint(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "unknown";
+  if (value.length <= 10) return value;
+  return `${value.slice(0, 6)}…${value.slice(-4)}`;
+}
+
 function decodeTenantCodeHeaderValue(raw) {
   const value = String(raw || '').trim();
   if (!value) return '';
@@ -208,15 +230,198 @@ async function upsertDevice(queryable, userId, deviceFingerprint) {
   const fingerprint = normalizeDeviceFingerprint(deviceFingerprint);
   if (!userId || !fingerprint) return null;
   const result = await queryable.query(
-    `INSERT INTO devices (id, user_id, device_fingerprint, trusted, created_at, last_seen)
+    `INSERT INTO devices (
+       id,
+       user_id,
+       device_fingerprint,
+       trusted,
+       created_at,
+       last_seen
+     )
      VALUES (gen_random_uuid(), $1, $2, true, now(), now())
      ON CONFLICT (user_id, device_fingerprint) DO UPDATE
        SET trusted = true,
            last_seen = now()
-     RETURNING id`,
+     RETURNING id, device_fingerprint, trusted_2fa_until, trusted_2fa_set_at`,
     [userId, fingerprint],
   );
-  return result.rows[0]?.id || null;
+  return result.rows[0] || null;
+}
+
+async function isTwoFactorTrustedDevice(queryable, userId, deviceFingerprint) {
+  const fingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+  if (!userId || !fingerprint) return false;
+  const q = await queryable.query(
+    `SELECT id
+     FROM devices
+     WHERE user_id = $1
+       AND device_fingerprint = $2
+       AND trusted_2fa_until IS NOT NULL
+       AND trusted_2fa_until > now()
+     LIMIT 1`,
+    [userId, fingerprint],
+  );
+  return q.rowCount > 0;
+}
+
+async function grantTwoFactorDeviceTrust(
+  queryable,
+  userId,
+  deviceFingerprint,
+  { days = TRUST_DEVICE_2FA_DAYS } = {},
+) {
+  const fingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+  if (!userId || !fingerprint) return null;
+  const safeDays = Math.max(1, Math.min(Number(days) || TRUST_DEVICE_2FA_DAYS, 90));
+  const q = await queryable.query(
+    `INSERT INTO devices (
+       id,
+       user_id,
+       device_fingerprint,
+       trusted,
+       created_at,
+       last_seen,
+       trusted_2fa_until,
+       trusted_2fa_set_at
+     )
+     VALUES (
+       gen_random_uuid(),
+       $1,
+       $2,
+       true,
+       now(),
+       now(),
+       now() + make_interval(days => $3::int),
+       now()
+     )
+     ON CONFLICT (user_id, device_fingerprint) DO UPDATE
+       SET trusted = true,
+           last_seen = now(),
+           trusted_2fa_until = now() + make_interval(days => $3::int),
+           trusted_2fa_set_at = now()
+     RETURNING id, trusted_2fa_until`,
+    [userId, fingerprint, safeDays],
+  );
+  return q.rows[0] || null;
+}
+
+async function revokeAllTwoFactorTrustedDevices(queryable, userId) {
+  if (!userId) return 0;
+  const q = await queryable.query(
+    `UPDATE devices
+     SET trusted_2fa_until = NULL,
+         trusted_2fa_set_at = NULL
+     WHERE user_id = $1
+       AND trusted_2fa_until IS NOT NULL`,
+    [userId],
+  );
+  return q.rowCount || 0;
+}
+
+async function listTwoFactorTrustedDevices(queryable, userId) {
+  if (!userId) return [];
+  const q = await queryable.query(
+    `SELECT id,
+            device_fingerprint,
+            last_seen,
+            trusted_2fa_until,
+            trusted_2fa_set_at,
+            created_at
+     FROM devices
+     WHERE user_id = $1
+       AND trusted_2fa_until IS NOT NULL
+       AND trusted_2fa_until > now()
+     ORDER BY trusted_2fa_until DESC, last_seen DESC, created_at DESC
+     LIMIT 30`,
+    [userId],
+  );
+  return q.rows;
+}
+
+async function countTwoFactorTrustedDevices(queryable, userId) {
+  if (!userId) return 0;
+  const q = await queryable.query(
+    `SELECT COUNT(*)::int AS count
+     FROM devices
+     WHERE user_id = $1
+       AND trusted_2fa_until IS NOT NULL
+       AND trusted_2fa_until > now()`,
+    [userId],
+  );
+  return Number(q.rows[0]?.count || 0);
+}
+
+async function revokeTwoFactorTrustedDeviceById(queryable, userId, deviceId) {
+  if (!userId || !deviceId) return false;
+  const q = await queryable.query(
+    `UPDATE devices
+     SET trusted_2fa_until = NULL,
+         trusted_2fa_set_at = NULL
+     WHERE id = $1::uuid
+       AND user_id = $2
+       AND trusted_2fa_until IS NOT NULL
+     RETURNING id`,
+    [deviceId, userId],
+  );
+  return q.rowCount > 0;
+}
+
+async function countActiveBackupCodes(queryable, userId) {
+  if (!userId) return 0;
+  const q = await queryable.query(
+    `SELECT COUNT(*)::int AS count
+     FROM user_two_factor_backup_codes
+     WHERE user_id = $1
+       AND used_at IS NULL`,
+    [userId],
+  );
+  return Number(q.rows[0]?.count || 0);
+}
+
+async function replaceUserBackupCodes(
+  queryable,
+  userId,
+  { count = BACKUP_CODES_DEFAULT_COUNT } = {},
+) {
+  if (!userId) return [];
+  const generated = generateBackupCodes({ count });
+  await queryable.query(
+    `DELETE FROM user_two_factor_backup_codes
+     WHERE user_id = $1`,
+    [userId],
+  );
+  for (const hash of generated.hashes) {
+    await queryable.query(
+      `INSERT INTO user_two_factor_backup_codes (
+         id,
+         user_id,
+         code_hash,
+         used_at,
+         created_at
+       )
+       VALUES (gen_random_uuid(), $1, $2, NULL, now())`,
+      [userId, hash],
+    );
+  }
+  return generated.plain;
+}
+
+async function consumeBackupCode(queryable, userId, rawCode) {
+  if (!userId) return false;
+  const normalized = normalizeBackupCode(rawCode);
+  if (!normalized) return false;
+  const hash = hashBackupCode(normalized);
+  if (!hash) return false;
+  const q = await queryable.query(
+    `UPDATE user_two_factor_backup_codes
+     SET used_at = now()
+     WHERE user_id = $1
+       AND code_hash = $2
+       AND used_at IS NULL
+     RETURNING id`,
+    [userId, hash],
+  );
+  return q.rowCount > 0;
 }
 
 async function upsertTenantUserIndex({
@@ -847,7 +1052,14 @@ router.post('/register', async (req, res) => {
  */
 router.post('/login', async (req, res) => {
   try {
-    const { email, password, device_fingerprint, access_key, otp_code } = req.body || {};
+    const {
+      email,
+      password,
+      device_fingerprint,
+      access_key,
+      otp_code,
+      trust_device,
+    } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const normalizedEmail = validator.normalizeEmail(email);
@@ -957,6 +1169,13 @@ router.post('/login', async (req, res) => {
 
         const requiresTwoFactor =
           isTwoFactorEligibleRole(user) && user.two_factor_enabled === true;
+        const normalizedFingerprint = normalizeDeviceFingerprint(
+          device_fingerprint,
+        );
+        const trustDeviceRequested = parseBooleanFlag(trust_device);
+        let twoFactorMethod = 'disabled';
+        let trustedByDevice = false;
+
         if (requiresTwoFactor) {
           const secret = decryptTwoFactorSecret(user.two_factor_secret);
           if (!secret) {
@@ -967,22 +1186,61 @@ router.post('/login', async (req, res) => {
               error: '2FA включена, но ключ недоступен. Обратитесь к создателю приложения.',
             };
           }
-          const providedCode = normalizeTotpCode(
-            otp_code || req.body?.two_factor_code || req.body?.totp_code,
+
+          trustedByDevice = await isTwoFactorTrustedDevice(
+            client,
+            user.id,
+            normalizedFingerprint,
           );
-          if (!verifyTwoFactorCode(secret, providedCode)) {
-            await client.query('ROLLBACK');
-            return {
-              ok: false,
-              status: 401,
-              error: 'Требуется код 2FA из Google Authenticator',
-              twoFactorRequired: true,
-            };
+
+          if (trustedByDevice) {
+            twoFactorMethod = 'trusted_device';
+          } else {
+            const providedCode = normalizeTotpCode(
+              otp_code || req.body?.two_factor_code || req.body?.totp_code,
+            );
+            let verified = false;
+            if (verifyTwoFactorCode(secret, providedCode)) {
+              verified = true;
+              twoFactorMethod = 'totp';
+            } else {
+              const backupAccepted = await consumeBackupCode(
+                client,
+                user.id,
+                providedCode,
+              );
+              if (backupAccepted) {
+                verified = true;
+                twoFactorMethod = 'backup_code';
+              }
+            }
+            if (!verified) {
+              await client.query('ROLLBACK');
+              return {
+                ok: false,
+                status: 401,
+                error: 'Требуется код 2FA (Google Authenticator или резервный код)',
+                twoFactorRequired: true,
+              };
+            }
           }
         }
 
-        await assertDeviceAccountLimit(client, device_fingerprint, user.id);
-        await upsertDevice(client, user.id, device_fingerprint);
+        await assertDeviceAccountLimit(client, normalizedFingerprint, user.id);
+        await upsertDevice(client, user.id, normalizedFingerprint);
+
+        if (
+          requiresTwoFactor &&
+          trustDeviceRequested &&
+          !trustedByDevice &&
+          normalizedFingerprint
+        ) {
+          await grantTwoFactorDeviceTrust(
+            client,
+            user.id,
+            normalizedFingerprint,
+          );
+        }
 
         const sessionId = uuidv4();
         const sessionExpiresAt = buildSessionExpiry();
@@ -1000,7 +1258,20 @@ router.post('/login', async (req, res) => {
         });
 
         await client.query('COMMIT');
-        return { ok: true, user, sessionId };
+        return {
+          ok: true,
+          user,
+          sessionId,
+          twoFactor: {
+            enabled: requiresTwoFactor,
+            method: twoFactorMethod,
+            trust_device_applied:
+              requiresTwoFactor &&
+              trustDeviceRequested &&
+              !trustedByDevice &&
+              Boolean(normalizedFingerprint),
+          },
+        };
       } catch (err) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         throw err;
@@ -1048,6 +1319,11 @@ router.post('/login', async (req, res) => {
     return res.json({
       token,
       session_id: result.sessionId,
+      two_factor: result.twoFactor || {
+        enabled: false,
+        method: 'disabled',
+        trust_device_applied: false,
+      },
       user: {
         id: result.user.id,
         email: result.user.email,
@@ -1243,11 +1519,21 @@ router.get('/2fa/status', authMiddleware, requireTwoFactorEligible, async (req, 
       return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
     }
     const row = q.rows[0];
+    let backupCodesRemaining = 0;
+    let trustedDevicesCount = 0;
+    if (row.two_factor_enabled === true) {
+      [backupCodesRemaining, trustedDevicesCount] = await Promise.all([
+        countActiveBackupCodes(db, req.user.id),
+        countTwoFactorTrustedDevices(db, req.user.id),
+      ]);
+    }
     return res.json({
       ok: true,
       data: {
         enabled: row.two_factor_enabled === true,
         enabled_at: row.two_factor_enabled_at || null,
+        backup_codes_remaining: backupCodesRemaining,
+        trusted_devices_count: trustedDevicesCount,
       },
     });
   } catch (err) {
@@ -1290,6 +1576,7 @@ router.post('/2fa/setup/start', authMiddleware, requireTwoFactorEligible, async 
 });
 
 router.post('/2fa/setup/confirm', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  const client = await db.pool.connect();
   try {
     const secret = String(req.body?.secret || '').trim();
     const code = normalizeTotpCode(req.body?.code || req.body?.otp_code);
@@ -1306,8 +1593,10 @@ router.post('/2fa/setup/confirm', authMiddleware, requireTwoFactorEligible, asyn
         error: 'Неверный 2FA-код',
       });
     }
+
+    await client.query('BEGIN');
     const encryptedSecret = encryptTwoFactorSecret(secret);
-    await db.query(
+    await client.query(
       `UPDATE users
        SET two_factor_enabled = true,
            two_factor_secret = $2,
@@ -1315,17 +1604,158 @@ router.post('/2fa/setup/confirm', authMiddleware, requireTwoFactorEligible, asyn
        WHERE id = $1`,
       [req.user.id, encryptedSecret],
     );
+    const backupCodes = await replaceUserBackupCodes(client, req.user.id, {
+      count: BACKUP_CODES_DEFAULT_COUNT,
+    });
+    await revokeAllTwoFactorTrustedDevices(client, req.user.id);
+    await client.query('COMMIT');
     return res.json({
       ok: true,
-      data: { enabled: true },
+      data: {
+        enabled: true,
+        backup_codes: backupCodes,
+        backup_codes_remaining: backupCodes.length,
+      },
     });
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
     console.error('auth.2fa.setup.confirm error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/2fa/backup-codes/regenerate', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const password = String(req.body?.password || '');
+    const code = normalizeTotpCode(req.body?.code || req.body?.otp_code);
+    if (!password || !code) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Нужны пароль и код 2FA',
+      });
+    }
+
+    await client.query('BEGIN');
+    const userQ = await client.query(
+      `SELECT password_hash, two_factor_enabled, two_factor_secret
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [req.user.id],
+    );
+    if (userQ.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
+    }
+    const user = userQ.rows[0];
+    const passOk = await bcrypt.compare(password, String(user.password_hash || ''));
+    if (!passOk) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ ok: false, error: 'Неверный пароль' });
+    }
+    if (user.two_factor_enabled !== true) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'Сначала включите 2FA',
+      });
+    }
+    const secret = decryptTwoFactorSecret(user.two_factor_secret);
+    if (!secret || !verifyTwoFactorCode(secret, code)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'Неверный 2FA-код',
+      });
+    }
+
+    const backupCodes = await replaceUserBackupCodes(client, req.user.id, {
+      count: BACKUP_CODES_DEFAULT_COUNT,
+    });
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      data: {
+        backup_codes: backupCodes,
+        backup_codes_remaining: backupCodes.length,
+      },
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('auth.2fa.backupCodes.regenerate error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/2fa/trusted-devices', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const rows = await listTwoFactorTrustedDevices(db, req.user.id);
+    return res.json({
+      ok: true,
+      data: rows.map((row) => ({
+        id: row.id,
+        fingerprint_mask: maskDeviceFingerprint(row.device_fingerprint),
+        trusted_until: row.trusted_2fa_until || null,
+        trusted_set_at: row.trusted_2fa_set_at || null,
+        last_seen: row.last_seen || null,
+        created_at: row.created_at || null,
+      })),
+    });
+  } catch (err) {
+    console.error('auth.2fa.trustedDevices.list error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/2fa/trusted-devices/revoke_all', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const revoked = await revokeAllTwoFactorTrustedDevices(db, req.user.id);
+    return res.json({ ok: true, data: { revoked } });
+  } catch (err) {
+    console.error('auth.2fa.trustedDevices.revokeAll error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.delete('/2fa/trusted-devices/:id', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  try {
+    const deviceId = String(req.params?.id || '').trim();
+    if (!deviceId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'device id обязателен',
+      });
+    }
+    const revoked = await revokeTwoFactorTrustedDeviceById(
+      db,
+      req.user.id,
+      deviceId,
+    );
+    if (!revoked) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Доверенное устройство не найдено',
+      });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('auth.2fa.trustedDevices.revokeOne error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });
 
 router.post('/2fa/disable', authMiddleware, requireTwoFactorEligible, async (req, res) => {
+  const client = await db.pool.connect();
   try {
     const password = String(req.body?.password || '');
     if (!password) {
@@ -1335,7 +1765,8 @@ router.post('/2fa/disable', authMiddleware, requireTwoFactorEligible, async (req
       });
     }
     const code = normalizeTotpCode(req.body?.code || req.body?.otp_code);
-    const userQ = await db.query(
+    await client.query('BEGIN');
+    const userQ = await client.query(
       `SELECT password_hash, two_factor_enabled, two_factor_secret
        FROM users
        WHERE id = $1
@@ -1343,17 +1774,20 @@ router.post('/2fa/disable', authMiddleware, requireTwoFactorEligible, async (req
       [req.user.id],
     );
     if (userQ.rowCount === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ ok: false, error: 'Пользователь не найден' });
     }
     const user = userQ.rows[0];
     const passOk = await bcrypt.compare(password, String(user.password_hash || ''));
     if (!passOk) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ ok: false, error: 'Неверный пароль' });
     }
 
     if (user.two_factor_enabled === true) {
       const secret = decryptTwoFactorSecret(user.two_factor_secret);
       if (!secret || !verifyTwoFactorCode(secret, code)) {
+        await client.query('ROLLBACK');
         return res.status(400).json({
           ok: false,
           error: 'Неверный 2FA-код',
@@ -1361,7 +1795,7 @@ router.post('/2fa/disable', authMiddleware, requireTwoFactorEligible, async (req
       }
     }
 
-    await db.query(
+    await client.query(
       `UPDATE users
        SET two_factor_enabled = false,
            two_factor_secret = NULL,
@@ -1369,13 +1803,25 @@ router.post('/2fa/disable', authMiddleware, requireTwoFactorEligible, async (req
        WHERE id = $1`,
       [req.user.id],
     );
+    await client.query(
+      `DELETE FROM user_two_factor_backup_codes
+       WHERE user_id = $1`,
+      [req.user.id],
+    );
+    await revokeAllTwoFactorTrustedDevices(client, req.user.id);
+    await client.query('COMMIT');
     return res.json({
       ok: true,
       data: { enabled: false },
     });
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
     console.error('auth.2fa.disable error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
   }
 });
 

@@ -335,6 +335,15 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
                 ),
                 textInputAction: TextInputAction.done,
               ),
+              const SizedBox(height: 8),
+              Text(
+                'Важно: если номер будет недоступен при первом звонке, аккаунт будет удален автоматически.',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 12.5,
+                ),
+              ),
               const SizedBox(height: 12),
               if (_shouldShowSecretField) ...[
                 TextField(

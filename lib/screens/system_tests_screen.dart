@@ -3,6 +3,46 @@ import 'package:flutter/material.dart';
 import '../main.dart';
 import '../widgets/phoenix_loader.dart';
 
+enum _CriticalCheckStatus { idle, running, passed, failed, skipped }
+
+class _CriticalCheckSkip implements Exception {
+  final String reason;
+  const _CriticalCheckSkip(this.reason);
+}
+
+class _CriticalCheckState {
+  final String id;
+  final String title;
+  final String description;
+  final _CriticalCheckStatus status;
+  final String details;
+  final int durationMs;
+
+  const _CriticalCheckState({
+    required this.id,
+    required this.title,
+    required this.description,
+    this.status = _CriticalCheckStatus.idle,
+    this.details = '',
+    this.durationMs = 0,
+  });
+
+  _CriticalCheckState copyWith({
+    _CriticalCheckStatus? status,
+    String? details,
+    int? durationMs,
+  }) {
+    return _CriticalCheckState(
+      id: id,
+      title: title,
+      description: description,
+      status: status ?? this.status,
+      details: details ?? this.details,
+      durationMs: durationMs ?? this.durationMs,
+    );
+  }
+}
+
 class SystemTestsScreen extends StatefulWidget {
   const SystemTestsScreen({super.key});
 
@@ -16,8 +56,48 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
   bool _deliveryBusy = false;
   bool _demoPostsBusy = false;
   bool _opsBusy = false;
+  bool _criticalBusy = false;
   Map<String, dynamic>? _deliverySnapshot;
   Map<String, dynamic>? _diagnosticsSnapshot;
+  DateTime? _criticalLastRunAt;
+  List<_CriticalCheckState> _criticalChecks = const [
+    _CriticalCheckState(
+      id: 'profile_scope',
+      title: 'Профиль и tenant-контекст',
+      description: 'Проверяет /api/profile и базовые поля пользователя.',
+    ),
+    _CriticalCheckState(
+      id: 'chats_main',
+      title: 'Список чатов + Основной канал',
+      description: 'Проверяет /api/chats и наличие основного канала.',
+    ),
+    _CriticalCheckState(
+      id: 'direct_search',
+      title: 'Поиск ЛС по номеру/email',
+      description:
+          'Проверяет /api/chats/direct/search на полный идентификатор.',
+    ),
+    _CriticalCheckState(
+      id: 'support_templates',
+      title: 'Шаблоны поддержки',
+      description: 'Проверяет /api/admin/ops/support/templates.',
+    ),
+    _CriticalCheckState(
+      id: 'notifications_center',
+      title: 'Центр уведомлений',
+      description: 'Проверяет /api/admin/ops/notifications/center.',
+    ),
+    _CriticalCheckState(
+      id: 'returns_analytics',
+      title: 'Аналитика возвратов',
+      description: 'Проверяет /api/admin/ops/returns/analytics.',
+    ),
+    _CriticalCheckState(
+      id: 'diagnostics_center',
+      title: 'Диагностика Ops',
+      description: 'Проверяет /api/admin/ops/diagnostics/center.',
+    ),
+  ];
 
   @override
   void initState() {
@@ -99,6 +179,377 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
       default:
         return 'Отправляется';
     }
+  }
+
+  String _safeError(Object error) {
+    final text = error.toString().trim();
+    if (text.startsWith('Exception: ')) {
+      return text.replaceFirst('Exception: ', '').trim();
+    }
+    return text;
+  }
+
+  Map<String, dynamic> _asMap(dynamic raw, {required String context}) {
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    throw Exception('$context: ожидался JSON-объект');
+  }
+
+  List<Map<String, dynamic>> _asMapList(
+    dynamic raw, {
+    required String context,
+  }) {
+    if (raw is! List) {
+      throw Exception('$context: ожидался JSON-массив');
+    }
+    return raw
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+  }
+
+  bool _toBool(dynamic raw) {
+    if (raw is bool) return raw;
+    if (raw is num) return raw != 0;
+    final text = raw?.toString().trim().toLowerCase() ?? '';
+    return text == 'true' || text == '1' || text == 'yes';
+  }
+
+  bool _isMainTitle(String raw) {
+    final value = raw.trim().toLowerCase();
+    return value == 'основной канал' || value.startsWith('основной канал ');
+  }
+
+  bool _isMainChannelRow(Map<String, dynamic> chat) {
+    final settingsRaw = chat['settings'];
+    final settings = settingsRaw is Map
+        ? Map<String, dynamic>.from(settingsRaw)
+        : const <String, dynamic>{};
+    final systemKey = (settings['system_key'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    final isMainFlag =
+        _toBool(chat['is_main_channel']) ||
+        _toBool(settings['is_main_channel']);
+    final title = (chat['title'] ?? '').toString();
+    final displayTitle = (chat['display_title'] ?? '').toString();
+    final name = (chat['name'] ?? '').toString();
+    return systemKey == 'main_channel' ||
+        kind == 'main_channel' ||
+        isMainFlag ||
+        _isMainTitle(title) ||
+        _isMainTitle(displayTitle) ||
+        _isMainTitle(name);
+  }
+
+  void _updateCriticalCheck(
+    String id,
+    _CriticalCheckStatus status, {
+    String? details,
+    int? durationMs,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _criticalChecks = _criticalChecks.map((check) {
+        if (check.id != id) return check;
+        return check.copyWith(
+          status: status,
+          details: details ?? check.details,
+          durationMs: durationMs ?? check.durationMs,
+        );
+      }).toList();
+    });
+  }
+
+  IconData _criticalStatusIcon(_CriticalCheckStatus status) {
+    switch (status) {
+      case _CriticalCheckStatus.running:
+        return Icons.sync_rounded;
+      case _CriticalCheckStatus.passed:
+        return Icons.check_circle_rounded;
+      case _CriticalCheckStatus.failed:
+        return Icons.error_rounded;
+      case _CriticalCheckStatus.skipped:
+        return Icons.remove_circle_outline_rounded;
+      case _CriticalCheckStatus.idle:
+        return Icons.radio_button_unchecked_rounded;
+    }
+  }
+
+  Color _criticalStatusColor(ThemeData theme, _CriticalCheckStatus status) {
+    switch (status) {
+      case _CriticalCheckStatus.running:
+        return theme.colorScheme.primary;
+      case _CriticalCheckStatus.passed:
+        return theme.colorScheme.tertiary;
+      case _CriticalCheckStatus.failed:
+        return theme.colorScheme.error;
+      case _CriticalCheckStatus.skipped:
+        return theme.colorScheme.outline;
+      case _CriticalCheckStatus.idle:
+        return theme.colorScheme.outline;
+    }
+  }
+
+  String _criticalStatusLabel(_CriticalCheckStatus status) {
+    switch (status) {
+      case _CriticalCheckStatus.running:
+        return 'Выполняется';
+      case _CriticalCheckStatus.passed:
+        return 'OK';
+      case _CriticalCheckStatus.failed:
+        return 'Ошибка';
+      case _CriticalCheckStatus.skipped:
+        return 'Пропуск';
+      case _CriticalCheckStatus.idle:
+        return 'Ожидание';
+    }
+  }
+
+  Future<String> _checkProfileScope() async {
+    final resp = await authService.dio.get('/api/profile');
+    final root = _asMap(resp.data, context: '/api/profile');
+    if (root['ok'] != true) {
+      throw Exception('/api/profile: ok != true');
+    }
+    final user = _asMap(
+      root['user'] ?? root['data'] ?? const {},
+      context: '/api/profile.user',
+    );
+    final email = (user['email'] ?? '').toString().trim();
+    final role = (user['role'] ?? authService.effectiveRole)
+        .toString()
+        .trim()
+        .toLowerCase();
+    final tenantCode = (user['tenant_code'] ?? user['tenantCode'] ?? '')
+        .toString()
+        .trim();
+
+    if (email.isEmpty) {
+      throw Exception('/api/profile: email пустой');
+    }
+    if (role != 'creator' && tenantCode.isEmpty) {
+      throw Exception('/api/profile: tenant_code пустой для роли $role');
+    }
+    if (role == 'creator') {
+      return 'role=$role, email=$email';
+    }
+    return 'role=$role, tenant=$tenantCode';
+  }
+
+  Future<String> _checkChatsMainChannel() async {
+    final resp = await authService.dio.get('/api/chats');
+    final root = _asMap(resp.data, context: '/api/chats');
+    if (root['ok'] != true) {
+      throw Exception('/api/chats: ok != true');
+    }
+    final chats = _asMapList(root['data'], context: '/api/chats.data');
+    if (chats.isEmpty) {
+      throw Exception('/api/chats: список пустой');
+    }
+    final hasMain = chats.any(_isMainChannelRow);
+    if (!hasMain) {
+      throw Exception('Основной канал не найден');
+    }
+    return 'чатов: ${chats.length}, основной канал найден';
+  }
+
+  Future<String> _checkDirectSearch() async {
+    final fallbackProbe = authService.currentUser?.phone?.trim() ?? '';
+    final fallbackDigits = fallbackProbe.replaceAll(RegExp(r'\D'), '');
+    final query = fallbackDigits.length >= 10
+        ? fallbackDigits
+        : authService.currentUser?.email.trim() ?? '89990000000';
+
+    final resp = await authService.dio.get(
+      '/api/chats/direct/search',
+      queryParameters: {'query': query, 'limit': 10},
+    );
+    final root = _asMap(resp.data, context: '/api/chats/direct/search');
+    if (root['ok'] != true) {
+      throw Exception('/api/chats/direct/search: ok != true');
+    }
+    final data = _asMap(root['data'], context: '/api/chats/direct/search.data');
+    final tooShort = _toBool(data['too_short']);
+    if (tooShort) {
+      throw Exception('direct/search вернул too_short для полного запроса');
+    }
+    final candidates = data['candidates'];
+    if (candidates is! List) {
+      throw Exception('direct/search: candidates не массив');
+    }
+    final exact = data['exact'];
+    return 'query="$query", exact=${exact == null ? 'нет' : 'есть'}, candidates=${candidates.length}';
+  }
+
+  Future<String> _checkSupportTemplates() async {
+    final resp = await authService.dio.get('/api/admin/ops/support/templates');
+    final root = _asMap(resp.data, context: '/api/admin/ops/support/templates');
+    if (root['ok'] != true) {
+      throw Exception('/api/admin/ops/support/templates: ok != true');
+    }
+    final rows = _asMapList(
+      root['data'],
+      context: '/api/admin/ops/support/templates.data',
+    );
+    return 'активных шаблонов: ${rows.length}';
+  }
+
+  Future<String> _checkNotificationsCenter() async {
+    final resp = await authService.dio.get(
+      '/api/admin/ops/notifications/center',
+      queryParameters: {'limit': 20},
+    );
+    final root = _asMap(
+      resp.data,
+      context: '/api/admin/ops/notifications/center',
+    );
+    if (root['ok'] != true) {
+      throw Exception('/api/admin/ops/notifications/center: ok != true');
+    }
+    final data = _asMap(
+      root['data'],
+      context: '/api/admin/ops/notifications/center.data',
+    );
+    final summary = _asMap(data['summary'], context: 'notifications.summary');
+    final items = data['items'];
+    if (items is! List) {
+      throw Exception('notifications.items не массив');
+    }
+    return 'attention=${summary['total_attention'] ?? 0}, событий=${items.length}';
+  }
+
+  Future<String> _checkReturnsAnalytics() async {
+    final resp = await authService.dio.get(
+      '/api/admin/ops/returns/analytics',
+      queryParameters: {'days': 30, 'top_limit': 8},
+    );
+    final root = _asMap(resp.data, context: '/api/admin/ops/returns/analytics');
+    if (root['ok'] != true) {
+      throw Exception('/api/admin/ops/returns/analytics: ok != true');
+    }
+    final data = _asMap(
+      root['data'],
+      context: '/api/admin/ops/returns/analytics.data',
+    );
+    final summary = _asMap(data['summary'], context: 'returns.summary');
+    final totalClaims = summary['total_claims'] ?? 0;
+    final defectSum = summary['defect_sum'] ?? 0;
+    return 'заявок=$totalClaims, сумма брака=$defectSum ₽';
+  }
+
+  Future<String> _checkDiagnosticsCenter() async {
+    final role = (authService.effectiveRole).toLowerCase().trim();
+    if (role != 'creator') {
+      throw const _CriticalCheckSkip('Проверка доступна только создателю');
+    }
+    final resp = await authService.dio.get('/api/admin/ops/diagnostics/center');
+    final root = _asMap(
+      resp.data,
+      context: '/api/admin/ops/diagnostics/center',
+    );
+    if (root['ok'] != true) {
+      throw Exception('/api/admin/ops/diagnostics/center: ok != true');
+    }
+    final data = _asMap(
+      root['data'],
+      context: '/api/admin/ops/diagnostics/center.data',
+    );
+    final monitoring = _asMap(
+      data['monitoring'],
+      context: 'diagnostics.monitoring',
+    );
+    return 'critical=${monitoring['critical'] ?? 0}, error=${monitoring['error'] ?? 0}';
+  }
+
+  Future<void> _runCriticalChecks() async {
+    if (_criticalBusy) return;
+    final checks = <Map<String, dynamic>>[
+      {'id': 'profile_scope', 'runner': _checkProfileScope},
+      {'id': 'chats_main', 'runner': _checkChatsMainChannel},
+      {'id': 'direct_search', 'runner': _checkDirectSearch},
+      {'id': 'support_templates', 'runner': _checkSupportTemplates},
+      {'id': 'notifications_center', 'runner': _checkNotificationsCenter},
+      {'id': 'returns_analytics', 'runner': _checkReturnsAnalytics},
+      {'id': 'diagnostics_center', 'runner': _checkDiagnosticsCenter},
+    ];
+
+    setState(() {
+      _criticalBusy = true;
+      _criticalChecks = _criticalChecks
+          .map(
+            (item) => item.copyWith(
+              status: _CriticalCheckStatus.idle,
+              details: '',
+              durationMs: 0,
+            ),
+          )
+          .toList();
+    });
+
+    var passed = 0;
+    var failed = 0;
+    var skipped = 0;
+
+    for (final item in checks) {
+      if (!mounted) return;
+      final id = item['id'] as String;
+      final runner = item['runner'] as Future<String> Function();
+      _updateCriticalCheck(
+        id,
+        _CriticalCheckStatus.running,
+        details: 'Выполняется...',
+      );
+      final sw = Stopwatch()..start();
+      try {
+        final details = await runner();
+        sw.stop();
+        _updateCriticalCheck(
+          id,
+          _CriticalCheckStatus.passed,
+          details: details,
+          durationMs: sw.elapsedMilliseconds,
+        );
+        passed += 1;
+      } on _CriticalCheckSkip catch (skip) {
+        sw.stop();
+        _updateCriticalCheck(
+          id,
+          _CriticalCheckStatus.skipped,
+          details: skip.reason,
+          durationMs: sw.elapsedMilliseconds,
+        );
+        skipped += 1;
+      } catch (error) {
+        sw.stop();
+        _updateCriticalCheck(
+          id,
+          _CriticalCheckStatus.failed,
+          details: _safeError(error),
+          durationMs: sw.elapsedMilliseconds,
+        );
+        failed += 1;
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _criticalBusy = false;
+      _criticalLastRunAt = DateTime.now();
+    });
+
+    final total = checks.length;
+    final tone = failed > 0 ? AppNoticeTone.error : AppNoticeTone.success;
+    final summary =
+        'Критичные проверки: OK $passed, ошибок $failed, пропусков $skipped из $total';
+    showAppNotice(
+      context,
+      summary,
+      tone: tone,
+      duration: const Duration(seconds: 4),
+    );
   }
 
   Future<void> _testNotice(
@@ -325,6 +776,136 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     return Text(
       text,
       style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+    );
+  }
+
+  Widget _criticalChecksCard() {
+    final theme = Theme.of(context);
+    final compact = MediaQuery.of(context).size.width < 680;
+    final passed = _criticalChecks
+        .where((item) => item.status == _CriticalCheckStatus.passed)
+        .length;
+    final failed = _criticalChecks
+        .where((item) => item.status == _CriticalCheckStatus.failed)
+        .length;
+    final skipped = _criticalChecks
+        .where((item) => item.status == _CriticalCheckStatus.skipped)
+        .length;
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(compact ? 12 : 16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _criticalBusy ? null : _runCriticalChecks,
+                icon: Icon(
+                  _criticalBusy
+                      ? Icons.hourglass_top_rounded
+                      : Icons.fact_check_outlined,
+                ),
+                label: Text(
+                  _criticalBusy
+                      ? 'Проверяем...'
+                      : 'Запустить критичные проверки',
+                ),
+              ),
+              Text(
+                'OK $passed · Ошибок $failed · Пропусков $skipped',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          if (_criticalLastRunAt != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Последний прогон: ${_criticalLastRunAt!.hour.toString().padLeft(2, '0')}:${_criticalLastRunAt!.minute.toString().padLeft(2, '0')}:${_criticalLastRunAt!.second.toString().padLeft(2, '0')}',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+          if (_criticalBusy) ...[
+            const SizedBox(height: 10),
+            const LinearProgressIndicator(minHeight: 3),
+          ],
+          const SizedBox(height: 12),
+          ..._criticalChecks.map((check) {
+            final color = _criticalStatusColor(theme, check.status);
+            final detailText = check.details.trim().isEmpty
+                ? check.description
+                : check.details.trim();
+            return Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surface,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(top: 1),
+                    child: Icon(
+                      _criticalStatusIcon(check.status),
+                      size: 18,
+                      color: color,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          check.title,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          detailText,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    check.durationMs > 0
+                        ? '${_criticalStatusLabel(check.status)} · ${check.durationMs} ms'
+                        : _criticalStatusLabel(check.status),
+                    textAlign: TextAlign.right,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: color,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
     );
   }
 
@@ -772,6 +1353,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
             _sectionTitle('Публикация'),
             const SizedBox(height: 12),
             _demoPostsCard(),
+            const SizedBox(height: 24),
+            _sectionTitle('Критичные проверки'),
+            const SizedBox(height: 12),
+            _criticalChecksCard(),
             const SizedBox(height: 24),
             _sectionTitle('Операционный центр'),
             const SizedBox(height: 12),

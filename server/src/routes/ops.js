@@ -35,6 +35,7 @@ const MONEY_STATUSES = [
   'in_delivery',
   'delivered',
 ];
+const CART_RETENTION_WARNING_DAYS = 30;
 const ROLE_PERMISSION_MODULES = [
   { key: 'chat.read', title: 'Чтение чатов' },
   { key: 'chat.write.public', title: 'Писать в публичные каналы' },
@@ -110,6 +111,18 @@ function parsePositiveInt(raw, fallback, min, max) {
   if (!Number.isFinite(parsed)) return fallback;
   const normalized = Math.trunc(parsed);
   return Math.max(min, Math.min(max, normalized));
+}
+
+function phoneTail(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length < 4) return '';
+  return digits.slice(-4);
+}
+
+function shelfLabel(raw) {
+  const shelf = Number(raw);
+  if (!Number.isFinite(shelf) || shelf <= 0) return 'не назначена';
+  return String(Math.trunc(shelf));
 }
 
 function tenantFilterSql(alias = 'u', tenantParamIndex = 1) {
@@ -422,6 +435,10 @@ function mapOpsEventPriority({
   const normalizedType = String(type || '').trim();
   const normalizedStatus = String(status || '').trim();
   const discountDecision = String(customerDiscountStatus || '').trim();
+
+  if (normalizedType === 'cart_retention') {
+    return 'high';
+  }
 
   if (normalizedType === 'support_ticket') {
     if (normalizedStatus === 'open') return 'high';
@@ -1950,7 +1967,8 @@ router.get(
     const tenantId = req.user?.tenant_id || null;
     const limit = parsePositiveInt(req.query?.limit, 60, 10, 200);
 
-    const [supportSummaryQ, claimsSummaryQ, eventsQ] = await Promise.all([
+    const [supportSummaryQ, claimsSummaryQ, retentionSummaryQ, eventsQ, retentionEventsQ] =
+      await Promise.all([
       db.query(
         `SELECT COUNT(*) FILTER (WHERE status = 'open')::int AS support_open,
                 COUNT(*) FILTER (WHERE status = 'waiting_customer')::int AS support_waiting_customer,
@@ -1970,6 +1988,19 @@ router.get(
          FROM customer_claims
          WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
         [tenantId],
+      ),
+      db.query(
+        `SELECT COUNT(*)::int AS stale_carts
+         FROM (
+           SELECT c.user_id
+           FROM cart_items c
+           JOIN users u ON u.id = c.user_id
+           WHERE c.status IN ('pending_processing', 'processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
+             AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+           GROUP BY c.user_id
+           HAVING MIN(c.created_at) <= now() - make_interval(days => $2::int)
+         ) stale`,
+        [tenantId, CART_RETENTION_WARNING_DAYS],
       ),
       db.query(
         `SELECT events.*
@@ -2015,12 +2046,38 @@ router.get(
          ) events
          ORDER BY events.event_at DESC
          LIMIT $2::int`,
-        [tenantId, limit],
+        [tenantId, Math.max(limit * 2, 40)],
+      ),
+      db.query(
+        `SELECT c.user_id::text AS user_id,
+                MIN(c.created_at) AS oldest_created_at,
+                MAX(c.updated_at) AS latest_updated_at,
+                COUNT(*)::int AS items_count,
+                COALESCE(
+                  SUM((COALESCE(c.custom_price, p.price) * c.quantity)),
+                  0
+                )::numeric AS total_sum,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+                COALESCE(NULLIF(BTRIM(ph.phone), ''), '') AS customer_phone,
+                us.shelf_number
+         FROM cart_items c
+         JOIN users u ON u.id = c.user_id
+         JOIN products p ON p.id = c.product_id
+         LEFT JOIN phones ph ON ph.user_id = u.id
+         LEFT JOIN user_shelves us ON us.user_id = u.id
+         WHERE c.status IN ('pending_processing', 'processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
+           AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+         GROUP BY c.user_id, u.name, u.email, ph.phone, us.shelf_number
+         HAVING MIN(c.created_at) <= now() - make_interval(days => $2::int)
+         ORDER BY MIN(c.created_at) ASC
+         LIMIT $3::int`,
+        [tenantId, CART_RETENTION_WARNING_DAYS, Math.max(limit, 20)],
       ),
     ]);
 
     const supportSummary = supportSummaryQ.rows[0] || {};
     const claimsSummary = claimsSummaryQ.rows[0] || {};
+    const retentionSummary = retentionSummaryQ.rows[0] || {};
     const summary = {
       support_open: Number(supportSummary.support_open || 0),
       support_waiting_customer: Number(
@@ -2033,14 +2090,16 @@ router.get(
         claimsSummary.claims_discount_waiting_customer || 0,
       ),
       claims_rejected: Number(claimsSummary.claims_rejected || 0),
+      stale_carts: Number(retentionSummary.stale_carts || 0),
     };
     summary.total_attention =
       summary.support_open +
       summary.support_waiting_customer +
       summary.claims_pending +
-      summary.claims_discount_waiting_customer;
+      summary.claims_discount_waiting_customer +
+      summary.stale_carts;
 
-    const items = eventsQ.rows.map((row) => {
+    const baseItems = eventsQ.rows.map((row) => {
       const eventType = String(row.event_type || '').trim();
       const status = String(row.status || '').trim();
       const customerDiscountStatus = String(
@@ -2084,6 +2143,47 @@ router.get(
         event_at: row.event_at || null,
       };
     });
+    const retentionItems = retentionEventsQ.rows.map((row) => {
+      const oldestCreatedAt = row.oldest_created_at
+        ? new Date(row.oldest_created_at)
+        : null;
+      const daysHeld =
+        oldestCreatedAt && !Number.isNaN(oldestCreatedAt.getTime())
+          ? Math.max(
+              0,
+              Math.floor((Date.now() - oldestCreatedAt.getTime()) / (24 * 60 * 60 * 1000)),
+            )
+          : CART_RETENTION_WARNING_DAYS;
+      const tail = phoneTail(row.customer_phone);
+      const tailLabel = tail ? `••••${tail}` : 'номер не указан';
+      const shelf = shelfLabel(row.shelf_number);
+      const total = toMoney(row.total_sum);
+      return {
+        id: `cart-retention:${String(row.user_id || '')}`,
+        type: 'cart_retention',
+        type_label: 'Корзины',
+        status: 'stale',
+        status_label: 'Ожидает расформировки',
+        priority: mapOpsEventPriority({ type: 'cart_retention', status: 'stale' }),
+        title: `Расформировать корзину: ${String(row.customer_name || 'Клиент')}`,
+        subtitle: `Телефон ${tailLabel} · Полка ${shelf} · ${daysHeld} дн.`,
+        customer_name: String(row.customer_name || ''),
+        related_name: `Полка ${shelf}`,
+        claim_type: null,
+        claim_type_label: null,
+        amount: total,
+        created_at: row.oldest_created_at || null,
+        updated_at: row.latest_updated_at || null,
+        event_at: row.latest_updated_at || row.oldest_created_at || null,
+      };
+    });
+    const items = [...baseItems, ...retentionItems]
+      .sort((a, b) => {
+        const aTs = new Date(a.event_at || 0).getTime();
+        const bTs = new Date(b.event_at || 0).getTime();
+        return bTs - aTs;
+      })
+      .slice(0, limit);
 
     await insertAuditFromReq(req, {
       action: 'ops.notifications.center.view',

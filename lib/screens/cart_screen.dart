@@ -9,6 +9,8 @@ import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
 import '../utils/date_time_utils.dart';
+import '../widgets/adaptive_network_image.dart';
+import '../widgets/app_empty_state.dart';
 import '../widgets/phoenix_loader.dart';
 
 class CartScreen extends StatefulWidget {
@@ -28,6 +30,7 @@ class _CartScreenState extends State<CartScreen> {
   List<Map<String, dynamic>> _items = [];
   List<Map<String, dynamic>> _recentDeliveries = [];
   List<Map<String, dynamic>> _claims = [];
+  Map<String, dynamic>? _cartRetentionWarning;
   double _total = 0;
   double _processed = 0;
   double _claimsTotal = 0;
@@ -69,6 +72,10 @@ class _CartScreenState extends State<CartScreen> {
     _claims = payload['claims'] is List
         ? List<Map<String, dynamic>>.from(payload['claims'])
         : [];
+    _cartRetentionWarning =
+        payload['cart_retention_warning'] is Map
+        ? Map<String, dynamic>.from(payload['cart_retention_warning'])
+        : null;
     _total = (payload['total_sum'] is num)
         ? (payload['total_sum'] as num).toDouble()
         : double.tryParse('${payload['total_sum'] ?? 0}') ?? 0;
@@ -310,13 +317,16 @@ class _CartScreenState extends State<CartScreen> {
 
   Future<String?> _pickAndUploadClaimImage({required bool useCamera}) async {
     try {
+      final reducedMode = performanceModeNotifier.value;
+      final pickerQuality = reducedMode ? 72 : 88;
+      final pickerMaxWidth = reducedMode ? 1440.0 : 2200.0;
       if (!kIsWeb &&
           (defaultTargetPlatform == TargetPlatform.android ||
               defaultTargetPlatform == TargetPlatform.iOS)) {
         final picked = await _imagePicker.pickImage(
           source: useCamera ? ImageSource.camera : ImageSource.gallery,
-          imageQuality: 88,
-          maxWidth: 2200,
+          imageQuality: pickerQuality,
+          maxWidth: pickerMaxWidth,
         );
         if (picked == null) return null;
         final bytes = await picked.readAsBytes();
@@ -832,6 +842,37 @@ class _CartScreenState extends State<CartScreen> {
               style: TextStyle(color: secondaryColor, fontSize: 13),
             ),
           ],
+          if (_cartRetentionWarning != null &&
+              _cartRetentionWarning!['active'] == true) ...[
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: reducedVisuals
+                    ? theme.colorScheme.errorContainer.withValues(alpha: 0.5)
+                    : Colors.white.withValues(alpha: 0.16),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: reducedVisuals
+                      ? theme.colorScheme.error
+                      : Colors.white.withValues(alpha: 0.35),
+                ),
+              ),
+              child: Text(
+                (_cartRetentionWarning!['message'] ??
+                        'Корзина удерживается слишком долго и готовится к расформировке.')
+                    .toString(),
+                style: TextStyle(
+                  color: reducedVisuals
+                      ? theme.colorScheme.error
+                      : theme.colorScheme.onPrimary,
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -859,8 +900,10 @@ class _CartScreenState extends State<CartScreen> {
       child: SizedBox(
         width: 86,
         height: 86,
-        child: Image.network(
+        child: AdaptiveNetworkImage(
           imageUrl,
+          width: 86,
+          height: 86,
           fit: BoxFit.cover,
           errorBuilder: (_, error, stackTrace) => Container(
             color: theme.colorScheme.surfaceContainerHighest,
@@ -1194,16 +1237,15 @@ class _CartScreenState extends State<CartScreen> {
               ? ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
-                    Text(
-                      _error,
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.error,
+                    AppEmptyState(
+                      title: 'Не удалось загрузить корзину',
+                      subtitle: _error,
+                      icon: Icons.error_outline_rounded,
+                      action: FilledButton.icon(
+                        onPressed: _load,
+                        icon: const Icon(Icons.refresh_rounded),
+                        label: const Text('Повторить'),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    FilledButton(
-                      onPressed: _load,
-                      child: const Text('Повторить'),
                     ),
                   ],
                 )
@@ -1213,38 +1255,11 @@ class _CartScreenState extends State<CartScreen> {
                     _buildSummary(),
                     const SizedBox(height: 14),
                     if (!hasVisibleCartContent)
-                      Builder(
-                        builder: (context) {
-                          final theme = Theme.of(context);
-                          return Container(
-                            padding: const EdgeInsets.all(18),
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.surfaceContainerLow,
-                              borderRadius: BorderRadius.circular(18),
-                              border: Border.all(
-                                color: theme.colorScheme.outlineVariant,
-                              ),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.shopping_basket_outlined,
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Text(
-                                    'Корзина пока пустая',
-                                    style: theme.textTheme.bodyLarge?.copyWith(
-                                      color: theme.colorScheme.onSurface,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
+                      const AppEmptyState(
+                        title: 'Корзина пока пустая',
+                        subtitle:
+                            'Добавьте товар из канала, чтобы он появился здесь.',
+                        icon: Icons.shopping_basket_outlined,
                       )
                     else ...[
                       if (basketItems.isNotEmpty) ...[

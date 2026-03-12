@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../main.dart';
+import 'adaptive_network_image.dart';
 
 class AppAvatar extends StatelessWidget {
   final String title;
@@ -86,8 +87,10 @@ class AppAvatar extends StatelessWidget {
               focusX.clamp(-1.0, 1.0),
               focusY.clamp(-1.0, 1.0),
             ),
-            child: Image.network(
+            child: AdaptiveNetworkImage(
               normalizedImageUrl,
+              width: size,
+              height: size,
               fit: BoxFit.cover,
               alignment: Alignment(
                 focusX.clamp(-1.0, 1.0),

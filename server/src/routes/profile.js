@@ -171,6 +171,61 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+async function loadWorkerPostsByName(tenantId = null) {
+  const rowsQ = await pool.query(
+    `WITH worker_candidates AS (
+       SELECT u.id,
+              u.name,
+              u.email
+       FROM users u
+       WHERE ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+         AND (
+           COALESCE(NULLIF(BTRIM(lower(u.role)), ''), '') = 'worker'
+           OR EXISTS (
+             SELECT 1
+             FROM user_role_templates urt
+             JOIN role_templates rt ON rt.id = urt.template_id
+             WHERE urt.user_id = u.id
+               AND (
+                 COALESCE(NULLIF(BTRIM(lower(rt.code)), ''), '') = 'worker'
+                 OR COALESCE(rt.permissions->>'product.create', 'false') = 'true'
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM products pp
+             WHERE pp.created_by = u.id
+           )
+         )
+     )
+     SELECT wc.id::text AS worker_id,
+            COALESCE(NULLIF(BTRIM(wc.name), ''), NULLIF(BTRIM(wc.email), ''), 'Работник') AS worker_name,
+            COUNT(p.id) FILTER (
+              WHERE timezone($1, p.created_at) >= date_trunc('day', timezone($1, now()))
+            )::int AS posts_today,
+            COUNT(p.id) FILTER (
+              WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now()))
+            )::int AS posts_week,
+            COUNT(p.id) FILTER (
+              WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
+                AND timezone($1, p.created_at) < date_trunc('week', timezone($1, now()))
+            )::int AS posts_prev_week
+     FROM worker_candidates wc
+     LEFT JOIN products p ON p.created_by = wc.id
+     GROUP BY wc.id, wc.name, wc.email
+     ORDER BY posts_week DESC, posts_today DESC, worker_name ASC
+     LIMIT 40`,
+    [SAMARA_TZ, tenantId || null],
+  );
+  return rowsQ.rows.map((row) => ({
+    worker_id: String(row.worker_id || ''),
+    worker_name: String(row.worker_name || 'Работник'),
+    posts_today: toNumber(row.posts_today),
+    posts_week: toNumber(row.posts_week),
+    posts_prev_week: toNumber(row.posts_prev_week),
+  }));
+}
+
 async function loadClientStats(userId) {
   const result = await pool.query(
     `SELECT
@@ -281,7 +336,7 @@ async function loadWorkerStats(userId) {
   };
 }
 
-async function loadAdminStats(userId) {
+async function loadAdminStats(userId, tenantId = null) {
   const processedQ = await pool.query(
     `SELECT
        COALESCE(SUM(r.quantity) FILTER (
@@ -329,6 +384,7 @@ async function loadAdminStats(userId) {
   );
   const processed = processedQ.rows[0] || {};
   const deliveries = deliveriesQ.rows[0] || {};
+  const workerPostsByName = await loadWorkerPostsByName(tenantId);
   return {
     today: {
       processed: toNumber(processed.processed_today),
@@ -350,10 +406,11 @@ async function loadAdminStats(userId) {
       processed_amount: toNumber(processed.processed_amount_all_time),
       deliveries: toNumber(deliveries.deliveries_all_time),
     },
+    worker_posts_by_name: workerPostsByName,
   };
 }
 
-async function loadCreatorStats() {
+async function loadCreatorStats(tenantId = null) {
   const totalsQ = await pool.query(
     `SELECT
        COUNT(*) FILTER (
@@ -383,8 +440,9 @@ async function loadCreatorStats() {
        COUNT(*)::int AS posts_all_time
      FROM products p
      JOIN users u ON u.id = p.created_by
-     WHERE u.role = 'worker'`,
-    [SAMARA_TZ],
+     WHERE u.role = 'worker'
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)`,
+    [SAMARA_TZ, tenantId || null],
   );
   const processedQ = await pool.query(
     `SELECT
@@ -467,19 +525,20 @@ async function loadCreatorStats() {
       unprocessed_reservations: toNumber(live.unprocessed_reservations),
       active_delivery_clients: toNumber(live.active_delivery_clients),
     },
+    worker_posts_by_name: await loadWorkerPostsByName(tenantId),
   };
 }
 
-async function loadRoleStats(userId, role) {
+async function loadRoleStats(userId, role, tenantId = null) {
   switch (String(role || "").trim()) {
     case "worker":
       return { role: "worker", periods: await loadWorkerStats(userId) };
     case "admin":
-      return { role: "admin", periods: await loadAdminStats(userId) };
+      return { role: "admin", periods: await loadAdminStats(userId, tenantId) };
     case "tenant":
-      return { role: "tenant", periods: await loadAdminStats(userId) };
+      return { role: "tenant", periods: await loadAdminStats(userId, tenantId) };
     case "creator":
-      return { role: "creator", periods: await loadCreatorStats() };
+      return { role: "creator", periods: await loadCreatorStats(tenantId) };
     case "client":
     default:
       return { role: "client", periods: await loadClientStats(userId) };
@@ -489,7 +548,11 @@ async function loadRoleStats(userId, role) {
 router.get("/", authMiddleware, async (req, res) => {
   try {
     const user = await loadUserProfile(req.user.id);
-    const stats = await loadRoleStats(req.user.id, req.user.role);
+    const stats = await loadRoleStats(
+      req.user.id,
+      req.user.role,
+      req.user?.tenant_id || null,
+    );
     const resolvedPermissions = await resolvePermissionSet(req.user, pool);
 
     if (!user) {

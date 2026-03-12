@@ -472,6 +472,7 @@ class AuthService {
     required String password,
     String? accessKey,
     String? otpCode,
+    bool trustDevice = false,
   }) async {
     debugPrint('🔓 login called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
@@ -502,7 +503,8 @@ class AuthService {
           'otp_code': otpCode.trim(),
         if (tenantCode != null && tenantCode.trim().isNotEmpty)
           'tenant_code': tenantCode.trim(),
-        if (fingerprint != null) 'device_fingerprint': fingerprint,
+        'device_fingerprint': fingerprint,
+        if (trustDevice) 'trust_device': true,
       },
     );
     debugPrint('📬 login response received, status: ${resp.statusCode}');
@@ -537,14 +539,19 @@ class AuthService {
     throw Exception('Сервер не вернул данные для настройки 2FA');
   }
 
-  Future<void> confirmTwoFactorSetup({
+  Future<Map<String, dynamic>> confirmTwoFactorSetup({
     required String secret,
     required String code,
   }) async {
-    await dio.post(
+    final resp = await dio.post(
       '/api/auth/2fa/setup/confirm',
       data: {'secret': secret.trim(), 'code': code.trim()},
     );
+    final data = resp.data;
+    if (data is Map && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data']);
+    }
+    return const <String, dynamic>{};
   }
 
   Future<void> disableTwoFactor({
@@ -555,6 +562,47 @@ class AuthService {
       '/api/auth/2fa/disable',
       data: {'password': password, 'code': code.trim()},
     );
+  }
+
+  Future<Map<String, dynamic>> regenerateTwoFactorBackupCodes({
+    required String password,
+    required String code,
+  }) async {
+    final resp = await dio.post(
+      '/api/auth/2fa/backup-codes/regenerate',
+      data: {'password': password, 'code': code.trim()},
+    );
+    final data = resp.data;
+    if (data is Map && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data']);
+    }
+    return const <String, dynamic>{};
+  }
+
+  Future<List<Map<String, dynamic>>> listTrustedTwoFactorDevices() async {
+    final resp = await dio.get('/api/auth/2fa/trusted-devices');
+    final data = resp.data;
+    if (data is Map && data['data'] is List) {
+      return data['data']
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .toList();
+    }
+    return const [];
+  }
+
+  Future<void> revokeTrustedTwoFactorDevice(String id) async {
+    await dio.delete('/api/auth/2fa/trusted-devices/$id');
+  }
+
+  Future<int> revokeAllTrustedTwoFactorDevices() async {
+    final resp = await dio.post('/api/auth/2fa/trusted-devices/revoke_all');
+    final data = resp.data;
+    if (data is Map && data['data'] is Map) {
+      final revoked = data['data']['revoked'];
+      return int.tryParse('$revoked') ?? 0;
+    }
+    return 0;
   }
 
   /// Регистрация (полная: email+password+name+phone + optional secret)
@@ -578,10 +626,10 @@ class AuthService {
           'access_key': accessKey.trim(),
         if (tenantCode != null && tenantCode.trim().isNotEmpty)
           'tenant_code': tenantCode.trim(),
-        if (name != null) 'name': name,
-        if (phone != null) 'phone': phone,
-        if (secret != null) 'secret': secret,
-        if (fingerprint != null) 'device_fingerprint': fingerprint,
+        'name': name,
+        'phone': phone,
+        'secret': secret,
+        'device_fingerprint': fingerprint,
       },
     );
     debugPrint('📬 register response received, status: ${resp.statusCode}');
@@ -632,8 +680,8 @@ class AuthService {
           'tenant_code': tenantCode.trim(),
         'name': name,
         'phone': phone,
-        if (secret != null) 'secret': secret,
-        if (fingerprint != null) 'device_fingerprint': fingerprint,
+        'secret': secret,
+        'device_fingerprint': fingerprint,
       },
     );
 

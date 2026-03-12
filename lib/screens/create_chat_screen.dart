@@ -97,25 +97,21 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
               onSubmitted: (_) => _create(),
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: RadioListTile<String>(
-                    value: 'public',
-                    groupValue: _type,
-                    title: const Text('Публичный'),
-                    onChanged: (v) => setState(() => _type = v ?? 'public'),
-                  ),
-                ),
-                Expanded(
-                  child: RadioListTile<String>(
-                    value: 'private',
-                    groupValue: _type,
-                    title: const Text('Приватный'),
-                    onChanged: (v) => setState(() => _type = v ?? 'private'),
-                  ),
-                ),
+            DropdownButtonFormField<String>(
+              key: ValueKey<String>('chat-type-$_type'),
+              initialValue: _type,
+              items: const [
+                DropdownMenuItem(value: 'public', child: Text('Публичный')),
+                DropdownMenuItem(value: 'private', child: Text('Приватный')),
               ],
+              onChanged: (v) {
+                if (v == null) return;
+                setState(() => _type = v);
+              },
+              decoration: const InputDecoration(
+                labelText: 'Тип чата',
+                border: OutlineInputBorder(),
+              ),
             ),
             if (_error.isNotEmpty) ...[
               const SizedBox(height: 8),

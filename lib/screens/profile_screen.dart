@@ -1025,6 +1025,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final month = _statsMap(stats['month']);
     final allTime = _statsMap(stats['all_time']);
     final live = _statsMap(stats['live']);
+    final workerPostsByName = stats['worker_posts_by_name'] is List
+        ? List<Map<String, dynamic>>.from(stats['worker_posts_by_name'])
+        : const <Map<String, dynamic>>[];
 
     Widget buildClientCard(String title, Map<String, dynamic> data) {
       return _periodCard(
@@ -1102,6 +1105,38 @@ class _ProfileScreenState extends State<ProfileScreen> {
       }
     }
 
+    Widget buildWorkerPostsByNameCard() {
+      if (workerPostsByName.isEmpty) {
+        return _periodCard(
+          title: 'Посты рабочих',
+          children: [
+            Text(
+              'Пока нет данных по рабочим за выбранные периоды.',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        );
+      }
+      return _periodCard(
+        title: 'Посты рабочих',
+        children: workerPostsByName.take(12).map((row) {
+          final name = (row['worker_name'] ?? 'Работник').toString().trim();
+          final todayPosts = '${row['posts_today'] ?? 0}';
+          final weekPosts = '${row['posts_week'] ?? 0}';
+          final prevWeekPosts = '${row['posts_prev_week'] ?? 0}';
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _statsMetricRow(
+              name.isEmpty ? 'Работник' : name,
+              'Сегодня $todayPosts • Неделя $weekPosts • Прошлая $prevWeekPosts',
+            ),
+          );
+        }).toList(),
+      );
+    }
+
     return _sectionCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1175,6 +1210,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                     ],
                   ),
+                ],
+                if (effectiveRole == 'admin' ||
+                    effectiveRole == 'tenant' ||
+                    effectiveRole == 'creator') ...[
+                  const SizedBox(height: 12),
+                  buildWorkerPostsByNameCard(),
                 ],
               ],
             ),

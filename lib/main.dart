@@ -211,12 +211,14 @@ Widget _wrapAppRoot(BuildContext context, Widget child) {
 void _applyPerformanceRuntimeTuning(bool enabled) {
   final cache = PaintingBinding.instance.imageCache;
   if (enabled) {
-    cache.maximumSizeBytes = 32 * 1024 * 1024;
-    cache.maximumSize = 220;
+    cache.maximumSizeBytes = 24 * 1024 * 1024;
+    cache.maximumSize = 160;
+    cache.clearLiveImages();
+    cache.clear();
     return;
   }
-  cache.maximumSizeBytes = 100 * 1024 * 1024;
-  cache.maximumSize = 1000;
+  cache.maximumSizeBytes = 110 * 1024 * 1024;
+  cache.maximumSize = 1200;
 }
 
 Future<void> refreshUserPreferences() async {

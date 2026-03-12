@@ -16,6 +16,7 @@ import 'package:record/record.dart';
 import '../main.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
+import '../widgets/adaptive_network_image.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
 import '../widgets/submit_on_enter.dart';
@@ -890,7 +891,7 @@ class _ChatScreenState extends State<ChatScreen> {
               maxScale: 4,
               child: AspectRatio(
                 aspectRatio: 1,
-                child: Image.network(
+                child: AdaptiveNetworkImage(
                   imageUrl,
                   fit: BoxFit.contain,
                   errorBuilder: (_, error, stackTrace) => Container(
@@ -940,6 +941,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<_ChatUploadFile?> _pickImageUpload(ImageSource source) async {
+    final reducedMode = performanceModeNotifier.value;
+    final pickerQuality = reducedMode ? 72 : 88;
+    final pickerMaxWidth = reducedMode ? 1440.0 : 2200.0;
     if (source == ImageSource.gallery && _preferFilePickerForImages) {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.image,
@@ -966,8 +970,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final picked = await _imagePicker.pickImage(
       source: source,
-      imageQuality: 88,
-      maxWidth: 2200,
+      imageQuality: pickerQuality,
+      maxWidth: pickerMaxWidth,
     );
     if (picked == null) return null;
     if (kIsWeb) {
@@ -2755,8 +2759,9 @@ class _ChatScreenState extends State<ChatScreen> {
             width: width ?? 240,
             child: AspectRatio(
               aspectRatio: 4 / 3,
-              child: Image.network(
+              child: AdaptiveNetworkImage(
                 imageUrl,
+                width: width ?? 240,
                 fit: BoxFit.cover,
                 errorBuilder: (_, error, stackTrace) => Container(
                   color: theme.colorScheme.surfaceContainerHighest,

@@ -15,6 +15,9 @@ class CreatorKeysScreen extends StatefulWidget {
 
 class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   static const String _platformCreatorEmail = 'zerotwo02166@gmail.com';
+  static final RegExp _tenantAccessKeyTemplateRegExp = RegExp(
+    r'^[A-Z]{3}-[A-Z]{3,24}-KEY$',
+  );
 
   final _tenantNameCtrl = TextEditingController();
   final _tenantNotesCtrl = TextEditingController();
@@ -69,6 +72,28 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       return e.message ?? 'Ошибка запроса';
     }
     return e.toString();
+  }
+
+  String _normalizeTenantAccessKeyDraft(String raw) {
+    final upper = raw.toUpperCase().trim();
+    if (upper.isEmpty) return '';
+    final lettersOnly = upper.replaceAll(RegExp(r'[^A-Z]'), '');
+    if (lettersOnly.length >= 9 && lettersOnly.endsWith('KEY')) {
+      final prefix = lettersOnly.substring(0, 3);
+      final middle = lettersOnly.substring(3, lettersOnly.length - 3);
+      final isPrefixValid = RegExp(r'^[A-Z]{3}$').hasMatch(prefix);
+      final isMiddleValid = RegExp(r'^[A-Z]{3,24}$').hasMatch(middle);
+      if (isPrefixValid && isMiddleValid) {
+        return '$prefix-$middle-KEY';
+      }
+    }
+    return upper.replaceAll(RegExp(r'[^A-Z-]'), '');
+  }
+
+  String _visibleKeyMask(Object? raw) {
+    final value = (raw ?? '').toString().trim();
+    if (value.isEmpty) return '—';
+    return value;
   }
 
   int _tenantMonthsOrDefault() {
@@ -311,6 +336,114 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     }
   }
 
+  Future<void> _changeTenantAccessKey(
+    String tenantId,
+    String tenantName,
+    String currentMask,
+  ) async {
+    final keyCtrl = TextEditingController();
+    final nextKey = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        String errorText = '';
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: const Text('Изменить ключ арендатора'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Арендатор: ${tenantName.isEmpty ? 'Без названия' : tenantName}',
+                ),
+                const SizedBox(height: 4),
+                Text('Текущая маска: $currentMask'),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: keyCtrl,
+                  textCapitalization: TextCapitalization.characters,
+                  decoration: withInputLanguageBadge(
+                    InputDecoration(
+                      labelText: 'Новый ключ',
+                      hintText: 'PHX-ZERROR-KEY',
+                      border: const OutlineInputBorder(),
+                      errorText: errorText.isEmpty ? null : errorText,
+                    ),
+                    controller: keyCtrl,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Шаблон: (PHX)(ZERROR)(KEY)\nПервые 3 буквы + несколько букв + обязательный KEY в конце.',
+                  style: TextStyle(
+                    color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Отмена'),
+              ),
+              FilledButton.tonal(
+                onPressed: () {
+                  final normalized = _normalizeTenantAccessKeyDraft(
+                    keyCtrl.text,
+                  );
+                  if (normalized.isEmpty) {
+                    setDialogState(() => errorText = 'Введите ключ по шаблону');
+                    return;
+                  }
+                  if (!_tenantAccessKeyTemplateRegExp.hasMatch(normalized)) {
+                    setDialogState(
+                      () => errorText = 'Формат должен быть XXX-XXXXXXX-KEY',
+                    );
+                    return;
+                  }
+                  Navigator.pop(ctx, normalized);
+                },
+                child: const Text('Сохранить'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    keyCtrl.dispose();
+    if (nextKey == null) return;
+
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    try {
+      final payload = <String, dynamic>{'access_key': nextKey};
+      final resp = await authService.dio.patch(
+        '/api/admin/tenants/$tenantId/access-key',
+        data: payload,
+        options: _creatorRequestOptions(),
+      );
+      final data = resp.data;
+      final newKey = data is Map && data['data'] is Map
+          ? (data['data']['access_key'] ?? '').toString()
+          : '';
+      if (!mounted) return;
+      setState(() {
+        _lastGeneratedTenantKey = newKey;
+        _message = newKey.isNotEmpty
+            ? 'Ключ арендатора обновлен'
+            : 'Ключ обновлен, но значение не получено';
+      });
+      await _loadTenants(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка смены ключа: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+  }
+
   Widget _tenantCreateCard() {
     return Card(
       child: Padding(
@@ -436,8 +569,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         final name = (tenant['name'] ?? '').toString();
         final code = (tenant['code'] ?? '').toString();
         final status = (tenant['status'] ?? '').toString();
-        final keyMask = (tenant['access_key_mask'] ?? '—').toString();
-        final isProtected = code.toLowerCase().trim() == 'default';
+        final keyMask = _visibleKeyMask(tenant['access_key_mask']);
         final subscription = formatDateTimeValue(
           tenant['subscription_expires_at'],
           fallback: '',
@@ -521,11 +653,18 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       label: Text(isActive ? 'Отключить' : 'Активировать'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _tenantActionLoading || isProtected
+                      onPressed: _tenantActionLoading
+                          ? null
+                          : () => _changeTenantAccessKey(id, name, keyMask),
+                      icon: const Icon(Icons.key_outlined),
+                      label: const Text('Изменить ключ'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _tenantActionLoading
                           ? null
                           : () => _deleteTenant(id, name),
                       icon: const Icon(Icons.delete_outline),
-                      label: Text(isProtected ? 'Системный' : 'Удалить'),
+                      label: const Text('Удалить'),
                     ),
                   ],
                 ),
