@@ -17,6 +17,7 @@ const {
   generateTenantCode,
   hashAccessKey,
   maskAccessKey,
+  normalizeAccessKey,
   normalizeInviteCode,
 } = require("../utils/tenants");
 const {
@@ -36,6 +37,7 @@ const requireReservationFulfillPermission = requirePermission(
 );
 const PUBLISH_POST_INTERVAL_MS = 3000;
 const SAMARA_TZ = "Europe/Samara";
+const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z]{3,24}-KEY$/;
 
 const channelUploadsDir = path.resolve(
   __dirname,
@@ -745,7 +747,7 @@ router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => 
       .trim()
       .toLowerCase() === "1";
     const result = await db.platformQuery(
-      `SELECT id, code, name, status, access_key_mask,
+      `SELECT id, code, name, status, COALESCE(access_key_mask, '—') AS access_key_mask,
               subscription_expires_at, last_payment_confirmed_at, notes,
               db_mode, db_name, is_deleted,
               created_at, updated_at
@@ -1025,6 +1027,74 @@ router.patch(
   },
 );
 
+router.patch(
+  "/tenants/:tenantId/access-key",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = String(req.params?.tenantId || "").trim();
+    if (!isUuidLike(tenantId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
+    }
+
+    const generate = req.body?.generate === true;
+    let accessKey = generate
+      ? generateAccessKey()
+      : normalizeTenantAccessKeyInput(req.body?.access_key || "");
+    if (!accessKey) {
+      return res.status(400).json({
+        ok: false,
+        error: "Укажите новый ключ арендатора или включите авто-генерацию",
+      });
+    }
+    if (!TENANT_ACCESS_KEY_PATTERN.test(accessKey)) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Ключ должен быть в формате XXX-XXXXXXX-KEY (первые 3 буквы, затем буквы, в конце KEY)",
+      });
+    }
+
+    try {
+      const tenant = await getTenantById(tenantId);
+      if (!tenant || tenant.is_deleted === true) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+
+      const updated = await db.platformQuery(
+        `UPDATE tenants
+         SET access_key_hash = $1,
+             access_key_mask = $2,
+             updated_at = now()
+         WHERE id = $3
+           AND COALESCE(is_deleted, false) = false
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
+        [hashAccessKey(accessKey), maskAccessKey(accessKey), tenantId],
+      );
+      if (updated.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      return res.json({
+        ok: true,
+        data: {
+          ...updated.rows[0],
+          access_key: accessKey,
+        },
+      });
+    } catch (err) {
+      console.error("admin.tenants.updateAccessKey error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 router.delete(
   "/tenants/:tenantId",
   requireAuth,
@@ -1048,12 +1118,6 @@ router.delete(
         return res.status(404).json({
           ok: false,
           error: "Арендатор уже удален",
-        });
-      }
-      if (isProtectedTenantCode(tenant.code)) {
-        return res.status(403).json({
-          ok: false,
-          error: "Системного арендатора default нельзя удалять",
         });
       }
       const archived = await db.platformQuery(
@@ -1092,6 +1156,20 @@ function parseNullablePositiveInt(raw, { min = 1, max = 100000 } = {}) {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return null;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function normalizeTenantAccessKeyInput(raw) {
+  const normalized = normalizeAccessKey(raw);
+  if (!normalized) return "";
+  const lettersOnly = normalized.replace(/[^A-Z]/g, "");
+  if (lettersOnly.length >= 9 && lettersOnly.endsWith("KEY")) {
+    const prefix = lettersOnly.slice(0, 3);
+    const middle = lettersOnly.slice(3, -3);
+    if (/^[A-Z]{3}$/.test(prefix) && /^[A-Z]{3,24}$/.test(middle)) {
+      return `${prefix}-${middle}-KEY`;
+    }
+  }
+  return normalized.slice(0, 64);
 }
 
 async function resolveTargetTenantForInvite(req) {

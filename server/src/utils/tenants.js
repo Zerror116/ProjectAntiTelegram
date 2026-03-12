@@ -96,10 +96,12 @@ function generateTenantCode(name) {
 }
 
 function generateAccessKey() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const chunk = () =>
-    Array.from({ length: 4 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
-  return `PHX-${chunk()}-${chunk()}-${chunk()}`;
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const middle = Array.from(
+    { length: 7 },
+    () => alphabet[Math.floor(Math.random() * alphabet.length)],
+  ).join("");
+  return `PHX-${middle}-KEY`;
 }
 
 function generateInviteCode() {

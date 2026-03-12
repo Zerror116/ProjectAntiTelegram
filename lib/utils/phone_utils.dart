@@ -26,7 +26,10 @@ class PhoneUtils {
     if (digits.isEmpty) return false;
     // допустимы 10 (например 9991714551) или 11 (89991714551 или 79991714551)
     if (digits.length == 10) return true;
-    if (digits.length == 11 && (digits.startsWith('7') || digits.startsWith('8'))) return true;
+    if (digits.length == 11 &&
+        (digits.startsWith('7') || digits.startsWith('8'))) {
+      return true;
+    }
     return false;
   }
 
@@ -44,7 +47,7 @@ class PhoneUtils {
     }
     if (digits.length == 11) {
       if (digits.startsWith('8')) {
-        return '+7' + digits.substring(1);
+        return '+7${digits.substring(1)}';
       }
       if (digits.startsWith('7')) {
         return '+$digits';
@@ -66,7 +69,7 @@ class PhoneUtils {
     }
     if (digits.length == 11) {
       if (digits.startsWith('8')) return digits;
-      if (digits.startsWith('7')) return '8' + digits.substring(1);
+      if (digits.startsWith('7')) return '8${digits.substring(1)}';
     }
     return '';
   }

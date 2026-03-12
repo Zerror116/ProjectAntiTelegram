@@ -18,7 +18,7 @@ Future<String> generateDeviceFingerprint() async {
 
   final di = DeviceInfoPlugin();
   final info = await di.deviceInfo;
-  final infoMap = info.toMap();
+  final infoMap = info.data;
 
   // Собираем набор полей, которые обычно присутствуют на разных платформах.
   // Не используем поля, которые могут содержать чувствительную информацию.

@@ -26,6 +26,7 @@ class _AuthScreenState extends State<AuthScreen> {
   String _message = '';
   bool _isRegister = false;
   bool _requiresTwoFactor = false;
+  bool _trustDeviceFor30Days = true;
 
   late final AuthService _authService;
 
@@ -229,6 +230,7 @@ class _AuthScreenState extends State<AuthScreen> {
           email: email,
           password: password,
           otpCode: _requiresTwoFactor ? _otpController.text.trim() : null,
+          trustDevice: _requiresTwoFactor ? _trustDeviceFor30Days : false,
         );
         _requiresTwoFactor = false;
       }
@@ -282,9 +284,12 @@ class _AuthScreenState extends State<AuthScreen> {
           bodyMap?['twoFactorRequired'] == true;
       if (twoFactorRequired) {
         _otpController.clear();
-        setState(() => _requiresTwoFactor = true);
+        setState(() {
+          _requiresTwoFactor = true;
+          _trustDeviceFor30Days = true;
+        });
         friendly =
-            'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator.';
+            'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator или резервный код.';
       } else if (status == 401 || status == 403) {
         friendly = 'Неверный email, пароль или код подтверждения';
       } else if (e.type == DioExceptionType.connectionTimeout ||
@@ -356,20 +361,42 @@ class _AuthScreenState extends State<AuthScreen> {
                       decoration: withInputLanguageBadge(
                         const InputDecoration(
                           labelText: 'Код 2FA',
-                          hintText: '6 цифр из Google Authenticator',
+                          hintText: '6 цифр или резервный код (ABCD-EFGH)',
                         ),
                         controller: _otpController,
                       ),
-                      keyboardType: TextInputType.number,
+                      keyboardType: TextInputType.text,
                       validator: (v) {
                         if (!_requiresTwoFactor) return null;
-                        final value = (v ?? '').replaceAll(RegExp(r'\s+'), '');
+                        final value = (v ?? '').trim();
+                        final digitsOnly = value.replaceAll(RegExp(r'\s+'), '');
+                        final backupNormalized = value.toUpperCase().replaceAll(
+                          RegExp(r'[^A-Z0-9]'),
+                          '',
+                        );
                         if (value.isEmpty) return 'Введите код 2FA';
-                        if (!RegExp(r'^\d{6}$').hasMatch(value)) {
-                          return 'Код должен состоять из 6 цифр';
+                        final isTotp = RegExp(r'^\d{6}$').hasMatch(digitsOnly);
+                        final isBackup = RegExp(
+                          r'^[A-Z0-9]{8}$',
+                        ).hasMatch(backupNormalized);
+                        if (!isTotp && !isBackup) {
+                          return 'Введите 6 цифр или резервный код ABCD-EFGH';
                         }
                         return null;
                       },
+                    ),
+                    const SizedBox(height: 8),
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: _trustDeviceFor30Days,
+                      onChanged: (value) {
+                        setState(() => _trustDeviceFor30Days = value == true);
+                      },
+                      title: const Text('Доверять устройству 30 дней'),
+                      subtitle: const Text(
+                        'На этом устройстве не будем спрашивать 2FA-код при следующем входе',
+                      ),
                     ),
                   ],
                   const SizedBox(height: 12),
@@ -429,6 +456,7 @@ class _AuthScreenState extends State<AuthScreen> {
                     _isRegister = !_isRegister;
                     _message = '';
                     _requiresTwoFactor = false;
+                    _trustDeviceFor30Days = true;
                     _otpController.clear();
                   }),
                   child: Text(_isRegister ? 'Войти' : 'Зарегистрироваться'),

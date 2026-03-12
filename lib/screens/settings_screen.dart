@@ -22,6 +22,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _twoFactorEnabled = false;
   bool _twoFactorLoading = false;
   String? _twoFactorEnabledAt;
+  int _twoFactorBackupCodesRemaining = 0;
+  int _twoFactorTrustedDevicesCount = 0;
   late final VoidCallback _notificationsListener;
   late final VoidCallback _themeListener;
   late final VoidCallback _performanceModeListener;
@@ -130,6 +132,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() {
         _twoFactorEnabled = data['enabled'] == true;
         _twoFactorEnabledAt = data['enabled_at']?.toString();
+        _twoFactorBackupCodesRemaining =
+            int.tryParse('${data['backup_codes_remaining'] ?? 0}') ?? 0;
+        _twoFactorTrustedDevicesCount =
+            int.tryParse('${data['trusted_devices_count'] ?? 0}') ?? 0;
       });
     } catch (e) {
       if (!silent && mounted) {
@@ -166,6 +172,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
 
       final codeCtrl = TextEditingController();
+      List<String> backupCodesGenerated = const [];
       String localError = '';
       bool saving = false;
       final enabled = await showDialog<bool>(
@@ -184,10 +191,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   localError = '';
                 });
                 try {
-                  await authService.confirmTwoFactorSetup(
+                  final result = await authService.confirmTwoFactorSetup(
                     secret: secret,
                     code: code,
                   );
+                  final rawCodes = result['backup_codes'];
+                  if (rawCodes is List) {
+                    backupCodesGenerated = rawCodes
+                        .map((item) => item.toString().trim())
+                        .where((item) => item.isNotEmpty)
+                        .toList();
+                  }
                   if (!dialogContext.mounted) return;
                   Navigator.of(dialogContext).pop(true);
                 } catch (e) {
@@ -293,6 +307,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await _loadTwoFactorStatus();
       if (enabled == true && mounted) {
         showAppNotice(context, '2FA включена', tone: AppNoticeTone.success);
+        if (backupCodesGenerated.isNotEmpty) {
+          await _showBackupCodesDialog(backupCodesGenerated);
+          if (mounted) {
+            showAppNotice(
+              context,
+              'Сохраните резервные коды в безопасном месте',
+              tone: AppNoticeTone.warning,
+            );
+          }
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -305,6 +329,329 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } finally {
       if (mounted) setState(() => _twoFactorLoading = false);
     }
+  }
+
+  Future<void> _showBackupCodesDialog(List<String> codes) async {
+    if (!mounted || codes.isEmpty) return;
+    final printable = codes.join('\n');
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Резервные коды 2FA'),
+          content: SizedBox(
+            width: 420,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Каждый код одноразовый. Сохраните их в безопасном месте.',
+                  ),
+                  const SizedBox(height: 12),
+                  SelectableText(printable),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: printable));
+                if (!dialogContext.mounted) return;
+                showAppNotice(
+                  dialogContext,
+                  'Резервные коды скопированы',
+                  tone: AppNoticeTone.info,
+                );
+              },
+              child: const Text('Копировать'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Закрыть'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<List<String>?> _showRegenerateBackupCodesDialog() async {
+    final passCtrl = TextEditingController();
+    final codeCtrl = TextEditingController();
+    String localError = '';
+    bool saving = false;
+    List<String>? generated;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> submit() async {
+              final password = passCtrl.text;
+              final code = codeCtrl.text.replaceAll(RegExp(r'\s+'), '');
+              if (password.isEmpty) {
+                setDialogState(() => localError = 'Введите пароль');
+                return;
+              }
+              if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+                setDialogState(() => localError = 'Введите 6-значный код 2FA');
+                return;
+              }
+              setDialogState(() {
+                saving = true;
+                localError = '';
+              });
+              try {
+                final result = await authService.regenerateTwoFactorBackupCodes(
+                  password: password,
+                  code: code,
+                );
+                final rawCodes = result['backup_codes'];
+                generated = rawCodes is List
+                    ? rawCodes
+                          .map((item) => item.toString().trim())
+                          .where((item) => item.isNotEmpty)
+                          .toList()
+                    : <String>[];
+                if (!dialogContext.mounted) return;
+                Navigator.of(dialogContext).pop();
+              } catch (e) {
+                setDialogState(() {
+                  localError = _extractDioMessage(
+                    e,
+                    fallback: 'Не удалось сгенерировать резервные коды',
+                  );
+                  saving = false;
+                });
+              }
+            }
+
+            return AlertDialog(
+              title: const Text('Новые резервные коды'),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: passCtrl,
+                      obscureText: true,
+                      decoration: const InputDecoration(labelText: 'Пароль'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: codeCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Код 2FA',
+                        hintText: '6 цифр',
+                      ),
+                    ),
+                    if (localError.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          localError,
+                          style: const TextStyle(color: Colors.red),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: saving
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Отмена'),
+                ),
+                ElevatedButton(
+                  onPressed: saving ? null : submit,
+                  child: saving
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Сгенерировать'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    passCtrl.dispose();
+    codeCtrl.dispose();
+    return generated;
+  }
+
+  Future<void> _openTwoFactorRecoveryCenter() async {
+    if (_twoFactorLoading || !_twoFactorEnabled) return;
+    setState(() => _twoFactorLoading = true);
+    List<Map<String, dynamic>> devices = const [];
+    try {
+      devices = await authService.listTrustedTwoFactorDevices();
+    } catch (e) {
+      if (mounted) {
+        showAppNotice(
+          context,
+          _extractDioMessage(e),
+          tone: AppNoticeTone.error,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _twoFactorLoading = false);
+    }
+    if (!mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        var localDevices = List<Map<String, dynamic>>.from(devices);
+        var actionBusy = false;
+        var localError = '';
+
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> revokeOne(String id) async {
+              if (actionBusy) return;
+              setDialogState(() {
+                actionBusy = true;
+                localError = '';
+              });
+              try {
+                await authService.revokeTrustedTwoFactorDevice(id);
+                localDevices.removeWhere((row) => '${row['id']}' == id);
+                await _loadTwoFactorStatus();
+              } catch (e) {
+                setDialogState(() {
+                  localError = _extractDioMessage(e);
+                });
+              } finally {
+                setDialogState(() => actionBusy = false);
+              }
+            }
+
+            Future<void> revokeAll() async {
+              if (actionBusy) return;
+              setDialogState(() {
+                actionBusy = true;
+                localError = '';
+              });
+              try {
+                await authService.revokeAllTrustedTwoFactorDevices();
+                localDevices = [];
+                await _loadTwoFactorStatus();
+              } catch (e) {
+                setDialogState(() {
+                  localError = _extractDioMessage(e);
+                });
+              } finally {
+                setDialogState(() => actionBusy = false);
+              }
+            }
+
+            Future<void> regenerateCodes() async {
+              if (actionBusy) return;
+              final codes = await _showRegenerateBackupCodesDialog();
+              if (codes == null || codes.isEmpty) return;
+              if (!dialogContext.mounted) return;
+              await _showBackupCodesDialog(codes);
+              await _loadTwoFactorStatus();
+            }
+
+            return AlertDialog(
+              title: const Text('2FA: коды и устройства'),
+              content: SizedBox(
+                width: 520,
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'Резервных кодов осталось: $_twoFactorBackupCodesRemaining',
+                      ),
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: actionBusy ? null : regenerateCodes,
+                        icon: const Icon(Icons.refresh_rounded),
+                        label: const Text('Перегенерировать резервные коды'),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'Доверенные устройства: ${localDevices.length}',
+                              style: Theme.of(context).textTheme.titleSmall,
+                            ),
+                          ),
+                          if (localDevices.isNotEmpty)
+                            TextButton(
+                              onPressed: actionBusy ? null : revokeAll,
+                              child: const Text('Отозвать все'),
+                            ),
+                        ],
+                      ),
+                      if (localDevices.isEmpty)
+                        const Text('Нет активных доверенных устройств')
+                      else
+                        ...localDevices.map((device) {
+                          final id = '${device['id']}';
+                          final mask = (device['fingerprint_mask'] ?? 'unknown')
+                              .toString();
+                          final trustedUntil = (device['trusted_until'] ?? '')
+                              .toString();
+                          final lastSeen = (device['last_seen'] ?? '')
+                              .toString();
+                          return ListTile(
+                            dense: true,
+                            contentPadding: EdgeInsets.zero,
+                            leading: const Icon(Icons.devices_outlined),
+                            title: Text(mask),
+                            subtitle: Text(
+                              'До: ${trustedUntil.isEmpty ? '—' : trustedUntil}\nПоследняя активность: ${lastSeen.isEmpty ? '—' : lastSeen}',
+                            ),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.link_off_rounded),
+                              onPressed: actionBusy
+                                  ? null
+                                  : () => revokeOne(id),
+                            ),
+                          );
+                        }),
+                      if (localError.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            localError,
+                            style: const TextStyle(color: Colors.red),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: actionBusy
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Закрыть'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _showDisableTwoFactorDialog() async {
@@ -489,6 +836,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             : Icons.lock_open_rounded,
                       ),
                 onTap: _openTwoFactorSheet,
+              ),
+            if (_twoFactorEligible && _twoFactorEnabled)
+              ListTile(
+                leading: const Icon(Icons.key_outlined),
+                title: const Text('Резервные коды и устройства'),
+                subtitle: Text(
+                  'Кодов: $_twoFactorBackupCodesRemaining • Доверенных устройств: $_twoFactorTrustedDevicesCount',
+                ),
+                onTap: _openTwoFactorRecoveryCenter,
               ),
             const SizedBox(height: 12),
             if (_canOpenSupport)

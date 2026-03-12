@@ -18,19 +18,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
 import 'chat_screen.dart';
 import '../utils/date_time_utils.dart';
+import '../widgets/adaptive_network_image.dart';
 import '../widgets/input_language_badge.dart';
 
 const String _defaultMapLightTiles =
     'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
-const String _defaultMapDarkTiles =
-    'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
 const String _mapTileLightUrl = String.fromEnvironment(
   'FENIX_MAP_TILE_LIGHT',
   defaultValue: _defaultMapLightTiles,
-);
-const String _mapTileDarkUrl = String.fromEnvironment(
-  'FENIX_MAP_TILE_DARK',
-  defaultValue: _defaultMapDarkTiles,
 );
 const String _mapTileSubdomainsRaw = String.fromEnvironment(
   'FENIX_MAP_TILE_SUBDOMAINS',
@@ -134,6 +129,7 @@ class _AdminPanelState extends State<AdminPanel>
   bool _clientCartSearchLoading = false;
   bool _clientCartLoading = false;
   bool _clientCartActionBusy = false;
+  bool _clientCartUndoPending = false;
   bool _tenantsLoading = false;
   bool _tenantActionLoading = false;
   bool _invitesLoading = false;
@@ -197,6 +193,10 @@ class _AdminPanelState extends State<AdminPanel>
   final Map<String, String> _ticketTemplateById = {};
   final Map<String, String> _roleSelectionByUserId = {};
   Timer? _supportDraftSaveTimer;
+  Timer? _clientCartUndoTimer;
+  Future<void> Function()? _clientCartPendingCommit;
+  VoidCallback? _clientCartPendingRollback;
+  String _clientCartPendingLabel = '';
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
   final Set<String> _overviewLoading = <String>{};
@@ -249,6 +249,9 @@ class _AdminPanelState extends State<AdminPanel>
     _authSub?.cancel();
     _unbindSupportTemplateDraftAutosave();
     _supportDraftSaveTimer?.cancel();
+    _clientCartUndoTimer?.cancel();
+    _clientCartPendingCommit = null;
+    _clientCartPendingRollback = null;
     _channelTitleCtrl.dispose();
     _channelDescriptionCtrl.dispose();
     _deliveryThresholdCtrl.dispose();
@@ -276,10 +279,8 @@ class _AdminPanelState extends State<AdminPanel>
     super.dispose();
   }
 
-  String _activeMapTileUrl(ThemeData theme) {
-    return theme.brightness == Brightness.dark
-        ? _mapTileDarkUrl
-        : _mapTileLightUrl;
+  String _activeMapTileUrl(ThemeData _) {
+    return _mapTileLightUrl;
   }
 
   List<String> _activeMapSubdomains(String urlTemplate) {
@@ -1025,9 +1026,9 @@ class _AdminPanelState extends State<AdminPanel>
         '/api/admin/tenant/invites',
         data: {
           'role': _inviteRole,
-          if (maxUses != null) 'max_uses': maxUses,
-          if (expiresDays != null) 'expires_days': expiresDays,
-          if (notes.isNotEmpty) 'notes': notes,
+          'max_uses': maxUses,
+          'expires_days': expiresDays,
+          'notes': notes.isNotEmpty ? notes : null,
         },
       );
       final data = resp.data;
@@ -2312,6 +2313,120 @@ class _AdminPanelState extends State<AdminPanel>
     return result;
   }
 
+  Future<void> _scheduleClientCartUndoAction({
+    required String label,
+    required Future<void> Function() commit,
+    VoidCallback? rollback,
+  }) async {
+    if (_clientCartUndoPending) {
+      if (mounted) {
+        setState(
+          () => _message =
+              'Уже есть действие с таймером. Отмените его или дождитесь завершения.',
+        );
+      }
+      return;
+    }
+    _clientCartPendingCommit = commit;
+    _clientCartPendingRollback = rollback;
+    _clientCartPendingLabel = label;
+    _clientCartUndoTimer?.cancel();
+    _clientCartUndoTimer = Timer(const Duration(seconds: 10), () {
+      unawaited(_commitPendingClientCartAction());
+    });
+
+    if (mounted) {
+      setState(() {
+        _clientCartUndoPending = true;
+        _message = '$label: можно отменить в течение 10 секунд';
+      });
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      messenger?.hideCurrentSnackBar();
+      messenger?.showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 10),
+          content: Text('$label через 10 секунд'),
+          action: SnackBarAction(
+            label: 'Отменить',
+            onPressed: _cancelPendingClientCartAction,
+          ),
+        ),
+      );
+    }
+  }
+
+  void _cancelPendingClientCartAction() {
+    if (!_clientCartUndoPending) return;
+    _clientCartUndoTimer?.cancel();
+    _clientCartUndoTimer = null;
+    final rollback = _clientCartPendingRollback;
+    _clientCartPendingCommit = null;
+    _clientCartPendingRollback = null;
+    _clientCartPendingLabel = '';
+    rollback?.call();
+    if (mounted) {
+      setState(() {
+        _clientCartUndoPending = false;
+        _message = 'Действие отменено';
+      });
+      ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+    }
+  }
+
+  Future<void> _commitPendingClientCartAction() async {
+    if (!_clientCartUndoPending) return;
+    _clientCartUndoTimer?.cancel();
+    _clientCartUndoTimer = null;
+    final commit = _clientCartPendingCommit;
+    final label = _clientCartPendingLabel;
+    _clientCartPendingCommit = null;
+    _clientCartPendingRollback = null;
+    _clientCartPendingLabel = '';
+    if (commit == null) {
+      if (mounted) {
+        setState(() => _clientCartUndoPending = false);
+      } else {
+        _clientCartUndoPending = false;
+      }
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _clientCartActionBusy = true;
+        _clientCartUndoPending = false;
+      });
+      ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+    } else {
+      _clientCartActionBusy = true;
+      _clientCartUndoPending = false;
+    }
+    try {
+      await commit();
+      if (mounted) {
+        setState(() => _message = '$label выполнено');
+      }
+    } catch (e) {
+      final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+      if (userId.isNotEmpty) {
+        try {
+          await _loadSelectedClientCart(userId);
+        } catch (_) {}
+      }
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка применения действия: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _clientCartActionBusy = false);
+      } else {
+        _clientCartActionBusy = false;
+      }
+    }
+  }
+
   Future<void> _searchClientCartsByPhone() async {
     final query = _clientCartSearchCtrl.text.trim();
     final digits = query.replaceAll(RegExp(r'\D'), '');
@@ -2392,7 +2507,9 @@ class _AdminPanelState extends State<AdminPanel>
 
   Future<void> _editSelectedCartItem(Map<String, dynamic> item) async {
     final itemId = (item['id'] ?? '').toString().trim();
-    if (itemId.isEmpty || _clientCartActionBusy) return;
+    if (itemId.isEmpty || _clientCartActionBusy || _clientCartUndoPending) {
+      return;
+    }
     final currentPrice = (item['custom_price'] ?? item['price'] ?? '')
         .toString()
         .trim();
@@ -2411,40 +2528,74 @@ class _AdminPanelState extends State<AdminPanel>
     );
     if (nextDescription == null) return;
 
-    setState(() => _clientCartActionBusy = true);
-    try {
-      final parsedPrice = nextPrice.trim().isEmpty
-          ? null
-          : double.tryParse(nextPrice.replaceAll(',', '.'));
-      await authService.dio.patch(
-        '/api/cart/admin/cart-items/$itemId',
-        data: {
-          'custom_price': parsedPrice,
-          'custom_description': nextDescription.trim().isEmpty
-              ? null
-              : nextDescription.trim(),
-        },
-      );
-      final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
-      if (userId.isNotEmpty) {
-        await _loadSelectedClientCart(userId);
+    final normalizedPriceRaw = nextPrice.trim().replaceAll(',', '.');
+    final parsedPrice = normalizedPriceRaw.isEmpty
+        ? null
+        : double.tryParse(normalizedPriceRaw);
+    if (normalizedPriceRaw.isNotEmpty &&
+        (parsedPrice == null || parsedPrice < 0)) {
+      if (mounted) {
+        setState(() => _message = 'Введите корректную цену');
       }
-      if (!mounted) return;
-      setState(() => _message = 'Позиция обновлена');
-    } catch (e) {
-      if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка редактирования: ${_extractDioError(e)}',
-      );
-    } finally {
-      if (mounted) setState(() => _clientCartActionBusy = false);
+      return;
     }
+    final normalizedDescription = nextDescription.trim().isEmpty
+        ? null
+        : nextDescription.trim();
+    final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+
+    final index = _selectedClientCartItems.indexWhere(
+      (row) => (row['id'] ?? '').toString().trim() == itemId,
+    );
+    final previousItem = index >= 0
+        ? Map<String, dynamic>.from(_selectedClientCartItems[index])
+        : null;
+    if (index >= 0 && mounted) {
+      final optimistic = Map<String, dynamic>.from(
+        _selectedClientCartItems[index],
+      );
+      optimistic['custom_price'] = parsedPrice;
+      optimistic['custom_description'] = normalizedDescription;
+      if (parsedPrice != null) {
+        optimistic['price'] = parsedPrice;
+        final qty = _toInt(optimistic['quantity'], fallback: 1);
+        optimistic['line_total'] = parsedPrice * qty;
+      }
+      if (normalizedDescription != null) {
+        optimistic['description'] = normalizedDescription;
+      }
+      setState(() => _selectedClientCartItems[index] = optimistic);
+    }
+
+    await _scheduleClientCartUndoAction(
+      label: 'Изменение позиции корзины',
+      rollback: previousItem == null || index < 0 || !mounted
+          ? null
+          : () {
+              if (!mounted) return;
+              setState(() => _selectedClientCartItems[index] = previousItem);
+            },
+      commit: () async {
+        await authService.dio.patch(
+          '/api/cart/admin/cart-items/$itemId',
+          data: {
+            'custom_price': parsedPrice,
+            'custom_description': normalizedDescription,
+          },
+        );
+        if (userId.isNotEmpty) {
+          await _loadSelectedClientCart(userId);
+        }
+      },
+    );
   }
 
   Future<void> _removeSelectedCartItem(Map<String, dynamic> item) async {
     final itemId = (item['id'] ?? '').toString().trim();
     final title = (item['title'] ?? 'Товар').toString().trim();
-    if (itemId.isEmpty || _clientCartActionBusy) return;
+    if (itemId.isEmpty || _clientCartActionBusy || _clientCartUndoPending) {
+      return;
+    }
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -2464,26 +2615,45 @@ class _AdminPanelState extends State<AdminPanel>
     );
     if (confirm != true) return;
 
-    setState(() => _clientCartActionBusy = true);
-    try {
-      await authService.dio.delete('/api/cart/admin/cart-items/$itemId');
-      final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
-      if (userId.isNotEmpty) {
-        await _loadSelectedClientCart(userId);
-      }
-      if (!mounted) return;
-      setState(() => _message = 'Позиция удалена');
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _message = 'Ошибка удаления: ${_extractDioError(e)}');
-    } finally {
-      if (mounted) setState(() => _clientCartActionBusy = false);
+    final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+    final index = _selectedClientCartItems.indexWhere(
+      (row) => (row['id'] ?? '').toString().trim() == itemId,
+    );
+    final removedItem = index >= 0
+        ? Map<String, dynamic>.from(_selectedClientCartItems[index])
+        : null;
+    if (index >= 0 && mounted) {
+      setState(() => _selectedClientCartItems.removeAt(index));
     }
+
+    await _scheduleClientCartUndoAction(
+      label: 'Удаление "$title"',
+      rollback: removedItem == null || index < 0 || !mounted
+          ? null
+          : () {
+              if (!mounted) return;
+              final safeIndex = index.clamp(0, _selectedClientCartItems.length);
+              setState(
+                () => _selectedClientCartItems.insert(
+                  safeIndex.toInt(),
+                  removedItem,
+                ),
+              );
+            },
+      commit: () async {
+        await authService.dio.delete('/api/cart/admin/cart-items/$itemId');
+        if (userId.isNotEmpty) {
+          await _loadSelectedClientCart(userId);
+        }
+      },
+    );
   }
 
   Future<void> _clearSelectedClientCart() async {
     final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
-    if (userId.isEmpty || _clientCartActionBusy) return;
+    if (userId.isEmpty || _clientCartActionBusy || _clientCartUndoPending) {
+      return;
+    }
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -2503,23 +2673,39 @@ class _AdminPanelState extends State<AdminPanel>
     );
     if (confirm != true) return;
 
-    setState(() => _clientCartActionBusy = true);
-    try {
-      await authService.dio.post('/api/cart/admin/clients/$userId/cart/clear');
-      await _loadSelectedClientCart(userId);
-      if (!mounted) return;
-      setState(() => _message = 'Корзина клиента очищена');
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _message = 'Ошибка очистки: ${_extractDioError(e)}');
-    } finally {
-      if (mounted) setState(() => _clientCartActionBusy = false);
+    final previousItems = _selectedClientCartItems
+        .map((row) => Map<String, dynamic>.from(row))
+        .toList();
+    if (mounted) {
+      setState(() => _selectedClientCartItems = <Map<String, dynamic>>[]);
     }
+
+    await _scheduleClientCartUndoAction(
+      label: 'Расформирование корзины',
+      rollback: !mounted
+          ? null
+          : () {
+              if (!mounted) return;
+              setState(() {
+                _selectedClientCartItems = previousItems
+                    .map((row) => Map<String, dynamic>.from(row))
+                    .toList();
+              });
+            },
+      commit: () async {
+        await authService.dio.post(
+          '/api/cart/admin/clients/$userId/cart/clear',
+        );
+        await _loadSelectedClientCart(userId);
+      },
+    );
   }
 
   Future<void> _blockSelectedClient() async {
     final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
-    if (userId.isEmpty || _clientCartActionBusy) return;
+    if (userId.isEmpty || _clientCartActionBusy || _clientCartUndoPending) {
+      return;
+    }
     final reason = await _askText(
       title: 'Блокировка клиента',
       label: 'Причина блокировки',
@@ -3284,7 +3470,8 @@ class _AdminPanelState extends State<AdminPanel>
       final data = resp.data;
       if (!mounted) return;
       setState(() {
-        _returnsAnalytics = data is Map && data['ok'] == true && data['data'] is Map
+        _returnsAnalytics =
+            data is Map && data['ok'] == true && data['data'] is Map
             ? Map<String, dynamic>.from(data['data'])
             : <String, dynamic>{};
       });
@@ -4582,6 +4769,7 @@ class _AdminPanelState extends State<AdminPanel>
       }
       return null;
     }
+    if (!mounted) return null;
 
     return showDialog<_AvatarPlacementResult>(
       context: context,
@@ -5423,7 +5611,8 @@ class _AdminPanelState extends State<AdminPanel>
                       const SizedBox(height: 10),
                       if (!isMain)
                         DropdownButtonFormField<String>(
-                          value: visibility,
+                          key: ValueKey<String>('visibility-$visibility'),
+                          initialValue: visibility,
                           decoration: const InputDecoration(
                             labelText: 'Тип канала',
                             border: OutlineInputBorder(),
@@ -5490,7 +5679,7 @@ class _AdminPanelState extends State<AdminPanel>
                             avatarFocusY: focusY,
                             isMain: isMain,
                           );
-                          if (!mounted) return;
+                          if (!ctx.mounted) return;
                           if (Navigator.of(ctx).canPop()) {
                             Navigator.of(ctx).pop();
                           }
@@ -5545,7 +5734,8 @@ class _AdminPanelState extends State<AdminPanel>
                     Expanded(
                       child: ListView.separated(
                         itemCount: clients.length,
-                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        separatorBuilder: (context, index) =>
+                            const Divider(height: 1),
                         itemBuilder: (context, index) {
                           final c = clients[index];
                           final blocked = c['is_blacklisted'] == true;
@@ -5595,75 +5785,88 @@ class _AdminPanelState extends State<AdminPanel>
     final media = _asMapList(overview['media']);
     await showDialog<void>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Медиа канала "$channelTitle"'),
-        content: SizedBox(
-          width: 680,
-          height: 480,
-          child: media.isEmpty
-              ? const Center(child: Text('В канале пока нет медиа'))
-              : GridView.builder(
-                  itemCount: media.length,
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 3,
-                    childAspectRatio: 0.86,
-                    crossAxisSpacing: 8,
-                    mainAxisSpacing: 8,
-                  ),
-                  itemBuilder: (context, index) {
-                    final item = media[index];
-                    final url = _resolveImageUrl(
-                      (item['image_url'] ?? '').toString(),
-                    );
-                    final caption = (item['text'] ?? '').toString().trim();
-                    return Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey.shade300),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(
-                            child: ClipRRect(
-                              borderRadius: const BorderRadius.vertical(
-                                top: Radius.circular(10),
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return AlertDialog(
+          title: Text('Медиа канала "$channelTitle"'),
+          content: SizedBox(
+            width: 680,
+            height: 480,
+            child: media.isEmpty
+                ? const Center(child: Text('В канале пока нет медиа'))
+                : GridView.builder(
+                    itemCount: media.length,
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3,
+                          childAspectRatio: 0.86,
+                          crossAxisSpacing: 8,
+                          mainAxisSpacing: 8,
+                        ),
+                    itemBuilder: (context, index) {
+                      final item = media[index];
+                      final url = _resolveImageUrl(
+                        (item['image_url'] ?? '').toString(),
+                      );
+                      final caption = (item['text'] ?? '').toString().trim();
+                      return Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: theme.colorScheme.outlineVariant,
+                          ),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: ClipRRect(
+                                borderRadius: const BorderRadius.vertical(
+                                  top: Radius.circular(10),
+                                ),
+                                child: url == null
+                                    ? Container(
+                                        color: theme
+                                            .colorScheme
+                                            .surfaceContainerHighest,
+                                        alignment: Alignment.center,
+                                        child: Icon(
+                                          Icons.photo_outlined,
+                                          color: theme
+                                              .colorScheme
+                                              .onSurfaceVariant,
+                                        ),
+                                      )
+                                    : AdaptiveNetworkImage(
+                                        url,
+                                        width: double.infinity,
+                                        fit: BoxFit.cover,
+                                      ),
                               ),
-                              child: url == null
-                                  ? Container(
-                                      color: Colors.grey.shade200,
-                                      alignment: Alignment.center,
-                                      child: const Icon(Icons.photo_outlined),
-                                    )
-                                  : Image.network(
-                                      url,
-                                      width: double.infinity,
-                                      fit: BoxFit.cover,
-                                    ),
                             ),
-                          ),
-                          Padding(
-                            padding: const EdgeInsets.all(8),
-                            child: Text(
-                              caption.isEmpty ? 'Без подписи' : caption,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 12),
+                            Padding(
+                              padding: const EdgeInsets.all(8),
+                              child: Text(
+                                caption.isEmpty ? 'Без подписи' : caption,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 12),
+                              ),
                             ),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Закрыть'),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
           ),
-        ],
-      ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Закрыть'),
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -5705,7 +5908,8 @@ class _AdminPanelState extends State<AdminPanel>
                     ? const Center(child: Text('Черный список пуст'))
                     : ListView.separated(
                         itemCount: blacklist.length,
-                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        separatorBuilder: (context, index) =>
+                            const Divider(height: 1),
                         itemBuilder: (context, i) {
                           final item = blacklist[i];
                           final user = _asMap(item['user']);
@@ -5837,6 +6041,7 @@ class _AdminPanelState extends State<AdminPanel>
     required double radius,
     required IconData fallbackIcon,
   }) {
+    final theme = Theme.of(context);
     final initials = title.trim().isEmpty
         ? '?'
         : title
@@ -5851,9 +6056,9 @@ class _AdminPanelState extends State<AdminPanel>
     if (imageUrl == null) {
       return CircleAvatar(
         radius: radius,
-        backgroundColor: Colors.grey.shade200,
+        backgroundColor: theme.colorScheme.surfaceContainerHighest,
         child: initials == '?'
-            ? Icon(fallbackIcon, color: Colors.grey.shade700)
+            ? Icon(fallbackIcon, color: theme.colorScheme.onSurfaceVariant)
             : Text(initials),
       );
     }
@@ -5861,7 +6066,7 @@ class _AdminPanelState extends State<AdminPanel>
     final size = radius * 2;
     return CircleAvatar(
       radius: radius,
-      backgroundColor: Colors.grey.shade200,
+      backgroundColor: theme.colorScheme.surfaceContainerHighest,
       child: ClipOval(
         child: SizedBox(
           width: size,
@@ -5869,11 +6074,13 @@ class _AdminPanelState extends State<AdminPanel>
           child: Transform.scale(
             scale: zoom,
             alignment: Alignment(focusX, focusY),
-            child: Image.network(
+            child: AdaptiveNetworkImage(
               imageUrl,
+              width: size,
+              height: size,
               fit: BoxFit.cover,
               alignment: Alignment(focusX, focusY),
-              errorBuilder: (_, __, ___) => Center(
+              errorBuilder: (context, error, stackTrace) => Center(
                 child: Text(
                   initials,
                   style: const TextStyle(fontWeight: FontWeight.w600),
@@ -5950,7 +6157,10 @@ class _AdminPanelState extends State<AdminPanel>
         ),
         const SizedBox(height: 12),
         DropdownButtonFormField<String>(
-          value: _newChannelVisibility,
+          key: ValueKey<String>(
+            'new-channel-visibility-$_newChannelVisibility',
+          ),
+          initialValue: _newChannelVisibility,
           decoration: const InputDecoration(
             labelText: 'Тип нового канала',
             border: OutlineInputBorder(),
@@ -6004,7 +6214,8 @@ class _AdminPanelState extends State<AdminPanel>
                   ),
                   const SizedBox(height: 10),
                   DropdownButtonFormField<String>(
-                    value: _inviteRole,
+                    key: ValueKey<String>('invite-role-$_inviteRole'),
+                    initialValue: _inviteRole,
                     decoration: const InputDecoration(
                       labelText: 'Роль по приглашению',
                       border: OutlineInputBorder(),
@@ -6141,6 +6352,7 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Widget _buildChannelCard(Map<String, dynamic> channel) {
+    final theme = Theme.of(context);
     final id = _channelIdOf(channel);
     final title = (channel['title'] ?? 'Канал').toString();
     final settings = _settingsOf(channel);
@@ -6273,10 +6485,6 @@ class _AdminPanelState extends State<AdminPanel>
                   _toInt(overviewStats['clients_total']).toString(),
                 ),
                 _buildStatChip(
-                  'Участники',
-                  _toInt(overviewStats['members_total']).toString(),
-                ),
-                _buildStatChip(
                   'Медиа',
                   _toInt(overviewStats['media_total']).toString(),
                 ),
@@ -6328,7 +6536,7 @@ class _AdminPanelState extends State<AdminPanel>
                   'Последние фото:',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
-                    color: Colors.grey.shade800,
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
               ),
@@ -6340,7 +6548,8 @@ class _AdminPanelState extends State<AdminPanel>
                   itemCount: overviewMedia.length > 8
                       ? 8
                       : overviewMedia.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                  separatorBuilder: (context, index) =>
+                      const SizedBox(width: 8),
                   itemBuilder: (context, i) {
                     final item = overviewMedia[i];
                     final url = _resolveImageUrl(
@@ -6352,10 +6561,14 @@ class _AdminPanelState extends State<AdminPanel>
                         width: 72,
                         child: url == null
                             ? Container(
-                                color: Colors.grey.shade200,
-                                child: const Icon(Icons.photo_outlined),
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
+                                child: Icon(
+                                  Icons.photo_outlined,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
                               )
-                            : Image.network(url, fit: BoxFit.cover),
+                            : AdaptiveNetworkImage(url, fit: BoxFit.cover),
                       ),
                     );
                   },
@@ -6370,7 +6583,7 @@ class _AdminPanelState extends State<AdminPanel>
                   'В черном списке:',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
-                    color: Colors.grey.shade800,
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
               ),
@@ -6428,7 +6641,8 @@ class _AdminPanelState extends State<AdminPanel>
       child: ListView.separated(
         padding: EdgeInsets.all(compact ? 10 : 16),
         itemCount: _channels.length,
-        separatorBuilder: (_, __) => SizedBox(height: compact ? 8 : 12),
+        separatorBuilder: (context, index) =>
+            SizedBox(height: compact ? 8 : 12),
         itemBuilder: (context, index) => _buildChannelCard(_channels[index]),
       ),
     );
@@ -6597,8 +6811,10 @@ class _AdminPanelState extends State<AdminPanel>
                             width: 96,
                             height: 96,
                             child: imageUrl != null
-                                ? Image.network(
+                                ? AdaptiveNetworkImage(
                                     imageUrl,
+                                    width: 96,
+                                    height: 96,
                                     fit: BoxFit.cover,
                                     errorBuilder: (_, error, stackTrace) =>
                                         Container(
@@ -6818,7 +7034,8 @@ class _AdminPanelState extends State<AdminPanel>
             if (!archived && _supportTemplates.isNotEmpty) ...[
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
-                value: (_ticketTemplateById[ticketId] ?? '').isEmpty
+                key: ValueKey<String>('ticket-template-$ticketId'),
+                initialValue: (_ticketTemplateById[ticketId] ?? '').isEmpty
                     ? null
                     : _ticketTemplateById[ticketId],
                 isExpanded: true,
@@ -6954,6 +7171,9 @@ class _AdminPanelState extends State<AdminPanel>
                       _buildModerationChip(
                         'Новые претензии: ${_toInt(notificationsSummary['claims_pending'])}',
                       ),
+                      _buildModerationChip(
+                        'Расформировка корзин: ${_toInt(notificationsSummary['stale_carts'])}',
+                      ),
                     ],
                   ),
                   const SizedBox(height: 8),
@@ -6997,6 +7217,8 @@ class _AdminPanelState extends State<AdminPanel>
                         leading: Icon(
                           event['type'] == 'claim'
                               ? Icons.assignment_return_outlined
+                              : event['type'] == 'cart_retention'
+                              ? Icons.warning_amber_rounded
                               : Icons.support_agent_outlined,
                           color: priorityColor,
                         ),
@@ -7059,7 +7281,9 @@ class _AdminPanelState extends State<AdminPanel>
                       return ListTile(
                         dense: true,
                         contentPadding: EdgeInsets.zero,
-                        title: Text((row['product_title'] ?? 'Товар').toString()),
+                        title: Text(
+                          (row['product_title'] ?? 'Товар').toString(),
+                        ),
                         subtitle: Text(
                           'Заявок: ${_toInt(row['total_claims'])} • '
                           'Сумма: ${_formatMoney(row['approved_sum'])}',
@@ -7529,6 +7753,7 @@ class _AdminPanelState extends State<AdminPanel>
 
     return RefreshIndicator(
       onRefresh: () async {
+        if (_clientCartUndoPending) return;
         if (_clientCartSearchCtrl.text.trim().isNotEmpty) {
           await _searchClientCartsByPhone();
         }
@@ -7565,7 +7790,7 @@ class _AdminPanelState extends State<AdminPanel>
             runSpacing: 8,
             children: [
               FilledButton.icon(
-                onPressed: _clientCartSearchLoading
+                onPressed: _clientCartSearchLoading || _clientCartUndoPending
                     ? null
                     : _searchClientCartsByPhone,
                 icon: _clientCartSearchLoading
@@ -7582,7 +7807,7 @@ class _AdminPanelState extends State<AdminPanel>
               ),
               if (selectedUserId.isNotEmpty)
                 OutlinedButton.icon(
-                  onPressed: _clientCartLoading
+                  onPressed: _clientCartLoading || _clientCartUndoPending
                       ? null
                       : () => _loadSelectedClientCart(selectedUserId),
                   icon: const Icon(Icons.refresh),
@@ -7628,7 +7853,7 @@ class _AdminPanelState extends State<AdminPanel>
                   trailing: user['is_active'] == false
                       ? const Icon(Icons.block, color: Colors.red)
                       : const Icon(Icons.chevron_right),
-                  onTap: userId.isEmpty
+                  onTap: userId.isEmpty || _clientCartUndoPending
                       ? null
                       : () => _loadSelectedClientCart(userId),
                 ),
@@ -7675,6 +7900,17 @@ class _AdminPanelState extends State<AdminPanel>
                     Text(
                       'Позиций: ${_selectedClientCartItems.length} • Сумма: ${_formatMoney(total)}',
                     ),
+                    if (_clientCartUndoPending)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          'Есть отложенное действие (10 сек). Можно отменить через кнопку "Отменить" внизу экрана.',
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.primary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
                     const SizedBox(height: 10),
                     Wrap(
                       spacing: 8,
@@ -7683,6 +7919,7 @@ class _AdminPanelState extends State<AdminPanel>
                         OutlinedButton.icon(
                           onPressed:
                               _clientCartActionBusy ||
+                                  _clientCartUndoPending ||
                                   _selectedClientCartItems.isEmpty
                               ? null
                               : _clearSelectedClientCart,
@@ -7691,7 +7928,9 @@ class _AdminPanelState extends State<AdminPanel>
                         ),
                         OutlinedButton.icon(
                           onPressed:
-                              _clientCartActionBusy || selectedUserBlocked
+                              _clientCartActionBusy ||
+                                  _clientCartUndoPending ||
+                                  selectedUserBlocked
                               ? null
                               : _blockSelectedClient,
                           icon: const Icon(Icons.block_outlined),
@@ -7758,7 +7997,9 @@ class _AdminPanelState extends State<AdminPanel>
                           runSpacing: 8,
                           children: [
                             OutlinedButton.icon(
-                              onPressed: _clientCartActionBusy
+                              onPressed:
+                                  _clientCartActionBusy ||
+                                      _clientCartUndoPending
                                   ? null
                                   : () => _editSelectedCartItem(item),
                               icon: const Icon(Icons.edit_outlined),
@@ -7766,7 +8007,9 @@ class _AdminPanelState extends State<AdminPanel>
                             ),
                             OutlinedButton.icon(
                               onPressed:
-                                  _clientCartActionBusy || linkedToDelivery
+                                  _clientCartActionBusy ||
+                                      _clientCartUndoPending ||
+                                      linkedToDelivery
                                   ? null
                                   : () => _removeSelectedCartItem(item),
                               icon: const Icon(Icons.delete_outline),
@@ -8283,7 +8526,10 @@ class _AdminPanelState extends State<AdminPanel>
                                 children: [
                                   Expanded(
                                     child: DropdownButtonFormField<String>(
-                                      value: currentValue,
+                                      key: ValueKey<String>(
+                                        'role-selection-$userId-$currentValue',
+                                      ),
+                                      initialValue: currentValue,
                                       isExpanded: true,
                                       items: items,
                                       onChanged: (value) {
@@ -8430,7 +8676,10 @@ class _AdminPanelState extends State<AdminPanel>
                       children: [
                         Expanded(
                           child: DropdownButtonFormField<String>(
-                            value: _smartNotifyType,
+                            key: ValueKey<String>(
+                              'smart-notify-type-$_smartNotifyType',
+                            ),
+                            initialValue: _smartNotifyType,
                             items: const [
                               DropdownMenuItem(
                                 value: 'order',
@@ -8458,7 +8707,10 @@ class _AdminPanelState extends State<AdminPanel>
                         const SizedBox(width: 10),
                         Expanded(
                           child: DropdownButtonFormField<String>(
-                            value: _smartNotifyPriority,
+                            key: ValueKey<String>(
+                              'smart-notify-priority-$_smartNotifyPriority',
+                            ),
+                            initialValue: _smartNotifyPriority,
                             items: const [
                               DropdownMenuItem(
                                 value: 'low',

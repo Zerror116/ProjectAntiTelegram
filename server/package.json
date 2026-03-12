@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "lint": "echo \"no lint configured\""
+    "lint": "echo \"no lint configured\"",
+    "test:critical": "node scripts/critical-integration.js",
+    "test:critical:admin": "E2E_STRICT_ADMIN=1 node scripts/critical-integration.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

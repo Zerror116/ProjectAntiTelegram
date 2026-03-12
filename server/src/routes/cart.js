@@ -33,6 +33,14 @@ const CLAIM_STATUSES = new Set([
   'rejected',
   'settled',
 ]);
+const CART_RETENTION_WARNING_DAYS = 30;
+const CART_RETENTION_ACTIVE_STATUSES = [
+  'pending_processing',
+  'processed',
+  'preparing_delivery',
+  'handing_to_courier',
+  'in_delivery',
+];
 
 const claimsUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'claims');
 fs.mkdirSync(claimsUploadsDir, { recursive: true });
@@ -129,6 +137,30 @@ function productMessageText(product) {
     'Нажмите "Купить", чтобы добавить в корзину',
   ].filter(Boolean);
   return lines.join('\n');
+}
+
+function buildCartRetentionWarning(row) {
+  if (!row || !row.oldest_created_at) return null;
+  const oldestCreatedAt = new Date(row.oldest_created_at);
+  if (Number.isNaN(oldestCreatedAt.getTime())) return null;
+  const nowTs = Date.now();
+  const daysHeld = Math.max(
+    0,
+    Math.floor((nowTs - oldestCreatedAt.getTime()) / (24 * 60 * 60 * 1000)),
+  );
+  if (daysHeld < CART_RETENTION_WARNING_DAYS) return null;
+  const itemsCount = Number(row.items_count || 0);
+  const totalSum = toMoney(row.total_sum);
+  return {
+    active: true,
+    threshold_days: CART_RETENTION_WARNING_DAYS,
+    days_held: daysHeld,
+    items_count: Number.isFinite(itemsCount) ? itemsCount : 0,
+    total_sum: totalSum,
+    oldest_created_at: oldestCreatedAt.toISOString(),
+    message:
+      'Корзина держится больше месяца. Если при следующем обзвоне/рассылке доставка будет отклонена, корзина расформируется автоматически.',
+  };
 }
 
 async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQuantity }) {
@@ -690,6 +722,20 @@ router.get('/', authMiddleware, async (req, res) => {
       [userId],
     );
 
+    const retentionQ = await db.query(
+      `SELECT MIN(c.created_at) AS oldest_created_at,
+              COUNT(*)::int AS items_count,
+              COALESCE(
+                SUM((COALESCE(c.custom_price, p.price) * c.quantity)),
+                0
+              )::numeric AS total_sum
+       FROM cart_items c
+       JOIN products p ON p.id = c.product_id
+       WHERE c.user_id = $1
+         AND c.status = ANY($2::text[])`,
+      [userId, CART_RETENTION_ACTIVE_STATUSES],
+    );
+
     const grouped = new Map();
     for (const row of result.rows) {
       const normalized = {
@@ -816,6 +862,7 @@ router.get('/', authMiddleware, async (req, res) => {
       requested_amount: toMoney(row.requested_amount),
       approved_amount: toMoney(row.approved_amount),
     }));
+    const retentionWarning = buildCartRetentionWarning(retentionQ.rows[0]);
 
     return res.json({
       ok: true,
@@ -827,6 +874,7 @@ router.get('/', authMiddleware, async (req, res) => {
         claims_total: toMoney(approvedClaimsTotal),
         recent_deliveries: recentDeliveries,
         claims,
+        cart_retention_warning: retentionWarning,
       },
     });
   } catch (err) {

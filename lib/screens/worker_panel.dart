@@ -9,6 +9,8 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
+import '../widgets/adaptive_network_image.dart';
+import '../widgets/app_empty_state.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
 
@@ -469,6 +471,9 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Future<void> _pickImage(ImageSource source) async {
     try {
+      final reducedMode = performanceModeNotifier.value;
+      final pickerQuality = reducedMode ? 72 : 88;
+      final pickerMaxWidth = reducedMode ? 1440.0 : 2200.0;
       var effectiveSource = source;
       if (source == ImageSource.camera && !_cameraSupported) {
         if (mounted) {
@@ -487,8 +492,8 @@ class _WorkerPanelState extends State<WorkerPanel>
         try {
           picked = await _imagePicker.pickImage(
             source: ImageSource.gallery,
-            imageQuality: 88,
-            maxWidth: 2200,
+            imageQuality: pickerQuality,
+            maxWidth: pickerMaxWidth,
           );
         } catch (_) {}
 
@@ -520,8 +525,8 @@ class _WorkerPanelState extends State<WorkerPanel>
       } else {
         picked = await _imagePicker.pickImage(
           source: effectiveSource,
-          imageQuality: 88,
-          maxWidth: 2200,
+          imageQuality: pickerQuality,
+          maxWidth: pickerMaxWidth,
         );
       }
 
@@ -1450,7 +1455,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         if (!canUseNetworkLikePath) {
           return imageErrorPlaceholder();
         }
-        return Image.network(
+        return AdaptiveNetworkImage(
           path,
           fit: BoxFit.cover,
           errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
@@ -1484,7 +1489,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                       ? Image.memory(localBytes, fit: BoxFit.cover)
                       : (localPath != null && localPath.isNotEmpty)
                       ? buildLocalPathPreview(localPath)
-                      : Image.network(
+                      : AdaptiveNetworkImage(
                           remoteUrl!,
                           fit: BoxFit.cover,
                           errorBuilder: (context, error, stackTrace) =>
@@ -1720,7 +1725,11 @@ class _WorkerPanelState extends State<WorkerPanel>
             ),
           ),
         if (!_searching && _searchResults.isEmpty)
-          const Text('Результаты появятся здесь'),
+          const AppEmptyState(
+            title: 'Результаты появятся здесь',
+            subtitle: 'Введите описание товара, чтобы найти старые позиции.',
+            icon: Icons.search_rounded,
+          ),
         ..._searchResults.map((p) {
           final label = _formatProductLabel(
             p['product_code'],
@@ -1732,7 +1741,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               leading: imageUrl != null
                   ? ClipRRect(
                       borderRadius: BorderRadius.circular(6),
-                      child: Image.network(
+                      child: AdaptiveNetworkImage(
                         imageUrl,
                         width: 52,
                         height: 52,
@@ -1972,7 +1981,13 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (_ownQueuedPosts.isEmpty) {
       return ListView(
         padding: const EdgeInsets.all(16),
-        children: const [Text('У вас пока нет своих постов в очереди')],
+        children: const [
+          AppEmptyState(
+            title: 'У вас пока нет постов в очереди',
+            subtitle: 'Отправьте товар в очередь, и он появится здесь.',
+            icon: Icons.inventory_2_outlined,
+          ),
+        ],
       );
     }
     return RefreshIndicator(
@@ -2005,7 +2020,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         width: 92,
                         height: 92,
                         child: imageUrl != null
-                            ? Image.network(
+                            ? AdaptiveNetworkImage(
                                 imageUrl,
                                 fit: BoxFit.cover,
                                 errorBuilder: (context, error, stackTrace) =>
@@ -2277,7 +2292,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         width: 78,
                         height: 78,
                         child: imageUrl != null
-                            ? Image.network(
+                            ? AdaptiveNetworkImage(
                                 imageUrl,
                                 fit: BoxFit.cover,
                                 errorBuilder: (context, error, stackTrace) =>
