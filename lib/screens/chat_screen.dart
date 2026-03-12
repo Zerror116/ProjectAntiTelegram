@@ -1507,15 +1507,9 @@ class _ChatScreenState extends State<ChatScreen> {
     String preferredTimeFrom = '';
     String preferredTimeTo = '';
     if (accepted) {
-      final addressCtrl = TextEditingController(
-        text: (meta['address_text'] ?? '').toString(),
-      );
-      final afterCtrl = TextEditingController(
-        text: (meta['preferred_time_from'] ?? '').toString(),
-      );
-      final beforeCtrl = TextEditingController(
-        text: (meta['preferred_time_to'] ?? '').toString(),
-      );
+      var addressDraft = (meta['address_text'] ?? '').toString();
+      var afterDraft = (meta['preferred_time_from'] ?? '').toString();
+      var beforeDraft = (meta['preferred_time_to'] ?? '').toString();
       final result = await showDialog<Map<String, String>>(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -1525,8 +1519,9 @@ class _ChatScreenState extends State<ChatScreen> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                TextField(
-                  controller: addressCtrl,
+                TextFormField(
+                  initialValue: addressDraft,
+                  onChanged: (value) => addressDraft = value,
                   minLines: 2,
                   maxLines: 4,
                   decoration: withInputLanguageBadge(
@@ -1534,36 +1529,35 @@ class _ChatScreenState extends State<ChatScreen> {
                       hintText: 'Самара, улица, дом, подъезд',
                       border: OutlineInputBorder(),
                     ),
-                    controller: addressCtrl,
                   ),
                 ),
                 const SizedBox(height: 12),
                 Row(
                   children: [
                     Expanded(
-                      child: TextField(
-                        controller: afterCtrl,
+                      child: TextFormField(
+                        initialValue: afterDraft,
+                        onChanged: (value) => afterDraft = value,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
                             labelText: 'После',
                             hintText: '10:00',
                             border: OutlineInputBorder(),
                           ),
-                          controller: afterCtrl,
                         ),
                       ),
                     ),
                     const SizedBox(width: 12),
                     Expanded(
-                      child: TextField(
-                        controller: beforeCtrl,
+                      child: TextFormField(
+                        initialValue: beforeDraft,
+                        onChanged: (value) => beforeDraft = value,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
                             labelText: 'До',
                             hintText: '16:00',
                             border: OutlineInputBorder(),
                           ),
-                          controller: beforeCtrl,
                         ),
                       ),
                     ),
@@ -1579,9 +1573,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             FilledButton(
               onPressed: () => Navigator.of(ctx).pop({
-                'address_text': addressCtrl.text.trim(),
-                'preferred_time_from': afterCtrl.text.trim(),
-                'preferred_time_to': beforeCtrl.text.trim(),
+                'address_text': addressDraft.trim(),
+                'preferred_time_from': afterDraft.trim(),
+                'preferred_time_to': beforeDraft.trim(),
               }),
               child: const Text('Отправить'),
             ),
@@ -1676,16 +1670,52 @@ class _ChatScreenState extends State<ChatScreen> {
         _placedCartItemIds.contains(cartItemId)) {
       return;
     }
-    int? manualShelf;
-    if (_requiresManualShelfOnPlaced()) {
-      final shelfCtrl = TextEditingController();
+    final knownShelfRaw = int.tryParse(
+      (meta['shelf_number'] ?? '').toString().trim(),
+    );
+    final knownShelf = (knownShelfRaw != null && knownShelfRaw > 0)
+        ? knownShelfRaw
+        : null;
+
+    setState(() => _markingPlaced = true);
+    try {
+      final reservationIdValue = (reservationId ?? '').trim();
+      final cartItemIdValue = (cartItemId ?? '').trim();
+      Future<Response<dynamic>> sendMarkPlaced({int? shelfNumber}) {
+        final shelfValue = shelfNumber != null && shelfNumber > 0
+            ? shelfNumber.toString()
+            : '';
+        return authService.dio.post(
+          '/api/admin/orders/mark_placed',
+          data: {
+            if (reservationIdValue.isNotEmpty)
+              'reservation_id': reservationIdValue,
+            if (cartItemIdValue.isNotEmpty) 'cart_item_id': cartItemIdValue,
+            if (shelfValue.isNotEmpty) 'shelf_number': shelfValue,
+          },
+        );
+      }
+
+      Response<dynamic> resp;
       try {
-        manualShelf = await showDialog<int>(
+        resp = await sendMarkPlaced(shelfNumber: knownShelf);
+      } on DioException catch (e) {
+        final requiresManualByRole = _requiresManualShelfOnPlaced();
+        final serverMessage = _extractDioError(e).toLowerCase();
+        final needsManualShelf =
+            requiresManualByRole &&
+            serverMessage.contains('вручную указать номер полки');
+        if (!needsManualShelf) rethrow;
+        if (!mounted) return;
+
+        var shelfDraft = '';
+        final manualShelf = await showDialog<int>(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Укажите полку'),
-            content: TextField(
-              controller: shelfCtrl,
+            content: TextFormField(
+              initialValue: shelfDraft,
+              onChanged: (value) => shelfDraft = value,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(
                 labelText: 'Номер полки',
@@ -1699,7 +1729,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               FilledButton(
                 onPressed: () {
-                  final parsed = int.tryParse(shelfCtrl.text.trim());
+                  final parsed = int.tryParse(shelfDraft.trim());
                   if (parsed == null || parsed <= 0) {
                     showAppNotice(
                       context,
@@ -1716,26 +1746,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ],
           ),
         );
-      } finally {
-        shelfCtrl.dispose();
+        if (manualShelf == null) return;
+        resp = await sendMarkPlaced(shelfNumber: manualShelf);
       }
-      if (manualShelf == null) return;
-    }
-
-    setState(() => _markingPlaced = true);
-    try {
-      final reservationIdValue = (reservationId ?? '').trim();
-      final cartItemIdValue = (cartItemId ?? '').trim();
-      final manualShelfValue = '${manualShelf ?? ''}'.trim();
-      final resp = await authService.dio.post(
-        '/api/admin/orders/mark_placed',
-        data: {
-          if (reservationIdValue.isNotEmpty)
-            'reservation_id': reservationIdValue,
-          if (cartItemIdValue.isNotEmpty) 'cart_item_id': cartItemIdValue,
-          if (manualShelfValue.isNotEmpty) 'shelf_number': manualShelfValue,
-        },
-      );
       if ((resp.statusCode == 200 || resp.statusCode == 201) && mounted) {
         setState(() {
           if (cartItemId != null && cartItemId.isNotEmpty) {
@@ -2117,19 +2130,19 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _editMessage(Map<String, dynamic> message) async {
     final current = (message['text'] ?? '').toString();
-    final controller = TextEditingController(text: current);
+    var nextDraft = current;
     final nextText = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Изменить сообщение'),
-        content: TextField(
-          controller: controller,
+        content: TextFormField(
+          initialValue: current,
+          onChanged: (value) => nextDraft = value,
           autofocus: true,
           minLines: 1,
           maxLines: 6,
           decoration: withInputLanguageBadge(
             const InputDecoration(border: OutlineInputBorder()),
-            controller: controller,
           ),
         ),
         actions: [
@@ -2138,7 +2151,7 @@ class _ChatScreenState extends State<ChatScreen> {
             child: const Text('Отмена'),
           ),
           TextButton(
-            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            onPressed: () => Navigator.of(ctx).pop(nextDraft.trim()),
             child: const Text('Сохранить'),
           ),
         ],

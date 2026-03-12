@@ -47,6 +47,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   final _quantityCtrl = TextEditingController(text: '1');
   final _searchCtrl = TextEditingController();
   final _revisionPercentCtrl = TextEditingController(text: '10');
+  final Map<String, int> _quickDuplicateCounters = {};
 
   final ImagePicker _imagePicker = ImagePicker();
   XFile? _pickedImage;
@@ -125,6 +126,22 @@ class _WorkerPanelState extends State<WorkerPanel>
     final shelf = int.tryParse(shelfDigits);
     if (shelf == null || shelf <= 0) return null;
     return shelf;
+  }
+
+  int _queuedQuantityForProduct(String productId) {
+    if (productId.isEmpty) return 0;
+    final matches = _ownQueuedPosts.where(
+      (row) => (row['product_id'] ?? '').toString() == productId,
+    );
+    if (matches.isEmpty) return 0;
+    final latest = matches.first;
+    final byProduct = _toIntValue(latest['product_quantity'], 0);
+    if (byProduct > 0) return byProduct;
+    final payload = latest['payload'];
+    if (payload is Map) {
+      return _toIntValue(payload['quantity'], 0);
+    }
+    return 0;
   }
 
   List<Map<String, dynamic>> _channels = [];
@@ -342,6 +359,61 @@ class _WorkerPanelState extends State<WorkerPanel>
     final normalized = _existingImageUrl?.trim();
     if (normalized == null || normalized.isEmpty) return null;
     return normalized;
+  }
+
+  Future<void> _showShelfFullscreenNotice(int shelfNumber) async {
+    if (!mounted) return;
+    await showGeneralDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'shelf_notice',
+      barrierColor: Colors.black.withValues(alpha: 0.72),
+      transitionDuration: const Duration(milliseconds: 180),
+      pageBuilder: (dialogContext, animation, secondaryAnimation) {
+        final theme = Theme.of(dialogContext);
+        return SafeArea(
+          child: Material(
+            color: theme.colorScheme.errorContainer.withValues(alpha: 0.98),
+            child: InkWell(
+              onTap: () => Navigator.of(dialogContext).pop(),
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.inventory_2_rounded,
+                        size: 72,
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Положите товар на полку $shelfNumber',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.headlineSmall?.copyWith(
+                          color: theme.colorScheme.onErrorContainer,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        'Нажмите в любом месте, чтобы закрыть',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onErrorContainer,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
   }
 
   void _resetProductForm() {
@@ -691,7 +763,9 @@ class _WorkerPanelState extends State<WorkerPanel>
         setState(() => _message = 'Не удалось загрузить каналы');
       }
     } catch (e) {
-      setState(() => _message = 'Ошибка загрузки каналов: ${_extractRequestError(e)}');
+      setState(
+        () => _message = 'Ошибка загрузки каналов: ${_extractRequestError(e)}',
+      );
     } finally {
       if (mounted) setState(() => _loadingChannels = false);
     }
@@ -712,7 +786,10 @@ class _WorkerPanelState extends State<WorkerPanel>
       }
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = 'Ошибка загрузки своих постов: ${_extractRequestError(e)}');
+      setState(
+        () => _message =
+            'Ошибка загрузки своих постов: ${_extractRequestError(e)}',
+      );
     } finally {
       if (mounted) {
         setState(() => _loadingOwnPosts = false);
@@ -1149,7 +1226,8 @@ class _WorkerPanelState extends State<WorkerPanel>
           }
         });
         _resetProductForm();
-        _loadOwnQueuedPosts();
+        await _loadOwnQueuedPosts();
+        _animateToTab('own');
         if (mounted) {
           showAppNotice(
             context,
@@ -1160,12 +1238,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             duration: const Duration(milliseconds: 1400),
           );
           if (shelfNumber != null) {
-            showAppNotice(
-              context,
-              'Положите товар на полку $shelfNumber',
-              tone: AppNoticeTone.warning,
-              duration: const Duration(milliseconds: 2300),
-            );
+            await _showShelfFullscreenNotice(shelfNumber);
           }
         }
         await playAppSound(AppUiSound.success);
@@ -1213,7 +1286,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _titleCtrl.text = (product['title'] ?? '').toString();
     _descriptionCtrl.text = (product['description'] ?? '').toString();
     _priceCtrl.text = (product['price'] ?? '').toString();
-    _quantityCtrl.text = ((product['quantity'] ?? 1)).toString();
+    _quantityCtrl.text = '1';
     setState(() {
       _pickedImage = null;
       _existingImageUrl = (product['image_url'] ?? '').toString();
@@ -1327,12 +1400,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             tone: AppNoticeTone.success,
           );
           if (shelfNumber != null) {
-            showAppNotice(
-              context,
-              'Положите товар на полку $shelfNumber',
-              tone: AppNoticeTone.warning,
-              duration: const Duration(milliseconds: 2300),
-            );
+            await _showShelfFullscreenNotice(shelfNumber);
           }
         }
         await playAppSound(AppUiSound.success);
@@ -1362,7 +1430,10 @@ class _WorkerPanelState extends State<WorkerPanel>
     final title = (product['title'] ?? '').toString().trim();
     final description = (product['description'] ?? '').toString().trim();
     final price = _toDoubleValue(product['price'], 0);
-    final quantity = _toIntValue(product['quantity'], 1);
+    final queuedQuantity = _queuedQuantityForProduct(productId);
+    final lastCounter = _quickDuplicateCounters[productId] ?? 0;
+    final baseQuantity = queuedQuantity > 0 ? queuedQuantity : lastCounter;
+    final quantity = (baseQuantity + 1).clamp(1, 999999);
     final imageUrl = (product['image_url'] ?? '').toString().trim();
 
     final validationError = _validateProductFields(
@@ -1391,9 +1462,11 @@ class _WorkerPanelState extends State<WorkerPanel>
           'price': price,
           'quantity': quantity,
           'image_url': imageUrl,
+          'merge_pending': true,
         },
       );
       if (resp.statusCode == 201 || resp.statusCode == 200) {
+        _quickDuplicateCounters[productId] = quantity;
         String? productLabel;
         final data = resp.data;
         if (data is Map && data['data'] is Map) {
@@ -1425,12 +1498,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             tone: AppNoticeTone.success,
           );
           if (shelfNumber != null) {
-            showAppNotice(
-              context,
-              'Положите товар на полку $shelfNumber',
-              tone: AppNoticeTone.warning,
-              duration: const Duration(milliseconds: 2300),
-            );
+            await _showShelfFullscreenNotice(shelfNumber);
           }
         }
         await playAppSound(AppUiSound.success);

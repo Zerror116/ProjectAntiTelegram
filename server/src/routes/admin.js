@@ -30,6 +30,7 @@ const {
   encryptMessageText,
   decryptMessageRow,
 } = require("../utils/messageCrypto");
+const { runInRequestTenantScope } = require("../utils/requestScope");
 
 const requireProductPublishPermission = requirePermission("product.publish");
 const requireReservationFulfillPermission = requirePermission(
@@ -1787,85 +1788,94 @@ router.delete(
   requireRole("admin", "creator"),
   async (req, res) => {
     const { id } = req.params;
-    const client = await db.pool.connect();
     try {
-      await client.query("BEGIN");
+      return await runInRequestTenantScope(req, async () => {
+        const client = await db.pool.connect();
+        try {
+          await client.query("BEGIN");
 
-      const current = await client.query(
-        `SELECT id, title, settings
-       FROM chats
-       WHERE id = $1 AND type = 'channel' AND tenant_id = $2
-       LIMIT 1
-       FOR UPDATE`,
-        [id, req.user.tenant_id],
-      );
-      if (current.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ ok: false, error: "Канал не найден" });
-      }
-      const currentSettings = normalizeSettings(current.rows[0].settings);
-      const systemKey = String(currentSettings.system_key || "").toLowerCase().trim();
-      if (
-        (currentSettings.kind && currentSettings.kind !== "channel") ||
-        systemKey === "main_channel" ||
-        systemKey === "reserved_orders" ||
-        currentSettings.admin_only === true ||
-        isBugReportsTitle(current.rows[0].title)
-      ) {
-        await client.query("ROLLBACK");
-        return res
-          .status(403)
-          .json({ ok: false, error: "Системный канал нельзя удалять" });
-      }
-
-      const deleted = await client.query(
-        `DELETE FROM chats
-       WHERE id = $1 AND type = 'channel' AND tenant_id = $2
-       RETURNING id, title, type, created_by, settings, created_at, updated_at`,
-        [id, req.user.tenant_id],
-      );
-      const deletedChannel = deleted.rows[0];
-      const deletedSettings = normalizeSettings(deletedChannel.settings);
-
-      // Если удалили текущий post-channel, автоматически назначаем следующий канал.
-      if (deletedSettings.is_post_channel === true) {
-        const next = await client.query(
-          `SELECT id
-         FROM chats
-         WHERE type = 'channel'
-           AND tenant_id = $1
-           AND COALESCE(settings->>'kind', 'channel') = 'channel'
-         ORDER BY updated_at DESC NULLS LAST, created_at DESC
-         LIMIT 1`,
-          [req.user.tenant_id],
-        );
-        if (next.rowCount > 0) {
-          await client.query(
-            `UPDATE chats
-           SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{is_post_channel}', 'true'::jsonb, true),
-               updated_at = now()
-           WHERE id = $1`,
-            [next.rows[0].id],
+          const current = await client.query(
+            `SELECT id, title, settings
+             FROM chats
+             WHERE id = $1 AND type = 'channel' AND tenant_id = $2
+             LIMIT 1
+             FOR UPDATE`,
+            [id, req.user.tenant_id],
           );
+          if (current.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ ok: false, error: "Канал не найден" });
+          }
+          const currentSettings = normalizeSettings(current.rows[0].settings);
+          const systemKey = String(currentSettings.system_key || "")
+            .toLowerCase()
+            .trim();
+          if (
+            (currentSettings.kind && currentSettings.kind !== "channel") ||
+            systemKey === "main_channel" ||
+            systemKey === "reserved_orders" ||
+            currentSettings.admin_only === true ||
+            isBugReportsTitle(current.rows[0].title)
+          ) {
+            await client.query("ROLLBACK");
+            return res
+              .status(403)
+              .json({ ok: false, error: "Системный канал нельзя удалять" });
+          }
+
+          const deleted = await client.query(
+            `DELETE FROM chats
+             WHERE id = $1 AND type = 'channel' AND tenant_id = $2
+             RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+            [id, req.user.tenant_id],
+          );
+          const deletedChannel = deleted.rows[0];
+          const deletedSettings = normalizeSettings(deletedChannel.settings);
+
+          // Если удалили текущий post-channel, автоматически назначаем следующий канал.
+          if (deletedSettings.is_post_channel === true) {
+            const next = await client.query(
+              `SELECT id
+               FROM chats
+               WHERE type = 'channel'
+                 AND tenant_id = $1
+                 AND COALESCE(settings->>'kind', 'channel') = 'channel'
+               ORDER BY updated_at DESC NULLS LAST, created_at DESC
+               LIMIT 1`,
+              [req.user.tenant_id],
+            );
+            if (next.rowCount > 0) {
+              await client.query(
+                `UPDATE chats
+                 SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{is_post_channel}', 'true'::jsonb, true),
+                     updated_at = now()
+                 WHERE id = $1`,
+                [next.rows[0].id],
+              );
+            }
+          }
+
+          await client.query("COMMIT");
+
+          const io = req.app.get("io");
+          if (io) {
+            emitToTenant(io, req.user?.tenant_id || null, "chat:deleted", {
+              chatId: id,
+            });
+          }
+
+          return res.json({ ok: true, data: deletedChannel });
+        } catch (err) {
+          await client.query("ROLLBACK");
+          console.error("admin.channels.delete error", err);
+          return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+        } finally {
+          client.release();
         }
-      }
-
-      await client.query("COMMIT");
-
-      const io = req.app.get("io");
-      if (io) {
-        emitToTenant(io, req.user?.tenant_id || null, "chat:deleted", {
-          chatId: id,
-        });
-      }
-
-      return res.json({ ok: true, data: deletedChannel });
+      });
     } catch (err) {
-      await client.query("ROLLBACK");
-      console.error("admin.channels.delete error", err);
+      console.error("admin.channels.delete scope error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
-    } finally {
-      client.release();
     }
   },
 );
@@ -2584,43 +2594,49 @@ router.get(
   requireProductPublishPermission,
   async (req, res) => {
     try {
-      const result = await db.query(
-        `SELECT q.id,
-              q.product_id,
-              q.channel_id,
-              q.queued_by,
-              q.status,
-              q.is_sent,
-              q.payload,
-              q.created_at,
-              c.title AS channel_title,
-              p.title AS product_title,
-              p.description AS product_description,
-              p.price AS product_price,
-              p.quantity AS product_quantity,
-              p.shelf_number AS product_shelf_number,
-              p.image_url AS product_image_url,
-              p.product_code,
-              u.email AS queued_by_email,
-              u.name AS queued_by_name
-       FROM product_publication_queue q
-       JOIN chats c ON c.id = q.channel_id
-       JOIN products p ON p.id = q.product_id
-       LEFT JOIN users u ON u.id = q.queued_by
-       WHERE q.status = 'pending'
-         AND COALESCE(q.is_sent, false) = false
-         AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
-       ORDER BY q.created_at ASC`,
-        [req.user.tenant_id || null],
-      );
-      const reservedStatsQ = await db.query(
-        `SELECT COUNT(*)::int AS total,
-                COALESCE(SUM(quantity), 0)::int AS units
-         FROM reservations r
-         JOIN users u ON u.id = r.user_id
-         WHERE r.is_fulfilled = false
-           AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
-        [req.user.tenant_id || null],
+      const [result, reservedStatsQ] = await runInRequestTenantScope(
+        req,
+        async () => {
+          const pendingRows = await db.query(
+            `SELECT q.id,
+                  q.product_id,
+                  q.channel_id,
+                  q.queued_by,
+                  q.status,
+                  q.is_sent,
+                  q.payload,
+                  q.created_at,
+                  c.title AS channel_title,
+                  p.title AS product_title,
+                  p.description AS product_description,
+                  p.price AS product_price,
+                  p.quantity AS product_quantity,
+                  p.shelf_number AS product_shelf_number,
+                  p.image_url AS product_image_url,
+                  p.product_code,
+                  u.email AS queued_by_email,
+                  u.name AS queued_by_name
+           FROM product_publication_queue q
+           JOIN chats c ON c.id = q.channel_id
+           JOIN products p ON p.id = q.product_id
+           LEFT JOIN users u ON u.id = q.queued_by
+           WHERE q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+             AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
+           ORDER BY q.created_at ASC`,
+            [req.user.tenant_id || null],
+          );
+          const reservedStats = await db.query(
+            `SELECT COUNT(*)::int AS total,
+                    COALESCE(SUM(quantity), 0)::int AS units
+             FROM reservations r
+             JOIN users u ON u.id = r.user_id
+             WHERE r.is_fulfilled = false
+               AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
+            [req.user.tenant_id || null],
+          );
+          return [pendingRows, reservedStats];
+        },
       );
       return res.json({
         ok: true,
@@ -2972,14 +2988,6 @@ router.post(
         });
       }
 
-      if (requiresManualShelf && manualShelf == null) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          error: "Для администратора нужно вручную указать номер полки",
-        });
-      }
-
       const shelfQ = await client.query(
         `SELECT shelf_number
          FROM user_shelves
@@ -2989,9 +2997,20 @@ router.post(
         [item.user_id],
       );
 
+      const existingShelf = shelfQ.rowCount > 0
+        ? Number(shelfQ.rows[0].shelf_number)
+        : null;
+      if (requiresManualShelf && manualShelf == null && !(existingShelf != null && existingShelf > 0)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Для первого товара в корзине нужно вручную указать номер полки",
+        });
+      }
+
       let finalShelf = manualShelf;
       if (finalShelf == null) {
-        finalShelf = shelfQ.rowCount > 0 ? Number(shelfQ.rows[0].shelf_number) : null;
+        finalShelf = existingShelf;
       }
       if (finalShelf == null) {
         finalShelf = await resolveAutoShelfNumber(
@@ -3079,6 +3098,21 @@ router.post(
           targetCartItemId,
         ],
       );
+      const syncedPendingClientMessages = await client.query(
+        `UPDATE messages
+         SET meta = jsonb_set(
+               COALESCE(meta, '{}'::jsonb),
+               '{shelf_number}',
+               to_jsonb($2::int),
+               true
+             )
+         WHERE chat_id = $1
+           AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
+           AND COALESCE(meta->>'user_id', '') = $3
+           AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
+         RETURNING id, chat_id, sender_id, text, meta, created_at`,
+        [reservedChannel.id, finalShelf, String(item.user_id)],
+      );
 
       let hiddenCatalogMessages = [];
       const productIdText = String(item.product_id || "").trim();
@@ -3148,7 +3182,14 @@ router.post(
 
       const io = req.app.get("io");
       if (io) {
+        const reservationMessagesById = new Map();
         for (const message of updatedReservedMessages.rows) {
+          reservationMessagesById.set(String(message.id), message);
+        }
+        for (const message of syncedPendingClientMessages.rows) {
+          reservationMessagesById.set(String(message.id), message);
+        }
+        for (const message of reservationMessagesById.values()) {
           io.to(`chat:${reservedChannel.id}`).emit("chat:message", {
             chatId: reservedChannel.id,
             message: decryptMessageRow(message),
