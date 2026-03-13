@@ -1787,8 +1787,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             theme: _buildLightTheme(),
             darkTheme: _buildDarkTheme(),
             home: Scaffold(
-              appBar: AppBar(title: const Text('Загрузка...')),
-              body: PhoenixLoadingView(
+              body: PhoenixWingLoadingView(
                 title: 'Проект Феникс запускается',
                 subtitle: _status ?? 'Подготавливаем приложение',
               ),
