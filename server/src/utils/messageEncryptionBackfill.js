@@ -198,11 +198,13 @@ async function runMessageEncryptionBackfill({ logger = console } = {}) {
 
   try {
     const tenantsQ = await db.platformQuery(
-      `SELECT id, code, name, db_mode, db_url
+      `SELECT id, code, name, db_mode, db_url, db_schema
        FROM tenants
        WHERE status = 'active'
-         AND lower(coalesce(db_mode, '')) = 'isolated'
-         AND coalesce(db_url, '') <> ''`,
+         AND (
+           (lower(coalesce(db_mode, '')) = 'isolated' AND coalesce(db_url, '') <> '')
+           OR (lower(coalesce(db_mode, '')) = 'schema_isolated' AND coalesce(db_schema, '') <> '')
+         )`,
     );
     for (const tenant of tenantsQ.rows) {
       scannedIsolated += 1;

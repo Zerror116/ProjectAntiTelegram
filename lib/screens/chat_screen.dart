@@ -69,6 +69,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _voiceSending = false;
   bool _pinLoading = false;
   bool _hasDraftText = false;
+  bool _offlineSyncBusy = false;
+  int _offlineQueuedCount = 0;
 
   String _searchQuery = '';
   List<String> _searchResultIds = const [];
@@ -83,6 +85,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _incomingTimer;
   Timer? _readDebounceTimer;
   Timer? _voiceRecordingTimer;
+  Timer? _offlineQueueRefreshTimer;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -101,6 +104,11 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadMessages();
     _loadPinnedMessage();
     _joinRoom();
+    unawaited(_refreshOfflineQueueCount());
+    _offlineQueueRefreshTimer = Timer.periodic(
+      const Duration(seconds: 8),
+      (_) => unawaited(_refreshOfflineQueueCount()),
+    );
 
     _searchController.addListener(() {
       final next = _searchController.text.trim();
@@ -202,6 +210,11 @@ class _ChatScreenState extends State<ChatScreen> {
         } else {
           setState(() => _activePin = null);
         }
+        return;
+      }
+      if (type == 'cart:offline-sync') {
+        unawaited(_refreshOfflineQueueCount());
+        unawaited(_loadMessages());
       }
     });
   }
@@ -214,6 +227,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _incomingTimer?.cancel();
     _readDebounceTimer?.cancel();
     _voiceRecordingTimer?.cancel();
+    _offlineQueueRefreshTimer?.cancel();
     _chatSub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
@@ -809,6 +823,81 @@ class _ChatScreenState extends State<ChatScreen> {
       return 'В этом публичном канале писать может только администрация';
     }
     return 'В этом чате отправка сообщений недоступна';
+  }
+
+  Future<void> _refreshOfflineQueueCount() async {
+    if (!mounted) return;
+    if (!_isClientRole()) {
+      if (_offlineQueuedCount != 0) {
+        setState(() => _offlineQueuedCount = 0);
+      }
+      return;
+    }
+    final userId = authService.currentUser?.id.trim() ?? '';
+    if (userId.isEmpty) return;
+    try {
+      final nextCount = await offlinePurchaseQueueService.countForUser(
+        userId,
+        tenantCode: authService.currentUser?.tenantCode,
+      );
+      if (!mounted) return;
+      if (nextCount != _offlineQueuedCount) {
+        setState(() => _offlineQueuedCount = nextCount);
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  Future<void> _syncOfflinePurchasesNow() async {
+    if (_offlineSyncBusy || !_isClientRole()) return;
+    final user = authService.currentUser;
+    final userId = user?.id.trim() ?? '';
+    if (userId.isEmpty) return;
+    setState(() => _offlineSyncBusy = true);
+    try {
+      final result = await offlinePurchaseQueueService.flushQueuedPurchases(
+        dio: authService.dio,
+        userId: userId,
+        tenantCode: user?.tenantCode,
+      );
+      await _refreshOfflineQueueCount();
+      if (!mounted) return;
+      if (result.confirmed > 0) {
+        showAppNotice(
+          context,
+          'Подтверждено оффлайн-покупок: ${result.confirmed}',
+          tone: AppNoticeTone.success,
+          duration: const Duration(seconds: 2),
+        );
+      } else if (result.rejected > 0) {
+        showAppNotice(
+          context,
+          'Отклонено оффлайн-покупок: ${result.rejected}',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+      } else {
+        showAppNotice(
+          context,
+          'Новых синхронизаций пока нет',
+          duration: const Duration(seconds: 2),
+        );
+      }
+      if (result.confirmed > 0 || result.rejected > 0) {
+        await _loadMessages();
+      }
+    } catch (_) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось синхронизировать оффлайн-покупки',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+    } finally {
+      if (mounted) setState(() => _offlineSyncBusy = false);
+    }
   }
 
   Future<void> _joinRoom() async {
@@ -1423,6 +1512,33 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
     } catch (e) {
+      if (_isLikelyOfflineBuyError(e)) {
+        final user = authService.currentUser;
+        final userId = user?.id.trim() ?? '';
+        if (userId.isNotEmpty) {
+          try {
+            final queued = await offlinePurchaseQueueService.enqueuePurchase(
+              userId: userId,
+              tenantCode: user?.tenantCode,
+              productId: productId,
+              quantity: 1,
+              sourceChatId: widget.chatId,
+            );
+            if (!mounted) return;
+            showAppNotice(
+              context,
+              'Нет сети. Покупка сохранена оффлайн (${queued.quantity} шт.). '
+              'Отправим автоматически, как только появится интернет.',
+              tone: AppNoticeTone.warning,
+              duration: const Duration(seconds: 3),
+            );
+            await playAppSound(AppUiSound.warning);
+            return;
+          } catch (_) {
+            // fallback to common error toast below
+          }
+        }
+      }
       if (!mounted) return;
       showAppNotice(
         context,
@@ -1450,6 +1566,21 @@ class _ChatScreenState extends State<ChatScreen> {
       return e.message ?? 'Ошибка запроса';
     }
     return e.toString();
+  }
+
+  bool _isLikelyOfflineBuyError(Object e) {
+    if (e is! DioException) return false;
+    if (e.type == DioExceptionType.connectionError ||
+        e.type == DioExceptionType.connectionTimeout ||
+        e.type == DioExceptionType.sendTimeout ||
+        e.type == DioExceptionType.receiveTimeout) {
+      return true;
+    }
+    final text = (e.message ?? '').toLowerCase();
+    return text.contains('connection refused') ||
+        text.contains('failed host lookup') ||
+        text.contains('socketexception') ||
+        text.contains('network is unreachable');
   }
 
   bool _isCatalogProduct(Map<String, dynamic> message) {
@@ -3413,6 +3544,48 @@ class _ChatScreenState extends State<ChatScreen> {
                         fontWeight: FontWeight.w600,
                       ),
                     ),
+                  ),
+                ],
+              ),
+            ),
+          if (_isClientRole() && _offlineQueuedCount > 0)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.fromLTRB(12, 10, 12, 2),
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.tertiaryContainer,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: Theme.of(context).colorScheme.tertiary,
+                ),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.cloud_off_outlined,
+                    color: Theme.of(context).colorScheme.onTertiaryContainer,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Оффлайн-покупок в очереди: $_offlineQueuedCount. '
+                      'Они отправятся автоматически, когда появится интернет.',
+                      style: TextStyle(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.onTertiaryContainer,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: _offlineSyncBusy ? null : _syncOfflinePurchasesNow,
+                    child: _offlineSyncBusy
+                        ? const Text('...')
+                        : const Text('Синхр.'),
                   ),
                 ],
               ),

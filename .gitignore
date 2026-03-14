@@ -1,5 +1,7 @@
 .env
 .env.*
+!.env.example
+!server/.env.example
 
 .DS_Store
 .idea/
@@ -12,7 +14,8 @@ build/
 server/node_modules/
 server/build/
 server/uploads/
-server/audit/nightly-self-audit.md
+server/audit/*.md
+server/audit/*.json
 
 **/__pycache__/
 *.pyc

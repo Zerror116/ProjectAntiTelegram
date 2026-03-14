@@ -33,6 +33,9 @@ async function applyClientContext(client, ctx = currentContext()) {
   await client.query("SELECT set_config('app.tenant_id', $1, false)", [
     tenantSetting,
   ]);
+  await client.query("SELECT set_config('search_path', $1, false)", [
+    resolveSearchPath(ctx),
+  ]);
 }
 
 function normalizeTenantCode(raw) {
@@ -50,6 +53,32 @@ function isIsolatedTenantRow(row) {
   return mode === 'isolated' && dbUrl.length > 0;
 }
 
+function isSchemaIsolatedTenantRow(row) {
+  const mode = String(row?.db_mode || '')
+    .toLowerCase()
+    .trim();
+  const schemaName = String(row?.db_schema || '')
+    .toLowerCase()
+    .trim();
+  return mode === 'schema_isolated' && schemaName.length > 0;
+}
+
+function normalizeSchemaName(raw) {
+  return String(raw || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48);
+}
+
+function resolveSearchPath(ctx = currentContext()) {
+  const schemaName = normalizeSchemaName(ctx?.tenant?.db_schema || '');
+  if (isSchemaIsolatedTenantRow(ctx?.tenant) && schemaName) {
+    return `"${schemaName}", public`;
+  }
+  return 'public';
+}
+
 async function resolveTenantByCode(tenantCode) {
   const normalized = normalizeTenantCode(tenantCode);
   if (!normalized) return null;
@@ -61,7 +90,8 @@ async function resolveTenantByCode(tenantCode) {
             subscription_expires_at,
             db_mode,
             db_url,
-            db_name
+            db_name,
+            db_schema
      FROM tenants
      WHERE lower(code) = $1
      LIMIT 1`,
@@ -81,7 +111,8 @@ async function resolveTenantById(tenantId) {
             subscription_expires_at,
             db_mode,
             db_url,
-            db_name
+            db_name,
+            db_schema
      FROM tenants
      WHERE id = $1
      LIMIT 1`,
@@ -133,7 +164,11 @@ async function runWithTenantRow(tenantRow, fn) {
     {
       pool,
       tenant: tenantRow,
-      source: isIsolatedTenantRow(tenantRow) ? 'tenant-isolated' : 'shared',
+      source: isIsolatedTenantRow(tenantRow)
+        ? 'tenant-isolated'
+        : isSchemaIsolatedTenantRow(tenantRow)
+        ? 'tenant-schema-isolated'
+        : 'shared',
     },
     fn,
   );
@@ -182,6 +217,9 @@ async function connect() {
     if (contextReady) return;
     await originalQuery("SELECT set_config('app.tenant_id', $1, false)", [
       resolveTenantSettingValue(ctx),
+    ]);
+    await originalQuery("SELECT set_config('search_path', $1, false)", [
+      resolveSearchPath(ctx),
     ]);
     contextReady = true;
   };
@@ -259,6 +297,7 @@ module.exports = {
   // Tenant helpers
   normalizeTenantCode,
   isIsolatedTenantRow,
+  isSchemaIsolatedTenantRow,
   resolveTenantByCode,
   resolveTenantById,
   runWithTenantRow,

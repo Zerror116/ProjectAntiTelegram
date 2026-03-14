@@ -1,7 +1,12 @@
 const path = require('path');
 const { Pool } = require('pg');
 
-const { ensureDatabaseExists, applyMigrationsToTarget } = require('./bootstrap');
+const {
+  ensureDatabaseExists,
+  applyMigrationsToTarget,
+  sanitizeSchemaName,
+  quoteIdentifier,
+} = require('./bootstrap');
 const { ensureSystemChannels } = require('./systemChannels');
 
 function sanitizeTenantDbNameFragment(raw) {
@@ -21,6 +26,38 @@ function buildDatabaseUrlWithName(baseDbUrl, dbName) {
   const base = new URL(baseDbUrl);
   base.pathname = `/${dbName}`;
   return base.toString();
+}
+
+function buildTenantSchemaName(tenantCode) {
+  const fragment = sanitizeTenantDbNameFragment(tenantCode) || 'tenant';
+  return sanitizeSchemaName(`tenant_${fragment}`) || 'tenant_scope';
+}
+
+function parseDatabaseNameFromUrl(dbUrl) {
+  try {
+    const url = new URL(dbUrl);
+    return (url.pathname || '').replace(/^\//, '') || 'postgres';
+  } catch (_) {
+    return 'postgres';
+  }
+}
+
+function isCreateDbPermissionError(err) {
+  const code = String(err?.code || '').trim();
+  if (code === '42501') return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return msg.includes('permission denied') && msg.includes('create database');
+}
+
+async function setSessionSchemaSearchPath(pool, schemaName) {
+  const normalized = sanitizeSchemaName(schemaName);
+  if (!normalized) return;
+  await pool.query(
+    `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(normalized)}`,
+  );
+  await pool.query("SELECT set_config('search_path', $1, false)", [
+    `${quoteIdentifier(normalized)}, public`,
+  ]);
 }
 
 async function resolveShadowCreatedBy(pool, createdBy) {
@@ -49,9 +86,14 @@ async function upsertTenantShadowRow({
   subscriptionExpiresAt,
   createdBy,
   notes,
+  dbMode = 'isolated',
+  dbSchema = null,
 }) {
   const pool = new Pool({ connectionString: dbUrl });
   try {
+    if (dbSchema) {
+      await setSessionSchemaSearchPath(pool, dbSchema);
+    }
     await pool.query('BEGIN');
     const shadowCreatedBy = await resolveShadowCreatedBy(pool, createdBy);
     await pool.query(
@@ -69,6 +111,7 @@ async function upsertTenantShadowRow({
          notes,
          db_mode,
          db_name,
+         db_schema,
          db_url,
          created_at,
          updated_at
@@ -77,7 +120,7 @@ async function upsertTenantShadowRow({
          $1, $2, $3, $4, $5, $6,
          $7, $8, now(),
          $9, $10,
-         'isolated', current_database(), NULL,
+         $11, current_database(), $12, NULL,
          now(), now()
        )
        ON CONFLICT (id)
@@ -91,8 +134,9 @@ async function upsertTenantShadowRow({
          subscription_expires_at = EXCLUDED.subscription_expires_at,
          last_payment_confirmed_at = now(),
          notes = EXCLUDED.notes,
-         db_mode = 'isolated',
+         db_mode = EXCLUDED.db_mode,
          db_name = current_database(),
+         db_schema = EXCLUDED.db_schema,
          db_url = NULL,
          updated_at = now()`,
       [
@@ -106,6 +150,8 @@ async function upsertTenantShadowRow({
         subscriptionExpiresAt,
         shadowCreatedBy,
         notes || null,
+        dbMode,
+        dbSchema ? sanitizeSchemaName(dbSchema) : null,
       ],
     );
 
@@ -141,34 +187,75 @@ async function provisionIsolatedTenantDatabase({
   const migrationsDir = path.resolve(__dirname, '../../migrations');
   const dbName = buildTenantDatabaseName(tenantCode || tenantId);
   const dbUrl = buildDatabaseUrlWithName(platformDbUrl, dbName);
+  try {
+    await ensureDatabaseExists(dbUrl);
+    await applyMigrationsToTarget(dbUrl, migrationsDir);
 
-  await ensureDatabaseExists(dbUrl);
-  await applyMigrationsToTarget(dbUrl, migrationsDir);
+    const systemChannels = await upsertTenantShadowRow({
+      dbUrl,
+      tenantId,
+      tenantCode,
+      tenantName,
+      accessKeyHash,
+      accessKeyMask,
+      accessKeyValue,
+      status,
+      subscriptionExpiresAt,
+      createdBy,
+      notes,
+      dbMode: 'isolated',
+      dbSchema: null,
+    });
 
-  const systemChannels = await upsertTenantShadowRow({
-    dbUrl,
-    tenantId,
-    tenantCode,
-    tenantName,
-    accessKeyHash,
-    accessKeyMask,
-    accessKeyValue,
-    status,
-    subscriptionExpiresAt,
-    createdBy,
-    notes,
-  });
+    return {
+      dbMode: 'isolated',
+      dbName,
+      dbUrl,
+      dbSchema: null,
+      systemChannels,
+    };
+  } catch (err) {
+    if (!isCreateDbPermissionError(err)) {
+      throw err;
+    }
 
-  return {
-    dbName,
-    dbUrl,
-    systemChannels,
-  };
+    const dbSchema = buildTenantSchemaName(tenantCode || tenantId);
+    await applyMigrationsToTarget(platformDbUrl, migrationsDir, {
+      schemaName: dbSchema,
+    });
+
+    const systemChannels = await upsertTenantShadowRow({
+      dbUrl: platformDbUrl,
+      tenantId,
+      tenantCode,
+      tenantName,
+      accessKeyHash,
+      accessKeyMask,
+      accessKeyValue,
+      status,
+      subscriptionExpiresAt,
+      createdBy,
+      notes,
+      dbMode: 'schema_isolated',
+      dbSchema,
+    });
+
+    return {
+      dbMode: 'schema_isolated',
+      dbName: parseDatabaseNameFromUrl(platformDbUrl),
+      dbUrl: null,
+      dbSchema,
+      systemChannels,
+      fallbackReason: 'createdb_permission_denied',
+    };
+  }
 }
 
 module.exports = {
   sanitizeTenantDbNameFragment,
   buildTenantDatabaseName,
   buildDatabaseUrlWithName,
+  buildTenantSchemaName,
+  isCreateDbPermissionError,
   provisionIsolatedTenantDatabase,
 };
