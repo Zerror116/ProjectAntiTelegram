@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -16,18 +17,27 @@ Future<String> generateDeviceFingerprint() async {
     return cached;
   }
 
-  final di = DeviceInfoPlugin();
-  final info = await di.deviceInfo;
-  final infoMap = info.data;
+  String raw = '';
+  try {
+    final di = DeviceInfoPlugin();
+    final info = await di.deviceInfo;
+    final infoMap = info.data;
 
-  // Собираем набор полей, которые обычно присутствуют на разных платформах.
-  // Не используем поля, которые могут содержать чувствительную информацию.
-  final model = infoMap['model'] ?? infoMap['name'] ?? '';
-  final manufacturer = infoMap['manufacturer'] ?? '';
-  final osVersion = infoMap['osVersion'] ?? infoMap['systemVersion'] ?? '';
-  final id = infoMap['identifierForVendor'] ?? infoMap['id'] ?? '';
-
-  final raw = '$model|$manufacturer|$osVersion|$id';
+    // Собираем набор полей, которые обычно присутствуют на разных платформах.
+    // Не используем поля, которые могут содержать чувствительную информацию.
+    final model = infoMap['model'] ?? infoMap['name'] ?? '';
+    final manufacturer = infoMap['manufacturer'] ?? '';
+    final osVersion = infoMap['osVersion'] ?? infoMap['systemVersion'] ?? '';
+    final id = infoMap['identifierForVendor'] ?? infoMap['id'] ?? '';
+    raw = '$model|$manufacturer|$osVersion|$id';
+  } catch (_) {
+    // fallback ниже
+  }
+  if (raw.trim().isEmpty) {
+    final rnd = Random.secure();
+    final entropy = List<int>.generate(32, (_) => rnd.nextInt(256));
+    raw = base64UrlEncode(entropy);
+  }
 
   final bytes = utf8.encode(raw);
   final digest = sha256.convert(bytes);

@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
 import 'screens/auth_screen.dart';
+import 'screens/phone_access_pending_screen.dart';
 import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
@@ -63,12 +64,14 @@ const _uiCardSizePrefPrefix = 'ui_card_size_';
 const _performanceModePrefPrefix = 'performance_mode_';
 String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
+String? _activePhoneAccessDialogRequestId;
 final AudioPlayer _appSoundPlayer = AudioPlayer();
 bool _appSoundPlayerPrepared = false;
 bool _socketInitInProgress = false;
 String? _socketBoundUserId;
 String? _socketBoundViewRole;
 String _lastConnectivityHint = '';
+bool _keyboardAssertRecoveredRecently = false;
 
 enum AppNoticeTone { info, success, warning, error }
 
@@ -439,6 +442,126 @@ void showGlobalAppNotice(
   Duration duration = const Duration(seconds: 5),
 }) {
   _showGlobalNotice(message, title: title, tone: tone, duration: duration);
+}
+
+bool _isPhoneAccessRestrictedState(String state) {
+  final normalized = state.toLowerCase().trim();
+  return normalized == 'pending' || normalized == 'rejected';
+}
+
+bool _isDuplicateKeyDownKeyboardAssert(Object error) {
+  final text = error.toString();
+  return text.contains(
+        'A KeyDownEvent is dispatched, but the state shows that the physical key is already pressed',
+      ) ||
+      text.contains("hardware_keyboard.dart': Failed assertion: line 516");
+}
+
+Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
+  if (data is! Map) return;
+  final map = Map<String, dynamic>.from(data);
+  final requestId = (map['request_id'] ?? '').toString().trim();
+  if (requestId.isEmpty) return;
+  if (_activePhoneAccessDialogRequestId == requestId) return;
+
+  final requesterName = (map['requester_name'] ?? '').toString().trim();
+  final requesterEmail = (map['requester_email'] ?? '').toString().trim();
+  final phone = (map['phone'] ?? '').toString().trim();
+  final requesterLabel = requesterName.isNotEmpty
+      ? requesterName
+      : (requesterEmail.isNotEmpty ? requesterEmail : 'пользователь');
+  showGlobalAppNotice(
+    'Новый запрос на общий доступ к корзине ($requesterLabel)',
+    title: 'Подтверждение номера',
+    tone: AppNoticeTone.warning,
+  );
+
+  final context = navigatorKey.currentContext;
+  if (context == null || !context.mounted) return;
+  _activePhoneAccessDialogRequestId = requestId;
+  try {
+    final decision = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Запрос на общий номер'),
+          content: Text(
+            'Пользователь "$requesterLabel" хочет зарегистрироваться на ваш номер'
+            '${phone.isNotEmpty ? ' ($phone)' : ''}.\n\n'
+            'Разрешить доступ к вашей корзине?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop('reject'),
+              child: const Text('Отклонить'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop('approve'),
+              child: const Text('Разрешить'),
+            ),
+          ],
+        );
+      },
+    );
+    if (decision == null) return;
+    await dio.post(
+      '/api/auth/phone-access/requests/$requestId/decision',
+      data: {'decision': decision},
+    );
+    showGlobalAppNotice(
+      decision == 'approve' ? 'Доступ к корзине разрешён' : 'Запрос отклонён',
+      title: 'Подтверждение номера',
+      tone: decision == 'approve' ? AppNoticeTone.success : AppNoticeTone.info,
+    );
+  } on DioException catch (e) {
+    final body = e.response?.data;
+    final map = body is Map ? Map<String, dynamic>.from(body) : null;
+    final message = (map?['error'] ?? e.message ?? 'Ошибка решения запроса')
+        .toString()
+        .trim();
+    showGlobalAppNotice(
+      message.isEmpty ? 'Ошибка решения запроса' : message,
+      title: 'Подтверждение номера',
+      tone: AppNoticeTone.error,
+    );
+  } catch (_) {
+    showGlobalAppNotice(
+      'Ошибка решения запроса',
+      title: 'Подтверждение номера',
+      tone: AppNoticeTone.error,
+    );
+  } finally {
+    _activePhoneAccessDialogRequestId = null;
+  }
+}
+
+Future<void> _probePendingPhoneAccessRequests() async {
+  try {
+    final user = authService.currentUser;
+    if (user == null) return;
+    final resp = await dio.get('/api/auth/phone-access/requests');
+    final root = resp.data is Map
+        ? Map<String, dynamic>.from(resp.data as Map)
+        : const <String, dynamic>{};
+    final data = root['data'];
+    if (data is! List || data.isEmpty) return;
+    final firstRaw = data.first;
+    if (firstRaw is! Map) return;
+    final first = Map<String, dynamic>.from(firstRaw);
+    final requestId = (first['id'] ?? '').toString().trim();
+    if (requestId.isEmpty) return;
+    await _handlePhoneAccessRequestEvent({
+      'request_id': requestId,
+      'requester_name': first['requester_name'],
+      'requester_email': first['requester_email'],
+      'requester_user_id': first['requester_user_id'],
+      'phone': first['phone'],
+      'requested_at': first['requested_at'],
+    });
+  } catch (_) {
+    // ignore
+  }
 }
 
 Duration _normalizeNoticeDuration(Duration duration) {
@@ -1463,6 +1586,30 @@ Future<void> _initSocket() async {
       _applySubscriptionSocketUpdate(data);
     });
 
+    socket?.on('phone-access:request', (data) {
+      debugPrint('📬 Socket event phone-access:request -> $data');
+      unawaited(_handlePhoneAccessRequestEvent(data));
+    });
+
+    socket?.on('phone-access:decision', (data) {
+      debugPrint('📬 Socket event phone-access:decision -> $data');
+      final map = data is Map ? Map<String, dynamic>.from(data) : null;
+      final status = (map?['status'] ?? '').toString().trim().toLowerCase();
+      if (status == 'approved') {
+        showGlobalAppNotice(
+          'Владелец номера разрешил доступ к корзине',
+          title: 'Подтверждение номера',
+          tone: AppNoticeTone.success,
+        );
+      } else if (status == 'rejected') {
+        showGlobalAppNotice(
+          'Владелец номера отклонил запрос',
+          title: 'Подтверждение номера',
+          tone: AppNoticeTone.error,
+        );
+      }
+    });
+
     socket?.on('cart:updated', (data) {
       debugPrint('📬 Socket event cart:updated -> $data');
       chatEventsController.add({'type': 'cart:updated', 'data': data});
@@ -1531,7 +1678,15 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
       final user = Map<String, dynamic>.from(resp.data['user']);
       final name = user['name'];
       final phone = user['phone'];
+      final phoneAccessState =
+          (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
+              .toString()
+              .trim()
+              .toLowerCase();
       debugPrint('determineInitialScreen: user name=$name phone=$phone');
+      if (_isPhoneAccessRestrictedState(phoneAccessState)) {
+        return const PhoneAccessPendingScreen();
+      }
       if (name == null ||
           (phone == null || (phone is String && phone.trim().isEmpty))) {
         return const PhoneNameScreen(isRegisterFlow: false);
@@ -1555,6 +1710,21 @@ Future<void> main() async {
   }
 
   FlutterError.onError = (FlutterErrorDetails details) {
+    if (_isDuplicateKeyDownKeyboardAssert(details.exception)) {
+      try {
+        unawaited(HardwareKeyboard.instance.syncKeyboardState());
+        if (!_keyboardAssertRecoveredRecently) {
+          _keyboardAssertRecoveredRecently = true;
+          debugPrint(
+            'Recovered from duplicate KeyDownEvent assert by resetting HardwareKeyboard state.',
+          );
+          Future<void>.delayed(const Duration(seconds: 2), () {
+            _keyboardAssertRecoveredRecently = false;
+          });
+        }
+      } catch (_) {}
+      return;
+    }
     FlutterError.presentError(details);
     debugPrint(
       'FlutterError caught: ${details.exceptionAsString()}\n${details.stack}',
@@ -1626,16 +1796,16 @@ class DiagnosticBootstrap extends StatefulWidget {
 
 class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Widget? _home;
-  String? _status;
   StreamSubscription<User?>? _authSub;
   Timer? _subscriptionProbeTimer;
   bool _subscriptionProbeBusy = false;
+  Timer? _phoneAccessProbeTimer;
+  bool _phoneAccessProbeBusy = false;
 
   void _showAuthScreen() {
     if (!mounted) return;
     setState(() {
       _home = const AuthScreen();
-      _status = null;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final navigator = navigatorKey.currentState;
@@ -1656,6 +1826,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       _authSub?.cancel();
     } catch (_) {}
     _subscriptionProbeTimer?.cancel();
+    _phoneAccessProbeTimer?.cancel();
     super.dispose();
   }
 
@@ -1666,6 +1837,29 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       (_) => unawaited(_probeSubscriptionState()),
     );
     unawaited(_probeSubscriptionState());
+  }
+
+  void _restartPhoneAccessProbe() {
+    _phoneAccessProbeTimer?.cancel();
+    _phoneAccessProbeTimer = Timer.periodic(
+      const Duration(seconds: 8),
+      (_) => unawaited(_probePhoneAccessOwnerRequests()),
+    );
+    unawaited(_probePhoneAccessOwnerRequests());
+  }
+
+  Future<void> _probePhoneAccessOwnerRequests() async {
+    if (!mounted || _phoneAccessProbeBusy) return;
+    final user = authService.currentUser;
+    if (user == null) return;
+    _phoneAccessProbeBusy = true;
+    try {
+      await _probePendingPhoneAccessRequests();
+    } catch (_) {
+      // ignore
+    } finally {
+      _phoneAccessProbeBusy = false;
+    }
   }
 
   Future<void> _probeSubscriptionState() async {
@@ -1707,7 +1901,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   }
 
   Future<void> _startInit() async {
-    setState(() => _status = 'Инициализация: attaching interceptor');
     try {
       authService = AuthService(dio: dio);
       _attachAuthInterceptor();
@@ -1734,11 +1927,13 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           } catch (e) {
             debugPrint('Failed to init socket after login: $e');
           }
+          unawaited(_probePendingPhoneAccessRequests());
           await refreshUserPreferences();
           _updateSubscriptionUiState();
         }
       });
       _restartSubscriptionProbe();
+      _restartPhoneAccessProbe();
 
       await refreshUserPreferences();
       unawaited(_prepareAppSoundPlayer());
@@ -1746,14 +1941,13 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       debugPrint('Error attaching interceptor: $e\n$st');
     }
 
-    setState(() => _status = 'Инициализация: проверка БД');
     final dbReady = await ensureDatabaseExists();
 
-    setState(() => _status = 'Инициализация: определение стартового экрана');
     final initial = await determineInitialScreen(
       dbReady,
     ).timeout(const Duration(seconds: 25), onTimeout: () => const AuthScreen());
     _updateSubscriptionUiState();
+    unawaited(_probePendingPhoneAccessRequests());
     await refreshUserPreferences();
 
     debugPrint(
@@ -1762,7 +1956,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     if (!mounted) return;
     setState(() {
       _home = initial;
-      _status = null;
     });
   }
 
@@ -1789,7 +1982,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             home: Scaffold(
               body: PhoenixWingLoadingView(
                 title: 'Проект Феникс запускается',
-                subtitle: _status ?? 'Подготавливаем приложение',
+                subtitle: 'Подключаемся к серверу и загружаем данные',
               ),
             ),
             builder: (context, child) {
@@ -1821,6 +2014,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           routes: {
             '/auth': (_) => const AuthScreen(),
             '/phone_name': (_) => const PhoneNameScreen(isRegisterFlow: false),
+            '/phone_access_pending': (_) => const PhoneAccessPendingScreen(),
             '/main': (_) => const MainShell(),
           },
           builder: (context, child) {

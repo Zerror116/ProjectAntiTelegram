@@ -567,6 +567,12 @@ router.get("/", authMiddleware, async (req, res) => {
       ok: true,
       user: {
         ...user,
+        phone_access_state:
+          String(req.user?.phone_access_state || '').trim() || 'none',
+        phone_access:
+          req.user?.phone_access && typeof req.user.phone_access === 'object'
+            ? req.user.phone_access
+            : { state: 'none' },
         permissions:
           resolvedPermissions &&
           resolvedPermissions.permissions &&

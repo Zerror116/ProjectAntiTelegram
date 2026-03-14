@@ -508,6 +508,10 @@ class AuthService {
     }
   }
 
+  Future<String?> getDeviceFingerprintForRequest() async {
+    return await _getDeviceFingerprintSafe();
+  }
+
   /// Вход
   Future<Map<String, dynamic>> login({
     required String email,

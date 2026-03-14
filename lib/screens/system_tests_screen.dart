@@ -729,6 +729,51 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
     await playAppSound(sound);
   }
 
+  Future<void> _previewEntryAnimation() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final theme = Theme.of(dialogContext);
+        return Dialog(
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 18,
+            vertical: 24,
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const PhoenixWingLoadingView(
+                  title: 'Предпросмотр анимации входа',
+                  subtitle: 'Качественная анимация на основе исходной иконки',
+                  size: 132,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Проверьте плавность, контраст и читаемость на вашем устройстве.',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                    child: const Text('Закрыть'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Future<void> _loadDeliverySnapshot() async {
     setState(() => _deliveryBusy = true);
     try {
@@ -2482,10 +2527,21 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(color: theme.colorScheme.outlineVariant),
               ),
-              child: const PhoenixLoadingView(
-                title: 'Проверка лоадера',
-                subtitle: 'Так выглядит анимированная загрузка',
-                size: 60,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const PhoenixWingLoadingView(
+                    title: 'Проверка входной анимации',
+                    subtitle: 'Реальный лоадер стартового экрана',
+                    size: 108,
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.tonalIcon(
+                    onPressed: _previewEntryAnimation,
+                    icon: const Icon(Icons.play_circle_outline_rounded),
+                    label: const Text('Открыть тест анимации входа'),
+                  ),
+                ],
               ),
             ),
           ],

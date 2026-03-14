@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
 import '../main.dart';
+import 'phone_access_pending_screen.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/input_language_badge.dart';
 
@@ -46,6 +47,33 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   bool get _isCreatorCurrentUser {
     final email = authService.currentUser?.email;
     return email != null && email.toLowerCase() == _creatorEmail.toLowerCase();
+  }
+
+  Future<void> _goNextAfterProfileCheck() async {
+    try {
+      final profileResp = await authService.dio.get('/api/profile');
+      final root = (profileResp.data is Map)
+          ? Map<String, dynamic>.from(profileResp.data as Map)
+          : const <String, dynamic>{};
+      final user = (root['user'] is Map)
+          ? Map<String, dynamic>.from(root['user'] as Map)
+          : const <String, dynamic>{};
+      final phoneAccessState =
+          (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
+              .toString()
+              .trim()
+              .toLowerCase();
+      if (!mounted) return;
+      if (phoneAccessState == 'pending' || phoneAccessState == 'rejected') {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const PhoneAccessPendingScreen()),
+          (route) => false,
+        );
+        return;
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    Navigator.of(context).pushNamedAndRemoveUntil('/main', (route) => false);
   }
 
   bool get _shouldShowSecretField =>
@@ -201,11 +229,15 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           return;
         }
 
+        final deviceFingerprint = await authService
+            .getDeviceFingerprintForRequest();
         final data = {
           'email': pendingEmail,
           'password': pendingPassword,
           'name': name,
           'phone': apiPhone,
+          if (deviceFingerprint != null && deviceFingerprint.trim().isNotEmpty)
+            'device_fingerprint': deviceFingerprint.trim(),
           if ((authService.pendingAccessKey ?? '').trim().isNotEmpty)
             'access_key': authService.pendingAccessKey!.trim(),
         };
@@ -246,10 +278,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         } catch (_) {}
 
         if (!mounted) return;
-        Navigator.of(context).pushNamedAndRemoveUntil(
-          '/main',
-          (route) => false,
-        );
+        await _goNextAfterProfileCheck();
         return;
       } else {
         final profileData = {'name': name};
@@ -280,10 +309,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           } catch (_) {}
 
           if (!mounted) return;
-          Navigator.of(context).pushNamedAndRemoveUntil(
-            '/main',
-            (route) => false,
-          );
+          await _goNextAfterProfileCheck();
           return;
         } else {
           setState(() => _message = 'Ошибка обновления профиля');

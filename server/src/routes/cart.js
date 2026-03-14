@@ -13,6 +13,7 @@ const requirePermission = require('../middleware/requirePermission');
 const { emitToTenant } = require('../utils/socket');
 const { guardAction } = require('../utils/antifraud');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
+const { resolveSharedCartOwnerId } = require('../utils/phoneAccess');
 
 const requireReservationFulfillPermission = requirePermission('reservation.fulfill');
 const requireDeliveryManagePermission = requirePermission('delivery.manage');
@@ -80,12 +81,27 @@ function normalizeNullableText(raw, { max = 1000 } = {}) {
   return text.slice(0, max);
 }
 
-function emitCartUpdated(req, userId, payload = {}) {
+function emitCartUpdated(req, userId, payload = {}, extraUserIds = []) {
   const io = req.app.get('io');
   if (!io || !userId) return;
-  io.to(`user:${userId}`).emit('cart:updated', {
-    userId: String(userId),
-    ...payload,
+  const receivers = new Set([
+    String(userId || '').trim(),
+    ...extraUserIds
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  ]);
+  for (const receiverId of receivers) {
+    io.to(`user:${receiverId}`).emit('cart:updated', {
+      userId: String(userId),
+      ...payload,
+    });
+  }
+}
+
+async function resolveEffectiveCartUserId(queryable, reqUser) {
+  return await resolveSharedCartOwnerId(queryable, {
+    requesterUserId: reqUser?.id || null,
+    tenantId: reqUser?.tenant_id || null,
   });
 }
 
@@ -331,7 +347,8 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
 router.post('/add', authMiddleware, async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const userId = req.user.id;
+    const actorUserId = String(req.user?.id || '').trim();
+    const userId = await resolveEffectiveCartUserId(client, req.user);
     const productId = String(req.body?.product_id || '').trim();
     const qtyRaw = Number(req.body?.quantity ?? 1);
     const quantity = Number.isFinite(qtyRaw) && qtyRaw > 0 ? Math.floor(qtyRaw) : 1;
@@ -343,7 +360,7 @@ router.post('/add', authMiddleware, async (req, res) => {
     const antifraud = await guardAction({
       queryable: client,
       tenantId: req.user?.tenant_id || null,
-      userId,
+      userId: actorUserId || userId,
       actionKey: 'cart.buy',
       details: {
         product_id: productId,
@@ -566,7 +583,7 @@ router.post('/add', authMiddleware, async (req, res) => {
       status: cartItem.status,
       available_in_stock: Number(updatedProduct.quantity),
       reason: 'item_added',
-    });
+    }, actorUserId && actorUserId !== userId ? [actorUserId] : []);
 
     return res.status(201).json({
       ok: true,
@@ -590,7 +607,7 @@ router.post('/add', authMiddleware, async (req, res) => {
 // Корзина пользователя и суммы
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = await resolveEffectiveCartUserId(db, req.user);
     const result = await db.query(
       `SELECT c.id,
               c.product_id,
@@ -887,7 +904,8 @@ router.get('/', authMiddleware, async (req, res) => {
 router.delete('/items/:id', authMiddleware, async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const userId = req.user.id;
+    const actorUserId = String(req.user?.id || '').trim();
+    const userId = await resolveEffectiveCartUserId(client, req.user);
     const cartItemId = String(req.params?.id || '').trim();
     if (!cartItemId) {
       return res.status(400).json({ ok: false, error: 'id позиции обязателен' });
@@ -1082,7 +1100,7 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
       available_in_stock: Number(updatedProduct.quantity),
       reason: remainingQuantity > 0 ? 'item_cancelled_partial' : 'item_cancelled',
-    });
+    }, actorUserId && actorUserId !== userId ? [actorUserId] : []);
 
     return res.json({
       ok: true,
@@ -1198,13 +1216,18 @@ router.get(
                 regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') AS phone_digits
          FROM users u
          LEFT JOIN phones p ON p.user_id = u.id
-         WHERE u.id <> $1
-           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
-           AND u.role = 'client'
-           AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE ('%' || $3::text)
+         WHERE ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+           AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE ('%' || $2::text)
+           AND EXISTS (
+             SELECT 1
+             FROM cart_items ci
+             WHERE ci.user_id = u.id
+               AND ci.status <> 'delivered'
+             LIMIT 1
+           )
          ORDER BY u.created_at DESC
-         LIMIT $4`,
-        [req.user?.id || null, tenantId, digits, limit],
+         LIMIT $3`,
+        [tenantId, digits, limit],
       );
 
       return res.json({
@@ -1718,7 +1741,8 @@ router.post(
 router.post('/claims', authMiddleware, async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const userId = String(req.user?.id || '').trim();
+    const actorUserId = String(req.user?.id || '').trim();
+    const userId = await resolveEffectiveCartUserId(client, req.user);
     const tenantId = req.user?.tenant_id || null;
     const cartItemId = String(req.body?.cart_item_id || '').trim();
     const claimType = String(req.body?.claim_type || 'return')
@@ -1843,7 +1867,7 @@ router.post('/claims', authMiddleware, async (req, res) => {
       cart_item_id: cartItemId,
       reason: 'claim_created',
       claim_id: claim.id,
-    });
+    }, actorUserId && actorUserId !== userId ? [actorUserId] : []);
     emitClaimUpdated(req, claim, 'claim_created');
     return res.status(201).json({
       ok: true,
@@ -1873,7 +1897,7 @@ router.post('/claims', authMiddleware, async (req, res) => {
 // Список заявок текущего клиента
 router.get('/claims', authMiddleware, async (req, res) => {
   try {
-    const userId = String(req.user?.id || '').trim();
+    const userId = await resolveEffectiveCartUserId(db, req.user);
     const result = await db.query(
       `SELECT cc.id,
               cc.user_id,
@@ -2161,7 +2185,8 @@ router.patch(
 router.post('/claims/:id/decision', authMiddleware, async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const userId = String(req.user?.id || '').trim();
+    const actorUserId = String(req.user?.id || '').trim();
+    const userId = await resolveEffectiveCartUserId(client, req.user);
     const claimId = String(req.params?.id || '').trim();
     const action = String(req.body?.action || '')
       .trim()
@@ -2244,7 +2269,7 @@ router.post('/claims/:id/decision', authMiddleware, async (req, res) => {
         ? 'claim_discount_accepted'
         : 'claim_discount_rejected_auto_return',
       claim_id: updatedClaim.id,
-    });
+    }, actorUserId && actorUserId !== userId ? [actorUserId] : []);
     emitClaimUpdated(
       req,
       updatedClaim,
