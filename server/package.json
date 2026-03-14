@@ -8,7 +8,12 @@
     "dev": "nodemon src/index.js",
     "lint": "echo \"no lint configured\"",
     "test:critical": "node scripts/critical-integration.js",
-    "test:critical:admin": "E2E_STRICT_ADMIN=1 node scripts/critical-integration.js"
+    "test:critical:admin": "E2E_STRICT_ADMIN=1 node scripts/critical-integration.js",
+    "test:phone-access:e2e": "node scripts/e2e-phone-access-flow.js",
+    "test:subscription-guard:e2e": "node scripts/e2e-subscription-guard-flow.js",
+    "test:order-pipeline:e2e": "node scripts/e2e-order-pipeline-flow.js",
+    "test:e2e:core": "npm run test:critical && npm run test:phone-access:e2e && npm run test:subscription-guard:e2e && npm run test:order-pipeline:e2e",
+    "audit:self": "node scripts/nightly-self-audit.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

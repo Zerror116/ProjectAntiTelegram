@@ -3316,6 +3316,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final allowEnterShortcut =
+        kIsWeb ||
+        defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.linux;
     final canCompose = _canCompose();
     final blockedReason = _composeBlockedReason();
     final visibleMessages = _visibleMessages();
@@ -3540,7 +3545,8 @@ class _ChatScreenState extends State<ChatScreen> {
                     padding: const EdgeInsets.symmetric(horizontal: 8),
                     child: SubmitOnEnter(
                       controller: _controller,
-                      enabled: canCompose && !_voiceRecording,
+                      enabled:
+                          allowEnterShortcut && canCompose && !_voiceRecording,
                       onSubmit: _send,
                       child: TextField(
                         focusNode: _inputFocusNode,

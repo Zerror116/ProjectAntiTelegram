@@ -29,12 +29,33 @@ const DELIVERY_STOP_BUFFER_MINUTES = 8;
 const DELIVERY_DIALOG_AUTO_DELETE_MS = 60 * 1000;
 const DELIVERY_DIALOG_CLEANUP_INTERVAL_MS = 15 * 1000;
 const CART_RETENTION_WARNING_DAYS = 30;
+const CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS = Math.max(
+  30,
+  Number(process.env.CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS || 180),
+);
+const CLIENT_RETENTION_SWEEP_LIMIT = Math.max(
+  10,
+  Number(process.env.CLIENT_RETENTION_SWEEP_LIMIT || 120),
+);
+const CLIENT_RETENTION_CLEANUP_INTERVAL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.CLIENT_RETENTION_CLEANUP_INTERVAL_MS || 60 * 60 * 1000),
+);
+const CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE = String(
+  process.env.CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE || "true",
+)
+  .toLowerCase()
+  .trim() !== "false";
 const CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE = [
   "pending_processing",
   "processed",
   "preparing_delivery",
   "handing_to_courier",
   "in_delivery",
+];
+const CART_INACTIVITY_SWEEP_STATUSES = [
+  "pending_processing",
+  "processed",
 ];
 const DEMO_USER_EMAIL_PREFIX = "phantom.delivery.";
 const DEMO_PRODUCT_TITLE_PREFIX = "[DEMO DELIVERY]";
@@ -72,6 +93,7 @@ const DEMO_SAMARA_POINTS = [
 let deliveryDialogCleanupTimer = null;
 let deliveryDialogCleanupRunning = false;
 let deliveryDialogCleanupIo = null;
+let lastClientRetentionSweepAt = 0;
 
 function deliveryDialogWhere(alias = "c") {
   return `${alias}.type = 'private'
@@ -941,9 +963,44 @@ function emitDeliveryUpdated(io, batchId, tenantId = null) {
   });
 }
 
-async function getCartRetentionSnapshot(queryable, userId, tenantId = null) {
+async function emitToCreators(io, eventName, payload) {
+  if (!io || !eventName) return;
+  try {
+    const creatorsQ = await db.platformQuery(
+      `SELECT id::text AS id
+       FROM users
+       WHERE COALESCE(NULLIF(BTRIM(role), ''), 'client') = 'creator'
+         AND COALESCE(is_active, true) = true`,
+    );
+    for (const row of creatorsQ.rows) {
+      const creatorId = String(row.id || "").trim();
+      if (!creatorId) continue;
+      io.to(`user:${creatorId}`).emit(eventName, payload);
+    }
+  } catch (err) {
+    console.error("delivery.emitToCreators error", err);
+  }
+}
+
+function normalizeCartStatusList(statuses) {
+  if (!Array.isArray(statuses)) return [...CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE];
+  const normalized = statuses
+    .map((status) => String(status || "").trim())
+    .filter((status) => status.length > 0);
+  return normalized.length > 0
+    ? normalized
+    : [...CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE];
+}
+
+async function getCartRetentionSnapshot(
+  queryable,
+  userId,
+  tenantId = null,
+  statuses = CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE,
+) {
   if (!userId) return null;
   const scopedTenantId = resolveTenantScopeId(tenantId);
+  const safeStatuses = normalizeCartStatusList(statuses);
   const snapshotQ = await queryable.query(
     `SELECT MIN(c.created_at) AS oldest_created_at,
             COUNT(*)::int AS items_count,
@@ -957,7 +1014,7 @@ async function getCartRetentionSnapshot(queryable, userId, tenantId = null) {
      WHERE c.user_id = $1
        AND c.status = ANY($2::text[])
        AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)`,
-    [userId, CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE, scopedTenantId],
+    [userId, safeStatuses, scopedTenantId],
   );
   const row = snapshotQ.rows[0] || {};
   if (!row.oldest_created_at || Number(row.items_count || 0) <= 0) return null;
@@ -976,8 +1033,21 @@ async function getCartRetentionSnapshot(queryable, userId, tenantId = null) {
   };
 }
 
-async function autoDismantleStaleCart(queryable, { userId, tenantId = null }) {
-  const retention = await getCartRetentionSnapshot(queryable, userId, tenantId);
+async function autoDismantleStaleCart(
+  queryable,
+  {
+    userId,
+    tenantId = null,
+    statuses = CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE,
+  } = {},
+) {
+  const safeStatuses = normalizeCartStatusList(statuses);
+  const retention = await getCartRetentionSnapshot(
+    queryable,
+    userId,
+    tenantId,
+    safeStatuses,
+  );
   if (!retention || !retention.is_stale) {
     return { applied: false, retention };
   }
@@ -993,7 +1063,7 @@ async function autoDismantleStaleCart(queryable, { userId, tenantId = null }) {
        AND c.status = ANY($2::text[])
        AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
      FOR UPDATE`,
-    [userId, CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE, scopedTenantId],
+    [userId, safeStatuses, scopedTenantId],
   );
   if (itemsQ.rowCount === 0) {
     return { applied: false, retention };
@@ -1065,6 +1135,301 @@ async function autoDismantleStaleCart(queryable, { userId, tenantId = null }) {
     removed_items_count: itemIds.length,
     restored_products_count: productTotals.size,
   };
+}
+
+async function listStaleCartUserIds(
+  queryable,
+  { tenantId = null, limit = CLIENT_RETENTION_SWEEP_LIMIT } = {},
+) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const safeLimit = Math.max(1, Number(limit) || CLIENT_RETENTION_SWEEP_LIMIT);
+  const result = await queryable.query(
+    `SELECT c.user_id::text AS user_id,
+            MAX(COALESCE(c.updated_at, c.created_at)) AS last_activity_at
+     FROM cart_items c
+     JOIN users u ON u.id = c.user_id
+     WHERE c.status = ANY($1::text[])
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM delivery_batch_customers dbc
+         JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
+         WHERE dbc.user_id = c.user_id
+           AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
+       )
+     GROUP BY c.user_id
+     HAVING MAX(COALESCE(c.updated_at, c.created_at))
+       <= now() - make_interval(days => $3::int)
+     ORDER BY MAX(COALESCE(c.updated_at, c.created_at)) ASC
+     LIMIT $4`,
+    [
+      CART_INACTIVITY_SWEEP_STATUSES,
+      scopedTenantId,
+      CART_RETENTION_WARNING_DAYS,
+      safeLimit,
+    ],
+  );
+  return result.rows
+    .map((row) => String(row.user_id || "").trim())
+    .filter(Boolean);
+}
+
+async function listInactiveClientAccounts(
+  queryable,
+  {
+    tenantId = null,
+    inactivityDays = CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS,
+    limit = CLIENT_RETENTION_SWEEP_LIMIT,
+  } = {},
+) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const safeDays = Math.max(30, Number(inactivityDays) || 180);
+  const safeLimit = Math.max(1, Number(limit) || CLIENT_RETENTION_SWEEP_LIMIT);
+  const result = await queryable.query(
+    `SELECT u.id::text AS user_id,
+            u.email,
+            COALESCE(NULLIF(BTRIM(p.phone), ''), '') AS phone,
+            activity.last_activity_at
+     FROM users u
+     LEFT JOIN phones p ON p.user_id = u.id
+     CROSS JOIN LATERAL (
+       SELECT GREATEST(
+         COALESCE(u.updated_at, u.created_at, to_timestamp(0)),
+         COALESCE((SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = u.id), to_timestamp(0)),
+         COALESCE((SELECT MAX(s.last_seen_at) FROM user_sessions s WHERE s.user_id = u.id), to_timestamp(0)),
+         COALESCE((SELECT MAX(c.updated_at) FROM cart_items c WHERE c.user_id = u.id), to_timestamp(0)),
+         COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.sender_id = u.id), to_timestamp(0)),
+         COALESCE((SELECT MAX(a.updated_at) FROM user_delivery_addresses a WHERE a.user_id = u.id), to_timestamp(0))
+       ) AS last_activity_at
+     ) activity
+     WHERE COALESCE(NULLIF(BTRIM(u.role), ''), 'client') = 'client'
+       AND COALESCE(u.is_active, true) = true
+       AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+       AND activity.last_activity_at < now() - make_interval(days => $2::int)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM delivery_batch_customers dbc
+         JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
+         WHERE dbc.user_id = u.id
+           AND dbt.status IN ('calling', 'couriers_assigned')
+       )
+     ORDER BY activity.last_activity_at ASC
+     LIMIT $3`,
+    [scopedTenantId, safeDays, safeLimit],
+  );
+  return result.rows;
+}
+
+async function deleteClientAccountByPolicy(
+  queryable,
+  { userId, tenantId = null, reason = "policy", source = "retention" } = {},
+) {
+  const scopedTenantId = resolveTenantScopeId(tenantId);
+  const candidateId = String(userId || "").trim();
+  if (!candidateId) return { applied: false, reason: "empty_user_id" };
+
+  const userQ = await queryable.query(
+    `SELECT u.id::text AS id,
+            u.email,
+            COALESCE(NULLIF(BTRIM(u.role), ''), 'client') AS role,
+            u.tenant_id::text AS tenant_id,
+            COALESCE(NULLIF(BTRIM(p.phone), ''), '') AS phone
+     FROM users u
+     LEFT JOIN phones p ON p.user_id = u.id
+     WHERE u.id = $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     LIMIT 1
+     FOR UPDATE`,
+    [candidateId, scopedTenantId],
+  );
+  if (userQ.rowCount === 0) return { applied: false, reason: "not_found" };
+  const user = userQ.rows[0];
+  if (String(user.role || "").toLowerCase().trim() !== "client") {
+    return { applied: false, reason: "role_not_client", user };
+  }
+
+  const hasPendingDeliveryQ = await queryable.query(
+    `SELECT 1
+     FROM delivery_batch_customers dbc
+     JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
+     WHERE dbc.user_id = $1
+       AND dbt.status IN ('calling', 'couriers_assigned')
+     LIMIT 1`,
+    [candidateId],
+  );
+  if (hasPendingDeliveryQ.rowCount > 0) {
+    return { applied: false, reason: "delivery_in_progress", user };
+  }
+
+  const deleted = await queryable.query(
+    `DELETE FROM users
+     WHERE id = $1
+     RETURNING id`,
+    [candidateId],
+  );
+  if (deleted.rowCount === 0) return { applied: false, reason: "delete_failed", user };
+
+  try {
+    await db.platformQuery(
+      `DELETE FROM tenant_user_index
+       WHERE user_id = $1`,
+      [candidateId],
+    );
+  } catch (cleanupErr) {
+    console.error("delivery.deleteClientAccountByPolicy tenant index cleanup error", cleanupErr);
+  }
+
+  return {
+    applied: true,
+    reason,
+    source,
+    user: {
+      id: candidateId,
+      email: String(user.email || ""),
+      phone: String(user.phone || ""),
+      tenant_id: String(user.tenant_id || ""),
+    },
+  };
+}
+
+async function runClientRetentionSweepInScope(
+  queryable,
+  { tenantId = null, io = null, scopeLabel = "shared" } = {},
+) {
+  const staleUserIds = await listStaleCartUserIds(queryable, {
+    tenantId,
+    limit: CLIENT_RETENTION_SWEEP_LIMIT,
+  });
+  let staleCartsDismantled = 0;
+  for (const userId of staleUserIds) {
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await autoDismantleStaleCart(client, {
+        userId,
+        tenantId,
+        statuses: CART_INACTIVITY_SWEEP_STATUSES,
+      });
+      await client.query("COMMIT");
+      if (result?.applied) {
+        staleCartsDismantled += 1;
+        emitCartUpdated(io, userId, {
+          status: "empty",
+          reason: "cart_auto_dismantled_inactive",
+          auto_dismantled: true,
+        });
+        await emitToCreators(io, "creator:alert", {
+          type: "cart_auto_dismantled_inactive",
+          tenant_id: resolveTenantScopeId(tenantId),
+          user_id: userId,
+          reason: "inactive_30d",
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("delivery.retention stale cart cleanup error", {
+        userId,
+        scopeLabel,
+        error: err?.message || err,
+      });
+    } finally {
+      client.release();
+    }
+  }
+
+  const inactiveClients = await listInactiveClientAccounts(queryable, {
+    tenantId,
+    inactivityDays: CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS,
+    limit: CLIENT_RETENTION_SWEEP_LIMIT,
+  });
+  let inactiveClientsDeleted = 0;
+  for (const row of inactiveClients) {
+    const userId = String(row.user_id || "").trim();
+    if (!userId) continue;
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const deletion = await deleteClientAccountByPolicy(client, {
+        userId,
+        tenantId,
+        reason: "inactive_180d",
+        source: "retention_sweep",
+      });
+      await client.query("COMMIT");
+      if (deletion.applied) {
+        inactiveClientsDeleted += 1;
+        emitToTenant(io, tenantId, "tenant:client:auto_deleted", {
+          user_id: deletion.user.id,
+          email: deletion.user.email,
+          phone: deletion.user.phone,
+          reason: "inactive_180d",
+          source: "retention_sweep",
+          at: new Date().toISOString(),
+        });
+        await emitToCreators(io, "creator:alert", {
+          type: "client_auto_deleted",
+          tenant_id: deletion.user.tenant_id || resolveTenantScopeId(tenantId),
+          user_id: deletion.user.id,
+          email: deletion.user.email,
+          phone: deletion.user.phone,
+          reason: "inactive_180d",
+          source: "retention_sweep",
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("delivery.retention inactive client cleanup error", {
+        userId,
+        scopeLabel,
+        error: err?.message || err,
+      });
+    } finally {
+      client.release();
+    }
+  }
+
+  if (staleCartsDismantled > 0 || inactiveClientsDeleted > 0) {
+    console.log("delivery retention sweep", {
+      scope: scopeLabel,
+      stale_carts_dismantled: staleCartsDismantled,
+      inactive_clients_deleted: inactiveClientsDeleted,
+    });
+  }
+
+  return {
+    stale_carts_dismantled: staleCartsDismantled,
+    inactive_clients_deleted: inactiveClientsDeleted,
+  };
+}
+
+async function runClientRetentionSweep(io = deliveryDialogCleanupIo) {
+  const sharedSummary = await runClientRetentionSweepInScope(db, {
+    tenantId: null,
+    io,
+    scopeLabel: "shared",
+  });
+  const isolatedTenants = await db.platformQuery(
+    `SELECT id, code, db_mode, db_url, db_name, status, subscription_expires_at
+     FROM tenants
+     WHERE db_mode = 'isolated'
+       AND db_url IS NOT NULL`,
+  );
+  for (const tenant of isolatedTenants.rows) {
+    await db.runWithTenantRow(tenant, async () => {
+      await runClientRetentionSweepInScope(db, {
+        tenantId: tenant.id,
+        io,
+        scopeLabel: String(tenant.code || tenant.id || "tenant"),
+      });
+    });
+  }
+  return sharedSummary;
 }
 
 async function upsertUserShelf(queryable, userId, shelfNumber) {
@@ -1852,6 +2217,11 @@ async function runDeliveryDialogCleanup(io = deliveryDialogCleanupIo) {
         await cleanupDuplicateDeliveryChats(db, io);
         await cleanupExpiredDeliveryChats(db, io);
       });
+    }
+    const nowMs = Date.now();
+    if (nowMs - lastClientRetentionSweepAt >= CLIENT_RETENTION_CLEANUP_INTERVAL_MS) {
+      lastClientRetentionSweepAt = nowMs;
+      await runClientRetentionSweep(io);
     }
   } catch (error) {
     console.error("delivery dialog cleanup error", error);
@@ -3434,6 +3804,11 @@ router.post(
     const { batchId, customerId } = req.params;
     const accepted = req.body?.accepted === true;
     const declined = req.body?.accepted === false;
+    const unreachableFirstCall =
+      declined &&
+      (req.body?.unreachable_first_call === true ||
+        req.body?.call_unreachable === true ||
+        req.body?.phone_unreachable === true);
     if (!accepted && !declined) {
       return res
         .status(400)
@@ -3794,6 +4169,42 @@ router.post(
       }
       emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
 
+      let autoDeletedClient = false;
+      if (
+        declined &&
+        unreachableFirstCall &&
+        CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE
+      ) {
+        const deletion = await deleteClientAccountByPolicy(db, {
+          userId: customer.user_id,
+          tenantId: req.user?.tenant_id || null,
+          reason: "phone_unreachable_first_call",
+          source: "delivery_admin_decision",
+        });
+        autoDeletedClient = deletion.applied === true;
+        if (autoDeletedClient) {
+          emitToTenant(io, req.user?.tenant_id || null, "tenant:client:auto_deleted", {
+            user_id: deletion.user.id,
+            email: deletion.user.email,
+            phone: deletion.user.phone,
+            reason: "phone_unreachable_first_call",
+            source: "delivery_admin_decision",
+            at: new Date().toISOString(),
+          });
+          await emitToCreators(io, "creator:alert", {
+            type: "client_auto_deleted",
+            tenant_id:
+              deletion.user.tenant_id || resolveTenantScopeId(req.user?.tenant_id || null),
+            user_id: deletion.user.id,
+            email: deletion.user.email,
+            phone: deletion.user.phone,
+            reason: "phone_unreachable_first_call",
+            source: "delivery_admin_decision",
+            at: new Date().toISOString(),
+          });
+        }
+      }
+
       const activeBatch = await fetchBatchDetails(
         db,
         batchId,
@@ -3812,6 +4223,7 @@ router.post(
           removed_items_count: Number(
             autoDismantleResult?.removed_items_count || 0,
           ),
+          auto_deleted_client: autoDeletedClient,
           active_batch: activeBatch,
         },
       });

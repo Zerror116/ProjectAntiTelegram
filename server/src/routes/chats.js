@@ -21,6 +21,11 @@ const {
   decryptMessageText,
   decryptMessageRow,
 } = require("../utils/messageCrypto");
+const {
+  normalizeKeyVersion,
+  buildSecretKeyring,
+  resolveSecretCandidates,
+} = require("../utils/secretKeyring");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -45,15 +50,25 @@ const CHAT_MEDIA_TOKEN_TTL_SECONDS = Math.max(
   60,
   Number(process.env.CHAT_MEDIA_TOKEN_TTL_SECONDS || 2 * 60 * 60),
 );
-const CHAT_MEDIA_TOKEN_SECRET = String(
-  process.env.CHAT_MEDIA_TOKEN_SECRET || process.env.JWT_SECRET || "",
-).trim();
-
-if (process.env.NODE_ENV === "production" && !CHAT_MEDIA_TOKEN_SECRET) {
-  throw new Error(
-    "CHAT_MEDIA_TOKEN_SECRET (or JWT_SECRET) must be configured in production",
-  );
-}
+const CHAT_MEDIA_KEYRING = buildSecretKeyring({
+  purpose: "chat-media",
+  currentVersion:
+    process.env.CHAT_MEDIA_TOKEN_SECRET_VERSION ||
+    process.env.CHAT_MEDIA_TOKEN_KEY_VERSION ||
+    "v1",
+  singleSecret:
+    process.env.CHAT_MEDIA_TOKEN_SECRET || process.env.JWT_SECRET || "",
+  keyringString:
+    process.env.CHAT_MEDIA_TOKEN_KEYRING ||
+    process.env.CHAT_MEDIA_TOKEN_SECRETS ||
+    "",
+  keyringJson:
+    process.env.CHAT_MEDIA_TOKEN_KEYS_JSON ||
+    process.env.CHAT_MEDIA_SECRETS_JSON ||
+    "",
+  requiredInProduction: true,
+  devFallbackSecret: "dev-chat-media-secret",
+});
 
 const CHAT_MEDIA_MARKERS = Object.freeze({
   image: "/uploads/chat_media/images/",
@@ -721,9 +736,9 @@ function extractChatMediaRef(rawUrl) {
   return null;
 }
 
-function signChatMediaAccess(pathValue, expUnixSeconds) {
+function signChatMediaAccess(pathValue, expUnixSeconds, secret) {
   return crypto
-    .createHmac("sha256", CHAT_MEDIA_TOKEN_SECRET || "dev-chat-media-secret")
+    .createHmac("sha256", String(secret || CHAT_MEDIA_KEYRING.currentSecret || ""))
     .update(`${pathValue}:${expUnixSeconds}`)
     .digest("hex");
 }
@@ -739,8 +754,16 @@ function buildSignedChatMediaUrl(req, rawUrl) {
   const ref = extractChatMediaRef(rawUrl);
   if (!ref) return rawUrl;
   const exp = Math.floor(Date.now() / 1000) + CHAT_MEDIA_TOKEN_TTL_SECONDS;
-  const sig = signChatMediaAccess(ref.canonicalPath, exp);
-  return `${req.protocol}://${req.get("host")}/api/chats/media/${ref.kind}/${encodeURIComponent(ref.filename)}?exp=${exp}&sig=${sig}`;
+  const signingCandidate =
+    resolveSecretCandidates(CHAT_MEDIA_KEYRING, CHAT_MEDIA_KEYRING.currentVersion)[0] ||
+    null;
+  const keyVersion = signingCandidate?.version || CHAT_MEDIA_KEYRING.currentVersion;
+  const sig = signChatMediaAccess(
+    ref.canonicalPath,
+    exp,
+    signingCandidate?.secret || CHAT_MEDIA_KEYRING.currentSecret,
+  );
+  return `${req.protocol}://${req.get("host")}/api/chats/media/${ref.kind}/${encodeURIComponent(ref.filename)}?exp=${exp}&kid=${encodeURIComponent(keyVersion)}&sig=${sig}`;
 }
 
 function decorateMessageMediaUrls(req, rawMessage) {
@@ -1713,6 +1736,10 @@ router.get("/media/:kind/:filename", async (req, res) => {
 
     const exp = Number(req.query.exp || 0);
     const sig = String(req.query.sig || "").trim().toLowerCase();
+    const requestedKeyVersion = normalizeKeyVersion(
+      req.query.kid || req.query.kv || "",
+      "",
+    );
     if (!Number.isFinite(exp) || exp <= 0 || !sig) {
       return res.status(403).json({ ok: false, error: "Missing media token" });
     }
@@ -1720,11 +1747,28 @@ router.get("/media/:kind/:filename", async (req, res) => {
     if (exp < nowSeconds) {
       return res.status(403).json({ ok: false, error: "Media token expired" });
     }
+    if (exp > nowSeconds + 24 * 60 * 60) {
+      return res.status(403).json({ ok: false, error: "Media token is invalid" });
+    }
 
     const marker = CHAT_MEDIA_MARKERS[kind];
     const canonicalPath = `${marker}${filename}`;
-    const expectedSig = signChatMediaAccess(canonicalPath, exp);
-    if (!secureEqualHex(sig, expectedSig)) {
+    const candidates = resolveSecretCandidates(
+      CHAT_MEDIA_KEYRING,
+      requestedKeyVersion,
+    );
+    let tokenValid = false;
+    for (const candidate of candidates) {
+      const expectedSig = signChatMediaAccess(
+        canonicalPath,
+        exp,
+        candidate.secret,
+      );
+      if (!secureEqualHex(sig, expectedSig)) continue;
+      tokenValid = true;
+      break;
+    }
+    if (!tokenValid) {
       return res.status(403).json({ ok: false, error: "Invalid media token" });
     }
 

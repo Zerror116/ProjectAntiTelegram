@@ -230,6 +230,7 @@ async function run() {
   }
 
   const adminEndpoints = [
+    "/api/profile/stats/extended?downtime_window_days=30",
     "/api/admin/ops/support/templates",
     "/api/admin/ops/notifications/center",
     "/api/admin/ops/returns/analytics",
@@ -304,4 +305,3 @@ run().catch((err) => {
   console.error("CRITICAL INTEGRATION FAILED:", err?.message || err);
   process.exit(1);
 });
-

@@ -12,6 +12,7 @@ build/
 server/node_modules/
 server/build/
 server/uploads/
+server/audit/nightly-self-audit.md
 
 **/__pycache__/
 *.pyc

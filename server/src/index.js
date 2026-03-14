@@ -16,6 +16,7 @@ const db = require("./db");
 
 // ✅ Сначала создаём app, потом использу��м его
 const app = express();
+app.disable("x-powered-by");
 
 // Импортируем роуты и middleware ПОСЛЕ создания app
 const profileUpdateRoutes = require("./routes/profileUpdate");
@@ -58,14 +59,51 @@ fs.mkdirSync(path.join(uploadsRoot, "chat_media", "voice"), { recursive: true })
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
+  "https://localhost:3000",
   "http://127.0.0.1:3000",
+  "https://127.0.0.1:3000",
   "http://localhost:5173",
+  "https://localhost:5173",
   "http://127.0.0.1:5173",
+  "https://127.0.0.1:5173",
   "http://localhost:8080",
+  "https://localhost:8080",
   "http://127.0.0.1:8080",
+  "https://127.0.0.1:8080",
   "http://localhost",
+  "https://localhost",
   "http://127.0.0.1",
+  "https://127.0.0.1",
 ];
+
+const NODE_ENV = String(process.env.NODE_ENV || "development")
+  .toLowerCase()
+  .trim();
+const IS_PRODUCTION = NODE_ENV === "production";
+
+function parseBooleanEnv(rawValue, fallback = false) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") {
+    return fallback;
+  }
+  const normalized = String(rawValue).toLowerCase().trim();
+  return ["1", "true", "yes", "on", "y"].includes(normalized);
+}
+
+const TRUST_PROXY_HOPS = Math.max(
+  0,
+  Number(
+    process.env.TRUST_PROXY_HOPS ||
+      (IS_PRODUCTION ? 1 : 0),
+  ) || 0,
+);
+if (TRUST_PROXY_HOPS > 0) {
+  app.set("trust proxy", TRUST_PROXY_HOPS);
+}
+
+const ENFORCE_HTTPS = parseBooleanEnv(
+  process.env.ENFORCE_HTTPS,
+  IS_PRODUCTION,
+);
 
 function normalizeOrigin(raw) {
   const value = String(raw || "").trim();
@@ -136,12 +174,49 @@ app.use(
   helmet({
     contentSecurityPolicy: false,
     crossOriginResourcePolicy: { policy: "cross-origin" },
+    referrerPolicy: { policy: "no-referrer" },
+    frameguard: { action: "deny" },
+    hsts: IS_PRODUCTION
+      ? {
+          maxAge: 31536000,
+          includeSubDomains: true,
+          preload: false,
+        }
+      : false,
   }),
 );
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(
+  bodyParser.json({
+    limit: String(process.env.JSON_BODY_LIMIT || "2mb").trim() || "2mb",
+  }),
+);
+app.use(
+  bodyParser.urlencoded({
+    extended: true,
+    limit: String(process.env.URLENCODED_BODY_LIMIT || "2mb").trim() || "2mb",
+  }),
+);
+
+app.use((req, res, next) => {
+  if (!ENFORCE_HTTPS) return next();
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .toLowerCase()
+    .trim();
+  const isSecure = req.secure === true || forwardedProto === "https";
+  if (isSecure) return next();
+
+  const host = String(req.headers.host || "").trim();
+  if ((req.method === "GET" || req.method === "HEAD") && host) {
+    return res.redirect(308, `https://${host}${req.originalUrl || req.url || "/"}`);
+  }
+  return res.status(426).json({
+    ok: false,
+    error: "HTTPS required",
+  });
+});
 
 for (const publicDir of ["products", "channels", "users", "claims"]) {
   const fullDir = path.join(uploadsRoot, publicDir);
@@ -743,6 +818,9 @@ async function canUserAccessChat(user, chatId) {
       console.log(`📝 Environment: ${process.env.NODE_ENV || "development"}`);
       console.log(
         `🔐 JWT Secret: ${JWT_SECRET ? "✅ Configured" : "⚠️ Not configured"}`,
+      );
+      console.log(
+        `🛡️ Security: trust_proxy=${TRUST_PROXY_HOPS}, enforce_https=${ENFORCE_HTTPS}`,
       );
       void runMessageEncryptionBackfill({ logger: console }).catch((err) => {
         console.error("message encryption backfill startup error:", err);

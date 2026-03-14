@@ -12,6 +12,7 @@ import 'cart_screen.dart';
 import 'chats_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
+import 'stats_dashboard_screen.dart';
 import 'system_tests_screen.dart';
 import 'worker_panel.dart';
 
@@ -44,6 +45,7 @@ class _MainShellState extends State<MainShell> {
   StreamSubscription<User?>? _authSub;
   String _lastEffectiveRole = '';
   final Set<String> _activatedDestinations = <String>{};
+  String? _phoneAccessDecisionInFlightId;
 
   @override
   void initState() {
@@ -99,6 +101,7 @@ class _MainShellState extends State<MainShell> {
         normalized == 'admin' ||
         normalized == 'tenant' ||
         normalized == 'creator';
+    final showStats = showAdmin;
     final showWorker =
         normalized == 'worker' ||
         normalized == 'tenant' ||
@@ -108,6 +111,7 @@ class _MainShellState extends State<MainShell> {
       'chats',
       'cart',
       if (showAdmin) 'admin',
+      if (showStats) 'stats',
       if (showWorker) 'worker',
       'profile',
       'settings',
@@ -150,6 +154,20 @@ class _MainShellState extends State<MainShell> {
     ]);
   }
 
+  bool _hasStatsTab() {
+    const roles = {'admin', 'tenant', 'creator'};
+    final role = _effectiveRole();
+    if (!roles.contains(role)) return false;
+    if (_isCreatorNativeView()) return true;
+    return _hasAnyPermission(const [
+      'delivery.manage',
+      'reservation.fulfill',
+      'support.manage',
+      'tenant.users.manage',
+      'chat.write.support',
+    ]);
+  }
+
   bool _hasWorkerTab() {
     const roles = {'worker', 'tenant', 'creator'};
     final role = _effectiveRole();
@@ -184,6 +202,7 @@ class _MainShellState extends State<MainShell> {
 
   List<_ShellDestination> _buildDestinations({
     required bool showAdmin,
+    required bool showStats,
     required bool showWorker,
     required bool showTests,
   }) {
@@ -209,6 +228,14 @@ class _MainShellState extends State<MainShell> {
           icon: Icons.admin_panel_settings_outlined,
           builder: _buildAdminScreen,
           priority: 85,
+        ),
+      if (showStats)
+        const _ShellDestination(
+          id: 'stats',
+          label: 'Статистика',
+          icon: Icons.bar_chart_rounded,
+          builder: _buildStatsScreen,
+          priority: 80,
         ),
       if (showWorker)
         const _ShellDestination(
@@ -247,6 +274,8 @@ class _MainShellState extends State<MainShell> {
   static Widget _buildCartScreen(BuildContext context) => const CartScreen();
   static Widget _buildAdminScreen(BuildContext context) => const AdminPanel();
   static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
+  static Widget _buildStatsScreen(BuildContext context) =>
+      const StatsDashboardScreen();
   static Widget _buildProfileScreen(BuildContext context) =>
       const ProfileScreen();
   static Widget _buildSettingsScreen(BuildContext context) =>
@@ -320,6 +349,96 @@ class _MainShellState extends State<MainShell> {
     });
   }
 
+  Future<void> _submitPhoneAccessOwnerDecision({
+    required PhoneAccessOwnerRequest request,
+    required bool approve,
+  }) async {
+    if (_phoneAccessDecisionInFlightId != null) return;
+    setState(() {
+      _phoneAccessDecisionInFlightId = request.id;
+    });
+    try {
+      await submitPhoneAccessOwnerDecision(request.id, approve: approve);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _phoneAccessDecisionInFlightId = null;
+        });
+      } else {
+        _phoneAccessDecisionInFlightId = null;
+      }
+    }
+  }
+
+  Widget _buildPhoneAccessOwnerBanner(BuildContext context) {
+    return ValueListenableBuilder<PhoneAccessOwnerRequest?>(
+      valueListenable: phoneAccessOwnerRequestNotifier,
+      builder: (context, request, _) {
+        if (request == null) return const SizedBox.shrink();
+        final theme = Theme.of(context);
+        final busy = _phoneAccessDecisionInFlightId == request.id;
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+          child: Material(
+            color: theme.colorScheme.errorContainer,
+            borderRadius: BorderRadius.circular(14),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Подтверждение номера',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Пользователь "${request.requesterLabel}" запросил доступ к вашей корзине'
+                    '${request.phone.isNotEmpty ? ' (${request.phone})' : ''}.',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: busy
+                              ? null
+                              : () => _submitPhoneAccessOwnerDecision(
+                                  request: request,
+                                  approve: false,
+                                ),
+                          child: const Text('Отклонить'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: busy
+                              ? null
+                              : () => _submitPhoneAccessOwnerDecision(
+                                  request: request,
+                                  approve: true,
+                                ),
+                          child: const Text('Разрешить'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
@@ -342,12 +461,14 @@ class _MainShellState extends State<MainShell> {
         }
 
         final showAdmin = _hasAdminTab();
+        final showStats = _hasStatsTab();
         final showWorker = _hasWorkerTab();
         final showTests = _hasTestsTab();
         final effectiveRole = _effectiveRole();
 
         final destinations = _buildDestinations(
           showAdmin: showAdmin,
+          showStats: showStats,
           showWorker: showWorker,
           showTests: showTests,
         );
@@ -402,18 +523,25 @@ class _MainShellState extends State<MainShell> {
 
         return Scaffold(
           body: SafeArea(
-            child: IndexedStack(
-              key: ValueKey('shell-$effectiveRole'),
-              index: _index,
-              children: destinations.map((destination) {
-                if (!_activatedDestinations.contains(destination.id)) {
-                  return const SizedBox.shrink();
-                }
-                return KeyedSubtree(
-                  key: ValueKey('page-${destination.id}-$effectiveRole'),
-                  child: destination.builder(context),
-                );
-              }).toList(),
+            child: Column(
+              children: [
+                _buildPhoneAccessOwnerBanner(context),
+                Expanded(
+                  child: IndexedStack(
+                    key: ValueKey('shell-$effectiveRole'),
+                    index: _index,
+                    children: destinations.map((destination) {
+                      if (!_activatedDestinations.contains(destination.id)) {
+                        return const SizedBox.shrink();
+                      }
+                      return KeyedSubtree(
+                        key: ValueKey('page-${destination.id}-$effectiveRole'),
+                        child: destination.builder(context),
+                      );
+                    }).toList(),
+                  ),
+                ),
+              ],
             ),
           ),
           bottomNavigationBar: BottomNavigationBar(

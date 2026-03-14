@@ -1,18 +1,38 @@
 const crypto = require("crypto");
 const path = require("path");
+const {
+  normalizeKeyVersion,
+  buildSecretKeyring,
+  resolveSecretCandidates,
+} = require("./secretKeyring");
 
 const SIGNED_UPLOAD_KINDS = new Set(["products", "channels", "users", "claims"]);
-const SIGNED_UPLOAD_TOKEN_SECRET = String(
-  process.env.UPLOADS_TOKEN_SECRET || process.env.CHAT_MEDIA_TOKEN_SECRET || "dev-uploads-secret",
-).trim();
+const SIGNED_UPLOAD_KEYRING = buildSecretKeyring({
+  purpose: "uploads",
+  currentVersion:
+    process.env.UPLOADS_TOKEN_SECRET_VERSION ||
+    process.env.UPLOADS_TOKEN_KEY_VERSION ||
+    "v1",
+  singleSecret:
+    process.env.UPLOADS_TOKEN_SECRET ||
+    process.env.CHAT_MEDIA_TOKEN_SECRET ||
+    process.env.JWT_SECRET ||
+    "",
+  keyringString:
+    process.env.UPLOADS_TOKEN_KEYRING || process.env.UPLOADS_TOKEN_SECRETS || "",
+  keyringJson:
+    process.env.UPLOADS_TOKEN_KEYS_JSON || process.env.UPLOADS_SECRETS_JSON || "",
+  requiredInProduction: true,
+  devFallbackSecret: "dev-uploads-secret",
+});
 const SIGNED_UPLOAD_TOKEN_TTL_SECONDS = Math.max(
   30,
   Number(process.env.UPLOADS_TOKEN_TTL_SECONDS || 15 * 60),
 );
 
-function signUploadAccess(canonicalPath, expUnixSeconds) {
+function signUploadAccess(canonicalPath, expUnixSeconds, secret) {
   return crypto
-    .createHmac("sha256", SIGNED_UPLOAD_TOKEN_SECRET || "dev-uploads-secret")
+    .createHmac("sha256", String(secret || SIGNED_UPLOAD_KEYRING.currentSecret || ""))
     .update(`${canonicalPath}:${expUnixSeconds}`)
     .digest("hex");
 }
@@ -76,12 +96,22 @@ function buildSignedUploadUrl(rawValue, { req, baseUrl } = {}) {
   const ref = normalizeUploadRef(rawValue);
   if (!ref) return rawValue;
   const exp = Math.floor(Date.now() / 1000) + SIGNED_UPLOAD_TOKEN_TTL_SECONDS;
-  const sig = signUploadAccess(ref.canonicalPath, exp);
+  const signingCandidate =
+    resolveSecretCandidates(
+      SIGNED_UPLOAD_KEYRING,
+      SIGNED_UPLOAD_KEYRING.currentVersion,
+    )[0] || null;
+  const keyVersion = signingCandidate?.version || SIGNED_UPLOAD_KEYRING.currentVersion;
+  const sig = signUploadAccess(
+    ref.canonicalPath,
+    exp,
+    signingCandidate?.secret || SIGNED_UPLOAD_KEYRING.currentSecret,
+  );
   const origin = ref.origin || resolveOrigin(req, baseUrl);
   if (!origin) {
-    return `${ref.canonicalPath}?exp=${exp}&sig=${sig}`;
+    return `${ref.canonicalPath}?exp=${exp}&kid=${encodeURIComponent(keyVersion)}&sig=${sig}`;
   }
-  return `${origin}${ref.canonicalPath}?exp=${exp}&sig=${sig}`;
+  return `${origin}${ref.canonicalPath}?exp=${exp}&kid=${encodeURIComponent(keyVersion)}&sig=${sig}`;
 }
 
 function isPlainObject(value) {
@@ -129,7 +159,7 @@ function rewriteSignedUploadsInPayload(payload, context = {}) {
   return walk(payload);
 }
 
-function verifySignedUploadRequest(kind, filename, expRaw, sigRaw) {
+function verifySignedUploadRequest(kind, filename, expRaw, sigRaw, kidRaw) {
   const safeKind = String(kind || "")
     .toLowerCase()
     .trim();
@@ -166,12 +196,31 @@ function verifySignedUploadRequest(kind, filename, expRaw, sigRaw) {
   }
 
   const canonicalPath = `/uploads/${safeKind}/${safeName}`;
-  const expected = signUploadAccess(canonicalPath, exp);
-  if (!secureEqualHex(expected, sig)) {
+  const requestedKeyVersion = normalizeKeyVersion(kidRaw, "");
+  const candidates = resolveSecretCandidates(
+    SIGNED_UPLOAD_KEYRING,
+    requestedKeyVersion,
+  );
+  let matchedVersion = "";
+  let signatureValid = false;
+  for (const candidate of candidates) {
+    const expected = signUploadAccess(canonicalPath, exp, candidate.secret);
+    if (!secureEqualHex(expected, sig)) continue;
+    signatureValid = true;
+    matchedVersion = candidate.version;
+    break;
+  }
+  if (!signatureValid) {
     return { ok: false, error: "Signature mismatch" };
   }
 
-  return { ok: true, canonicalPath, kind: safeKind, filename: safeName };
+  return {
+    ok: true,
+    canonicalPath,
+    kind: safeKind,
+    filename: safeName,
+    keyVersion: matchedVersion || requestedKeyVersion || null,
+  };
 }
 
 function signedUploadGuard(kind) {
@@ -183,6 +232,7 @@ function signedUploadGuard(kind) {
       filename,
       req.query?.exp,
       req.query?.sig,
+      req.query?.kid || req.query?.kv,
     );
     if (!checked.ok) {
       return res.status(403).json({ ok: false, error: "Доступ к файлу запрещен" });

@@ -528,7 +528,7 @@ async function insertAuditFromReq(req, payload) {
   });
 }
 
-router.get('/finance/summary', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
+router.get('/finance/summary', requireAuth, requireRole('admin', 'tenant', 'creator'), async (req, res) => {
   try {
     const periodRaw = String(req.query?.period || 'month').toLowerCase().trim();
     const period = ['day', 'week', 'month', 'all'].includes(periodRaw)
