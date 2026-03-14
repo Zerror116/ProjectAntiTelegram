@@ -2788,14 +2788,12 @@ router.post(
                 p.image_url AS product_image_url,
                 u.name AS client_name,
                 ph.phone AS client_phone,
-                us.shelf_number
+                NULL::int AS shelf_number
          FROM reservations r
          JOIN products p ON p.id = r.product_id
          JOIN users u ON u.id = r.user_id
          LEFT JOIN phones ph ON ph.user_id = r.user_id
-         LEFT JOIN user_shelves us ON us.user_id = r.user_id
          WHERE r.is_fulfilled = false
-           AND COALESCE(r.is_sent, false) = false
            AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
          ORDER BY r.created_at ASC
          FOR UPDATE OF r`,
@@ -2928,9 +2926,13 @@ router.post(
     const reservationId = String(req.body?.reservation_id || "").trim();
     const cartItemId = String(req.body?.cart_item_id || "").trim();
     const shelfRaw = Number(req.body?.shelf_number);
-    const manualShelf = Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
-    const effectiveRole = String(req.user?.role || "").toLowerCase().trim();
-    const requiresManualShelf = effectiveRole === "admin" || effectiveRole === "tenant";
+    const manualShelf =
+      Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
+    const manualShelfConfirmed = ["1", "true", "yes", "y"].includes(
+      String(req.body?.manual_shelf ?? "").toLowerCase().trim(),
+    );
+    // В этом потоке (админ/создатель/арендатор) первая полка всегда вводится вручную.
+    const requiresManualShelf = true;
 
     if (!reservationId && !cartItemId) {
       return res
@@ -2988,37 +2990,86 @@ router.post(
         });
       }
 
-      const shelfQ = await client.query(
-        `SELECT shelf_number
-         FROM user_shelves
-         WHERE user_id = $1
-         LIMIT 1
-         FOR UPDATE`,
-        [item.user_id],
+      const carryShelfQ = await client.query(
+        `SELECT NULLIF(regexp_replace(COALESCE(meta->>'shelf_number', ''), '\\D', '', 'g'), '')::int AS shelf_number
+         FROM messages
+         WHERE chat_id = $1
+           AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
+           AND (
+             COALESCE(meta->>'reservation_id', '') = $2
+             OR ($3 <> '' AND COALESCE(meta->>'cart_item_id', '') = $3)
+           )
+           AND NULLIF(regexp_replace(COALESCE(meta->>'shelf_number', ''), '\\D', '', 'g'), '') IS NOT NULL
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [reservedChannel.id, String(item.id), targetCartItemId],
       );
 
-      const existingShelf = shelfQ.rowCount > 0
-        ? Number(shelfQ.rows[0].shelf_number)
+      const activeShelfContextQ = await client.query(
+        `SELECT 1
+         FROM cart_items
+         WHERE user_id = $1
+           AND status = ANY($2::text[])
+         LIMIT 1`,
+        [String(item.user_id), ["processed", "preparing_delivery", "handing_to_courier"]],
+      );
+      const hasActiveShelfContext = activeShelfContextQ.rowCount > 0;
+      const messageShelf = carryShelfQ.rowCount > 0
+        ? Number(carryShelfQ.rows[0].shelf_number)
         : null;
-      if (requiresManualShelf && manualShelf == null && !(existingShelf != null && existingShelf > 0)) {
+
+      let persistedUserShelf = null;
+      if (hasActiveShelfContext) {
+        const userShelfQ = await client.query(
+          `SELECT shelf_number
+           FROM user_shelves
+           WHERE user_id = $1
+           LIMIT 1`,
+          [String(item.user_id)],
+        );
+        if (userShelfQ.rowCount > 0) {
+          const parsed = Number(userShelfQ.rows[0]?.shelf_number);
+          persistedUserShelf =
+            Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+        }
+      }
+
+      const existingShelf =
+        messageShelf != null && messageShelf > 0
+          ? messageShelf
+          : persistedUserShelf;
+      const canReuseExistingShelf = existingShelf != null && existingShelf > 0;
+      if (
+        requiresManualShelf &&
+        !hasActiveShelfContext &&
+        (manualShelf == null || manualShelfConfirmed !== true)
+      ) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
+          code: "manual_shelf_required",
+          error: "Для первого товара в корзине нужно вручную указать номер полки",
+        });
+      }
+      if (requiresManualShelf && manualShelf == null && !canReuseExistingShelf) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          code: "manual_shelf_required",
           error: "Для первого товара в корзине нужно вручную указать номер полки",
         });
       }
 
       let finalShelf = manualShelf;
       if (finalShelf == null) {
-        finalShelf = existingShelf;
+        finalShelf = canReuseExistingShelf ? existingShelf : null;
       }
-      if (finalShelf == null) {
-        finalShelf = await resolveAutoShelfNumber(
-          client,
-          req.user?.tenant_id || null,
-          null,
-          1,
-        );
+      if (finalShelf == null || finalShelf <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Не удалось определить полку. Укажите номер полки вручную",
+        });
       }
       await client.query(
         `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)

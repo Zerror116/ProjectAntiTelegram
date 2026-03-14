@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+const String _phoenixHeroAsset = 'assets/app_icon_source.png';
+
 class PhoenixLoader extends StatefulWidget {
   final double size;
 
@@ -357,7 +359,7 @@ class PhoenixWingLoadingView extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            PhoenixWingsLoader(size: size),
+            PhoenixEntryHero(size: size),
             const SizedBox(height: 18),
             Text(
               title,
@@ -379,6 +381,244 @@ class PhoenixWingLoadingView extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class PhoenixEntryHero extends StatefulWidget {
+  final double size;
+
+  const PhoenixEntryHero({super.key, this.size = 128});
+
+  @override
+  State<PhoenixEntryHero> createState() => _PhoenixEntryHeroState();
+}
+
+class _PhoenixEntryHeroState extends State<PhoenixEntryHero>
+    with TickerProviderStateMixin {
+  late final AnimationController _introController;
+  late final AnimationController _pulseController;
+  bool _reducedMotion = false;
+  bool _pulseStarted = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _introController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1050),
+    );
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2600),
+    );
+    _introController.addStatusListener((status) {
+      if (status == AnimationStatus.completed && !_pulseStarted && mounted) {
+        _pulseStarted = true;
+        _pulseController.repeat();
+      }
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final nextReduced = MediaQuery.maybeOf(context)?.disableAnimations == true;
+    if (nextReduced == _reducedMotion) {
+      if (!_reducedMotion && !_introController.isAnimating) {
+        if (_introController.isCompleted) {
+          if (!_pulseController.isAnimating) {
+            _pulseController.repeat();
+          }
+        } else {
+          _introController.forward();
+        }
+      }
+      return;
+    }
+    _reducedMotion = nextReduced;
+    if (_reducedMotion) {
+      _introController.stop();
+      _pulseController.stop();
+      _introController.value = 1;
+      _pulseController.value = 0;
+      return;
+    }
+    _pulseStarted = false;
+    _introController
+      ..stop()
+      ..value = 0;
+    _pulseController
+      ..stop()
+      ..value = 0;
+    _introController.forward();
+  }
+
+  @override
+  void dispose() {
+    _introController.dispose();
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  double _mix(double from, double to, double t) => from + ((to - from) * t);
+
+  Widget _buildImageFrame(
+    ThemeData theme, {
+    required double reveal,
+    required double scale,
+    required double tilt,
+    required double lift,
+  }) {
+    final size = widget.size;
+    final radius = size * 0.26;
+    return Transform.translate(
+      offset: Offset(0, lift),
+      child: Transform.rotate(
+        angle: tilt,
+        child: Transform.scale(
+          scale: scale,
+          child: Container(
+            width: size,
+            height: size,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(
+                color: theme.colorScheme.primary.withValues(alpha: 0.42),
+                width: 1.2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.28),
+                  blurRadius: 34,
+                  spreadRadius: 1,
+                  offset: const Offset(0, 14),
+                ),
+                BoxShadow(
+                  color: theme.colorScheme.tertiary.withValues(alpha: 0.24),
+                  blurRadius: 18,
+                  spreadRadius: 1,
+                  offset: const Offset(0, 8),
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(radius),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          theme.colorScheme.surfaceContainerHighest,
+                          theme.colorScheme.surfaceContainer,
+                        ],
+                      ),
+                    ),
+                  ),
+                  ClipRect(
+                    child: Align(
+                      alignment: Alignment.center,
+                      widthFactor: reveal,
+                      child: Image.asset(
+                        _phoenixHeroAsset,
+                        fit: BoxFit.cover,
+                        filterQuality: FilterQuality.high,
+                      ),
+                    ),
+                  ),
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: const Alignment(-0.65, -1),
+                            end: const Alignment(0.75, 1),
+                            colors: [
+                              Colors.white.withValues(alpha: 0.16),
+                              Colors.transparent,
+                              Colors.black.withValues(alpha: 0.10),
+                            ],
+                            stops: const [0.0, 0.45, 1.0],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    if (_reducedMotion) {
+      return _buildImageFrame(theme, reveal: 1, scale: 1, tilt: 0, lift: 0);
+    }
+
+    return AnimatedBuilder(
+      animation: Listenable.merge([_introController, _pulseController]),
+      builder: (context, _) {
+        final intro = Curves.easeOutCubic.transform(
+          _introController.value.clamp(0, 1),
+        );
+        final introBack = Curves.easeOutBack.transform(
+          _introController.value.clamp(0, 1),
+        );
+        final pulseWave = math.sin(_pulseController.value * math.pi * 2);
+        final pulse = (pulseWave + 1) / 2;
+
+        final reveal = _mix(0.80, 1.0, introBack).clamp(0.75, 1.0);
+        final scale = _mix(0.93, 1.0, intro) * _mix(0.992, 1.01, pulse);
+        final tilt = _mix(0.07, 0.0, intro) + (pulseWave * 0.008);
+        final lift = _mix(16, 0, intro) + (pulseWave * 1.8);
+        final glowScale = _mix(0.86, 1.0, intro) + (pulse * 0.04);
+        final glowOpacity = _mix(0.10, 0.20, pulse);
+        final haloSize = widget.size * 1.22;
+
+        return SizedBox(
+          width: haloSize,
+          height: haloSize,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Transform.scale(
+                scale: glowScale,
+                child: Container(
+                  width: widget.size,
+                  height: widget.size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: RadialGradient(
+                      colors: [
+                        theme.colorScheme.primary.withValues(
+                          alpha: glowOpacity,
+                        ),
+                        theme.colorScheme.primary.withValues(alpha: 0.02),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              _buildImageFrame(
+                theme,
+                reveal: reveal,
+                scale: scale,
+                tilt: tilt,
+                lift: lift,
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }

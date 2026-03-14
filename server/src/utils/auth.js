@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 const { isTenantActive, isPlatformCreatorEmail } = require('./tenants');
 const { touchUserSession } = require('./sessions');
+const { resolvePhoneAccessState } = require('./phoneAccess');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
@@ -86,6 +87,38 @@ function isProfileProbeRequest(req) {
   const baseUrl = String(req?.baseUrl || '').toLowerCase().trim();
   const path = String(req?.path || '').toLowerCase().trim();
   return baseUrl === '/api/profile' && (path === '' || path === '/');
+}
+
+function isPhoneAccessRestrictionState(state) {
+  const normalized = String(state || '').toLowerCase().trim();
+  return normalized === 'pending' || normalized === 'rejected';
+}
+
+function isPhoneAccessBypassRequest(req) {
+  const method = String(req?.method || '').toUpperCase().trim();
+  const fullPath = `${String(req?.baseUrl || '').trim()}${String(
+    req?.path || '',
+  ).trim()}`;
+  if (
+    method === 'GET' &&
+    (fullPath === '/api/profile' || fullPath === '/api/profile/')
+  ) {
+    return true;
+  }
+  if (method === 'POST' && fullPath === '/api/auth/logout') return true;
+  if (method === 'GET' && fullPath === '/api/auth/phone-access/status') {
+    return true;
+  }
+  if (method === 'GET' && fullPath === '/api/auth/phone-access/requests') {
+    return true;
+  }
+  if (
+    method === 'POST' &&
+    /^\/api\/auth\/phone-access\/requests\/[^/]+\/decision$/i.test(fullPath)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 async function resolveAuthContextFromToken(
@@ -262,6 +295,30 @@ async function resolveAuthContextFromToken(
     session_id: sessionId ? String(sessionId) : null,
   };
 
+  if (!isPlatformCreator && baseRole === 'client' && row.tenant_id) {
+    try {
+      const readPhoneAccess = async () =>
+        await resolvePhoneAccessState(db, {
+          requesterUserId: row.id,
+          tenantId: row.tenant_id || null,
+        });
+      const phoneAccessState = tenantRegistry
+        ? await db.runWithTenantRow(tenantRegistry, readPhoneAccess)
+        : await db.runWithPlatform(readPhoneAccess);
+      if (phoneAccessState && phoneAccessState.state) {
+        user.phone_access_state = phoneAccessState.state;
+        user.phone_access = phoneAccessState;
+      }
+    } catch (err) {
+      if (NODE_ENV !== 'production') {
+        console.error(
+          'resolveAuthContextFromToken phone access state error:',
+          err && err.message ? err.message : err,
+        );
+      }
+    }
+  }
+
   return { ok: true, user, tenantScope: tenantRegistry || tenantScope || null };
 }
 
@@ -308,6 +365,21 @@ async function authMiddleware(req, res, next) {
       });
     }
     req.user = context.user;
+    if (
+      isPhoneAccessRestrictionState(req.user?.phone_access_state) &&
+      !isPhoneAccessBypassRequest(req)
+    ) {
+      const state = String(req.user?.phone_access_state || '').trim();
+      const message =
+        state === 'rejected'
+          ? 'Владелец номера отклонил запрос. Обновите номер телефона в профиле.'
+          : 'Ожидается разрешение первого владельца номера.';
+      return res.status(423).json({
+        error: message,
+        code: `phone_access_${state || 'restricted'}`,
+        phone_access: req.user?.phone_access || null,
+      });
+    }
     if (context.user?.is_platform_creator === true) {
       return db.runWithPlatform(() => next());
     }

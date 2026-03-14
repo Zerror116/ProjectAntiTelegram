@@ -6,6 +6,7 @@ import '../main.dart'; // глобальный authService и dio
 import '../widgets/input_language_badge.dart';
 
 import 'phone_name_screen.dart';
+import 'phone_access_pending_screen.dart';
 import 'main_shell.dart';
 
 class AuthScreen extends StatefulWidget {
@@ -242,8 +243,22 @@ class _AuthScreenState extends State<AuthScreen> {
         final user = data['user'] as Map<String, dynamic>? ?? {};
         final name = (user['name'] ?? '').toString().trim();
         final phone = (user['phone'] ?? '').toString().trim();
+        final phoneAccessState =
+            (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
+                .toString()
+                .trim()
+                .toLowerCase();
         final hasName = name.isNotEmpty;
         final hasPhone = phone.isNotEmpty;
+
+        if (phoneAccessState == 'pending' || phoneAccessState == 'rejected') {
+          if (!mounted) return;
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const PhoneAccessPendingScreen()),
+          );
+          return;
+        }
 
         // Экран добора данных нужен только если имя/номер действительно отсутствуют.
         if (!hasName || !hasPhone) {

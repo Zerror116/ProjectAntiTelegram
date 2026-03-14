@@ -1465,6 +1465,51 @@ class _ChatScreenState extends State<ChatScreen> {
         (metaMap['reservation_id'] != null || metaMap['cart_item_id'] != null);
   }
 
+  bool _isReservedOrdersChat() {
+    if ((widget.chatType ?? '').toLowerCase().trim() != 'channel') return false;
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
+    final systemKey = (settings['system_key'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    final title = widget.chatTitle.toLowerCase().trim();
+    return kind == 'reserved_orders' ||
+        systemKey == 'reserved_orders' ||
+        title == 'забронированный товар';
+  }
+
+  String? _reservedProductCodeOf(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final directCode = int.tryParse((meta['product_code'] ?? '').toString());
+    if (directCode != null && directCode > 0) {
+      return directCode.toString();
+    }
+
+    final label = (meta['product_label'] ?? '').toString().trim();
+    if (label.isNotEmpty) {
+      final fromLabel = label
+          .split('--')
+          .first
+          .trim()
+          .replaceAll(RegExp(r'\D'), '');
+      if (fromLabel.isNotEmpty) {
+        return fromLabel;
+      }
+    }
+
+    final text = (message['text'] ?? '').toString();
+    final fromText = RegExp(
+      r'ID\s*товара\s*:\s*([0-9]+)',
+      caseSensitive: false,
+    ).firstMatch(text)?.group(1);
+    final normalizedTextCode = (fromText ?? '').trim();
+    if (normalizedTextCode.isNotEmpty) {
+      return normalizedTextCode;
+    }
+    return null;
+  }
+
   bool _isDeliveryOffer(Map<String, dynamic> message) {
     final metaMap = _metaMapOf(message['meta']);
     return metaMap['kind']?.toString() == 'delivery_offer';
@@ -1482,7 +1527,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _requiresManualShelfOnPlaced() {
     final role = authService.effectiveRole.toLowerCase().trim();
-    return role == 'admin' || role == 'tenant';
+    return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
   bool _isClientRole() {
@@ -1681,7 +1726,10 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final reservationIdValue = (reservationId ?? '').trim();
       final cartItemIdValue = (cartItemId ?? '').trim();
-      Future<Response<dynamic>> sendMarkPlaced({int? shelfNumber}) {
+      Future<Response<dynamic>> sendMarkPlaced({
+        int? shelfNumber,
+        bool manualShelf = false,
+      }) {
         final shelfValue = shelfNumber != null && shelfNumber > 0
             ? shelfNumber.toString()
             : '';
@@ -1692,19 +1740,30 @@ class _ChatScreenState extends State<ChatScreen> {
               'reservation_id': reservationIdValue,
             if (cartItemIdValue.isNotEmpty) 'cart_item_id': cartItemIdValue,
             if (shelfValue.isNotEmpty) 'shelf_number': shelfValue,
+            if (manualShelf) 'manual_shelf': true,
           },
         );
       }
 
       Response<dynamic> resp;
+      final requiresManualByRole = _requiresManualShelfOnPlaced();
       try {
-        resp = await sendMarkPlaced(shelfNumber: knownShelf);
+        // Для админского потока не подставляем полку автоматически:
+        // первый товар должен быть подтвержден ручным вводом.
+        resp = await sendMarkPlaced(
+          shelfNumber: requiresManualByRole ? null : knownShelf,
+        );
       } on DioException catch (e) {
-        final requiresManualByRole = _requiresManualShelfOnPlaced();
+        final rawData = e.response?.data;
+        final responseMap = rawData is Map
+            ? Map<String, dynamic>.from(rawData)
+            : const <String, dynamic>{};
+        final errorCode = (responseMap['code'] ?? '').toString().trim();
         final serverMessage = _extractDioError(e).toLowerCase();
         final needsManualShelf =
             requiresManualByRole &&
-            serverMessage.contains('вручную указать номер полки');
+            (errorCode == 'manual_shelf_required' ||
+                serverMessage.contains('вручную указать номер полки'));
         if (!needsManualShelf) rethrow;
         if (!mounted) return;
 
@@ -1747,7 +1806,10 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         );
         if (manualShelf == null) return;
-        resp = await sendMarkPlaced(shelfNumber: manualShelf);
+        resp = await sendMarkPlaced(
+          shelfNumber: manualShelf,
+          manualShelf: true,
+        );
       }
       if ((resp.statusCode == 200 || resp.statusCode == 201) && mounted) {
         setState(() {
@@ -1793,6 +1855,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _messageMatchesSearch(Map<String, dynamic> message, String query) {
     if (query.isEmpty) return true;
+    final rawQuery = query.trim();
+    if (rawQuery.isEmpty) return true;
+    if (RegExp(r'^\d+$').hasMatch(rawQuery) &&
+        (_isReservedOrdersChat() || _isReservedOrder(message))) {
+      final productCode = _reservedProductCodeOf(message);
+      if (productCode == null || productCode.isEmpty) return false;
+      return productCode == rawQuery;
+    }
+
     final q = query.toLowerCase();
     final text = (message['text'] ?? '').toString().toLowerCase();
     final meta = _metaMapOf(message['meta']);
@@ -3510,9 +3581,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                   onPressed: !canCompose || _mediaUploading
                       ? null
-                      : (_hasDraftText
-                            ? _send
-                            : _toggleVoiceComposerAction),
+                      : (_hasDraftText ? _send : _toggleVoiceComposerAction),
                 ),
               ],
             ),

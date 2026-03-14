@@ -25,6 +25,15 @@ const {
   revokeUserSession,
 } = require('../utils/sessions');
 const {
+  normalizePhoneDigits,
+  findOldestPhoneOwner,
+  createPhoneAccessRequest,
+  rebalancePendingPhoneRequestOwners,
+  resolvePhoneAccessState,
+  listPendingPhoneAccessRequestsForOwner,
+  decidePhoneAccessRequest,
+} = require('../utils/phoneAccess');
+const {
   isTwoFactorEligibleRole,
   normalizeTotpCode,
   generateTwoFactorSetup,
@@ -136,6 +145,18 @@ function requireTwoFactorEligible(req, res, next) {
 function normalizeDeviceFingerprint(value) {
   const normalized = String(value || '').trim();
   return normalized ? normalized.slice(0, 255) : null;
+}
+
+function ensureDeviceFingerprint(value) {
+  const normalized = normalizeDeviceFingerprint(value);
+  if (!normalized) {
+    const error = new Error(
+      'Для регистрации требуется отпечаток устройства. Обновите приложение и повторите попытку.',
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalized;
 }
 
 function parseBooleanFlag(raw) {
@@ -768,6 +789,7 @@ router.post('/register', async (req, res) => {
     if (typeof password !== 'string' || password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
+    const requiredDeviceFingerprint = ensureDeviceFingerprint(device_fingerprint);
 
     let role = 'client';
     let tenant = null;
@@ -870,7 +892,20 @@ router.post('/register', async (req, res) => {
           return { ok: false, status: 409, error: 'Email already registered' };
         }
 
-        await assertDeviceAccountLimit(client, device_fingerprint);
+        await assertDeviceAccountLimit(client, requiredDeviceFingerprint);
+
+        const normalizedPhone = normalizePhoneDigits(phone);
+        if (phone && normalizedPhone.length < 10) {
+          await client.query('ROLLBACK');
+          return { ok: false, status: 400, error: 'Invalid phone format' };
+        }
+        let duplicatePhoneOwner = null;
+        if (role === 'client' && tenant?.id && normalizedPhone.length >= 10) {
+          duplicatePhoneOwner = await findOldestPhoneOwner(client, {
+            tenantId: tenant.id,
+            phoneDigits: normalizedPhone,
+          });
+        }
 
         const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
         const insertUser = await client.query(
@@ -887,12 +922,8 @@ router.post('/register', async (req, res) => {
         );
         const user = insertUser.rows[0];
 
-        if (phone) {
-          const normalizedPhone = String(phone).replace(/\D/g, '');
-          if (normalizedPhone.length < 10) {
-            await client.query('ROLLBACK');
-            return { ok: false, status: 400, error: 'Invalid phone format' };
-          }
+        let phoneAccessRequest = null;
+        if (normalizedPhone.length >= 10) {
           await client.query(
             `INSERT INTO phones (user_id, phone, status, created_at)
              VALUES ($1, $2, 'pending_verification', now())
@@ -900,6 +931,17 @@ router.post('/register', async (req, res) => {
                SET phone = $2, status = 'pending_verification', created_at = now()`,
             [user.id, normalizedPhone],
           );
+          if (
+            duplicatePhoneOwner &&
+            String(duplicatePhoneOwner.id || '') !== String(user.id || '')
+          ) {
+            phoneAccessRequest = await createPhoneAccessRequest(client, {
+              tenantId: tenant?.id || null,
+              phoneDigits: normalizedPhone,
+              ownerUserId: duplicatePhoneOwner.id,
+              requesterUserId: user.id,
+            });
+          }
         }
 
         if (role === "tenant" && tenant?.id) {
@@ -943,7 +985,7 @@ router.post('/register', async (req, res) => {
           }
         }
 
-        await upsertDevice(client, user.id, device_fingerprint);
+        await upsertDevice(client, user.id, requiredDeviceFingerprint);
 
         const sessionId = uuidv4();
         const sessionExpiresAt = buildSessionExpiry();
@@ -951,7 +993,7 @@ router.post('/register', async (req, res) => {
           queryable: client,
           userId: user.id,
           sessionId,
-          deviceFingerprint: device_fingerprint,
+          deviceFingerprint: requiredDeviceFingerprint,
           userAgent: req.get('user-agent') || '',
           ipAddress:
             req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
@@ -961,7 +1003,7 @@ router.post('/register', async (req, res) => {
         });
 
         await client.query('COMMIT');
-        return { ok: true, user, sessionId };
+        return { ok: true, user, sessionId, phoneAccessRequest };
       } catch (err) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         throw err;
@@ -1012,6 +1054,45 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    let phoneAccess = { state: 'none' };
+    if (!isPlatformCreator && registration.user?.tenant_id) {
+      try {
+        phoneAccess = await db.runWithTenantRow(tenant, async () =>
+          await resolvePhoneAccessState(db, {
+            requesterUserId: registration.user.id,
+            tenantId: registration.user.tenant_id || tenant?.id || null,
+          }),
+        );
+      } catch (err) {
+        console.error('auth.register phoneAccess state error', err);
+      }
+    }
+
+    if (registration.phoneAccessRequest?.id) {
+      try {
+        const io = req.app.get('io');
+        const ownerUserId = String(
+          registration.phoneAccessRequest.owner_user_id || '',
+        ).trim();
+        if (io && ownerUserId) {
+          io.to(`user:${ownerUserId}`).emit('phone-access:request', {
+            request_id: registration.phoneAccessRequest.id,
+            tenant_id:
+              registration.phoneAccessRequest.tenant_id ||
+              registration.user?.tenant_id ||
+              null,
+            phone: registration.phoneAccessRequest.phone || '',
+            requester_user_id: registration.user.id,
+            requester_name: registration.user.name || '',
+            requester_email: registration.user.email || '',
+            requested_at: registration.phoneAccessRequest.requested_at || null,
+          });
+        }
+      } catch (err) {
+        console.error('auth.register phoneAccess notify error', err);
+      }
+    }
+
     const token = signToken({
       id: registration.user.id,
       email: registration.user.email,
@@ -1032,6 +1113,8 @@ router.post('/register', async (req, res) => {
         tenant_id: registration.user.tenant_id || null,
         tenant_code: tenant?.code || null,
         tenant_name: tenant?.name || null,
+        phone_access_state: phoneAccess.state || 'none',
+        phone_access: phoneAccess,
       },
       tenant: tenant
         ? {
@@ -1318,6 +1401,20 @@ router.post('/login', async (req, res) => {
       }
     }
 
+    let phoneAccess = { state: 'none' };
+    if (!isPlatformCreator && result.user?.tenant_id) {
+      try {
+        phoneAccess = await db.runWithTenantRow(tenant, async () =>
+          await resolvePhoneAccessState(db, {
+            requesterUserId: result.user.id,
+            tenantId: result.user.tenant_id || tenant?.id || null,
+          }),
+        );
+      } catch (err) {
+        console.error('auth.login phoneAccess state error', err);
+      }
+    }
+
     const effectiveTenantCode = tenant?.code || result.user.tenant_code || null;
     const token = signToken({
       id: result.user.id,
@@ -1342,6 +1439,8 @@ router.post('/login', async (req, res) => {
         tenant_id: result.user.tenant_id || null,
         tenant_code: effectiveTenantCode,
         tenant_name: result.user.tenant_name || tenant?.name || null,
+        phone_access_state: phoneAccess.state || 'none',
+        phone_access: phoneAccess,
       },
       tenant: result.user.tenant_id
         ? {
@@ -1357,6 +1456,114 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error('auth.login error', err);
     return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+router.get('/phone-access/status', authMiddleware, async (req, res) => {
+  try {
+    await rebalancePendingPhoneRequestOwners(db, {
+      tenantId: req.user?.tenant_id || null,
+    });
+    const state = await resolvePhoneAccessState(db, {
+      requesterUserId: req.user?.id || null,
+      tenantId: req.user?.tenant_id || null,
+    });
+    return res.json({
+      ok: true,
+      data: state,
+    });
+  } catch (err) {
+    console.error('auth.phoneAccess.status error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/phone-access/requests', authMiddleware, async (req, res) => {
+  try {
+    await rebalancePendingPhoneRequestOwners(db, {
+      tenantId: req.user?.tenant_id || null,
+    });
+    const pending = await listPendingPhoneAccessRequestsForOwner(db, {
+      ownerUserId: req.user?.id || null,
+      tenantId: req.user?.tenant_id || null,
+    });
+    return res.json({
+      ok: true,
+      data: pending.map((row) => ({
+        id: row.id,
+        tenant_id: row.tenant_id || null,
+        phone: row.phone || '',
+        status: row.status || 'pending',
+        requested_at: row.requested_at || null,
+        requester_user_id: row.requester_user_id || null,
+        requester_name: row.requester_name || '',
+        requester_email: row.requester_email || '',
+      })),
+    });
+  } catch (err) {
+    console.error('auth.phoneAccess.requests error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/phone-access/requests/:id/decision', authMiddleware, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const requestId = String(req.params?.id || '').trim();
+    const decision = String(req.body?.decision || '').trim().toLowerCase();
+    const note = String(req.body?.note || '').trim();
+    if (!requestId) {
+      return res.status(400).json({ ok: false, error: 'id запроса обязателен' });
+    }
+    if (!decision) {
+      return res.status(400).json({ ok: false, error: 'decision обязателен' });
+    }
+
+    await client.query('BEGIN');
+    const decided = await decidePhoneAccessRequest(client, {
+      requestId,
+      ownerUserId: req.user?.id || null,
+      tenantId: req.user?.tenant_id || null,
+      decision,
+      note,
+    });
+    if (!decided.ok || !decided.row) {
+      await client.query('ROLLBACK');
+      return res
+        .status(decided.status || 400)
+        .json({ ok: false, error: decided.error || 'Не удалось сохранить решение' });
+    }
+    await client.query('COMMIT');
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user:${decided.row.requester_user_id}`).emit('phone-access:decision', {
+        request_id: decided.row.id,
+        status: decided.row.status,
+        owner_user_id: decided.row.owner_user_id,
+        requester_user_id: decided.row.requester_user_id,
+        decided_at: decided.row.decided_at || null,
+        note: decided.row.note || '',
+      });
+      io.to(`user:${decided.row.owner_user_id}`).emit('phone-access:updated', {
+        request_id: decided.row.id,
+        status: decided.row.status,
+        requester_user_id: decided.row.requester_user_id,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: decided.row,
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('auth.phoneAccess.decision error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
   }
 });
 

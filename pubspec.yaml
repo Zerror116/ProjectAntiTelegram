@@ -86,4 +86,5 @@ flutter_native_splash:
 flutter:
   uses-material-design: true
   assets:
+    - assets/app_icon_source.png
     - assets/sounds/
