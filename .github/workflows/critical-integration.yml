@@ -36,3 +36,49 @@ jobs:
           E2E_STRICT_ADMIN: ${{ secrets.E2E_STRICT_ADMIN }}
           E2E_DEVICE_FINGERPRINT: github-critical-e2e
         run: npm run --prefix server test:critical
+
+      - name: Run subscription-guard E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_CREATOR_EMAIL: ${{ secrets.E2E_CREATOR_EMAIL }}
+          E2E_CREATOR_PASSWORD: ${{ secrets.E2E_CREATOR_PASSWORD }}
+          E2E_CREATOR_TOTP_CODE: ${{ secrets.E2E_CREATOR_TOTP_CODE }}
+          E2E_CREATOR_BACKUP_CODE: ${{ secrets.E2E_CREATOR_BACKUP_CODE }}
+          E2E_STAFF_EMAIL: ${{ secrets.E2E_STAFF_EMAIL }}
+          E2E_STAFF_PASSWORD: ${{ secrets.E2E_STAFF_PASSWORD }}
+          E2E_STAFF_TOTP_CODE: ${{ secrets.E2E_STAFF_TOTP_CODE }}
+          E2E_STAFF_BACKUP_CODE: ${{ secrets.E2E_STAFF_BACKUP_CODE }}
+          E2E_CLIENT_EMAIL: ${{ secrets.E2E_CLIENT_EMAIL }}
+          E2E_CLIENT_PASSWORD: ${{ secrets.E2E_CLIENT_PASSWORD }}
+          E2E_CLIENT_TOTP_CODE: ${{ secrets.E2E_CLIENT_TOTP_CODE }}
+          E2E_CLIENT_BACKUP_CODE: ${{ secrets.E2E_CLIENT_BACKUP_CODE }}
+          E2E_TENANT_CODE: ${{ secrets.E2E_TENANT_CODE }}
+        run: |
+          if [ -z "${E2E_CREATOR_EMAIL}" ] || [ -z "${E2E_CREATOR_PASSWORD}" ] || [ -z "${E2E_STAFF_EMAIL}" ] || [ -z "${E2E_STAFF_PASSWORD}" ] || [ -z "${E2E_CLIENT_EMAIL}" ] || [ -z "${E2E_CLIENT_PASSWORD}" ]; then
+            echo "Skip subscription-guard E2E: creator/staff/client credentials are not configured"
+            exit 0
+          fi
+          npm run --prefix server test:subscription-guard:e2e
+
+      - name: Run order-pipeline E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_WORKER_EMAIL: ${{ secrets.E2E_WORKER_EMAIL }}
+          E2E_WORKER_PASSWORD: ${{ secrets.E2E_WORKER_PASSWORD }}
+          E2E_WORKER_TOTP_CODE: ${{ secrets.E2E_WORKER_TOTP_CODE }}
+          E2E_WORKER_BACKUP_CODE: ${{ secrets.E2E_WORKER_BACKUP_CODE }}
+          E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+          E2E_ADMIN_TOTP_CODE: ${{ secrets.E2E_ADMIN_TOTP_CODE }}
+          E2E_ADMIN_BACKUP_CODE: ${{ secrets.E2E_ADMIN_BACKUP_CODE }}
+          E2E_CLIENT_EMAIL: ${{ secrets.E2E_CLIENT_EMAIL }}
+          E2E_CLIENT_PASSWORD: ${{ secrets.E2E_CLIENT_PASSWORD }}
+          E2E_CLIENT_TOTP_CODE: ${{ secrets.E2E_CLIENT_TOTP_CODE }}
+          E2E_CLIENT_BACKUP_CODE: ${{ secrets.E2E_CLIENT_BACKUP_CODE }}
+          E2E_TENANT_CODE: ${{ secrets.E2E_TENANT_CODE }}
+        run: |
+          if [ -z "${E2E_ADMIN_EMAIL}" ] || [ -z "${E2E_ADMIN_PASSWORD}" ] || [ -z "${E2E_CLIENT_EMAIL}" ] || [ -z "${E2E_CLIENT_PASSWORD}" ]; then
+            echo "Skip order-pipeline E2E: admin/client credentials are not configured"
+            exit 0
+          fi
+          npm run --prefix server test:order-pipeline:e2e

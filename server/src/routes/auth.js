@@ -4,10 +4,10 @@ const router = express.Router();
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const validator = require('validator');
-const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db'); // предполагается, что db экспортирует функцию query
 const { authMiddleware } = require('../utils/auth');
+const { signJwt } = require('../utils/jwt');
 const {
   PLATFORM_CREATOR_EMAIL,
   normalizeAccessKey,
@@ -46,17 +46,6 @@ const {
 } = require('../utils/twoFactor');
 const { ensureSystemChannels } = require("../utils/systemChannels");
 require('dotenv').config();
-
-const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
-
-if (
-  process.env.NODE_ENV === 'production' &&
-  JWT_SECRET === 'change_me_long_secret'
-) {
-  throw new Error(
-    'JWT_SECRET must be configured in production (default fallback is forbidden).',
-  );
-}
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
 // Настройки для Creator
@@ -80,7 +69,7 @@ if (
 }
 
 function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+  return signJwt(payload, { expiresIn: '7d' });
 }
 
 function buildSessionExpiry() {

@@ -56,6 +56,8 @@ final ValueNotifier<int> themeStyleVersionNotifier = ValueNotifier(0);
 final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
   null,
 );
+final ValueNotifier<PhoneAccessOwnerRequest?> phoneAccessOwnerRequestNotifier =
+    ValueNotifier<PhoneAccessOwnerRequest?>(null);
 
 const _notificationsPrefPrefix = 'notifications_enabled_';
 const _themePrefPrefix = 'theme_mode_dark_';
@@ -76,6 +78,62 @@ bool _keyboardAssertRecoveredRecently = false;
 enum AppNoticeTone { info, success, warning, error }
 
 enum AppUiSound { tap, sent, incoming, success, warning }
+
+class PhoneAccessOwnerRequest {
+  final String id;
+  final String requesterName;
+  final String requesterEmail;
+  final String requesterUserId;
+  final String phone;
+  final String? requestedAt;
+
+  const PhoneAccessOwnerRequest({
+    required this.id,
+    required this.requesterName,
+    required this.requesterEmail,
+    required this.requesterUserId,
+    required this.phone,
+    required this.requestedAt,
+  });
+
+  String get requesterLabel {
+    final name = requesterName.trim();
+    if (name.isNotEmpty) return name;
+    final email = requesterEmail.trim();
+    if (email.isNotEmpty) return email;
+    return 'пользователь';
+  }
+}
+
+PhoneAccessOwnerRequest? _parsePhoneAccessOwnerRequest(dynamic data) {
+  if (data is! Map) return null;
+  final map = Map<String, dynamic>.from(data);
+  final requestId = (map['request_id'] ?? map['id'] ?? '').toString().trim();
+  if (requestId.isEmpty) return null;
+  return PhoneAccessOwnerRequest(
+    id: requestId,
+    requesterName: (map['requester_name'] ?? '').toString().trim(),
+    requesterEmail: (map['requester_email'] ?? '').toString().trim(),
+    requesterUserId: (map['requester_user_id'] ?? '').toString().trim(),
+    phone: (map['phone'] ?? '').toString().trim(),
+    requestedAt: (map['requested_at'] ?? '').toString().trim().isEmpty
+        ? null
+        : (map['requested_at'] ?? '').toString().trim(),
+  );
+}
+
+Map<String, dynamic> _phoneAccessRequestToEventMap(
+  PhoneAccessOwnerRequest request,
+) {
+  return <String, dynamic>{
+    'request_id': request.id,
+    'requester_name': request.requesterName,
+    'requester_email': request.requesterEmail,
+    'requester_user_id': request.requesterUserId,
+    'phone': request.phone,
+    'requested_at': request.requestedAt,
+  };
+}
 
 String _resolveApiBaseUrl(String raw) {
   const fallback = 'http://127.0.0.1:3000';
@@ -458,18 +516,13 @@ bool _isDuplicateKeyDownKeyboardAssert(Object error) {
 }
 
 Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
-  if (data is! Map) return;
-  final map = Map<String, dynamic>.from(data);
-  final requestId = (map['request_id'] ?? '').toString().trim();
-  if (requestId.isEmpty) return;
+  final request = _parsePhoneAccessOwnerRequest(data);
+  if (request == null) return;
+  final requestId = request.id;
+  phoneAccessOwnerRequestNotifier.value = request;
   if (_activePhoneAccessDialogRequestId == requestId) return;
 
-  final requesterName = (map['requester_name'] ?? '').toString().trim();
-  final requesterEmail = (map['requester_email'] ?? '').toString().trim();
-  final phone = (map['phone'] ?? '').toString().trim();
-  final requesterLabel = requesterName.isNotEmpty
-      ? requesterName
-      : (requesterEmail.isNotEmpty ? requesterEmail : 'пользователь');
+  final requesterLabel = request.requesterLabel;
   showGlobalAppNotice(
     'Новый запрос на общий доступ к корзине ($requesterLabel)',
     title: 'Подтверждение номера',
@@ -488,7 +541,7 @@ Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
           title: const Text('Запрос на общий номер'),
           content: Text(
             'Пользователь "$requesterLabel" хочет зарегистрироваться на ваш номер'
-            '${phone.isNotEmpty ? ' ($phone)' : ''}.\n\n'
+            '${request.phone.isNotEmpty ? ' (${request.phone})' : ''}.\n\n'
             'Разрешить доступ к вашей корзине?',
           ),
           actions: [
@@ -505,14 +558,9 @@ Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
       },
     );
     if (decision == null) return;
-    await dio.post(
-      '/api/auth/phone-access/requests/$requestId/decision',
-      data: {'decision': decision},
-    );
-    showGlobalAppNotice(
-      decision == 'approve' ? 'Доступ к корзине разрешён' : 'Запрос отклонён',
-      title: 'Подтверждение номера',
-      tone: decision == 'approve' ? AppNoticeTone.success : AppNoticeTone.info,
+    await submitPhoneAccessOwnerDecision(
+      requestId,
+      approve: decision == 'approve',
     );
   } on DioException catch (e) {
     final body = e.response?.data;
@@ -536,29 +584,122 @@ Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
   }
 }
 
+Future<bool> submitPhoneAccessOwnerDecision(
+  String requestId, {
+  required bool approve,
+}) async {
+  final id = requestId.trim();
+  if (id.isEmpty) return false;
+  try {
+    await dio.post(
+      '/api/auth/phone-access/requests/$id/decision',
+      data: {'decision': approve ? 'approve' : 'reject'},
+    );
+    phoneAccessOwnerRequestNotifier.value = null;
+    showGlobalAppNotice(
+      approve ? 'Доступ к корзине разрешён' : 'Запрос отклонён',
+      title: 'Подтверждение номера',
+      tone: approve ? AppNoticeTone.success : AppNoticeTone.info,
+    );
+    await _probePendingPhoneAccessRequests();
+    return true;
+  } on DioException catch (e) {
+    final body = e.response?.data;
+    final map = body is Map ? Map<String, dynamic>.from(body) : null;
+    final message = (map?['error'] ?? e.message ?? 'Ошибка решения запроса')
+        .toString()
+        .trim();
+    showGlobalAppNotice(
+      message.isEmpty ? 'Ошибка решения запроса' : message,
+      title: 'Подтверждение номера',
+      tone: AppNoticeTone.error,
+    );
+  } catch (_) {
+    showGlobalAppNotice(
+      'Ошибка решения запроса',
+      title: 'Подтверждение номера',
+      tone: AppNoticeTone.error,
+    );
+  }
+  return false;
+}
+
+void _handleCreatorAlertEvent(dynamic data) {
+  if (data is! Map) return;
+  final map = Map<String, dynamic>.from(data);
+  final type = (map['type'] ?? '').toString().trim().toLowerCase();
+  final tenantId = (map['tenant_id'] ?? '').toString().trim();
+  final userId = (map['user_id'] ?? '').toString().trim();
+  final reason = (map['reason'] ?? '').toString().trim();
+  final source = (map['source'] ?? '').toString().trim();
+
+  String title = 'Системный алерт';
+  String message;
+  AppNoticeTone tone = AppNoticeTone.warning;
+
+  if (type == 'client_auto_deleted') {
+    title = 'Автоудаление клиента';
+    message =
+        'Клиент удален автоматически${tenantId.isNotEmpty ? ' (tenant: $tenantId)' : ''}'
+        '${userId.isNotEmpty ? ', user: $userId' : ''}.'
+        '${reason.isNotEmpty ? ' Причина: $reason.' : ''}'
+        '${source.isNotEmpty ? ' Источник: $source.' : ''}';
+    tone = AppNoticeTone.error;
+  } else if (type == 'cart_auto_dismantled_inactive') {
+    title = 'Авторасформировка корзины';
+    message =
+        'Корзина расформирована по неактивности 30 дней'
+        '${tenantId.isNotEmpty ? ' (tenant: $tenantId)' : ''}'
+        '${userId.isNotEmpty ? ', user: $userId' : ''}.';
+    tone = AppNoticeTone.warning;
+  } else {
+    message = map['message']?.toString().trim().isNotEmpty == true
+        ? map['message'].toString().trim()
+        : 'Получен системный алерт';
+  }
+
+  showGlobalAppNotice(
+    message,
+    title: title,
+    tone: tone,
+    duration: const Duration(seconds: 8),
+  );
+}
+
 Future<void> _probePendingPhoneAccessRequests() async {
   try {
     final user = authService.currentUser;
-    if (user == null) return;
+    if (user == null) {
+      phoneAccessOwnerRequestNotifier.value = null;
+      return;
+    }
     final resp = await dio.get('/api/auth/phone-access/requests');
     final root = resp.data is Map
         ? Map<String, dynamic>.from(resp.data as Map)
         : const <String, dynamic>{};
     final data = root['data'];
-    if (data is! List || data.isEmpty) return;
+    if (data is! List || data.isEmpty) {
+      phoneAccessOwnerRequestNotifier.value = null;
+      return;
+    }
     final firstRaw = data.first;
-    if (firstRaw is! Map) return;
+    if (firstRaw is! Map) {
+      phoneAccessOwnerRequestNotifier.value = null;
+      return;
+    }
     final first = Map<String, dynamic>.from(firstRaw);
-    final requestId = (first['id'] ?? '').toString().trim();
-    if (requestId.isEmpty) return;
-    await _handlePhoneAccessRequestEvent({
-      'request_id': requestId,
-      'requester_name': first['requester_name'],
-      'requester_email': first['requester_email'],
-      'requester_user_id': first['requester_user_id'],
-      'phone': first['phone'],
-      'requested_at': first['requested_at'],
-    });
+    final request = _parsePhoneAccessOwnerRequest(first);
+    if (request == null) {
+      phoneAccessOwnerRequestNotifier.value = null;
+      return;
+    }
+
+    final previousId = phoneAccessOwnerRequestNotifier.value?.id;
+    phoneAccessOwnerRequestNotifier.value = request;
+
+    final shouldOpenDialog = previousId == null || previousId != request.id;
+    if (!shouldOpenDialog) return;
+    await _handlePhoneAccessRequestEvent(_phoneAccessRequestToEventMap(request));
   } catch (_) {
     // ignore
   }
@@ -847,319 +988,281 @@ class _GlobalNoticeHost extends StatelessWidget {
     final reducedMotion =
         performanceModeNotifier.value ||
         (MediaQuery.maybeOf(context)?.disableAnimations == true);
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (!constraints.hasBoundedWidth || !constraints.hasBoundedHeight) {
-          return child;
-        }
-        return Stack(
-          fit: StackFit.loose,
-          children: [
-            Positioned.fill(child: child),
-            IgnorePointer(
-              ignoring: false,
-              child: SafeArea(
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  child: ValueListenableBuilder<_AppNoticePayload?>(
-                    valueListenable: _appNoticeNotifier,
-                    builder: (context, notice, _) {
-                      return AnimatedSwitcher(
-                        duration: reducedMotion
-                            ? Duration.zero
-                            : const Duration(milliseconds: 220),
-                        switchInCurve: Curves.easeOut,
-                        switchOutCurve: Curves.easeIn,
-                        child: notice == null
-                            ? const SizedBox.shrink()
-                            : Padding(
-                                key: ValueKey(notice.id),
-                                padding: const EdgeInsets.fromLTRB(
-                                  12,
-                                  8,
-                                  12,
-                                  0,
-                                ),
-                                child: ConstrainedBox(
-                                  constraints: const BoxConstraints(
-                                    maxWidth: 760,
-                                  ),
-                                  child: Material(
-                                    color:
-                                        theme.colorScheme.surfaceContainerHigh,
-                                    elevation: 8,
-                                    borderRadius: BorderRadius.circular(16),
-                                    child: InkWell(
-                                      borderRadius: BorderRadius.circular(16),
-                                      onTap: () =>
-                                          _appNoticeNotifier.value = null,
-                                      child: Padding(
-                                        padding: const EdgeInsets.fromLTRB(
-                                          14,
-                                          12,
-                                          14,
-                                          12,
-                                        ),
-                                        child: Builder(
-                                          builder: (context) {
-                                            final visuals = _noticeVisuals(
-                                              context,
-                                              notice.tone,
-                                            );
-                                            return Row(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              children: [
-                                                Padding(
-                                                  padding:
-                                                      const EdgeInsets.only(
-                                                        top: 1,
-                                                      ),
-                                                  child: Icon(
-                                                    visuals.icon,
-                                                    color: visuals.accent,
-                                                    size: 20,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 10),
-                                                Expanded(
-                                                  child: Column(
-                                                    mainAxisSize:
-                                                        MainAxisSize.min,
-                                                    crossAxisAlignment:
-                                                        CrossAxisAlignment
-                                                            .start,
-                                                    children: [
-                                                      if (notice.title != null)
-                                                        Text(
-                                                          notice.title!,
-                                                          style: theme
-                                                              .textTheme
-                                                              .labelLarge
-                                                              ?.copyWith(
-                                                                color: theme
-                                                                    .colorScheme
-                                                                    .onSurface,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w700,
-                                                              ),
-                                                        ),
-                                                      Text(
-                                                        notice.message,
-                                                        style: theme
-                                                            .textTheme
-                                                            .bodyMedium
-                                                            ?.copyWith(
-                                                              color: theme
-                                                                  .colorScheme
-                                                                  .onSurface,
-                                                            ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                ),
-                                              ],
-                                            );
-                                          },
-                                        ),
-                                      ),
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        child,
+        IgnorePointer(
+          ignoring: false,
+          child: SafeArea(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: ValueListenableBuilder<_AppNoticePayload?>(
+                valueListenable: _appNoticeNotifier,
+                builder: (context, notice, _) {
+                  return AnimatedSwitcher(
+                    duration: reducedMotion
+                        ? Duration.zero
+                        : const Duration(milliseconds: 220),
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    child: notice == null
+                        ? const SizedBox.shrink()
+                        : Padding(
+                            key: ValueKey(notice.id),
+                            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 760),
+                              child: Material(
+                                color: theme.colorScheme.surfaceContainerHigh,
+                                elevation: 8,
+                                borderRadius: BorderRadius.circular(16),
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(16),
+                                  onTap: () => _appNoticeNotifier.value = null,
+                                  child: Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      14,
+                                      12,
+                                      14,
+                                      12,
                                     ),
-                                  ),
-                                ),
-                              ),
-                      );
-                    },
-                  ),
-                ),
-              ),
-            ),
-            ValueListenableBuilder<_SubscriptionUiPayload>(
-              valueListenable: _subscriptionUiNotifier,
-              builder: (context, state, _) {
-                if (state.blocked || state.warningMessage == null) {
-                  return const SizedBox.shrink();
-                }
-                return Positioned(
-                  left: 12,
-                  right: 12,
-                  bottom: _subscriptionWarningBottomOffset(context),
-                  child: IgnorePointer(
-                    ignoring: true,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 760),
-                      child: Center(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 760),
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.errorContainer,
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(
-                                color: theme.colorScheme.error,
-                              ),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(
-                                12,
-                                10,
-                                12,
-                                10,
-                              ),
-                              child: StreamBuilder<int>(
-                                stream: Stream<int>.periodic(
-                                  const Duration(seconds: 1),
-                                  (tick) => tick,
-                                ),
-                                builder: (context, _) {
-                                  final expiresAt = state.warningExpiresAt;
-                                  Duration? remaining;
-                                  if (expiresAt != null) {
-                                    remaining = expiresAt.difference(
-                                      DateTime.now(),
-                                    );
-                                  }
-                                  final countdown = remaining == null
-                                      ? null
-                                      : _formatCountdown(remaining);
-                                  final subtitle = remaining == null
-                                      ? null
-                                      : remaining <= Duration.zero
-                                      ? 'Срок подписки истек'
-                                      : 'До отключения: $countdown';
-
-                                  return Row(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Icon(
-                                        Icons.warning_amber_rounded,
-                                        size: 18,
-                                        color:
-                                            theme.colorScheme.onErrorContainer,
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Column(
+                                    child: Builder(
+                                      builder: (context) {
+                                        final visuals = _noticeVisuals(
+                                          context,
+                                          notice.tone,
+                                        );
+                                        return Row(
                                           crossAxisAlignment:
                                               CrossAxisAlignment.start,
                                           children: [
-                                            Text(
-                                              state.warningMessage!,
-                                              style: theme.textTheme.bodySmall
-                                                  ?.copyWith(
-                                                    color: theme
-                                                        .colorScheme
-                                                        .onErrorContainer,
-                                                    fontWeight: FontWeight.w700,
-                                                  ),
-                                            ),
-                                            if (subtitle != null) ...[
-                                              const SizedBox(height: 4),
-                                              Text(
-                                                subtitle,
-                                                style: theme
-                                                    .textTheme
-                                                    .labelSmall
-                                                    ?.copyWith(
-                                                      color: theme
-                                                          .colorScheme
-                                                          .onErrorContainer,
-                                                      fontWeight:
-                                                          FontWeight.w700,
-                                                    ),
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                top: 1,
                                               ),
-                                            ],
+                                              child: Icon(
+                                                visuals.icon,
+                                                color: visuals.accent,
+                                                size: 20,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Expanded(
+                                              child: Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  if (notice.title != null)
+                                                    Text(
+                                                      notice.title!,
+                                                      style: theme
+                                                          .textTheme
+                                                          .labelLarge
+                                                          ?.copyWith(
+                                                            color: theme
+                                                                .colorScheme
+                                                                .onSurface,
+                                                            fontWeight:
+                                                                FontWeight.w700,
+                                                          ),
+                                                    ),
+                                                  Text(
+                                                    notice.message,
+                                                    style: theme
+                                                        .textTheme
+                                                        .bodyMedium
+                                                        ?.copyWith(
+                                                          color: theme
+                                                              .colorScheme
+                                                              .onSurface,
+                                                        ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
                                           ],
-                                        ),
-                                      ),
-                                    ],
-                                  );
-                                },
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                      ),
-                    ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
-            ValueListenableBuilder<_SubscriptionUiPayload>(
-              valueListenable: _subscriptionUiNotifier,
-              builder: (context, state, _) {
-                if (!state.blocked) return const SizedBox.shrink();
-                return Positioned.fill(
-                  child: Material(
-                    color: theme.colorScheme.scrim.withValues(alpha: 0.78),
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 520),
+          ),
+        ),
+        Positioned(
+          left: 12,
+          right: 12,
+          bottom: _subscriptionWarningBottomOffset(context),
+          child: ValueListenableBuilder<_SubscriptionUiPayload>(
+            valueListenable: _subscriptionUiNotifier,
+            builder: (context, state, _) {
+              if (state.blocked || state.warningMessage == null) {
+                return const SizedBox.shrink();
+              }
+              return IgnorePointer(
+                ignoring: true,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 760),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 760),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.errorContainer,
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: theme.colorScheme.error,
+                          ),
+                        ),
                         child: Padding(
-                          padding: const EdgeInsets.all(20),
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.surface,
-                              borderRadius: BorderRadius.circular(24),
-                              border: Border.all(
-                                color: theme.colorScheme.errorContainer,
-                              ),
-                              boxShadow: const [
-                                BoxShadow(
-                                  blurRadius: 26,
-                                  offset: Offset(0, 16),
-                                  color: Color(0x33000000),
-                                ),
-                              ],
+                          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                          child: StreamBuilder<int>(
+                            stream: Stream<int>.periodic(
+                              const Duration(seconds: 1),
+                              (tick) => tick,
                             ),
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(
-                                22,
-                                22,
-                                22,
-                                22,
-                              ),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
+                            builder: (context, _) {
+                              final expiresAt = state.warningExpiresAt;
+                              Duration? remaining;
+                              if (expiresAt != null) {
+                                remaining = expiresAt.difference(DateTime.now());
+                              }
+                              final countdown = remaining == null
+                                  ? null
+                                  : _formatCountdown(remaining);
+                              final subtitle = remaining == null
+                                  ? null
+                                  : remaining <= Duration.zero
+                                  ? 'Срок подписки истек'
+                                  : 'До отключения: $countdown';
+
+                              return Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Icon(
-                                    Icons.lock_outline_rounded,
-                                    size: 44,
-                                    color: theme.colorScheme.error,
+                                    Icons.warning_amber_rounded,
+                                    size: 18,
+                                    color: theme.colorScheme.onErrorContainer,
                                   ),
-                                  const SizedBox(height: 14),
-                                  Text(
-                                    state.blockedTitle ?? 'Подписка отключена',
-                                    textAlign: TextAlign.center,
-                                    style: theme.textTheme.titleLarge?.copyWith(
-                                      fontWeight: FontWeight.w800,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 10),
-                                  Text(
-                                    state.blockedMessage ??
-                                        'Подписка отключена. Свяжитесь с Вазгеном.',
-                                    textAlign: TextAlign.center,
-                                    style: theme.textTheme.bodyMedium?.copyWith(
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                      height: 1.35,
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          state.warningMessage!,
+                                          style: theme.textTheme.bodySmall
+                                              ?.copyWith(
+                                                color: theme
+                                                    .colorScheme
+                                                    .onErrorContainer,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                        ),
+                                        if (subtitle != null) ...[
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            subtitle,
+                                            style: theme.textTheme.labelSmall
+                                                ?.copyWith(
+                                                  color: theme.colorScheme
+                                                      .onErrorContainer,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                          ),
+                                        ],
+                                      ],
                                     ),
                                   ),
                                 ],
-                              ),
-                            ),
+                              );
+                            },
                           ),
                         ),
                       ),
                     ),
                   ),
-                );
-              },
-            ),
-          ],
-        );
-      },
+                ),
+              );
+            },
+          ),
+        ),
+        Positioned.fill(
+          child: ValueListenableBuilder<_SubscriptionUiPayload>(
+            valueListenable: _subscriptionUiNotifier,
+            builder: (context, state, _) {
+              if (!state.blocked) return const SizedBox.shrink();
+              return Material(
+                color: theme.colorScheme.scrim.withValues(alpha: 0.78),
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 520),
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surface,
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: theme.colorScheme.errorContainer,
+                          ),
+                          boxShadow: const [
+                            BoxShadow(
+                              blurRadius: 26,
+                              offset: Offset(0, 16),
+                              color: Color(0x33000000),
+                            ),
+                          ],
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(22, 22, 22, 22),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.lock_outline_rounded,
+                                size: 44,
+                                color: theme.colorScheme.error,
+                              ),
+                              const SizedBox(height: 14),
+                              Text(
+                                state.blockedTitle ?? 'Подписка отключена',
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.titleLarge?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                state.blockedMessage ??
+                                    'Подписка отключена. Свяжитесь с Вазгеном.',
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                  height: 1.35,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1586,9 +1689,19 @@ Future<void> _initSocket() async {
       _applySubscriptionSocketUpdate(data);
     });
 
+    socket?.on('creator:alert', (data) {
+      debugPrint('📬 Socket event creator:alert -> $data');
+      _handleCreatorAlertEvent(data);
+    });
+
     socket?.on('phone-access:request', (data) {
       debugPrint('📬 Socket event phone-access:request -> $data');
       unawaited(_handlePhoneAccessRequestEvent(data));
+    });
+
+    socket?.on('phone-access:updated', (data) {
+      debugPrint('📬 Socket event phone-access:updated -> $data');
+      unawaited(_probePendingPhoneAccessRequests());
     });
 
     socket?.on('phone-access:decision', (data) {
@@ -1608,6 +1721,7 @@ Future<void> _initSocket() async {
           tone: AppNoticeTone.error,
         );
       }
+      unawaited(_probePendingPhoneAccessRequests());
     });
 
     socket?.on('cart:updated', (data) {
@@ -1916,6 +2030,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           await disconnectSocket();
           _lastPlayedMessageId = null;
           activeChatIdNotifier.value = null;
+          phoneAccessOwnerRequestNotifier.value = null;
           await refreshUserPreferences();
           _updateSubscriptionUiState();
           _showAuthScreen();

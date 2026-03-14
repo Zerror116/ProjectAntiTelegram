@@ -100,6 +100,11 @@ function normalizeRole(raw) {
   return String(raw || "").toLowerCase().trim();
 }
 
+function hasExtendedStatsAccess(user) {
+  const role = normalizeRole(user?.role || "");
+  return role === "admin" || role === "tenant" || role === "creator";
+}
+
 function isTenantManager(user) {
   const baseRole = normalizeRole(user?.base_role || user?.role || "");
   return baseRole === "tenant" || baseRole === "creator";
@@ -225,6 +230,266 @@ async function loadWorkerPostsByName(tenantId = null) {
     posts_week: toNumber(row.posts_week),
     posts_prev_week: toNumber(row.posts_prev_week),
   }));
+}
+
+async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30 } = {}) {
+  const safeDowntimeWindowDays = Math.max(
+    7,
+    Math.min(90, Number(downtimeWindowDays) || 30),
+  );
+  const dailyQ = await pool.query(
+    `WITH worker_candidates AS (
+       SELECT u.id,
+              u.name,
+              u.email
+       FROM users u
+       WHERE ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+         AND (
+           COALESCE(NULLIF(BTRIM(lower(u.role)), ''), '') = 'worker'
+           OR EXISTS (
+             SELECT 1
+             FROM user_role_templates urt
+             JOIN role_templates rt ON rt.id = urt.template_id
+             WHERE urt.user_id = u.id
+               AND (
+                 COALESCE(NULLIF(BTRIM(lower(rt.code)), ''), '') = 'worker'
+                 OR COALESCE(rt.permissions->>'product.create', 'false') = 'true'
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM products pp
+             WHERE pp.created_by = u.id
+           )
+         )
+     ),
+     week_anchor AS (
+       SELECT date_trunc('week', timezone($1, now())) AS current_week_start
+     ),
+     day_series AS (
+       SELECT generate_series(
+                (SELECT current_week_start - interval '7 days' FROM week_anchor),
+                (SELECT current_week_start + interval '6 days' FROM week_anchor),
+                interval '1 day'
+              ) AS day_local
+     ),
+     post_counts AS (
+       SELECT p.created_by AS worker_id,
+              date_trunc('day', timezone($1, p.created_at)) AS day_local,
+              COUNT(*)::int AS posts_count
+       FROM products p
+       JOIN worker_candidates wc ON wc.id = p.created_by
+       WHERE timezone($1, p.created_at) >= (
+               SELECT current_week_start - interval '7 days'
+               FROM week_anchor
+             )
+         AND timezone($1, p.created_at) < (
+               SELECT current_week_start + interval '7 days'
+               FROM week_anchor
+             )
+       GROUP BY p.created_by, date_trunc('day', timezone($1, p.created_at))
+     )
+     SELECT wc.id::text AS worker_id,
+            COALESCE(
+              NULLIF(BTRIM(wc.name), ''),
+              NULLIF(BTRIM(wc.email), ''),
+              'Работник'
+            ) AS worker_name,
+            to_char(ds.day_local, 'YYYY-MM-DD') AS day,
+            CASE
+              WHEN ds.day_local >= (SELECT current_week_start FROM week_anchor)
+                THEN 'current_week'
+              ELSE 'previous_week'
+            END AS period,
+            COALESCE(pc.posts_count, 0)::int AS posts_count
+     FROM worker_candidates wc
+     CROSS JOIN day_series ds
+     LEFT JOIN post_counts pc
+       ON pc.worker_id = wc.id
+      AND pc.day_local = ds.day_local
+     ORDER BY worker_name ASC, day ASC`,
+    [SAMARA_TZ, tenantId || null],
+  );
+
+  const downtimeQ = await pool.query(
+    `WITH worker_candidates AS (
+       SELECT u.id,
+              u.name,
+              u.email
+       FROM users u
+       WHERE ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
+         AND (
+           COALESCE(NULLIF(BTRIM(lower(u.role)), ''), '') = 'worker'
+           OR EXISTS (
+             SELECT 1
+             FROM user_role_templates urt
+             JOIN role_templates rt ON rt.id = urt.template_id
+             WHERE urt.user_id = u.id
+               AND (
+                 COALESCE(NULLIF(BTRIM(lower(rt.code)), ''), '') = 'worker'
+                 OR COALESCE(rt.permissions->>'product.create', 'false') = 'true'
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM products pp
+             WHERE pp.created_by = u.id
+           )
+         )
+     ),
+     worker_posts AS (
+       SELECT p.created_by AS worker_id,
+              p.created_at,
+              LAG(p.created_at) OVER (
+                PARTITION BY p.created_by
+                ORDER BY p.created_at
+              ) AS prev_created_at
+       FROM products p
+       JOIN worker_candidates wc ON wc.id = p.created_by
+       WHERE p.created_at >= now() - make_interval(days => $2::int)
+     ),
+     gaps AS (
+       SELECT worker_id,
+              EXTRACT(EPOCH FROM (created_at - prev_created_at)) / 60.0 AS gap_minutes
+       FROM worker_posts
+       WHERE prev_created_at IS NOT NULL
+     )
+     SELECT wc.id::text AS worker_id,
+            COALESCE(
+              NULLIF(BTRIM(wc.name), ''),
+              NULLIF(BTRIM(wc.email), ''),
+              'Работник'
+            ) AS worker_name,
+            COUNT(g.gap_minutes)::int AS gaps_count,
+            COALESCE(ROUND(AVG(g.gap_minutes)::numeric, 2), 0)::float8 AS avg_gap_minutes,
+            COALESCE(ROUND(MIN(g.gap_minutes)::numeric, 2), 0)::float8 AS min_gap_minutes,
+            COALESCE(ROUND(MAX(g.gap_minutes)::numeric, 2), 0)::float8 AS max_gap_minutes
+     FROM worker_candidates wc
+     LEFT JOIN gaps g ON g.worker_id = wc.id
+     GROUP BY wc.id, wc.name, wc.email
+     ORDER BY worker_name ASC`,
+    [tenantId || null, safeDowntimeWindowDays],
+  );
+
+  const workersMap = new Map();
+  const ensureWorker = (workerId, workerName) => {
+    const id = String(workerId || "").trim();
+    if (!id) return null;
+    if (!workersMap.has(id)) {
+      workersMap.set(id, {
+        worker_id: id,
+        worker_name: String(workerName || "Работник"),
+        days_current_week: [],
+        days_previous_week: [],
+        posts_current_week: 0,
+        posts_previous_week: 0,
+        days_worked_current_week: 0,
+        days_worked_previous_week: 0,
+        post_downtime: {
+          window_days: safeDowntimeWindowDays,
+          gaps_count: 0,
+          avg_gap_minutes: 0,
+          min_gap_minutes: 0,
+          max_gap_minutes: 0,
+        },
+      });
+    }
+    return workersMap.get(id);
+  };
+
+  for (const row of dailyQ.rows) {
+    const worker = ensureWorker(row.worker_id, row.worker_name);
+    if (!worker) continue;
+    const postsCount = toNumber(row.posts_count);
+    const dayEntry = {
+      day: String(row.day || ""),
+      posts_count: postsCount,
+      worked: postsCount > 0,
+    };
+    if (String(row.period || "") === "current_week") {
+      worker.days_current_week.push(dayEntry);
+    } else {
+      worker.days_previous_week.push(dayEntry);
+    }
+  }
+
+  let weightedGapTotal = 0;
+  let weightedGapCount = 0;
+  let overallMaxGapMinutes = 0;
+  for (const row of downtimeQ.rows) {
+    const worker = ensureWorker(row.worker_id, row.worker_name);
+    if (!worker) continue;
+    const gapsCount = toNumber(row.gaps_count);
+    const avgGap = toNumber(row.avg_gap_minutes);
+    const minGap = toNumber(row.min_gap_minutes);
+    const maxGap = toNumber(row.max_gap_minutes);
+    worker.post_downtime = {
+      window_days: safeDowntimeWindowDays,
+      gaps_count: gapsCount,
+      avg_gap_minutes: avgGap,
+      min_gap_minutes: minGap,
+      max_gap_minutes: maxGap,
+    };
+    if (gapsCount > 0) {
+      weightedGapTotal += avgGap * gapsCount;
+      weightedGapCount += gapsCount;
+      if (maxGap > overallMaxGapMinutes) overallMaxGapMinutes = maxGap;
+    }
+  }
+
+  const workers = Array.from(workersMap.values()).map((worker) => {
+    worker.posts_current_week = worker.days_current_week.reduce(
+      (sum, day) => sum + toNumber(day.posts_count),
+      0,
+    );
+    worker.posts_previous_week = worker.days_previous_week.reduce(
+      (sum, day) => sum + toNumber(day.posts_count),
+      0,
+    );
+    worker.days_worked_current_week = worker.days_current_week.reduce(
+      (sum, day) => sum + (day.worked ? 1 : 0),
+      0,
+    );
+    worker.days_worked_previous_week = worker.days_previous_week.reduce(
+      (sum, day) => sum + (day.worked ? 1 : 0),
+      0,
+    );
+    return worker;
+  });
+
+  const workersTotal = workers.length;
+  const workersActiveCurrentWeek = workers.filter(
+    (worker) => worker.posts_current_week > 0,
+  ).length;
+  const workersActivePreviousWeek = workers.filter(
+    (worker) => worker.posts_previous_week > 0,
+  ).length;
+  const postsCurrentWeek = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.posts_current_week),
+    0,
+  );
+  const postsPreviousWeek = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.posts_previous_week),
+    0,
+  );
+
+  return {
+    summary: {
+      workers_total: workersTotal,
+      workers_active_current_week: workersActiveCurrentWeek,
+      workers_active_previous_week: workersActivePreviousWeek,
+      posts_current_week: postsCurrentWeek,
+      posts_previous_week: postsPreviousWeek,
+      overall_avg_gap_minutes:
+        weightedGapCount > 0
+          ? toNumber((weightedGapTotal / weightedGapCount).toFixed(2))
+          : 0,
+      overall_max_gap_minutes: toNumber(overallMaxGapMinutes),
+      downtime_window_days: safeDowntimeWindowDays,
+    },
+    workers,
+    generated_at: new Date().toISOString(),
+  };
 }
 
 async function loadClientStats(userId) {
@@ -590,6 +855,29 @@ router.get("/", authMiddleware, async (req, res) => {
       ok: false,
       error: "Internal server error",
     });
+  }
+});
+
+router.get("/stats/extended", authMiddleware, async (req, res) => {
+  try {
+    if (!hasExtendedStatsAccess(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Доступно только администратору, арендатору или создателю",
+      });
+    }
+    const downtimeWindowDays = Math.max(
+      7,
+      Math.min(90, Number(req.query?.downtime_window_days) || 30),
+    );
+    const tenantId = String(req.user?.tenant_id || "").trim() || null;
+    const data = await loadStaffExtendedStats(tenantId, {
+      downtimeWindowDays,
+    });
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("profile.stats.extended error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
   }
 });
 

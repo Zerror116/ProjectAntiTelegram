@@ -14,6 +14,7 @@
 - [x] Темы: только светлая/темная (без RGB-палитры)
 - [x] Режим для старых устройств (меньше анимаций/легче отрисовка)
 - [x] Уведомления по подписке арендатора (warning + blocking overlay)
+- [x] Отдельная нижняя вкладка `Статистика` для admin/tenant/creator
 - [x] Карта в админке всегда светлая
 - [ ] Нативная анимированная pre-splash загрузка Android (до Flutter)
 
@@ -31,6 +32,7 @@
 - [x] Регистрация по инвайту/коду арендатора
 - [x] Проверка email до регистрации (`/api/auth/check_email`)
 - [x] Login/Logout
+- [x] Дубликат номера: второй клиент уходит в ожидание, а у первого владельца есть постоянная плашка `Разрешить/Отклонить`
 - [x] Управление сессиями: список, закрыть одну, закрыть остальные
 - [x] 2FA (TOTP/Google Authenticator)
 - [x] Backup-коды 2FA
@@ -162,6 +164,10 @@
 - [x] Remove-from-route
 - [x] Экспорт batch
 - [x] Карта маршрутов в админке
+- [x] Авторасформировка корзины при неактивности 30 дней (фоновый sweep)
+- [x] Автоудаление клиента при неактивности 180 дней (фоновый sweep)
+- [x] Автоудаление клиента при `unreachable_first_call` (из admin decision)
+- [x] Мгновенные creator-алерты по авторасформировкам/автоудалениям (`creator:alert`)
 
 ## 11) Профиль и настройки
 - [x] Профиль пользователя + роли/permissions
@@ -169,6 +175,7 @@
 - [x] Кроп/фокус/zoom аватара
 - [x] Статистика по ролям (today/week/month/all-time/live)
 - [x] В профиле: статистика по рабочим «сегодня / неделя / прошлая неделя»
+- [x] Расширенная статистика staff: дни активности рабочих + простой между постами
 - [x] Управление клиентами арендатора через поиск (без автосписка при пустом поиске)
 - [x] Смена роли клиенту внутри арендатора (client/worker/admin)
 - [x] Переключение сохраненных сессий арендатора у создателя
@@ -185,10 +192,14 @@
 - [x] Тестовый publish demo posts
 - [x] Тест отправки smart notifications
 - [x] Серверный smoke-критический скрипт (`server/scripts/critical-integration.js`)
+- [x] E2E-скрипт дубликата номера и подтверждения владельцем (`server/scripts/e2e-phone-access-flow.js`)
+- [x] E2E-скрипт проверки ограничений подписки (`server/scripts/e2e-subscription-guard-flow.js`): staff блокируется, client продолжает работать
+- [x] E2E-скрипт полного потока заказа (`server/scripts/e2e-order-pipeline-flow.js`): worker -> очередь -> publish -> cart/add -> dispatch_reserved -> mark_placed (полка)
+- [x] Комбинированный запуск ключевых E2E (`npm --prefix server run test:e2e:core`)
 - [ ] Полный автоматический e2e-набор по всем критичным сценариям UI+API
 
 ## 13) Что сейчас важно держать в фокусе
 - [ ] Нативный красивый Android pre-splash (до старта Flutter) пока не реализован
 - [ ] Полный CI-пакет автотестов (unit/widget/integration/e2e) не закрыт
-- [ ] Регулярный автоматический self-audit всего проекта пока не настроен
-
+- [x] Регулярный автоматический self-audit (nightly workflow + `server/scripts/nightly-self-audit.js`)
+- [x] В nightly workflow добавлен запуск backend + optional API smoke (`critical`, `phone-access e2e`, `subscription-guard e2e`, `order-pipeline e2e`) при наличии E2E secrets

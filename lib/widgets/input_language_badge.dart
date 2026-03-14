@@ -2,24 +2,73 @@ import 'package:flutter/material.dart';
 
 import '../services/input_language_service.dart';
 
-class InputLanguageBadge extends StatelessWidget {
+class InputLanguageBadge extends StatefulWidget {
   const InputLanguageBadge({super.key, this.controller});
 
   final TextEditingController? controller;
 
   @override
+  State<InputLanguageBadge> createState() => _InputLanguageBadgeState();
+}
+
+class _InputLanguageBadgeState extends State<InputLanguageBadge> {
+  String _textSnapshot = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _textSnapshot = widget.controller?.text ?? '';
+    _attachController(widget.controller);
+  }
+
+  @override
+  void didUpdateWidget(covariant InputLanguageBadge oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) return;
+    _detachController(oldWidget.controller);
+    _textSnapshot = widget.controller?.text ?? '';
+    _attachController(widget.controller);
+  }
+
+  @override
+  void dispose() {
+    _detachController(widget.controller);
+    super.dispose();
+  }
+
+  void _onControllerChanged() {
+    if (!mounted) return;
+    final next = widget.controller?.text ?? '';
+    if (next == _textSnapshot) return;
+    setState(() => _textSnapshot = next);
+  }
+
+  void _attachController(TextEditingController? controller) {
+    if (controller == null) return;
+    try {
+      controller.addListener(_onControllerChanged);
+    } catch (_) {
+      // Controller may already be disposed during route transitions.
+    }
+  }
+
+  void _detachController(TextEditingController? controller) {
+    if (controller == null) return;
+    try {
+      controller.removeListener(_onControllerChanged);
+    } catch (_) {
+      // Ignore disposal race; listener is no longer needed.
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final listenables = <Listenable>[inputLanguageService.currentCode];
-    if (controller != null) {
-      listenables.add(controller!);
-    }
-    final animation = Listenable.merge(listenables);
-    return AnimatedBuilder(
-      animation: animation,
-      builder: (context, _) {
-        final inferredCode = _inferCodeFromText(controller?.text ?? '');
-        final code = inferredCode ?? inputLanguageService.currentCode.value;
+    return ValueListenableBuilder<String>(
+      valueListenable: inputLanguageService.currentCode,
+      builder: (context, currentCode, _) {
+        final inferredCode = _inferCodeFromText(_textSnapshot);
+        final code = inferredCode ?? currentCode;
         return IgnorePointer(
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),

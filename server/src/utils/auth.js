@@ -6,7 +6,7 @@ const { touchUserSession } = require('./sessions');
 const { resolvePhoneAccessState } = require('./phoneAccess');
 require('dotenv').config();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
+const JWT_FALLBACK_SECRET = String(process.env.JWT_SECRET || '').trim();
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 let verifyTokenFn = null;
@@ -38,7 +38,8 @@ function verifyToken(token) {
     }
   }
   try {
-    return jwt.verify(token, JWT_SECRET);
+    if (!JWT_FALLBACK_SECRET) return null;
+    return jwt.verify(token, JWT_FALLBACK_SECRET);
   } catch (err) {
     if (NODE_ENV !== 'production') {
       console.error('jwt.verify error:', err && err.message ? err.message : err);
