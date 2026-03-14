@@ -1,0 +1,181 @@
+name: Critical Integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  critical_e2e:
+    if: ${{ secrets.E2E_BASE_URL != '' && secrets.E2E_EMAIL != '' && secrets.E2E_PASSWORD != '' }}
+    name: Backend critical integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install server dependencies
+        run: npm ci --prefix server
+
+      - name: Run critical integration checks
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
+          E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+          E2E_TENANT_CODE: ${{ secrets.E2E_TENANT_CODE }}
+          E2E_TOTP_CODE: ${{ secrets.E2E_TOTP_CODE }}
+          E2E_BACKUP_CODE: ${{ secrets.E2E_BACKUP_CODE }}
+          E2E_DIRECT_QUERY: ${{ secrets.E2E_DIRECT_QUERY }}
+          E2E_VIEW_ROLE: ${{ secrets.E2E_VIEW_ROLE }}
+          E2E_STRICT_ADMIN: ${{ secrets.E2E_STRICT_ADMIN }}
+          E2E_DEVICE_FINGERPRINT: github-critical-e2e
+        run: npm run --prefix server test:critical
+
+      - name: Run subscription-guard E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_CREATOR_EMAIL: ${{ secrets.E2E_CREATOR_EMAIL }}
+          E2E_CREATOR_PASSWORD: ${{ secrets.E2E_CREATOR_PASSWORD }}
+          E2E_CREATOR_TOTP_CODE: ${{ secrets.E2E_CREATOR_TOTP_CODE }}
+          E2E_CREATOR_BACKUP_CODE: ${{ secrets.E2E_CREATOR_BACKUP_CODE }}
+          E2E_STAFF_EMAIL: ${{ secrets.E2E_STAFF_EMAIL }}
+          E2E_STAFF_PASSWORD: ${{ secrets.E2E_STAFF_PASSWORD }}
+          E2E_STAFF_TOTP_CODE: ${{ secrets.E2E_STAFF_TOTP_CODE }}
+          E2E_STAFF_BACKUP_CODE: ${{ secrets.E2E_STAFF_BACKUP_CODE }}
+          E2E_CLIENT_EMAIL: ${{ secrets.E2E_CLIENT_EMAIL }}
+          E2E_CLIENT_PASSWORD: ${{ secrets.E2E_CLIENT_PASSWORD }}
+          E2E_CLIENT_TOTP_CODE: ${{ secrets.E2E_CLIENT_TOTP_CODE }}
+          E2E_CLIENT_BACKUP_CODE: ${{ secrets.E2E_CLIENT_BACKUP_CODE }}
+          E2E_TENANT_CODE: ${{ secrets.E2E_TENANT_CODE }}
+        run: |
+          if [ -z "${E2E_CREATOR_EMAIL}" ] || [ -z "${E2E_CREATOR_PASSWORD}" ] || [ -z "${E2E_STAFF_EMAIL}" ] || [ -z "${E2E_STAFF_PASSWORD}" ] || [ -z "${E2E_CLIENT_EMAIL}" ] || [ -z "${E2E_CLIENT_PASSWORD}" ]; then
+            echo "Skip subscription-guard E2E: creator/staff/client credentials are not configured"
+            exit 0
+          fi
+          npm run --prefix server test:subscription-guard:e2e
+
+      - name: Run order-pipeline E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_WORKER_EMAIL: ${{ secrets.E2E_WORKER_EMAIL }}
+          E2E_WORKER_PASSWORD: ${{ secrets.E2E_WORKER_PASSWORD }}
+          E2E_WORKER_TOTP_CODE: ${{ secrets.E2E_WORKER_TOTP_CODE }}
+          E2E_WORKER_BACKUP_CODE: ${{ secrets.E2E_WORKER_BACKUP_CODE }}
+          E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+          E2E_ADMIN_TOTP_CODE: ${{ secrets.E2E_ADMIN_TOTP_CODE }}
+          E2E_ADMIN_BACKUP_CODE: ${{ secrets.E2E_ADMIN_BACKUP_CODE }}
+          E2E_CLIENT_EMAIL: ${{ secrets.E2E_CLIENT_EMAIL }}
+          E2E_CLIENT_PASSWORD: ${{ secrets.E2E_CLIENT_PASSWORD }}
+          E2E_CLIENT_TOTP_CODE: ${{ secrets.E2E_CLIENT_TOTP_CODE }}
+          E2E_CLIENT_BACKUP_CODE: ${{ secrets.E2E_CLIENT_BACKUP_CODE }}
+          E2E_TENANT_CODE: ${{ secrets.E2E_TENANT_CODE }}
+        run: |
+          if [ -z "${E2E_ADMIN_EMAIL}" ] || [ -z "${E2E_ADMIN_PASSWORD}" ] || [ -z "${E2E_CLIENT_EMAIL}" ] || [ -z "${E2E_CLIENT_PASSWORD}" ]; then
+            echo "Skip order-pipeline E2E: admin/client credentials are not configured"
+            exit 0
+          fi
+          npm run --prefix server test:order-pipeline:e2e
+
+      - name: Run tenant-isolation E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_REQUIRE_TENANT_ISOLATION: "1"
+          E2E_TENANT_A_EMAIL: ${{ secrets.E2E_TENANT_A_EMAIL }}
+          E2E_TENANT_A_PASSWORD: ${{ secrets.E2E_TENANT_A_PASSWORD }}
+          E2E_TENANT_A_CODE: ${{ secrets.E2E_TENANT_A_CODE }}
+          E2E_TENANT_A_TOTP_CODE: ${{ secrets.E2E_TENANT_A_TOTP_CODE }}
+          E2E_TENANT_A_BACKUP_CODE: ${{ secrets.E2E_TENANT_A_BACKUP_CODE }}
+          E2E_TENANT_B_EMAIL: ${{ secrets.E2E_TENANT_B_EMAIL }}
+          E2E_TENANT_B_PASSWORD: ${{ secrets.E2E_TENANT_B_PASSWORD }}
+          E2E_TENANT_B_CODE: ${{ secrets.E2E_TENANT_B_CODE }}
+          E2E_TENANT_B_TOTP_CODE: ${{ secrets.E2E_TENANT_B_TOTP_CODE }}
+          E2E_TENANT_B_BACKUP_CODE: ${{ secrets.E2E_TENANT_B_BACKUP_CODE }}
+        run: |
+          if [ -z "${E2E_TENANT_A_EMAIL}" ] || [ -z "${E2E_TENANT_A_PASSWORD}" ] || [ -z "${E2E_TENANT_B_EMAIL}" ] || [ -z "${E2E_TENANT_B_PASSWORD}" ]; then
+            echo "Skip tenant-isolation E2E: tenant A/B credentials are not configured"
+            exit 0
+          fi
+          npm run --prefix server test:tenant-isolation:e2e
+
+      - name: Run tenant-regression E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_REQUIRE_TENANT_REGRESSION: "1"
+          E2E_TENANT_ISOLATION_REQUIRE_FULL: ${{ secrets.E2E_TENANT_ISOLATION_REQUIRE_FULL }}
+          E2E_TENANT_A_EMAIL: ${{ secrets.E2E_TENANT_A_EMAIL }}
+          E2E_TENANT_A_PASSWORD: ${{ secrets.E2E_TENANT_A_PASSWORD }}
+          E2E_TENANT_A_CODE: ${{ secrets.E2E_TENANT_A_CODE }}
+          E2E_TENANT_A_TOTP_CODE: ${{ secrets.E2E_TENANT_A_TOTP_CODE }}
+          E2E_TENANT_A_BACKUP_CODE: ${{ secrets.E2E_TENANT_A_BACKUP_CODE }}
+          E2E_TENANT_B_EMAIL: ${{ secrets.E2E_TENANT_B_EMAIL }}
+          E2E_TENANT_B_PASSWORD: ${{ secrets.E2E_TENANT_B_PASSWORD }}
+          E2E_TENANT_B_CODE: ${{ secrets.E2E_TENANT_B_CODE }}
+          E2E_TENANT_B_TOTP_CODE: ${{ secrets.E2E_TENANT_B_TOTP_CODE }}
+          E2E_TENANT_B_BACKUP_CODE: ${{ secrets.E2E_TENANT_B_BACKUP_CODE }}
+        run: |
+          if [ -z "${E2E_TENANT_A_EMAIL}" ] || [ -z "${E2E_TENANT_A_PASSWORD}" ] || [ -z "${E2E_TENANT_B_EMAIL}" ] || [ -z "${E2E_TENANT_B_PASSWORD}" ]; then
+            echo "Skip tenant-regression E2E: tenant A/B credentials are not configured"
+            exit 0
+          fi
+          npm run --prefix server test:tenant-regression:e2e
+
+      - name: Run device-limit E2E (optional)
+        env:
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_REQUIRE_DEVICE_LIMIT: "1"
+          E2E_DEVICE_LIMIT_INVITE_CODE: ${{ secrets.E2E_DEVICE_LIMIT_INVITE_CODE }}
+        run: |
+          if [ -z "${E2E_DEVICE_LIMIT_INVITE_CODE}" ]; then
+            echo "Skip device-limit E2E: invite code is not configured"
+            exit 0
+          fi
+          npm run --prefix server test:device-limit:e2e
+
+      - name: Run full E2E regression bundle (optional)
+        env:
+          E2E_RUN_FULL_REGRESSION: ${{ secrets.E2E_RUN_FULL_REGRESSION }}
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_EMAIL: ${{ secrets.E2E_EMAIL }}
+          E2E_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+          E2E_TENANT_CODE: ${{ secrets.E2E_TENANT_CODE }}
+          E2E_OWNER_EMAIL: ${{ secrets.E2E_OWNER_EMAIL }}
+          E2E_OWNER_PASSWORD: ${{ secrets.E2E_OWNER_PASSWORD }}
+          E2E_DUP_INVITE_CODE: ${{ secrets.E2E_DUP_INVITE_CODE }}
+          E2E_CREATOR_EMAIL: ${{ secrets.E2E_CREATOR_EMAIL }}
+          E2E_CREATOR_PASSWORD: ${{ secrets.E2E_CREATOR_PASSWORD }}
+          E2E_STAFF_EMAIL: ${{ secrets.E2E_STAFF_EMAIL }}
+          E2E_STAFF_PASSWORD: ${{ secrets.E2E_STAFF_PASSWORD }}
+          E2E_CLIENT_EMAIL: ${{ secrets.E2E_CLIENT_EMAIL }}
+          E2E_CLIENT_PASSWORD: ${{ secrets.E2E_CLIENT_PASSWORD }}
+          E2E_WORKER_EMAIL: ${{ secrets.E2E_WORKER_EMAIL }}
+          E2E_WORKER_PASSWORD: ${{ secrets.E2E_WORKER_PASSWORD }}
+          E2E_TENANT_A_EMAIL: ${{ secrets.E2E_TENANT_A_EMAIL }}
+          E2E_TENANT_A_PASSWORD: ${{ secrets.E2E_TENANT_A_PASSWORD }}
+          E2E_TENANT_A_CODE: ${{ secrets.E2E_TENANT_A_CODE }}
+          E2E_TENANT_B_EMAIL: ${{ secrets.E2E_TENANT_B_EMAIL }}
+          E2E_TENANT_B_PASSWORD: ${{ secrets.E2E_TENANT_B_PASSWORD }}
+          E2E_TENANT_B_CODE: ${{ secrets.E2E_TENANT_B_CODE }}
+          E2E_DEVICE_LIMIT_INVITE_CODE: ${{ secrets.E2E_DEVICE_LIMIT_INVITE_CODE }}
+          E2E_REQUIRE_FULL: ${{ secrets.E2E_REQUIRE_FULL }}
+        run: |
+          if [ "${E2E_RUN_FULL_REGRESSION}" != "1" ]; then
+            echo "Skip full E2E regression bundle: E2E_RUN_FULL_REGRESSION != 1"
+            exit 0
+          fi
+          npm run --prefix server test:e2e:full
+
+      - name: Upload critical integration reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: critical-integration-reports
+          path: |
+            server/audit/e2e-full-regression.md
+            server/audit/tenant-isolation-regression.md

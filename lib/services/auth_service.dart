@@ -90,6 +90,10 @@ class User {
 
 class AuthService {
   final Dio dio;
+  static const bool _verboseAuthLogs = bool.fromEnvironment(
+    'FENIX_VERBOSE_AUTH_LOGS',
+    defaultValue: false,
+  );
   static const _tokenKey = 'auth_token';
   static const _viewRoleKey = 'creator_view_role';
   static const _tenantCodeKey = 'tenant_code_scope';
@@ -102,6 +106,7 @@ class AuthService {
 
   // Current authenticated user (populated after login / profile fetch)
   User? _currentUser;
+  String? _cachedToken;
   User? get currentUser => _currentUser;
   String? _viewRole;
   String? get viewRole => _viewRole;
@@ -152,6 +157,12 @@ class AuthService {
   }
 
   AuthService({required this.dio});
+
+  void _authVerboseLog(String message) {
+    if (kDebugMode && _verboseAuthLogs) {
+      debugPrint(message);
+    }
+  }
 
   String _sessionIdFor(String email, String? tenantCode) {
     final mail = email.trim().toLowerCase();
@@ -294,6 +305,7 @@ class AuthService {
     debugPrint(
       '🔐 setToken called with token: ${_shortToken(token)}..., user: ${user?.email}',
     );
+    _cachedToken = token;
     await _saveToken(token);
     _setAuthHeader(token);
     if (user != null) _currentUser = user;
@@ -331,6 +343,7 @@ class AuthService {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_tokenKey);
       await prefs.remove(_viewRoleKey);
+      _cachedToken = null;
       debugPrint('✅ Token removed from SharedPreferences');
 
       _setAuthHeader(null);
@@ -352,6 +365,7 @@ class AuthService {
   /// Приватный: сохранить токен в SharedPreferences
   Future<void> _saveToken(String token) async {
     try {
+      _cachedToken = token;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_tokenKey, token);
       debugPrint(
@@ -365,9 +379,13 @@ class AuthService {
   /// Получение токена из SharedPreferences
   Future<String?> getToken() async {
     try {
+      if (_cachedToken != null && _cachedToken!.trim().isNotEmpty) {
+        return _cachedToken;
+      }
       final prefs = await SharedPreferences.getInstance();
       final token = prefs.getString(_tokenKey);
-      debugPrint(
+      _cachedToken = token;
+      _authVerboseLog(
         '🔑 getToken -> ${token != null ? '${_shortToken(token)}...' : 'null'}',
       );
       return token;

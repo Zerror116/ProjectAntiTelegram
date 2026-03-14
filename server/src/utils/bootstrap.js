@@ -13,6 +13,18 @@ function parseDatabaseUrl(dbUrl) {
   return { adminUrl: adminUrl.toString(), targetUrl: dbUrl, targetDbName };
 }
 
+function sanitizeSchemaName(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48);
+}
+
+function quoteIdentifier(identifier) {
+  return `"${String(identifier || "").replace(/"/g, '""')}"`;
+}
+
 async function ensureDatabaseExists(dbUrl) {
   const { adminUrl, targetUrl, targetDbName } = parseDatabaseUrl(dbUrl);
 
@@ -52,11 +64,24 @@ async function ensureSchemaMigrationsTable(pool) {
   );
 }
 
-async function applyMigrationsToTarget(dbUrl, migrationsDir) {
+async function applyMigrationsToTarget(dbUrl, migrationsDir, options = {}) {
+  const schemaName = sanitizeSchemaName(options.schemaName);
+  const schemaSearchPath = schemaName
+    ? `${quoteIdentifier(schemaName)}, public`
+    : "";
   const pool = new Pool({ connectionString: dbUrl });
   try {
     if (!fs.existsSync(migrationsDir)) {
       throw new Error(`Migrations folder not found: ${migrationsDir}`);
+    }
+
+    if (schemaName) {
+      await pool.query(
+        `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schemaName)}`,
+      );
+      await pool.query("SELECT set_config('search_path', $1, false)", [
+        schemaSearchPath,
+      ]);
     }
 
     const files = fs
@@ -81,6 +106,11 @@ async function applyMigrationsToTarget(dbUrl, migrationsDir) {
 
       await pool.query("BEGIN");
       try {
+        if (schemaName) {
+          await pool.query("SELECT set_config('search_path', $1, true)", [
+            schemaSearchPath,
+          ]);
+        }
         await pool.query(sql);
         await pool.query(
           "INSERT INTO schema_migrations (filename, applied_at) VALUES ($1, now())",
@@ -154,6 +184,8 @@ async function bootstrapDatabase({
 
 module.exports = {
   parseDatabaseUrl,
+  sanitizeSchemaName,
+  quoteIdentifier,
   ensureDatabaseExists,
   ensureSchemaMigrationsTable,
   applyMigrationsToTarget,

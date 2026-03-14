@@ -484,7 +484,7 @@ async function resolveTenantByAccessKey(accessKey) {
   const hash = hashAccessKey(normalized);
   const tenantRes = await db.platformQuery(
     `SELECT id, code, name, status, subscription_expires_at,
-            db_mode, db_url, db_name
+            db_mode, db_url, db_name, db_schema
      FROM tenants
      WHERE access_key_hash = $1
      LIMIT 1`,
@@ -506,7 +506,8 @@ async function resolveTenantByUserEmail(email) {
               t.subscription_expires_at,
               t.db_mode,
               t.db_url,
-              t.db_name
+              t.db_name,
+              t.db_schema
        FROM tenant_user_index tui
        JOIN tenants t ON t.id = tui.tenant_id
        WHERE lower(tui.email) = $1
@@ -543,7 +544,8 @@ async function resolveTenantByUserEmail(email) {
             t.subscription_expires_at,
             t.db_mode,
             t.db_url,
-            t.db_name
+            t.db_name,
+            t.db_schema
      FROM users u
      JOIN tenants t ON t.id = u.tenant_id
      WHERE lower(u.email) = $1
@@ -575,7 +577,8 @@ async function resolveTenantByUserEmail(email) {
             subscription_expires_at,
             db_mode,
             db_url,
-            db_name
+            db_name,
+            db_schema
      FROM tenants
      WHERE COALESCE(status, 'active') <> 'deleted'
      ORDER BY created_at DESC
@@ -589,8 +592,8 @@ async function resolveTenantByUserEmail(email) {
     const tenantId = String(tenantRow?.id || '').trim();
     if (!tenantId) continue;
     try {
-      const hasUser = await db.runWithTenantRow(tenantRow, async (ctx) => {
-        const q = await ctx.client.query(
+      const hasUser = await db.runWithTenantRow(tenantRow, async () => {
+        const q = await db.query(
           `SELECT u.id
            FROM users u
            WHERE lower(u.email) = $1
@@ -636,7 +639,8 @@ async function resolveTenantInviteByCode(inviteCode) {
             t.subscription_expires_at,
             t.db_mode,
             t.db_url,
-            t.db_name
+            t.db_name,
+            t.db_schema
      FROM tenant_invites i
      JOIN tenants t ON t.id = i.tenant_id
      WHERE i.code = $1
@@ -650,7 +654,7 @@ async function resolveTenantInviteByCode(inviteCode) {
 
 async function resolveDefaultTenant() {
   const result = await db.platformQuery(
-    `SELECT id, code, name, status, subscription_expires_at, db_mode, db_url, db_name
+    `SELECT id, code, name, status, subscription_expires_at, db_mode, db_url, db_name, db_schema
      FROM tenants
      WHERE code = 'default'
      LIMIT 1`,
@@ -851,6 +855,7 @@ router.post('/register', async (req, res) => {
           db_mode: invite.db_mode || 'shared',
           db_url: invite.db_url || null,
           db_name: invite.db_name || null,
+          db_schema: invite.db_schema || null,
         };
         // Приглашения всегда регистрируют клиента.
         role = 'client';

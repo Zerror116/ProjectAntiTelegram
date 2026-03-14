@@ -1415,10 +1415,12 @@ async function runClientRetentionSweep(io = deliveryDialogCleanupIo) {
     scopeLabel: "shared",
   });
   const isolatedTenants = await db.platformQuery(
-    `SELECT id, code, db_mode, db_url, db_name, status, subscription_expires_at
+    `SELECT id, code, db_mode, db_url, db_name, db_schema, status, subscription_expires_at
      FROM tenants
-     WHERE db_mode = 'isolated'
-       AND db_url IS NOT NULL`,
+     WHERE (
+       (db_mode = 'isolated' AND db_url IS NOT NULL)
+       OR (db_mode = 'schema_isolated' AND db_schema IS NOT NULL)
+     )`,
   );
   for (const tenant of isolatedTenants.rows) {
     await db.runWithTenantRow(tenant, async () => {
@@ -2207,10 +2209,12 @@ async function runDeliveryDialogCleanup(io = deliveryDialogCleanupIo) {
     await cleanupDuplicateDeliveryChats(db, io);
     await cleanupExpiredDeliveryChats(db, io);
     const isolatedTenants = await db.platformQuery(
-      `SELECT id, code, db_mode, db_url, db_name, status, subscription_expires_at
+      `SELECT id, code, db_mode, db_url, db_name, db_schema, status, subscription_expires_at
        FROM tenants
-       WHERE db_mode = 'isolated'
-         AND db_url IS NOT NULL`,
+       WHERE (
+         (db_mode = 'isolated' AND db_url IS NOT NULL)
+         OR (db_mode = 'schema_isolated' AND db_schema IS NOT NULL)
+       )`,
     );
     for (const tenant of isolatedTenants.rows) {
       await db.runWithTenantRow(tenant, async () => {

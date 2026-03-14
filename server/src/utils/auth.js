@@ -224,7 +224,7 @@ async function resolveAuthContextFromToken(
     }
 
     const tenantRes = await db.platformQuery(
-      `SELECT id, code, name, status, subscription_expires_at, db_mode, db_url, db_name
+      `SELECT id, code, name, status, subscription_expires_at, db_mode, db_url, db_name, db_schema
        FROM tenants
        WHERE lower(code) = $1
        LIMIT 1`,

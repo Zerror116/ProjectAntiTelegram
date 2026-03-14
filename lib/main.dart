@@ -15,6 +15,7 @@ import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
 import 'services/input_language_service.dart';
+import 'services/offline_purchase_queue_service.dart';
 import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
 
@@ -58,6 +59,8 @@ final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
 );
 final ValueNotifier<PhoneAccessOwnerRequest?> phoneAccessOwnerRequestNotifier =
     ValueNotifier<PhoneAccessOwnerRequest?>(null);
+final OfflinePurchaseQueueService offlinePurchaseQueueService =
+    OfflinePurchaseQueueService();
 
 const _notificationsPrefPrefix = 'notifications_enabled_';
 const _themePrefPrefix = 'theme_mode_dark_';
@@ -74,6 +77,16 @@ String? _socketBoundUserId;
 String? _socketBoundViewRole;
 String _lastConnectivityHint = '';
 bool _keyboardAssertRecoveredRecently = false;
+const bool _verboseSocketLogs = bool.fromEnvironment(
+  'FENIX_VERBOSE_SOCKET_LOGS',
+  defaultValue: false,
+);
+
+void _socketVerboseLog(String message) {
+  if (kDebugMode && _verboseSocketLogs) {
+    debugPrint(message);
+  }
+}
 
 enum AppNoticeTone { info, success, warning, error }
 
@@ -187,6 +200,31 @@ void _setRuntimeApiBaseUrl(String next) {
   _runtimeApiBaseUrl = normalized;
   dio.options.baseUrl = normalized;
   debugPrint('API base URL switched to $_runtimeApiBaseUrl');
+}
+
+@visibleForTesting
+void debugSetApiBaseUrlForTesting(String next) {
+  _setRuntimeApiBaseUrl(next);
+}
+
+@visibleForTesting
+String debugGetApiBaseUrlForTesting() {
+  return _runtimeApiBaseUrl;
+}
+
+bool _isAuthServiceInitialized() {
+  try {
+    authService;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+@visibleForTesting
+void debugEnsureAuthServiceForTesting() {
+  if (_isAuthServiceInitialized()) return;
+  authService = AuthService(dio: dio);
 }
 
 List<String> _buildApiBaseCandidates() {
@@ -1604,8 +1642,7 @@ Future<void> _initSocket() async {
   try {
     debugPrint('🚀 Initializing socket...');
 
-    final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString('auth_token');
+    final token = await authService.getToken();
     if (token == null || token.trim().isEmpty) {
       debugPrint('⏭️ _initSocket skipped: empty auth token');
       return;
@@ -1643,69 +1680,69 @@ Future<void> _initSocket() async {
 
     // Chat created -> notify listeners to reload chats
     socket?.on('chat:created', (data) {
-      debugPrint('📬 Socket event chat:created -> $data');
+      _socketVerboseLog('📬 Socket event chat:created -> $data');
       chatEventsController.add({'type': 'chat:created', 'data': data});
     });
 
     socket?.on('chat:deleted', (data) {
-      debugPrint('📬 Socket event chat:deleted -> $data');
+      _socketVerboseLog('📬 Socket event chat:deleted -> $data');
       chatEventsController.add({'type': 'chat:deleted', 'data': data});
     });
 
     socket?.on('chat:updated', (data) {
-      debugPrint('📬 Socket event chat:updated -> $data');
+      _socketVerboseLog('📬 Socket event chat:updated -> $data');
       chatEventsController.add({'type': 'chat:updated', 'data': data});
     });
 
     socket?.on('chat:pinned', (data) {
-      debugPrint('📬 Socket event chat:pinned -> $data');
+      _socketVerboseLog('📬 Socket event chat:pinned -> $data');
       chatEventsController.add({'type': 'chat:pinned', 'data': data});
     });
 
     // New message -> notify listeners
     socket?.on('chat:message', (data) {
-      debugPrint('📬 Socket event chat:message -> $data');
+      _socketVerboseLog('📬 Socket event chat:message -> $data');
       chatEventsController.add({'type': 'chat:message', 'data': data});
       _maybePlayIncomingMessageSound(data);
     });
 
     socket?.on('chat:message:deleted', (data) {
-      debugPrint('📬 Socket event chat:message:deleted -> $data');
+      _socketVerboseLog('📬 Socket event chat:message:deleted -> $data');
       chatEventsController.add({'type': 'chat:message:deleted', 'data': data});
     });
 
     socket?.on('chat:cleared', (data) {
-      debugPrint('📬 Socket event chat:cleared -> $data');
+      _socketVerboseLog('📬 Socket event chat:cleared -> $data');
       chatEventsController.add({'type': 'chat:cleared', 'data': data});
     });
 
     socket?.on('chat:message:read', (data) {
-      debugPrint('📬 Socket event chat:message:read -> $data');
+      _socketVerboseLog('📬 Socket event chat:message:read -> $data');
       chatEventsController.add({'type': 'chat:message:read', 'data': data});
     });
 
     socket?.on('tenant:subscription:update', (data) {
-      debugPrint('📬 Socket event tenant:subscription:update -> $data');
+      _socketVerboseLog('📬 Socket event tenant:subscription:update -> $data');
       _applySubscriptionSocketUpdate(data);
     });
 
     socket?.on('creator:alert', (data) {
-      debugPrint('📬 Socket event creator:alert -> $data');
+      _socketVerboseLog('📬 Socket event creator:alert -> $data');
       _handleCreatorAlertEvent(data);
     });
 
     socket?.on('phone-access:request', (data) {
-      debugPrint('📬 Socket event phone-access:request -> $data');
+      _socketVerboseLog('📬 Socket event phone-access:request -> $data');
       unawaited(_handlePhoneAccessRequestEvent(data));
     });
 
     socket?.on('phone-access:updated', (data) {
-      debugPrint('📬 Socket event phone-access:updated -> $data');
+      _socketVerboseLog('📬 Socket event phone-access:updated -> $data');
       unawaited(_probePendingPhoneAccessRequests());
     });
 
     socket?.on('phone-access:decision', (data) {
-      debugPrint('📬 Socket event phone-access:decision -> $data');
+      _socketVerboseLog('📬 Socket event phone-access:decision -> $data');
       final map = data is Map ? Map<String, dynamic>.from(data) : null;
       final status = (map?['status'] ?? '').toString().trim().toLowerCase();
       if (status == 'approved') {
@@ -1725,23 +1762,23 @@ Future<void> _initSocket() async {
     });
 
     socket?.on('cart:updated', (data) {
-      debugPrint('📬 Socket event cart:updated -> $data');
+      _socketVerboseLog('📬 Socket event cart:updated -> $data');
       chatEventsController.add({'type': 'cart:updated', 'data': data});
     });
 
     socket?.on('delivery:updated', (data) {
-      debugPrint('📬 Socket event delivery:updated -> $data');
+      _socketVerboseLog('📬 Socket event delivery:updated -> $data');
       chatEventsController.add({'type': 'delivery:updated', 'data': data});
     });
 
     socket?.on('claims:updated', (data) {
-      debugPrint('📬 Socket event claims:updated -> $data');
+      _socketVerboseLog('📬 Socket event claims:updated -> $data');
       chatEventsController.add({'type': 'claims:updated', 'data': data});
     });
 
     // Global message event (optional)
     socket?.on('chat:message:global', (data) {
-      debugPrint('📬 Socket event chat:message:global -> $data');
+      _socketVerboseLog('📬 Socket event chat:message:global -> $data');
       chatEventsController.add({'type': 'chat:message:global', 'data': data});
       _maybePlayIncomingMessageSound(data);
     });
@@ -1915,6 +1952,8 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   bool _subscriptionProbeBusy = false;
   Timer? _phoneAccessProbeTimer;
   bool _phoneAccessProbeBusy = false;
+  Timer? _offlinePurchaseProbeTimer;
+  bool _offlinePurchaseProbeBusy = false;
 
   void _showAuthScreen() {
     if (!mounted) return;
@@ -1941,6 +1980,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     } catch (_) {}
     _subscriptionProbeTimer?.cancel();
     _phoneAccessProbeTimer?.cancel();
+    _offlinePurchaseProbeTimer?.cancel();
     super.dispose();
   }
 
@@ -1960,6 +2000,15 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       (_) => unawaited(_probePhoneAccessOwnerRequests()),
     );
     unawaited(_probePhoneAccessOwnerRequests());
+  }
+
+  void _restartOfflinePurchaseProbe() {
+    _offlinePurchaseProbeTimer?.cancel();
+    _offlinePurchaseProbeTimer = Timer.periodic(
+      const Duration(seconds: 7),
+      (_) => unawaited(_probeOfflinePurchaseQueue()),
+    );
+    unawaited(_probeOfflinePurchaseQueue());
   }
 
   Future<void> _probePhoneAccessOwnerRequests() async {
@@ -2014,6 +2063,55 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     }
   }
 
+  Future<void> _probeOfflinePurchaseQueue() async {
+    if (!mounted || _offlinePurchaseProbeBusy) return;
+    final user = authService.currentUser;
+    if (user == null) return;
+
+    _offlinePurchaseProbeBusy = true;
+    try {
+      final result = await offlinePurchaseQueueService.flushQueuedPurchases(
+        dio: dio,
+        userId: user.id,
+        tenantCode: user.tenantCode,
+      );
+      if (result.confirmed > 0) {
+        showGlobalAppNotice(
+          'Оффлайн-покупки подтверждены: ${result.confirmed}',
+          tone: AppNoticeTone.success,
+          duration: const Duration(seconds: 2),
+        );
+      }
+      if (result.rejected > 0) {
+        final firstReason = result.events
+            .where((e) => e.outcome == OfflinePurchaseSyncOutcome.rejected)
+            .map((e) => e.message.trim())
+            .firstWhere((msg) => msg.isNotEmpty, orElse: () => '');
+        showGlobalAppNotice(
+          firstReason.isNotEmpty
+              ? 'Оффлайн-покупка отклонена: $firstReason'
+              : 'Часть оффлайн-покупок отклонена: ${result.rejected}',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 3),
+        );
+      }
+      if (result.confirmed > 0 || result.rejected > 0) {
+        chatEventsController.add({
+          'type': 'cart:offline-sync',
+          'data': {
+            'confirmed': result.confirmed,
+            'rejected': result.rejected,
+            'remaining': result.remaining,
+          },
+        });
+      }
+    } catch (_) {
+      // ignore: service handles connection/runtime fallbacks
+    } finally {
+      _offlinePurchaseProbeBusy = false;
+    }
+  }
+
   Future<void> _startInit() async {
     try {
       authService = AuthService(dio: dio);
@@ -2031,6 +2129,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           _lastPlayedMessageId = null;
           activeChatIdNotifier.value = null;
           phoneAccessOwnerRequestNotifier.value = null;
+          _offlinePurchaseProbeTimer?.cancel();
           await refreshUserPreferences();
           _updateSubscriptionUiState();
           _showAuthScreen();
@@ -2043,12 +2142,14 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             debugPrint('Failed to init socket after login: $e');
           }
           unawaited(_probePendingPhoneAccessRequests());
+          _restartOfflinePurchaseProbe();
           await refreshUserPreferences();
           _updateSubscriptionUiState();
         }
       });
       _restartSubscriptionProbe();
       _restartPhoneAccessProbe();
+      _restartOfflinePurchaseProbe();
 
       await refreshUserPreferences();
       unawaited(_prepareAppSoundPlayer());

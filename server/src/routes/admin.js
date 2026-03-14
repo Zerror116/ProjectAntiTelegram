@@ -43,12 +43,12 @@ const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$/;
 function buildIsolatedProvisionWarning(err) {
   const code = String(err?.code || "").trim();
   if (code === "42501") {
-    return "Изолированная БД не создана (проверьте CREATEDB). Арендатор переведен в shared-режим.";
+    return "Не удалось создать отдельную БД (проверьте CREATEDB). Арендатор переведен в schema-isolated режим.";
   }
   if (code === "23503") {
-    return "Изолированная БД создана частично, но не удалось связать служебные данные. Арендатор переведен в shared-режим.";
+    return "Изоляция создана частично, но не удалось связать служебные данные. Требуется ручная проверка арендатора.";
   }
-  return "Изолированная БД не создана. Арендатор переведен в shared-режим.";
+  return "Изолированная БД не создана. Включен безопасный fallback.";
 }
 
 function emitTenantSubscriptionUpdate(io, tenantId, row, source = "admin") {
@@ -776,7 +776,7 @@ router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => 
               COALESCE(access_key_mask, '—') AS access_key_mask,
               COALESCE(NULLIF(access_key_value, ''), NULL) AS access_key_value,
               subscription_expires_at, last_payment_confirmed_at, notes,
-              db_mode, db_name, is_deleted,
+              db_mode, db_name, db_schema, is_deleted,
               created_at, updated_at
        FROM tenants
        WHERE ($1::boolean = true OR COALESCE(is_deleted, false) = false)
@@ -829,12 +829,12 @@ router.post(
            id, code, name, access_key_hash, access_key_mask,
            access_key_value,
            status, subscription_expires_at, last_payment_confirmed_at,
-           created_by, notes, db_mode, db_name, db_url, created_at, updated_at
+           created_by, notes, db_mode, db_name, db_schema, db_url, created_at, updated_at
          )
          VALUES (
            $1, $2, $3, $4, $5, $6,
            'active', now() + make_interval(months => $7::int), now(),
-           $8, $9, 'isolated', NULL, NULL, now(), now()
+           $8, $9, 'isolated', NULL, NULL, NULL, now(), now()
          )
          RETURNING id, code, name, status, access_key_mask, access_key_value, subscription_expires_at, notes, created_at`,
         [
@@ -854,6 +854,7 @@ router.post(
       const createdRow = created.rows[0];
       var dbMode = "isolated";
       var dbName = null;
+      var dbSchema = null;
       var warning = "";
 
       try {
@@ -871,16 +872,25 @@ router.post(
           notes,
         });
 
-        dbName = provision.dbName;
+        dbMode = String(provision.dbMode || "isolated")
+          .toLowerCase()
+          .trim();
+        dbName = provision.dbName || null;
+        dbSchema = provision.dbSchema || null;
         await db.platformQuery(
           `UPDATE tenants
-           SET db_mode = 'isolated',
-               db_name = $2,
-               db_url = $3,
+           SET db_mode = $2,
+               db_name = $3,
+               db_schema = $4,
+               db_url = $5,
                updated_at = now()
            WHERE id = $1`,
-          [tenantId, provision.dbName, provision.dbUrl],
+          [tenantId, dbMode, dbName, dbSchema, provision.dbUrl || null],
         );
+        if (dbMode === "schema_isolated") {
+          warning =
+            "Отдельная БД не была создана из-за ограничений PostgreSQL, включен schema-isolated режим (данные арендатора в отдельной схеме).";
+        }
       } catch (provisionErr) {
         console.error(
           "admin.tenants.create isolated provision failed",
@@ -888,12 +898,14 @@ router.post(
         );
         dbMode = "shared";
         dbName = null;
+        dbSchema = null;
         warning = buildIsolatedProvisionWarning(provisionErr);
         try {
           await db.platformQuery(
             `UPDATE tenants
              SET db_mode = 'shared',
                  db_name = NULL,
+                 db_schema = NULL,
                  db_url = NULL,
                  updated_at = now()
              WHERE id = $1`,
@@ -931,6 +943,7 @@ router.post(
           access_key: accessKey,
           db_mode: dbMode,
           db_name: dbName,
+          db_schema: dbSchema,
           warning,
         },
       });
@@ -3722,6 +3735,7 @@ router.post(
                 t.status,
                 t.db_mode,
                 t.db_name,
+                t.db_schema,
                 t.is_deleted,
                 t.subscription_expires_at,
                 t.last_payment_confirmed_at,
@@ -3784,6 +3798,7 @@ router.post(
       let missingMainChannel = 0;
       let missingStaff = 0;
       let isolated = 0;
+      let schemaIsolated = 0;
       let shared = 0;
 
       for (const row of q.rows) {
@@ -3811,6 +3826,7 @@ router.post(
           .toLowerCase()
           .trim();
         if (dbMode === "isolated") isolated += 1;
+        if (dbMode === "schema_isolated") schemaIsolated += 1;
         if (dbMode === "shared") shared += 1;
       }
 
@@ -3828,6 +3844,7 @@ router.post(
             missing_main_channel: missingMainChannel,
             missing_staff: missingStaff,
             isolated,
+            schema_isolated: schemaIsolated,
             shared,
           },
           rows: q.rows,

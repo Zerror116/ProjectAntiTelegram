@@ -12,7 +12,12 @@
     "test:phone-access:e2e": "node scripts/e2e-phone-access-flow.js",
     "test:subscription-guard:e2e": "node scripts/e2e-subscription-guard-flow.js",
     "test:order-pipeline:e2e": "node scripts/e2e-order-pipeline-flow.js",
+    "test:device-limit:e2e": "node scripts/e2e-device-limit-flow.js",
+    "test:tenant-isolation:e2e": "node scripts/e2e-tenant-isolation-flow.js",
+    "test:tenant-regression:e2e": "node scripts/e2e-tenant-isolation-regression.js",
     "test:e2e:core": "npm run test:critical && npm run test:phone-access:e2e && npm run test:subscription-guard:e2e && npm run test:order-pipeline:e2e",
+    "test:e2e:extended": "npm run test:e2e:core && npm run test:tenant-isolation:e2e && npm run test:tenant-regression:e2e && npm run test:device-limit:e2e",
+    "test:e2e:full": "node scripts/e2e-full-regression.js",
     "audit:self": "node scripts/nightly-self-audit.js"
   },
   "dependencies": {
