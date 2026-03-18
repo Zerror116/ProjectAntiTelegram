@@ -90,8 +90,19 @@ class _WorkerPanelState extends State<WorkerPanel>
     return parsed ?? fallback;
   }
 
+  void _dismissKeyboard() {
+    final focus = FocusManager.instance.primaryFocus;
+    if (focus?.hasFocus ?? false) {
+      focus?.unfocus();
+    }
+  }
+
   String _extractRequestError(Object error) {
     if (error is DioException) {
+      final statusCode = error.response?.statusCode;
+      if (statusCode == 413) {
+        return 'Фото слишком большое для загрузки. Уменьшите размер и попробуйте снова.';
+      }
       final data = error.response?.data;
       if (data is Map) {
         final raw = (data['error'] ?? data['message'] ?? '').toString().trim();
@@ -1647,6 +1658,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Widget _buildQueueTab() {
     return ListView(
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.all(16),
       children: [
         if (_loadingChannels)
@@ -1776,6 +1788,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Widget _buildSearchTab() {
     return ListView(
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.all(16),
       children: [
         Row(
@@ -2066,6 +2079,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
     if (_ownQueuedPosts.isEmpty) {
       return ListView(
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: const [
           AppEmptyState(
@@ -2079,6 +2093,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     return RefreshIndicator(
       onRefresh: _loadOwnQueuedPosts,
       child: ListView.separated(
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         itemCount: _ownQueuedPosts.length,
         separatorBuilder: (context, index) => const SizedBox(height: 12),
@@ -2210,6 +2225,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         await _loadRevisionDates();
       },
       child: ListView(
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
           Container(
@@ -2536,31 +2552,36 @@ class _WorkerPanelState extends State<WorkerPanel>
           controller: controller,
           tabs: tabs,
           isScrollable: compact,
+          onTap: (_) => _dismissKeyboard(),
         ),
       ),
       body: SafeArea(
-        child: Column(
-          children: [
-            if (_message.isNotEmpty)
-              Padding(
-                padding: EdgeInsets.fromLTRB(
-                  compact ? 10 : 16,
-                  12,
-                  compact ? 10 : 16,
-                  0,
-                ),
-                child: Text(
-                  _message,
-                  style: TextStyle(
-                    color: _messageColor(Theme.of(context)),
-                    fontWeight: FontWeight.w600,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: _dismissKeyboard,
+          child: Column(
+            children: [
+              if (_message.isNotEmpty)
+                Padding(
+                  padding: EdgeInsets.fromLTRB(
+                    compact ? 10 : 16,
+                    12,
+                    compact ? 10 : 16,
+                    0,
+                  ),
+                  child: Text(
+                    _message,
+                    style: TextStyle(
+                      color: _messageColor(Theme.of(context)),
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
+              Expanded(
+                child: TabBarView(controller: controller, children: tabViews),
               ),
-            Expanded(
-              child: TabBarView(controller: controller, children: tabViews),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

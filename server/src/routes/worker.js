@@ -17,6 +17,11 @@ const { runInRequestTenantScope } = require('../utils/requestScope');
 const productUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
 const SAMARA_TZ = 'Europe/Samara';
+const productImageMaxMb = Math.max(
+  1,
+  Number.parseInt(String(process.env.PRODUCT_IMAGE_MAX_MB || '8').trim(), 10) || 8,
+);
+const productImageMaxBytes = productImageMaxMb * 1024 * 1024;
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -27,7 +32,7 @@ const upload = multer({
       cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
     },
   }),
-  limits: { fileSize: 8 * 1024 * 1024 },
+  limits: { fileSize: productImageMaxBytes },
   fileFilter: (_req, file, cb) => {
     if (String(file.mimetype || '').startsWith('image/')) {
       cb(null, true);
@@ -41,7 +46,10 @@ function uploadProductImage(req, res, next) {
   upload.single('image')(req, res, (err) => {
     if (!err) return next();
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ ok: false, error: 'Размер фото не должен превышать 8MB' });
+      return res.status(400).json({
+        ok: false,
+        error: `Размер фото не должен превышать ${productImageMaxMb}MB`,
+      });
     }
     return res.status(400).json({ ok: false, error: err.message || 'Некорректный файл' });
   });

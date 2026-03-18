@@ -4,10 +4,10 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
-	<key>CFBundleExecutable</key>
-	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleDisplayName</key>
 	<string>Проект Феникс</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIconFile</key>
 	<string></string>
 	<key>CFBundleIdentifier</key>
@@ -24,12 +24,12 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Приложению нужен доступ к микрофону, чтобы отправлять голосовые сообщения в чатах.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Приложению нужен доступ к микрофону, чтобы отправлять голосовые сообщения в чатах.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
