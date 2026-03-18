@@ -16,6 +16,8 @@ dependencies:
 
   # Сеть
   dio: ^5.2.2
+  package_info_plus: ^8.1.3
+  url_launcher: ^6.3.1
 
   # Хранение токена
   shared_preferences: ^2.1.1
