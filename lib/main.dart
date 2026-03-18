@@ -6,8 +6,10 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
+import 'package:url_launcher/url_launcher.dart';
 
 import 'screens/auth_screen.dart';
 import 'screens/phone_access_pending_screen.dart';
@@ -91,6 +93,37 @@ void _socketVerboseLog(String message) {
 enum AppNoticeTone { info, success, warning, error }
 
 enum AppUiSound { tap, sent, incoming, success, warning }
+
+class _AppUpdateVersion {
+  final String version;
+  final int build;
+
+  const _AppUpdateVersion({required this.version, required this.build});
+
+  String get token => '$version+$build';
+}
+
+class _AppUpdateInfo {
+  final bool required;
+  final String title;
+  final String? message;
+  final String? downloadUrl;
+  final String platform;
+  final _AppUpdateVersion current;
+  final _AppUpdateVersion latest;
+  final _AppUpdateVersion? minSupported;
+
+  const _AppUpdateInfo({
+    required this.required,
+    required this.title,
+    required this.message,
+    required this.downloadUrl,
+    required this.platform,
+    required this.current,
+    required this.latest,
+    required this.minSupported,
+  });
+}
 
 class PhoneAccessOwnerRequest {
   final String id;
@@ -737,7 +770,9 @@ Future<void> _probePendingPhoneAccessRequests() async {
 
     final shouldOpenDialog = previousId == null || previousId != request.id;
     if (!shouldOpenDialog) return;
-    await _handlePhoneAccessRequestEvent(_phoneAccessRequestToEventMap(request));
+    await _handlePhoneAccessRequestEvent(
+      _phoneAccessRequestToEventMap(request),
+    );
   } catch (_) {
     // ignore
   }
@@ -792,6 +827,151 @@ String _extractApiErrorMessage(DioException err) {
     if (raw.isNotEmpty) return raw;
   }
   return (err.message ?? '').trim();
+}
+
+int _safePositiveInt(dynamic raw, {int fallback = 0}) {
+  final parsed = int.tryParse((raw ?? '').toString().trim());
+  if (parsed == null || parsed < 0) return fallback;
+  return parsed;
+}
+
+bool _toBool(dynamic raw, {bool fallback = false}) {
+  if (raw == null) return fallback;
+  if (raw is bool) return raw;
+  final normalized = raw.toString().toLowerCase().trim();
+  if (normalized.isEmpty) return fallback;
+  return normalized == 'true' ||
+      normalized == '1' ||
+      normalized == 'yes' ||
+      normalized == 'on';
+}
+
+String _normalizeVersion(String raw) {
+  final cleaned = raw.trim().replaceFirst(RegExp(r'^[vV]'), '');
+  return cleaned.isEmpty ? '0.0.0' : cleaned;
+}
+
+List<String> _splitVersionParts(String version) {
+  return _normalizeVersion(version).split('.');
+}
+
+int _versionPartToInt(String part) {
+  final digits = part.replaceAll(RegExp(r'[^0-9]'), '');
+  if (digits.isEmpty) return 0;
+  return int.tryParse(digits) ?? 0;
+}
+
+int _compareVersionOnly(String a, String b) {
+  final left = _splitVersionParts(a);
+  final right = _splitVersionParts(b);
+  final maxLen = left.length > right.length ? left.length : right.length;
+  for (var i = 0; i < maxLen; i++) {
+    final li = i < left.length ? _versionPartToInt(left[i]) : 0;
+    final ri = i < right.length ? _versionPartToInt(right[i]) : 0;
+    if (li != ri) return li.compareTo(ri);
+  }
+  return 0;
+}
+
+int _compareVersionWithBuild(_AppUpdateVersion a, _AppUpdateVersion b) {
+  final versionCmp = _compareVersionOnly(a.version, b.version);
+  if (versionCmp != 0) return versionCmp;
+  return a.build.compareTo(b.build);
+}
+
+String? _resolveAppUpdatePlatform() {
+  if (kIsWeb) return null;
+  if (defaultTargetPlatform == TargetPlatform.android) return 'android';
+  if (defaultTargetPlatform == TargetPlatform.iOS) return 'ios';
+  return null;
+}
+
+Future<bool> _openUpdateUrl(String rawUrl) async {
+  final uri = Uri.tryParse(rawUrl.trim());
+  if (uri == null) return false;
+  try {
+    return await launchUrl(uri, mode: LaunchMode.externalApplication);
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
+  final platform = _resolveAppUpdatePlatform();
+  if (platform == null) return null;
+
+  final packageInfo = await PackageInfo.fromPlatform();
+  final current = _AppUpdateVersion(
+    version: _normalizeVersion(packageInfo.version),
+    build: _safePositiveInt(packageInfo.buildNumber, fallback: 0),
+  );
+
+  final response = await dio.get(
+    '/api/app/update',
+    options: Options(
+      sendTimeout: const Duration(seconds: 6),
+      receiveTimeout: const Duration(seconds: 6),
+    ),
+  );
+  final root = response.data;
+  if (root is! Map) return null;
+  if (root['ok'] != true) return null;
+  final data = root['data'];
+  if (data is! Map) return null;
+  final platformConfigRaw = data[platform];
+  if (platformConfigRaw is! Map) return null;
+  final platformConfig = Map<String, dynamic>.from(platformConfigRaw);
+  if (!_toBool(platformConfig['enabled'], fallback: false)) return null;
+
+  final latestVersionRaw = (platformConfig['latest_version'] ?? '')
+      .toString()
+      .trim();
+  final latestBuildRaw = platformConfig['latest_build'];
+  final latestVersion = _normalizeVersion(latestVersionRaw);
+  final latestBuild = _safePositiveInt(latestBuildRaw, fallback: 0);
+  final latest = _AppUpdateVersion(version: latestVersion, build: latestBuild);
+
+  final minVersionRaw = (platformConfig['min_supported_version'] ?? '')
+      .toString()
+      .trim();
+  final minBuildRaw = platformConfig['min_supported_build'];
+  _AppUpdateVersion? minSupported;
+  if (minVersionRaw.isNotEmpty || minBuildRaw != null) {
+    minSupported = _AppUpdateVersion(
+      version: _normalizeVersion(minVersionRaw),
+      build: _safePositiveInt(minBuildRaw, fallback: 0),
+    );
+  }
+
+  final hasLatestConfigured =
+      latestVersionRaw.isNotEmpty || platformConfig['latest_build'] != null;
+  if (!hasLatestConfigured && minSupported == null) return null;
+
+  final isNewerThanCurrent = _compareVersionWithBuild(latest, current) > 0;
+  final belowMinSupported =
+      minSupported != null &&
+      _compareVersionWithBuild(current, minSupported) < 0;
+  final required =
+      _toBool(platformConfig['required'], fallback: false) || belowMinSupported;
+
+  if (!isNewerThanCurrent && !belowMinSupported) {
+    return null;
+  }
+
+  final title = (platformConfig['title'] ?? '').toString().trim();
+  final message = (platformConfig['message'] ?? '').toString().trim();
+  final downloadUrl = (platformConfig['download_url'] ?? '').toString().trim();
+
+  return _AppUpdateInfo(
+    required: required,
+    title: title.isNotEmpty ? title : 'Доступно обновление Феникс',
+    message: message.isNotEmpty ? message : null,
+    downloadUrl: downloadUrl.isNotEmpty ? downloadUrl : null,
+    platform: platform,
+    current: current,
+    latest: latest,
+    minSupported: minSupported,
+  );
 }
 
 bool _isSubscriptionErrorText(String message) {
@@ -1156,9 +1336,7 @@ class _GlobalNoticeHost extends StatelessWidget {
                         decoration: BoxDecoration(
                           color: theme.colorScheme.errorContainer,
                           borderRadius: BorderRadius.circular(14),
-                          border: Border.all(
-                            color: theme.colorScheme.error,
-                          ),
+                          border: Border.all(color: theme.colorScheme.error),
                         ),
                         child: Padding(
                           padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
@@ -1171,7 +1349,9 @@ class _GlobalNoticeHost extends StatelessWidget {
                               final expiresAt = state.warningExpiresAt;
                               Duration? remaining;
                               if (expiresAt != null) {
-                                remaining = expiresAt.difference(DateTime.now());
+                                remaining = expiresAt.difference(
+                                  DateTime.now(),
+                                );
                               }
                               final countdown = remaining == null
                                   ? null
@@ -1212,7 +1392,8 @@ class _GlobalNoticeHost extends StatelessWidget {
                                             subtitle,
                                             style: theme.textTheme.labelSmall
                                                 ?.copyWith(
-                                                  color: theme.colorScheme
+                                                  color: theme
+                                                      .colorScheme
                                                       .onErrorContainer,
                                                   fontWeight: FontWeight.w700,
                                                 ),
@@ -1954,6 +2135,10 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   bool _phoneAccessProbeBusy = false;
   Timer? _offlinePurchaseProbeTimer;
   bool _offlinePurchaseProbeBusy = false;
+  Timer? _appUpdateProbeTimer;
+  bool _appUpdateProbeBusy = false;
+  bool _appUpdateDialogOpen = false;
+  String? _dismissedUpdateToken;
 
   void _showAuthScreen() {
     if (!mounted) return;
@@ -1981,6 +2166,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     _subscriptionProbeTimer?.cancel();
     _phoneAccessProbeTimer?.cancel();
     _offlinePurchaseProbeTimer?.cancel();
+    _appUpdateProbeTimer?.cancel();
     super.dispose();
   }
 
@@ -2009,6 +2195,155 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       (_) => unawaited(_probeOfflinePurchaseQueue()),
     );
     unawaited(_probeOfflinePurchaseQueue());
+  }
+
+  void _restartAppUpdateProbe() {
+    _appUpdateProbeTimer?.cancel();
+    _appUpdateProbeTimer = Timer.periodic(
+      const Duration(minutes: 10),
+      (_) => unawaited(_probeAppUpdate()),
+    );
+    unawaited(_probeAppUpdate());
+  }
+
+  Future<void> _showAppUpdateDialog(_AppUpdateInfo info) async {
+    if (!mounted || _appUpdateDialogOpen) return;
+    final context = navigatorKey.currentContext ?? this.context;
+    if (!context.mounted) return;
+
+    final updateToken = '${info.platform}:${info.latest.token}';
+    _appUpdateDialogOpen = true;
+    try {
+      final decision = await showDialog<String>(
+        context: context,
+        barrierDismissible: !info.required,
+        builder: (dialogContext) {
+          final theme = Theme.of(dialogContext);
+          final currentLabel = '${info.current.version}+${info.current.build}';
+          final latestLabel = '${info.latest.version}+${info.latest.build}';
+          final platformLabel = info.platform == 'android'
+              ? 'Android'
+              : info.platform == 'ios'
+              ? 'iOS'
+              : info.platform;
+          final minSupportedLabel = info.minSupported == null
+              ? null
+              : '${info.minSupported!.version}+${info.minSupported!.build}';
+          return AlertDialog(
+            title: Text(
+              info.required
+                  ? 'Требуется обновление Феникс'
+                  : (info.title.isNotEmpty
+                        ? info.title
+                        : 'Доступно обновление Феникс'),
+            ),
+            content: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 520),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Платформа: $platformLabel\n'
+                    'Текущая версия: $currentLabel\n'
+                    'Новая версия: $latestLabel',
+                    style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
+                  ),
+                  if (minSupportedLabel != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Минимально поддерживаемая: $minSupportedLabel',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                  if ((info.message ?? '').trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      info.message!.trim(),
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ],
+                  if ((info.downloadUrl ?? '').trim().isEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      'Ссылка на обновление не настроена на сервере. '
+                      'Обратитесь к администратору.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.error,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              if (!info.required)
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop('later'),
+                  child: const Text('Позже'),
+                ),
+              FilledButton.icon(
+                onPressed: () => Navigator.of(dialogContext).pop('update'),
+                icon: const Icon(Icons.system_update_alt_rounded),
+                label: const Text('Обновить Феникс'),
+              ),
+            ],
+          );
+        },
+      );
+
+      if (decision == 'update') {
+        final url = (info.downloadUrl ?? '').trim();
+        if (url.isEmpty) {
+          showGlobalAppNotice(
+            'Ссылка на обновление не настроена на сервере.',
+            title: 'Обновление Феникс',
+            tone: AppNoticeTone.error,
+          );
+          return;
+        }
+        final opened = await _openUpdateUrl(url);
+        if (opened) {
+          _dismissedUpdateToken = updateToken;
+          showGlobalAppNotice(
+            'Открыта ссылка на обновление Феникс.',
+            title: 'Обновление',
+            tone: AppNoticeTone.success,
+          );
+        } else {
+          showGlobalAppNotice(
+            'Не удалось открыть ссылку обновления. Проверьте URL.',
+            title: 'Обновление Феникс',
+            tone: AppNoticeTone.error,
+          );
+        }
+      } else if (decision == 'later' && !info.required) {
+        _dismissedUpdateToken = updateToken;
+      }
+    } finally {
+      _appUpdateDialogOpen = false;
+    }
+  }
+
+  Future<void> _probeAppUpdate() async {
+    if (!mounted || _appUpdateProbeBusy || _appUpdateDialogOpen) return;
+    _appUpdateProbeBusy = true;
+    try {
+      final info = await _fetchAppUpdateInfo();
+      if (!mounted || info == null) return;
+      final updateToken = '${info.platform}:${info.latest.token}';
+      if (!info.required && _dismissedUpdateToken == updateToken) {
+        return;
+      }
+      await _showAppUpdateDialog(info);
+    } catch (_) {
+      // ignore: отсутствие ответа не должно мешать работе приложения
+    } finally {
+      _appUpdateProbeBusy = false;
+    }
   }
 
   Future<void> _probePhoneAccessOwnerRequests() async {
@@ -2150,6 +2485,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       _restartSubscriptionProbe();
       _restartPhoneAccessProbe();
       _restartOfflinePurchaseProbe();
+      _restartAppUpdateProbe();
 
       await refreshUserPreferences();
       unawaited(_prepareAppSoundPlayer());

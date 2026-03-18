@@ -31,6 +31,7 @@ const deliveryRoutes = require("./routes/delivery");
 const workerRoutes = require("./routes/worker");
 const cartRoutes = require("./routes/cart");
 const supportRoutes = require("./routes/support");
+const appUpdateRoutes = require("./routes/appUpdate");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
 const {
@@ -363,6 +364,7 @@ app.use("/api/delivery", deliveryRoutes);
 app.use("/api/worker", workerRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/api/app/update", appUpdateRoutes);
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
