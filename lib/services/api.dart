@@ -1,5 +1,6 @@
 // lib/services/api.dart
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class ApiService {
@@ -8,10 +9,26 @@ class ApiService {
 
   ApiService._(this.dio, this.storage);
 
-  factory ApiService({String baseUrl = 'http://localhost:3000'}) {
+  static String _resolveBaseUrl(String rawBaseUrl) {
+    final source = rawBaseUrl.trim();
+    if (source.isNotEmpty) return source;
+    if (!kIsWeb) return 'http://127.0.0.1:3000';
+
+    final uri = Uri.base;
+    final scheme = uri.scheme.toLowerCase();
+    final host = uri.host.trim();
+    if ((scheme == 'http' || scheme == 'https') && host.isNotEmpty) {
+      final portPart = uri.hasPort ? ':${uri.port}' : '';
+      return '$scheme://$host$portPart';
+    }
+    return 'http://127.0.0.1:3000';
+  }
+
+  factory ApiService({String baseUrl = ''}) {
+    final resolvedBaseUrl = _resolveBaseUrl(baseUrl);
     final dio = Dio(
       BaseOptions(
-        baseUrl: baseUrl,
+        baseUrl: resolvedBaseUrl,
         connectTimeout: const Duration(seconds: 5),
         receiveTimeout: const Duration(seconds: 5),
       ),
@@ -30,14 +47,20 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> register(String email, String password) async {
-    final resp = await dio.post('/api/auth/register', data: {'email': email, 'password': password});
+    final resp = await dio.post(
+      '/api/auth/register',
+      data: {'email': email, 'password': password},
+    );
     final token = resp.data['token'] as String?;
     if (token != null) await setAuthToken(token);
     return resp.data as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> login(String email, String password) async {
-    final resp = await dio.post('/api/auth/login', data: {'email': email, 'password': password});
+    final resp = await dio.post(
+      '/api/auth/login',
+      data: {'email': email, 'password': password},
+    );
     final token = resp.data['token'] as String?;
     if (token != null) await setAuthToken(token);
     return resp.data as Map<String, dynamic>;

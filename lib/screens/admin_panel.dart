@@ -3122,7 +3122,7 @@ class _AdminPanelState extends State<AdminPanel>
                       return TileLayer(
                         urlTemplate: tileUrl,
                         subdomains: subdomains,
-                        userAgentPackageName: 'projectantitelegram',
+                        userAgentPackageName: 'projectphoenix',
                       );
                     },
                   ),

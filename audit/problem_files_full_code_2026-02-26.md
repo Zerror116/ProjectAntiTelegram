@@ -15,7 +15,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:projectantitelegram/main.dart';
+import 'package:projectphoenix/main.dart';
 
 void main() {
   testWidgets('Counter increments smoke test', (WidgetTester tester) async {
@@ -812,7 +812,7 @@ async function findUserByEmail(email) {
 
 // Базовый health check
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'ProjectAntiTelegram API' });
+  res.json({ ok: true, service: 'ProjectPhoenix API' });
 });
 
 // Ping для проверки доступности
@@ -1734,8 +1734,8 @@ async def lifespan(app: FastAPI):
 
 # Создаём FastAPI приложение с управлением жизненным циклом
 app = FastAPI(
-    title="ProjectAntiTelegram API",
-    description="API для приложения ProjectAntiTelegram",
+    title="ProjectPhoenix API",
+    description="API для приложения ProjectPhoenix",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -1775,7 +1775,7 @@ async def root():
     """Базовый health check."""
     return {
         "status": "ok",
-        "service": "ProjectAntiTelegram API",
+        "service": "ProjectPhoenix API",
         "environment": settings.ENVIRONMENT
     }
 

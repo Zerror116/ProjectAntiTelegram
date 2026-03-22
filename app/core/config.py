@@ -28,7 +28,7 @@ class Settings:
     # URL базы данных: ожидается формат postgresql://user:pass@host:port/dbname
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql://antitelegram_user:password@127.0.0.1:5432/antitelegram_db"
+        "postgresql://projectphoenix_user:password@127.0.0.1:5432/projectphoenix_db"
     )
 
     # Проверка: используются ли дефолтные учётные данные в продакшене

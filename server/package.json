@@ -1,7 +1,7 @@
 {
-  "name": "antitelegram-server",
+  "name": "projectphoenix-server",
   "version": "1.0.0",
-  "description": "Backend for ProjectAntiTelegram (minimal Express + Postgres API)",
+  "description": "Backend for ProjectPhoenix (minimal Express + Postgres API)",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -47,7 +47,7 @@
     "express",
     "postgres",
     "api",
-    "antitelegram"
+    "projectphoenix"
   ],
   "author": "",
   "license": "MIT"

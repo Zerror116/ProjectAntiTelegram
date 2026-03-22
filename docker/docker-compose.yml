@@ -1,12 +1,12 @@
-# PycharmProjects/ProjectAntiTelegram/docker/docker-compose.yml
+# PycharmProjects/ProjectPhoenix/docker/docker-compose.yml
 services:
   db:
     image: postgres:15
     restart: unless-stopped
     environment:
-      POSTGRES_USER: antitelegram
-      POSTGRES_PASSWORD: antitelegram
-      POSTGRES_DB: antitelegram
+      POSTGRES_USER: projectphoenix
+      POSTGRES_PASSWORD: projectphoenix
+      POSTGRES_DB: projectphoenix
     volumes:
       - db-data:/var/lib/postgresql/data
       - ../server/migrations:/docker-entrypoint-initdb.d:ro
@@ -19,7 +19,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://antitelegram:antitelegram@db:5432/antitelegram
+      DATABASE_URL: postgres://projectphoenix:projectphoenix@db:5432/projectphoenix
       JWT_SECRET: change_me_long_secret
       PORT: "3000"
     depends_on:

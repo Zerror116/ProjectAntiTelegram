@@ -820,7 +820,7 @@ router.post(
 
     const platformDbUrl =
       process.env.DATABASE_URL ||
-      "postgresql://antitelegram:antitelegram@localhost:5432/antitelegram";
+      "postgresql://projectphoenix:projectphoenix@localhost:5432/projectphoenix";
     const client = await db.platformConnect();
     try {
       await client.query("BEGIN");
