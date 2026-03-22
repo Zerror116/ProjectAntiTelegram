@@ -5,7 +5,7 @@ require('dotenv').config();
 
 const DEFAULT_DATABASE_URL =
   process.env.DATABASE_URL ||
-  'postgresql://antitelegram:antitelegram@localhost:5432/antitelegram';
+  'postgresql://projectphoenix:projectphoenix@localhost:5432/projectphoenix';
 
 const platformPool = new Pool({
   connectionString: DEFAULT_DATABASE_URL,

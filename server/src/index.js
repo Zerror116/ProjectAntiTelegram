@@ -375,7 +375,7 @@ const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
 
 // Базовый health check
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "ProjectAntiTelegram API" });
+  res.json({ ok: true, service: "ProjectPhoenix API" });
 });
 
 // Ping для проверки доступности

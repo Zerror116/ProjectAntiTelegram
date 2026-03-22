@@ -164,7 +164,7 @@ async function ensureSystemChannelsReady(createdBy = null) {
 
 async function bootstrapDatabase({
   dbUrl = process.env.DATABASE_URL ||
-    "postgresql://antitelegram:antitelegram@localhost:5432/antitelegram",
+    "postgresql://projectphoenix:projectphoenix@localhost:5432/projectphoenix",
   migrationsDir = path.resolve(__dirname, "../../migrations"),
   createdBy = null,
 } = {}) {

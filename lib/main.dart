@@ -24,7 +24,7 @@ import 'widgets/phoenix_loader.dart';
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 const String _rawApiBaseUrl = String.fromEnvironment(
   'FENIX_API_BASE_URL',
-  defaultValue: 'http://127.0.0.1:3000',
+  defaultValue: '',
 );
 final String _initialApiBaseUrl = _resolveApiBaseUrl(_rawApiBaseUrl);
 String _runtimeApiBaseUrl = _initialApiBaseUrl;
@@ -181,8 +181,25 @@ Map<String, dynamic> _phoneAccessRequestToEventMap(
   };
 }
 
+String _defaultApiBaseUrl() {
+  const nativeFallback = 'http://127.0.0.1:3000';
+  if (!kIsWeb) return nativeFallback;
+
+  final base = Uri.base;
+  final scheme = base.scheme.toLowerCase();
+  if (scheme != 'http' && scheme != 'https') {
+    return nativeFallback;
+  }
+
+  final host = base.host.trim();
+  if (host.isEmpty) return nativeFallback;
+
+  final portPart = base.hasPort ? ':${base.port}' : '';
+  return '$scheme://$host$portPart';
+}
+
 String _resolveApiBaseUrl(String raw) {
-  const fallback = 'http://127.0.0.1:3000';
+  final fallback = _defaultApiBaseUrl();
   final source = raw.trim();
   if (source.isEmpty) return fallback;
 
@@ -315,6 +332,15 @@ String _buildConnectivityHint() {
     }
   }
   return 'Проверьте, что сервер запущен и доступен по адресу $base';
+}
+
+bool _isLoopbackApiBase(String base) {
+  final uri = Uri.tryParse(base);
+  final host = (uri?.host ?? '').toLowerCase().trim();
+  return host == '127.0.0.1' ||
+      host == 'localhost' ||
+      host == '::1' ||
+      host == '0.0.0.0';
 }
 
 class _AppNoticePayload {
@@ -1596,26 +1622,32 @@ Future<bool> ensureDatabaseExists() async {
       debugPrint('ensureDatabaseExists: /health[$base] failed: $e');
     }
 
-    try {
-      debugPrint('ensureDatabaseExists: fallback /api/setup at $base');
-      final resp = await dio.post(
-        '/api/setup',
-        options: Options(
-          sendTimeout: const Duration(seconds: 6),
-          receiveTimeout: const Duration(seconds: 6),
-        ),
-      );
-      debugPrint(
-        'ensureDatabaseExists: /api/setup[$base] status=${resp.statusCode}, data=${resp.data}',
-      );
-      if (resp.statusCode == 200) {
-        final data = resp.data;
-        _lastConnectivityHint = '';
-        if (data is Map && data['ok'] == true) return true;
+    if (_isLoopbackApiBase(base)) {
+      try {
+        debugPrint('ensureDatabaseExists: fallback /api/setup at $base');
+        final resp = await dio.post(
+          '/api/setup',
+          options: Options(
+            sendTimeout: const Duration(seconds: 6),
+            receiveTimeout: const Duration(seconds: 6),
+          ),
+        );
+        debugPrint(
+          'ensureDatabaseExists: /api/setup[$base] status=${resp.statusCode}, data=${resp.data}',
+        );
+        if (resp.statusCode == 200) {
+          final data = resp.data;
+          _lastConnectivityHint = '';
+          if (data is Map && data['ok'] == true) return true;
+        }
+      } catch (e) {
+        lastError = e;
+        debugPrint('ensureDatabaseExists fallback[$base] error: $e');
       }
-    } catch (e) {
-      lastError = e;
-      debugPrint('ensureDatabaseExists fallback[$base] error: $e');
+    } else {
+      debugPrint(
+        'ensureDatabaseExists: skip /api/setup for non-local base $base',
+      );
     }
   }
 

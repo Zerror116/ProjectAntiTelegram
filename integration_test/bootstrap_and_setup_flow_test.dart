@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
-import 'package:projectantitelegram/main.dart' as app;
+import 'package:projectphoenix/main.dart' as app;
 
 class _ApiStubState {
   int healthStatus = 200;
@@ -37,30 +37,22 @@ void main() {
         if (options.path == '/health') {
           final code = apiState.healthStatus;
           handler.resolve(
-            _jsonResponse(options, code, {
-              'ok': code >= 200 && code < 300,
-            }),
+            _jsonResponse(options, code, {'ok': code >= 200 && code < 300}),
           );
           return;
         }
         if (options.path == '/api/setup') {
           final code = apiState.setupStatus;
           handler.resolve(
-            _jsonResponse(options, code, {
-              'ok': code >= 200 && code < 300,
-            }),
+            _jsonResponse(options, code, {'ok': code >= 200 && code < 300}),
           );
           return;
         }
         if (options.path == '/api/profile') {
-          handler.resolve(
-            _jsonResponse(options, 404, const {'ok': false}),
-          );
+          handler.resolve(_jsonResponse(options, 404, const {'ok': false}));
           return;
         }
-        handler.resolve(
-          _jsonResponse(options, 200, const {'ok': true}),
-        );
+        handler.resolve(_jsonResponse(options, 200, const {'ok': true}));
       },
     );
     app.dio.interceptors.add(interceptor);
@@ -92,9 +84,7 @@ void main() {
     apiState.healthStatus = 503;
     apiState.setupStatus = 503;
 
-    await tester.pumpWidget(
-      const MaterialApp(home: app.SetupFailedScreen()),
-    );
+    await tester.pumpWidget(const MaterialApp(home: app.SetupFailedScreen()));
     await tester.pumpAndSettle();
     expect(
       find.text('Не удалось инициализировать базу данных на сервере.'),

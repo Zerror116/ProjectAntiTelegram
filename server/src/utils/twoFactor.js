@@ -7,7 +7,7 @@ const {
 } = require("./messageCrypto");
 
 const TWO_FACTOR_ISSUER = String(
-  process.env.TWO_FACTOR_ISSUER || "ProjectAntiTelegram",
+  process.env.TWO_FACTOR_ISSUER || "ProjectPhoenix",
 ).trim();
 
 authenticator.options = {
