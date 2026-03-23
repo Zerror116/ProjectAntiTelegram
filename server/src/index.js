@@ -49,6 +49,7 @@ const {
 // ===================================
 
 const uploadsRoot = path.resolve(__dirname, "..", "uploads");
+const downloadsRoot = path.resolve(__dirname, "..", "downloads");
 fs.mkdirSync(path.join(uploadsRoot, "products"), { recursive: true });
 fs.mkdirSync(path.join(uploadsRoot, "channels"), { recursive: true });
 fs.mkdirSync(path.join(uploadsRoot, "users"), { recursive: true });
@@ -57,6 +58,7 @@ fs.mkdirSync(path.join(uploadsRoot, "chat_media", "images"), {
   recursive: true,
 });
 fs.mkdirSync(path.join(uploadsRoot, "chat_media", "voice"), { recursive: true });
+fs.mkdirSync(downloadsRoot, { recursive: true });
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
@@ -105,6 +107,10 @@ const ENFORCE_HTTPS = parseBooleanEnv(
   process.env.ENFORCE_HTTPS,
   IS_PRODUCTION,
 );
+const APK_DOWNLOAD_ANDROID_ONLY = parseBooleanEnv(
+  process.env.APK_DOWNLOAD_ANDROID_ONLY,
+  true,
+);
 
 function normalizeOrigin(raw) {
   const value = String(raw || "").trim();
@@ -150,6 +156,14 @@ function isOriginAllowed(origin) {
   const normalized = normalizeOrigin(origin);
   if (!normalized) return false;
   return allowedOrigins.has(normalized);
+}
+
+function isAndroidUserAgent(req) {
+  const userAgent = String(req.headers["user-agent"] || "")
+    .toLowerCase()
+    .trim();
+  if (!userAgent) return false;
+  return userAgent.includes("android");
 }
 
 const corsOptions = {
@@ -236,6 +250,30 @@ for (const publicDir of ["products", "channels", "users", "claims"]) {
     }),
   );
 }
+
+app.use("/downloads", (req, res, next) => {
+  if (!APK_DOWNLOAD_ANDROID_ONLY) return next();
+  if (isAndroidUserAgent(req)) return next();
+  return res.status(403).json({
+    ok: false,
+    error: "APK download is allowed only from Android devices",
+  });
+});
+
+app.use(
+  "/downloads",
+  express.static(downloadsRoot, {
+    index: false,
+    fallthrough: false,
+    maxAge: "5m",
+    immutable: false,
+    setHeaders(res) {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", "private, max-age=300");
+      res.setHeader("Content-Disposition", "attachment");
+    },
+  }),
+);
 
 app.use((req, res, next) => {
   const originalJson = res.json.bind(res);

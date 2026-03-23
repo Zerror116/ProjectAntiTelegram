@@ -2008,6 +2008,9 @@ Future<void> _initSocket() async {
 
 Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
+  if (kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+    return const AuthScreen();
+  }
   if (!dbReady) return const SetupFailedScreen();
 
   // ✅ ИСПРАВЛЕНИЕ: Используй tryRefreshOnStartup вместо setAuthHeaderFromStorage

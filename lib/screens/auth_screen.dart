@@ -1,6 +1,7 @@
 // lib/screens/auth_screen.dart
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -71,7 +72,9 @@ class _AuthScreenState extends State<AuthScreen> {
       _isRegister = true;
     }
 
-    _tryAutoLogin();
+    if (!_isIosWebRestricted()) {
+      _tryAutoLogin();
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _prepareWebExperience();
@@ -81,11 +84,21 @@ class _AuthScreenState extends State<AuthScreen> {
   void _prepareWebExperience() {
     if (!kIsWeb) return;
     _loadApkDownloadUrl();
-    _maybeShowIosAddToHomeHint();
+    if (!_isIosWebRestricted()) {
+      _maybeShowIosAddToHomeHint();
+    }
   }
 
   bool _isIosWeb() {
     return kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+  }
+
+  bool _isAndroidWeb() {
+    return kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  }
+
+  bool _isIosWebRestricted() {
+    return _isIosWeb();
   }
 
   String _extractServerMessage(
@@ -157,6 +170,38 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   Future<void> _openApkDownload() async {
+    if (!_isAndroidWeb()) {
+      showAppNotice(
+        context,
+        'Скачивание APK доступно только с Android-устройств',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Скачать APK'),
+          content: const Text(
+            'Подтвердите загрузку APK. Установка доступна только на Android.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Скачать'),
+            ),
+          ],
+        );
+      },
+    );
+    if (!mounted) return;
+    if (confirmed != true) return;
+
     final raw = (_apkDownloadUrl ?? '').trim();
     if (raw.isEmpty) {
       showAppNotice(
@@ -184,6 +229,25 @@ class _AuthScreenState extends State<AuthScreen> {
         tone: AppNoticeTone.error,
       );
     }
+  }
+
+  Future<void> _copyApkLink() async {
+    final raw = (_apkDownloadUrl ?? '').trim();
+    if (raw.isEmpty) {
+      showAppNotice(
+        context,
+        'Ссылка APK пока не настроена на сервере',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: raw));
+    if (!mounted) return;
+    showAppNotice(
+      context,
+      'Ссылка APK скопирована',
+      tone: AppNoticeTone.success,
+    );
   }
 
   Future<void> _maybeShowIosAddToHomeHint() async {
@@ -492,6 +556,139 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isIosWebRestricted()) {
+      final theme = Theme.of(context);
+      return Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 520),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(18, 20, 18, 24),
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      gradient: const LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [Color(0xFF123A8A), Color(0xFF1A56C4)],
+                      ),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0x331A56C4),
+                          blurRadius: 18,
+                          offset: Offset(0, 8),
+                        ),
+                      ],
+                    ),
+                    padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: const Text(
+                            'iPhone режим',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Веб-версия для iPhone отключена',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 22,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Доступ с iPhone ограничен. Для работы используйте Android-приложение (APK).',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            height: 1.35,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Card(
+                    elevation: 0,
+                    color: theme.colorScheme.surfaceContainerLow,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20),
+                      side: BorderSide(color: theme.colorScheme.outlineVariant),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Добавить ярлык как у банковских приложений',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          const Text('1. Откройте сайт в Safari'),
+                          const SizedBox(height: 4),
+                          const Text('2. Нажмите «Поделиться»'),
+                          const SizedBox(height: 4),
+                          const Text('3. Выберите «На экран Домой»'),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: null,
+                      icon: const Icon(Icons.android_rounded),
+                      label: const Text('Скачать APK (только Android)'),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: _copyApkLink,
+                      icon: const Icon(Icons.copy_rounded),
+                      label: const Text('Скопировать ссылку APK'),
+                    ),
+                  ),
+                  if (_apkInfoMessage.trim().isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      _apkInfoMessage.trim(),
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(title: Text(_isRegister ? 'Регистрация' : 'Вход')),
       body: Padding(
@@ -640,7 +837,7 @@ class _AuthScreenState extends State<AuthScreen> {
                 ),
               ],
             ),
-            if (kIsWeb) ...[
+            if (_isAndroidWeb()) ...[
               const SizedBox(height: 8),
               SizedBox(
                 width: double.infinity,
