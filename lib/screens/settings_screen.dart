@@ -37,6 +37,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool get _canReportProblem => _canOpenSupport;
 
+  bool get _isAndroidWeb =>
+      kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
   @override
   void initState() {
     super.initState();
@@ -64,7 +67,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (_twoFactorEligible) {
       _loadTwoFactorStatus();
     }
-    if (kIsWeb) {
+    if (_isAndroidWeb) {
       _loadApkDownloadUrl();
     }
   }
@@ -185,6 +188,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _openApkDownload() async {
+    if (!_isAndroidWeb) {
+      showAppNotice(
+        context,
+        'Скачивание APK доступно только с Android-устройств',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
     final raw = (_apkDownloadUrl ?? '').trim();
     if (raw.isEmpty) {
       showAppNotice(
@@ -956,7 +967,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 onTap: _openBugReport,
               ),
-            if (kIsWeb)
+            if (_isAndroidWeb)
               ListTile(
                 leading: _apkInfoLoading
                     ? const SizedBox(

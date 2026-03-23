@@ -54,6 +54,10 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
+    if (_isIosWeb()) {
+      _loading = false;
+      return;
+    }
     _lastEffectiveRole = authService.effectiveRole;
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;
@@ -495,6 +499,9 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isIosWeb()) {
+      return const AuthScreen();
+    }
     return StreamBuilder<User?>(
       stream: authService.authStream,
       initialData: authService.currentUser,
