@@ -174,9 +174,17 @@ fi
 SERVICE="$REMOTE_SERVICE"
 if [[ "$SERVICE" == "auto" ]]; then
   SERVICE=""
-  PID=$(ss -ltnp 2>/dev/null | awk -F'"'"'pid='"'"' '/:3000/{split($2,a,", ");print a[1]; exit}')
+  PID=$(ss -ltnp 2>/dev/null | awk -F'"'"'pid='"'"' '/:3000/{split($2,a,",");print a[1]; exit}')
   if [[ -n "$PID" && -r "/proc/$PID/cgroup" ]]; then
     SERVICE=$(grep -aoE '"'"'[^/]+\.service'"'"' "/proc/$PID/cgroup" | head -n1 || true)
+  fi
+  if [[ -z "$SERVICE" ]]; then
+    for CANDIDATE in fenix-server.service projectphoenix.service; do
+      if systemctl list-unit-files --type=service | awk '{print $1}' | grep -Fxq "$CANDIDATE"; then
+        SERVICE="$CANDIDATE"
+        break
+      fi
+    done
   fi
 fi
 
