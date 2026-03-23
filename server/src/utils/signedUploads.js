@@ -107,10 +107,9 @@ function buildSignedUploadUrl(rawValue, { req, baseUrl } = {}) {
     exp,
     signingCandidate?.secret || SIGNED_UPLOAD_KEYRING.currentSecret,
   );
-  // Prefer runtime/public origin over origin captured in stored URL.
-  // This prevents legacy absolute links (for example, sslip.io/dev hosts)
-  // from leaking to clients when service is now served via production domain.
-  const origin = resolveOrigin(req, baseUrl) || ref.origin;
+  // Never trust origin stored in database URL. Build from current runtime
+  // origin (req/baseUrl) or fall back to relative path.
+  const origin = resolveOrigin(req, baseUrl);
   if (!origin) {
     return `${ref.canonicalPath}?exp=${exp}&kid=${encodeURIComponent(keyVersion)}&sig=${sig}`;
   }
