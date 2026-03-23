@@ -1,10 +1,14 @@
 // lib/screens/auth_screen.dart
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../services/auth_service.dart';
 import '../main.dart'; // глобальный authService и dio
 import '../widgets/input_language_badge.dart';
 
+import 'pwa_guide_screen.dart';
 import 'phone_name_screen.dart';
 import 'phone_access_pending_screen.dart';
 import 'main_shell.dart';
@@ -18,6 +22,7 @@ class AuthScreen extends StatefulWidget {
 
 class _AuthScreenState extends State<AuthScreen> {
   static const String _creatorEmail = 'zerotwo02166@gmail.com';
+  static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v1';
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -28,6 +33,9 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _isRegister = false;
   bool _requiresTwoFactor = false;
   bool _trustDeviceFor30Days = true;
+  bool _apkInfoLoading = false;
+  String? _apkDownloadUrl;
+  String _apkInfoMessage = '';
 
   late final AuthService _authService;
 
@@ -64,6 +72,160 @@ class _AuthScreenState extends State<AuthScreen> {
     }
 
     _tryAutoLogin();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _prepareWebExperience();
+    });
+  }
+
+  void _prepareWebExperience() {
+    if (!kIsWeb) return;
+    _loadApkDownloadUrl();
+    _maybeShowIosAddToHomeHint();
+  }
+
+  bool _isIosWeb() {
+    return kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+  }
+
+  String _extractServerMessage(
+    Object error, {
+    String fallback = 'Ошибка сети',
+  }) {
+    if (error is DioException) {
+      final data = error.response?.data;
+      if (data is Map && (data['error'] != null || data['message'] != null)) {
+        return (data['error'] ?? data['message']).toString();
+      }
+      final message = (error.message ?? '').trim();
+      if (message.isNotEmpty) return message;
+    }
+    return fallback;
+  }
+
+  Future<void> _loadApkDownloadUrl() async {
+    if (!kIsWeb) return;
+    setState(() {
+      _apkInfoLoading = true;
+      _apkInfoMessage = '';
+    });
+    try {
+      final resp = await dio.get(
+        '/api/app/update',
+        options: Options(
+          sendTimeout: const Duration(seconds: 6),
+          receiveTimeout: const Duration(seconds: 6),
+        ),
+      );
+      String? nextUrl;
+      final root = resp.data;
+      if (root is Map) {
+        final data = root['data'];
+        if (data is Map) {
+          final android = data['android'];
+          if (android is Map) {
+            final raw = (android['download_url'] ?? '').toString().trim();
+            if (raw.isNotEmpty) {
+              nextUrl = raw;
+            }
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _apkDownloadUrl = nextUrl;
+        _apkInfoMessage = nextUrl == null || nextUrl.isEmpty
+            ? 'APK пока не настроен на сервере'
+            : 'Скачать Android APK';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _apkDownloadUrl = null;
+        _apkInfoMessage = _extractServerMessage(
+          e,
+          fallback: 'Не удалось получить ссылку APK',
+        );
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _apkInfoLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openApkDownload() async {
+    final raw = (_apkDownloadUrl ?? '').trim();
+    if (raw.isEmpty) {
+      showAppNotice(
+        context,
+        'Ссылка на APK пока не настроена на сервере',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    final uri = Uri.tryParse(raw);
+    if (uri == null) {
+      showAppNotice(
+        context,
+        'Некорректная ссылка APK',
+        tone: AppNoticeTone.error,
+      );
+      return;
+    }
+    final opened = await launchUrl(uri, mode: LaunchMode.platformDefault);
+    if (!mounted) return;
+    if (!opened) {
+      showAppNotice(
+        context,
+        'Не удалось открыть ссылку APK',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  Future<void> _maybeShowIosAddToHomeHint() async {
+    if (!_isIosWeb()) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alreadyShown = prefs.getBool(_iosHomeHintShownKey) == true;
+      if (alreadyShown || !mounted) return;
+      await prefs.setBool(_iosHomeHintShownKey, true);
+      if (!mounted) return;
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      if (!mounted) return;
+
+      final action = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: const Text('Установить на iPhone'),
+            content: const Text(
+              'Чтобы открывать сайт как приложение, добавьте его на экран «Домой»:\n\n'
+              'Safari → Поделиться → На экран «Домой».',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop('later'),
+                child: const Text('Позже'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop('guide'),
+                child: const Text('Показать шаги'),
+              ),
+            ],
+          );
+        },
+      );
+      if (!mounted || action != 'guide') return;
+      Navigator.of(
+        context,
+      ).push(MaterialPageRoute(builder: (_) => const PwaGuideScreen()));
+    } catch (_) {
+      // ignore
+    }
   }
 
   String _extractInviteFromUri() {
@@ -478,6 +640,33 @@ class _AuthScreenState extends State<AuthScreen> {
                 ),
               ],
             ),
+            if (kIsWeb) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _apkInfoLoading ? null : _openApkDownload,
+                  icon: _apkInfoLoading
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.download_rounded),
+                  label: const Text('Скачать APK для Android'),
+                ),
+              ),
+              if (_apkInfoMessage.trim().isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(
+                  _apkInfoMessage.trim(),
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ],
             const SizedBox(height: 8),
             if (_message.isNotEmpty)
               Text(_message, style: const TextStyle(color: Colors.red)),

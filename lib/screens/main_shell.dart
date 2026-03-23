@@ -1,7 +1,9 @@
 // lib/screens/main_shell.dart
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
@@ -11,6 +13,7 @@ import 'auth_screen.dart';
 import 'cart_screen.dart';
 import 'chats_screen.dart';
 import 'profile_screen.dart';
+import 'pwa_guide_screen.dart';
 import 'settings_screen.dart';
 import 'stats_dashboard_screen.dart';
 import 'system_tests_screen.dart';
@@ -40,6 +43,7 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
+  static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v1';
   int _index = 0;
   bool _loading = true;
   StreamSubscription<User?>? _authSub;
@@ -79,6 +83,11 @@ class _MainShellState extends State<MainShell> {
         if (mounted && _loading) setState(() => _loading = false);
       });
     }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _maybeShowIosAddToHomeHint();
+    });
   }
 
   @override
@@ -193,11 +202,56 @@ class _MainShellState extends State<MainShell> {
   }
 
   bool _useCompactNavigation(BuildContext context) {
+    if (kIsWeb) return true;
     final width = MediaQuery.sizeOf(context).width;
     final platform = Theme.of(context).platform;
     final isIosLike =
         platform == TargetPlatform.iOS || platform == TargetPlatform.macOS;
     return isIosLike && width < 700;
+  }
+
+  bool _isIosWeb() {
+    return kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+  }
+
+  Future<void> _maybeShowIosAddToHomeHint() async {
+    if (!_isIosWeb()) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final alreadyShown = prefs.getBool(_iosHomeHintShownKey) == true;
+      if (alreadyShown || !mounted) return;
+      await prefs.setBool(_iosHomeHintShownKey, true);
+      if (!mounted) return;
+
+      final action = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: const Text('Установить на iPhone'),
+            content: const Text(
+              'Чтобы сайт открывался как приложение, добавьте его на экран «Домой»:\n\n'
+              'Safari → Поделиться → На экран «Домой».',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop('later'),
+                child: const Text('Позже'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop('guide'),
+                child: const Text('Инструкция'),
+              ),
+            ],
+          );
+        },
+      );
+      if (!mounted || action != 'guide') return;
+      Navigator.of(
+        context,
+      ).push(MaterialPageRoute(builder: (_) => const PwaGuideScreen()));
+    } catch (_) {
+      // ignore
+    }
   }
 
   List<_ShellDestination> _buildDestinations({

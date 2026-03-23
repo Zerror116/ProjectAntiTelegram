@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
+import '../src/utils/media_url.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/input_language_badge.dart';
@@ -347,22 +348,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   String? _resolveImageUrl(String? raw) {
-    final value = raw?.trim();
-    if (value == null || value.isEmpty) {
-      return null;
-    }
-    if (value.startsWith('http://') || value.startsWith('https://')) {
-      return value;
-    }
-
-    final base = authService.dio.options.baseUrl.trim();
-    if (base.isEmpty) {
-      return value;
-    }
-    if (value.startsWith('/')) {
-      return '$base$value';
-    }
-    return '$base/$value';
+    return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
   }
 
   String? _normalizedImageUrlFromForm() {

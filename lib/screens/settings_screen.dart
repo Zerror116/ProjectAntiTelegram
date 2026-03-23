@@ -1,6 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
 import 'bug_report_screen.dart';
@@ -24,6 +26,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _twoFactorEnabledAt;
   int _twoFactorBackupCodesRemaining = 0;
   int _twoFactorTrustedDevicesCount = 0;
+  bool _apkInfoLoading = false;
+  String? _apkDownloadUrl;
+  String _apkInfoMessage = '';
   late final VoidCallback _notificationsListener;
   late final VoidCallback _themeListener;
   late final VoidCallback _performanceModeListener;
@@ -58,6 +63,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     performanceModeNotifier.addListener(_performanceModeListener);
     if (_twoFactorEligible) {
       _loadTwoFactorStatus();
+    }
+    if (kIsWeb) {
+      _loadApkDownloadUrl();
     }
   }
 
@@ -119,6 +127,91 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     }
     return fallback;
+  }
+
+  Future<void> _loadApkDownloadUrl() async {
+    if (!kIsWeb) return;
+    if (mounted) {
+      setState(() {
+        _apkInfoLoading = true;
+        _apkInfoMessage = '';
+      });
+    }
+    try {
+      final resp = await dio.get(
+        '/api/app/update',
+        options: Options(
+          sendTimeout: const Duration(seconds: 6),
+          receiveTimeout: const Duration(seconds: 6),
+        ),
+      );
+      String? nextUrl;
+      final root = resp.data;
+      if (root is Map) {
+        final data = root['data'];
+        if (data is Map) {
+          final android = data['android'];
+          if (android is Map) {
+            final raw = (android['download_url'] ?? '').toString().trim();
+            if (raw.isNotEmpty) {
+              nextUrl = raw;
+            }
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _apkDownloadUrl = nextUrl;
+        _apkInfoMessage = nextUrl == null
+            ? 'APK пока не настроен на сервере'
+            : 'Скачать Android APK';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _apkDownloadUrl = null;
+        _apkInfoMessage = _extractDioMessage(
+          e,
+          fallback: 'Не удалось получить ссылку APK',
+        );
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _apkInfoLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openApkDownload() async {
+    final raw = (_apkDownloadUrl ?? '').trim();
+    if (raw.isEmpty) {
+      showAppNotice(
+        context,
+        'Ссылка APK пока не настроена на сервере',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    final uri = Uri.tryParse(raw);
+    if (uri == null) {
+      showAppNotice(
+        context,
+        'Некорректная ссылка APK',
+        tone: AppNoticeTone.error,
+      );
+      return;
+    }
+    final opened = await launchUrl(uri, mode: LaunchMode.platformDefault);
+    if (!mounted) return;
+    if (!opened) {
+      showAppNotice(
+        context,
+        'Не удалось открыть ссылку APK',
+        tone: AppNoticeTone.error,
+      );
+    }
   }
 
   Future<void> _loadTwoFactorStatus({bool silent = true}) async {
@@ -862,6 +955,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   'Быстро отправить описание ошибки в отдельный служебный канал',
                 ),
                 onTap: _openBugReport,
+              ),
+            if (kIsWeb)
+              ListTile(
+                leading: _apkInfoLoading
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.download_for_offline_outlined),
+                title: const Text('Скачать APK для Android'),
+                subtitle: Text(
+                  _apkInfoMessage.isEmpty
+                      ? 'Проверяем наличие APK'
+                      : _apkInfoMessage,
+                ),
+                onTap: _apkInfoLoading ? null : _openApkDownload,
               ),
             ListTile(
               leading: const Icon(Icons.privacy_tip_outlined),
