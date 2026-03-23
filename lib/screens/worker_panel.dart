@@ -14,6 +14,7 @@ import '../widgets/adaptive_network_image.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/product_photo_crop_dialog.dart';
 
 class WorkerPanel extends StatefulWidget {
   const WorkerPanel({super.key});
@@ -53,6 +54,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   final ImagePicker _imagePicker = ImagePicker();
   XFile? _pickedImage;
   Uint8List? _pickedImageBytes;
+  String? _pickedImageUploadFileName;
   String? _existingImageUrl;
   bool _removeImageOnSubmit = false;
 
@@ -420,6 +422,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _quantityCtrl.text = '1';
     _pickedImage = null;
     _pickedImageBytes = null;
+    _pickedImageUploadFileName = null;
     _existingImageUrl = null;
     _removeImageOnSubmit = false;
   }
@@ -556,11 +559,69 @@ class _WorkerPanelState extends State<WorkerPanel>
     await _pickImage(source);
   }
 
+  String _resolvedPickedFileName(XFile? picked) {
+    final preferred = _pickedImageUploadFileName?.trim();
+    if (preferred != null && preferred.isNotEmpty) {
+      return preferred;
+    }
+    final fromName = picked?.name.trim() ?? '';
+    if (fromName.isNotEmpty) return fromName;
+    final path = picked?.path.trim() ?? '';
+    if (path.isNotEmpty) {
+      final normalized = path.replaceAll('\\', '/');
+      final fromPath = normalized.split('/').last.trim();
+      if (fromPath.isNotEmpty) return fromPath;
+    }
+    return 'product-photo.jpg';
+  }
+
+  Future<void> _cropCurrentPickedImage() async {
+    final picked = _pickedImage;
+    Uint8List? sourceBytes = _pickedImageBytes;
+    if ((sourceBytes == null || sourceBytes.isEmpty) && picked != null) {
+      try {
+        sourceBytes = await picked.readAsBytes();
+      } catch (_) {
+        sourceBytes = null;
+      }
+    }
+    if (sourceBytes == null || sourceBytes.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _message = 'Сначала выберите фото, затем обрежьте его';
+      });
+      return;
+    }
+
+    try {
+      if (!mounted) return;
+      final result = await showProductPhotoCropDialog(
+        context: context,
+        sourceBytes: sourceBytes,
+        originalFileName: _resolvedPickedFileName(picked),
+      );
+      if (result == null || !mounted) return;
+      setState(() {
+        _pickedImageBytes = result.bytes;
+        _pickedImageUploadFileName = result.fileName;
+        _removeImageOnSubmit = false;
+        _message = '';
+      });
+      showAppNotice(
+        context,
+        'Обрезка фото применена',
+        tone: AppNoticeTone.success,
+        duration: const Duration(milliseconds: 900),
+      );
+      await playAppSound(AppUiSound.tap);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Не удалось обрезать фото: $e');
+    }
+  }
+
   Future<void> _pickImage(ImageSource source) async {
     try {
-      final reducedMode = performanceModeNotifier.value;
-      final pickerQuality = reducedMode ? 72 : 88;
-      final pickerMaxWidth = reducedMode ? 1440.0 : 2200.0;
       var effectiveSource = source;
       if (source == ImageSource.camera && !_cameraSupported) {
         if (mounted) {
@@ -577,11 +638,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           _preferFilePickerForGallery) {
         // On desktop first try ImagePicker, then fallback to FilePicker.
         try {
-          picked = await _imagePicker.pickImage(
-            source: ImageSource.gallery,
-            imageQuality: pickerQuality,
-            maxWidth: pickerMaxWidth,
-          );
+          picked = await _imagePicker.pickImage(source: ImageSource.gallery);
         } catch (_) {}
 
         try {
@@ -610,11 +667,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           // Ignore and handle below.
         }
       } else {
-        picked = await _imagePicker.pickImage(
-          source: effectiveSource,
-          imageQuality: pickerQuality,
-          maxWidth: pickerMaxWidth,
-        );
+        picked = await _imagePicker.pickImage(source: effectiveSource);
       }
 
       if (picked == null) {
@@ -624,18 +677,39 @@ class _WorkerPanelState extends State<WorkerPanel>
         });
         return;
       }
-      Uint8List? pickedBytes;
-      if (kIsWeb) {
-        try {
-          pickedBytes = await picked.readAsBytes();
-        } catch (_) {
-          pickedBytes = null;
-        }
+
+      Uint8List pickedBytes;
+      try {
+        pickedBytes = await picked.readAsBytes();
+      } catch (e) {
+        if (!mounted) return;
+        setState(() => _message = 'Не удалось прочитать фото: $e');
+        return;
+      }
+      if (pickedBytes.isEmpty) {
+        if (!mounted) return;
+        setState(() => _message = 'Выбрано пустое изображение');
+        return;
+      }
+
+      if (!mounted) return;
+      final cropResult = await showProductPhotoCropDialog(
+        context: context,
+        sourceBytes: pickedBytes,
+        originalFileName: _resolvedPickedFileName(picked),
+      );
+      if (cropResult == null) {
+        if (!mounted) return;
+        setState(() {
+          _message = 'Выбор фото отменен';
+        });
+        return;
       }
       if (!mounted) return;
       setState(() {
         _pickedImage = picked;
-        _pickedImageBytes = pickedBytes;
+        _pickedImageBytes = cropResult.bytes;
+        _pickedImageUploadFileName = cropResult.fileName;
         _removeImageOnSubmit = false;
         _message = '';
       });
@@ -656,6 +730,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     setState(() {
       _pickedImage = null;
       _pickedImageBytes = null;
+      _pickedImageUploadFileName = null;
       _existingImageUrl = null;
       _removeImageOnSubmit = true;
     });
@@ -663,11 +738,15 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Future<MultipartFile?> _buildPickedImageMultipart() async {
     final picked = _pickedImage;
+    final fileName = _resolvedPickedFileName(picked);
+    final preparedBytes = _pickedImageBytes;
+    if (preparedBytes != null && preparedBytes.isNotEmpty) {
+      return MultipartFile.fromBytes(preparedBytes, filename: fileName);
+    }
     if (picked == null) return null;
-    final fileName = picked.name.trim().isNotEmpty ? picked.name : 'image.jpg';
 
     if (kIsWeb) {
-      final bytes = _pickedImageBytes ?? await picked.readAsBytes();
+      final bytes = await picked.readAsBytes();
       if (bytes.isEmpty) return null;
       return MultipartFile.fromBytes(bytes, filename: fileName);
     }
@@ -690,7 +769,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       'quantity': quantity,
     };
 
-    if (_pickedImage != null) {
+    if (_pickedImage != null || (_pickedImageBytes?.isNotEmpty ?? false)) {
       final imageFile = await _buildPickedImageMultipart();
       if (imageFile != null) {
         map['image'] = imageFile;
@@ -721,7 +800,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       'quantity': quantity,
     };
 
-    if (_pickedImage != null) {
+    if (_pickedImage != null || (_pickedImageBytes?.isNotEmpty ?? false)) {
       final imageFile = await _buildPickedImageMultipart();
       if (imageFile != null) {
         map['image'] = imageFile;
@@ -1153,6 +1232,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final qtyText = _quantityCtrl.text.trim();
     final hasImage =
         _pickedImage != null ||
+        (_pickedImageBytes?.isNotEmpty ?? false) ||
         ((_existingImageUrl?.trim().isNotEmpty ?? false) &&
             !_removeImageOnSubmit);
 
@@ -1286,6 +1366,8 @@ class _WorkerPanelState extends State<WorkerPanel>
     _quantityCtrl.text = '1';
     setState(() {
       _pickedImage = null;
+      _pickedImageBytes = null;
+      _pickedImageUploadFileName = null;
       _existingImageUrl = (product['image_url'] ?? '').toString();
       _removeImageOnSubmit = false;
       _message = 'Данные товара подставлены. Проверьте и отправьте в очередь.';
@@ -1331,6 +1413,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final existingImage = (product['image_url'] ?? '').toString().trim();
     final hasImage =
         _pickedImage != null ||
+        (_pickedImageBytes?.isNotEmpty ?? false) ||
         ((_existingImageUrl?.trim().isNotEmpty ?? false) &&
             !_removeImageOnSubmit) ||
         (existingImage.isNotEmpty && !_removeImageOnSubmit);
@@ -1513,12 +1596,17 @@ class _WorkerPanelState extends State<WorkerPanel>
     final theme = Theme.of(context);
     final localPath = _pickedImage?.path.trim();
     final localBytes = _pickedImageBytes;
-    final remoteUrl = _resolveImageUrl(_existingImageUrl);
-    final hasImage =
+    final hasLocalPickedImage =
         (localBytes != null && localBytes.isNotEmpty) ||
-        (localPath != null && localPath.isNotEmpty) ||
-        remoteUrl != null;
+        (localPath != null && localPath.isNotEmpty);
+    final remoteUrl = _resolveImageUrl(_existingImageUrl);
+    final hasImage = hasLocalPickedImage || remoteUrl != null;
     const previewWidth = 220.0;
+    Widget withPreviewSurface(Widget child) => Container(
+      color: theme.colorScheme.surfaceContainerHighest,
+      alignment: Alignment.center,
+      child: child,
+    );
     Widget imageErrorPlaceholder() => Container(
       color: theme.colorScheme.surfaceContainerHighest,
       alignment: Alignment.center,
@@ -1540,14 +1628,17 @@ class _WorkerPanelState extends State<WorkerPanel>
         }
         return AdaptiveNetworkImage(
           path,
-          fit: BoxFit.cover,
+          fit: BoxFit.contain,
           errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
         );
       }
-      return Image(
-        image: FileImage(File(path)),
-        fit: BoxFit.cover,
-        errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
+      return withPreviewSurface(
+        Image(
+          image: FileImage(File(path)),
+          fit: BoxFit.contain,
+          filterQuality: FilterQuality.high,
+          errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
+        ),
       );
     }
 
@@ -1569,14 +1660,22 @@ class _WorkerPanelState extends State<WorkerPanel>
                 child: AspectRatio(
                   aspectRatio: 4 / 3,
                   child: (localBytes != null && localBytes.isNotEmpty)
-                      ? Image.memory(localBytes, fit: BoxFit.cover)
+                      ? withPreviewSurface(
+                          Image.memory(
+                            localBytes,
+                            fit: BoxFit.contain,
+                            filterQuality: FilterQuality.high,
+                          ),
+                        )
                       : (localPath != null && localPath.isNotEmpty)
                       ? buildLocalPathPreview(localPath)
-                      : AdaptiveNetworkImage(
-                          remoteUrl!,
-                          fit: BoxFit.cover,
-                          errorBuilder: (context, error, stackTrace) =>
-                              imageErrorPlaceholder(),
+                      : withPreviewSurface(
+                          AdaptiveNetworkImage(
+                            remoteUrl!,
+                            fit: BoxFit.contain,
+                            errorBuilder: (context, error, stackTrace) =>
+                                imageErrorPlaceholder(),
+                          ),
                         ),
                 ),
               ),
@@ -1630,6 +1729,13 @@ class _WorkerPanelState extends State<WorkerPanel>
             ),
             if (hasImage) ...[
               const SizedBox(width: 8),
+              if (hasLocalPickedImage)
+                IconButton(
+                  onPressed: _cropCurrentPickedImage,
+                  icon: const Icon(Icons.crop),
+                  tooltip: 'Обрезать фото',
+                ),
+              if (hasLocalPickedImage) const SizedBox(width: 2),
               IconButton(
                 onPressed: _clearSelectedImage,
                 icon: const Icon(Icons.delete_outline),
@@ -1830,7 +1936,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         imageUrl,
                         width: 52,
                         height: 52,
-                        fit: BoxFit.cover,
+                        fit: BoxFit.contain,
                         errorBuilder: (_, error, stackTrace) => Container(
                           width: 52,
                           height: 52,
@@ -2109,7 +2215,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         child: imageUrl != null
                             ? AdaptiveNetworkImage(
                                 imageUrl,
-                                fit: BoxFit.cover,
+                                fit: BoxFit.contain,
                                 errorBuilder: (context, error, stackTrace) =>
                                     Container(
                                       color: theme
@@ -2382,7 +2488,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         child: imageUrl != null
                             ? AdaptiveNetworkImage(
                                 imageUrl,
-                                fit: BoxFit.cover,
+                                fit: BoxFit.contain,
                                 errorBuilder: (context, error, stackTrace) =>
                                     Container(
                                       color: theme
