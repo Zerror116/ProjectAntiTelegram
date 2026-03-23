@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 import '../main.dart';
+import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/adaptive_network_image.dart';
@@ -2168,22 +2169,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String? _resolveImageUrl(String? raw) {
-    final value = raw?.trim();
-    if (value == null || value.isEmpty) {
-      return null;
-    }
-    if (value.startsWith('http://') || value.startsWith('https://')) {
-      return value;
-    }
-
-    final base = authService.dio.options.baseUrl.trim();
-    if (base.isEmpty) {
-      return value;
-    }
-    if (value.startsWith('/')) {
-      return '$base$value';
-    }
-    return '$base/$value';
+    return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
   }
 
   String _attachmentTypeOf(Map<String, dynamic> meta) {
@@ -3582,7 +3568,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                   const SizedBox(width: 8),
                   TextButton(
-                    onPressed: _offlineSyncBusy ? null : _syncOfflinePurchasesNow,
+                    onPressed: _offlineSyncBusy
+                        ? null
+                        : _syncOfflinePurchasesNow,
                     child: _offlineSyncBusy
                         ? const Text('...')
                         : const Text('Синхр.'),

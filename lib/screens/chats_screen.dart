@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
+import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/phoenix_loader.dart';
@@ -162,17 +163,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   String? _resolveImageUrl(String? raw) {
-    final value = raw?.trim();
-    if (value == null || value.isEmpty) return null;
-    if (value.startsWith('http://') || value.startsWith('https://')) {
-      return value;
-    }
-    final base = authService.dio.options.baseUrl.trim();
-    if (base.isEmpty) return value;
-    if (value.startsWith('/')) {
-      return '$base$value';
-    }
-    return '$base/$value';
+    return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
   }
 
   double _toAvatarFocus(Object? raw) {

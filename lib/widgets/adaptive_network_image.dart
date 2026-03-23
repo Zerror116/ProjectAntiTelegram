@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import '../src/utils/media_url.dart';
 
 class AdaptiveNetworkImage extends StatelessWidget {
   const AdaptiveNetworkImage(
@@ -55,6 +56,8 @@ class AdaptiveNetworkImage extends StatelessWidget {
   Widget build(BuildContext context) {
     final reducedMode = performanceModeNotifier.value;
     final dpr = MediaQuery.maybeOf(context)?.devicePixelRatio ?? 1;
+    final resolvedUrl =
+        resolveMediaUrl(url, apiBaseUrl: dio.options.baseUrl) ?? url;
     return LayoutBuilder(
       builder: (context, constraints) {
         final boundedWidth = constraints.hasBoundedWidth
@@ -77,7 +80,7 @@ class AdaptiveNetworkImage extends StatelessWidget {
         );
 
         return Image.network(
-          url,
+          resolvedUrl,
           width: width,
           height: height,
           fit: fit,
