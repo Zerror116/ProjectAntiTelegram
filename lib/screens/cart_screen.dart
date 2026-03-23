@@ -302,16 +302,11 @@ class _CartScreenState extends State<CartScreen> {
 
   Future<String?> _pickAndUploadClaimImage({required bool useCamera}) async {
     try {
-      final reducedMode = performanceModeNotifier.value;
-      final pickerQuality = reducedMode ? 72 : 88;
-      final pickerMaxWidth = reducedMode ? 1440.0 : 2200.0;
       if (!kIsWeb &&
           (defaultTargetPlatform == TargetPlatform.android ||
               defaultTargetPlatform == TargetPlatform.iOS)) {
         final picked = await _imagePicker.pickImage(
           source: useCamera ? ImageSource.camera : ImageSource.gallery,
-          imageQuality: pickerQuality,
-          maxWidth: pickerMaxWidth,
         );
         if (picked == null) return null;
         final bytes = await picked.readAsBytes();
@@ -889,7 +884,7 @@ class _CartScreenState extends State<CartScreen> {
           imageUrl,
           width: 86,
           height: 86,
-          fit: BoxFit.cover,
+          fit: BoxFit.contain,
           errorBuilder: (_, error, stackTrace) => Container(
             color: theme.colorScheme.surfaceContainerHighest,
             child: Icon(

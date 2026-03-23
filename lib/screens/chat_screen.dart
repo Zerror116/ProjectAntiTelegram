@@ -1034,9 +1034,6 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<_ChatUploadFile?> _pickImageUpload(ImageSource source) async {
-    final reducedMode = performanceModeNotifier.value;
-    final pickerQuality = reducedMode ? 72 : 88;
-    final pickerMaxWidth = reducedMode ? 1440.0 : 2200.0;
     if (source == ImageSource.gallery && _preferFilePickerForImages) {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.image,
@@ -1061,11 +1058,7 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
-    final picked = await _imagePicker.pickImage(
-      source: source,
-      imageQuality: pickerQuality,
-      maxWidth: pickerMaxWidth,
-    );
+    final picked = await _imagePicker.pickImage(source: source);
     if (picked == null) return null;
     if (kIsWeb) {
       final bytes = await picked.readAsBytes();
@@ -2966,7 +2959,7 @@ class _ChatScreenState extends State<ChatScreen> {
               child: AdaptiveNetworkImage(
                 imageUrl,
                 width: width ?? 240,
-                fit: BoxFit.cover,
+                fit: BoxFit.contain,
                 errorBuilder: (_, error, stackTrace) => Container(
                   color: theme.colorScheme.surfaceContainerHighest,
                   alignment: Alignment.center,
