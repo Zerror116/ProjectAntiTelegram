@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
 import '../src/utils/media_url.dart';
@@ -29,6 +30,8 @@ class _ChatUploadFile {
   final String? path;
   final Uint8List? bytes;
 }
+
+enum _ComposerMediaMode { voice, camera }
 
 class ChatScreen extends StatefulWidget {
   final String chatId;
@@ -68,6 +71,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _searchMode = false;
   bool _voiceRecording = false;
   bool _voiceSending = false;
+  _ComposerMediaMode _composerMediaMode = _ComposerMediaMode.voice;
   bool _pinLoading = false;
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
@@ -97,6 +101,17 @@ class _ChatScreenState extends State<ChatScreen> {
   final Set<String> _supportFeedbackBusyTicketIds = {};
   final Map<String, GlobalKey> _messageItemKeys = {};
   Map<String, dynamic>? _activePin;
+
+  static const List<String> _quickReactions = <String>[
+    '👍',
+    '❤️',
+    '🔥',
+    '😂',
+    '👏',
+    '😮',
+    '😢',
+    '🙏',
+  ];
 
   @override
   void initState() {
@@ -1099,6 +1114,52 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<_ChatUploadFile?> _pickVideoUpload(ImageSource source) async {
+    if (source == ImageSource.gallery && _preferFilePickerForImages) {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.video,
+        allowMultiple: false,
+        withData: kIsWeb,
+      );
+      final picked = result?.files.single;
+      if (picked == null) return null;
+      if (kIsWeb) {
+        final bytes = picked.bytes;
+        if (bytes == null || bytes.isEmpty) return null;
+        return _ChatUploadFile(
+          filename: picked.name.isNotEmpty ? picked.name : 'video-message.mp4',
+          bytes: bytes,
+        );
+      }
+      final path = picked.path;
+      if (path == null || path.trim().isEmpty) return null;
+      return _ChatUploadFile(
+        filename: picked.name.isNotEmpty ? picked.name : path.split('/').last,
+        path: path,
+      );
+    }
+
+    final picked = await _imagePicker.pickVideo(
+      source: source,
+      maxDuration: const Duration(seconds: 90),
+    );
+    if (picked == null) return null;
+    if (kIsWeb) {
+      final bytes = await picked.readAsBytes();
+      if (bytes.isEmpty) return null;
+      return _ChatUploadFile(
+        filename: picked.name.isNotEmpty ? picked.name : 'video-message.mp4',
+        bytes: bytes,
+      );
+    }
+    return _ChatUploadFile(
+      filename: picked.name.isNotEmpty
+          ? picked.name
+          : picked.path.split('/').last,
+      path: picked.path,
+    );
+  }
+
   Future<void> _sendMediaMessage({
     required _ChatUploadFile upload,
     required String attachmentType,
@@ -1106,10 +1167,12 @@ class _ChatScreenState extends State<ChatScreen> {
   }) async {
     if (!_canCompose()) return;
     final clientMsgId = _generateClientMessageId();
-    final caption = attachmentType == 'image' ? _controller.text.trim() : '';
+    final caption = attachmentType == 'image' || attachmentType == 'video'
+        ? _controller.text.trim()
+        : '';
     final previousText = _controller.text;
     setState(() {
-      _mediaUploading = attachmentType == 'image';
+      _mediaUploading = attachmentType == 'image' || attachmentType == 'video';
       _voiceSending = attachmentType == 'voice';
     });
     try {
@@ -1118,6 +1181,8 @@ class _ChatScreenState extends State<ChatScreen> {
           'image': await _multipartFromUpload(upload),
         if (attachmentType == 'voice')
           'voice': await _multipartFromUpload(upload),
+        if (attachmentType == 'video')
+          'video': await _multipartFromUpload(upload),
         'client_msg_id': clientMsgId,
         if (caption.isNotEmpty) 'text': caption,
         if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
@@ -1129,7 +1194,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (resp.statusCode == 200 || resp.statusCode == 201) {
         final data = resp.data;
         if (data is Map && data['ok'] == true && data['data'] is Map) {
-          if (attachmentType == 'image') {
+          if (attachmentType == 'image' || attachmentType == 'video') {
             _controller.clear();
           }
           _upsertMessage(
@@ -1153,6 +1218,8 @@ class _ChatScreenState extends State<ChatScreen> {
         context,
         attachmentType == 'image'
             ? 'Не удалось отправить изображение'
+            : attachmentType == 'video'
+            ? 'Не удалось отправить видео'
             : 'Не удалось отправить голосовое сообщение',
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
@@ -1343,19 +1410,58 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _toggleVoiceComposerAction() async {
-    if (kIsWeb) {
-      if (_mediaUploading || _voiceSending) return;
-      final upload = await _pickVoiceUpload();
-      if (upload == null) return;
-      await _sendMediaMessage(upload: upload, attachmentType: 'voice');
+  Future<void> _captureAndSendVideoMessage() async {
+    if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
     }
-    if (_voiceRecording) {
-      await _stopVoiceRecordingAndSend();
+    try {
+      final source = _cameraSupported
+          ? ImageSource.camera
+          : ImageSource.gallery;
+      final upload = await _pickVideoUpload(source);
+      if (upload == null) return;
+      await _sendMediaMessage(upload: upload, attachmentType: 'video');
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось записать видео',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+      debugPrint('captureAndSendVideoMessage error: $e');
+    }
+  }
+
+  void _toggleComposerMediaMode() {
+    if (!_cameraSupported) {
+      if (_composerMediaMode != _ComposerMediaMode.voice) {
+        setState(() => _composerMediaMode = _ComposerMediaMode.voice);
+      }
+      return;
+    }
+    setState(() {
+      _composerMediaMode = _composerMediaMode == _ComposerMediaMode.voice
+          ? _ComposerMediaMode.camera
+          : _ComposerMediaMode.voice;
+    });
+  }
+
+  Future<void> _handleComposerMediaLongPressStart() async {
+    if (_hasDraftText || !_canCompose() || _mediaUploading || _voiceSending) {
+      return;
+    }
+    if (_composerMediaMode == _ComposerMediaMode.camera) {
+      await _captureAndSendVideoMessage();
       return;
     }
     await _startVoiceRecording();
+  }
+
+  Future<void> _handleComposerMediaLongPressEnd() async {
+    if (_composerMediaMode == _ComposerMediaMode.voice && _voiceRecording) {
+      await _stopVoiceRecordingAndSend();
+    }
   }
 
   Future<void> _toggleVoicePlayback(String messageId, String voiceUrl) async {
@@ -2177,7 +2283,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (caption.isNotEmpty) return caption;
     final text = (message['text'] ?? '').toString().trim();
     if (text.toLowerCase() == 'фото' ||
-        text.toLowerCase() == 'голосовое сообщение') {
+        text.toLowerCase() == 'голосовое сообщение' ||
+        text.toLowerCase() == 'видеосообщение') {
       return '';
     }
     return text;
@@ -2237,6 +2344,88 @@ class _ChatScreenState extends State<ChatScreen> {
 
   int _voiceDurationMsOf(Map<String, dynamic> meta) {
     return int.tryParse('${meta['voice_duration_ms'] ?? 0}') ?? 0;
+  }
+
+  String? _videoUrlOf(Map<String, dynamic> meta) {
+    return _resolveImageUrl(meta['video_url']?.toString());
+  }
+
+  int _videoDurationMsOf(Map<String, dynamic> meta) {
+    return int.tryParse('${meta['video_duration_ms'] ?? 0}') ?? 0;
+  }
+
+  Map<String, String> _reactionByUserOf(Map<String, dynamic> meta) {
+    final raw = meta['reactions_by_user'];
+    if (raw is! Map) return const <String, String>{};
+    final normalized = <String, String>{};
+    raw.forEach((key, value) {
+      final userId = '$key'.trim();
+      final emoji = '$value'.trim();
+      if (userId.isEmpty || emoji.isEmpty) return;
+      normalized[userId] = emoji;
+    });
+    return normalized;
+  }
+
+  Future<void> _toggleMessageReaction(String messageId, String emoji) async {
+    final trimmedMessageId = messageId.trim();
+    final trimmedEmoji = emoji.trim();
+    if (trimmedMessageId.isEmpty || trimmedEmoji.isEmpty) return;
+    try {
+      final resp = await authService.dio.post(
+        '/api/chats/${widget.chatId}/messages/$trimmedMessageId/reactions',
+        data: {'emoji': trimmedEmoji},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        _upsertMessage(
+          Map<String, dynamic>.from(data['data']),
+          autoScroll: false,
+        );
+      }
+    } on DioException catch (e) {
+      if (!mounted) return;
+      final status = e.response?.statusCode;
+      if (status == 404) {
+        showAppNotice(
+          context,
+          'Реакции недоступны: сервер не обновлён (маршрут /reactions не найден)',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 3),
+        );
+      } else {
+        showAppNotice(
+          context,
+          'Не удалось поставить реакцию',
+          tone: AppNoticeTone.error,
+          duration: const Duration(seconds: 2),
+        );
+      }
+      debugPrint('toggleMessageReaction error: $e');
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось поставить реакцию',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+      debugPrint('toggleMessageReaction error: $e');
+    }
+  }
+
+  Future<void> _openExternalMedia(String url) async {
+    final parsed = Uri.tryParse(url.trim());
+    if (parsed == null) return;
+    final opened = await launchUrl(parsed, mode: LaunchMode.platformDefault);
+    if (opened) return;
+    if (!mounted) return;
+    showAppNotice(
+      context,
+      'Не удалось открыть медиа',
+      tone: AppNoticeTone.warning,
+      duration: const Duration(seconds: 2),
+    );
   }
 
   String _senderNameOf(Map<String, dynamic> message) {
@@ -2492,6 +2681,7 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool canCopy,
     required bool canCopyId,
     required bool canOpenImage,
+    required bool canReact,
   }) async {
     final text = (message['text'] ?? '').toString();
     final imageUrl = _resolveImageUrl(
@@ -2527,6 +2717,12 @@ class _ChatScreenState extends State<ChatScreen> {
         if (id.isNotEmpty) {
           await _copyText(id);
         }
+      } else if (action.startsWith('react:') && canReact) {
+        final messageId = message['id']?.toString() ?? '';
+        final emoji = action.substring('react:'.length).trim();
+        if (messageId.isNotEmpty && emoji.isNotEmpty) {
+          await _toggleMessageReaction(messageId, emoji);
+        }
       }
     }
 
@@ -2538,6 +2734,13 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     if (canReply) {
       options.add(const PopupMenuItem(value: 'reply', child: Text('Ответить')));
+    }
+    if (canReact) {
+      for (final emoji in _quickReactions) {
+        options.add(
+          PopupMenuItem(value: 'react:$emoji', child: Text('Реакция $emoji')),
+        );
+      }
     }
     if (canPin) {
       options.add(
@@ -2603,6 +2806,23 @@ class _ChatScreenState extends State<ChatScreen> {
       builder: (ctx) => SafeArea(
         child: Wrap(
           children: [
+            if (canReact)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: _quickReactions
+                      .map(
+                        (emoji) => ActionChip(
+                          label: Text(emoji),
+                          onPressed: () =>
+                              Navigator.of(ctx).pop('react:$emoji'),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
             if (canCopy)
               ListTile(
                 leading: const Icon(Icons.copy_all_outlined),
@@ -2836,6 +3056,13 @@ class _ChatScreenState extends State<ChatScreen> {
         !isDeliveryOffer &&
         !isSupportFeedback &&
         attachmentType == 'voice';
+    final isVideoMessage =
+        !isDeleted &&
+        !hasBuy &&
+        !isReservedOrder &&
+        !isDeliveryOffer &&
+        !isSupportFeedback &&
+        attachmentType == 'video';
     final imageUrl = _resolveImageUrl(metaMap['image_url']?.toString());
     final captionText = _captionTextOf(message, metaMap);
     final catalogTexts = _extractCatalogTexts(text);
@@ -2917,7 +3144,8 @@ class _ChatScreenState extends State<ChatScreen> {
         !isDeliveryOffer &&
         !isSupportFeedback &&
         !isImageMessage &&
-        !isVoiceMessage;
+        !isVoiceMessage &&
+        !isVideoMessage;
     final isCreator = _isCreatorRole();
     final isClient = _isClientRole();
     final canEdit = isPlainMessage && fromMe && !isDeleted;
@@ -2938,6 +3166,7 @@ class _ChatScreenState extends State<ChatScreen> {
         (isImageMessage && captionText.isNotEmpty);
     final canCopyId = !isClient;
     final canOpenImage = imageUrl != null;
+    final canReact = hasMessageId && !isDeleted;
     final maxBubbleWidth = MediaQuery.of(context).size.width * 0.72;
     final showChatIdentity = !hasBuy && !isReservedOrder;
     final timeLabel = _formatMessageTime(message['created_at']);
@@ -2975,6 +3204,19 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
+    final reactionByUser = _reactionByUserOf(metaMap);
+    final currentUserId = authService.currentUser?.id.trim() ?? '';
+    final reactionCounts = <String, int>{};
+    for (final emoji in reactionByUser.values) {
+      reactionCounts.update(emoji, (value) => value + 1, ifAbsent: () => 1);
+    }
+    final reactionEntries = reactionCounts.entries.toList()
+      ..sort((a, b) {
+        final byCount = b.value.compareTo(a.value);
+        if (byCount != 0) return byCount;
+        return a.key.compareTo(b.key);
+      });
+
     final bubble = GestureDetector(
       onSecondaryTapDown: (details) => _showMessageActions(
         message,
@@ -2989,6 +3231,7 @@ class _ChatScreenState extends State<ChatScreen> {
         canCopy: canCopy,
         canCopyId: canCopyId,
         canOpenImage: canOpenImage,
+        canReact: canReact,
       ),
       onLongPress: () => _showMessageActions(
         message,
@@ -3002,6 +3245,7 @@ class _ChatScreenState extends State<ChatScreen> {
         canCopy: canCopy,
         canCopyId: canCopyId,
         canOpenImage: canOpenImage,
+        canReact: canReact,
       ),
       child: AnimatedContainer(
         duration: reducedMotion
@@ -3289,6 +3533,81 @@ class _ChatScreenState extends State<ChatScreen> {
                     style: TextStyle(color: textColor),
                   ),
                 ],
+              ] else if (isVideoMessage) ...[
+                Builder(
+                  builder: (context) {
+                    final videoUrl = _videoUrlOf(metaMap);
+                    final durationMs = _videoDurationMsOf(metaMap);
+                    final durationLabel = durationMs > 0
+                        ? _formatDurationLabel(
+                            Duration(milliseconds: durationMs),
+                          )
+                        : '';
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(14),
+                      onTap: videoUrl == null
+                          ? null
+                          : () => _openExternalMedia(videoUrl),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerHighest,
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: theme.colorScheme.outlineVariant,
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.play_circle_fill_rounded,
+                              size: 30,
+                              color: theme.colorScheme.primary,
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Видеосообщение',
+                                    style: TextStyle(
+                                      color: theme.colorScheme.onSurface,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  if (durationLabel.isNotEmpty)
+                                    Text(
+                                      durationLabel,
+                                      style: TextStyle(
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                            if (videoUrl != null)
+                              Icon(
+                                Icons.open_in_new_rounded,
+                                size: 18,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+                if (captionText.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  _buildHighlightedText(
+                    captionText,
+                    style: TextStyle(color: textColor),
+                  ),
+                ],
               ] else ...[
                 if (imageUrl != null) ...[
                   buildMessageImage(),
@@ -3319,6 +3638,53 @@ class _ChatScreenState extends State<ChatScreen> {
                           : theme.colorScheme.onSurfaceVariant,
                       fontSize: 11,
                     ),
+                  ),
+                ),
+              if (reactionEntries.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: reactionEntries.map((entry) {
+                      final mine =
+                          currentUserId.isNotEmpty &&
+                          reactionByUser[currentUserId] == entry.key;
+                      return InkWell(
+                        borderRadius: BorderRadius.circular(999),
+                        onTap: () =>
+                            _toggleMessageReaction(messageId, entry.key),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: mine
+                                ? theme.colorScheme.secondaryContainer
+                                : theme.colorScheme.surfaceContainerLow,
+                            borderRadius: BorderRadius.circular(999),
+                            border: Border.all(
+                              color: mine
+                                  ? theme.colorScheme.secondary
+                                  : theme.colorScheme.outlineVariant,
+                            ),
+                          ),
+                          child: Text(
+                            '${entry.key} ${entry.value}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: mine
+                                  ? FontWeight.w700
+                                  : FontWeight.w600,
+                              color: mine
+                                  ? theme.colorScheme.onSecondaryContainer
+                                  : theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      );
+                    }).toList(),
                   ),
                 ),
               if (timeLabel.isNotEmpty) ...[
@@ -3426,11 +3792,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final platform = defaultTargetPlatform;
+    final viewportWidth = MediaQuery.sizeOf(context).width;
+    final isMobileLikePlatform =
+        platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+    final isLikelyMobileWeb =
+        kIsWeb && (isMobileLikePlatform || viewportWidth < 900);
     final allowEnterShortcut =
-        kIsWeb ||
-        defaultTargetPlatform == TargetPlatform.macOS ||
-        defaultTargetPlatform == TargetPlatform.windows ||
-        defaultTargetPlatform == TargetPlatform.linux;
+        !isLikelyMobileWeb &&
+        (kIsWeb ||
+            platform == TargetPlatform.macOS ||
+            platform == TargetPlatform.windows ||
+            platform == TargetPlatform.linux);
     final canCompose = _canCompose();
     final blockedReason = _composeBlockedReason();
     final visibleMessages = _visibleMessages();
@@ -3713,7 +4086,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         decoration: withInputLanguageBadge(
                           InputDecoration(
                             hintText: _voiceRecording
-                                ? 'Говорите... повторное нажатие отправит голосовое'
+                                ? 'Говорите... отпустите кнопку для отправки'
                                 : canCompose
                                 ? 'Сообщение...'
                                 : 'Отправка сообщений недоступна',
@@ -3725,24 +4098,72 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
                 ),
-                IconButton(
-                  icon: _voiceSending
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : Icon(
-                          _hasDraftText
-                              ? Icons.send
-                              : (_voiceRecording
-                                    ? Icons.stop_circle_outlined
-                                    : Icons.mic_none_rounded),
+                if (_hasDraftText)
+                  IconButton(
+                    icon: _voiceSending
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send),
+                    onPressed: !canCompose || _mediaUploading ? null : _send,
+                  )
+                else
+                  Builder(
+                    builder: (context) {
+                      final disabled =
+                          !canCompose || _mediaUploading || _voiceSending;
+                      final activeColor = Theme.of(context).colorScheme.primary;
+                      final icon = _voiceRecording
+                          ? Icons.stop_circle_outlined
+                          : (_composerMediaMode == _ComposerMediaMode.camera
+                                ? Icons.videocam_rounded
+                                : Icons.mic_none_rounded);
+                      return GestureDetector(
+                        onTap: () {
+                          if (disabled || _voiceRecording) return;
+                          if (kIsWeb &&
+                              _composerMediaMode == _ComposerMediaMode.voice) {
+                            unawaited(_startVoiceRecording());
+                            return;
+                          }
+                          _toggleComposerMediaMode();
+                        },
+                        onLongPressStart: disabled
+                            ? null
+                            : (_) => unawaited(
+                                _handleComposerMediaLongPressStart(),
+                              ),
+                        onLongPressEnd: disabled
+                            ? null
+                            : (_) =>
+                                  unawaited(_handleComposerMediaLongPressEnd()),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 10,
+                          ),
+                          child: _voiceSending
+                              ? const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : Icon(
+                                  icon,
+                                  color: disabled
+                                      ? Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant
+                                      : activeColor,
+                                ),
                         ),
-                  onPressed: !canCompose || _mediaUploading
-                      ? null
-                      : (_hasDraftText ? _send : _toggleVoiceComposerAction),
-                ),
+                      );
+                    },
+                  ),
               ],
             ),
           ),

@@ -43,8 +43,17 @@ const chatVoiceUploadsDir = path.resolve(
   "chat_media",
   "voice",
 );
+const chatVideoUploadsDir = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "uploads",
+  "chat_media",
+  "video",
+);
 fs.mkdirSync(chatImageUploadsDir, { recursive: true });
 fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
+fs.mkdirSync(chatVideoUploadsDir, { recursive: true });
 
 const CHAT_MEDIA_TOKEN_TTL_SECONDS = Math.max(
   60,
@@ -73,6 +82,7 @@ const CHAT_MEDIA_KEYRING = buildSecretKeyring({
 const CHAT_MEDIA_MARKERS = Object.freeze({
   image: "/uploads/chat_media/images/",
   voice: "/uploads/chat_media/voice/",
+  video: "/uploads/chat_media/video/",
 });
 
 const chatMediaUpload = multer({
@@ -86,11 +96,19 @@ const chatMediaUpload = multer({
         cb(null, chatVoiceUploadsDir);
         return;
       }
+      if (file.fieldname === "video") {
+        cb(null, chatVideoUploadsDir);
+        return;
+      }
       cb(new Error("Некорректный тип вложения"));
     },
     filename: (_req, file, cb) => {
       const ext = path.extname(file.originalname || "").toLowerCase();
-      const fallbackExt = file.fieldname === "voice" ? ".m4a" : ".jpg";
+      const fallbackExt = file.fieldname === "voice"
+        ? ".m4a"
+        : file.fieldname === "video"
+        ? ".mp4"
+        : ".jpg";
       const safeExt = ext && ext.length <= 10 ? ext : fallbackExt;
       cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
     },
@@ -112,6 +130,14 @@ const chatMediaUpload = multer({
         return;
       }
       cb(new Error("Можно загружать только аудиофайлы"));
+      return;
+    }
+    if (file.fieldname === "video") {
+      if (mime.startsWith("video/") || mime === "application/octet-stream") {
+        cb(null, true);
+        return;
+      }
+      cb(new Error("Можно загружать только видеофайлы"));
       return;
     }
     cb(new Error("Некорректный тип вложения"));
@@ -147,6 +173,7 @@ function uploadChatMedia(req, res, next) {
   chatMediaUpload.fields([
     { name: "image", maxCount: 1 },
     { name: "voice", maxCount: 1 },
+    { name: "video", maxCount: 1 },
   ])(req, res, (err) => {
     if (!err) return next();
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
@@ -412,6 +439,27 @@ function isSystemMessage(meta) {
     .toLowerCase()
     .trim();
   return kind.length > 0;
+}
+
+function normalizeReactionEmoji(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const bounded = Array.from(value).slice(0, 8).join("");
+  return bounded.trim();
+}
+
+function normalizeReactionsByUser(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const normalized = {};
+  for (const [userIdRaw, emojiRaw] of Object.entries(raw)) {
+    const userId = String(userIdRaw || "").trim();
+    const emoji = normalizeReactionEmoji(emojiRaw);
+    if (!userId || !emoji) continue;
+    normalized[userId] = emoji;
+  }
+  return normalized;
 }
 
 function normalizePhoneDigits(raw) {
@@ -705,6 +753,9 @@ function toChatMediaUrl(req, file) {
   if (file.fieldname === "voice") {
     return `${req.protocol}://${req.get("host")}/uploads/chat_media/voice/${file.filename}`;
   }
+  if (file.fieldname === "video") {
+    return `${req.protocol}://${req.get("host")}/uploads/chat_media/video/${file.filename}`;
+  }
   return null;
 }
 
@@ -772,7 +823,7 @@ function decorateMessageMediaUrls(req, rawMessage) {
   const meta = parseMeta(rawMessage.meta);
   const nextMeta = { ...meta };
   let changed = false;
-  for (const key of ["image_url", "voice_url"]) {
+  for (const key of ["image_url", "voice_url", "video_url"]) {
     const value = String(nextMeta[key] || "").trim();
     if (!value) continue;
     const signed = buildSignedChatMediaUrl(req, value);
@@ -812,6 +863,10 @@ function removeChatMediaByUrl(raw) {
     {
       marker: "/uploads/chat_media/voice/",
       baseDir: chatVoiceUploadsDir,
+    },
+    {
+      marker: "/uploads/chat_media/video/",
+      baseDir: chatVideoUploadsDir,
     },
   ];
 
@@ -1722,7 +1777,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
 router.get("/media/:kind/:filename", async (req, res) => {
   try {
     const kind = String(req.params.kind || "").trim().toLowerCase();
-    if (kind !== "image" && kind !== "voice") {
+    if (kind !== "image" && kind !== "voice" && kind !== "video") {
       return res.status(404).json({ ok: false, error: "Media not found" });
     }
 
@@ -1774,7 +1829,11 @@ router.get("/media/:kind/:filename", async (req, res) => {
       return res.status(403).json({ ok: false, error: "Invalid media token" });
     }
 
-    const mediaField = kind === "image" ? "image_url" : "voice_url";
+    const mediaField = kind === "image"
+      ? "image_url"
+      : kind === "voice"
+      ? "voice_url"
+      : "video_url";
     const refQ = await db.query(
       `SELECT 1
        FROM messages m
@@ -1786,7 +1845,11 @@ router.get("/media/:kind/:filename", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Media reference not found" });
     }
 
-    const baseDir = kind === "image" ? chatImageUploadsDir : chatVoiceUploadsDir;
+    const baseDir = kind === "image"
+      ? chatImageUploadsDir
+      : kind === "voice"
+      ? chatVoiceUploadsDir
+      : chatVideoUploadsDir;
     const absoluteBaseDir = path.resolve(baseDir);
     const absoluteFilePath = path.resolve(baseDir, filename);
     if (
@@ -2185,6 +2248,7 @@ router.post(
     const uploadedFiles = [
       ...((req.files?.image || []).map((file) => file)),
       ...((req.files?.voice || []).map((file) => file)),
+      ...((req.files?.video || []).map((file) => file)),
     ];
     try {
       const userId = req.user.id;
@@ -2195,17 +2259,24 @@ router.post(
       const durationMsRaw = Math.floor(Number(req.body?.duration_ms || 0));
       const imageFile = req.files?.image?.[0] || null;
       const voiceFile = req.files?.voice?.[0] || null;
+      const videoFile = req.files?.video?.[0] || null;
 
-      if ((imageFile && voiceFile) || (!imageFile && !voiceFile)) {
+      const pickedCount =
+        (imageFile ? 1 : 0) + (voiceFile ? 1 : 0) + (videoFile ? 1 : 0);
+      if (pickedCount !== 1) {
         removeUploadedFiles(uploadedFiles);
         return res.status(400).json({
           ok: false,
-          error: "Нужно передать либо изображение, либо голосовое сообщение",
+          error: "Нужно передать либо изображение, либо голосовое сообщение, либо видео",
         });
       }
 
-      const attachmentType = imageFile ? "image" : "voice";
-      const uploadedFile = imageFile || voiceFile;
+      const attachmentType = imageFile
+        ? "image"
+        : voiceFile
+        ? "voice"
+        : "video";
+      const uploadedFile = imageFile || voiceFile || videoFile;
       const mediaUrl = toChatMediaUrl(req, uploadedFile);
       if (!mediaUrl) {
         removeUploadedFiles(uploadedFiles);
@@ -2235,6 +2306,8 @@ router.post(
       const hasCaption = caption.length > 0;
       const text = attachmentType === "image"
         ? (hasCaption ? caption : "Фото")
+        : attachmentType === "video"
+        ? (hasCaption ? caption : "Видеосообщение")
         : "Голосовое сообщение";
       const meta = {
         attachment_type: attachmentType,
@@ -2243,11 +2316,20 @@ router.post(
           ? {
               image_url: mediaUrl,
             }
-          : {
+          : attachmentType === "voice"
+          ? {
               voice_url: mediaUrl,
               voice_duration_ms: durationMs,
               voice_mime_type: String(uploadedFile.mimetype || "").trim(),
               voice_file_name: String(
+                uploadedFile.originalname || uploadedFile.filename || "",
+              ).trim(),
+            }
+          : {
+              video_url: mediaUrl,
+              video_duration_ms: durationMs,
+              video_mime_type: String(uploadedFile.mimetype || "").trim(),
+              video_file_name: String(
                 uploadedFile.originalname || uploadedFile.filename || "",
               ).trim(),
             }),
@@ -2409,6 +2491,96 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
   }
 });
 
+router.post(
+  "/:chatId/messages/:messageId/reactions",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const role = req.user.role;
+      const { chatId, messageId } = req.params;
+      const emoji = normalizeReactionEmoji(req.body?.emoji || "");
+      if (!emoji) {
+        return res.status(400).json({ ok: false, error: "emoji required" });
+      }
+
+      const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+      if (!context) {
+        return res.status(404).json({ ok: false, error: "Chat not found" });
+      }
+      if (!canReadChat(context, role)) {
+        return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+      }
+
+      const messageQ = await db.query(
+        `SELECT id, sender_id, meta
+         FROM messages
+         WHERE id = $1
+           AND chat_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [messageId, chatId],
+      );
+      if (messageQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Сообщение не найдено" });
+      }
+
+      const current = messageQ.rows[0];
+      const meta = parseMeta(current.meta);
+      if (isSystemMessage(meta)) {
+        return res.status(403).json({
+          ok: false,
+          error: "Системные сообщения не поддерживают реакции",
+        });
+      }
+      if (meta.deleted === true || meta.hidden_for_all === true) {
+        return res.status(400).json({
+          ok: false,
+          error: "Нельзя поставить реакцию на удаленное сообщение",
+        });
+      }
+
+      const userIdText = String(userId || "").trim();
+      const byUser = normalizeReactionsByUser(meta.reactions_by_user);
+      if (byUser[userIdText] === emoji) {
+        delete byUser[userIdText];
+      } else {
+        byUser[userIdText] = emoji;
+      }
+
+      const nextMeta = { ...meta };
+      if (Object.keys(byUser).length > 0) {
+        nextMeta.reactions_by_user = byUser;
+      } else {
+        delete nextMeta.reactions_by_user;
+      }
+
+      const upd = await db.query(
+        `UPDATE messages
+         SET meta = $1::jsonb
+         WHERE id = $2
+         RETURNING id`,
+        [JSON.stringify(nextMeta), messageId],
+      );
+      const updatedRaw = await getHydratedMessageById(upd.rows[0]?.id, userId);
+      const updated = decorateMessageMediaUrls(req, updatedRaw);
+      if (!updated) {
+        return res.status(500).json({ ok: false, error: "Не удалось загрузить сообщение" });
+      }
+
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`chat:${chatId}`).emit("chat:message", { chatId, message: updated });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      }
+      return res.json({ ok: true, data: updated });
+    } catch (err) {
+      console.error("chats.reaction.toggle error", err);
+      return res.status(500).json({ ok: false, error: "Server error" });
+    }
+  },
+);
+
 /**
  * DELETE /api/chats/:chatId/messages/:messageId
  * Удаление сообщения:
@@ -2520,6 +2692,7 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
 
     removeChatMediaByUrl(meta?.image_url);
     removeChatMediaByUrl(meta?.voice_url);
+    removeChatMediaByUrl(meta?.video_url);
 
     const io = req.app.get("io");
     if (io) {
@@ -2578,6 +2751,7 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
       const meta = parseMeta(row.meta);
       removeChatMediaByUrl(meta?.image_url);
       removeChatMediaByUrl(meta?.voice_url);
+      removeChatMediaByUrl(meta?.video_url);
     }
 
     await db.query("DELETE FROM message_reads WHERE chat_id = $1", [chatId]);

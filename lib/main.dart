@@ -2005,7 +2005,7 @@ Future<void> _initSocket() async {
     socket = io.io(
       _runtimeApiBaseUrl,
       io.OptionBuilder()
-          .setTransports(['websocket'])
+          .setTransports(['websocket', 'polling'])
           .disableAutoConnect()
           .setAuth(socketAuth)
           .build(),
