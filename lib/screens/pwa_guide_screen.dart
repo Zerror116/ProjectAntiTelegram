@@ -7,7 +7,7 @@ class PwaGuideScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('PWA для iOS')),
+      appBar: AppBar(title: const Text('Как добавить сайт в быстрый доступ')),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(16),
@@ -19,7 +19,7 @@ class PwaGuideScreen extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Как установить приложение на iPhone',
+                      'Как добавить сайт в быстрый доступ',
                       style: theme.textTheme.titleMedium?.copyWith(
                         fontWeight: FontWeight.w800,
                       ),

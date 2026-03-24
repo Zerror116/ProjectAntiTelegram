@@ -43,7 +43,7 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v1';
+  static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
   int _index = 0;
   bool _loading = true;
   StreamSubscription<User?>? _authSub;
@@ -54,7 +54,7 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
-    if (_isIosWeb()) {
+    if (_isAndroidWeb()) {
       _loading = false;
       return;
     }
@@ -218,6 +218,10 @@ class _MainShellState extends State<MainShell> {
     return kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
   }
 
+  bool _isAndroidWeb() {
+    return kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  }
+
   Future<void> _maybeShowIosAddToHomeHint() async {
     if (!_isIosWeb()) return;
     try {
@@ -231,7 +235,7 @@ class _MainShellState extends State<MainShell> {
         context: context,
         builder: (dialogContext) {
           return AlertDialog(
-            title: const Text('Установить на iPhone'),
+            title: const Text('Как добавить сайт в быстрый доступ'),
             content: const Text(
               'Чтобы сайт открывался как приложение, добавьте его на экран «Домой»:\n\n'
               'Safari → Поделиться → На экран «Домой».',
@@ -499,7 +503,7 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isIosWeb()) {
+    if (_isAndroidWeb()) {
       return const AuthScreen();
     }
     return StreamBuilder<User?>(
