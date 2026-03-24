@@ -92,7 +92,21 @@ const channelAvatarUpload = multer({
   }),
   limits: { fileSize: 8 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (String(file.mimetype || "").startsWith("image/")) {
+    const mime = String(file.mimetype || "").toLowerCase().trim();
+    const ext = path.extname(String(file.originalname || "")).toLowerCase();
+    const allowedExt = new Set([
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".webp",
+      ".bmp",
+      ".heic",
+      ".heif",
+    ]);
+    const isImageMime = mime.startsWith("image/");
+    const isOctetImage = mime === "application/octet-stream" && allowedExt.has(ext);
+    if (isImageMime || isOctetImage) {
       cb(null, true);
       return;
     }

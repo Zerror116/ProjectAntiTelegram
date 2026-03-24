@@ -1025,7 +1025,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool get _cameraSupported {
-    if (kIsWeb) return false;
+    if (kIsWeb) {
+      return defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS;
+    }
     return defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS;
   }
@@ -4122,10 +4125,16 @@ class _ChatScreenState extends State<ChatScreen> {
                                 : Icons.mic_none_rounded);
                       return GestureDetector(
                         onTap: () {
-                          if (disabled || _voiceRecording) return;
-                          if (kIsWeb &&
-                              _composerMediaMode == _ComposerMediaMode.voice) {
-                            unawaited(_startVoiceRecording());
+                          if (disabled || _voiceRecording) {
+                            if (!canCompose && mounted) {
+                              showAppNotice(
+                                context,
+                                _composeBlockedReason() ??
+                                    'Отправка сообщений недоступна',
+                                tone: AppNoticeTone.warning,
+                                duration: const Duration(seconds: 2),
+                              );
+                            }
                             return;
                           }
                           _toggleComposerMediaMode();

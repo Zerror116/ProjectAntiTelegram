@@ -5144,14 +5144,73 @@ class _AdminPanelState extends State<AdminPanel>
   Future<void> _pickAndUploadChannelAvatar(Map<String, dynamic> channel) async {
     final channelId = _channelIdOf(channel);
     if (channelId.isEmpty) return;
+    final settings = _settingsOf(channel);
+    final systemKey = (settings['system_key'] ?? '').toString().trim();
+    final isSystemChannel = systemKey.isNotEmpty;
+
     final picked = await FilePicker.platform.pickFiles(
       type: FileType.image,
       allowMultiple: false,
-      withData: false,
+      withData: kIsWeb,
     );
     if (picked == null || picked.files.isEmpty) return;
+    final pickedFile = picked.files.single;
 
-    final path = picked.files.single.path;
+    if (kIsWeb) {
+      final bytes = pickedFile.bytes;
+      if (bytes == null || bytes.isEmpty) {
+        if (mounted) {
+          setState(() => _message = 'Не удалось прочитать выбранный файл');
+        }
+        return;
+      }
+      setState(() {
+        _avatarUpdating = true;
+        _message = '';
+      });
+      try {
+        final fileName = pickedFile.name.trim().isNotEmpty
+            ? pickedFile.name.trim()
+            : 'channel-avatar.jpg';
+        final form = FormData.fromMap({
+          'avatar': MultipartFile.fromBytes(bytes, filename: fileName),
+        });
+        final resp = await authService.dio.post(
+          '/api/admin/channels/$channelId/avatar',
+          data: form,
+        );
+        _emitChatUpdatedIfPresent(resp.data);
+
+        // Системные каналы защищены по PATCH-роуту; сам avatar_url уже сохранён POST-роутом.
+        if (!isSystemChannel) {
+          await authService.dio.patch(
+            '/api/admin/channels/$channelId',
+            data: {
+              'avatar_focus_x': 0,
+              'avatar_focus_y': 0,
+              'avatar_zoom': 1,
+            },
+          );
+        }
+
+        await _loadChannels();
+        await _loadChannelOverview(channelId, force: true, silent: true);
+        if (mounted) {
+          setState(() => _message = 'Аватарка канала обновлена');
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(
+            () => _message = 'Ошибка загрузки аватарки: ${_extractDioError(e)}',
+          );
+        }
+      } finally {
+        if (mounted) setState(() => _avatarUpdating = false);
+      }
+      return;
+    }
+
+    final path = pickedFile.path;
     if (path == null || path.isEmpty) {
       if (mounted) {
         setState(() => _message = 'Не удалось получить путь к файлу');
@@ -5159,9 +5218,8 @@ class _AdminPanelState extends State<AdminPanel>
       return;
     }
 
-    final selectedName = (picked.files.single.name).toLowerCase().trim();
+    final selectedName = (pickedFile.name).toLowerCase().trim();
     final isGif = selectedName.endsWith('.gif');
-    final settings = _settingsOf(channel);
     final placement = await _showAvatarPlacementDialog(
       filePath: path,
       initialFocusX: _toFocus(settings['avatar_focus_x']),
@@ -5190,14 +5248,16 @@ class _AdminPanelState extends State<AdminPanel>
       final focusX = isGif ? placement.focusX : 0;
       final focusY = isGif ? placement.focusY : 0;
       final avatarZoom = isGif ? placement.zoom : 1;
-      await authService.dio.patch(
-        '/api/admin/channels/$channelId',
-        data: {
-          'avatar_focus_x': focusX,
-          'avatar_focus_y': focusY,
-          'avatar_zoom': avatarZoom,
-        },
-      );
+      if (!isSystemChannel) {
+        await authService.dio.patch(
+          '/api/admin/channels/$channelId',
+          data: {
+            'avatar_focus_x': focusX,
+            'avatar_focus_y': focusY,
+            'avatar_zoom': avatarZoom,
+          },
+        );
+      }
 
       await _loadChannels();
       await _loadChannelOverview(channelId, force: true, silent: true);
