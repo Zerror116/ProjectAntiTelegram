@@ -193,7 +193,22 @@ if [[ -n "$SERVICE" ]]; then
   systemctl restart "$SERVICE"
   systemctl is-active "$SERVICE"
 else
-  echo "[deploy_full][server] WARNING: backend service not detected. Set REMOTE_SERVICE explicitly."
+  echo "[deploy_full][server] WARNING: backend service not detected. Fallback to manual node restart."
+  if [[ -d "$REMOTE_PROJECT_DIR/server" ]] && command -v npm >/dev/null 2>&1; then
+    cd "$REMOTE_PROJECT_DIR/server"
+    pkill -f "node src/index.js" || true
+    nohup npm start >/var/log/projectphoenix-server.log 2>&1 &
+    sleep 2
+    if ss -ltnp 2>/dev/null | grep -q ':3000'; then
+      echo "[deploy_full][server] manual backend restart OK (:3000 listening)"
+    else
+      echo "[deploy_full][server] ERROR: backend did not start on :3000"
+      exit 1
+    fi
+  else
+    echo "[deploy_full][server] ERROR: cannot restart backend (no server dir or npm)"
+    exit 1
+  fi
 fi
 
 mkdir -p "$REMOTE_WEB_ROOT"
