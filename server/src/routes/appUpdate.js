@@ -47,18 +47,28 @@ function resolveAndroidApkAbsolutePath(fileName) {
 function resolveAndroidDownloadUrl(rawUrl) {
   const explicit = cleanString(rawUrl);
   if (explicit) {
-    if (!explicit.startsWith("/downloads/")) {
-      return explicit;
+    let explicitPath = explicit;
+    if (explicit.includes("://")) {
+      try {
+        explicitPath = new URL(explicit).pathname || explicit;
+      } catch (_) {
+        explicitPath = explicit;
+      }
     }
-    const relativePart = explicit
-      .slice("/downloads/".length)
-      .split("?")[0]
-      .split("#")[0];
-    const decoded = decodeURIComponent(relativePart);
-    const absolute = resolveAndroidApkAbsolutePath(decoded);
-    if (!absolute) return "";
-    const safeName = path.basename(absolute);
-    return `/api/app/update/android/apk?file=${encodeURIComponent(safeName)}`;
+    const marker = "/downloads/";
+    const markerIndex = explicitPath.indexOf(marker);
+    if (markerIndex >= 0) {
+      const relativePart = explicitPath
+        .slice(markerIndex + marker.length)
+        .split("?")[0]
+        .split("#")[0];
+      const decoded = decodeURIComponent(relativePart);
+      const absolute = resolveAndroidApkAbsolutePath(decoded);
+      if (!absolute) return "";
+      const safeName = path.basename(absolute);
+      return `/api/app/update/android/apk?file=${encodeURIComponent(safeName)}`;
+    }
+    return explicit;
   }
 
   const defaultFile = toSafeApkFileName(

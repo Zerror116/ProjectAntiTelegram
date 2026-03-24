@@ -2945,6 +2945,7 @@ class _AdminPanelState extends State<AdminPanel>
     final routeEntries =
         routes.entries.where((entry) => entry.key != '_pending').toList()
           ..sort((a, b) => a.key.compareTo(b.key));
+    final pendingCustomers = routes['_pending'] ?? const <Map<String, dynamic>>[];
 
     for (var index = 0; index < routeEntries.length; index += 1) {
       final entry = routeEntries[index];
@@ -3188,7 +3189,7 @@ class _AdminPanelState extends State<AdminPanel>
                   ),
                 ),
               ),
-            if (routes.containsKey('_pending'))
+            if (pendingCustomers.isNotEmpty)
               Container(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 10,
@@ -3199,7 +3200,7 @@ class _AdminPanelState extends State<AdminPanel>
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Text(
-                  'Без маршрута: ${routes['_pending']!.length}',
+                  'Без маршрута: ${pendingCustomers.length}',
                   style: TextStyle(
                     color: theme.colorScheme.onSurfaceVariant,
                     fontWeight: FontWeight.w700,
