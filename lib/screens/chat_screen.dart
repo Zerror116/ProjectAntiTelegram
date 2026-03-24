@@ -72,6 +72,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _voiceRecording = false;
   bool _voiceSending = false;
   _ComposerMediaMode _composerMediaMode = _ComposerMediaMode.voice;
+  bool _composerMediaPressActive = false;
+  bool _voiceStartInProgress = false;
   bool _pinLoading = false;
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
@@ -101,16 +103,47 @@ class _ChatScreenState extends State<ChatScreen> {
   final Set<String> _supportFeedbackBusyTicketIds = {};
   final Map<String, GlobalKey> _messageItemKeys = {};
   Map<String, dynamic>? _activePin;
+  final List<String> _recentReactionEmojis = <String>[];
+  final List<String> _recentComposerEmojis = <String>[];
 
   static const List<String> _quickReactions = <String>[
     '👍',
+    '🎉',
     '❤️',
+    '👎',
     '🔥',
-    '😂',
+    '🥰',
     '👏',
-    '😮',
+    '😂',
+    '😎',
+    '🤝',
     '😢',
+  ];
+  static const List<String> _composerEmojiPalette = <String>[
+    '🙂',
+    '😀',
+    '😁',
+    '😅',
+    '😂',
+    '😊',
+    '😍',
+    '😘',
+    '🤔',
+    '😎',
+    '😭',
+    '😡',
+    '👍',
+    '👎',
+    '👏',
+    '🔥',
+    '❤️',
+    '💯',
+    '✅',
     '🙏',
+    '🎉',
+    '🤝',
+    '👀',
+    '⭐',
   ];
 
   @override
@@ -1310,10 +1343,174 @@ class _ChatScreenState extends State<ChatScreen> {
     return '$mm:$ss';
   }
 
+  void _rememberRecentEmoji(List<String> target, String emoji) {
+    final normalized = emoji.trim();
+    if (normalized.isEmpty) return;
+    target.removeWhere((value) => value == normalized);
+    target.insert(0, normalized);
+    const maxRecent = 8;
+    if (target.length > maxRecent) {
+      target.removeRange(maxRecent, target.length);
+    }
+  }
+
+  List<String> _mergeEmojiChoices(
+    List<String> primary,
+    List<String> fallback, {
+    required int maxCount,
+  }) {
+    final out = <String>[];
+    for (final emoji in [...primary, ...fallback]) {
+      final normalized = emoji.trim();
+      if (normalized.isEmpty || out.contains(normalized)) continue;
+      out.add(normalized);
+      if (out.length >= maxCount) break;
+    }
+    return out;
+  }
+
+  List<String> _reactionPickerEmojis() {
+    return _mergeEmojiChoices(
+      _recentReactionEmojis,
+      _quickReactions,
+      maxCount: 9,
+    );
+  }
+
+  List<String> _composerPickerEmojis() {
+    return _mergeEmojiChoices(
+      _recentComposerEmojis,
+      _composerEmojiPalette,
+      maxCount: 28,
+    );
+  }
+
+  void _insertComposerEmoji(String emoji) {
+    final value = _controller.value;
+    final normalized = emoji.trim();
+    if (normalized.isEmpty) return;
+    final start = max(0, value.selection.start);
+    final end = max(0, value.selection.end);
+    final left = value.text.substring(0, min(start, value.text.length));
+    final right = value.text.substring(min(end, value.text.length));
+    final nextText = '$left$normalized$right';
+    final nextOffset = (left.length + normalized.length).clamp(
+      0,
+      nextText.length,
+    );
+    _controller.value = value.copyWith(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: nextOffset),
+      composing: TextRange.empty,
+    );
+    _rememberRecentEmoji(_recentComposerEmojis, normalized);
+    _inputFocusNode.requestFocus();
+  }
+
+  Future<void> _openComposerEmojiPicker() async {
+    if (!_canCompose() || _voiceRecording) return;
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        final options = _composerPickerEmojis();
+        final recent = _recentComposerEmojis;
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Эмодзи',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (recent.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    'Недавние',
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: recent
+                          .map(
+                            (emoji) => Padding(
+                              padding: const EdgeInsets.only(right: 6),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(999),
+                                onTap: () => Navigator.of(ctx).pop(emoji),
+                                child: Ink(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 8,
+                                  ),
+                                  child: Text(
+                                    emoji,
+                                    style: const TextStyle(fontSize: 26),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Flexible(
+                  child: GridView.builder(
+                    shrinkWrap: true,
+                    itemCount: options.length,
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 7,
+                          mainAxisSpacing: 6,
+                          crossAxisSpacing: 6,
+                          childAspectRatio: 1,
+                        ),
+                    itemBuilder: (context, index) {
+                      final emoji = options[index];
+                      return InkWell(
+                        borderRadius: BorderRadius.circular(10),
+                        onTap: () => Navigator.of(ctx).pop(emoji),
+                        child: Center(
+                          child: Text(
+                            emoji,
+                            style: const TextStyle(fontSize: 24),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (selected == null || !mounted) return;
+    setState(() => _insertComposerEmoji(selected));
+  }
+
   Future<void> _startVoiceRecording() async {
-    if (!_canCompose() || _voiceSending || _mediaUploading || _voiceRecording) {
+    if (!_canCompose() ||
+        _voiceSending ||
+        _mediaUploading ||
+        _voiceRecording ||
+        _voiceStartInProgress) {
       return;
     }
+    _voiceStartInProgress = true;
     try {
       final allowed = await _voiceRecorder.hasPermission();
       if (!allowed) {
@@ -1328,27 +1525,29 @@ class _ChatScreenState extends State<ChatScreen> {
       }
 
       RecordConfig config;
-      String? outputPath;
+      late String outputPath;
       if (kIsWeb) {
-        final upload = await _pickVoiceUpload();
-        if (upload == null) return;
-        await _sendMediaMessage(upload: upload, attachmentType: 'voice');
-        return;
+        outputPath = 'voice-${DateTime.now().millisecondsSinceEpoch}.webm';
+        config = const RecordConfig(
+          encoder: AudioEncoder.opus,
+          bitRate: 128000,
+          sampleRate: 48000,
+        );
+      } else {
+        final tempDir = await getTemporaryDirectory();
+        final useAac =
+            defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS ||
+            defaultTargetPlatform == TargetPlatform.macOS;
+        final extension = useAac ? 'm4a' : 'wav';
+        outputPath =
+            '${tempDir.path}/voice-${DateTime.now().millisecondsSinceEpoch}.$extension';
+        config = RecordConfig(
+          encoder: useAac ? AudioEncoder.aacLc : AudioEncoder.wav,
+          bitRate: useAac ? 128000 : 1411200,
+          sampleRate: 44100,
+        );
       }
-
-      final tempDir = await getTemporaryDirectory();
-      final useAac =
-          defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS ||
-          defaultTargetPlatform == TargetPlatform.macOS;
-      final extension = useAac ? 'm4a' : 'wav';
-      outputPath =
-          '${tempDir.path}/voice-${DateTime.now().millisecondsSinceEpoch}.$extension';
-      config = RecordConfig(
-        encoder: useAac ? AudioEncoder.aacLc : AudioEncoder.wav,
-        bitRate: useAac ? 128000 : 1411200,
-        sampleRate: 44100,
-      );
 
       await _voiceRecorder.start(config, path: outputPath);
       _voiceRecordingTimer?.cancel();
@@ -1360,6 +1559,9 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!mounted) return;
         setState(() => _recordingSeconds += 1);
       });
+      if (!_composerMediaPressActive) {
+        await _stopVoiceRecordingAndSend();
+      }
     } catch (e) {
       if (!mounted) return;
       showAppNotice(
@@ -1369,6 +1571,34 @@ class _ChatScreenState extends State<ChatScreen> {
         duration: const Duration(seconds: 2),
       );
       debugPrint('startVoiceRecording error: $e');
+      if (kIsWeb) {
+        try {
+          final upload = await _pickVoiceUpload();
+          if (upload != null) {
+            await _sendMediaMessage(upload: upload, attachmentType: 'voice');
+          }
+        } catch (_) {
+          // ignore fallback errors
+        }
+      }
+    } finally {
+      _voiceStartInProgress = false;
+    }
+  }
+
+  Future<Uint8List?> _readWebBlobBytes(String blobUrl) async {
+    if (!kIsWeb) return null;
+    try {
+      final resp = await Dio().get<List<int>>(
+        blobUrl,
+        options: Options(responseType: ResponseType.bytes),
+      );
+      final data = resp.data;
+      if (data == null || data.isEmpty) return null;
+      return Uint8List.fromList(data);
+    } catch (e) {
+      debugPrint('readWebBlobBytes error: $e');
+      return null;
     }
   }
 
@@ -1393,14 +1623,36 @@ class _ChatScreenState extends State<ChatScreen> {
         );
         return;
       }
-      await _sendMediaMessage(
-        upload: _ChatUploadFile(
-          filename: recordedPath.split('/').last,
-          path: recordedPath,
-        ),
-        attachmentType: 'voice',
-        durationMs: durationMs,
-      );
+      if (kIsWeb) {
+        final bytes = await _readWebBlobBytes(recordedPath);
+        if (bytes == null || bytes.isEmpty) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Не удалось прочитать записанный файл',
+            tone: AppNoticeTone.error,
+            duration: const Duration(seconds: 2),
+          );
+          return;
+        }
+        await _sendMediaMessage(
+          upload: _ChatUploadFile(
+            filename: 'voice-${DateTime.now().millisecondsSinceEpoch}.webm',
+            bytes: bytes,
+          ),
+          attachmentType: 'voice',
+          durationMs: durationMs,
+        );
+      } else {
+        await _sendMediaMessage(
+          upload: _ChatUploadFile(
+            filename: recordedPath.split('/').last,
+            path: recordedPath,
+          ),
+          attachmentType: 'voice',
+          durationMs: durationMs,
+        );
+      }
     } catch (e) {
       if (!mounted) return;
       showAppNotice(
@@ -1454,14 +1706,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_hasDraftText || !_canCompose() || _mediaUploading || _voiceSending) {
       return;
     }
+    _composerMediaPressActive = true;
     if (_composerMediaMode == _ComposerMediaMode.camera) {
       await _captureAndSendVideoMessage();
+      _composerMediaPressActive = false;
       return;
     }
     await _startVoiceRecording();
   }
 
   Future<void> _handleComposerMediaLongPressEnd() async {
+    _composerMediaPressActive = false;
     if (_composerMediaMode == _ComposerMediaMode.voice && _voiceRecording) {
       await _stopVoiceRecordingAndSend();
     }
@@ -2374,6 +2629,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final trimmedMessageId = messageId.trim();
     final trimmedEmoji = emoji.trim();
     if (trimmedMessageId.isEmpty || trimmedEmoji.isEmpty) return;
+    if (mounted) {
+      setState(() => _rememberRecentEmoji(_recentReactionEmojis, trimmedEmoji));
+    }
     try {
       final resp = await authService.dio.post(
         '/api/chats/${widget.chatId}/messages/$trimmedMessageId/reactions',
@@ -2690,6 +2948,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final imageUrl = _resolveImageUrl(
       _metaMapOf(message['meta'])['image_url']?.toString(),
     );
+    final reactionByUser = _reactionByUserOf(_metaMapOf(message['meta']));
+    final currentUserId = authService.currentUser?.id.trim() ?? '';
 
     Future<void> applyAction(String action) async {
       if (action == 'copy') {
@@ -2720,6 +2980,22 @@ class _ChatScreenState extends State<ChatScreen> {
         if (id.isNotEmpty) {
           await _copyText(id);
         }
+      } else if (action == 'forward') {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Пересылка появится в следующем обновлении',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+      } else if (action == 'select') {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Режим выбора сообщений появится в следующем обновлении',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
       } else if (action.startsWith('react:') && canReact) {
         final messageId = message['id']?.toString() ?? '';
         final emoji = action.substring('react:'.length).trim();
@@ -2739,7 +3015,7 @@ class _ChatScreenState extends State<ChatScreen> {
       options.add(const PopupMenuItem(value: 'reply', child: Text('Ответить')));
     }
     if (canReact) {
-      for (final emoji in _quickReactions) {
+      for (final emoji in _reactionPickerEmojis()) {
         options.add(
           PopupMenuItem(value: 'react:$emoji', child: Text('Реакция $emoji')),
         );
@@ -2806,94 +3082,180 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted) return;
     final selected = await showModalBottomSheet<String>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            if (canReact)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: _quickReactions
-                      .map(
-                        (emoji) => ActionChip(
-                          label: Text(emoji),
-                          onPressed: () =>
-                              Navigator.of(ctx).pop('react:$emoji'),
-                        ),
-                      )
-                      .toList(),
-                ),
-              ),
-            if (canCopy)
-              ListTile(
-                leading: const Icon(Icons.copy_all_outlined),
-                title: const Text('Копировать'),
-                onTap: () => Navigator.of(ctx).pop('copy'),
-              ),
-            if (canReply)
-              ListTile(
-                leading: const Icon(Icons.reply_outlined),
-                title: const Text('Ответить'),
-                onTap: () => Navigator.of(ctx).pop('reply'),
-              ),
-            if (canPin)
-              ListTile(
-                leading: Icon(
-                  isPinned ? Icons.push_pin_outlined : Icons.push_pin,
-                ),
-                title: Text(isPinned ? 'Открепить' : 'Закрепить'),
-                onTap: () => Navigator.of(ctx).pop(isPinned ? 'unpin' : 'pin'),
-              ),
-            if (canOpenImage)
-              ListTile(
-                leading: const Icon(Icons.image_outlined),
-                title: const Text('Открыть фото'),
-                onTap: () => Navigator.of(ctx).pop('open_image'),
-              ),
-            if (canCopyId)
-              ListTile(
-                leading: const Icon(Icons.tag_outlined),
-                title: const Text('Копировать ID'),
-                onTap: () => Navigator.of(ctx).pop('copy_id'),
-              ),
-            if (canEdit)
-              ListTile(
-                leading: const Icon(Icons.edit_outlined),
-                title: const Text('Изменить'),
-                onTap: () => Navigator.of(ctx).pop('edit'),
-              ),
-            if (canDeleteForMe)
-              ListTile(
-                leading: const Icon(Icons.remove_circle_outline),
-                title: const Text('Удалить у меня'),
-                onTap: () => Navigator.of(ctx).pop('delete_me'),
-              ),
-            if (canDeleteForAll)
-              ListTile(
-                leading: const Icon(Icons.delete_outline, color: Colors.red),
-                title: const Text(
-                  'Удалить у всех',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () => Navigator.of(ctx).pop('delete_all'),
-              ),
-            if (canDeleteEntireChat)
-              ListTile(
-                leading: const Icon(
-                  Icons.delete_forever_outlined,
-                  color: Colors.red,
-                ),
-                title: const Text(
-                  'УДАЛИТЬ ВСЁ!',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () => Navigator.of(ctx).pop('delete_chat'),
-              ),
-          ],
-        ),
-      ),
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        final reactionChoices = _reactionPickerEmojis();
+        final hasMenuItems =
+            canReply ||
+            canCopy ||
+            canPin ||
+            canOpenImage ||
+            canCopyId ||
+            canEdit ||
+            canDeleteForMe ||
+            canDeleteForAll ||
+            canDeleteEntireChat;
+        final topBarColor = theme.brightness == Brightness.dark
+            ? const Color(0xFF1A2638)
+            : theme.colorScheme.primaryContainer;
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (canReact && reactionChoices.isNotEmpty)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(bottom: 8),
+                    decoration: BoxDecoration(
+                      color: topBarColor,
+                      borderRadius: BorderRadius.circular(22),
+                    ),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      child: Row(
+                        children: reactionChoices.map((emoji) {
+                          final mine =
+                              currentUserId.isNotEmpty &&
+                              reactionByUser[currentUserId] == emoji;
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 3),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(999),
+                              onTap: () =>
+                                  Navigator.of(ctx).pop('react:$emoji'),
+                              child: Ink(
+                                padding: const EdgeInsets.all(7),
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: mine
+                                      ? theme.colorScheme.primary.withValues(
+                                          alpha: 0.22,
+                                        )
+                                      : Colors.transparent,
+                                ),
+                                child: Text(
+                                  emoji,
+                                  style: const TextStyle(fontSize: 30),
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ),
+                if (hasMenuItems)
+                  Container(
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surface,
+                      borderRadius: BorderRadius.circular(22),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (canReply)
+                          ListTile(
+                            leading: const Icon(Icons.reply_outlined),
+                            title: const Text('Ответить'),
+                            onTap: () => Navigator.of(ctx).pop('reply'),
+                          ),
+                        if (canCopy)
+                          ListTile(
+                            leading: const Icon(Icons.copy_all_outlined),
+                            title: const Text('Копировать текст'),
+                            onTap: () => Navigator.of(ctx).pop('copy'),
+                          ),
+                        if (canPin)
+                          ListTile(
+                            leading: Icon(
+                              isPinned
+                                  ? Icons.push_pin_outlined
+                                  : Icons.push_pin,
+                            ),
+                            title: Text(isPinned ? 'Открепить' : 'Закрепить'),
+                            onTap: () => Navigator.of(
+                              ctx,
+                            ).pop(isPinned ? 'unpin' : 'pin'),
+                          ),
+                        if (canCopy)
+                          ListTile(
+                            leading: const Icon(
+                              Icons.forward_to_inbox_outlined,
+                            ),
+                            title: const Text('Переслать'),
+                            onTap: () => Navigator.of(ctx).pop('forward'),
+                          ),
+                        if (canCopy)
+                          ListTile(
+                            leading: const Icon(
+                              Icons.check_circle_outline_rounded,
+                            ),
+                            title: const Text('Выбрать'),
+                            onTap: () => Navigator.of(ctx).pop('select'),
+                          ),
+                        if (canOpenImage)
+                          ListTile(
+                            leading: const Icon(Icons.image_outlined),
+                            title: const Text('Открыть фото'),
+                            onTap: () => Navigator.of(ctx).pop('open_image'),
+                          ),
+                        if (canCopyId)
+                          ListTile(
+                            leading: const Icon(Icons.tag_outlined),
+                            title: const Text('Копировать ID'),
+                            onTap: () => Navigator.of(ctx).pop('copy_id'),
+                          ),
+                        if (canEdit)
+                          ListTile(
+                            leading: const Icon(Icons.edit_outlined),
+                            title: const Text('Изменить'),
+                            onTap: () => Navigator.of(ctx).pop('edit'),
+                          ),
+                        if (canDeleteForMe)
+                          ListTile(
+                            leading: const Icon(Icons.remove_circle_outline),
+                            title: const Text('Удалить у меня'),
+                            onTap: () => Navigator.of(ctx).pop('delete_me'),
+                          ),
+                        if (canDeleteForAll)
+                          ListTile(
+                            leading: const Icon(
+                              Icons.delete_outline,
+                              color: Colors.red,
+                            ),
+                            title: const Text(
+                              'Удалить у всех',
+                              style: TextStyle(color: Colors.red),
+                            ),
+                            onTap: () => Navigator.of(ctx).pop('delete_all'),
+                          ),
+                        if (canDeleteEntireChat)
+                          ListTile(
+                            leading: const Icon(
+                              Icons.delete_forever_outlined,
+                              color: Colors.red,
+                            ),
+                            title: const Text(
+                              'УДАЛИТЬ ВСЁ!',
+                              style: TextStyle(color: Colors.red),
+                            ),
+                            onTap: () => Navigator.of(ctx).pop('delete_chat'),
+                          ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
     );
 
     if (selected != null) {
@@ -4051,129 +4413,156 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
           SafeArea(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                IconButton(
-                  icon: _mediaUploading
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.add_photo_alternate_outlined),
-                  onPressed:
-                      canCompose &&
-                          !_mediaUploading &&
-                          !_voiceSending &&
-                          !_voiceRecording
-                      ? _openAttachmentSheet
-                      : null,
-                ),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: SubmitOnEnter(
-                      controller: _controller,
-                      enabled:
-                          allowEnterShortcut && canCompose && !_voiceRecording,
-                      onSubmit: _send,
-                      child: TextField(
-                        focusNode: _inputFocusNode,
-                        controller: _controller,
-                        enabled: canCompose && !_voiceRecording,
-                        minLines: 1,
-                        maxLines: 6,
-                        keyboardType: TextInputType.multiline,
-                        textInputAction: TextInputAction.newline,
-                        decoration: withInputLanguageBadge(
-                          InputDecoration(
-                            hintText: _voiceRecording
-                                ? 'Говорите... отпустите кнопку для отправки'
-                                : canCompose
-                                ? 'Сообщение...'
-                                : 'Отправка сообщений недоступна',
-                            border: const OutlineInputBorder(),
-                          ),
-                          controller: _controller,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                if (_hasDraftText)
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
                   IconButton(
-                    icon: _voiceSending
+                    tooltip: 'Вложение',
+                    icon: _mediaUploading
                         ? const SizedBox(
                             width: 18,
                             height: 18,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(Icons.send),
-                    onPressed: !canCompose || _mediaUploading ? null : _send,
-                  )
-                else
-                  Builder(
-                    builder: (context) {
-                      final disabled =
-                          !canCompose || _mediaUploading || _voiceSending;
-                      final activeColor = Theme.of(context).colorScheme.primary;
-                      final icon = _voiceRecording
-                          ? Icons.stop_circle_outlined
-                          : (_composerMediaMode == _ComposerMediaMode.camera
-                                ? Icons.videocam_rounded
-                                : Icons.mic_none_rounded);
-                      return GestureDetector(
-                        onTap: () {
-                          if (disabled || _voiceRecording) {
-                            if (!canCompose && mounted) {
-                              showAppNotice(
-                                context,
-                                _composeBlockedReason() ??
-                                    'Отправка сообщений недоступна',
-                                tone: AppNoticeTone.warning,
-                                duration: const Duration(seconds: 2),
-                              );
-                            }
-                            return;
-                          }
-                          _toggleComposerMediaMode();
-                        },
-                        onLongPressStart: disabled
-                            ? null
-                            : (_) => unawaited(
-                                _handleComposerMediaLongPressStart(),
-                              ),
-                        onLongPressEnd: disabled
-                            ? null
-                            : (_) =>
-                                  unawaited(_handleComposerMediaLongPressEnd()),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 10,
-                          ),
-                          child: _voiceSending
-                              ? const SizedBox(
-                                  width: 20,
-                                  height: 20,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : Icon(
-                                  icon,
-                                  color: disabled
-                                      ? Theme.of(
-                                          context,
-                                        ).colorScheme.onSurfaceVariant
-                                      : activeColor,
-                                ),
-                        ),
-                      );
-                    },
+                        : const Icon(Icons.attach_file_rounded),
+                    onPressed:
+                        canCompose &&
+                            !_mediaUploading &&
+                            !_voiceSending &&
+                            !_voiceRecording
+                        ? _openAttachmentSheet
+                        : null,
                   ),
-              ],
+                  Expanded(
+                    child: Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.surfaceContainerLow,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: SubmitOnEnter(
+                        controller: _controller,
+                        enabled:
+                            allowEnterShortcut &&
+                            canCompose &&
+                            !_voiceRecording,
+                        onSubmit: _send,
+                        child: TextField(
+                          focusNode: _inputFocusNode,
+                          controller: _controller,
+                          enabled: canCompose && !_voiceRecording,
+                          minLines: 1,
+                          maxLines: 6,
+                          keyboardType: TextInputType.multiline,
+                          textInputAction: TextInputAction.newline,
+                          decoration: withInputLanguageBadge(
+                            InputDecoration(
+                              hintText: _voiceRecording
+                                  ? 'Говорите... отпустите кнопку для отправки'
+                                  : canCompose
+                                  ? 'Сообщение...'
+                                  : 'Отправка сообщений недоступна',
+                              border: InputBorder.none,
+                              isDense: true,
+                            ),
+                            controller: _controller,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Эмодзи',
+                    icon: const Icon(Icons.emoji_emotions_outlined),
+                    onPressed: canCompose && !_voiceRecording
+                        ? _openComposerEmojiPicker
+                        : null,
+                  ),
+                  if (_hasDraftText)
+                    IconButton(
+                      icon: _voiceSending
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.send_rounded),
+                      onPressed: !canCompose || _mediaUploading ? null : _send,
+                    )
+                  else
+                    Builder(
+                      builder: (context) {
+                        final disabled =
+                            !canCompose || _mediaUploading || _voiceSending;
+                        final activeColor = Theme.of(
+                          context,
+                        ).colorScheme.primary;
+                        final icon = _voiceRecording
+                            ? Icons.stop_circle_outlined
+                            : (_composerMediaMode == _ComposerMediaMode.camera
+                                  ? Icons.videocam_rounded
+                                  : Icons.mic_none_rounded);
+                        return GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () {
+                            if (disabled || _voiceRecording) {
+                              if (!canCompose && mounted) {
+                                showAppNotice(
+                                  context,
+                                  _composeBlockedReason() ??
+                                      'Отправка сообщений недоступна',
+                                  tone: AppNoticeTone.warning,
+                                  duration: const Duration(seconds: 2),
+                                );
+                              }
+                              return;
+                            }
+                            _toggleComposerMediaMode();
+                          },
+                          onLongPressStart: disabled
+                              ? null
+                              : (_) => unawaited(
+                                  _handleComposerMediaLongPressStart(),
+                                ),
+                          onLongPressEnd: disabled
+                              ? null
+                              : (_) => unawaited(
+                                  _handleComposerMediaLongPressEnd(),
+                                ),
+                          child: Container(
+                            width: 44,
+                            height: 44,
+                            alignment: Alignment.center,
+                            child: _voiceSending
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : Icon(
+                                    icon,
+                                    color: disabled
+                                        ? Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant
+                                        : activeColor,
+                                  ),
+                          ),
+                        );
+                      },
+                    ),
+                ],
+              ),
             ),
           ),
         ],
