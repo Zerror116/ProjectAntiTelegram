@@ -11,6 +11,8 @@ REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/garphoenix.com}"
 REMOTE_SERVICE="${REMOTE_SERVICE:-auto}"
 BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
+RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
+HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
 SKIP_BUILD="0"
 NO_COMMIT="0"
 
@@ -162,7 +164,14 @@ run_ssh "$SERVER" \
 set -euo pipefail
 
 cd "$REMOTE_PROJECT_DIR"
-git pull --ff-only origin "$BRANCH"
+if [[ -n "$(git status --porcelain)" ]]; then
+  STASH_NAME="autostash-before-deploy-$(date +%F-%H%M%S)"
+  echo "[deploy_full][server] remote tree is dirty, creating stash: $STASH_NAME"
+  git stash push -u -m "$STASH_NAME" >/dev/null || true
+fi
+
+git fetch origin "$BRANCH"
+git reset --hard "origin/$BRANCH"
 
 if [[ -d "$REMOTE_PROJECT_DIR/server" ]]; then
   cd "$REMOTE_PROJECT_DIR/server"
@@ -238,6 +247,9 @@ systemctl reload nginx
 REMOTE_SCRIPT
 
 echo "[deploy_full] done"
-echo "[deploy_full] quick checks:"
-echo "  curl -Iv https://garphoenix.com"
-echo "  curl -I https://garphoenix.com/.DS_Store"
+if [[ "$RUN_HEALTH_CHECK" == "1" ]]; then
+  echo "[deploy_full] running production health check for $HEALTH_DOMAIN"
+  bash "$SCRIPT_DIR/prod_health_check.sh" "$HEALTH_DOMAIN"
+else
+  echo "[deploy_full] RUN_HEALTH_CHECK=0, skip production health check"
+fi
