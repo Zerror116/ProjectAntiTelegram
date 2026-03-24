@@ -54,11 +54,21 @@ router.post("/", async (req, res) => {
     return res.json(result);
   } catch (err) {
     console.error("Setup error:", err);
-    return res.status(500).json({ ok: false, error: String(err) });
+    const isProd = process.env.NODE_ENV === "production";
+    return res.status(500).json({
+      ok: false,
+      error: isProd ? "Setup failed" : String(err),
+    });
   }
 });
 
-router.get("/", (_req, res) => {
+router.get("/", (req, res) => {
+  if (!canRunSetup(req)) {
+    return res.status(403).json({
+      ok: false,
+      error: "Setup endpoint is restricted",
+    });
+  }
   return res.json({
     ok: true,
     in_progress: setupInFlight != null,
