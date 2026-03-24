@@ -22,6 +22,30 @@ const productImageMaxMb = Math.max(
   Number.parseInt(String(process.env.PRODUCT_IMAGE_MAX_MB || '8').trim(), 10) || 8,
 );
 const productImageMaxBytes = productImageMaxMb * 1024 * 1024;
+const allowedImageExtensions = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.webp',
+  '.gif',
+  '.bmp',
+  '.heic',
+  '.heif',
+  '.avif',
+]);
+
+function isAcceptedProductImage(file) {
+  const mime = String(file?.mimetype || '')
+    .toLowerCase()
+    .trim();
+  if (mime.startsWith('image/')) return true;
+
+  // Some browsers send octet-stream for Blob uploads.
+  if (mime !== '' && mime !== 'application/octet-stream') return false;
+
+  const ext = path.extname(String(file?.originalname || '').toLowerCase());
+  return allowedImageExtensions.has(ext);
+}
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -34,7 +58,7 @@ const upload = multer({
   }),
   limits: { fileSize: productImageMaxBytes },
   fileFilter: (_req, file, cb) => {
-    if (String(file.mimetype || '').startsWith('image/')) {
+    if (isAcceptedProductImage(file)) {
       cb(null, true);
       return;
     }
