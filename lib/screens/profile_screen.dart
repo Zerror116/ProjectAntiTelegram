@@ -776,6 +776,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
     setState(() => _message = 'Ссылка приглашения скопирована');
   }
 
+  String _normalizedQrInviteData(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return '';
+    final parsed = Uri.tryParse(trimmed);
+    if (parsed != null && parsed.hasScheme && parsed.host.isNotEmpty) {
+      return parsed.toString();
+    }
+    return Uri.encodeFull(trimmed);
+  }
+
   Future<void> _loadTenantClients({String? searchOverride}) async {
     if (!_canManageTenantUsers) return;
     final search = (searchOverride ?? _tenantClientSearchCtrl.text).trim();
@@ -1504,44 +1514,82 @@ class _ProfileScreenState extends State<ProfileScreen> {
                             ),
                           ],
                           if (_publicInviteLink.trim().isNotEmpty) ...[
-                            const SizedBox(height: 12),
-                            Center(
-                              child: Container(
-                                padding: const EdgeInsets.all(12),
-                                decoration: BoxDecoration(
-                                  color: Colors.white,
-                                  borderRadius: BorderRadius.circular(16),
-                                  border: Border.all(
-                                    color: theme.colorScheme.outlineVariant,
-                                  ),
-                                ),
-                                child: QrImageView(
-                                  data: _publicInviteLink.trim(),
-                                  size: 220,
-                                  eyeStyle: const QrEyeStyle(
-                                    eyeShape: QrEyeShape.square,
-                                  ),
-                                  dataModuleStyle: const QrDataModuleStyle(
-                                    dataModuleShape: QrDataModuleShape.square,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            SelectableText(
-                              _publicInviteLink.trim(),
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            SizedBox(
-                              width: double.infinity,
-                              child: OutlinedButton.icon(
-                                onPressed: _copyPublicInviteLink,
-                                icon: const Icon(Icons.link_rounded),
-                                label: const Text('Скопировать ссылку'),
-                              ),
+                            Builder(
+                              builder: (context) {
+                                final qrData = _normalizedQrInviteData(
+                                  _publicInviteLink,
+                                );
+                                if (qrData.isEmpty) {
+                                  return const SizedBox.shrink();
+                                }
+                                return Column(
+                                  children: [
+                                    const SizedBox(height: 12),
+                                    Center(
+                                      child: Container(
+                                        padding: const EdgeInsets.all(12),
+                                        decoration: BoxDecoration(
+                                          color: Colors.white,
+                                          borderRadius: BorderRadius.circular(
+                                            16,
+                                          ),
+                                          border: Border.all(
+                                            color: theme
+                                                .colorScheme
+                                                .outlineVariant,
+                                          ),
+                                        ),
+                                        child: QrImageView(
+                                          data: qrData,
+                                          size: 220,
+                                          gapless: false,
+                                          eyeStyle: const QrEyeStyle(
+                                            eyeShape: QrEyeShape.square,
+                                          ),
+                                          dataModuleStyle:
+                                              const QrDataModuleStyle(
+                                                dataModuleShape:
+                                                    QrDataModuleShape.square,
+                                              ),
+                                          errorStateBuilder: (_, error) {
+                                            return const SizedBox(
+                                              width: 220,
+                                              height: 220,
+                                              child: Center(
+                                                child: Text(
+                                                  'QR временно недоступен',
+                                                  textAlign: TextAlign.center,
+                                                ),
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 10),
+                                    SelectableText(
+                                      _publicInviteLink.trim(),
+                                      style: theme.textTheme.bodySmall
+                                          ?.copyWith(
+                                            color: theme
+                                                .colorScheme
+                                                .onSurfaceVariant,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    SizedBox(
+                                      width: double.infinity,
+                                      child: OutlinedButton.icon(
+                                        onPressed: _copyPublicInviteLink,
+                                        icon: const Icon(Icons.link_rounded),
+                                        label: const Text(
+                                          'Скопировать ссылку',
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                );
+                              },
                             ),
                           ],
                         ],

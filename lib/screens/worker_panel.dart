@@ -634,43 +634,64 @@ class _WorkerPanelState extends State<WorkerPanel>
       }
 
       XFile? picked;
+      Uint8List? preloadedBytes;
+      String? preloadedFileName;
       if (effectiveSource == ImageSource.gallery &&
           _preferFilePickerForGallery) {
-        // On desktop first try ImagePicker, then fallback to FilePicker.
-        try {
-          picked = await _imagePicker.pickImage(source: ImageSource.gallery);
-        } catch (_) {}
-
-        try {
-          if (picked == null) {
-            final result = await FilePicker.platform.pickFiles(
-              type: FileType.image,
-              allowMultiple: false,
-              withData: kIsWeb,
-            );
-            final selected = result?.files.single;
+        if (kIsWeb) {
+          // Web: read bytes directly from FilePicker to avoid revoked Blob URLs.
+          final result = await FilePicker.platform.pickFiles(
+            type: FileType.image,
+            allowMultiple: false,
+            withData: true,
+          );
+          final selected = result?.files.single;
+          final bytes = selected?.bytes;
+          if (bytes != null && bytes.isNotEmpty) {
+            preloadedBytes = bytes;
+            preloadedFileName = (selected?.name ?? 'image.jpg').trim();
+            picked = XFile.fromData(bytes, name: preloadedFileName);
+          } else {
             final path = selected?.path;
             if (path != null && path.isNotEmpty) {
               picked = XFile(path, name: selected?.name ?? '');
-            } else {
-              final bytes = selected?.bytes;
-              if (bytes != null && bytes.isNotEmpty) {
-                picked = XFile.fromData(
-                  bytes,
-                  name: selected?.name ?? 'image.jpg',
-                  mimeType: selected?.extension,
-                );
-              }
             }
           }
-        } catch (_) {
-          // Ignore and handle below.
+        } else {
+          // Desktop: first try ImagePicker, then fallback to FilePicker.
+          try {
+            picked = await _imagePicker.pickImage(source: ImageSource.gallery);
+          } catch (_) {}
+
+          try {
+            if (picked == null) {
+              final result = await FilePicker.platform.pickFiles(
+                type: FileType.image,
+                allowMultiple: false,
+                withData: false,
+              );
+              final selected = result?.files.single;
+              final path = selected?.path;
+              if (path != null && path.isNotEmpty) {
+                picked = XFile(path, name: selected?.name ?? '');
+              } else {
+                final bytes = selected?.bytes;
+                if (bytes != null && bytes.isNotEmpty) {
+                  preloadedBytes = bytes;
+                  preloadedFileName = (selected?.name ?? 'image.jpg').trim();
+                  picked = XFile.fromData(bytes, name: preloadedFileName);
+                }
+              }
+            }
+          } catch (_) {
+            // Ignore and handle below.
+          }
         }
       } else {
         picked = await _imagePicker.pickImage(source: effectiveSource);
       }
 
-      if (picked == null) {
+      if (picked == null && (preloadedBytes == null || preloadedBytes.isEmpty)) {
         if (!mounted) return;
         setState(() {
           _message = 'Фото не выбрано';
@@ -679,12 +700,16 @@ class _WorkerPanelState extends State<WorkerPanel>
       }
 
       Uint8List pickedBytes;
-      try {
-        pickedBytes = await picked.readAsBytes();
-      } catch (e) {
-        if (!mounted) return;
-        setState(() => _message = 'Не удалось прочитать фото: $e');
-        return;
+      if (preloadedBytes != null && preloadedBytes.isNotEmpty) {
+        pickedBytes = preloadedBytes;
+      } else {
+        try {
+          pickedBytes = await picked!.readAsBytes();
+        } catch (e) {
+          if (!mounted) return;
+          setState(() => _message = 'Не удалось прочитать фото: $e');
+          return;
+        }
       }
       if (pickedBytes.isEmpty) {
         if (!mounted) return;
@@ -693,6 +718,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       }
 
       if (!mounted) return;
+      if (preloadedFileName != null && preloadedFileName.isNotEmpty) {
+        _pickedImageUploadFileName = preloadedFileName;
+      }
       final cropResult = await showProductPhotoCropDialog(
         context: context,
         sourceBytes: pickedBytes,
