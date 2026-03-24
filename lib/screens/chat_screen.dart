@@ -72,6 +72,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _searchMode = false;
   bool _voiceRecording = false;
   bool _voiceSending = false;
+  bool _voiceRecordingLocked = false;
   _ComposerMediaMode _composerMediaMode = _ComposerMediaMode.voice;
   bool _composerMediaPressActive = false;
   bool _composerHoldActionTriggered = false;
@@ -102,9 +103,14 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<PlayerState>? _voiceStateSub;
   StreamSubscription<void>? _voiceCompleteSub;
   DateTime? _voiceRecordingStartedAt;
+  Offset? _composerPressStartGlobal;
+  double _recordingDragDx = 0;
+  double _recordingDragDy = 0;
   bool _microphonePermissionAsked = false;
   bool _microphonePermissionGranted = false;
   bool _microphonePermissionDenied = false;
+  Future<List<({RecordConfig config, String extension, String label})>>?
+  _webVoiceConfigsFuture;
 
   final Set<String> _messageIds = {};
   final Set<String> _placedCartItemIds = {};
@@ -1128,7 +1134,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<List<({RecordConfig config, String extension, String label})>>
-  _resolveWebVoiceRecordConfigs() async {
+  _resolveWebVoiceRecordConfigs() {
+    final cached = _webVoiceConfigsFuture;
+    if (cached != null) return cached;
+    final future = _computeWebVoiceRecordConfigs();
+    _webVoiceConfigsFuture = future;
+    return future;
+  }
+
+  Future<List<({RecordConfig config, String extension, String label})>>
+  _computeWebVoiceRecordConfigs() async {
     final candidates =
         <({RecordConfig config, String extension, String label})>[];
 
@@ -1334,7 +1349,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final picked = await _imagePicker.pickVideo(
       source: source,
-      maxDuration: const Duration(seconds: 90),
+      maxDuration: const Duration(seconds: 60),
       preferredCameraDevice: source == ImageSource.camera
           ? CameraDevice.front
           : CameraDevice.rear,
@@ -1726,7 +1741,10 @@ class _ChatScreenState extends State<ChatScreen> {
       _voiceRecordingTimer?.cancel();
       setState(() {
         _voiceRecording = true;
+        _voiceRecordingLocked = false;
         _recordingSeconds = 0;
+        _recordingDragDx = 0;
+        _recordingDragDy = 0;
       });
       _voiceRecordingStartedAt = DateTime.now();
       _microphonePermissionGranted = true;
@@ -1805,7 +1823,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _voiceRecordingStartedAt = null;
     setState(() {
       _voiceRecording = false;
+      _voiceRecordingLocked = false;
       _recordingSeconds = 0;
+      _recordingDragDx = 0;
+      _recordingDragDy = 0;
     });
     try {
       final recordedPath = await _voiceRecorder.stop();
@@ -1872,6 +1893,37 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<void> _cancelVoiceRecording({
+    String notice = 'Голосовое отменено',
+  }) async {
+    if (!_voiceRecording && !_voiceStartInProgress) {
+      _voiceRecordingLocked = false;
+      _recordingDragDx = 0;
+      _recordingDragDy = 0;
+      return;
+    }
+    _voiceRecordingTimer?.cancel();
+    _voiceRecordingTimer = null;
+    _voiceRecordingStartedAt = null;
+    setState(() {
+      _voiceRecording = false;
+      _voiceRecordingLocked = false;
+      _recordingSeconds = 0;
+      _recordingDragDx = 0;
+      _recordingDragDy = 0;
+    });
+    try {
+      await _voiceRecorder.stop();
+    } catch (_) {}
+    if (!mounted) return;
+    showAppNotice(
+      context,
+      notice,
+      tone: AppNoticeTone.info,
+      duration: const Duration(milliseconds: 900),
+    );
+  }
+
   Future<void> _captureAndSendVideoMessage() async {
     if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
@@ -1887,7 +1939,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       showAppNotice(
         context,
-        'Не удалось записать видео',
+        'Не удалось записать видео: ${_extractDioError(e)}',
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
       );
@@ -1963,6 +2015,7 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool disabled,
     required BuildContext context,
     required bool canCompose,
+    required TapDownDetails details,
   }) {
     if (disabled) return;
     final isDesktopWeb =
@@ -1972,10 +2025,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (isDesktopWeb && !_cameraSupported) {
       return;
     }
+    if (kIsWeb &&
+        _composerMediaMode == _ComposerMediaMode.voice &&
+        _webVoiceConfigsFuture == null) {
+      // Warm up encoder support detection once to avoid a long delay on first hold.
+      unawaited(_resolveWebVoiceRecordConfigs());
+    }
     _composerMediaPressActive = true;
+    _composerPressStartGlobal = details.globalPosition;
     _composerHoldActionTriggered = false;
     _cancelComposerMediaHoldTimer();
-    _composerMediaHoldTimer = Timer(const Duration(milliseconds: 100), () {
+    _composerMediaHoldTimer = Timer(const Duration(milliseconds: 40), () {
       unawaited(_runComposerHoldAction());
     });
   }
@@ -1987,10 +2047,13 @@ class _ChatScreenState extends State<ChatScreen> {
   }) async {
     final holdTriggered = _composerHoldActionTriggered;
     _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
 
     if (holdTriggered) {
-      if (_composerMediaMode == _ComposerMediaMode.voice && _voiceRecording) {
+      if (_composerMediaMode == _ComposerMediaMode.voice &&
+          _voiceRecording &&
+          !_voiceRecordingLocked) {
         await _stopVoiceRecordingAndSend();
       }
       return;
@@ -2006,10 +2069,59 @@ class _ChatScreenState extends State<ChatScreen> {
   void _handleComposerMediaTapCancel() {
     final holdTriggered = _composerHoldActionTriggered;
     _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
     if (holdTriggered &&
         _composerMediaMode == _ComposerMediaMode.voice &&
+        !_voiceRecordingLocked &&
         _voiceRecording) {
+      unawaited(_stopVoiceRecordingAndSend());
+    }
+  }
+
+  void _handleComposerMediaPanUpdate(DragUpdateDetails details) {
+    if (!_composerMediaPressActive) return;
+    final start = _composerPressStartGlobal;
+    if (start == null) return;
+    final dx = details.globalPosition.dx - start.dx;
+    final dy = details.globalPosition.dy - start.dy;
+    if (_voiceRecording && mounted) {
+      setState(() {
+        _recordingDragDx = dx;
+        _recordingDragDy = dy;
+      });
+    }
+    if (!_voiceRecording || _voiceRecordingLocked) return;
+    if (dx <= -88) {
+      unawaited(
+        _cancelVoiceRecording(notice: 'Голосовое отменено (свайп влево)'),
+      );
+      _composerMediaPressActive = false;
+      _cancelComposerMediaHoldTimer();
+      return;
+    }
+    if (dy <= -72) {
+      setState(() {
+        _voiceRecordingLocked = true;
+      });
+      showAppNotice(
+        context,
+        'Запись зафиксирована',
+        tone: AppNoticeTone.info,
+        duration: const Duration(milliseconds: 900),
+      );
+    }
+  }
+
+  void _handleComposerMediaPanEnd() {
+    final holdTriggered = _composerHoldActionTriggered;
+    _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
+    _cancelComposerMediaHoldTimer();
+    if (holdTriggered &&
+        _composerMediaMode == _ComposerMediaMode.voice &&
+        _voiceRecording &&
+        !_voiceRecordingLocked) {
       unawaited(_stopVoiceRecordingAndSend());
     }
   }
@@ -4665,21 +4777,54 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_voiceRecording)
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: Row(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(
-                    Icons.mic_rounded,
-                    color: Theme.of(context).colorScheme.error,
-                    size: 18,
+                  Row(
+                    children: [
+                      Icon(
+                        _voiceRecordingLocked
+                            ? Icons.lock_clock_rounded
+                            : Icons.mic_rounded,
+                        color: Theme.of(context).colorScheme.error,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Запись голосового: ${_formatDurationLabel(Duration(seconds: _recordingSeconds))}',
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.onSurface,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      if (_voiceRecordingLocked) ...[
+                        TextButton(
+                          onPressed: () => unawaited(_cancelVoiceRecording()),
+                          child: const Text('Отмена'),
+                        ),
+                        const SizedBox(width: 6),
+                        FilledButton.tonal(
+                          onPressed: () =>
+                              unawaited(_stopVoiceRecordingAndSend()),
+                          child: const Text('Отправить'),
+                        ),
+                      ],
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  Text(
-                    'Запись голосового: ${_formatDurationLabel(Duration(seconds: _recordingSeconds))}',
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.onSurface,
-                      fontWeight: FontWeight.w700,
+                  if (!_voiceRecordingLocked)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        'Влево — отмена • Вверх — зафиксировать'
+                        '${_recordingDragDx < 0 || _recordingDragDy < 0 ? '  (${(-_recordingDragDx).round()}x / ${(-_recordingDragDy).round()}y)' : ''}',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          fontSize: 12,
+                        ),
+                      ),
                     ),
-                  ),
                 ],
               ),
             ),
@@ -4783,10 +4928,11 @@ class _ChatScreenState extends State<ChatScreen> {
                                   : Icons.mic_none_rounded);
                         return GestureDetector(
                           behavior: HitTestBehavior.opaque,
-                          onTapDown: (_) => _handleComposerMediaTapDown(
+                          onTapDown: (details) => _handleComposerMediaTapDown(
                             disabled: disabled,
                             context: context,
                             canCompose: canCompose,
+                            details: details,
                           ),
                           onTapUp: (_) => unawaited(
                             _handleComposerMediaTapUp(
@@ -4796,6 +4942,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           ),
                           onTapCancel: _handleComposerMediaTapCancel,
+                          onPanUpdate: _handleComposerMediaPanUpdate,
+                          onPanEnd: (_) => _handleComposerMediaPanEnd(),
+                          onPanCancel: _handleComposerMediaTapCancel,
                           child: Container(
                             width: 44,
                             height: 44,
