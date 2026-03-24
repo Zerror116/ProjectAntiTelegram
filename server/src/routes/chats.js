@@ -85,6 +85,15 @@ const CHAT_MEDIA_MARKERS = Object.freeze({
   video: "/uploads/chat_media/video/",
 });
 
+const CHAT_MEDIA_MAX_FILE_SIZE_BYTES = Math.max(
+  8 * 1024 * 1024,
+  Number(process.env.CHAT_MEDIA_MAX_FILE_SIZE_BYTES || 64 * 1024 * 1024),
+);
+const CHAT_MEDIA_MAX_FILE_SIZE_MB = Math.max(
+  8,
+  Math.round(CHAT_MEDIA_MAX_FILE_SIZE_BYTES / (1024 * 1024)),
+);
+
 function isVoiceMimeAllowed(mimeRaw, originalNameRaw) {
   const mime = String(mimeRaw || "").toLowerCase().trim();
   const originalName = String(originalNameRaw || "").toLowerCase().trim();
@@ -135,7 +144,7 @@ const chatMediaUpload = multer({
       cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
     },
   }),
-  limits: { fileSize: 16 * 1024 * 1024 },
+  limits: { fileSize: CHAT_MEDIA_MAX_FILE_SIZE_BYTES },
   fileFilter: (_req, file, cb) => {
     const mime = String(file.mimetype || "").toLowerCase().trim();
     if (file.fieldname === "image") {
@@ -205,7 +214,7 @@ function uploadChatMedia(req, res, next) {
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
       return res.status(400).json({
         ok: false,
-        error: "Размер вложения не должен превышать 16MB",
+        error: `Размер вложения не должен превышать ${CHAT_MEDIA_MAX_FILE_SIZE_MB}MB`,
       });
     }
     return res.status(400).json({

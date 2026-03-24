@@ -9,7 +9,7 @@ REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/opt/fenix}"
 REMOTE_TMP_DIR="${REMOTE_TMP_DIR:-/tmp/garphoenix-web}"
 REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/garphoenix.com}"
 REMOTE_SERVICE="${REMOTE_SERVICE:-auto}"
-BUILD_ARGS="${BUILD_ARGS:---release --pwa-strategy=none --no-wasm-dry-run}"
+BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 SKIP_BUILD="0"
 NO_COMMIT="0"
@@ -189,6 +189,22 @@ if [[ "$SERVICE" == "auto" ]]; then
 fi
 
 if [[ -n "$SERVICE" ]]; then
+  mapfile -t PORT_3000_PIDS < <(
+    ss -ltnp 2>/dev/null | grep ':3000' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+  )
+  for PID in "${PORT_3000_PIDS[@]:-}"; do
+    [[ -z "$PID" ]] && continue
+    OWNER_SERVICE=""
+    if [[ -r "/proc/$PID/cgroup" ]]; then
+      OWNER_SERVICE=$(grep -aoE '[^/]+\.service' "/proc/$PID/cgroup" | head -n1 || true)
+    fi
+    if [[ -n "$OWNER_SERVICE" && "$OWNER_SERVICE" == "$SERVICE" ]]; then
+      continue
+    fi
+    echo "[deploy_full][server] stopping stale process on :3000 pid=$PID service=${OWNER_SERVICE:-none}"
+    kill -TERM "$PID" || true
+  done
+  sleep 1
   systemctl daemon-reload || true
   systemctl restart "$SERVICE"
   systemctl is-active "$SERVICE"
