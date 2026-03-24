@@ -919,8 +919,20 @@ String? _resolveAppUpdatePlatform() {
 }
 
 Future<bool> _openUpdateUrl(String rawUrl) async {
-  final uri = Uri.tryParse(rawUrl.trim());
-  if (uri == null) return false;
+  final trimmed = rawUrl.trim();
+  if (trimmed.isEmpty) return false;
+
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null) return false;
+
+  Uri uri = parsed;
+  if (!parsed.hasScheme) {
+    final base = Uri.tryParse(dio.options.baseUrl.trim());
+    if (base != null && base.hasScheme && base.host.isNotEmpty) {
+      uri = base.resolveUri(parsed);
+    }
+  }
+
   try {
     return await launchUrl(uri, mode: LaunchMode.externalApplication);
   } catch (_) {
