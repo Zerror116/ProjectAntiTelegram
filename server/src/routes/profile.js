@@ -122,6 +122,97 @@ function buildInviteLink(req, inviteCode, tenantCode = "") {
   return `${req.protocol}://${req.get("host")}/?invite=${encodedInvite}${tenantPart}`;
 }
 
+async function resolveTenantCode(tenantId, fallbackCode = "") {
+  const fromFallback = String(fallbackCode || "").trim().toLowerCase();
+  if (fromFallback) return fromFallback;
+  const normalizedTenantId = String(tenantId || "").trim();
+  if (!normalizedTenantId) return "";
+  try {
+    const tenantQ = await pool.query(
+      `SELECT code
+       FROM tenants
+       WHERE id = $1::uuid
+       LIMIT 1`,
+      [normalizedTenantId],
+    );
+    if (tenantQ.rowCount > 0) {
+      return String(tenantQ.rows[0]?.code || "").trim().toLowerCase();
+    }
+  } catch (_) {
+    // ignore
+  }
+  return "";
+}
+
+async function getOrCreateClientInvite({ tenantId, userId }) {
+  const normalizedTenantId = String(tenantId || "").trim();
+  const normalizedUserId = String(userId || "").trim();
+  if (!normalizedTenantId || !normalizedUserId) {
+    return {
+      ok: false,
+      status: 403,
+      error: "Аккаунт не привязан к группе арендатора",
+    };
+  }
+
+  const existing = await pool.query(
+    `SELECT id, code
+     FROM tenant_invites
+     WHERE tenant_id = $1::uuid
+       AND role = 'client'
+       AND is_active = true
+       AND (expires_at IS NULL OR expires_at > now())
+       AND (max_uses IS NULL OR used_count < max_uses)
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [normalizedTenantId],
+  );
+
+  if (existing.rowCount > 0) {
+    return {
+      ok: true,
+      data: {
+        inviteId: String(existing.rows[0]?.id || "").trim(),
+        inviteCode: String(existing.rows[0]?.code || "").trim(),
+      },
+    };
+  }
+
+  for (let i = 0; i < 5; i += 1) {
+    const nextCode = normalizeInviteCode(generateInviteCode());
+    try {
+      const insert = await pool.query(
+        `INSERT INTO tenant_invites (
+           id, tenant_id, code, role, is_active, max_uses,
+           used_count, expires_at, created_by, notes, created_at, updated_at
+         )
+         VALUES (
+           $1, $2::uuid, $3, 'client', true, NULL,
+           0, NULL, $4::uuid, 'Публичная клиентская ссылка', now(), now()
+         )
+         RETURNING id, code`,
+        [uuidv4(), normalizedTenantId, nextCode, normalizedUserId],
+      );
+      return {
+        ok: true,
+        data: {
+          inviteId: String(insert.rows[0]?.id || "").trim(),
+          inviteCode: String(insert.rows[0]?.code || "").trim(),
+        },
+      };
+    } catch (err) {
+      if (String(err?.code || "") === "23505") continue;
+      throw err;
+    }
+  }
+
+  return {
+    ok: false,
+    status: 500,
+    error: "Не удалось создать клиентский код приглашения",
+  };
+}
+
 async function loadUserProfile(userId) {
   const result = await pool.query(
     `SELECT 
@@ -1011,8 +1102,7 @@ router.get(
     }
 
     const tenantId = String(req.user?.tenant_id || "").trim();
-    const tenantCode = String(req.user?.tenant_code || "").trim();
-    if (!tenantId || !tenantCode) {
+    if (!tenantId) {
       return res.status(403).json({
         ok: false,
         error: "Аккаунт не привязан к группе арендатора",
@@ -1020,58 +1110,25 @@ router.get(
     }
 
     try {
-      const existing = await pool.query(
-        `SELECT id, code, is_active, max_uses, used_count, expires_at
-         FROM tenant_invites
-         WHERE tenant_id = $1
-           AND role = 'client'
-           AND is_active = true
-           AND (expires_at IS NULL OR expires_at > now())
-           AND (max_uses IS NULL OR used_count < max_uses)
-         ORDER BY created_at DESC
-         LIMIT 1`,
-        [tenantId],
-      );
-
-      let inviteCode = "";
-      let inviteId = "";
-      if (existing.rowCount > 0) {
-        inviteCode = String(existing.rows[0].code || "").trim();
-        inviteId = String(existing.rows[0].id || "").trim();
-      } else {
-        let created = null;
-        for (let i = 0; i < 5; i += 1) {
-          const nextCode = normalizeInviteCode(generateInviteCode());
-          try {
-            const insert = await pool.query(
-              `INSERT INTO tenant_invites (
-                 id, tenant_id, code, role, is_active, max_uses,
-                 used_count, expires_at, created_by, notes, created_at, updated_at
-               )
-               VALUES (
-                 $1, $2, $3, 'client', true, NULL,
-                 0, NULL, $4, 'Публичная клиентская ссылка', now(), now()
-               )
-               RETURNING id, code`,
-              [uuidv4(), tenantId, nextCode, req.user.id],
-            );
-            created = insert.rows[0];
-            break;
-          } catch (err) {
-            if (String(err?.code || "") === "23505") continue;
-            throw err;
-          }
-        }
-
-        if (!created) {
-          return res.status(500).json({
-            ok: false,
-            error: "Не удалось создать клиентский код приглашения",
-          });
-        }
-        inviteCode = String(created.code || "").trim();
-        inviteId = String(created.id || "").trim();
+      const tenantCode = await resolveTenantCode(tenantId, req.user?.tenant_code);
+      if (!tenantCode) {
+        return res.status(403).json({
+          ok: false,
+          error: "Аккаунт не привязан к группе арендатора",
+        });
       }
+      const invite = await getOrCreateClientInvite({
+        tenantId,
+        userId: req.user.id,
+      });
+      if (!invite.ok) {
+        return res.status(invite.status || 500).json({
+          ok: false,
+          error: invite.error || "Ошибка сервера",
+        });
+      }
+      const inviteCode = String(invite.data?.inviteCode || "").trim();
+      const inviteId = String(invite.data?.inviteId || "").trim();
 
       return res.json({
         ok: true,
@@ -1088,6 +1145,51 @@ router.get(
     }
   },
 );
+
+router.get("/group-invite", authMiddleware, async (req, res) => {
+  const tenantId = String(req.user?.tenant_id || "").trim();
+  if (!tenantId) {
+    return res.status(403).json({
+      ok: false,
+      error: "Аккаунт не привязан к группе арендатора",
+    });
+  }
+
+  try {
+    const tenantCode = await resolveTenantCode(tenantId, req.user?.tenant_code);
+    if (!tenantCode) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+    const invite = await getOrCreateClientInvite({
+      tenantId,
+      userId: req.user.id,
+    });
+    if (!invite.ok) {
+      return res.status(invite.status || 500).json({
+        ok: false,
+        error: invite.error || "Ошибка сервера",
+      });
+    }
+    const inviteCode = String(invite.data?.inviteCode || "").trim();
+    const inviteId = String(invite.data?.inviteId || "").trim();
+
+    return res.json({
+      ok: true,
+      data: {
+        invite_id: inviteId,
+        code: inviteCode,
+        tenant_code: tenantCode,
+        invite_link: buildInviteLink(req, inviteCode, tenantCode),
+      },
+    });
+  } catch (err) {
+    console.error("profile.groupInvite error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
 
 router.get(
   "/tenant/clients",

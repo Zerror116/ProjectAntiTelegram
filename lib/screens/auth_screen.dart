@@ -23,7 +23,7 @@ class AuthScreen extends StatefulWidget {
 
 class _AuthScreenState extends State<AuthScreen> {
   static const String _creatorEmail = 'zerotwo02166@gmail.com';
-  static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v1';
+  static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -37,6 +37,7 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _apkInfoLoading = false;
   String? _apkDownloadUrl;
   String _apkInfoMessage = '';
+  String _tenantCodeFromLink = '';
 
   late final AuthService _authService;
 
@@ -63,6 +64,7 @@ class _AuthScreenState extends State<AuthScreen> {
 
     final tenantFromLink = _extractTenantFromUri();
     if (tenantFromLink.isNotEmpty) {
+      _tenantCodeFromLink = tenantFromLink;
       _authService.setTenantCode(tenantFromLink);
     }
 
@@ -72,7 +74,7 @@ class _AuthScreenState extends State<AuthScreen> {
       _isRegister = true;
     }
 
-    if (!_isIosWebRestricted()) {
+    if (!_isAndroidWebRestricted()) {
       _tryAutoLogin();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -83,10 +85,11 @@ class _AuthScreenState extends State<AuthScreen> {
 
   void _prepareWebExperience() {
     if (!kIsWeb) return;
-    _loadApkDownloadUrl();
-    if (!_isIosWebRestricted()) {
-      _maybeShowIosAddToHomeHint();
+    if (_isAndroidWeb()) {
+      _loadApkDownloadUrl();
+      return;
     }
+    _maybeShowIosAddToHomeHint();
   }
 
   bool _isIosWeb() {
@@ -97,8 +100,8 @@ class _AuthScreenState extends State<AuthScreen> {
     return kIsWeb && defaultTargetPlatform == TargetPlatform.android;
   }
 
-  bool _isIosWebRestricted() {
-    return _isIosWeb();
+  bool _isAndroidWebRestricted() {
+    return _isAndroidWeb();
   }
 
   String _extractServerMessage(
@@ -250,6 +253,25 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
+  Future<void> _copyInviteCodeFromLink() async {
+    final inviteCode = _accessKeyController.text.trim();
+    if (inviteCode.isEmpty) {
+      showAppNotice(
+        context,
+        'Код приглашения не найден в ссылке',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: inviteCode));
+    if (!mounted) return;
+    showAppNotice(
+      context,
+      'Код приглашения скопирован',
+      tone: AppNoticeTone.success,
+    );
+  }
+
   Future<void> _maybeShowIosAddToHomeHint() async {
     if (!_isIosWeb()) return;
     try {
@@ -265,7 +287,7 @@ class _AuthScreenState extends State<AuthScreen> {
         context: context,
         builder: (dialogContext) {
           return AlertDialog(
-            title: const Text('Установить на iPhone'),
+            title: const Text('Как добавить сайт в быстрый доступ'),
             content: const Text(
               'Чтобы открывать сайт как приложение, добавьте его на экран «Домой»:\n\n'
               'Safari → Поделиться → На экран «Домой».',
@@ -556,8 +578,10 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isIosWebRestricted()) {
+    if (_isAndroidWebRestricted()) {
       final theme = Theme.of(context);
+      final inviteCode = _accessKeyController.text.trim().toUpperCase();
+      final tenantCode = _tenantCodeFromLink.trim().toLowerCase();
       return Scaffold(
         body: SafeArea(
           child: Center(
@@ -596,7 +620,7 @@ class _AuthScreenState extends State<AuthScreen> {
                             borderRadius: BorderRadius.circular(999),
                           ),
                           child: const Text(
-                            'iPhone режим',
+                            'Android APK',
                             style: TextStyle(
                               color: Colors.white,
                               fontWeight: FontWeight.w700,
@@ -605,7 +629,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                         const SizedBox(height: 12),
                         const Text(
-                          'Веб-версия для iPhone отключена',
+                          'Веб-версия на Android отключена',
                           style: TextStyle(
                             color: Colors.white,
                             fontSize: 22,
@@ -614,7 +638,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Доступ с iPhone ограничен. Для работы используйте Android-приложение (APK).',
+                          'Для Android доступна только установка приложения (APK). После установки войдите с кодом вашей группы.',
                           style: TextStyle(
                             color: Colors.white,
                             fontSize: 14,
@@ -638,17 +662,37 @@ class _AuthScreenState extends State<AuthScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Добавить ярлык как у банковских приложений',
+                            'Как войти в приложении',
                             style: theme.textTheme.titleMedium?.copyWith(
                               fontWeight: FontWeight.w800,
                             ),
                           ),
                           const SizedBox(height: 10),
-                          const Text('1. Откройте сайт в Safari'),
+                          const Text('1. Нажмите кнопку «Скачать APK».'),
                           const SizedBox(height: 4),
-                          const Text('2. Нажмите «Поделиться»'),
+                          const Text('2. Установите приложение на Android.'),
                           const SizedBox(height: 4),
-                          const Text('3. Выберите «На экран Домой»'),
+                          const Text(
+                            '3. На экране регистрации вставьте код приглашения.',
+                          ),
+                          if (inviteCode.isNotEmpty) ...[
+                            const SizedBox(height: 12),
+                            SelectableText(
+                              'Код приглашения: $inviteCode',
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ],
+                          if (tenantCode.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            SelectableText(
+                              'Группа: $tenantCode',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -657,20 +701,36 @@ class _AuthScreenState extends State<AuthScreen> {
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton.icon(
-                      onPressed: null,
+                      onPressed: _apkInfoLoading ? null : _openApkDownload,
                       icon: const Icon(Icons.android_rounded),
-                      label: const Text('Скачать APK (только Android)'),
+                      label: Text(
+                        _apkInfoLoading
+                            ? 'Загрузка...'
+                            : 'Скачать APK (только Android)',
+                      ),
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      onPressed: _copyApkLink,
-                      icon: const Icon(Icons.copy_rounded),
-                      label: const Text('Скопировать ссылку APK'),
+                  if (inviteCode.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _copyInviteCodeFromLink,
+                        icon: const Icon(Icons.copy_rounded),
+                        label: const Text('Скопировать код приглашения'),
+                      ),
                     ),
-                  ),
+                  ] else ...[
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _copyApkLink,
+                        icon: const Icon(Icons.copy_rounded),
+                        label: const Text('Скопировать ссылку APK'),
+                      ),
+                    ),
+                  ],
                   if (_apkInfoMessage.trim().isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Text(
@@ -837,33 +897,6 @@ class _AuthScreenState extends State<AuthScreen> {
                 ),
               ],
             ),
-            if (_isAndroidWeb()) ...[
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: _apkInfoLoading ? null : _openApkDownload,
-                  icon: _apkInfoLoading
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.download_rounded),
-                  label: const Text('Скачать APK для Android'),
-                ),
-              ),
-              if (_apkInfoMessage.trim().isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text(
-                  _apkInfoMessage.trim(),
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ],
             const SizedBox(height: 8),
             if (_message.isNotEmpty)
               Text(_message, style: const TextStyle(color: Colors.red)),

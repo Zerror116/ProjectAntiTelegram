@@ -2008,7 +2008,7 @@ Future<void> _initSocket() async {
 
 Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
-  if (kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+  if (kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     return const AuthScreen();
   }
   if (!dbReady) return const SetupFailedScreen();

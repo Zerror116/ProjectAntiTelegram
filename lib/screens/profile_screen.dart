@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import '../main.dart';
 import '../src/utils/media_url.dart';
@@ -39,6 +40,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   double _avatarZoom = 1;
   String _message = '';
   String _publicInviteCode = '';
+  String _publicInviteLink = '';
+  String _publicInviteTenantCode = '';
   String _viewMode = 'creator';
   Map<String, dynamic> _stats = const {};
   bool _statsExpanded = false;
@@ -679,26 +682,39 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _fetchPublicInviteCode() async {
-    if (!_canManageTenantInvites) return;
+    if (!_canManageTenantInvites &&
+        (authService.currentUser?.tenantCode ?? '').trim().isEmpty) {
+      return;
+    }
     if (_inviteBusy) return;
     setState(() {
       _inviteBusy = true;
       _message = '';
     });
     try {
-      final resp = await authService.dio.get(
-        '/api/profile/tenant/client-invite',
-        options: _tenantManagerRequestOptions(),
-      );
+      Response<dynamic> resp;
+      try {
+        resp = await authService.dio.get('/api/profile/group-invite');
+      } on DioException catch (e) {
+        if (e.response?.statusCode != 404) rethrow;
+        resp = await authService.dio.get(
+          '/api/profile/tenant/client-invite',
+          options: _tenantManagerRequestOptions(),
+        );
+      }
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final row = Map<String, dynamic>.from(data['data']);
         var code = (row['code'] ?? '').toString().trim().toUpperCase();
+        var inviteLink = (row['invite_link'] ?? '').toString().trim();
+        final tenantCode = (row['tenant_code'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
         if (code.isEmpty) {
-          final link = (row['invite_link'] ?? '').toString().trim();
-          if (link.isNotEmpty) {
+          if (inviteLink.isNotEmpty) {
             try {
-              final uri = Uri.parse(link);
+              final uri = Uri.parse(inviteLink);
               code =
                   (uri.queryParameters['invite'] ??
                           uri.queryParameters['code'] ??
@@ -713,11 +729,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
           setState(() => _message = 'Код приглашения недоступен');
           return;
         }
-        await Clipboard.setData(ClipboardData(text: code));
+        if (inviteLink.isEmpty) {
+          final base = Uri.base;
+          final qp = <String, String>{'invite': code};
+          final normalizedTenant = tenantCode.trim();
+          if (normalizedTenant.isNotEmpty) {
+            qp['tenant'] = normalizedTenant;
+          }
+          inviteLink = base.replace(queryParameters: qp, fragment: '').toString();
+        }
+        await Clipboard.setData(ClipboardData(text: inviteLink));
         if (!mounted) return;
         setState(() {
           _publicInviteCode = code;
-          _message = 'Код приглашения скопирован';
+          _publicInviteLink = inviteLink;
+          _publicInviteTenantCode = tenantCode;
+          _message = 'Ссылка приглашения скопирована. QR готов.';
         });
       } else {
         if (!mounted) return;
@@ -731,6 +758,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } finally {
       if (mounted) setState(() => _inviteBusy = false);
     }
+  }
+
+  Future<void> _copyPublicInviteCode() async {
+    final code = _publicInviteCode.trim();
+    if (code.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: code));
+    if (!mounted) return;
+    setState(() => _message = 'Код приглашения скопирован');
+  }
+
+  Future<void> _copyPublicInviteLink() async {
+    final link = _publicInviteLink.trim();
+    if (link.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: link));
+    if (!mounted) return;
+    setState(() => _message = 'Ссылка приглашения скопирована');
   }
 
   Future<void> _loadTenantClients({String? searchOverride}) async {
@@ -1240,7 +1283,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final actualRole = authService.currentUser?.role ?? 'client';
     final effectiveRole = authService.effectiveRole;
     final canManageClients = _canManageTenantUsers;
-    final canShareInvite = _canManageTenantInvites;
+    final canShareInvite =
+        (authService.currentUser?.tenantCode ?? '').trim().isNotEmpty ||
+        _canManageTenantInvites;
     final isPlatformCreator =
         actualRole.toLowerCase().trim() == 'creator' &&
         effectiveRole.toLowerCase().trim() == 'creator' &&
@@ -1400,14 +1445,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Приглашение в вашу группу',
+                            'QR-приглашение в вашу группу',
                             style: theme.textTheme.titleMedium?.copyWith(
                               fontWeight: FontWeight.w800,
                             ),
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'Скопируйте короткий код и отправьте клиенту для регистрации.',
+                            'Любая роль может сгенерировать ссылку и QR. iPhone откроет сайт с кодом приглашения, Android получит экран загрузки APK и этот же код.',
                             style: theme.textTheme.bodyMedium?.copyWith(
                               color: theme.colorScheme.onSurfaceVariant,
                             ),
@@ -1427,15 +1472,76 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                         strokeWidth: 2,
                                       ),
                                     )
-                                  : const Icon(Icons.share_outlined),
-                              label: const Text('Скопировать код'),
+                                  : const Icon(Icons.qr_code_2_rounded),
+                              label: const Text('Получить QR и ссылку'),
                             ),
                           ),
                           if (_publicInviteCode.trim().isNotEmpty) ...[
                             const SizedBox(height: 10),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: SelectableText(
+                                    'Код: ${_publicInviteCode.trim()}',
+                                    style: theme.textTheme.bodySmall,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'Скопировать код',
+                                  onPressed: _copyPublicInviteCode,
+                                  icon: const Icon(Icons.copy_rounded),
+                                ),
+                              ],
+                            ),
+                          ],
+                          if (_publicInviteTenantCode.trim().isNotEmpty) ...[
+                            const SizedBox(height: 2),
                             SelectableText(
-                              _publicInviteCode,
-                              style: theme.textTheme.bodySmall,
+                              'Группа: ${_publicInviteTenantCode.trim()}',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                          if (_publicInviteLink.trim().isNotEmpty) ...[
+                            const SizedBox(height: 12),
+                            Center(
+                              child: Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(
+                                    color: theme.colorScheme.outlineVariant,
+                                  ),
+                                ),
+                                child: QrImageView(
+                                  data: _publicInviteLink.trim(),
+                                  size: 220,
+                                  eyeStyle: const QrEyeStyle(
+                                    eyeShape: QrEyeShape.square,
+                                  ),
+                                  dataModuleStyle: const QrDataModuleStyle(
+                                    dataModuleShape: QrDataModuleShape.square,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            SelectableText(
+                              _publicInviteLink.trim(),
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed: _copyPublicInviteLink,
+                                icon: const Icon(Icons.link_rounded),
+                                label: const Text('Скопировать ссылку'),
+                              ),
                             ),
                           ],
                         ],
