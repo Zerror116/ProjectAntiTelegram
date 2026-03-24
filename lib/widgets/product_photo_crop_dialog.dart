@@ -74,7 +74,7 @@ img.Image _cropViewport({
   return img.copyCrop(source, x: srcX, y: srcY, width: srcW, height: srcH);
 }
 
-img.Image _normalizeForUpload(img.Image source, {int maxLongestSide = 2200}) {
+img.Image _normalizeForUpload(img.Image source, {int maxLongestSide = 2600}) {
   final longestSide = math.max(source.width, source.height);
   if (longestSide <= maxLongestSide) return source;
   final scale = maxLongestSide / longestSide;
@@ -91,7 +91,7 @@ img.Image _normalizeForUpload(img.Image source, {int maxLongestSide = 2200}) {
 Uint8List _encodeTelegramLikeJpeg(img.Image source) {
   var working = _normalizeForUpload(source);
   const maxUploadBytes = 7 * 1024 * 1024;
-  const qualitySteps = <int>[95, 93, 91, 89, 86, 82];
+  const qualitySteps = <int>[97, 95, 93, 90, 87, 84];
 
   for (final quality in qualitySteps) {
     final output = Uint8List.fromList(img.encodeJpg(working, quality: quality));
@@ -118,11 +118,22 @@ String _buildCroppedFilename(String originalFileName) {
   return '${clean}_crop.jpg';
 }
 
+String _buildOriginalFilename(String originalFileName) {
+  final normalizedPath = originalFileName.replaceAll('\\', '/').trim();
+  final lastSegment = normalizedPath.split('/').last.trim();
+  if (lastSegment.isEmpty) return 'product-photo.jpg';
+  final safe = lastSegment
+      .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_')
+      .replaceAll(RegExp(r'_+'), '_')
+      .trim();
+  return safe.isEmpty ? 'product-photo.jpg' : safe;
+}
+
 Future<ProductPhotoCropResult?> showProductPhotoCropDialog({
   required BuildContext context,
   required Uint8List sourceBytes,
   required String originalFileName,
-  double cropAspectRatio = 4 / 3,
+  double? cropAspectRatio,
 }) async {
   final decoded = img.decodeImage(sourceBytes);
   if (decoded == null) {
@@ -130,6 +141,7 @@ Future<ProductPhotoCropResult?> showProductPhotoCropDialog({
   }
   final source = img.bakeOrientation(decoded);
   final fileName = _buildCroppedFilename(originalFileName);
+  final passthroughFileName = _buildOriginalFilename(originalFileName);
   if (!context.mounted) return null;
 
   return showDialog<ProductPhotoCropResult>(
@@ -138,11 +150,20 @@ Future<ProductPhotoCropResult?> showProductPhotoCropDialog({
       final media = MediaQuery.of(dialogContext);
       final maxDialogWidth = (media.size.width - 34).clamp(300.0, 680.0);
       final maxViewportHeight = (media.size.height - 320).clamp(220.0, 460.0);
+      final sourceAspect = source.width > 0 && source.height > 0
+          ? source.width / source.height
+          : 1.0;
+      final resolvedAspect =
+          (cropAspectRatio != null && cropAspectRatio > 0
+                  ? cropAspectRatio
+                  : sourceAspect)
+              .clamp(0.45, 2.4)
+              .toDouble();
       var viewportWidth = maxDialogWidth;
-      var viewportHeight = viewportWidth / cropAspectRatio;
+      var viewportHeight = viewportWidth / resolvedAspect;
       if (viewportHeight > maxViewportHeight) {
         viewportHeight = maxViewportHeight;
-        viewportWidth = viewportHeight * cropAspectRatio;
+        viewportWidth = viewportHeight * resolvedAspect;
       }
 
       const minZoom = 1.0;
@@ -296,11 +317,10 @@ Future<ProductPhotoCropResult?> showProductPhotoCropDialog({
                 onPressed: exporting
                     ? null
                     : () {
-                        final output = _encodeTelegramLikeJpeg(source);
                         Navigator.of(dialogContext).pop(
                           ProductPhotoCropResult(
-                            bytes: output,
-                            fileName: fileName,
+                            bytes: sourceBytes,
+                            fileName: passthroughFileName,
                             width: source.width,
                             height: source.height,
                           ),

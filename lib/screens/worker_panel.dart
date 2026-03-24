@@ -654,8 +654,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           } else if (selected != null) {
             if (!mounted) return;
             setState(() {
-              _message =
-                  'Браузер не отдал данные фото. Повторите выбор файла.';
+              _message = 'Браузер не отдал данные фото. Повторите выбор файла.';
             });
             return;
           }
@@ -693,7 +692,8 @@ class _WorkerPanelState extends State<WorkerPanel>
         picked = await _imagePicker.pickImage(source: effectiveSource);
       }
 
-      if (picked == null && (preloadedBytes == null || preloadedBytes.isEmpty)) {
+      if (picked == null &&
+          (preloadedBytes == null || preloadedBytes.isEmpty)) {
         if (!mounted) return;
         setState(() {
           _message = 'Фото не выбрано';
@@ -1687,8 +1687,11 @@ class _WorkerPanelState extends State<WorkerPanel>
               width: previewWidth,
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(12),
-                child: AspectRatio(
-                  aspectRatio: 4 / 3,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    minHeight: 140,
+                    maxHeight: previewWidth * 1.25,
+                  ),
                   child: (localBytes != null && localBytes.isNotEmpty)
                       ? withPreviewSurface(
                           Image.memory(
@@ -1716,8 +1719,11 @@ class _WorkerPanelState extends State<WorkerPanel>
             alignment: Alignment.centerLeft,
             child: SizedBox(
               width: previewWidth,
-              child: AspectRatio(
-                aspectRatio: 4 / 3,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: 140,
+                  maxHeight: previewWidth * 1.25,
+                ),
                 child: Container(
                   width: double.infinity,
                   decoration: BoxDecoration(

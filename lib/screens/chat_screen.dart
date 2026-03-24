@@ -74,6 +74,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _voiceSending = false;
   _ComposerMediaMode _composerMediaMode = _ComposerMediaMode.voice;
   bool _composerMediaPressActive = false;
+  bool _composerHoldActionTriggered = false;
   bool _voiceStartInProgress = false;
   bool _pinLoading = false;
   bool _hasDraftText = false;
@@ -95,10 +96,15 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _readDebounceTimer;
   Timer? _voiceRecordingTimer;
   Timer? _offlineQueueRefreshTimer;
+  Timer? _composerMediaHoldTimer;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
   StreamSubscription<void>? _voiceCompleteSub;
+  DateTime? _voiceRecordingStartedAt;
+  bool _microphonePermissionAsked = false;
+  bool _microphonePermissionGranted = false;
+  bool _microphonePermissionDenied = false;
 
   final Set<String> _messageIds = {};
   final Set<String> _placedCartItemIds = {};
@@ -279,6 +285,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _readDebounceTimer?.cancel();
     _voiceRecordingTimer?.cancel();
     _offlineQueueRefreshTimer?.cancel();
+    _composerMediaHoldTimer?.cancel();
     _chatSub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
@@ -1199,6 +1206,65 @@ class _ChatScreenState extends State<ChatScreen> {
     return 'попробуйте перезагрузить страницу и повторить';
   }
 
+  bool _isLikelyMicrophonePermissionError(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('permission') ||
+        text.contains('notallowed') ||
+        text.contains('microphone') ||
+        text.contains('denied') ||
+        text.contains('security');
+  }
+
+  Future<bool> _ensureMicrophonePermission() async {
+    if (_microphonePermissionGranted) return true;
+    if (_microphonePermissionDenied) return false;
+
+    if (kIsWeb) {
+      try {
+        final status = await _voiceRecorder.hasPermission(request: false);
+        if (status) {
+          _microphonePermissionGranted = true;
+          return true;
+        }
+      } catch (e) {
+        // Some WebKit variants may not support permissions.query.
+        debugPrint('voice hasPermission(request:false) web fallback: $e');
+      }
+
+      if (_microphonePermissionAsked) {
+        // Avoid repeated permission prompts each attempt.
+        return false;
+      }
+
+      _microphonePermissionAsked = true;
+      try {
+        final granted = await _voiceRecorder.hasPermission();
+        _microphonePermissionGranted = granted;
+        _microphonePermissionDenied = !granted;
+        return granted;
+      } catch (e) {
+        // Let start() try to request access as last fallback on browsers.
+        debugPrint('voice hasPermission() web fallback start-only: $e');
+        return true;
+      }
+    }
+
+    if (_microphonePermissionAsked) {
+      return false;
+    }
+    _microphonePermissionAsked = true;
+    try {
+      final granted = await _voiceRecorder.hasPermission();
+      _microphonePermissionGranted = granted;
+      _microphonePermissionDenied = !granted;
+      return granted;
+    } catch (e) {
+      debugPrint('voice hasPermission native error: $e');
+      _microphonePermissionDenied = true;
+      return false;
+    }
+  }
+
   Future<_ChatUploadFile?> _pickImageUpload(ImageSource source) async {
     if (source == ImageSource.gallery && _preferFilePickerForImages) {
       final result = await FilePicker.platform.pickFiles(
@@ -1269,6 +1335,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final picked = await _imagePicker.pickVideo(
       source: source,
       maxDuration: const Duration(seconds: 90),
+      preferredCameraDevice: source == ImageSource.camera
+          ? CameraDevice.front
+          : CameraDevice.rear,
     );
     if (picked == null) return null;
     if (kIsWeb) {
@@ -1606,17 +1675,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _voiceStartInProgress = true;
     try {
-      final allowed = kIsWeb
-          ? await (() async {
-              try {
-                return await _voiceRecorder.hasPermission();
-              } catch (e) {
-                // Safari/PWA may not support permissions.query; fallback to start().
-                debugPrint('voice hasPermission web fallback: $e');
-                return true;
-              }
-            })()
-          : await _voiceRecorder.hasPermission();
+      final allowed = await _ensureMicrophonePermission();
       if (!allowed) {
         if (!mounted) return;
         showAppNotice(
@@ -1669,6 +1728,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _voiceRecording = true;
         _recordingSeconds = 0;
       });
+      _voiceRecordingStartedAt = DateTime.now();
+      _microphonePermissionGranted = true;
+      _microphonePermissionDenied = false;
       _voiceRecordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         if (!mounted) return;
         setState(() => _recordingSeconds += 1);
@@ -1684,6 +1746,9 @@ class _ChatScreenState extends State<ChatScreen> {
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
       );
+      if (_isLikelyMicrophonePermissionError(e)) {
+        _microphonePermissionDenied = true;
+      }
       debugPrint('startVoiceRecording error: $e');
     } finally {
       _voiceStartInProgress = false;
@@ -1731,9 +1796,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _stopVoiceRecordingAndSend() async {
     if (!_voiceRecording) return;
-    final durationMs = _recordingSeconds * 1000;
+    final startedAt = _voiceRecordingStartedAt;
+    final durationMs = startedAt == null
+        ? _recordingSeconds * 1000
+        : DateTime.now().difference(startedAt).inMilliseconds;
     _voiceRecordingTimer?.cancel();
     _voiceRecordingTimer = null;
+    _voiceRecordingStartedAt = null;
     setState(() {
       _voiceRecording = false;
       _recordingSeconds = 0;
@@ -1747,6 +1816,16 @@ class _ChatScreenState extends State<ChatScreen> {
           'Запись не получена',
           tone: AppNoticeTone.warning,
           duration: const Duration(seconds: 2),
+        );
+        return;
+      }
+      if (durationMs < 1000) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Голосовое отменено (меньше 1 секунды)',
+          tone: AppNoticeTone.info,
+          duration: const Duration(milliseconds: 900),
         );
         return;
       }
@@ -1830,11 +1909,14 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _handleComposerMediaLongPressStart() async {
-    if (_hasDraftText || !_canCompose() || _mediaUploading || _voiceSending) {
-      return;
-    }
-    _composerMediaPressActive = true;
+  void _cancelComposerMediaHoldTimer() {
+    _composerMediaHoldTimer?.cancel();
+    _composerMediaHoldTimer = null;
+  }
+
+  Future<void> _runComposerHoldAction() async {
+    if (_composerHoldActionTriggered || !_composerMediaPressActive) return;
+    _composerHoldActionTriggered = true;
     if (_composerMediaMode == _ComposerMediaMode.camera) {
       await _captureAndSendVideoMessage();
       _composerMediaPressActive = false;
@@ -1843,10 +1925,92 @@ class _ChatScreenState extends State<ChatScreen> {
     await _startVoiceRecording();
   }
 
-  Future<void> _handleComposerMediaLongPressEnd() async {
+  void _handleComposerMediaTap({
+    required BuildContext context,
+    required bool canCompose,
+    required bool disabled,
+  }) {
+    if (disabled) {
+      if (!canCompose && mounted) {
+        showAppNotice(
+          context,
+          _composeBlockedReason() ?? 'Отправка сообщений недоступна',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+      }
+      return;
+    }
+    final isDesktopWeb =
+        kIsWeb &&
+        defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS;
+    if (!_cameraSupported &&
+        _composerMediaMode == _ComposerMediaMode.voice &&
+        isDesktopWeb) {
+      if (_voiceRecording) {
+        unawaited(_stopVoiceRecordingAndSend());
+      } else {
+        unawaited(_startVoiceRecording(autoStopIfNotPressed: false));
+      }
+      return;
+    }
+    if (_voiceRecording) return;
+    _toggleComposerMediaMode();
+  }
+
+  void _handleComposerMediaTapDown({
+    required bool disabled,
+    required BuildContext context,
+    required bool canCompose,
+  }) {
+    if (disabled) return;
+    final isDesktopWeb =
+        kIsWeb &&
+        defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS;
+    if (isDesktopWeb && !_cameraSupported) {
+      return;
+    }
+    _composerMediaPressActive = true;
+    _composerHoldActionTriggered = false;
+    _cancelComposerMediaHoldTimer();
+    _composerMediaHoldTimer = Timer(const Duration(milliseconds: 100), () {
+      unawaited(_runComposerHoldAction());
+    });
+  }
+
+  Future<void> _handleComposerMediaTapUp({
+    required bool disabled,
+    required BuildContext context,
+    required bool canCompose,
+  }) async {
+    final holdTriggered = _composerHoldActionTriggered;
     _composerMediaPressActive = false;
-    if (_composerMediaMode == _ComposerMediaMode.voice && _voiceRecording) {
-      await _stopVoiceRecordingAndSend();
+    _cancelComposerMediaHoldTimer();
+
+    if (holdTriggered) {
+      if (_composerMediaMode == _ComposerMediaMode.voice && _voiceRecording) {
+        await _stopVoiceRecordingAndSend();
+      }
+      return;
+    }
+
+    _handleComposerMediaTap(
+      context: context,
+      canCompose: canCompose,
+      disabled: disabled,
+    );
+  }
+
+  void _handleComposerMediaTapCancel() {
+    final holdTriggered = _composerHoldActionTriggered;
+    _composerMediaPressActive = false;
+    _cancelComposerMediaHoldTimer();
+    if (holdTriggered &&
+        _composerMediaMode == _ComposerMediaMode.voice &&
+        _voiceRecording) {
+      unawaited(_stopVoiceRecordingAndSend());
     }
   }
 
@@ -3655,8 +3819,8 @@ class _ChatScreenState extends State<ChatScreen> {
           borderRadius: BorderRadius.circular(12),
           child: SizedBox(
             width: width ?? 240,
-            child: AspectRatio(
-              aspectRatio: 4 / 3,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 340),
               child: AdaptiveNetworkImage(
                 imageUrl,
                 width: width ?? 240,
@@ -4619,54 +4783,19 @@ class _ChatScreenState extends State<ChatScreen> {
                                   : Icons.mic_none_rounded);
                         return GestureDetector(
                           behavior: HitTestBehavior.opaque,
-                          onTap: () {
-                            if (disabled) {
-                              if (!canCompose && mounted) {
-                                showAppNotice(
-                                  context,
-                                  _composeBlockedReason() ??
-                                      'Отправка сообщений недоступна',
-                                  tone: AppNoticeTone.warning,
-                                  duration: const Duration(seconds: 2),
-                                );
-                              }
-                              return;
-                            }
-                            final isDesktopWeb =
-                                kIsWeb &&
-                                defaultTargetPlatform !=
-                                    TargetPlatform.android &&
-                                defaultTargetPlatform != TargetPlatform.iOS;
-                            if (!_cameraSupported &&
-                                _composerMediaMode ==
-                                    _ComposerMediaMode.voice &&
-                                isDesktopWeb) {
-                              if (_voiceRecording) {
-                                unawaited(_stopVoiceRecordingAndSend());
-                              } else {
-                                unawaited(
-                                  _startVoiceRecording(
-                                    autoStopIfNotPressed: false,
-                                  ),
-                                );
-                              }
-                              return;
-                            }
-                            if (_voiceRecording) {
-                              return;
-                            }
-                            _toggleComposerMediaMode();
-                          },
-                          onLongPressStart: disabled
-                              ? null
-                              : (_) => unawaited(
-                                  _handleComposerMediaLongPressStart(),
-                                ),
-                          onLongPressEnd: disabled
-                              ? null
-                              : (_) => unawaited(
-                                  _handleComposerMediaLongPressEnd(),
-                                ),
+                          onTapDown: (_) => _handleComposerMediaTapDown(
+                            disabled: disabled,
+                            context: context,
+                            canCompose: canCompose,
+                          ),
+                          onTapUp: (_) => unawaited(
+                            _handleComposerMediaTapUp(
+                              disabled: disabled,
+                              context: context,
+                              canCompose: canCompose,
+                            ),
+                          ),
+                          onTapCancel: _handleComposerMediaTapCancel,
                           child: Container(
                             width: 44,
                             height: 44,
