@@ -116,7 +116,89 @@
     For more details:
     * https://docs.flutter.dev/platform-integration/web/initialization
   -->
-  <script src="flutter_bootstrap.js" async=""></script>
+  <script>
+    (function () {
+      const buildVersionKey = 'projectphoenix-web-build-version';
+      const reloadOnceKey = 'projectphoenix-web-reload-once';
+
+      function appendFlutterBootstrap(versionToken) {
+        const script = document.createElement('script');
+        const token =
+          (versionToken || '').toString().trim() ||
+          Date.now().toString();
+        script.src = `flutter_bootstrap.js?v=${encodeURIComponent(token)}`;
+        script.async = true;
+        document.body.appendChild(script);
+      }
+
+      async function readServerBuildVersion() {
+        const resp = await fetch(`version.json?_ts=${Date.now()}`, {
+          cache: 'no-store',
+        });
+        if (!resp.ok) return '';
+        const data = await resp.json();
+        return (data && data.version ? String(data.version) : '').trim();
+      }
+
+      async function clearOldWebCaches() {
+        if ('serviceWorker' in navigator) {
+          try {
+            const registrations = await navigator.serviceWorker.getRegistrations();
+            for (const registration of registrations) {
+              await registration.unregister();
+            }
+          } catch (_) {}
+        }
+        if ('caches' in window) {
+          try {
+            const cacheKeys = await caches.keys();
+            await Promise.all(cacheKeys.map((key) => caches.delete(key)));
+          } catch (_) {}
+        }
+      }
+
+      (async function bootstrapWithAutoRefresh() {
+        let serverVersion = '';
+        try {
+          serverVersion = await readServerBuildVersion();
+        } catch (_) {}
+
+        let previousVersion = '';
+        let alreadyReloaded = false;
+        try {
+          previousVersion = localStorage.getItem(buildVersionKey) || '';
+          alreadyReloaded = sessionStorage.getItem(reloadOnceKey) === '1';
+        } catch (_) {}
+
+        const shouldHardRefresh =
+          previousVersion &&
+          serverVersion &&
+          previousVersion !== serverVersion &&
+          !alreadyReloaded;
+
+        if (shouldHardRefresh) {
+          try {
+            sessionStorage.setItem(reloadOnceKey, '1');
+          } catch (_) {}
+          await clearOldWebCaches();
+          try {
+            localStorage.setItem(buildVersionKey, serverVersion);
+          } catch (_) {}
+          window.location.reload();
+          return;
+        }
+
+        try {
+          sessionStorage.removeItem(reloadOnceKey);
+          if (serverVersion) {
+            localStorage.setItem(buildVersionKey, serverVersion);
+          }
+        } catch (_) {}
+
+        appendFlutterBootstrap(serverVersion);
+      })();
+    })();
+  </script>
 
 
 </body></html>

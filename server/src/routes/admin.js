@@ -1634,6 +1634,101 @@ router.patch(
   },
 );
 
+router.patch(
+  "/tenant/invites/:inviteId/code",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator === true) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Коды приглашений здесь отключены. Используйте раздел Профиль внутри нужной группы.",
+      });
+    }
+    if (isTenantUser(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Клиентские приглашения арендатора доступны только во вкладке Профиль",
+      });
+    }
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Изменять код приглашения может только Создатель",
+      });
+    }
+    const targetTenant = await resolveTargetTenantForInvite(req);
+    if (!targetTenant?.id) {
+      return res.status(403).json({
+        ok: false,
+        error: "Не выбран арендатор для кодов приглашения",
+      });
+    }
+    const inviteId = String(req.params?.inviteId || "").trim();
+    if (!isUuidLike(inviteId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный inviteId" });
+    }
+    const nextCode = normalizeInviteCode(req.body?.code || "");
+    if (!nextCode || nextCode.length < 6 || nextCode.length > 64) {
+      return res.status(400).json({
+        ok: false,
+        error: "Код должен содержать от 6 до 64 символов (A-Z, 0-9, -)",
+      });
+    }
+    try {
+      const updated = await db.platformQuery(
+        `UPDATE tenant_invites
+         SET code = $1,
+             updated_at = now()
+         WHERE id = $2
+           AND tenant_id = $3
+         RETURNING id,
+                   tenant_id,
+                   code,
+                   role,
+                   is_active,
+                   max_uses,
+                   used_count,
+                   expires_at,
+                   created_by,
+                   last_used_at,
+                   notes,
+                   created_at,
+                   updated_at`,
+        [nextCode, inviteId, targetTenant.id],
+      );
+      if (updated.rowCount === 0) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Код приглашения не найден" });
+      }
+      const row = updated.rows[0];
+      return res.json({
+        ok: true,
+        data: {
+          ...row,
+          invite_link: inviteLinkForRequest(
+            req,
+            row.code,
+            targetTenant.code || "",
+          ),
+        },
+      });
+    } catch (err) {
+      if (String(err?.code || "") === "23505") {
+        return res.status(409).json({
+          ok: false,
+          error: "Такой код уже существует. Выберите другой.",
+        });
+      }
+      console.error("admin.tenant.invites.rename error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 router.delete(
   "/tenant/invites/:inviteId",
   requireAuth,
@@ -1711,9 +1806,15 @@ router.get(
        FROM chats
        WHERE type = 'channel'
          AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
-         AND COALESCE(settings->>'kind', 'channel') = 'channel'
-         AND COALESCE((settings->>'admin_only')::boolean, false) = false
-         AND COALESCE((settings->>'hidden_in_chat_list')::boolean, false) = false
+         AND (
+           (
+             COALESCE(settings->>'kind', 'channel') = 'channel'
+             AND COALESCE((settings->>'admin_only')::boolean, false) = false
+             AND COALESCE((settings->>'hidden_in_chat_list')::boolean, false) = false
+           )
+           OR COALESCE(settings->>'system_key', '') IN ('reserved_orders', 'posts_archive')
+           OR COALESCE(settings->>'kind', '') IN ('reserved_orders', 'posts_archive')
+         )
          AND LOWER(TRIM(title)) <> LOWER(TRIM('Баг-репорты'))
        ORDER BY updated_at DESC NULLS LAST, created_at DESC`,
         [req.user.tenant_id || null],

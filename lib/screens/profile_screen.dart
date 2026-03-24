@@ -736,7 +736,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
           if (normalizedTenant.isNotEmpty) {
             qp['tenant'] = normalizedTenant;
           }
-          inviteLink = base.replace(queryParameters: qp, fragment: '').toString();
+          inviteLink = base
+              .replace(queryParameters: qp, fragment: '')
+              .toString();
         }
         await Clipboard.setData(ClipboardData(text: inviteLink));
         if (!mounted) return;
@@ -1542,15 +1544,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                         child: QrImageView(
                                           data: qrData,
                                           size: 220,
+                                          version: QrVersions.auto,
                                           gapless: false,
-                                          eyeStyle: const QrEyeStyle(
-                                            eyeShape: QrEyeShape.square,
-                                          ),
-                                          dataModuleStyle:
-                                              const QrDataModuleStyle(
-                                                dataModuleShape:
-                                                    QrDataModuleShape.square,
-                                              ),
                                           errorStateBuilder: (_, error) {
                                             return const SizedBox(
                                               width: 220,
@@ -1582,9 +1577,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                       child: OutlinedButton.icon(
                                         onPressed: _copyPublicInviteLink,
                                         icon: const Icon(Icons.link_rounded),
-                                        label: const Text(
-                                          'Скопировать ссылку',
-                                        ),
+                                        label: const Text('Скопировать ссылку'),
                                       ),
                                     ),
                                   ],

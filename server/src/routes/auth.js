@@ -214,16 +214,23 @@ function normalizeMainChannelTitle(raw) {
     .slice(0, 120);
 }
 
-async function assertDeviceAccountLimit(queryable, deviceFingerprint, userId = null) {
+async function assertDeviceAccountLimit(
+  queryable,
+  deviceFingerprint,
+  userId = null,
+  tenantId = null,
+) {
   const fingerprint = normalizeDeviceFingerprint(deviceFingerprint);
   if (!fingerprint) return;
 
   const usage = await queryable.query(
-    `SELECT user_id::text AS user_id
-     FROM devices
-     WHERE device_fingerprint = $1
-     GROUP BY user_id`,
-    [fingerprint],
+    `SELECT d.user_id::text AS user_id
+     FROM devices d
+     JOIN users u ON u.id = d.user_id
+     WHERE d.device_fingerprint = $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     GROUP BY d.user_id`,
+    [fingerprint, tenantId || null],
   );
   const userIds = usage.rows
     .map((row) => String(row.user_id || '').trim())
@@ -886,7 +893,12 @@ router.post('/register', async (req, res) => {
           return { ok: false, status: 409, error: 'Email already registered' };
         }
 
-        await assertDeviceAccountLimit(client, requiredDeviceFingerprint);
+        await assertDeviceAccountLimit(
+          client,
+          requiredDeviceFingerprint,
+          null,
+          tenant?.id || null,
+        );
 
         const normalizedPhone = normalizePhoneDigits(phone);
         if (phone && normalizedPhone.length < 10) {
@@ -1314,7 +1326,12 @@ router.post('/login', async (req, res) => {
           }
         }
 
-        await assertDeviceAccountLimit(client, normalizedFingerprint, user.id);
+        await assertDeviceAccountLimit(
+          client,
+          normalizedFingerprint,
+          user.id,
+          user.tenant_id || null,
+        );
         await upsertDevice(client, user.id, normalizedFingerprint);
 
         if (
