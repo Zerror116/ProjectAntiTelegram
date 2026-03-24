@@ -182,17 +182,23 @@ Map<String, dynamic> _phoneAccessRequestToEventMap(
 }
 
 String _defaultApiBaseUrl() {
-  const nativeFallback = 'http://127.0.0.1:3000';
-  if (!kIsWeb) return nativeFallback;
+  const nativeDebugFallback = 'http://127.0.0.1:3000';
+  const nativeReleaseFallback = String.fromEnvironment(
+    'FENIX_NATIVE_RELEASE_API_BASE_URL',
+    defaultValue: 'https://garphoenix.com',
+  );
+  if (!kIsWeb) {
+    return kReleaseMode ? nativeReleaseFallback : nativeDebugFallback;
+  }
 
   final base = Uri.base;
   final scheme = base.scheme.toLowerCase();
   if (scheme != 'http' && scheme != 'https') {
-    return nativeFallback;
+    return nativeDebugFallback;
   }
 
   final host = base.host.trim();
-  if (host.isEmpty) return nativeFallback;
+  if (host.isEmpty) return nativeDebugFallback;
 
   final portPart = base.hasPort ? ':${base.port}' : '';
   return '$scheme://$host$portPart';
