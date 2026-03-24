@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -484,18 +485,56 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final picked = await FilePicker.platform.pickFiles(
       type: FileType.image,
       allowMultiple: false,
-      withData: false,
+      withData: kIsWeb,
     );
     if (picked == null || picked.files.isEmpty) return;
+    final pickedFile = picked.files.single;
 
-    final path = picked.files.single.path;
+    if (kIsWeb) {
+      final bytes = pickedFile.bytes;
+      if (bytes == null || bytes.isEmpty) {
+        if (!mounted) return;
+        setState(() => _message = 'Не удалось прочитать выбранный файл');
+        return;
+      }
+      setState(() {
+        _avatarBusy = true;
+        _message = '';
+      });
+      try {
+        final fileName = pickedFile.name.trim().isNotEmpty
+            ? pickedFile.name.trim()
+            : 'avatar.jpg';
+        final form = FormData.fromMap({
+          'avatar': MultipartFile.fromBytes(bytes, filename: fileName),
+        });
+        final resp = await authService.dio.post('/api/profile/avatar', data: form);
+        final data = resp.data;
+        if (data is Map && data['user'] is Map && mounted) {
+          setState(() {
+            _applyUser(Map<String, dynamic>.from(data['user']));
+            _message = 'Аватарка обновлена';
+          });
+        }
+      } catch (e) {
+        if (!mounted) return;
+        setState(
+          () => _message = 'Ошибка загрузки аватарки: ${_extractDioMessage(e)}',
+        );
+      } finally {
+        if (mounted) setState(() => _avatarBusy = false);
+      }
+      return;
+    }
+
+    final path = pickedFile.path;
     if (path == null || path.isEmpty) {
       if (!mounted) return;
       setState(() => _message = 'Не удалось получить путь к файлу');
       return;
     }
 
-    final selectedName = (picked.files.single.name).toLowerCase().trim();
+    final selectedName = (pickedFile.name).toLowerCase().trim();
     final isGif = selectedName.endsWith('.gif');
     AvatarCropResult? placement;
     if (!isGif) {
