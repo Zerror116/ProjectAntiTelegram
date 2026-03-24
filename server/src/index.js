@@ -168,11 +168,9 @@ function isAndroidUserAgent(req) {
 
 const corsOptions = {
   origin(origin, callback) {
-    if (isOriginAllowed(origin)) {
-      callback(null, true);
-      return;
-    }
-    callback(new Error("Not allowed by CORS"));
+    // For disallowed origins we return `false` instead of throwing, so server
+    // does not leak internal 500 errors on preflight requests.
+    callback(null, isOriginAllowed(origin));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],

@@ -22,14 +22,20 @@ else
   echo "[deploy_web] skip build requested"
 fi
 
+find "$PROJECT_ROOT/build/web" -name '.DS_Store' -delete || true
+rm -f "$PROJECT_ROOT/build/web/.last_build_id" || true
+
 echo "[deploy_web] uploading build/web to server tmp..."
-rsync -avz --delete "$PROJECT_ROOT/build/web/" "$SERVER:$REMOTE_TMP_DIR/"
+rsync -avz --delete --exclude='.DS_Store' --exclude='.last_build_id' \
+  "$PROJECT_ROOT/build/web/" "$SERVER:$REMOTE_TMP_DIR/"
 
 echo "[deploy_web] applying build on server..."
 ssh "$SERVER" "
   set -euo pipefail
   mkdir -p '$REMOTE_WEB_ROOT'
   rsync -av --delete '$REMOTE_TMP_DIR/' '$REMOTE_WEB_ROOT/'
+  find '$REMOTE_WEB_ROOT' -name '.DS_Store' -delete || true
+  rm -f '$REMOTE_WEB_ROOT/.last_build_id' || true
   chown -R www-data:www-data '$REMOTE_WEB_ROOT'
   nginx -t
   systemctl reload nginx
