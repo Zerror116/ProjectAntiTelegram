@@ -651,11 +651,13 @@ class _WorkerPanelState extends State<WorkerPanel>
             preloadedBytes = bytes;
             preloadedFileName = (selected?.name ?? 'image.jpg').trim();
             picked = XFile.fromData(bytes, name: preloadedFileName);
-          } else {
-            final path = selected?.path;
-            if (path != null && path.isNotEmpty) {
-              picked = XFile(path, name: selected?.name ?? '');
-            }
+          } else if (selected != null) {
+            if (!mounted) return;
+            setState(() {
+              _message =
+                  'Браузер не отдал данные фото. Повторите выбор файла.';
+            });
+            return;
           }
         } else {
           // Desktop: first try ImagePicker, then fallback to FilePicker.
