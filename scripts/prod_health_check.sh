@@ -10,6 +10,7 @@ cleanup() {
   rm -f "$tmp_headers" "$tmp_body"
 }
 trap cleanup EXIT
+LAST_STATUS_CODE=""
 
 check_status() {
   local name="$1"
@@ -26,6 +27,7 @@ check_status() {
   else
     code=$(curl -sS -L -D "$tmp_headers" -o "$tmp_body" "$url" -w "%{http_code}")
   fi
+  LAST_STATUS_CODE="$code"
   IFS=',' read -r -a expected <<<"$expected_csv"
 
   local ok=0
@@ -89,6 +91,18 @@ check_contains_header \
   "android apk content type" \
   "content-type" \
   "application/vnd.android.package-archive"
+check_status \
+  "direct /downloads apk path" \
+  "$BASE_URL/downloads/fenix-1.0.1.apk" \
+  "200,403,404" \
+  -I \
+  -A "Mozilla/5.0 (Linux; Android 14; Pixel 8)"
+if [[ "$LAST_STATUS_CODE" == "200" ]]; then
+  check_contains_header \
+    "direct /downloads content type" \
+    "content-type" \
+    "application/vnd.android.package-archive"
+fi
 check_status "socket polling handshake" "$BASE_URL/socket.io/?EIO=4&transport=polling" "200"
 
 echo "[check] security headers"
@@ -100,4 +114,8 @@ echo | openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" 2>/dev/null
 echo
 
 echo "[check] web bootstrap canvaskit override"
-curl -sS "https://$DOMAIN/flutter_bootstrap.js" | grep -n "canvasKitBaseUrl" || true
+if curl -sS "https://$DOMAIN/flutter_bootstrap.js" | grep -q "canvasKitBaseUrl"; then
+  echo "[ok] canvasKitBaseUrl override detected"
+else
+  echo "[warn] canvasKitBaseUrl override not found in flutter_bootstrap.js"
+fi

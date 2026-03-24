@@ -107,10 +107,39 @@ const ENFORCE_HTTPS = parseBooleanEnv(
   process.env.ENFORCE_HTTPS,
   IS_PRODUCTION,
 );
+const BLOCK_DIRECT_BACKEND_PUBLIC_ACCESS = parseBooleanEnv(
+  process.env.BLOCK_DIRECT_BACKEND_PUBLIC_ACCESS,
+  IS_PRODUCTION,
+);
 const APK_DOWNLOAD_ANDROID_ONLY = parseBooleanEnv(
   process.env.APK_DOWNLOAD_ANDROID_ONLY,
   true,
 );
+const REQUEST_LOGGING_ENABLED = parseBooleanEnv(
+  process.env.REQUEST_LOGGING,
+  !IS_PRODUCTION,
+);
+const BIND_HOST = String(
+  process.env.BIND_HOST || (IS_PRODUCTION ? "127.0.0.1" : "0.0.0.0"),
+)
+  .trim()
+  .toLowerCase();
+
+function normalizeIp(rawValue) {
+  let ip = String(rawValue || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  if (ip.startsWith("::ffff:")) {
+    ip = ip.slice("::ffff:".length);
+  }
+  return ip;
+}
+
+function isLoopbackIp(rawValue) {
+  const ip = normalizeIp(rawValue);
+  return ip === "127.0.0.1" || ip === "::1" || ip === "localhost";
+}
 
 function normalizeOrigin(raw) {
   const value = String(raw || "").trim();
@@ -166,6 +195,16 @@ function isAndroidUserAgent(req) {
   return userAgent.includes("android");
 }
 
+function sanitizeRequestPathForLog(req) {
+  const method = String(req?.method || "").toUpperCase().trim();
+  const rawUrl = String(req?.originalUrl || req?.url || "").trim();
+  if (!rawUrl) return method ? `${method} /` : "/";
+  const qIndex = rawUrl.indexOf("?");
+  const pathOnly = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
+  if (!method) return pathOnly || "/";
+  return `${method} ${pathOnly || "/"}`;
+}
+
 const corsOptions = {
   origin(origin, callback) {
     // For disallowed origins we return `false` instead of throwing, so server
@@ -213,12 +252,25 @@ app.use(
 );
 
 app.use((req, res, next) => {
+  if (!BLOCK_DIRECT_BACKEND_PUBLIC_ACCESS) return next();
+  const remoteIp = normalizeIp(req.socket?.remoteAddress || req.ip || "");
+  if (isLoopbackIp(remoteIp)) return next();
+  return res.status(403).json({
+    ok: false,
+    error: "Direct backend access is disabled",
+  });
+});
+
+app.use((req, res, next) => {
   if (!ENFORCE_HTTPS) return next();
   const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
     .split(",")[0]
     .toLowerCase()
     .trim();
-  const isSecure = req.secure === true || forwardedProto === "https";
+  const remoteIp = normalizeIp(req.socket?.remoteAddress || req.ip || "");
+  const trustedForwardedProto =
+    forwardedProto === "https" && isLoopbackIp(remoteIp);
+  const isSecure = req.secure === true || trustedForwardedProto;
   if (isSecure) return next();
 
   const host = String(req.headers.host || "").trim();
@@ -324,13 +376,13 @@ function patchSocketEmittersWithSignedUploads(io) {
 
 // Логирование входящих запросов и времени обработки
 app.use((req, res, next) => {
+  if (!REQUEST_LOGGING_ENABLED) return next();
   const start = Date.now();
-  console.log("SERVER REQ START →", req.method, req.url);
+  const requestLabel = sanitizeRequestPathForLog(req);
+  console.log("SERVER REQ START →", requestLabel);
   res.on("finish", () => {
     const duration = Date.now() - start;
-    console.log(
-      `SERVER REQ END ← ${req.method} ${req.url} ${res.statusCode} ${duration}ms`,
-    );
+    console.log(`SERVER REQ END ← ${requestLabel} ${res.statusCode} ${duration}ms`);
   });
   next();
 });
@@ -851,8 +903,8 @@ async function canUserAccessChat(user, chatId) {
       process.exit(1);
     });
 
-    server.listen(PORT, "0.0.0.0", () => {
-      console.log(`\n✅ Server listening on http://0.0.0.0:${PORT}`);
+    server.listen(PORT, BIND_HOST, () => {
+      console.log(`\n✅ Server listening on http://${BIND_HOST}:${PORT}`);
       console.log(`📝 Environment: ${process.env.NODE_ENV || "development"}`);
       console.log(
         `🔐 JWT Secret: ${JWT_SECRET ? "✅ Configured" : "⚠️ Not configured"}`,
