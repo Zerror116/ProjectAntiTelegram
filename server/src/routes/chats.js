@@ -92,6 +92,8 @@ function isVoiceMimeAllowed(mimeRaw, originalNameRaw) {
   if (mime === "application/octet-stream") return true;
   // Some browsers (especially web blob uploads) label voice webm as video/webm.
   if (mime === "video/webm" || mime.startsWith("video/webm;")) return true;
+  // Safari/iOS may wrap audio-only recordings in an mp4 container.
+  if (mime === "video/mp4" || mime.startsWith("video/mp4;")) return true;
   if (!mime) {
     const ext = path.extname(originalName || "");
     if (
@@ -149,6 +151,10 @@ const chatMediaUpload = multer({
         cb(null, true);
         return;
       }
+      console.warn("[chat-media] rejected voice mime", {
+        mime,
+        name: file.originalname || "",
+      });
       cb(new Error("Можно загружать только аудиофайлы"));
       return;
     }

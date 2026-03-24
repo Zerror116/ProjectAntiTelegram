@@ -84,6 +84,7 @@ class _ChatScreenState extends State<ChatScreen> {
   List<String> _searchResultIds = const [];
   int _searchResultIndex = -1;
   int _recordingSeconds = 0;
+  String _activeVoiceUploadExtension = 'm4a';
   String? _activeVoiceMessageId;
   Duration _activeVoicePosition = Duration.zero;
   Duration _activeVoiceDuration = Duration.zero;
@@ -1119,6 +1120,85 @@ class _ChatScreenState extends State<ChatScreen> {
     return DioMediaType('application', 'octet-stream');
   }
 
+  Future<List<({RecordConfig config, String extension, String label})>>
+  _resolveWebVoiceRecordConfigs() async {
+    final candidates =
+        <({RecordConfig config, String extension, String label})>[];
+
+    Future<bool> supports(AudioEncoder encoder) async {
+      try {
+        return await _voiceRecorder.isEncoderSupported(encoder);
+      } catch (e) {
+        debugPrint('voice isEncoderSupported($encoder) error: $e');
+        return false;
+      }
+    }
+
+    if (await supports(AudioEncoder.aacLc)) {
+      candidates.add((
+        config: const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 44100,
+        ),
+        extension: 'm4a',
+        label: 'aac',
+      ));
+    }
+
+    if (await supports(AudioEncoder.opus)) {
+      candidates.add((
+        config: const RecordConfig(
+          encoder: AudioEncoder.opus,
+          bitRate: 128000,
+          sampleRate: 48000,
+        ),
+        extension: 'webm',
+        label: 'opus',
+      ));
+    }
+
+    if (await supports(AudioEncoder.wav)) {
+      candidates.add((
+        config: const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 44100,
+          bitRate: 1411200,
+        ),
+        extension: 'wav',
+        label: 'wav',
+      ));
+    }
+
+    candidates.add((
+      config: const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: 44100,
+        bitRate: 1411200,
+      ),
+      extension: 'wav',
+      label: 'pcm16',
+    ));
+    return candidates;
+  }
+
+  String _recordingErrorHint(Object e) {
+    final raw = e.toString();
+    final text = raw.toLowerCase();
+    if (text.contains('permission') ||
+        text.contains('notallowed') ||
+        text.contains('microphone')) {
+      return 'разрешите доступ к микрофону в браузере';
+    }
+    if (text.contains('notfound') || text.contains('device')) {
+      return 'микрофон не найден';
+    }
+    if (text.contains('security') || text.contains('https')) {
+      return 'запись доступна только по HTTPS';
+    }
+    return 'попробуйте перезагрузить страницу и повторить';
+  }
+
   Future<_ChatUploadFile?> _pickImageUpload(ImageSource source) async {
     if (source == ImageSource.gallery && _preferFilePickerForImages) {
       final result = await FilePicker.platform.pickFiles(
@@ -1158,30 +1238,6 @@ class _ChatScreenState extends State<ChatScreen> {
           ? picked.name
           : picked.path.split('/').last,
       path: picked.path,
-    );
-  }
-
-  Future<_ChatUploadFile?> _pickVoiceUpload() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.audio,
-      allowMultiple: false,
-      withData: kIsWeb,
-    );
-    final picked = result?.files.single;
-    if (picked == null) return null;
-    if (kIsWeb) {
-      final bytes = picked.bytes;
-      if (bytes == null || bytes.isEmpty) return null;
-      return _ChatUploadFile(
-        filename: picked.name.isNotEmpty ? picked.name : 'voice-message.webm',
-        bytes: bytes,
-      );
-    }
-    final path = picked.path;
-    if (path == null || path.trim().isEmpty) return null;
-    return _ChatUploadFile(
-      filename: picked.name.isNotEmpty ? picked.name : path.split('/').last,
-      path: path,
     );
   }
 
@@ -1291,10 +1347,10 @@ class _ChatScreenState extends State<ChatScreen> {
       showAppNotice(
         context,
         attachmentType == 'image'
-            ? 'Не удалось отправить изображение'
+            ? 'Не удалось отправить изображение: ${_extractDioError(e)}'
             : attachmentType == 'video'
-            ? 'Не удалось отправить видео'
-            : 'Не удалось отправить голосовое сообщение',
+            ? 'Не удалось отправить видео: ${_extractDioError(e)}'
+            : 'Не удалось отправить голосовое сообщение: ${_extractDioError(e)}',
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
       );
@@ -1540,7 +1596,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() => _insertComposerEmoji(selected));
   }
 
-  Future<void> _startVoiceRecording() async {
+  Future<void> _startVoiceRecording({bool autoStopIfNotPressed = true}) async {
     if (!_canCompose() ||
         _voiceSending ||
         _mediaUploading ||
@@ -1550,7 +1606,17 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _voiceStartInProgress = true;
     try {
-      final allowed = await _voiceRecorder.hasPermission();
+      final allowed = kIsWeb
+          ? await (() async {
+              try {
+                return await _voiceRecorder.hasPermission();
+              } catch (e) {
+                // Safari/PWA may not support permissions.query; fallback to start().
+                debugPrint('voice hasPermission web fallback: $e');
+                return true;
+              }
+            })()
+          : await _voiceRecorder.hasPermission();
       if (!allowed) {
         if (!mounted) return;
         showAppNotice(
@@ -1562,32 +1628,42 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      RecordConfig config;
-      late String outputPath;
       if (kIsWeb) {
-        outputPath = 'voice-${DateTime.now().millisecondsSinceEpoch}.webm';
-        config = const RecordConfig(
-          encoder: AudioEncoder.opus,
-          bitRate: 128000,
-          sampleRate: 48000,
-        );
+        final webConfigs = await _resolveWebVoiceRecordConfigs();
+        Object? lastStartError;
+        bool started = false;
+        for (final candidate in webConfigs) {
+          final candidatePath =
+              'voice-${DateTime.now().millisecondsSinceEpoch}.${candidate.extension}';
+          try {
+            await _voiceRecorder.start(candidate.config, path: candidatePath);
+            _activeVoiceUploadExtension = candidate.extension;
+            started = true;
+            break;
+          } catch (e) {
+            lastStartError = e;
+            debugPrint('voice start candidate ${candidate.label} failed: $e');
+          }
+        }
+        if (!started) {
+          throw lastStartError ?? Exception('Voice recorder start failed');
+        }
       } else {
         final tempDir = await getTemporaryDirectory();
         final useAac =
             defaultTargetPlatform == TargetPlatform.android ||
             defaultTargetPlatform == TargetPlatform.iOS ||
             defaultTargetPlatform == TargetPlatform.macOS;
-        final extension = useAac ? 'm4a' : 'wav';
-        outputPath =
-            '${tempDir.path}/voice-${DateTime.now().millisecondsSinceEpoch}.$extension';
-        config = RecordConfig(
+        _activeVoiceUploadExtension = useAac ? 'm4a' : 'wav';
+        final outputPath =
+            '${tempDir.path}/voice-${DateTime.now().millisecondsSinceEpoch}.$_activeVoiceUploadExtension';
+        final config = RecordConfig(
           encoder: useAac ? AudioEncoder.aacLc : AudioEncoder.wav,
           bitRate: useAac ? 128000 : 1411200,
           sampleRate: 44100,
         );
+        await _voiceRecorder.start(config, path: outputPath);
       }
-
-      await _voiceRecorder.start(config, path: outputPath);
       _voiceRecordingTimer?.cancel();
       setState(() {
         _voiceRecording = true;
@@ -1597,28 +1673,18 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!mounted) return;
         setState(() => _recordingSeconds += 1);
       });
-      if (!_composerMediaPressActive) {
+      if (autoStopIfNotPressed && !_composerMediaPressActive) {
         await _stopVoiceRecordingAndSend();
       }
     } catch (e) {
       if (!mounted) return;
       showAppNotice(
         context,
-        'Не удалось начать запись',
+        'Не удалось начать запись: ${_recordingErrorHint(e)}',
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
       );
       debugPrint('startVoiceRecording error: $e');
-      if (kIsWeb) {
-        try {
-          final upload = await _pickVoiceUpload();
-          if (upload != null) {
-            await _sendMediaMessage(upload: upload, attachmentType: 'voice');
-          }
-        } catch (_) {
-          // ignore fallback errors
-        }
-      }
     } finally {
       _voiceStartInProgress = false;
     }
@@ -1626,18 +1692,41 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<Uint8List?> _readWebBlobBytes(String blobUrl) async {
     if (!kIsWeb) return null;
-    try {
-      final resp = await Dio().get<List<int>>(
-        blobUrl,
-        options: Options(responseType: ResponseType.bytes),
-      );
-      final data = resp.data;
-      if (data == null || data.isEmpty) return null;
-      return Uint8List.fromList(data);
-    } catch (e) {
-      debugPrint('readWebBlobBytes error: $e');
-      return null;
+    final url = blobUrl.trim();
+    if (url.isEmpty) return null;
+    const retryDelays = <Duration>[
+      Duration.zero,
+      Duration(milliseconds: 60),
+      Duration(milliseconds: 160),
+      Duration(milliseconds: 320),
+    ];
+    for (var attempt = 0; attempt < retryDelays.length; attempt++) {
+      final delay = retryDelays[attempt];
+      if (delay > Duration.zero) {
+        await Future<void>.delayed(delay);
+      }
+      try {
+        final bytes = await XFile(url).readAsBytes();
+        if (bytes.isNotEmpty) {
+          return bytes;
+        }
+      } catch (e) {
+        debugPrint('readWebBlobBytes XFile attempt ${attempt + 1} error: $e');
+      }
+      try {
+        final resp = await Dio().get<List<int>>(
+          url,
+          options: Options(responseType: ResponseType.bytes),
+        );
+        final data = resp.data;
+        if (data != null && data.isNotEmpty) {
+          return Uint8List.fromList(data);
+        }
+      } catch (e) {
+        debugPrint('readWebBlobBytes Dio attempt ${attempt + 1} error: $e');
+      }
     }
+    return null;
   }
 
   Future<void> _stopVoiceRecordingAndSend() async {
@@ -1675,7 +1764,8 @@ class _ChatScreenState extends State<ChatScreen> {
         }
         await _sendMediaMessage(
           upload: _ChatUploadFile(
-            filename: 'voice-${DateTime.now().millisecondsSinceEpoch}.webm',
+            filename:
+                'voice-${DateTime.now().millisecondsSinceEpoch}.$_activeVoiceUploadExtension',
             bytes: bytes,
           ),
           attachmentType: 'voice',
@@ -1695,7 +1785,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       showAppNotice(
         context,
-        'Не удалось отправить голосовое сообщение',
+        'Не удалось отправить голосовое сообщение: ${_extractDioError(e)}',
         tone: AppNoticeTone.error,
         duration: const Duration(seconds: 2),
       );
@@ -3312,6 +3402,7 @@ class _ChatScreenState extends State<ChatScreen> {
               .clamp(0.0, 1.0)
               .toDouble()
         : 0.0;
+    final waveform = _buildVoiceWaveform(theme, messageId, progress);
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
@@ -3339,41 +3430,16 @@ class _ChatScreenState extends State<ChatScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(999),
-                child: LinearProgressIndicator(
-                  minHeight: 6,
-                  value: progress,
-                  backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                  valueColor: AlwaysStoppedAnimation<Color>(
-                    theme.colorScheme.primary,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
+              waveform,
+              const SizedBox(height: 6),
               Row(
                 children: [
-                  Icon(
-                    Icons.graphic_eq_rounded,
-                    size: 16,
-                    color: theme.colorScheme.primary,
-                  ),
-                  const SizedBox(width: 6),
                   Text(
                     isActive && currentPosition > Duration.zero
                         ? _formatDurationLabel(currentPosition)
                         : _formatDurationLabel(totalDuration),
                     style: TextStyle(
                       color: textColor,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const Spacer(),
-                  Text(
-                    'Голосовое',
-                    style: TextStyle(
-                      color: theme.colorScheme.onSurfaceVariant,
-                      fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -3384,6 +3450,45 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ],
     );
+  }
+
+  Widget _buildVoiceWaveform(ThemeData theme, String seed, double progress) {
+    final bars = _voiceWaveHeights(seed, 30);
+    final activeBars = (bars.length * progress).round();
+    return SizedBox(
+      height: 20,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: List.generate(bars.length, (index) {
+          final played = index < activeBars;
+          return Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 0.7),
+              child: Container(
+                height: bars[index],
+                decoration: BoxDecoration(
+                  color: played
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.onSurfaceVariant.withValues(
+                          alpha: 0.38,
+                        ),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
+  List<double> _voiceWaveHeights(String seed, int count) {
+    final safeCount = count < 8 ? 8 : count;
+    final random = Random(seed.hashCode);
+    return List<double>.generate(safeCount, (_) {
+      final base = 4 + random.nextInt(12); // 4..15
+      return base.toDouble();
+    });
   }
 
   Widget _buildMessageItem(Map<String, dynamic> message) {
@@ -4515,7 +4620,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         return GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTap: () {
-                            if (disabled || _voiceRecording) {
+                            if (disabled) {
                               if (!canCompose && mounted) {
                                 showAppNotice(
                                   context,
@@ -4525,6 +4630,29 @@ class _ChatScreenState extends State<ChatScreen> {
                                   duration: const Duration(seconds: 2),
                                 );
                               }
+                              return;
+                            }
+                            final isDesktopWeb =
+                                kIsWeb &&
+                                defaultTargetPlatform !=
+                                    TargetPlatform.android &&
+                                defaultTargetPlatform != TargetPlatform.iOS;
+                            if (!_cameraSupported &&
+                                _composerMediaMode ==
+                                    _ComposerMediaMode.voice &&
+                                isDesktopWeb) {
+                              if (_voiceRecording) {
+                                unawaited(_stopVoiceRecordingAndSend());
+                              } else {
+                                unawaited(
+                                  _startVoiceRecording(
+                                    autoStopIfNotPressed: false,
+                                  ),
+                                );
+                              }
+                              return;
+                            }
+                            if (_voiceRecording) {
                               return;
                             }
                             _toggleComposerMediaMode();
