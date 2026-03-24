@@ -23,6 +23,32 @@ function cleanString(rawValue) {
   return String(rawValue || "").trim();
 }
 
+function resolvePublicOrigin(req) {
+  const configuredBase = cleanString(
+    process.env.PUBLIC_BASE_URL || process.env.API_PUBLIC_BASE_URL,
+  );
+  if (configuredBase) {
+    try {
+      return new URL(configuredBase).origin;
+    } catch (_) {}
+  }
+  if (!req) return "";
+  const host = cleanString(req.get("host"));
+  const protocol = cleanString(req.protocol);
+  if (!host || !protocol) return "";
+  return `${protocol}://${host}`;
+}
+
+function toAbsolutePublicUrl(rawUrl, req) {
+  const normalized = cleanString(rawUrl);
+  if (!normalized) return "";
+  if (normalized.includes("://")) return normalized;
+  const origin = resolvePublicOrigin(req);
+  if (!origin) return normalized;
+  if (normalized.startsWith("/")) return `${origin}${normalized}`;
+  return `${origin}/${normalized}`;
+}
+
 function isAndroidUserAgent(req) {
   const userAgent = cleanString(req.headers["user-agent"]).toLowerCase();
   return userAgent.includes("android");
@@ -161,6 +187,12 @@ router.get("/", (req, res) => {
   try {
     const android = buildPlatformConfig("APP_UPDATE_ANDROID");
     const ios = buildPlatformConfig("APP_UPDATE_IOS");
+    if (android.download_url) {
+      android.download_url = toAbsolutePublicUrl(android.download_url, req);
+    }
+    if (ios.download_url) {
+      ios.download_url = toAbsolutePublicUrl(ios.download_url, req);
+    }
 
     return res.json({
       ok: true,
