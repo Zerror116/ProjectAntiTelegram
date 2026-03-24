@@ -663,7 +663,7 @@ async function canUserAccessChat(user, chatId) {
         credentials: true,
       },
       allowEIO3: true,
-      transports: ["websocket"],
+      transports: ["websocket", "polling"],
     });
 
     // Делаем io доступным в express
