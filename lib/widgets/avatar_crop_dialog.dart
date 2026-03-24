@@ -83,12 +83,12 @@ Future<String> _exportAvatarCrop({
   );
   final resized = img.copyResize(
     cropped,
-    width: 512,
-    height: 512,
+    width: 1024,
+    height: 1024,
     interpolation: img.Interpolation.cubic,
   );
 
-  final outputBytes = img.encodeJpg(resized, quality: 92);
+  final outputBytes = img.encodeJpg(resized, quality: 95);
   final outputPath =
       '${Directory.systemTemp.path}${Platform.pathSeparator}profile_avatar_${DateTime.now().millisecondsSinceEpoch}.jpg';
   await File(outputPath).writeAsBytes(outputBytes, flush: true);

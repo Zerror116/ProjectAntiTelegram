@@ -594,12 +594,12 @@ class _AdminPanelState extends State<AdminPanel>
     );
     final resized = img.copyResize(
       cropped,
-      width: 512,
-      height: 512,
+      width: 1024,
+      height: 1024,
       interpolation: img.Interpolation.cubic,
     );
 
-    final outputBytes = img.encodeJpg(resized, quality: 92);
+    final outputBytes = img.encodeJpg(resized, quality: 95);
     final outputPath =
         '${Directory.systemTemp.path}${Platform.pathSeparator}channel_avatar_${DateTime.now().millisecondsSinceEpoch}.jpg';
     await File(outputPath).writeAsBytes(outputBytes, flush: true);
@@ -5185,11 +5185,7 @@ class _AdminPanelState extends State<AdminPanel>
         if (!isSystemChannel) {
           await authService.dio.patch(
             '/api/admin/channels/$channelId',
-            data: {
-              'avatar_focus_x': 0,
-              'avatar_focus_y': 0,
-              'avatar_zoom': 1,
-            },
+            data: {'avatar_focus_x': 0, 'avatar_focus_y': 0, 'avatar_zoom': 1},
           );
         }
 
