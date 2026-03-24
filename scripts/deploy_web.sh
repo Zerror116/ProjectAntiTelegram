@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SERVER="${SERVER:-root@89.23.99.18}"
 REMOTE_TMP_DIR="${REMOTE_TMP_DIR:-/tmp/garphoenix-web}"
 REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/garphoenix.com}"
-BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
+BUILD_ARGS="${BUILD_ARGS:---release --pwa-strategy=none --no-wasm-dry-run}"
 
 echo "[deploy_web] project: $PROJECT_ROOT"
 echo "[deploy_web] server:  $SERVER"

@@ -1074,6 +1074,65 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
+  Future<void> _renameInviteCode(String inviteId, String currentCode) async {
+    if (!_isCreatorBase()) {
+      if (mounted) {
+        setState(
+          () => _message = 'Изменять код приглашения может только Создатель',
+        );
+      }
+      return;
+    }
+    final ctrl = TextEditingController(text: currentCode.trim());
+    final nextCode = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Изменить код приглашения'),
+        content: TextField(
+          controller: ctrl,
+          textCapitalization: TextCapitalization.characters,
+          decoration: const InputDecoration(
+            labelText: 'Новый код',
+            hintText: 'INV-XXXX-XXXX',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(ctrl.text.trim()),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    final normalized = (nextCode ?? '').trim().toUpperCase();
+    if (normalized.isEmpty || normalized == currentCode.trim().toUpperCase()) {
+      return;
+    }
+    setState(() => _inviteActionLoading = true);
+    try {
+      await authService.dio.patch(
+        '/api/admin/tenant/invites/$inviteId/code',
+        data: {'code': normalized},
+      );
+      if (mounted) {
+        setState(() => _message = 'Код приглашения обновлен');
+      }
+      await _loadTenantInvites(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка изменения кода: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _inviteActionLoading = false);
+    }
+  }
+
   Future<void> _loadChannels() async {
     setState(() {
       _loading = true;
@@ -2945,7 +3004,8 @@ class _AdminPanelState extends State<AdminPanel>
     final routeEntries =
         routes.entries.where((entry) => entry.key != '_pending').toList()
           ..sort((a, b) => a.key.compareTo(b.key));
-    final pendingCustomers = routes['_pending'] ?? const <Map<String, dynamic>>[];
+    final pendingCustomers =
+        routes['_pending'] ?? const <Map<String, dynamic>>[];
 
     for (var index = 0; index < routeEntries.length; index += 1) {
       final entry = routeEntries[index];
@@ -6317,6 +6377,14 @@ class _AdminPanelState extends State<AdminPanel>
                 trailing: Wrap(
                   spacing: 6,
                   children: [
+                    if (_isCreatorBase())
+                      IconButton(
+                        tooltip: 'Переименовать код',
+                        icon: const Icon(Icons.edit_outlined),
+                        onPressed: _inviteActionLoading
+                            ? null
+                            : () => _renameInviteCode(id, code),
+                      ),
                     IconButton(
                       tooltip: isActive ? 'Отключить' : 'Включить',
                       icon: Icon(

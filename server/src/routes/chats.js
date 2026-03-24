@@ -1367,6 +1367,7 @@ router.get("/", requireAuth, async (req, res) => {
           AND uc.contact_user_id = ou.id
           AND ($6::uuid IS NULL OR uc.tenant_id = $6::uuid)
          WHERE ocm.chat_id = c.id
+           AND c.type = 'private'
            AND ocm.user_id <> $1
          ORDER BY ocm.joined_at ASC
          LIMIT 1
@@ -1525,6 +1526,7 @@ router.get("/", requireAuth, async (req, res) => {
           AND uc.contact_user_id = ou.id
           AND ($3::uuid IS NULL OR uc.tenant_id = $3::uuid)
          WHERE ocm.chat_id = c.id
+           AND c.type = 'private'
            AND ocm.user_id <> $1
          ORDER BY ocm.joined_at ASC
          LIMIT 1

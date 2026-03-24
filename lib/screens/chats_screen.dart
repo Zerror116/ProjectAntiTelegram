@@ -725,19 +725,24 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final title = _chatDisplayTitle(chat);
     final time = _formatTime(chat['updated_at'] ?? chat['time']);
     final settings = _settingsOf(chat);
+    final chatType = (chat['type'] ?? '').toString().trim().toLowerCase();
+    final usePeerAvatar = chatType == 'private';
     final peerAvatarUrl = _resolveImageUrl(
       (chat['peer_avatar_url'] ?? '').toString(),
     );
-    final avatarUrl =
-        peerAvatarUrl ??
-        _resolveImageUrl((settings['avatar_url'] ?? '').toString());
-    final avatarFocusX = peerAvatarUrl != null
+    final channelAvatarUrl = _resolveImageUrl(
+      (settings['avatar_url'] ?? '').toString(),
+    );
+    final avatarUrl = usePeerAvatar
+        ? (peerAvatarUrl ?? channelAvatarUrl)
+        : channelAvatarUrl;
+    final avatarFocusX = usePeerAvatar && peerAvatarUrl != null
         ? _toAvatarFocus(chat['peer_avatar_focus_x'])
         : _toAvatarFocus(settings['avatar_focus_x']);
-    final avatarFocusY = peerAvatarUrl != null
+    final avatarFocusY = usePeerAvatar && peerAvatarUrl != null
         ? _toAvatarFocus(chat['peer_avatar_focus_y'])
         : _toAvatarFocus(settings['avatar_focus_y']);
-    final avatarZoom = peerAvatarUrl != null
+    final avatarZoom = usePeerAvatar && peerAvatarUrl != null
         ? _toAvatarZoom(chat['peer_avatar_zoom'])
         : _toAvatarZoom(settings['avatar_zoom']);
     final preview = _lastMessagePreview(chat);

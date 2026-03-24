@@ -17,6 +17,7 @@ import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
 import 'services/input_language_service.dart';
+import 'services/native_update_installer.dart';
 import 'services/offline_purchase_queue_service.dart';
 import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
@@ -915,15 +916,19 @@ String? _resolveAppUpdatePlatform() {
   if (kIsWeb) return null;
   if (defaultTargetPlatform == TargetPlatform.android) return 'android';
   if (defaultTargetPlatform == TargetPlatform.iOS) return 'ios';
+  if (defaultTargetPlatform == TargetPlatform.windows) return 'windows';
+  if (defaultTargetPlatform == TargetPlatform.macOS) return 'macos';
   return null;
 }
 
-Future<bool> _openUpdateUrl(String rawUrl) async {
+bool _nativeDesktopUpdateBusy = false;
+
+Uri? _resolveUpdateUri(String rawUrl) {
   final trimmed = rawUrl.trim();
-  if (trimmed.isEmpty) return false;
+  if (trimmed.isEmpty) return null;
 
   final parsed = Uri.tryParse(trimmed);
-  if (parsed == null) return false;
+  if (parsed == null) return null;
 
   Uri uri = parsed;
   if (!parsed.hasScheme) {
@@ -931,6 +936,117 @@ Future<bool> _openUpdateUrl(String rawUrl) async {
     if (base != null && base.hasScheme && base.host.isNotEmpty) {
       uri = base.resolveUri(parsed);
     }
+  }
+  return uri;
+}
+
+String _fallbackInstallerNameForPlatform(
+  String platform,
+  _AppUpdateVersion latest,
+) {
+  final suffix = '${latest.version}+${latest.build}'.replaceAll('+', '-');
+  if (platform == 'android') return 'projectphoenix-$suffix.apk';
+  if (platform == 'windows') return 'projectphoenix-$suffix.exe';
+  if (platform == 'macos') return 'projectphoenix-$suffix.dmg';
+  return 'projectphoenix-update-$suffix.bin';
+}
+
+Future<bool> _downloadAndInstallAndroidUpdate({
+  required Uri uri,
+  required _AppUpdateVersion latest,
+}) async {
+  final savePath = await NativeUpdateInstaller.downloadPackage(
+    url: uri,
+    fallbackFileName: _fallbackInstallerNameForPlatform('android', latest),
+    headers: const {'X-Fenix-Platform': 'android'},
+  );
+  if (savePath == null || savePath.trim().isEmpty) return false;
+  return NativeUpdateInstaller.openDownloadedPackage(savePath);
+}
+
+Future<void> _downloadAndInstallDesktopUpdateInBackground({
+  required String platform,
+  required Uri uri,
+  required _AppUpdateVersion latest,
+}) async {
+  if (_nativeDesktopUpdateBusy) {
+    showGlobalAppNotice(
+      'Обновление уже скачивается в фоне.',
+      title: 'Обновление Феникс',
+      tone: AppNoticeTone.info,
+    );
+    return;
+  }
+  _nativeDesktopUpdateBusy = true;
+  showGlobalAppNotice(
+    'Скачивание обновления началось в фоне. Мы откроем установщик после загрузки.',
+    title: 'Обновление Феникс',
+    tone: AppNoticeTone.info,
+  );
+
+  try {
+    final savePath = await NativeUpdateInstaller.downloadPackage(
+      url: uri,
+      fallbackFileName: _fallbackInstallerNameForPlatform(platform, latest),
+    );
+    if (savePath == null || savePath.trim().isEmpty) {
+      showGlobalAppNotice(
+        'Не удалось скачать обновление. Проверьте сеть и повторите.',
+        title: 'Обновление Феникс',
+        tone: AppNoticeTone.error,
+      );
+      return;
+    }
+    final opened = await NativeUpdateInstaller.openDownloadedPackage(savePath);
+    if (!opened) {
+      showGlobalAppNotice(
+        'Обновление скачано, но установщик не открылся автоматически.',
+        title: 'Обновление Феникс',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    showGlobalAppNotice(
+      'Установщик обновления открыт.',
+      title: 'Обновление Феникс',
+      tone: AppNoticeTone.success,
+    );
+  } catch (e) {
+    showGlobalAppNotice(
+      'Ошибка фонового обновления: $e',
+      title: 'Обновление Феникс',
+      tone: AppNoticeTone.error,
+    );
+  } finally {
+    _nativeDesktopUpdateBusy = false;
+  }
+}
+
+Future<bool> _openUpdateUrl(
+  String rawUrl, {
+  required String platform,
+  required _AppUpdateVersion latest,
+}) async {
+  final uri = _resolveUpdateUri(rawUrl);
+  if (uri == null) return false;
+
+  if (!kIsWeb && platform == 'android') {
+    try {
+      return await _downloadAndInstallAndroidUpdate(uri: uri, latest: latest);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  if (!kIsWeb && (platform == 'windows' || platform == 'macos')) {
+    unawaited(
+      _downloadAndInstallDesktopUpdateInBackground(
+        platform: platform,
+        uri: uri,
+        latest: latest,
+      ),
+    );
+    return true;
   }
 
   try {
@@ -2278,6 +2394,10 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
               ? 'Android'
               : info.platform == 'ios'
               ? 'iOS'
+              : info.platform == 'windows'
+              ? 'Windows'
+              : info.platform == 'macos'
+              ? 'macOS'
               : info.platform;
           final minSupportedLabel = info.minSupported == null
               ? null
@@ -2358,17 +2478,29 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           );
           return;
         }
-        final opened = await _openUpdateUrl(url);
+        final opened = await _openUpdateUrl(
+          url,
+          platform: info.platform,
+          latest: info.latest,
+        );
         if (opened) {
           _dismissedUpdateToken = updateToken;
+          final successMessage =
+              info.platform == 'windows' || info.platform == 'macos'
+              ? 'Обновление скачивается в фоне. Установщик откроется автоматически.'
+              : 'Открыта ссылка на обновление Феникс.';
           showGlobalAppNotice(
-            'Открыта ссылка на обновление Феникс.',
+            successMessage,
             title: 'Обновление',
             tone: AppNoticeTone.success,
           );
         } else {
+          final failedMessage = info.platform == 'android'
+              ? 'Не удалось установить обновление. Проверьте разрешение '
+                    '«Установка неизвестных приложений» для Феникс и повторите.'
+              : 'Не удалось открыть ссылку обновления. Проверьте URL.';
           showGlobalAppNotice(
-            'Не удалось открыть ссылку обновления. Проверьте URL.',
+            failedMessage,
             title: 'Обновление Феникс',
             tone: AppNoticeTone.error,
           );
