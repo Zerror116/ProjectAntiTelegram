@@ -85,6 +85,26 @@ const CHAT_MEDIA_MARKERS = Object.freeze({
   video: "/uploads/chat_media/video/",
 });
 
+function isVoiceMimeAllowed(mimeRaw, originalNameRaw) {
+  const mime = String(mimeRaw || "").toLowerCase().trim();
+  const originalName = String(originalNameRaw || "").toLowerCase().trim();
+  if (mime.startsWith("audio/")) return true;
+  if (mime === "application/octet-stream") return true;
+  // Some browsers (especially web blob uploads) label voice webm as video/webm.
+  if (mime === "video/webm" || mime.startsWith("video/webm;")) return true;
+  if (!mime) {
+    const ext = path.extname(originalName || "");
+    if (
+      [".webm", ".m4a", ".aac", ".wav", ".mp3", ".ogg", ".opus", ".mp4"].includes(
+        ext,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const chatMediaUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, file, cb) => {
@@ -125,7 +145,7 @@ const chatMediaUpload = multer({
       return;
     }
     if (file.fieldname === "voice") {
-      if (mime.startsWith("audio/") || mime === "application/octet-stream") {
+      if (isVoiceMimeAllowed(mime, file.originalname)) {
         cb(null, true);
         return;
       }

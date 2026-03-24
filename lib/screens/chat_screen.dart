@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:dio/dio.dart';
@@ -1073,15 +1074,49 @@ class _ChatScreenState extends State<ChatScreen> {
         defaultTargetPlatform == TargetPlatform.linux;
   }
 
-  Future<MultipartFile> _multipartFromUpload(_ChatUploadFile file) async {
+  Future<MultipartFile> _multipartFromUpload(
+    _ChatUploadFile file, {
+    DioMediaType? contentType,
+  }) async {
     if (!kIsWeb && file.path != null && file.path!.trim().isNotEmpty) {
-      return MultipartFile.fromFile(file.path!, filename: file.filename);
+      return MultipartFile.fromFile(
+        file.path!,
+        filename: file.filename,
+        contentType: contentType,
+      );
     }
     final bytes = file.bytes;
     if (bytes == null || bytes.isEmpty) {
       throw Exception('Не удалось прочитать файл');
     }
-    return MultipartFile.fromBytes(bytes, filename: file.filename);
+    return MultipartFile.fromBytes(
+      bytes,
+      filename: file.filename,
+      contentType: contentType,
+    );
+  }
+
+  DioMediaType? _voiceContentTypeForUpload(_ChatUploadFile upload) {
+    final name = upload.filename.toLowerCase().trim();
+    if (name.endsWith('.m4a') || name.endsWith('.mp4')) {
+      return DioMediaType('audio', 'mp4');
+    }
+    if (name.endsWith('.aac')) {
+      return DioMediaType('audio', 'aac');
+    }
+    if (name.endsWith('.wav')) {
+      return DioMediaType('audio', 'wav');
+    }
+    if (name.endsWith('.mp3')) {
+      return DioMediaType('audio', 'mpeg');
+    }
+    if (name.endsWith('.ogg') || name.endsWith('.opus')) {
+      return DioMediaType('audio', 'ogg');
+    }
+    if (name.endsWith('.webm')) {
+      return DioMediaType('audio', 'webm');
+    }
+    return DioMediaType('application', 'octet-stream');
   }
 
   Future<_ChatUploadFile?> _pickImageUpload(ImageSource source) async {
@@ -1216,7 +1251,10 @@ class _ChatScreenState extends State<ChatScreen> {
         if (attachmentType == 'image')
           'image': await _multipartFromUpload(upload),
         if (attachmentType == 'voice')
-          'voice': await _multipartFromUpload(upload),
+          'voice': await _multipartFromUpload(
+            upload,
+            contentType: _voiceContentTypeForUpload(upload),
+          ),
         if (attachmentType == 'video')
           'video': await _multipartFromUpload(upload),
         'client_msg_id': clientMsgId,
@@ -3005,258 +3043,222 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
 
-    final options = <PopupMenuEntry<String>>[];
-    if (canCopy) {
-      options.add(
-        const PopupMenuItem(value: 'copy', child: Text('Копировать')),
-      );
-    }
-    if (canReply) {
-      options.add(const PopupMenuItem(value: 'reply', child: Text('Ответить')));
-    }
-    if (canReact) {
-      for (final emoji in _reactionPickerEmojis()) {
-        options.add(
-          PopupMenuItem(value: 'react:$emoji', child: Text('Реакция $emoji')),
-        );
-      }
-    }
-    if (canPin) {
-      options.add(
-        PopupMenuItem(
-          value: isPinned ? 'unpin' : 'pin',
-          child: Text(isPinned ? 'Открепить' : 'Закрепить'),
-        ),
-      );
-    }
-    if (canOpenImage) {
-      options.add(
-        const PopupMenuItem(value: 'open_image', child: Text('Открыть фото')),
-      );
-    }
-    if (canCopyId) {
-      options.add(
-        const PopupMenuItem(value: 'copy_id', child: Text('Копировать ID')),
-      );
-    }
-    if (canEdit) {
-      options.add(const PopupMenuItem(value: 'edit', child: Text('Изменить')));
-    }
-    if (canDeleteForMe) {
-      options.add(
-        const PopupMenuItem(value: 'delete_me', child: Text('Удалить у меня')),
-      );
-    }
-    if (canDeleteForAll) {
-      options.add(
-        const PopupMenuItem(value: 'delete_all', child: Text('Удалить у всех')),
-      );
-    }
-    if (canDeleteEntireChat) {
-      options.add(
-        const PopupMenuItem(
-          value: 'delete_chat',
-          child: Text('УДАЛИТЬ ВСЁ!', style: TextStyle(color: Colors.red)),
-        ),
-      );
-    }
-    if (options.isEmpty) return;
+    final reactionChoices = canReact
+        ? _reactionPickerEmojis()
+        : const <String>[];
+    final hasMenuItems =
+        canReply ||
+        canCopy ||
+        canPin ||
+        canOpenImage ||
+        canCopyId ||
+        canEdit ||
+        canDeleteForMe ||
+        canDeleteForAll ||
+        canDeleteEntireChat;
+    if (!hasMenuItems && reactionChoices.isEmpty) return;
 
-    if (secondaryTap != null) {
-      final selected = await showMenu<String>(
-        context: context,
-        position: RelativeRect.fromLTRB(
-          secondaryTap.globalPosition.dx,
-          secondaryTap.globalPosition.dy,
-          secondaryTap.globalPosition.dx,
-          secondaryTap.globalPosition.dy,
-        ),
-        items: options,
-      );
-      if (selected != null) {
-        await applyAction(selected);
-      }
-      return;
-    }
+    Widget buildActionPanel(BuildContext ctx, {required bool desktop}) {
+      final theme = Theme.of(ctx);
+      final topBarColor = theme.brightness == Brightness.dark
+          ? const Color(0xFF1A2638).withValues(alpha: 0.82)
+          : theme.colorScheme.primaryContainer.withValues(alpha: 0.86);
+      final surfaceColor = theme.colorScheme.surface.withValues(alpha: 0.84);
 
-    if (!mounted) return;
-    final selected = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) {
-        final theme = Theme.of(ctx);
-        final reactionChoices = _reactionPickerEmojis();
-        final hasMenuItems =
-            canReply ||
-            canCopy ||
-            canPin ||
-            canOpenImage ||
-            canCopyId ||
-            canEdit ||
-            canDeleteForMe ||
-            canDeleteForAll ||
-            canDeleteEntireChat;
-        final topBarColor = theme.brightness == Brightness.dark
-            ? const Color(0xFF1A2638)
-            : theme.colorScheme.primaryContainer;
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (canReact && reactionChoices.isNotEmpty)
-                  Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.only(bottom: 8),
-                    decoration: BoxDecoration(
-                      color: topBarColor,
-                      borderRadius: BorderRadius.circular(22),
-                    ),
-                    child: SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      child: Row(
-                        children: reactionChoices.map((emoji) {
-                          final mine =
-                              currentUserId.isNotEmpty &&
-                              reactionByUser[currentUserId] == emoji;
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 3),
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(999),
-                              onTap: () =>
-                                  Navigator.of(ctx).pop('react:$emoji'),
-                              child: Ink(
-                                padding: const EdgeInsets.all(7),
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: mine
-                                      ? theme.colorScheme.primary.withValues(
-                                          alpha: 0.22,
-                                        )
-                                      : Colors.transparent,
-                                ),
-                                child: Text(
-                                  emoji,
-                                  style: const TextStyle(fontSize: 30),
-                                ),
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ),
-                  ),
-                if (hasMenuItems)
-                  Container(
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.surface,
-                      borderRadius: BorderRadius.circular(22),
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (canReply)
-                          ListTile(
-                            leading: const Icon(Icons.reply_outlined),
-                            title: const Text('Ответить'),
-                            onTap: () => Navigator.of(ctx).pop('reply'),
-                          ),
-                        if (canCopy)
-                          ListTile(
-                            leading: const Icon(Icons.copy_all_outlined),
-                            title: const Text('Копировать текст'),
-                            onTap: () => Navigator.of(ctx).pop('copy'),
-                          ),
-                        if (canPin)
-                          ListTile(
-                            leading: Icon(
-                              isPinned
-                                  ? Icons.push_pin_outlined
-                                  : Icons.push_pin,
-                            ),
-                            title: Text(isPinned ? 'Открепить' : 'Закрепить'),
-                            onTap: () => Navigator.of(
-                              ctx,
-                            ).pop(isPinned ? 'unpin' : 'pin'),
-                          ),
-                        if (canCopy)
-                          ListTile(
-                            leading: const Icon(
-                              Icons.forward_to_inbox_outlined,
-                            ),
-                            title: const Text('Переслать'),
-                            onTap: () => Navigator.of(ctx).pop('forward'),
-                          ),
-                        if (canCopy)
-                          ListTile(
-                            leading: const Icon(
-                              Icons.check_circle_outline_rounded,
-                            ),
-                            title: const Text('Выбрать'),
-                            onTap: () => Navigator.of(ctx).pop('select'),
-                          ),
-                        if (canOpenImage)
-                          ListTile(
-                            leading: const Icon(Icons.image_outlined),
-                            title: const Text('Открыть фото'),
-                            onTap: () => Navigator.of(ctx).pop('open_image'),
-                          ),
-                        if (canCopyId)
-                          ListTile(
-                            leading: const Icon(Icons.tag_outlined),
-                            title: const Text('Копировать ID'),
-                            onTap: () => Navigator.of(ctx).pop('copy_id'),
-                          ),
-                        if (canEdit)
-                          ListTile(
-                            leading: const Icon(Icons.edit_outlined),
-                            title: const Text('Изменить'),
-                            onTap: () => Navigator.of(ctx).pop('edit'),
-                          ),
-                        if (canDeleteForMe)
-                          ListTile(
-                            leading: const Icon(Icons.remove_circle_outline),
-                            title: const Text('Удалить у меня'),
-                            onTap: () => Navigator.of(ctx).pop('delete_me'),
-                          ),
-                        if (canDeleteForAll)
-                          ListTile(
-                            leading: const Icon(
-                              Icons.delete_outline,
-                              color: Colors.red,
-                            ),
-                            title: const Text(
-                              'Удалить у всех',
-                              style: TextStyle(color: Colors.red),
-                            ),
-                            onTap: () => Navigator.of(ctx).pop('delete_all'),
-                          ),
-                        if (canDeleteEntireChat)
-                          ListTile(
-                            leading: const Icon(
-                              Icons.delete_forever_outlined,
-                              color: Colors.red,
-                            ),
-                            title: const Text(
-                              'УДАЛИТЬ ВСЁ!',
-                              style: TextStyle(color: Colors.red),
-                            ),
-                            onTap: () => Navigator.of(ctx).pop('delete_chat'),
-                          ),
-                      ],
-                    ),
-                  ),
-              ],
+      Widget glass({required Widget child, EdgeInsetsGeometry? padding}) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(24),
+          child: BackdropFilter(
+            filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+            child: Container(
+              color: surfaceColor,
+              padding: padding,
+              child: child,
             ),
           ),
         );
-      },
-    );
+      }
+
+      Widget actionTile(
+        String value, {
+        required IconData icon,
+        required String title,
+        Color? color,
+      }) {
+        return ListTile(
+          dense: true,
+          visualDensity: const VisualDensity(vertical: -1),
+          leading: Icon(icon, color: color),
+          title: Text(title, style: TextStyle(color: color)),
+          onTap: () => Navigator.of(ctx).pop(value),
+        );
+      }
+
+      final actionWidgets = <Widget>[
+        if (canReply)
+          actionTile('reply', icon: Icons.reply_outlined, title: 'Ответить'),
+        if (canCopy)
+          actionTile(
+            'copy',
+            icon: Icons.copy_all_outlined,
+            title: 'Копировать текст',
+          ),
+        if (canPin)
+          actionTile(
+            isPinned ? 'unpin' : 'pin',
+            icon: isPinned ? Icons.push_pin_outlined : Icons.push_pin,
+            title: isPinned ? 'Открепить' : 'Закрепить',
+          ),
+        if (canCopy)
+          actionTile(
+            'forward',
+            icon: Icons.forward_to_inbox_outlined,
+            title: 'Переслать',
+          ),
+        if (canCopy)
+          actionTile(
+            'select',
+            icon: Icons.check_circle_outline_rounded,
+            title: 'Выбрать',
+          ),
+        if (canOpenImage)
+          actionTile(
+            'open_image',
+            icon: Icons.image_outlined,
+            title: 'Открыть фото',
+          ),
+        if (canCopyId)
+          actionTile(
+            'copy_id',
+            icon: Icons.tag_outlined,
+            title: 'Копировать ID',
+          ),
+        if (canEdit)
+          actionTile('edit', icon: Icons.edit_outlined, title: 'Изменить'),
+        if (canDeleteForMe)
+          actionTile(
+            'delete_me',
+            icon: Icons.remove_circle_outline,
+            title: 'Удалить у меня',
+          ),
+        if (canDeleteForAll)
+          actionTile(
+            'delete_all',
+            icon: Icons.delete_outline,
+            title: 'Удалить у всех',
+            color: Colors.red,
+          ),
+        if (canDeleteEntireChat)
+          actionTile(
+            'delete_chat',
+            icon: Icons.delete_forever_outlined,
+            title: 'УДАЛИТЬ ВСЁ!',
+            color: Colors.red,
+          ),
+      ];
+
+      return ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: desktop ? 460 : double.infinity,
+          maxHeight: MediaQuery.sizeOf(ctx).height * (desktop ? 0.82 : 0.72),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (reactionChoices.isNotEmpty)
+              glass(
+                child: Container(
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: topBarColor,
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    child: Row(
+                      children: reactionChoices.map((emoji) {
+                        final mine =
+                            currentUserId.isNotEmpty &&
+                            reactionByUser[currentUserId] == emoji;
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 3),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(999),
+                            onTap: () => Navigator.of(ctx).pop('react:$emoji'),
+                            child: Ink(
+                              padding: const EdgeInsets.all(7),
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: mine
+                                    ? theme.colorScheme.primary.withValues(
+                                        alpha: 0.22,
+                                      )
+                                    : Colors.transparent,
+                              ),
+                              child: Text(
+                                emoji,
+                                style: const TextStyle(fontSize: 30),
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ),
+              ),
+            if (hasMenuItems) ...[
+              if (reactionChoices.isNotEmpty) const SizedBox(height: 8),
+              glass(
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: actionWidgets,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
+    if (!mounted) return;
+    final isDesktopLike = secondaryTap != null;
+    final modalContext = context;
+    final selected = isDesktopLike
+        // ignore: use_build_context_synchronously
+        ? await showDialog<String>(
+            // ignore: use_build_context_synchronously
+            context: modalContext,
+            barrierColor: Colors.black.withValues(alpha: 0.38),
+            builder: (ctx) => Dialog(
+              elevation: 0,
+              backgroundColor: Colors.transparent,
+              insetPadding: const EdgeInsets.symmetric(
+                horizontal: 18,
+                vertical: 24,
+              ),
+              child: buildActionPanel(ctx, desktop: true),
+            ),
+          )
+        // ignore: use_build_context_synchronously
+        : await showModalBottomSheet<String>(
+            // ignore: use_build_context_synchronously
+            context: modalContext,
+            isScrollControlled: true,
+            backgroundColor: Colors.transparent,
+            builder: (ctx) => SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                child: buildActionPanel(ctx, desktop: false),
+              ),
+            ),
+          );
 
     if (selected != null) {
       await applyAction(selected);
