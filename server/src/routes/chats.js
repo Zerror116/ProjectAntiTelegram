@@ -211,6 +211,16 @@ function uploadChatMedia(req, res, next) {
     { name: "video", maxCount: 1 },
   ])(req, res, (err) => {
     if (!err) return next();
+    console.warn("[chat-media] upload error", {
+      code: err?.code || null,
+      field: err?.field || null,
+      message: err?.message || "unknown",
+      contentType: req.headers?.["content-type"] || "",
+      userAgent: req.headers?.["user-agent"] || "",
+      origin: req.headers?.origin || "",
+      chatId: req.params?.chatId || "",
+      userId: req.user?.id || "",
+    });
     if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
       return res.status(400).json({
         ok: false,
@@ -2299,6 +2309,23 @@ router.post(
       const pickedCount =
         (imageFile ? 1 : 0) + (voiceFile ? 1 : 0) + (videoFile ? 1 : 0);
       if (pickedCount !== 1) {
+        console.warn("[chat-media] invalid uploaded files count", {
+          pickedCount,
+          hasImage: Boolean(imageFile),
+          hasVoice: Boolean(voiceFile),
+          hasVideo: Boolean(videoFile),
+          imageMime: imageFile?.mimetype || "",
+          voiceMime: voiceFile?.mimetype || "",
+          videoMime: videoFile?.mimetype || "",
+          imageSize: imageFile?.size || 0,
+          voiceSize: voiceFile?.size || 0,
+          videoSize: videoFile?.size || 0,
+          contentType: req.headers?.["content-type"] || "",
+          userAgent: req.headers?.["user-agent"] || "",
+          origin: req.headers?.origin || "",
+          chatId,
+          userId,
+        });
         removeUploadedFiles(uploadedFiles);
         return res.status(400).json({
           ok: false,

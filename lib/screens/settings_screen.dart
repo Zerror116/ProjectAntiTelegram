@@ -111,6 +111,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Future<void> _openSystemNotificationSettings() async {
+    if (kIsWeb) {
+      showAppNotice(
+        context,
+        'Для веб-версии откройте настройки уведомлений браузера/сайта',
+        tone: AppNoticeTone.info,
+      );
+      return;
+    }
+    final opened = await launchUrl(
+      Uri.parse('app-settings:'),
+      mode: LaunchMode.externalApplication,
+    );
+    if (opened) return;
+    if (!mounted) return;
+    showAppNotice(
+      context,
+      'Не удалось открыть настройки устройства',
+      tone: AppNoticeTone.warning,
+    );
+  }
+
   bool _isTwoFactorEligibleRole() {
     final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
     return role == 'admin' || role == 'tenant' || role == 'creator';
@@ -902,6 +924,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               subtitle: const Text(
                 'Локальные уведомления и звуки внутри приложения',
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.notifications_active_outlined),
+              title: const Text('Системные настройки уведомлений'),
+              subtitle: const Text(
+                'Открыть настройки уведомлений устройства/браузера',
+              ),
+              onTap: _openSystemNotificationSettings,
             ),
             SwitchListTile(
               value: _darkMode,
