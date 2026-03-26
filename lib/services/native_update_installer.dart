@@ -28,7 +28,16 @@ class NativeUpdateInstaller {
     );
   }
 
-  static Future<bool> openDownloadedPackage(String filePath) {
-    return impl.openDownloadedPackage(filePath);
+  static Future<bool> openDownloadedPackage(
+    String filePath, {
+    bool detached = false,
+  }) {
+    return impl.openDownloadedPackage(filePath, detached: detached);
+  }
+
+  static Future<void> exitCurrentAppForUpdate({
+    Duration delay = const Duration(milliseconds: 1200),
+  }) {
+    return impl.exitCurrentAppForUpdate(delay: delay);
   }
 }

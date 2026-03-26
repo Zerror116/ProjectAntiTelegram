@@ -997,12 +997,26 @@ Future<void> _downloadAndInstallDesktopUpdateInBackground({
       );
       return;
     }
-    final opened = await NativeUpdateInstaller.openDownloadedPackage(savePath);
+    final opened = await NativeUpdateInstaller.openDownloadedPackage(
+      savePath,
+      detached: true,
+    );
     if (!opened) {
       showGlobalAppNotice(
         'Обновление скачано, но установщик не открылся автоматически.',
         title: 'Обновление Феникс',
         tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    if (platform == 'windows' || platform == 'macos') {
+      showGlobalAppNotice(
+        'Установщик обновления запущен. Приложение закроется автоматически.',
+        title: 'Обновление Феникс',
+        tone: AppNoticeTone.success,
+      );
+      await NativeUpdateInstaller.exitCurrentAppForUpdate(
+        delay: const Duration(milliseconds: 1600),
       );
       return;
     }
@@ -2487,7 +2501,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           _dismissedUpdateToken = updateToken;
           final successMessage =
               info.platform == 'windows' || info.platform == 'macos'
-              ? 'Обновление скачивается в фоне. Установщик откроется автоматически.'
+              ? 'Обновление скачивается в фоне. После загрузки запустится установщик, и приложение закроется автоматически.'
               : 'Открыта ссылка на обновление Феникс.';
           showGlobalAppNotice(
             successMessage,
