@@ -1073,7 +1073,12 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool get _cameraSupported {
-    if (kIsWeb) return true;
+    if (kIsWeb) {
+      // Desktop browsers usually provide only file-picker fallback for video capture.
+      // Keep camera mode only on mobile web where real camera capture is available.
+      return defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS;
+    }
     return defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS;
   }
@@ -1925,6 +1930,20 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
     }
+    if (kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.linux)) {
+      if (mounted) {
+        showAppNotice(
+          context,
+          'Веб-версия на компьютере пока не поддерживает запись видеокружка с камеры',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 3),
+        );
+      }
+      return;
+    }
     try {
       final source = _cameraSupported
           ? ImageSource.camera
@@ -1967,8 +1986,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_composerHoldActionTriggered || !_composerMediaPressActive) return;
     _composerHoldActionTriggered = true;
     if (_composerMediaMode == _ComposerMediaMode.camera) {
-      await _captureAndSendVideoMessage();
-      _composerMediaPressActive = false;
+      // For camera mode, defer capture to tap-up to preserve user gesture context
+      // on mobile browsers (Safari/Chrome), otherwise camera picker may be blocked.
       return;
     }
     await _startVoiceRecording();
@@ -2041,9 +2060,9 @@ class _ChatScreenState extends State<ChatScreen> {
     _cancelComposerMediaHoldTimer();
 
     if (holdTriggered) {
-      if (_composerMediaMode == _ComposerMediaMode.voice &&
-          _voiceRecording &&
-          !_voiceRecordingLocked) {
+      if (_composerMediaMode == _ComposerMediaMode.camera) {
+        await _captureAndSendVideoMessage();
+      } else if (_voiceRecording && !_voiceRecordingLocked) {
         await _stopVoiceRecordingAndSend();
       }
       return;
@@ -3687,51 +3706,84 @@ class _ChatScreenState extends State<ChatScreen> {
         : 0.0;
     final waveform = _buildVoiceWaveform(theme, messageId, progress);
 
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
-      children: [
-        InkWell(
-          borderRadius: BorderRadius.circular(999),
-          onTap: voiceUrl == null
-              ? null
-              : () => _toggleVoicePlayback(messageId, voiceUrl),
-          child: Ink(
-            width: 42,
-            height: 42,
-            decoration: BoxDecoration(
-              color: theme.colorScheme.primary.withValues(alpha: 0.12),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(
-              isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-              color: theme.colorScheme.primary,
-            ),
-          ),
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primary.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: theme.colorScheme.primary.withValues(alpha: 0.18),
         ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              waveform,
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Text(
-                    isActive && currentPosition > Duration.zero
-                        ? _formatDurationLabel(currentPosition)
-                        : _formatDurationLabel(totalDuration),
-                    style: TextStyle(
-                      color: textColor,
-                      fontWeight: FontWeight.w600,
-                    ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: voiceUrl == null
+                ? null
+                : () => _toggleVoicePlayback(messageId, voiceUrl),
+            child: Ink(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    theme.colorScheme.primary.withValues(alpha: 0.85),
+                    theme.colorScheme.primary.withValues(alpha: 0.65),
+                  ],
+                ),
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: theme.colorScheme.primary.withValues(alpha: 0.24),
+                    blurRadius: 10,
+                    offset: const Offset(0, 4),
                   ),
                 ],
               ),
-            ],
+              child: Icon(
+                isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                color: Colors.white,
+              ),
+            ),
           ),
-        ),
-      ],
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                waveform,
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Text(
+                      isActive && currentPosition > Duration.zero
+                          ? _formatDurationLabel(currentPosition)
+                          : _formatDurationLabel(totalDuration),
+                      style: TextStyle(
+                        color: textColor,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      'голосовое',
+                      style: TextStyle(
+                        color: textColor.withValues(alpha: 0.66),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -4785,60 +4837,192 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
               ),
-            if (_voiceRecording)
+            if (_voiceRecording || _voiceStartInProgress)
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(
-                          _voiceRecordingLocked
-                              ? Icons.lock_clock_rounded
-                              : Icons.mic_rounded,
-                          color: Theme.of(context).colorScheme.error,
-                          size: 18,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'Запись голосового: ${_formatDurationLabel(Duration(seconds: _recordingSeconds))}',
-                            style: TextStyle(
-                              color: Theme.of(context).colorScheme.onSurface,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                        if (_voiceRecordingLocked) ...[
-                          TextButton(
-                            onPressed: () => unawaited(_cancelVoiceRecording()),
-                            child: const Text('Отмена'),
-                          ),
-                          const SizedBox(width: 6),
-                          FilledButton.tonal(
-                            onPressed: () =>
-                                unawaited(_stopVoiceRecordingAndSend()),
-                            child: const Text('Отправить'),
-                          ),
-                        ],
-                      ],
-                    ),
-                    if (!_voiceRecordingLocked)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 2),
-                        child: Text(
-                          'Влево — отмена • Вверх — зафиксировать'
-                          '${_recordingDragDx < 0 || _recordingDragDy < 0 ? '  (${(-_recordingDragDx).round()}x / ${(-_recordingDragDy).round()}y)' : ''}',
-                          style: TextStyle(
-                            color: Theme.of(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: BackdropFilter(
+                    filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Theme.of(
                               context,
-                            ).colorScheme.onSurfaceVariant,
-                            fontSize: 12,
-                          ),
+                            ).colorScheme.surfaceContainerLow.withValues(
+                                  alpha: 0.9,
+                                ),
+                            Theme.of(
+                              context,
+                            ).colorScheme.surfaceContainerHigh.withValues(
+                                  alpha: 0.9,
+                                ),
+                          ],
+                        ),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.outlineVariant.withValues(alpha: 0.45),
                         ),
                       ),
-                  ],
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              TweenAnimationBuilder<double>(
+                                duration: const Duration(milliseconds: 900),
+                                tween: Tween<double>(
+                                  begin: 0.85,
+                                  end: _voiceRecording ? 1.08 : 1.0,
+                                ),
+                                curve: Curves.easeInOut,
+                                builder: (ctx, scale, child) => Transform.scale(
+                                  scale: scale,
+                                  child: child,
+                                ),
+                                child: Container(
+                                  width: 20,
+                                  height: 20,
+                                  decoration: BoxDecoration(
+                                    color: _voiceRecording
+                                        ? Theme.of(context).colorScheme.error
+                                        : Theme.of(context).colorScheme.primary,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Icon(
+                                    _voiceRecording
+                                        ? (_voiceRecordingLocked
+                                              ? Icons.lock_clock_rounded
+                                              : Icons.mic_rounded)
+                                        : Icons.hourglass_top_rounded,
+                                    size: 12,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  _voiceRecording
+                                      ? 'Голосовое: ${_formatDurationLabel(Duration(seconds: _recordingSeconds))}'
+                                      : 'Запускаем микрофон...',
+                                  style: TextStyle(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurface,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              if (_voiceRecordingLocked)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.primary.withValues(alpha: 0.16),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    'Зафиксировано',
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.primary,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                              if (_voiceRecordingLocked) ...[
+                                const SizedBox(width: 8),
+                                IconButton(
+                                  tooltip: 'Отмена',
+                                  onPressed: () =>
+                                      unawaited(_cancelVoiceRecording()),
+                                  icon: const Icon(Icons.close_rounded),
+                                ),
+                                FilledButton.tonalIcon(
+                                  onPressed: () =>
+                                      unawaited(_stopVoiceRecordingAndSend()),
+                                  icon: const Icon(Icons.send_rounded, size: 16),
+                                  label: const Text('Отправить'),
+                                ),
+                              ],
+                            ],
+                          ),
+                          if (_voiceRecording && !_voiceRecordingLocked)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.keyboard_double_arrow_left_rounded,
+                                    size: 16,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    'Свайп влево — отмена',
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Icon(
+                                    Icons.keyboard_double_arrow_up_rounded,
+                                    size: 16,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    'Свайп вверх — фиксация',
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                  if (_recordingDragDx < 0 ||
+                                      _recordingDragDy < 0) ...[
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      '(${(-_recordingDragDx).round()} / ${(-_recordingDragDy).round()})',
+                                      style: TextStyle(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ),
               ),
             SafeArea(
@@ -4943,6 +5127,11 @@ class _ChatScreenState extends State<ChatScreen> {
                               : (_composerMediaMode == _ComposerMediaMode.camera
                                     ? Icons.videocam_rounded
                                     : Icons.mic_none_rounded);
+                          final isArmed =
+                              _voiceRecording || _voiceStartInProgress;
+                          final buttonBaseColor = _voiceRecording
+                              ? Theme.of(context).colorScheme.error
+                              : activeColor;
                           return GestureDetector(
                             behavior: HitTestBehavior.opaque,
                             onTapDown: (details) => _handleComposerMediaTapDown(
@@ -4962,26 +5151,76 @@ class _ChatScreenState extends State<ChatScreen> {
                             onPanUpdate: _handleComposerMediaPanUpdate,
                             onPanEnd: (_) => _handleComposerMediaPanEnd(),
                             onPanCancel: _handleComposerMediaTapCancel,
-                            child: Container(
-                              width: 44,
-                              height: 44,
-                              alignment: Alignment.center,
-                              child: _voiceSending
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
+                            child: TweenAnimationBuilder<double>(
+                              duration: const Duration(milliseconds: 180),
+                              tween: Tween<double>(
+                                begin: 1,
+                                end: isArmed ? 1.08 : 1.0,
+                              ),
+                              curve: Curves.easeOutBack,
+                              builder: (ctx, scale, child) => Transform.scale(
+                                scale: scale,
+                                child: child,
+                              ),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 180),
+                                width: 46,
+                                height: 46,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  gradient: disabled
+                                      ? null
+                                      : LinearGradient(
+                                          begin: Alignment.topLeft,
+                                          end: Alignment.bottomRight,
+                                          colors: [
+                                            buttonBaseColor.withValues(
+                                              alpha: 0.9,
+                                            ),
+                                            buttonBaseColor.withValues(
+                                              alpha: 0.72,
+                                            ),
+                                          ],
+                                        ),
+                                  color: disabled
+                                      ? Theme.of(
+                                          context,
+                                        ).colorScheme.surfaceContainerHigh
+                                      : null,
+                                  boxShadow: disabled
+                                      ? null
+                                      : [
+                                          BoxShadow(
+                                            color: buttonBaseColor.withValues(
+                                              alpha: 0.30,
+                                            ),
+                                            blurRadius: 14,
+                                            offset: const Offset(0, 5),
+                                          ),
+                                        ],
+                                ),
+                                child: _voiceSending || _voiceStartInProgress
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2.2,
+                                          valueColor:
+                                              AlwaysStoppedAnimation<Color>(
+                                            Colors.white,
+                                          ),
+                                        ),
+                                      )
+                                    : Icon(
+                                        icon,
+                                        color: disabled
+                                            ? Theme.of(
+                                                context,
+                                              ).colorScheme.onSurfaceVariant
+                                            : Colors.white,
                                       ),
-                                    )
-                                  : Icon(
-                                      icon,
-                                      color: disabled
-                                          ? Theme.of(
-                                              context,
-                                            ).colorScheme.onSurfaceVariant
-                                          : activeColor,
-                                    ),
+                              ),
                             ),
                           );
                         },
