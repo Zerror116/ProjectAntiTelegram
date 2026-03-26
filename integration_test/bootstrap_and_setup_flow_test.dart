@@ -8,6 +8,13 @@ import 'package:projectphoenix/main.dart' as app;
 class _ApiStubState {
   int healthStatus = 200;
   int setupStatus = 200;
+  int healthRequests = 0;
+  int setupRequests = 0;
+
+  void resetCounters() {
+    healthRequests = 0;
+    setupRequests = 0;
+  }
 }
 
 Response<dynamic> _jsonResponse(
@@ -28,6 +35,11 @@ void main() {
   final apiState = _ApiStubState();
   late InterceptorsWrapper interceptor;
 
+  setUp(() {
+    apiState.resetCounters();
+    app.debugSetApiBaseUrlForTesting('http://integration.test');
+  });
+
   setUpAll(() {
     app.debugEnsureAuthServiceForTesting();
     app.debugSetApiBaseUrlForTesting('http://integration.test');
@@ -35,6 +47,7 @@ void main() {
     interceptor = InterceptorsWrapper(
       onRequest: (options, handler) {
         if (options.path == '/health') {
+          apiState.healthRequests += 1;
           final code = apiState.healthStatus;
           handler.resolve(
             _jsonResponse(options, code, {'ok': code >= 200 && code < 300}),
@@ -42,6 +55,7 @@ void main() {
           return;
         }
         if (options.path == '/api/setup') {
+          apiState.setupRequests += 1;
           final code = apiState.setupStatus;
           handler.resolve(
             _jsonResponse(options, code, {'ok': code >= 200 && code < 300}),
@@ -70,14 +84,33 @@ void main() {
 
     final ok = await app.ensureDatabaseExists();
     expect(ok, isTrue);
+    expect(apiState.healthRequests, greaterThanOrEqualTo(1));
+    expect(apiState.setupRequests, 0);
   });
 
-  testWidgets('ensureDatabaseExists falls back to /api/setup', (tester) async {
+  testWidgets('ensureDatabaseExists falls back to /api/setup for loopback base', (
+    tester,
+  ) async {
+    app.debugSetApiBaseUrlForTesting('http://127.0.0.1:3000');
     apiState.healthStatus = 503;
     apiState.setupStatus = 200;
 
     final ok = await app.ensureDatabaseExists();
     expect(ok, isTrue);
+    expect(apiState.healthRequests, greaterThanOrEqualTo(1));
+    expect(apiState.setupRequests, greaterThanOrEqualTo(1));
+  });
+
+  testWidgets('ensureDatabaseExists skips /api/setup for non-local base', (
+    tester,
+  ) async {
+    apiState.healthStatus = 503;
+    apiState.setupStatus = 200;
+
+    final ok = await app.ensureDatabaseExists();
+    expect(ok, isFalse);
+    expect(apiState.healthRequests, greaterThanOrEqualTo(1));
+    expect(apiState.setupRequests, 0);
   });
 
   testWidgets('SetupFailedScreen retry rechecks backend', (tester) async {

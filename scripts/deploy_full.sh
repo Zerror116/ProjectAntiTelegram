@@ -84,6 +84,7 @@ if [[ -n "${SSH_PASSWORD:-}" ]]; then
     exit 1
   fi
   USE_SSHPASS="1"
+  SSH_OPTS+=(-o PreferredAuthentications=password -o PubkeyAuthentication=no)
 fi
 
 run_ssh() {
@@ -107,6 +108,19 @@ echo "[deploy_full] branch:  $BRANCH"
 echo "[deploy_full] server:  $SERVER"
 echo "[deploy_full] remote project: $REMOTE_PROJECT_DIR"
 echo "[deploy_full] remote web root: $REMOTE_WEB_ROOT"
+
+strip_web_debug_artifacts() {
+  find "$PROJECT_ROOT/build/web" -name '.DS_Store' -delete || true
+  rm -f "$PROJECT_ROOT/build/web/.last_build_id" || true
+  for file in \
+    "$PROJECT_ROOT/build/web/flutter.js" \
+    "$PROJECT_ROOT/build/web/flutter_bootstrap.js"
+  do
+    [[ -f "$file" ]] || continue
+    sed -i.bak '/sourceMappingURL=flutter\.js\.map/d' "$file" || true
+    rm -f "$file.bak"
+  done
+}
 
 cd "$PROJECT_ROOT"
 
@@ -146,8 +160,7 @@ else
   echo "[deploy_full] --skip-build: skip flutter build"
 fi
 
-find "$PROJECT_ROOT/build/web" -name '.DS_Store' -delete || true
-rm -f "$PROJECT_ROOT/build/web/.last_build_id" || true
+strip_web_debug_artifacts
 
 echo "[deploy_full] upload build/web -> $SERVER:$REMOTE_TMP_DIR"
 run_rsync -avz --delete --exclude='.DS_Store' --exclude='.last_build_id' \
