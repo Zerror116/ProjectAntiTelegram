@@ -1073,10 +1073,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool get _cameraSupported {
-    if (kIsWeb) {
-      return defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS;
-    }
+    if (kIsWeb) return true;
     return defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS;
   }
@@ -2018,13 +2015,6 @@ class _ChatScreenState extends State<ChatScreen> {
     required TapDownDetails details,
   }) {
     if (disabled) return;
-    final isDesktopWeb =
-        kIsWeb &&
-        defaultTargetPlatform != TargetPlatform.android &&
-        defaultTargetPlatform != TargetPlatform.iOS;
-    if (isDesktopWeb && !_cameraSupported) {
-      return;
-    }
     if (kIsWeb &&
         _composerMediaMode == _ComposerMediaMode.voice &&
         _webVoiceConfigsFuture == null) {
@@ -3529,7 +3519,7 @@ class _ChatScreenState extends State<ChatScreen> {
           maxHeight: MediaQuery.sizeOf(ctx).height * (desktop ? 0.82 : 0.72),
         ),
         child: Column(
-          mainAxisSize: MainAxisSize.min,
+          mainAxisSize: hasMenuItems ? MainAxisSize.max : MainAxisSize.min,
           children: [
             if (reactionChoices.isNotEmpty)
               glass(
@@ -3579,11 +3569,13 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             if (hasMenuItems) ...[
               if (reactionChoices.isNotEmpty) const SizedBox(height: 8),
-              glass(
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: actionWidgets,
+              Flexible(
+                child: glass(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: actionWidgets,
+                    ),
                   ),
                 ),
               ),
@@ -4604,6 +4596,9 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: Icon(_searchMode ? Icons.close : Icons.search),
             onPressed: () {
+              if (!_searchMode && _voiceRecording) {
+                unawaited(_cancelVoiceRecording());
+              }
               setState(() {
                 if (_searchMode) {
                   _searchController.clear();
@@ -4763,216 +4758,224 @@ class _ChatScreenState extends State<ChatScreen> {
                     },
                   ),
           ),
-          if (blockedReason != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: Text(
-                blockedReason,
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  fontSize: 12,
+          if (!_searchMode) ...[
+            if (blockedReason != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: Text(
+                  blockedReason,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                  ),
                 ),
               ),
-            ),
-          if (_voiceRecording)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        _voiceRecordingLocked
-                            ? Icons.lock_clock_rounded
-                            : Icons.mic_rounded,
-                        color: Theme.of(context).colorScheme.error,
-                        size: 18,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Запись голосового: ${_formatDurationLabel(Duration(seconds: _recordingSeconds))}',
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.onSurface,
-                            fontWeight: FontWeight.w700,
-                          ),
+            if (_voiceRecording)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          _voiceRecordingLocked
+                              ? Icons.lock_clock_rounded
+                              : Icons.mic_rounded,
+                          color: Theme.of(context).colorScheme.error,
+                          size: 18,
                         ),
-                      ),
-                      if (_voiceRecordingLocked) ...[
-                        TextButton(
-                          onPressed: () => unawaited(_cancelVoiceRecording()),
-                          child: const Text('Отмена'),
-                        ),
-                        const SizedBox(width: 6),
-                        FilledButton.tonal(
-                          onPressed: () =>
-                              unawaited(_stopVoiceRecordingAndSend()),
-                          child: const Text('Отправить'),
-                        ),
-                      ],
-                    ],
-                  ),
-                  if (!_voiceRecordingLocked)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 2),
-                      child: Text(
-                        'Влево — отмена • Вверх — зафиксировать'
-                        '${_recordingDragDx < 0 || _recordingDragDy < 0 ? '  (${(-_recordingDragDx).round()}x / ${(-_recordingDragDy).round()}y)' : ''}',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  IconButton(
-                    tooltip: 'Вложение',
-                    icon: _mediaUploading
-                        ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.attach_file_rounded),
-                    onPressed:
-                        canCompose &&
-                            !_mediaUploading &&
-                            !_voiceSending &&
-                            !_voiceRecording
-                        ? _openAttachmentSheet
-                        : null,
-                  ),
-                  Expanded(
-                    child: Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 4),
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      decoration: BoxDecoration(
-                        color: Theme.of(
-                          context,
-                        ).colorScheme.surfaceContainerLow,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: Theme.of(context).colorScheme.outlineVariant,
-                        ),
-                      ),
-                      child: SubmitOnEnter(
-                        controller: _controller,
-                        enabled:
-                            allowEnterShortcut &&
-                            canCompose &&
-                            !_voiceRecording,
-                        onSubmit: _send,
-                        child: TextField(
-                          focusNode: _inputFocusNode,
-                          controller: _controller,
-                          enabled: canCompose && !_voiceRecording,
-                          minLines: 1,
-                          maxLines: 6,
-                          keyboardType: TextInputType.multiline,
-                          textInputAction: TextInputAction.newline,
-                          decoration: withInputLanguageBadge(
-                            InputDecoration(
-                              hintText: _voiceRecording
-                                  ? 'Говорите... отпустите кнопку для отправки'
-                                  : canCompose
-                                  ? 'Сообщение...'
-                                  : 'Отправка сообщений недоступна',
-                              border: InputBorder.none,
-                              isDense: true,
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Запись голосового: ${_formatDurationLabel(Duration(seconds: _recordingSeconds))}',
+                            style: TextStyle(
+                              color: Theme.of(context).colorScheme.onSurface,
+                              fontWeight: FontWeight.w700,
                             ),
-                            controller: _controller,
+                          ),
+                        ),
+                        if (_voiceRecordingLocked) ...[
+                          TextButton(
+                            onPressed: () => unawaited(_cancelVoiceRecording()),
+                            child: const Text('Отмена'),
+                          ),
+                          const SizedBox(width: 6),
+                          FilledButton.tonal(
+                            onPressed: () =>
+                                unawaited(_stopVoiceRecordingAndSend()),
+                            child: const Text('Отправить'),
+                          ),
+                        ],
+                      ],
+                    ),
+                    if (!_voiceRecordingLocked)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          'Влево — отмена • Вверх — зафиксировать'
+                          '${_recordingDragDx < 0 || _recordingDragDy < 0 ? '  (${(-_recordingDragDx).round()}x / ${(-_recordingDragDy).round()}y)' : ''}',
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                            fontSize: 12,
                           ),
                         ),
                       ),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Эмодзи',
-                    icon: const Icon(Icons.emoji_emotions_outlined),
-                    onPressed: canCompose && !_voiceRecording
-                        ? _openComposerEmojiPicker
-                        : null,
-                  ),
-                  if (_hasDraftText)
+                  ],
+                ),
+              ),
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
                     IconButton(
-                      icon: _voiceSending
+                      tooltip: 'Вложение',
+                      icon: _mediaUploading
                           ? const SizedBox(
                               width: 18,
                               height: 18,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : const Icon(Icons.send_rounded),
-                      onPressed: !canCompose || _mediaUploading ? null : _send,
-                    )
-                  else
-                    Builder(
-                      builder: (context) {
-                        final disabled =
-                            !canCompose || _mediaUploading || _voiceSending;
-                        final activeColor = Theme.of(
-                          context,
-                        ).colorScheme.primary;
-                        final icon = _voiceRecording
-                            ? Icons.stop_circle_outlined
-                            : (_composerMediaMode == _ComposerMediaMode.camera
-                                  ? Icons.videocam_rounded
-                                  : Icons.mic_none_rounded);
-                        return GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTapDown: (details) => _handleComposerMediaTapDown(
-                            disabled: disabled,
-                            context: context,
-                            canCompose: canCompose,
-                            details: details,
+                          : const Icon(Icons.attach_file_rounded),
+                      onPressed:
+                          canCompose &&
+                              !_mediaUploading &&
+                              !_voiceSending &&
+                              !_voiceRecording
+                          ? _openAttachmentSheet
+                          : null,
+                    ),
+                    Expanded(
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 4),
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        decoration: BoxDecoration(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.surfaceContainerLow,
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: Theme.of(context).colorScheme.outlineVariant,
                           ),
-                          onTapUp: (_) => unawaited(
-                            _handleComposerMediaTapUp(
+                        ),
+                        child: SubmitOnEnter(
+                          controller: _controller,
+                          enabled:
+                              allowEnterShortcut &&
+                              canCompose &&
+                              !_voiceRecording,
+                          onSubmit: _send,
+                          child: TextField(
+                            focusNode: _inputFocusNode,
+                            controller: _controller,
+                            enabled: canCompose && !_voiceRecording,
+                            minLines: 1,
+                            maxLines: 6,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            decoration: withInputLanguageBadge(
+                              InputDecoration(
+                                hintText: _voiceRecording
+                                    ? 'Говорите... отпустите кнопку для отправки'
+                                    : canCompose
+                                    ? 'Сообщение...'
+                                    : 'Отправка сообщений недоступна',
+                                border: InputBorder.none,
+                                isDense: true,
+                              ),
+                              controller: _controller,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Эмодзи',
+                      icon: const Icon(Icons.emoji_emotions_outlined),
+                      onPressed: canCompose && !_voiceRecording
+                          ? _openComposerEmojiPicker
+                          : null,
+                    ),
+                    if (_hasDraftText)
+                      IconButton(
+                        icon: _voiceSending
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.send_rounded),
+                        onPressed: !canCompose || _mediaUploading
+                            ? null
+                            : _send,
+                      )
+                    else
+                      Builder(
+                        builder: (context) {
+                          final disabled =
+                              !canCompose || _mediaUploading || _voiceSending;
+                          final activeColor = Theme.of(
+                            context,
+                          ).colorScheme.primary;
+                          final icon = _voiceRecording
+                              ? Icons.stop_circle_outlined
+                              : (_composerMediaMode == _ComposerMediaMode.camera
+                                    ? Icons.videocam_rounded
+                                    : Icons.mic_none_rounded);
+                          return GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTapDown: (details) => _handleComposerMediaTapDown(
                               disabled: disabled,
                               context: context,
                               canCompose: canCompose,
+                              details: details,
                             ),
-                          ),
-                          onTapCancel: _handleComposerMediaTapCancel,
-                          onPanUpdate: _handleComposerMediaPanUpdate,
-                          onPanEnd: (_) => _handleComposerMediaPanEnd(),
-                          onPanCancel: _handleComposerMediaTapCancel,
-                          child: Container(
-                            width: 44,
-                            height: 44,
-                            alignment: Alignment.center,
-                            child: _voiceSending
-                                ? const SizedBox(
-                                    width: 20,
-                                    height: 20,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
+                            onTapUp: (_) => unawaited(
+                              _handleComposerMediaTapUp(
+                                disabled: disabled,
+                                context: context,
+                                canCompose: canCompose,
+                              ),
+                            ),
+                            onTapCancel: _handleComposerMediaTapCancel,
+                            onPanUpdate: _handleComposerMediaPanUpdate,
+                            onPanEnd: (_) => _handleComposerMediaPanEnd(),
+                            onPanCancel: _handleComposerMediaTapCancel,
+                            child: Container(
+                              width: 44,
+                              height: 44,
+                              alignment: Alignment.center,
+                              child: _voiceSending
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : Icon(
+                                      icon,
+                                      color: disabled
+                                          ? Theme.of(
+                                              context,
+                                            ).colorScheme.onSurfaceVariant
+                                          : activeColor,
                                     ),
-                                  )
-                                : Icon(
-                                    icon,
-                                    color: disabled
-                                        ? Theme.of(
-                                            context,
-                                          ).colorScheme.onSurfaceVariant
-                                        : activeColor,
-                                  ),
-                          ),
-                        );
-                      },
-                    ),
-                ],
+                            ),
+                          );
+                        },
+                      ),
+                  ],
+                ),
               ),
             ),
-          ),
+          ],
         ],
       ),
     );
