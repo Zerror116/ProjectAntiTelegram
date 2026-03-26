@@ -74,10 +74,35 @@ Future<String?> downloadPackage({
   return targetFile.path;
 }
 
-Future<bool> openDownloadedPackage(String filePath) async {
+Future<bool> openDownloadedPackage(
+  String filePath, {
+  bool detached = false,
+}) async {
   final file = File(filePath);
   if (!await file.exists()) return false;
+  if (detached &&
+      (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
+    try {
+      await Process.start(
+        file.path,
+        const [],
+        workingDirectory: file.parent.path,
+        mode: ProcessStartMode.detached,
+        runInShell: true,
+      );
+      return true;
+    } catch (_) {
+      // Fallback to open_filex below.
+    }
+  }
   final result = await OpenFilex.open(file.path);
   final typeName = result.type.toString().split('.').last.toLowerCase();
   return typeName == 'done' || typeName == 'success';
+}
+
+Future<void> exitCurrentAppForUpdate({
+  Duration delay = const Duration(milliseconds: 1200),
+}) async {
+  await Future.delayed(delay);
+  exit(0);
 }

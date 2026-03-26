@@ -13,6 +13,13 @@ Future<String?> downloadPackage({
   return null;
 }
 
-Future<bool> openDownloadedPackage(String filePath) async {
+Future<bool> openDownloadedPackage(
+  String filePath, {
+  bool detached = false,
+}) async {
   return false;
 }
+
+Future<void> exitCurrentAppForUpdate({
+  Duration delay = const Duration(milliseconds: 1200),
+}) async {}
