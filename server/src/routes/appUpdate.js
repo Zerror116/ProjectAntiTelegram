@@ -23,6 +23,17 @@ function cleanString(rawValue) {
   return String(rawValue || "").trim();
 }
 
+function looksLikePlaceholderUrl(rawValue) {
+  const value = cleanString(rawValue).toLowerCase();
+  if (!value) return false;
+  return (
+    value.includes("xxxxxxx") ||
+    value.includes("example.com") ||
+    value.includes("example.org") ||
+    value.includes("example.test")
+  );
+}
+
 function resolvePublicOrigin(req) {
   const configuredBase = cleanString(
     process.env.PUBLIC_BASE_URL || process.env.API_PUBLIC_BASE_URL,
@@ -141,7 +152,11 @@ function buildPlatformConfig(prefix) {
   const minSupportedVersion = cleanString(process.env[`${prefix}_MIN_VERSION`]);
   const minSupportedBuild = parsePositiveInt(process.env[`${prefix}_MIN_BUILD`], 0);
   const rawDownloadUrl = cleanString(process.env[`${prefix}_DOWNLOAD_URL`]);
-  const downloadUrl = resolvePlatformDownloadUrl(prefix, rawDownloadUrl);
+  const resolvedDownloadUrl = resolvePlatformDownloadUrl(prefix, rawDownloadUrl);
+  const hasPlaceholderDownload =
+    looksLikePlaceholderUrl(rawDownloadUrl) ||
+    looksLikePlaceholderUrl(resolvedDownloadUrl);
+  const downloadUrl = hasPlaceholderDownload ? "" : resolvedDownloadUrl;
   const message = cleanString(process.env[`${prefix}_MESSAGE`]);
   const title =
     cleanString(process.env[`${prefix}_TITLE`]) || "Доступно обновление Феникс";
@@ -159,7 +174,7 @@ function buildPlatformConfig(prefix) {
   const enabled = parseBooleanEnv(
     process.env[`${prefix}_ENABLED`],
     Boolean(hasConfig),
-  );
+  ) && !hasPlaceholderDownload;
 
   return {
     enabled,
