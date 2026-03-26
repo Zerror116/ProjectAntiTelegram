@@ -764,13 +764,25 @@ class AuthService {
   Future<void> setViewRole(String? role) async {
     if (!canSwitchViewRole) return;
     final normalized = role?.toLowerCase().trim();
-    final prefs = await SharedPreferences.getInstance();
-    if (normalized == null || normalized.isEmpty || normalized == 'creator') {
-      _viewRole = null;
-      await prefs.remove(_viewRoleKey);
-    } else {
-      _viewRole = normalized;
-      await prefs.setString(_viewRoleKey, normalized);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (normalized == null ||
+          normalized.isEmpty ||
+          normalized == 'creator') {
+        _viewRole = null;
+        await prefs.remove(_viewRoleKey);
+      } else {
+        _viewRole = normalized;
+        await prefs.setString(_viewRoleKey, normalized);
+      }
+    } catch (e) {
+      // Do not crash UI if storage is temporarily unavailable on web.
+      debugPrint('setViewRole storage error: $e');
+      if (normalized == null || normalized.isEmpty || normalized == 'creator') {
+        _viewRole = null;
+      } else {
+        _viewRole = normalized;
+      }
     }
     try {
       _authController.add(_currentUser);
