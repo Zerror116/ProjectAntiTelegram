@@ -3042,9 +3042,24 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       final status = e.response?.statusCode;
       if (status == 404) {
+        final data = e.response?.data;
+        final path = data is Map ? '${data['path'] ?? ''}'.trim() : '';
+        final errorText = data is Map
+            ? '${data['error'] ?? data['message'] ?? ''}'
+                .toLowerCase()
+                .trim()
+            : '';
+        final looksLikeMissingRoute =
+            path.contains('/reactions') && errorText.contains('not found');
+        final looksLikeMissingMessage =
+            errorText.contains('сообщение не найдено');
         showAppNotice(
           context,
-          'Реакции недоступны: сервер не обновлён (маршрут /reactions не найден)',
+          looksLikeMissingRoute
+              ? 'Реакции недоступны: сервер не обновлён (маршрут /reactions не найден)'
+              : looksLikeMissingMessage
+              ? 'Сообщение больше недоступно для реакции'
+              : 'Не удалось поставить реакцию',
           tone: AppNoticeTone.warning,
           duration: const Duration(seconds: 3),
         );
