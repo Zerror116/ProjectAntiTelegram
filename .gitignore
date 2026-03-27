@@ -11,6 +11,9 @@
 .flutter-plugins-dependencies
 build/
 
+upload-keystore.jks
+android/key.properties
+
 server/node_modules/
 server/build/
 server/uploads/

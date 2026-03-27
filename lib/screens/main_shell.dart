@@ -7,7 +7,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
-import '../widgets/phoenix_loader.dart';
+import '../services/web_notification_service.dart';
+import '../services/web_push_client_service.dart';
+import '../widgets/web_notification_prompt.dart';
 import 'admin_panel.dart';
 import 'auth_screen.dart';
 import 'cart_screen.dart';
@@ -44,54 +46,49 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> {
   static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
+  static const String _webNotificationsBannerDismissedKey =
+      'web_notifications_banner_dismissed_v1';
   int _index = 0;
-  bool _loading = true;
   StreamSubscription<User?>? _authSub;
   String _lastEffectiveRole = '';
   final Set<String> _activatedDestinations = <String>{};
   String? _phoneAccessDecisionInFlightId;
+  WebNotificationPermissionState _webNotificationPermissionState =
+      WebNotificationPermissionState.unsupported;
+  bool _webNotificationStatusLoaded = false;
+  bool _webNotificationBannerDismissed = false;
+  bool _webNotificationRequestInProgress = false;
 
   @override
   void initState() {
     super.initState();
-    if (_isAndroidWeb()) {
-      _loading = false;
-      return;
-    }
+    if (_isAndroidWeb()) return;
     _lastEffectiveRole = authService.effectiveRole;
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;
-      if (_loading) {
-        setState(() {
-          _loading = false;
-          _lastEffectiveRole = nextRole;
-          _index = _resolveNextIndexForRole(nextRole);
-          _activatedDestinations.clear();
-        });
-      } else {
-        setState(() {
-          if (_lastEffectiveRole != nextRole) {
-            final nextIndex = _resolveNextIndexForRole(nextRole);
-            _lastEffectiveRole = nextRole;
-            _index = nextIndex;
-            _activatedDestinations.clear();
-          }
-        });
+      final currentUser = authService.currentUser;
+      if (kIsWeb &&
+          currentUser != null &&
+          _webNotificationPermissionState ==
+              WebNotificationPermissionState.granted) {
+        unawaited(WebPushClientService.ensureSubscribed(dio));
+        unawaited(WebPushClientService.syncUnreadBadge(dio));
       }
-    });
-
-    if (authService.currentUser != null) {
-      _loading = false;
-    } else {
-      Future.delayed(const Duration(milliseconds: 800), () {
-        if (mounted && _loading) setState(() => _loading = false);
+      setState(() {
+        if (_lastEffectiveRole != nextRole) {
+          final nextIndex = _resolveNextIndexForRole(nextRole);
+          _lastEffectiveRole = nextRole;
+          _index = nextIndex;
+          _activatedDestinations.clear();
+        }
       });
-    }
+    });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _maybeShowIosAddToHomeHint();
     });
+    unawaited(_loadWebNotificationPromptState());
   }
 
   @override
@@ -220,6 +217,166 @@ class _MainShellState extends State<MainShell> {
 
   bool _isAndroidWeb() {
     return kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  }
+
+  Future<void> _loadWebNotificationPromptState() async {
+    if (!kIsWeb) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final dismissed =
+          prefs.getBool(_webNotificationsBannerDismissedKey) == true;
+      final permission = await WebNotificationService.getPermissionState();
+      if (!mounted) return;
+      setState(() {
+        _webNotificationBannerDismissed =
+            dismissed && permission != WebNotificationPermissionState.granted;
+        _webNotificationPermissionState = permission;
+        _webNotificationStatusLoaded = true;
+      });
+      if (permission == WebNotificationPermissionState.granted &&
+          authService.currentUser != null) {
+        unawaited(WebPushClientService.ensureSubscribed(dio));
+        unawaited(WebPushClientService.syncUnreadBadge(dio));
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _webNotificationStatusLoaded = true;
+      });
+    }
+  }
+
+  Future<void> _dismissWebNotificationPrompt() async {
+    if (!kIsWeb) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_webNotificationsBannerDismissedKey, true);
+    if (!mounted) return;
+    setState(() {
+      _webNotificationBannerDismissed = true;
+    });
+  }
+
+  Future<void> _requestWebNotificationAccess() async {
+    if (!kIsWeb) return;
+    if (_webNotificationRequestInProgress) return;
+    setState(() {
+      _webNotificationRequestInProgress = true;
+    });
+    try {
+      final current = await WebNotificationService.getPermissionState();
+      var next = current;
+      final showGuideInstead =
+          current == WebNotificationPermissionState.unsupported ||
+          (_isIosWeb() && !WebNotificationService.isStandaloneDisplayMode);
+
+      if (showGuideInstead) {
+        if (!mounted) return;
+        await showWebNotificationHelpSheet(
+          context,
+          permissionState: current,
+          isIosWeb: _isIosWeb(),
+          isAndroidWeb: _isAndroidWeb(),
+          isStandalone: WebNotificationService.isStandaloneDisplayMode,
+        );
+      } else if (current == WebNotificationPermissionState.granted) {
+        await WebPushClientService.ensureSubscribed(dio);
+        await WebPushClientService.syncUnreadBadge(dio);
+        final sent = await WebPushClientService.sendServerTestPush(dio);
+        if (sent <= 0) {
+          await WebNotificationService.showSystemNotification(
+            title: 'Проект Феникс',
+            body: 'Системные уведомления уже включены.',
+            tag: 'settings-test-notification',
+          );
+        }
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          sent > 0
+              ? 'Тестовый push отправлен с сервера'
+              : 'Тестовое уведомление отправлено',
+          tone: AppNoticeTone.success,
+        );
+      } else {
+        next = await WebNotificationService.requestPermission();
+        if (!mounted) return;
+        if (next == WebNotificationPermissionState.granted) {
+          await WebPushClientService.ensureSubscribed(dio);
+          await WebPushClientService.syncUnreadBadge(dio);
+          final sent = await WebPushClientService.sendServerTestPush(dio);
+          if (sent <= 0) {
+            await WebNotificationService.showSystemNotification(
+              title: 'Проект Феникс',
+              body:
+                  'Уведомления включены. Новые сообщения будут приходить со звуком и в центре уведомлений браузера.',
+              tag: 'notifications-enabled',
+            );
+          }
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            sent > 0
+                ? 'Системные уведомления включены, тестовый push отправлен'
+                : 'Системные уведомления включены',
+            tone: AppNoticeTone.success,
+          );
+        } else {
+          await showWebNotificationHelpSheet(
+            context,
+            permissionState: next,
+            isIosWeb: _isIosWeb(),
+            isAndroidWeb: _isAndroidWeb(),
+            isStandalone: WebNotificationService.isStandaloneDisplayMode,
+          );
+        }
+      }
+
+      if (!mounted) return;
+      final refreshed = await WebNotificationService.getPermissionState();
+      setState(() {
+        _webNotificationPermissionState = refreshed;
+        if (refreshed == WebNotificationPermissionState.granted) {
+          _webNotificationBannerDismissed = true;
+        }
+      });
+      if (refreshed == WebNotificationPermissionState.granted) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_webNotificationsBannerDismissedKey, true);
+        await WebPushClientService.syncUnreadBadge(dio);
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _webNotificationRequestInProgress = false;
+        });
+      } else {
+        _webNotificationRequestInProgress = false;
+      }
+    }
+  }
+
+  Future<void> _openWebNotificationGuide() async {
+    if (!kIsWeb || !mounted) return;
+    await showWebNotificationHelpSheet(
+      context,
+      permissionState: _webNotificationPermissionState,
+      isIosWeb: _isIosWeb(),
+      isAndroidWeb: _isAndroidWeb(),
+      isStandalone: WebNotificationService.isStandaloneDisplayMode,
+    );
+  }
+
+  bool _shouldShowWebNotificationPrompt() {
+    if (!kIsWeb) return false;
+    if (!_webNotificationStatusLoaded) return false;
+    if (_webNotificationBannerDismissed) return false;
+    if (authService.currentUser == null) return false;
+    if (_webNotificationPermissionState ==
+        WebNotificationPermissionState.granted) {
+      return false;
+    }
+    if (WebNotificationService.isSupported) return true;
+    return _isIosWeb();
   }
 
   Future<void> _maybeShowIosAddToHomeHint() async {
@@ -501,6 +658,23 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
+  Widget _buildWebNotificationBanner(BuildContext context) {
+    if (!_shouldShowWebNotificationPrompt()) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+      child: WebNotificationPromptCard(
+        permissionState: _webNotificationPermissionState,
+        isStandalone: WebNotificationService.isStandaloneDisplayMode,
+        loading: _webNotificationRequestInProgress,
+        onPrimaryPressed: _requestWebNotificationAccess,
+        onGuidePressed: _openWebNotificationGuide,
+        onDismissed: _dismissWebNotificationPrompt,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isAndroidWeb()) {
@@ -510,17 +684,6 @@ class _MainShellState extends State<MainShell> {
       stream: authService.authStream,
       initialData: authService.currentUser,
       builder: (context, _) {
-        if (_loading) {
-          return const Scaffold(
-            body: SafeArea(
-              child: PhoenixLoadingView(
-                title: 'Открываем приложение',
-                subtitle: 'Подготавливаем ваш рабочий стол',
-              ),
-            ),
-          );
-        }
-
         if (authService.currentUser == null) {
           return const AuthScreen();
         }
@@ -591,6 +754,7 @@ class _MainShellState extends State<MainShell> {
             child: Column(
               children: [
                 _buildPhoneAccessOwnerBanner(context),
+                _buildWebNotificationBanner(context),
                 Expanded(
                   child: IndexedStack(
                     key: ValueKey('shell-$effectiveRole'),

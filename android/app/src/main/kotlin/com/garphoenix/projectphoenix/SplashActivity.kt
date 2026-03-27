@@ -1,4 +1,4 @@
-package com.example.projectphoenix
+package com.garphoenix.projectphoenix
 
 import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
@@ -65,4 +65,3 @@ class SplashActivity : Activity() {
     super.onDestroy()
   }
 }
-

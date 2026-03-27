@@ -1,3 +1,5 @@
+// ignore_for_file: avoid_print
+
 // lib/services/auth_service.dart
 import 'dart:async';
 import 'dart:convert';
@@ -5,6 +7,8 @@ import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
 import '../src/utils/device_utils.dart';
+import 'web_notification_service.dart';
+import 'web_push_client_service.dart';
 
 class User {
   final String id;
@@ -12,6 +16,7 @@ class User {
   final String? name;
   final String role;
   final String? phone;
+  final String? phoneAccessState;
   final String? tenantCode;
   final String? tenantName;
   final String? tenantStatus;
@@ -24,6 +29,7 @@ class User {
     this.name,
     required this.role,
     this.phone,
+    this.phoneAccessState,
     this.tenantCode,
     this.tenantName,
     this.tenantStatus,
@@ -38,6 +44,12 @@ class User {
       name: m['name']?.toString(),
       role: m['role']?.toString() ?? 'client',
       phone: m['phone']?.toString(),
+      phoneAccessState: (() {
+        final raw = (m['phone_access_state'] ?? m['phoneAccessState'] ?? '')
+            .toString()
+            .trim();
+        return raw.isEmpty ? null : raw;
+      })(),
       tenantCode: (() {
         final raw = (m['tenant_code'] ?? m['tenantCode'] ?? '')
             .toString()
@@ -79,6 +91,7 @@ class User {
       'name': name,
       'role': role,
       'phone': phone,
+      'phone_access_state': phoneAccessState,
       'tenant_code': tenantCode,
       'tenant_name': tenantName,
       'tenant_status': tenantStatus,
@@ -98,6 +111,7 @@ class AuthService {
   static const _viewRoleKey = 'creator_view_role';
   static const _tenantCodeKey = 'tenant_code_scope';
   static const _savedSessionsKey = 'saved_tenant_sessions_v1';
+  static const _userSnapshotKey = 'auth_user_snapshot_v1';
 
   // Temporary storage for multi-step registration
   String? pendingEmail;
@@ -157,6 +171,20 @@ class AuthService {
   }
 
   AuthService({required this.dio});
+
+  Future<void> _maybeEnsureWebPushSubscription() async {
+    if (!kIsWeb) return;
+    try {
+      final permission = await WebNotificationService.getPermissionState();
+      print('[web-push] auth hook permission=$permission user=${_currentUser?.email ?? ''}');
+      if (permission != WebNotificationPermissionState.granted) return;
+      await WebPushClientService.ensureSubscribed(dio);
+      await WebPushClientService.syncUnreadBadge(dio);
+    } catch (e) {
+      print('[web-push] auth hook error: $e');
+      _authVerboseLog('⚠️ Web push sync skipped: $e');
+    }
+  }
 
   void _authVerboseLog(String message) {
     if (kDebugMode && _verboseAuthLogs) {
@@ -309,6 +337,7 @@ class AuthService {
     await _saveToken(token);
     _setAuthHeader(token);
     if (user != null) _currentUser = user;
+    await _saveUserSnapshot(_currentUser);
     final responseTenantCode = (user?.tenantCode ?? '').trim();
     if (responseTenantCode.isNotEmpty) {
       await setTenantCode(responseTenantCode);
@@ -326,6 +355,7 @@ class AuthService {
     try {
       _authController.add(_currentUser);
     } catch (_) {}
+    await _maybeEnsureWebPushSubscription();
     debugPrint(
       '✅ AuthService.setToken -> token set, user=${_currentUser?.email}',
     );
@@ -340,9 +370,15 @@ class AuthService {
     }
     _isLoggingOut = true;
     try {
+      try {
+        if (kIsWeb) {
+          await WebPushClientService.unsubscribe(dio);
+        }
+      } catch (_) {}
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_tokenKey);
       await prefs.remove(_viewRoleKey);
+      await prefs.remove(_userSnapshotKey);
       _cachedToken = null;
       debugPrint('✅ Token removed from SharedPreferences');
 
@@ -376,6 +412,66 @@ class AuthService {
     }
   }
 
+  Future<void> _saveUserSnapshot(User? user) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (user == null) {
+        await prefs.remove(_userSnapshotKey);
+        return;
+      }
+      await prefs.setString(_userSnapshotKey, jsonEncode(user.toMap()));
+    } catch (e) {
+      debugPrint('⚠️ Error saving auth user snapshot: $e');
+    }
+  }
+
+  Future<User?> _readStoredUserSnapshot() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_userSnapshotKey);
+      if (raw == null || raw.trim().isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final map = Map<String, dynamic>.from(decoded);
+      final email = (map['email'] ?? '').toString().trim();
+      if (email.isEmpty) return null;
+      return User.fromMap(map);
+    } catch (e) {
+      debugPrint('⚠️ Error reading auth user snapshot: $e');
+      return null;
+    }
+  }
+
+  User? _decodeUserFromTokenUnsafe(String token) {
+    try {
+      final parts = token.split('.');
+      if (parts.length < 2) return null;
+      var normalized = parts[1].replaceAll('-', '+').replaceAll('_', '/');
+      final padLength = (4 - (normalized.length % 4)) % 4;
+      normalized = normalized.padRight(normalized.length + padLength, '=');
+      final json = utf8.decode(base64Decode(normalized));
+      final decoded = jsonDecode(json);
+      if (decoded is! Map) return null;
+      final map = Map<String, dynamic>.from(decoded);
+      final userId = (map['id'] ?? map['userId'] ?? map['sub'] ?? '')
+          .toString()
+          .trim();
+      final email = (map['email'] ?? '').toString().trim();
+      final role = (map['role'] ?? 'client').toString().trim();
+      if (userId.isEmpty || email.isEmpty) return null;
+      return User.fromMap({
+        'id': userId,
+        'email': email,
+        'role': role.isEmpty ? 'client' : role,
+        'tenant_id': map['tenant_id'],
+        'tenant_code': map['tenant_code'] ?? map['tenantCode'],
+      });
+    } catch (e) {
+      debugPrint('⚠️ Error decoding auth token payload: $e');
+      return null;
+    }
+  }
+
   /// Получение токена из SharedPreferences
   Future<String?> getToken() async {
     try {
@@ -392,6 +488,32 @@ class AuthService {
     } catch (e) {
       debugPrint('❌ Error getting token: $e');
       return null;
+    }
+  }
+
+  Future<bool> primeAuthHeaderFromStoredToken() async {
+    try {
+      final token = await getToken();
+      if (token == null || token.trim().isEmpty) {
+        _setAuthHeader(null);
+        return false;
+      }
+      _setAuthHeader(token);
+      if (_currentUser == null) {
+        _currentUser = await _readStoredUserSnapshot();
+        _currentUser ??= _decodeUserFromTokenUnsafe(token);
+        if (_currentUser != null) {
+          final prefs = await SharedPreferences.getInstance();
+          if (_currentUser?.role.toLowerCase().trim() == 'creator') {
+            _viewRole = prefs.getString(_viewRoleKey);
+          }
+        }
+      }
+      return true;
+    } catch (e) {
+      debugPrint('❌ Error priming auth header from storage: $e');
+      _setAuthHeader(null);
+      return false;
     }
   }
 
@@ -766,9 +888,7 @@ class AuthService {
     final normalized = role?.toLowerCase().trim();
     try {
       final prefs = await SharedPreferences.getInstance();
-      if (normalized == null ||
-          normalized.isEmpty ||
-          normalized == 'creator') {
+      if (normalized == null || normalized.isEmpty || normalized == 'creator') {
         _viewRole = null;
         await prefs.remove(_viewRoleKey);
       } else {
@@ -802,6 +922,7 @@ class AuthService {
 
   void updateCurrentUserFromMap(Map<String, dynamic> userMap) {
     _currentUser = User.fromMap(userMap);
+    unawaited(_saveUserSnapshot(_currentUser));
   }
 
   /// Попытка обновить токен при старте (восстановить сессию)
@@ -835,9 +956,11 @@ class AuthService {
           _currentUser = User.fromMap(userMap);
           final prefs = await SharedPreferences.getInstance();
           _viewRole = prefs.getString(_viewRoleKey);
+          await _saveUserSnapshot(_currentUser);
           try {
             _authController.add(_currentUser);
           } catch (_) {}
+          await _maybeEnsureWebPushSubscription();
           debugPrint(
             '✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}',
           );

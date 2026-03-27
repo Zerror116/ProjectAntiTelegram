@@ -74,9 +74,6 @@ class _AuthScreenState extends State<AuthScreen> {
       _isRegister = true;
     }
 
-    if (!_isAndroidWebRestricted()) {
-      _tryAutoLogin();
-    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _prepareWebExperience();
@@ -392,27 +389,6 @@ class _AuthScreenState extends State<AuthScreen> {
     _accessKeyController.dispose();
     _otpController.dispose();
     super.dispose();
-  }
-
-  Future<void> _tryAutoLogin() async {
-    setState(() => _loading = true);
-    final ok = await _authServiceTryRefresh();
-    setState(() => _loading = false);
-    if (ok) {
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const MainShell()),
-      );
-    }
-  }
-
-  Future<bool> _authServiceTryRefresh() async {
-    try {
-      return await _authService.tryRefreshOnStartup();
-    } catch (_) {
-      return false;
-    }
   }
 
   /// Проверяем занятость email на сервере

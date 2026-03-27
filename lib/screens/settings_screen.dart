@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -5,8 +7,9 @@ import 'package:dio/dio.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../services/web_notification_service.dart';
+import '../widgets/web_notification_prompt.dart';
 import 'bug_report_screen.dart';
-import 'privacy_policy_screen.dart';
 import 'support_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -29,6 +32,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _apkInfoLoading = false;
   String? _apkDownloadUrl;
   String _apkInfoMessage = '';
+  WebNotificationPermissionState _webNotificationPermissionState =
+      WebNotificationPermissionState.unsupported;
   late final VoidCallback _notificationsListener;
   late final VoidCallback _themeListener;
   late final VoidCallback _performanceModeListener;
@@ -69,6 +74,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     if (_isAndroidWeb) {
       _loadApkDownloadUrl();
+    }
+    if (kIsWeb) {
+      unawaited(_loadWebNotificationPermissionState());
     }
   }
 
@@ -113,10 +121,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _openSystemNotificationSettings() async {
     if (kIsWeb) {
-      showAppNotice(
+      await showWebNotificationHelpSheet(
         context,
-        'Для веб-версии откройте настройки уведомлений браузера/сайта',
-        tone: AppNoticeTone.info,
+        permissionState: _webNotificationPermissionState,
+        isIosWeb: defaultTargetPlatform == TargetPlatform.iOS,
+        isAndroidWeb: defaultTargetPlatform == TargetPlatform.android,
+        isStandalone: WebNotificationService.isStandaloneDisplayMode,
       );
       return;
     }
@@ -131,6 +141,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
       'Не удалось открыть настройки устройства',
       tone: AppNoticeTone.warning,
     );
+  }
+
+  Future<void> _loadWebNotificationPermissionState() async {
+    if (!kIsWeb) return;
+    final state = await WebNotificationService.getPermissionState();
+    if (!mounted) return;
+    setState(() {
+      _webNotificationPermissionState = state;
+    });
   }
 
   bool _isTwoFactorEligibleRole() {
@@ -902,13 +921,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  void _openPrivacyPolicy() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const PrivacyPolicyScreen()),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1014,14 +1026,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 onTap: _apkInfoLoading ? null : _openApkDownload,
               ),
-            ListTile(
-              leading: const Icon(Icons.privacy_tip_outlined),
-              title: const Text('Политика конфиденциальности'),
-              subtitle: const Text(
-                'Как обрабатываются данные и ограничения ЛС',
-              ),
-              onTap: _openPrivacyPolicy,
-            ),
           ],
         ),
       ),

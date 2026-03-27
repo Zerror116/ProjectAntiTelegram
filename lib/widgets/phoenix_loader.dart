@@ -81,8 +81,13 @@ class _PhoenixLoaderState extends State<PhoenixLoader>
     return AnimatedBuilder(
       animation: _controller,
       builder: (context, _) {
-        final rotation = _controller.value * 2 * math.pi;
-        final pulse = 0.9 + (math.sin(rotation) * 0.08);
+        final pulse = 0.9 + (math.sin(_controller.value * 2 * math.pi) * 0.08);
+        final wave = (math.sin(_controller.value * 2 * math.pi) + 1) / 2;
+        final barHeights = <double>[
+          0.42 + (wave * 0.34),
+          0.68 - (wave * 0.16),
+          0.36 + ((1 - wave) * 0.28),
+        ];
 
         return SizedBox(
           width: size,
@@ -93,39 +98,50 @@ class _PhoenixLoaderState extends State<PhoenixLoader>
               Transform.scale(
                 scale: pulse,
                 child: Container(
-                  width: size,
-                  height: size,
+                  width: size * 0.88,
+                  height: size * 0.88,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
+                    gradient: RadialGradient(
+                      radius: 0.9,
                       colors: [
-                        theme.colorScheme.primary.withValues(alpha: 0.24),
-                        theme.colorScheme.tertiary.withValues(alpha: 0.14),
+                        theme.colorScheme.primary.withValues(alpha: 0.18),
+                        theme.colorScheme.primary.withValues(alpha: 0.02),
                       ],
                     ),
                   ),
                 ),
               ),
-              Transform.rotate(
-                angle: rotation,
-                child: Container(
-                  width: size * 0.82,
-                  height: size * 0.82,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: theme.colorScheme.primary.withValues(alpha: 0.72),
-                      width: 3,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: List.generate(barHeights.length, (index) {
+                  return AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOut,
+                    width: size * 0.12,
+                    height: size * barHeights[index],
+                    margin: EdgeInsets.symmetric(horizontal: size * 0.03),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(999),
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          theme.colorScheme.primary.withValues(alpha: 0.96),
+                          theme.colorScheme.tertiary.withValues(alpha: 0.82),
+                        ],
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: theme.colorScheme.primary.withValues(alpha: 0.22),
+                          blurRadius: 12,
+                          offset: const Offset(0, 6),
+                        ),
+                      ],
                     ),
-                  ),
-                ),
-              ),
-              Icon(
-                Icons.local_fire_department_rounded,
-                size: size * 0.42,
-                color: theme.colorScheme.primary,
+                  );
+                }),
               ),
             ],
           ),
@@ -150,13 +166,14 @@ class PhoenixLoadingView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final heroSize = math.max(size * 1.55, 86.0);
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            PhoenixLoader(size: size),
+            PhoenixEntryHero(size: heroSize),
             const SizedBox(height: 16),
             Text(
               title,

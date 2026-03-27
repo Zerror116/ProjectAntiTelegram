@@ -14,9 +14,18 @@ if (keystorePropertiesFile.exists()) {
         keystoreProperties.load(stream)
     }
 }
+val isReleaseTask = gradle.startParameter.taskNames.any { taskName ->
+    taskName.contains("Release", ignoreCase = true)
+}
+
+if (isReleaseTask && !keystorePropertiesFile.exists()) {
+    throw GradleException(
+        "Release build requires android/key.properties and a real signing keystore.",
+    )
+}
 
 android {
-    namespace = "com.example.projectphoenix"
+    namespace = "com.garphoenix.projectphoenix"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -30,8 +39,7 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.projectphoenix"
+        applicationId = "com.garphoenix.projectphoenix"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -66,11 +74,7 @@ android {
 
     buildTypes {
         release {
-            signingConfig = if (keystorePropertiesFile.exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }
