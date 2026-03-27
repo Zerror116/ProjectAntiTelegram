@@ -116,6 +116,29 @@ function isVoiceMimeAllowed(mimeRaw, originalNameRaw) {
   return false;
 }
 
+function isVideoMimeAllowed(mimeRaw, originalNameRaw) {
+  const mime = String(mimeRaw || "").toLowerCase().trim();
+  const originalName = String(originalNameRaw || "").toLowerCase().trim();
+  if (mime.startsWith("video/")) return true;
+  if (mime === "application/octet-stream") return true;
+  if (mime === "application/mp4" || mime.startsWith("application/mp4;")) {
+    return true;
+  }
+  if (mime === "audio/mp4" || mime.startsWith("audio/mp4;")) {
+    return true;
+  }
+  if (mime === "audio/quicktime" || mime.startsWith("audio/quicktime;")) {
+    return true;
+  }
+  if (!mime) {
+    const ext = path.extname(originalName || "");
+    if ([".mp4", ".m4v", ".mov", ".webm"].includes(ext)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const chatMediaUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, file, cb) => {
@@ -168,7 +191,7 @@ const chatMediaUpload = multer({
       return;
     }
     if (file.fieldname === "video") {
-      if (mime.startsWith("video/") || mime === "application/octet-stream") {
+      if (isVideoMimeAllowed(mime, file.originalname)) {
         cb(null, true);
         return;
       }
@@ -352,7 +375,7 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
   };
 }
 
-function canReadChat(context, userRole) {
+function canReadChat(context, userRole, permissions = {}) {
   if (!context) return false;
   const role = normalizeRole(userRole);
 
@@ -375,6 +398,16 @@ function canReadChat(context, userRole) {
     if (context.visibility === "public") return true;
     if (context.isMember) return true;
     return role === "worker" || role === "admin" || role === "creator";
+  }
+
+  if (isSupportTicketChatContext(context)) {
+    return (
+      role === "admin" ||
+      role === "tenant" ||
+      role === "creator" ||
+      hasPermission(permissions, "chat.write.support") ||
+      hasPermission(permissions, "support.manage")
+    );
   }
 
   if (context.hasMembers) return context.isMember;
@@ -1405,6 +1438,13 @@ router.get("/", requireAuth, async (req, res) => {
     const tenantId = req.user.tenant_id || null;
     const userIdText = String(userId);
     const role = normalizeRole(req.user.role);
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    const supportStaffAccess =
+      role === "admin" ||
+      role === "tenant" ||
+      role === "creator" ||
+      hasPermission(permissionSet.permissions, "chat.write.support") ||
+      hasPermission(permissionSet.permissions, "support.manage");
     const workerOrHigher =
       role === "worker" || role === "admin" || role === "creator";
     const adminOrCreator = role === "admin" || role === "creator";
@@ -1601,7 +1641,9 @@ router.get("/", requireAuth, async (req, res) => {
               COALESCE(last_user.avatar_focus_y, 0) AS last_message_sender_avatar_focus_y,
               COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
        FROM chats c
-       JOIN chat_members cm ON cm.chat_id = c.id
+       LEFT JOIN chat_members cm
+         ON cm.chat_id = c.id
+        AND cm.user_id = $1
        LEFT JOIN user_chat_preferences pref
          ON pref.chat_id = c.id
         AND pref.user_id = $1
@@ -1657,7 +1699,16 @@ router.get("/", requireAuth, async (req, res) => {
        ) AS unread_stats ON true
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE c.type <> 'channel'
-         AND cm.user_id = $1
+         AND (
+           cm.user_id = $1
+           OR (
+             $4::boolean = true
+             AND (
+               COALESCE(c.settings->>'kind', '') = 'support_ticket'
+               OR COALESCE((c.settings->>'support_ticket')::boolean, false) = true
+             )
+           )
+         )
          AND ($3::uuid IS NULL OR c.tenant_id = $3::uuid)
          AND COALESCE(pref.hidden, false) = false
        ORDER BY
@@ -1665,7 +1716,7 @@ router.get("/", requireAuth, async (req, res) => {
          pref.pinned_at DESC NULLS LAST,
          updated_at DESC NULLS LAST
        LIMIT 100`,
-      [userId, userIdText, tenantId],
+      [userId, userIdText, tenantId, supportStaffAccess],
     );
 
     const byId = new Map();
@@ -1764,7 +1815,8 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -1925,7 +1977,8 @@ router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -1999,7 +2052,8 @@ router.get("/:chatId/pin", requireAuth, async (req, res) => {
     if (!context) {
       return res.status(404).json({ ok: false, error: "Chat not found" });
     }
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -2021,7 +2075,8 @@ router.post("/:chatId/pin/:messageId", requireAuth, async (req, res) => {
     if (!context) {
       return res.status(404).json({ ok: false, error: "Chat not found" });
     }
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
     if (!(await canPinInChat(req.user))) {
@@ -2106,7 +2161,8 @@ router.delete("/:chatId/pin", requireAuth, async (req, res) => {
     if (!context) {
       return res.status(404).json({ ok: false, error: "Chat not found" });
     }
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
     if (!(await canPinInChat(req.user))) {
@@ -2147,7 +2203,8 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -2490,7 +2547,8 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -2570,7 +2628,8 @@ router.post(
       if (!context) {
         return res.status(404).json({ ok: false, error: "Chat not found" });
       }
-      if (!canReadChat(context, role)) {
+      const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
         return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
       }
 
@@ -2667,7 +2726,8 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
       return res.status(404).json({ ok: false, error: "Chat not found" });
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -2798,7 +2858,8 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
     if (!context) {
       return res.status(404).json({ ok: false, error: "Chat not found" });
     }
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
@@ -2863,7 +2924,8 @@ router.patch("/:chatId/list-preferences", requireAuth, async (req, res) => {
     if (!context) {
       return res.status(404).json({ ok: false, error: "Chat not found" });
     }
-    if (!canReadChat(context, role)) {
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
