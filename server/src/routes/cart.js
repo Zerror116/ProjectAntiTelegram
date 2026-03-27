@@ -105,6 +105,13 @@ async function resolveEffectiveCartUserId(queryable, reqUser) {
   });
 }
 
+async function resolveAdminCartTargetUserId(queryable, userId, tenantId = null) {
+  return await resolveSharedCartOwnerId(queryable, {
+    requesterUserId: String(userId || '').trim(),
+    tenantId: tenantId || null,
+  });
+}
+
 function emitClaimUpdated(req, claim, reason = 'claim_updated') {
   const io = req.app.get('io');
   if (!io || !claim) return;
@@ -1218,21 +1225,56 @@ router.get(
          LEFT JOIN phones p ON p.user_id = u.id
          WHERE ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
            AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE ('%' || $2::text)
-           AND EXISTS (
-             SELECT 1
-             FROM cart_items ci
-             WHERE ci.user_id = u.id
-               AND ci.status <> 'delivered'
-             LIMIT 1
-           )
          ORDER BY u.created_at DESC
          LIMIT $3`,
         [tenantId, digits, limit],
       );
 
+      const matchedUsers = foundQ.rows || [];
+      const effectiveOwnerByUserId = new Map();
+      const ownerIds = new Set();
+
+      for (const row of matchedUsers) {
+        const userId = String(row.id || '').trim();
+        if (!userId) continue;
+        const effectiveOwnerId = await resolveAdminCartTargetUserId(
+          db,
+          userId,
+          tenantId,
+        );
+        const normalizedOwnerId = String(effectiveOwnerId || '').trim() || userId;
+        effectiveOwnerByUserId.set(userId, normalizedOwnerId);
+        ownerIds.add(normalizedOwnerId);
+      }
+
+      let activeCartOwners = new Set();
+      if (ownerIds.size > 0) {
+        const ownerIdsList = Array.from(ownerIds);
+        const activeOwnersQ = await db.query(
+          `SELECT DISTINCT ci.user_id
+           FROM cart_items ci
+           WHERE ci.user_id = ANY($1::uuid[])
+             AND ci.status <> 'delivered'`,
+          [ownerIdsList],
+        );
+        activeCartOwners = new Set(
+          activeOwnersQ.rows.map((row) => String(row.user_id || '').trim()).filter(Boolean),
+        );
+      }
+
+      const visibleUsers = matchedUsers.filter((row) => {
+        const userId = String(row.id || '').trim();
+        if (!userId) return false;
+        const ownerId = effectiveOwnerByUserId.get(userId) || userId;
+        return activeCartOwners.has(ownerId);
+      });
+
       return res.json({
         ok: true,
-        data: foundQ.rows.map((row) => ({
+        data: visibleUsers.map((row) => {
+          const userId = String(row.id || '').trim();
+          const effectiveOwnerId = effectiveOwnerByUserId.get(userId) || userId;
+          return {
           id: row.id,
           name: row.name || '',
           email: row.email || '',
@@ -1241,7 +1283,10 @@ router.get(
           is_active: row.is_active !== false,
           block_reason: row.block_reason || '',
           created_at: row.created_at || null,
-        })),
+          effective_cart_owner_id: effectiveOwnerId,
+          shares_cart_with_owner: effectiveOwnerId !== userId,
+        };
+        }),
       });
     } catch (err) {
       console.error('cart.admin.clientsByPhone error', err);
@@ -1281,6 +1326,13 @@ router.get(
         return res.status(404).json({ ok: false, error: 'Клиент не найден' });
       }
 
+      const effectiveOwnerId = await resolveAdminCartTargetUserId(
+        db,
+        userId,
+        tenantId,
+      );
+      const cartOwnerId = String(effectiveOwnerId || '').trim() || userId;
+
       const itemsQ = await db.query(
         `SELECT c.id,
                 c.user_id,
@@ -1306,7 +1358,7 @@ router.get(
          WHERE c.user_id = $1
            AND c.status <> 'delivered'
          ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
-        [userId],
+        [cartOwnerId],
       );
 
       const items = itemsQ.rows.map((row) => {
@@ -1323,7 +1375,11 @@ router.get(
       return res.json({
         ok: true,
         data: {
-          user: userQ.rows[0],
+          user: {
+            ...userQ.rows[0],
+            effective_cart_owner_id: cartOwnerId,
+            shares_cart_with_owner: cartOwnerId !== userId,
+          },
           items,
           total_sum: toMoney(items.reduce((sum, item) => sum + toMoney(item.line_total), 0)),
         },
@@ -1572,6 +1628,13 @@ router.post(
         return res.status(404).json({ ok: false, error: 'Клиент не найден' });
       }
 
+      const effectiveOwnerId = await resolveAdminCartTargetUserId(
+        client,
+        userId,
+        req.user?.tenant_id || null,
+      );
+      const cartOwnerId = String(effectiveOwnerId || '').trim() || userId;
+
       await client.query('BEGIN');
       const cartIdsQ = await client.query(
         `SELECT c.id
@@ -1579,7 +1642,7 @@ router.post(
          WHERE c.user_id = $1
            AND c.status <> 'delivered'
          ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
-        [userId],
+        [cartOwnerId],
       );
 
       let removedCount = 0;
@@ -1644,14 +1707,20 @@ router.post(
         }
       }
 
-      emitCartUpdated(req, userId, {
-        reason: 'admin_cart_cleared',
-      });
+      emitCartUpdated(
+        req,
+        cartOwnerId,
+        {
+          reason: 'admin_cart_cleared',
+        },
+        cartOwnerId !== userId ? [userId] : [],
+      );
 
       return res.json({
         ok: true,
         data: {
           user_id: userId,
+          effective_cart_owner_id: cartOwnerId,
           removed_items: removedCount,
           removed_units: removedUnits,
           blocked_item_ids: blockedItemIds,
