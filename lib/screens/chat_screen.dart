@@ -14,23 +14,31 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:video_player/video_player.dart' as vp;
 
 import '../main.dart';
+import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/adaptive_network_image.dart';
+import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
 import '../widgets/submit_on_enter.dart';
 
 class _ChatUploadFile {
-  const _ChatUploadFile({required this.filename, this.path, this.bytes});
+  const _ChatUploadFile({
+    required this.filename,
+    this.path,
+    this.bytes,
+    this.mimeType,
+  });
 
   final String filename;
   final String? path;
   final Uint8List? bytes;
+  final String? mimeType;
 }
 
 enum _ComposerMediaMode { voice, camera }
@@ -98,6 +106,11 @@ class _ChatScreenState extends State<ChatScreen> {
   PlayerState _voicePlayerState = PlayerState.stopped;
   List<cam.CameraDescription> _availableCameras = const [];
   cam.CameraController? _videoCameraController;
+  Future<bool>? _videoCameraReadyFuture;
+  vp.VideoPlayerController? _inlineVideoNoteController;
+  Object? _lastVideoCameraError;
+  String? _activeVideoNoteMessageId;
+  bool _inlineVideoNoteInitializing = false;
 
   StreamSubscription? _chatSub;
   Timer? _incomingTimer;
@@ -323,6 +336,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       unawaited(_videoCameraController!.dispose());
     }
+    unawaited(_stopInlineVideoNotePlayback(notify: false));
 
     _controller.dispose();
     _searchController.dispose();
@@ -1098,7 +1112,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool get _anyComposerRecording => _voiceRecording || _videoRecording;
 
-  bool get _anyRecorderStarting => _voiceStartInProgress || _videoStartInProgress;
+  bool get _anyRecorderStarting =>
+      _voiceStartInProgress || _videoStartInProgress;
 
   double _normalizedProgress(double value, double threshold) {
     if (threshold <= 0) return 0;
@@ -1116,11 +1131,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _ChatUploadFile file, {
     DioMediaType? contentType,
   }) async {
+    final resolvedContentType =
+        contentType ?? _mediaTypeFromMimeString(file.mimeType);
     if (!kIsWeb && file.path != null && file.path!.trim().isNotEmpty) {
       return MultipartFile.fromFile(
         file.path!,
         filename: file.filename,
-        contentType: contentType,
+        contentType: resolvedContentType,
       );
     }
     final bytes = file.bytes;
@@ -1130,11 +1147,23 @@ class _ChatScreenState extends State<ChatScreen> {
     return MultipartFile.fromBytes(
       bytes,
       filename: file.filename,
-      contentType: contentType,
+      contentType: resolvedContentType,
     );
   }
 
+  DioMediaType? _mediaTypeFromMimeString(String? mimeRaw) {
+    final mime = (mimeRaw ?? '').trim().toLowerCase();
+    if (mime.isEmpty || !mime.contains('/')) return null;
+    final parts = mime.split('/');
+    final type = parts.first.trim();
+    final subtype = parts.sublist(1).join('/').split(';').first.trim();
+    if (type.isEmpty || subtype.isEmpty) return null;
+    return DioMediaType(type, subtype);
+  }
+
   DioMediaType? _voiceContentTypeForUpload(_ChatUploadFile upload) {
+    final mimeType = _mediaTypeFromMimeString(upload.mimeType);
+    if (mimeType != null) return mimeType;
     final name = upload.filename.toLowerCase().trim();
     if (name.endsWith('.m4a') || name.endsWith('.mp4')) {
       return DioMediaType('audio', 'mp4');
@@ -1155,6 +1184,29 @@ class _ChatScreenState extends State<ChatScreen> {
       return DioMediaType('audio', 'webm');
     }
     return DioMediaType('application', 'octet-stream');
+  }
+
+  DioMediaType? _videoContentTypeForUpload(_ChatUploadFile upload) {
+    final mimeType = _mediaTypeFromMimeString(upload.mimeType);
+    if (mimeType != null) return mimeType;
+    final name = upload.filename.toLowerCase().trim();
+    if (name.endsWith('.mp4') || name.endsWith('.m4v')) {
+      return DioMediaType('video', 'mp4');
+    }
+    if (name.endsWith('.webm')) {
+      return DioMediaType('video', 'webm');
+    }
+    if (name.endsWith('.mov')) {
+      return DioMediaType('video', 'quicktime');
+    }
+    return DioMediaType('application', 'octet-stream');
+  }
+
+  String _videoExtensionForMime(String? mimeRaw) {
+    final mime = (mimeRaw ?? '').trim().toLowerCase();
+    if (mime.contains('webm')) return 'webm';
+    if (mime.contains('quicktime') || mime.contains('mov')) return 'mov';
+    return 'mp4';
   }
 
   Future<List<({RecordConfig config, String extension, String label})>>
@@ -1245,6 +1297,26 @@ class _ChatScreenState extends State<ChatScreen> {
     return 'попробуйте перезагрузить страницу и повторить';
   }
 
+  String _cameraErrorHint(Object? error) {
+    final text = '${error ?? ''}'.toLowerCase();
+    if (text.contains('permission') ||
+        text.contains('notallowed') ||
+        text.contains('denied') ||
+        text.contains('security')) {
+      return 'разрешите доступ к камере в браузере';
+    }
+    if (text.contains('notfound') || text.contains('device')) {
+      return 'камера не найдена';
+    }
+    if (text.contains('https')) {
+      return 'камера доступна только по HTTPS';
+    }
+    if (text.contains('unsupported') || text.contains('notsupported')) {
+      return 'браузер не поддерживает запись камеры';
+    }
+    return 'попробуйте перезагрузить страницу и повторить';
+  }
+
   bool _isLikelyMicrophonePermissionError(Object error) {
     final text = error.toString().toLowerCase();
     return text.contains('permission') ||
@@ -1254,15 +1326,52 @@ class _ChatScreenState extends State<ChatScreen> {
         text.contains('security');
   }
 
+  bool _applyWebCapturePermissionState(WebMediaCaptureAccessState state) {
+    switch (state) {
+      case WebMediaCaptureAccessState.grantedAudioOnly:
+      case WebMediaCaptureAccessState.grantedAudioVideo:
+        _microphonePermissionAsked = true;
+        _microphonePermissionGranted = true;
+        _microphonePermissionDenied = false;
+        return true;
+      case WebMediaCaptureAccessState.denied:
+        _microphonePermissionAsked = true;
+        _microphonePermissionGranted = false;
+        _microphonePermissionDenied = true;
+        return false;
+      case WebMediaCaptureAccessState.defaultState:
+      case WebMediaCaptureAccessState.unsupported:
+        return false;
+    }
+  }
+
   Future<bool> _ensureMicrophonePermission() async {
     if (_microphonePermissionGranted) return true;
     if (_microphonePermissionDenied) return false;
 
     if (kIsWeb) {
       try {
+        final access =
+            await WebMediaCapturePermissionService.requestPreferredAccess(
+              includeVideo: _cameraSupported,
+              allowAudioOnlyFallback: true,
+            );
+        if (_applyWebCapturePermissionState(access)) {
+          return true;
+        }
+        if (access == WebMediaCaptureAccessState.denied) {
+          return false;
+        }
+      } catch (e) {
+        debugPrint('web media capture permission fallback: $e');
+      }
+
+      try {
         final status = await _voiceRecorder.hasPermission(request: false);
         if (status) {
           _microphonePermissionGranted = true;
+          _microphonePermissionAsked = true;
+          _microphonePermissionDenied = false;
           return true;
         }
       } catch (e) {
@@ -1371,7 +1480,10 @@ class _ChatScreenState extends State<ChatScreen> {
             contentType: _voiceContentTypeForUpload(upload),
           ),
         if (attachmentType == 'video')
-          'video': await _multipartFromUpload(upload),
+          'video': await _multipartFromUpload(
+            upload,
+            contentType: _videoContentTypeForUpload(upload),
+          ),
         'client_msg_id': clientMsgId,
         if (caption.isNotEmpty) 'text': caption,
         if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
@@ -1798,40 +1910,81 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<bool> _ensureVideoCameraReady() async {
+    final pending = _videoCameraReadyFuture;
+    if (pending != null) {
+      return pending;
+    }
+    final future = _initializeVideoCameraController();
+    _videoCameraReadyFuture = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_videoCameraReadyFuture, future)) {
+        _videoCameraReadyFuture = null;
+      }
+    }
+  }
+
+  Future<bool> _initializeVideoCameraController() async {
     if (!_cameraSupported) return false;
     try {
       if (_availableCameras.isEmpty) {
         _availableCameras = await cam.availableCameras();
       }
-      final preferred = _preferredFrontCamera();
-      if (preferred == null) return false;
+      final cameras = _availableCameras;
+      if (cameras.isEmpty) {
+        _lastVideoCameraError = StateError('no camera devices found');
+        return false;
+      }
 
+      final preferred = _preferredFrontCamera();
       final current = _videoCameraController;
-      if (current != null &&
+      if (preferred != null &&
+          current != null &&
           current.value.isInitialized &&
           current.description.name == preferred.name) {
+        _lastVideoCameraError = null;
         return true;
       }
 
-      final next = cam.CameraController(
-        preferred,
-        cam.ResolutionPreset.medium,
-        enableAudio: true,
-      );
-      await next.initialize();
-      try {
-        await next.lockCaptureOrientation(DeviceOrientation.portraitUp);
-      } catch (_) {}
-      try {
-        await next.setFlashMode(cam.FlashMode.off);
-      } catch (_) {}
-      final previous = _videoCameraController;
-      _videoCameraController = next;
-      if (previous != null) {
-        await previous.dispose();
+      final attemptQueue = <cam.CameraDescription>[
+        ...?preferred == null ? null : [preferred],
+        ...cameras.where((camera) => camera.name != preferred?.name),
+      ];
+
+      Object? lastError;
+      for (final candidate in attemptQueue) {
+        try {
+          final next = cam.CameraController(
+            candidate,
+            cam.ResolutionPreset.medium,
+            enableAudio: true,
+          );
+          await next.initialize();
+          try {
+            await next.lockCaptureOrientation(DeviceOrientation.portraitUp);
+          } catch (_) {}
+          try {
+            await next.setFlashMode(cam.FlashMode.off);
+          } catch (_) {}
+          final previous = _videoCameraController;
+          _videoCameraController = next;
+          _lastVideoCameraError = null;
+          if (previous != null) {
+            await previous.dispose();
+          }
+          return true;
+        } catch (e) {
+          lastError = e;
+          debugPrint(
+            'ensureVideoCameraReady candidate ${candidate.name} failed: $e',
+          );
+        }
       }
-      return true;
+      _lastVideoCameraError = lastError;
+      return false;
     } catch (e) {
+      _lastVideoCameraError = e;
       debugPrint('ensureVideoCameraReady error: $e');
       return false;
     }
@@ -1850,23 +2003,44 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _videoStartInProgress = true;
     try {
-      final micAllowed = await _ensureMicrophonePermission();
-      if (!micAllowed) {
-        if (!mounted) return;
-        showAppNotice(
-          context,
-          'Нет доступа к микрофону',
-          tone: AppNoticeTone.warning,
-          duration: const Duration(seconds: 2),
-        );
-        return;
+      if (kIsWeb) {
+        final access =
+            await WebMediaCapturePermissionService.requestPreferredAccess(
+              includeVideo: true,
+              allowAudioOnlyFallback: false,
+            );
+        final granted = _applyWebCapturePermissionState(access);
+        if (!granted || access != WebMediaCaptureAccessState.grantedAudioVideo) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            access == WebMediaCaptureAccessState.grantedAudioOnly
+                ? 'Для видеокружка нужен доступ к фронтальной камере'
+                : 'Нет доступа к камере и микрофону',
+            tone: AppNoticeTone.warning,
+            duration: const Duration(seconds: 2),
+          );
+          return;
+        }
+      } else {
+        final micAllowed = await _ensureMicrophonePermission();
+        if (!micAllowed) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Нет доступа к микрофону',
+            tone: AppNoticeTone.warning,
+            duration: const Duration(seconds: 2),
+          );
+          return;
+        }
       }
       final cameraReady = await _ensureVideoCameraReady();
       if (!cameraReady || _videoCameraController == null) {
         if (!mounted) return;
         showAppNotice(
           context,
-          'Не удалось подготовить камеру',
+          'Не удалось подготовить камеру: ${_cameraErrorHint(_lastVideoCameraError)}',
           tone: AppNoticeTone.error,
           duration: const Duration(seconds: 2),
         );
@@ -1939,7 +2113,9 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       if (kIsWeb) {
-        final bytes = await xfile.readAsBytes();
+        final mimeType = xfile.mimeType?.trim();
+        final bytes =
+            await _readWebBlobBytes(xfile.path) ?? await xfile.readAsBytes();
         if (bytes.isEmpty) {
           if (!mounted) return;
           showAppNotice(
@@ -1953,8 +2129,9 @@ class _ChatScreenState extends State<ChatScreen> {
         await _sendMediaMessage(
           upload: _ChatUploadFile(
             filename:
-                'video-note-${DateTime.now().millisecondsSinceEpoch}.mp4',
+                'video-note-${DateTime.now().millisecondsSinceEpoch}.${_videoExtensionForMime(mimeType)}',
             bytes: bytes,
+            mimeType: mimeType,
           ),
           attachmentType: 'video',
           durationMs: durationMs,
@@ -2140,7 +2317,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ? _ComposerMediaMode.camera
           : _ComposerMediaMode.voice;
     });
-    if (_composerMediaMode == _ComposerMediaMode.camera) {
+    if (_composerMediaMode == _ComposerMediaMode.camera && !kIsWeb) {
       unawaited(_ensureVideoCameraReady());
     }
   }
@@ -2208,14 +2385,15 @@ class _ChatScreenState extends State<ChatScreen> {
       unawaited(_resolveWebVoiceRecordConfigs());
     }
     if (_composerMediaMode == _ComposerMediaMode.camera &&
-        _videoCameraController == null) {
+        _videoCameraController == null &&
+        !kIsWeb) {
       unawaited(_ensureVideoCameraReady());
     }
     _composerMediaPressActive = true;
     _composerPressStartGlobal = details.globalPosition;
     _composerHoldActionTriggered = false;
     _cancelComposerMediaHoldTimer();
-    _composerMediaHoldTimer = Timer(const Duration(milliseconds: 40), () {
+    _composerMediaHoldTimer = Timer(const Duration(milliseconds: 160), () {
       unawaited(_runComposerHoldAction());
     });
   }
@@ -2249,26 +2427,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _handleComposerMediaTapCancel() {
-    final holdTriggered = _composerHoldActionTriggered;
+    if (_composerHoldActionTriggered ||
+        _anyComposerRecording ||
+        _anyRecorderStarting) {
+      return;
+    }
     _composerMediaPressActive = false;
     _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
-    if (!holdTriggered) return;
-    if (_composerMediaMode == _ComposerMediaMode.camera &&
-        !_videoRecordingLocked &&
-        _videoRecording) {
-      unawaited(_cancelVideoCircleRecording());
-      return;
-    }
-    if (_composerMediaMode == _ComposerMediaMode.voice &&
-        !_voiceRecordingLocked &&
-        _voiceRecording) {
-      unawaited(
-        _cancelVoiceRecording(
-          notice: 'Голосовое отменено',
-        ),
-      );
-    }
   }
 
   void _handleComposerMediaPanUpdate(DragUpdateDetails details) {
@@ -2355,6 +2521,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  void _handleComposerMediaPanCancel() {
+    final holdTriggered = _composerHoldActionTriggered;
+    _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
+    _cancelComposerMediaHoldTimer();
+    if (!holdTriggered) return;
+    if (_composerMediaMode == _ComposerMediaMode.camera) {
+      unawaited(_cancelVideoCircleRecording());
+      return;
+    }
+    unawaited(_cancelVoiceRecording(notice: 'Голосовое отменено'));
+  }
+
   Future<void> _toggleVoicePlayback(String messageId, String voiceUrl) async {
     if (messageId.isEmpty || voiceUrl.trim().isEmpty) return;
     try {
@@ -2368,6 +2547,7 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
+      await _stopInlineVideoNotePlayback();
       await _voicePlayer.stop();
       setState(() {
         _activeVoiceMessageId = messageId;
@@ -2384,6 +2564,184 @@ class _ChatScreenState extends State<ChatScreen> {
         duration: const Duration(seconds: 2),
       );
       debugPrint('toggleVoicePlayback error: $e');
+    }
+  }
+
+  Future<void> _stopInlineVideoNotePlayback({
+    bool clearSelection = true,
+    bool notify = true,
+  }) async {
+    if (kIsWeb) {
+      if (notify && mounted) {
+        setState(() {
+          _inlineVideoNoteInitializing = false;
+          if (clearSelection) {
+            _activeVideoNoteMessageId = null;
+          }
+        });
+      } else {
+        _inlineVideoNoteInitializing = false;
+        if (clearSelection) {
+          _activeVideoNoteMessageId = null;
+        }
+      }
+      return;
+    }
+
+    final controller = _inlineVideoNoteController;
+    _inlineVideoNoteController = null;
+
+    if (notify && mounted) {
+      setState(() {
+        _inlineVideoNoteInitializing = false;
+        if (clearSelection) {
+          _activeVideoNoteMessageId = null;
+        }
+      });
+    } else {
+      _inlineVideoNoteInitializing = false;
+      if (clearSelection) {
+        _activeVideoNoteMessageId = null;
+      }
+    }
+
+    if (controller != null) {
+      try {
+        await controller.pause();
+      } catch (_) {}
+      await controller.dispose();
+    }
+  }
+
+  Future<void> _toggleInlineVideoNotePlayback(
+    String messageId,
+    String videoUrl,
+  ) async {
+    final trimmedMessageId = messageId.trim();
+    final trimmedVideoUrl = videoUrl.trim();
+    if (trimmedMessageId.isEmpty || trimmedVideoUrl.isEmpty) return;
+
+    if (kIsWeb) {
+      try {
+        await _voicePlayer.stop();
+      } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _activeVoiceMessageId = null;
+        _activeVoicePosition = Duration.zero;
+        _activeVoiceDuration = Duration.zero;
+        _voicePlayerState = PlayerState.stopped;
+        _inlineVideoNoteInitializing = false;
+        _activeVideoNoteMessageId = trimmedMessageId;
+      });
+      return;
+    }
+
+    final currentController = _inlineVideoNoteController;
+    final isCurrent =
+        _activeVideoNoteMessageId == trimmedMessageId &&
+        currentController != null;
+
+    if (isCurrent && currentController.value.isInitialized) {
+      try {
+        if (currentController.value.isPlaying) {
+          await currentController.pause();
+        } else {
+          final duration = currentController.value.duration;
+          final position = currentController.value.position;
+          if (duration > Duration.zero &&
+              position >= duration - const Duration(milliseconds: 240)) {
+            await currentController.seekTo(Duration.zero);
+          }
+          await currentController.play();
+        }
+        if (mounted) {
+          setState(() {});
+        }
+      } catch (e) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Не удалось воспроизвести видеокружок',
+          tone: AppNoticeTone.error,
+          duration: const Duration(seconds: 2),
+        );
+        debugPrint('toggleInlineVideoNotePlayback error: $e');
+      }
+      return;
+    }
+
+    if (_inlineVideoNoteInitializing) return;
+
+    final parsed = Uri.tryParse(trimmedVideoUrl);
+    if (parsed == null) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Некорректная ссылка на видеокружок',
+        tone: AppNoticeTone.warning,
+        duration: const Duration(seconds: 2),
+      );
+      return;
+    }
+
+    await _stopInlineVideoNotePlayback(clearSelection: false);
+    if (!mounted) return;
+
+    try {
+      await _voicePlayer.stop();
+      if (_activeVoiceMessageId != null ||
+          _activeVoicePosition > Duration.zero ||
+          _activeVoiceDuration > Duration.zero ||
+          _voicePlayerState != PlayerState.stopped) {
+        setState(() {
+          _activeVoiceMessageId = null;
+          _activeVoicePosition = Duration.zero;
+          _activeVoiceDuration = Duration.zero;
+          _voicePlayerState = PlayerState.stopped;
+        });
+      }
+    } catch (_) {}
+
+    final controller = vp.VideoPlayerController.networkUrl(
+      parsed,
+      videoPlayerOptions: vp.VideoPlayerOptions(mixWithOthers: false),
+    );
+
+    setState(() {
+      _activeVideoNoteMessageId = trimmedMessageId;
+      _inlineVideoNoteInitializing = true;
+      _inlineVideoNoteController = controller;
+    });
+
+    try {
+      await controller.initialize();
+      await controller.setLooping(false);
+      if (!mounted ||
+          _inlineVideoNoteController != controller ||
+          _activeVideoNoteMessageId != trimmedMessageId) {
+        await controller.dispose();
+        return;
+      }
+      setState(() => _inlineVideoNoteInitializing = false);
+      await controller.play();
+    } catch (e) {
+      if (_inlineVideoNoteController == controller) {
+        _inlineVideoNoteController = null;
+      }
+      await controller.dispose();
+      if (!mounted) return;
+      setState(() {
+        _inlineVideoNoteInitializing = false;
+        _activeVideoNoteMessageId = null;
+      });
+      showAppNotice(
+        context,
+        'Не удалось воспроизвести видеокружок',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+      debugPrint('toggleInlineVideoNotePlayback error: $e');
     }
   }
 
@@ -3284,14 +3642,13 @@ class _ChatScreenState extends State<ChatScreen> {
         final data = e.response?.data;
         final path = data is Map ? '${data['path'] ?? ''}'.trim() : '';
         final errorText = data is Map
-            ? '${data['error'] ?? data['message'] ?? ''}'
-                .toLowerCase()
-                .trim()
+            ? '${data['error'] ?? data['message'] ?? ''}'.toLowerCase().trim()
             : '';
         final looksLikeMissingRoute =
             path.contains('/reactions') && errorText.contains('not found');
-        final looksLikeMissingMessage =
-            errorText.contains('сообщение не найдено');
+        final looksLikeMissingMessage = errorText.contains(
+          'сообщение не найдено',
+        );
         showAppNotice(
           context,
           looksLikeMissingRoute
@@ -3321,20 +3678,6 @@ class _ChatScreenState extends State<ChatScreen> {
       );
       debugPrint('toggleMessageReaction error: $e');
     }
-  }
-
-  Future<void> _openExternalMedia(String url) async {
-    final parsed = Uri.tryParse(url.trim());
-    if (parsed == null) return;
-    final opened = await launchUrl(parsed, mode: LaunchMode.platformDefault);
-    if (opened) return;
-    if (!mounted) return;
-    showAppNotice(
-      context,
-      'Не удалось открыть медиа',
-      tone: AppNoticeTone.warning,
-      duration: const Duration(seconds: 2),
-    );
   }
 
   String _senderNameOf(Map<String, dynamic> message) {
@@ -4007,7 +4350,9 @@ class _ChatScreenState extends State<ChatScreen> {
                         vertical: 3,
                       ),
                       decoration: BoxDecoration(
-                        color: theme.colorScheme.primary.withValues(alpha: 0.12),
+                        color: theme.colorScheme.primary.withValues(
+                          alpha: 0.12,
+                        ),
                         borderRadius: BorderRadius.circular(999),
                       ),
                       child: Text(
@@ -4166,7 +4511,11 @@ class _ChatScreenState extends State<ChatScreen> {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(icon, size: 14, color: Colors.white.withValues(alpha: 0.84)),
+                Icon(
+                  icon,
+                  size: 14,
+                  color: Colors.white.withValues(alpha: 0.84),
+                ),
                 const SizedBox(width: 6),
                 Text(
                   label,
@@ -4220,7 +4569,9 @@ class _ChatScreenState extends State<ChatScreen> {
                         shape: BoxShape.circle,
                         boxShadow: [
                           BoxShadow(
-                            color: const Color(0xFFFF4D5B).withValues(alpha: 0.4),
+                            color: const Color(
+                              0xFFFF4D5B,
+                            ).withValues(alpha: 0.4),
                             blurRadius: 8,
                           ),
                         ],
@@ -4228,7 +4579,9 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                     const SizedBox(width: 10),
                     Text(
-                      _formatDurationLabel(Duration(seconds: _recordingSeconds)),
+                      _formatDurationLabel(
+                        Duration(seconds: _recordingSeconds),
+                      ),
                       style: const TextStyle(
                         color: Colors.white,
                         fontWeight: FontWeight.w700,
@@ -4246,8 +4599,10 @@ class _ChatScreenState extends State<ChatScreen> {
                                 duration: const Duration(milliseconds: 90),
                                 opacity: _voiceRecordingLocked
                                     ? 0
-                                    : (1 - cancelProgress * 0.82)
-                                          .clamp(0.18, 1.0),
+                                    : (1 - cancelProgress * 0.82).clamp(
+                                        0.18,
+                                        1.0,
+                                      ),
                                 child: Icon(
                                   Icons.chevron_left_rounded,
                                   color: Colors.white.withValues(alpha: 0.55),
@@ -4333,7 +4688,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (controller != null && controller.value.isInitialized) {
       final previewSize = controller.value.previewSize;
       Widget preview = cam.CameraPreview(controller);
-      if (controller.description.lensDirection == cam.CameraLensDirection.front) {
+      if (controller.description.lensDirection ==
+          cam.CameraLensDirection.front) {
         preview = Transform(
           alignment: Alignment.center,
           transform: Matrix4.diagonal3Values(-1, 1, 1),
@@ -4366,9 +4722,7 @@ class _ChatScreenState extends State<ChatScreen> {
             colors: [Color(0xFF3C2A68), Color(0xFF241631)],
           ),
         ),
-        child: const Center(
-          child: CircularProgressIndicator(strokeWidth: 2.4),
-        ),
+        child: const Center(child: CircularProgressIndicator(strokeWidth: 2.4)),
       );
     }
     return AnimatedScale(
@@ -4410,7 +4764,9 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             _buildComposerActionBubble(
               icon: Icons.cameraswitch_rounded,
-              onTap: _videoRecording ? null : () => unawaited(_switchVideoCameraLens()),
+              onTap: _videoRecording
+                  ? null
+                  : () => unawaited(_switchVideoCameraLens()),
               color: Colors.white,
               size: 44,
               filled: false,
@@ -4463,8 +4819,10 @@ class _ChatScreenState extends State<ChatScreen> {
                                 duration: const Duration(milliseconds: 90),
                                 opacity: _videoRecordingLocked
                                     ? 0
-                                    : (1 - cancelProgress * 0.82)
-                                          .clamp(0.18, 1.0),
+                                    : (1 - cancelProgress * 0.82).clamp(
+                                        0.18,
+                                        1.0,
+                                      ),
                                 child: Icon(
                                   Icons.chevron_left_rounded,
                                   color: Colors.white.withValues(alpha: 0.55),
@@ -4497,7 +4855,8 @@ class _ChatScreenState extends State<ChatScreen> {
                       Container(
                         margin: const EdgeInsets.only(left: 8),
                         child: TextButton(
-                          onPressed: () => unawaited(_cancelVideoCircleRecording()),
+                          onPressed: () =>
+                              unawaited(_cancelVideoCircleRecording()),
                           style: TextButton.styleFrom(
                             foregroundColor: Colors.white,
                             padding: const EdgeInsets.symmetric(
@@ -4546,95 +4905,198 @@ class _ChatScreenState extends State<ChatScreen> {
   }) {
     final videoUrl = _videoUrlOf(meta);
     final durationMs = _videoDurationMsOf(meta);
-    final durationLabel = durationMs > 0
-        ? _formatDurationLabel(Duration(milliseconds: durationMs))
-        : '00:00';
     final messageId = message['id']?.toString().trim() ?? '';
     final accent = theme.colorScheme.primary;
     final seed = messageId.isEmpty ? meta.toString() : messageId;
     final bars = _voiceWaveHeights(seed, 18);
-    return InkWell(
-      borderRadius: BorderRadius.circular(999),
-      onTap: videoUrl == null ? null : () => _openExternalMedia(videoUrl),
-      child: SizedBox(
+    final isActive = _activeVideoNoteMessageId == messageId;
+    final useInlineWebVideo = kIsWeb && videoUrl != null;
+    final controller = isActive ? _inlineVideoNoteController : null;
+    final shellGradient = LinearGradient(
+      begin: Alignment.topLeft,
+      end: Alignment.bottomRight,
+      colors: [accent.withValues(alpha: 0.82), const Color(0xFF1C2631)],
+    );
+
+    Widget buildVideoOrb({
+      required Widget content,
+      required String badgeLabel,
+      required String footerLabel,
+      required String durationLabel,
+      required IconData actionIcon,
+      required double actionProgress,
+      bool showSpinner = false,
+      bool isPlaying = false,
+    }) {
+      return Container(
         width: 196,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        height: 196,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: shellGradient,
+          border: Border.all(
+            color: Colors.white.withValues(alpha: 0.12),
+            width: 1.2,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.18),
+              blurRadius: 16,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Stack(
           children: [
-            Container(
-              width: 196,
-              height: 196,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    accent.withValues(alpha: 0.82),
-                    const Color(0xFF1C2631),
+            Positioned.fill(
+              child: ClipOval(
+                child: ColoredBox(
+                  color: const Color(0xFF11161D),
+                  child: content,
+                ),
+              ),
+            ),
+            Positioned.fill(
+              child: IgnorePointer(
+                child: ClipOval(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          Colors.black.withValues(alpha: 0.06),
+                          Colors.transparent,
+                          Colors.black.withValues(alpha: 0.30),
+                        ],
+                        stops: const [0, 0.56, 1],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: 12,
+              top: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.32),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      isPlaying
+                          ? Icons.equalizer_rounded
+                          : Icons.videocam_rounded,
+                      size: 14,
+                      color: Colors.white,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      badgeLabel,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.94),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                   ],
                 ),
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.12),
-                  width: 1.2,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.18),
-                    blurRadius: 16,
-                    offset: const Offset(0, 10),
-                  ),
-                ],
               ),
-              child: Stack(
+            ),
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 18,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Positioned.fill(
-                    child: ClipOval(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: RadialGradient(
-                            center: const Alignment(-0.25, -0.35),
-                            radius: 1.0,
-                            colors: [
-                              Colors.white.withValues(alpha: 0.22),
-                              Colors.transparent,
-                            ],
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: LinearProgressIndicator(
+                      value: actionProgress.clamp(0.0, 1.0),
+                      minHeight: 4,
+                      backgroundColor: Colors.white.withValues(alpha: 0.18),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        Colors.white,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          footerLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.86),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                       ),
-                    ),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.42),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          durationLabel,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            fontFeatures: [ui.FontFeature.tabularFigures()],
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
-                  Positioned(
-                    left: 18,
-                    right: 18,
-                    bottom: 54,
-                    child: SizedBox(
-                      height: 24,
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.end,
-                        children: List.generate(bars.length, (index) {
-                          return Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 1),
-                              child: Container(
-                                height: 6 + bars[index],
-                                decoration: BoxDecoration(
-                                  color: Colors.white.withValues(
-                                    alpha: index.isEven ? 0.58 : 0.40,
-                                  ),
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                              ),
-                            ),
-                          );
-                        }),
+                ],
+              ),
+            ),
+            Center(
+              child: Container(
+                width: 74,
+                height: 74,
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.20),
+                  shape: BoxShape.circle,
+                ),
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    SizedBox(
+                      width: 74,
+                      height: 74,
+                      child: CircularProgressIndicator(
+                        value: showSpinner
+                            ? null
+                            : actionProgress.clamp(0.0, 1.0),
+                        strokeWidth: 3.2,
+                        backgroundColor: Colors.white.withValues(alpha: 0.14),
+                        valueColor: const AlwaysStoppedAnimation<Color>(
+                          Colors.white,
+                        ),
                       ),
                     ),
-                  ),
-                  Center(
-                    child: Container(
-                      width: 68,
-                      height: 68,
+                    Container(
+                      width: 60,
+                      height: 60,
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.92),
                         shape: BoxShape.circle,
@@ -4646,83 +5108,199 @@ class _ChatScreenState extends State<ChatScreen> {
                           ),
                         ],
                       ),
-                      child: Icon(
-                        Icons.play_arrow_rounded,
-                        color: accent,
-                        size: 34,
-                      ),
+                      child: showSpinner
+                          ? Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.4,
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  accent,
+                                ),
+                              ),
+                            )
+                          : Icon(actionIcon, color: accent, size: 34),
                     ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    Widget inactiveVideoBackdrop() {
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: ClipOval(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: RadialGradient(
+                    center: const Alignment(-0.25, -0.35),
+                    radius: 1.0,
+                    colors: [
+                      Colors.white.withValues(alpha: 0.22),
+                      Colors.transparent,
+                    ],
                   ),
-                  Positioned(
-                    right: 12,
-                    bottom: 12,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.48),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Text(
-                        durationLabel,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          fontFeatures: [ui.FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            left: 18,
+            right: 18,
+            bottom: 58,
+            child: SizedBox(
+              height: 24,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: List.generate(bars.length, (index) {
+                  return Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 1),
+                      child: Container(
+                        height: 6 + bars[index],
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(
+                            alpha: index.isEven ? 0.58 : 0.40,
+                          ),
+                          borderRadius: BorderRadius.circular(999),
                         ),
                       ),
                     ),
-                  ),
-                  Positioned(
-                    left: 12,
-                    top: 12,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.28),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(
-                            Icons.videocam_rounded,
-                            size: 14,
-                            color: Colors.white,
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            'кружок',
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.92),
-                              fontSize: 11,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
+                  );
+                }),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    Widget activeVideoOrb() {
+      if (kIsWeb && videoUrl != null) {
+        return InlineVideoNoteOrb(
+          videoUrl: videoUrl,
+          durationMs: durationMs,
+          accentColor: accent,
+          footerText: 'Нажмите, чтобы продолжить',
+        );
+      }
+
+      final activeController = controller;
+      if (activeController == null) {
+        return buildVideoOrb(
+          content: inactiveVideoBackdrop(),
+          badgeLabel: 'загрузка',
+          footerLabel: 'Подготавливаем воспроизведение',
+          durationLabel: durationMs > 0
+              ? _formatDurationLabel(Duration(milliseconds: durationMs))
+              : '00:00',
+          actionIcon: Icons.hourglass_top_rounded,
+          actionProgress: 0,
+          showSpinner: true,
+        );
+      }
+      return ValueListenableBuilder<vp.VideoPlayerValue>(
+        valueListenable: activeController,
+        builder: (context, value, _) {
+          final initialized = value.isInitialized;
+          final totalDuration = initialized && value.duration > Duration.zero
+              ? value.duration
+              : Duration(milliseconds: durationMs > 0 ? durationMs : 0);
+          final position = initialized ? value.position : Duration.zero;
+          final progress = totalDuration.inMilliseconds > 0
+              ? (position.inMilliseconds / totalDuration.inMilliseconds)
+                    .clamp(0.0, 1.0)
+                    .toDouble()
+              : 0.0;
+          final hasFinished =
+              totalDuration > Duration.zero &&
+              position >= totalDuration - const Duration(milliseconds: 180) &&
+              !value.isPlaying;
+          final playIcon = value.isPlaying
+              ? Icons.pause_rounded
+              : hasFinished
+              ? Icons.replay_rounded
+              : Icons.play_arrow_rounded;
+
+          Widget content;
+          if (initialized) {
+            final videoSize = value.size;
+            final safeWidth = videoSize.width > 0 ? videoSize.width : 196.0;
+            final safeHeight = videoSize.height > 0 ? videoSize.height : 196.0;
+            content = IgnorePointer(
+              child: FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: safeWidth,
+                  height: safeHeight,
+                  child: vp.VideoPlayer(activeController),
                 ),
               ),
-            if (videoUrl != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 10, left: 8),
-                child: Text(
-                  'Нажмите, чтобы открыть видео',
-                  style: TextStyle(
-                    color: textColor.withValues(alpha: 0.64),
-                    fontSize: 12,
-                    fontWeight: FontWeight.w500,
+            );
+          } else {
+            content = inactiveVideoBackdrop();
+          }
+
+          return buildVideoOrb(
+            content: content,
+            badgeLabel: value.isPlaying ? 'видео' : 'кружок',
+            footerLabel: value.isPlaying
+                ? 'Нажмите для паузы'
+                : initialized
+                ? 'Нажмите для воспроизведения'
+                : 'Подготавливаем воспроизведение',
+            durationLabel: totalDuration > Duration.zero
+                ? '${_formatDurationLabel(position)} / ${_formatDurationLabel(totalDuration)}'
+                : '00:00',
+            actionIcon: playIcon,
+            actionProgress: progress,
+            showSpinner: !initialized || _inlineVideoNoteInitializing,
+            isPlaying: value.isPlaying,
+          );
+        },
+      );
+    }
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(999),
+      onTap: useInlineWebVideo
+          ? null
+          : videoUrl == null
+          ? null
+          : (kIsWeb && isActive)
+          ? null
+          : () =>
+                unawaited(_toggleInlineVideoNotePlayback(messageId, videoUrl)),
+      child: SizedBox(
+        width: 196,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            useInlineWebVideo
+                ? InlineVideoNoteOrb(
+                    videoUrl: videoUrl,
+                    durationMs: durationMs,
+                    accentColor: accent,
+                    footerText: 'Нажмите для воспроизведения',
+                  )
+                : isActive
+                ? activeVideoOrb()
+                : buildVideoOrb(
+                    content: inactiveVideoBackdrop(),
+                    badgeLabel: 'кружок',
+                    footerLabel: 'Нажмите для воспроизведения',
+                    durationLabel: durationMs > 0
+                        ? _formatDurationLabel(
+                            Duration(milliseconds: durationMs),
+                          )
+                        : '00:00',
+                    actionIcon: Icons.play_arrow_rounded,
+                    actionProgress: 0,
                   ),
-                ),
-              ),
           ],
         ),
       ),
@@ -5245,7 +5823,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ] else if (isVideoMessage) ...[
                 Align(
-                  alignment: fromMe ? Alignment.centerRight : Alignment.centerLeft,
+                  alignment: fromMe
+                      ? Alignment.centerRight
+                      : Alignment.centerLeft,
                   child: _buildVideoNoteAttachment(
                     theme,
                     message,
@@ -5460,6 +6040,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final blockedReason = _composeBlockedReason();
     final visibleMessages = _visibleMessages();
     final timeline = _buildTimeline(visibleMessages);
+    final recordingOverlayActive = _voiceRecording || _videoRecording;
 
     return Scaffold(
       appBar: AppBar(
@@ -5527,386 +6108,410 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Column(
             children: [
-          if (_isDirectMessageChat())
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.errorContainer,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Theme.of(context).colorScheme.error),
-              ),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    Icons.warning_amber_rounded,
-                    color: Theme.of(context).colorScheme.onErrorContainer,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Внимание: не отправляйте личные данные, фото документов, карты и пароли. Личные сообщения пока в доработке, поэтому это небезопасно.',
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.onErrorContainer,
-                        fontWeight: FontWeight.w600,
-                      ),
+              if (_isDirectMessageChat())
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.errorContainer,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.error,
                     ),
                   ),
-                ],
-              ),
-            ),
-          if (_isClientRole() && _offlineQueuedCount > 0)
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.fromLTRB(12, 10, 12, 2),
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.tertiaryContainer,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.tertiary,
-                ),
-              ),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    Icons.cloud_off_outlined,
-                    color: Theme.of(context).colorScheme.onTertiaryContainer,
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        Icons.warning_amber_rounded,
+                        color: Theme.of(context).colorScheme.onErrorContainer,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Внимание: не отправляйте личные данные, фото документов, карты и пароли. Личные сообщения пока в доработке, поэтому это небезопасно.',
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onErrorContainer,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Оффлайн-покупок в очереди: $_offlineQueuedCount. '
-                      'Они отправятся автоматически, когда появится интернет.',
-                      style: TextStyle(
+                ),
+              if (_isClientRole() && _offlineQueuedCount > 0)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.fromLTRB(12, 10, 12, 2),
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.tertiaryContainer,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.tertiary,
+                    ),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(
+                        Icons.cloud_off_outlined,
                         color: Theme.of(
                           context,
                         ).colorScheme.onTertiaryContainer,
-                        fontWeight: FontWeight.w600,
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  TextButton(
-                    onPressed: _offlineSyncBusy
-                        ? null
-                        : _syncOfflinePurchasesNow,
-                    child: _offlineSyncBusy
-                        ? const Text('...')
-                        : const Text('Синхр.'),
-                  ),
-                ],
-              ),
-            ),
-          if (_activePin != null)
-            GestureDetector(
-              onTap: _jumpToPinnedMessage,
-              child: Container(
-                width: double.infinity,
-                margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-                padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: Theme.of(context).colorScheme.outlineVariant,
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.push_pin,
-                      size: 18,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        _pinPreviewText(),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
-                    ),
-                    if (_canPinMessages())
-                      IconButton(
-                        tooltip: 'Открепить',
-                        icon: const Icon(Icons.close, size: 18),
-                        onPressed: _unpinMessage,
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          Expanded(
-            child: _loading
-                ? const PhoenixLoadingView(
-                    title: 'Загрузка чата',
-                    subtitle: 'Подтягиваем сообщения и медиа',
-                  )
-                : timeline.isEmpty
-                ? Center(
-                    child: Text(
-                      _searchQuery.isEmpty
-                          ? 'Нет сообщений'
-                          : 'Ничего не найдено',
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    itemCount: timeline.length,
-                    itemBuilder: (context, i) {
-                      final row = timeline[i];
-                      if (row['type'] == 'date') {
-                        return _buildDateDivider(
-                          (row['label'] ?? 'Без даты').toString(),
-                        );
-                      }
-                      final message = Map<String, dynamic>.from(
-                        row['data'] as Map,
-                      );
-                      return _buildMessageItem(message);
-                    },
-                  ),
-          ),
-          if (!_searchMode) ...[
-            if (blockedReason != null &&
-                !_voiceRecording &&
-                !_voiceStartInProgress &&
-                !_videoRecording &&
-                !_videoStartInProgress)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                child: Text(
-                  blockedReason,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-            if (_videoRecording || _videoStartInProgress)
-              _buildVideoRecordingBar(Theme.of(context))
-            else if (_voiceRecording || _voiceStartInProgress)
-              _buildVoiceRecordingBar(Theme.of(context))
-            else
-              SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    IconButton(
-                      tooltip: 'Вложение',
-                      icon: _mediaUploading
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.attach_file_rounded),
-                      onPressed:
-                          canCompose &&
-                              !_mediaUploading &&
-                              !_voiceSending &&
-                              !_anyComposerRecording &&
-                              !_anyRecorderStarting
-                          ? _openAttachmentSheet
-                          : null,
-                    ),
-                    Expanded(
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(horizontal: 4),
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        decoration: BoxDecoration(
-                          color: Theme.of(
-                            context,
-                          ).colorScheme.surfaceContainerLow,
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(
-                            color: Theme.of(context).colorScheme.outlineVariant,
-                          ),
-                        ),
-                        child: SubmitOnEnter(
-                          controller: _controller,
-                          enabled:
-                              allowEnterShortcut &&
-                              canCompose &&
-                              !_anyComposerRecording,
-                          onSubmit: _send,
-                          child: TextField(
-                            focusNode: _inputFocusNode,
-                            controller: _controller,
-                            enabled: canCompose && !_anyComposerRecording,
-                            minLines: 1,
-                            maxLines: 6,
-                            keyboardType: TextInputType.multiline,
-                            textInputAction: TextInputAction.newline,
-                            decoration: withInputLanguageBadge(
-                              InputDecoration(
-                                hintText: _anyComposerRecording
-                                    ? 'Говорите... отпустите кнопку для отправки'
-                                    : canCompose
-                                    ? 'Сообщение...'
-                                    : 'Отправка сообщений недоступна',
-                                border: InputBorder.none,
-                                isDense: true,
-                              ),
-                              controller: _controller,
-                            ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Оффлайн-покупок в очереди: $_offlineQueuedCount. '
+                          'Они отправятся автоматически, когда появится интернет.',
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onTertiaryContainer,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                       ),
-                    ),
-                    IconButton(
-                      tooltip: 'Эмодзи',
-                      icon: const Icon(Icons.emoji_emotions_outlined),
-                      onPressed: canCompose && !_anyComposerRecording
-                          ? _openComposerEmojiPicker
-                          : null,
-                    ),
-                    if (_hasDraftText)
-                      IconButton(
-                        icon: _voiceSending
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Icon(Icons.send_rounded),
-                        onPressed: !canCompose || _mediaUploading
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: _offlineSyncBusy
                             ? null
-                            : _send,
+                            : _syncOfflinePurchasesNow,
+                        child: _offlineSyncBusy
+                            ? const Text('...')
+                            : const Text('Синхр.'),
+                      ),
+                    ],
+                  ),
+                ),
+              if (_activePin != null)
+                GestureDetector(
+                  onTap: _jumpToPinnedMessage,
+                  child: Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                    padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: Theme.of(context).colorScheme.outlineVariant,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.push_pin,
+                          size: 18,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _pinPreviewText(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodyMedium,
+                          ),
+                        ),
+                        if (_canPinMessages())
+                          IconButton(
+                            tooltip: 'Открепить',
+                            icon: const Icon(Icons.close, size: 18),
+                            onPressed: _unpinMessage,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              Expanded(
+                child: _loading
+                    ? const PhoenixLoadingView(
+                        title: 'Загрузка чата',
+                        subtitle: 'Подтягиваем сообщения и медиа',
                       )
-                    else
-                      Builder(
-                        builder: (context) {
-                          final disabled =
-                              !canCompose ||
-                              _mediaUploading ||
-                              _voiceSending ||
-                              _anyRecorderStarting;
-                          final activeColor = Theme.of(
-                            context,
-                          ).colorScheme.primary;
-                          final icon = _voiceRecording
-                              ? Icons.stop_circle_outlined
-                              : (_composerMediaMode == _ComposerMediaMode.camera
-                                    ? Icons.radio_button_unchecked_rounded
-                                    : Icons.mic_rounded);
-                          final isArmed =
-                              _anyComposerRecording || _anyRecorderStarting;
-                          final buttonBaseColor = _voiceRecording
-                              ? Theme.of(context).colorScheme.error
-                              : _videoRecording
-                              ? const Color(0xFF2F80FF)
-                              : activeColor;
-                          return GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTapDown: (details) => _handleComposerMediaTapDown(
-                              disabled: disabled,
-                              context: context,
-                              canCompose: canCompose,
-                              details: details,
-                            ),
-                            onTapUp: (_) => unawaited(
-                              _handleComposerMediaTapUp(
-                                disabled: disabled,
-                                context: context,
-                                canCompose: canCompose,
+                    : timeline.isEmpty
+                    ? Center(
+                        child: Text(
+                          _searchQuery.isEmpty
+                              ? 'Нет сообщений'
+                              : 'Ничего не найдено',
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: _scrollController,
+                        itemCount: timeline.length,
+                        itemBuilder: (context, i) {
+                          final row = timeline[i];
+                          if (row['type'] == 'date') {
+                            return _buildDateDivider(
+                              (row['label'] ?? 'Без даты').toString(),
+                            );
+                          }
+                          final message = Map<String, dynamic>.from(
+                            row['data'] as Map,
+                          );
+                          return _buildMessageItem(message);
+                        },
+                      ),
+              ),
+              if (!_searchMode) ...[
+                if (blockedReason != null &&
+                    !_voiceRecording &&
+                    !_voiceStartInProgress &&
+                    !_videoRecording &&
+                    !_videoStartInProgress)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                    child: Text(
+                      blockedReason,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                AnimatedOpacity(
+                  duration: const Duration(milliseconds: 140),
+                  opacity: recordingOverlayActive ? 0 : 1,
+                  child: SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          IconButton(
+                            tooltip: 'Вложение',
+                            icon: _mediaUploading
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.attach_file_rounded),
+                            onPressed:
+                                canCompose &&
+                                    !_mediaUploading &&
+                                    !_voiceSending &&
+                                    !_anyComposerRecording &&
+                                    !_anyRecorderStarting
+                                ? _openAttachmentSheet
+                                : null,
+                          ),
+                          Expanded(
+                            child: Container(
+                              margin: const EdgeInsets.symmetric(horizontal: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
                               ),
-                            ),
-                            onTapCancel: _handleComposerMediaTapCancel,
-                            onPanUpdate: _handleComposerMediaPanUpdate,
-                            onPanEnd: (_) => _handleComposerMediaPanEnd(),
-                            onPanCancel: _handleComposerMediaTapCancel,
-                            child: TweenAnimationBuilder<double>(
-                              duration: const Duration(milliseconds: 180),
-                              tween: Tween<double>(
-                                begin: 1,
-                                end: isArmed ? 1.08 : 1.0,
-                              ),
-                              curve: Curves.easeOutBack,
-                              builder: (ctx, scale, child) => Transform.scale(
-                                scale: scale,
-                                child: child,
-                              ),
-                              child: AnimatedContainer(
-                                duration: const Duration(milliseconds: 180),
-                                width: 46,
-                                height: 46,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  gradient: disabled
-                                      ? null
-                                      : LinearGradient(
-                                          begin: Alignment.topLeft,
-                                          end: Alignment.bottomRight,
-                                          colors: [
-                                            buttonBaseColor.withValues(
-                                              alpha: 0.9,
-                                            ),
-                                            buttonBaseColor.withValues(
-                                              alpha: 0.72,
-                                            ),
-                                          ],
-                                        ),
-                                  color: disabled
-                                      ? Theme.of(
-                                          context,
-                                        ).colorScheme.surfaceContainerHigh
-                                      : null,
-                                  boxShadow: disabled
-                                      ? null
-                                      : [
-                                          BoxShadow(
-                                            color: buttonBaseColor.withValues(
-                                              alpha: 0.30,
-                                            ),
-                                            blurRadius: 14,
-                                            offset: const Offset(0, 5),
-                                          ),
-                                        ],
+                              decoration: BoxDecoration(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.surfaceContainerLow,
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.outlineVariant,
                                 ),
-                                child: _voiceSending || _anyRecorderStarting
-                                    ? const SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2.2,
-                                          valueColor:
-                                              AlwaysStoppedAnimation<Color>(
-                                            Colors.white,
-                                          ),
+                              ),
+                              child: SubmitOnEnter(
+                                controller: _controller,
+                                enabled:
+                                    allowEnterShortcut &&
+                                    canCompose &&
+                                    !_anyComposerRecording,
+                                onSubmit: _send,
+                                child: TextField(
+                                  focusNode: _inputFocusNode,
+                                  controller: _controller,
+                                  enabled: canCompose && !_anyComposerRecording,
+                                  minLines: 1,
+                                  maxLines: 6,
+                                  keyboardType: TextInputType.multiline,
+                                  textInputAction: TextInputAction.newline,
+                                  decoration: withInputLanguageBadge(
+                                    InputDecoration(
+                                      hintText: _anyComposerRecording
+                                          ? 'Говорите... отпустите кнопку для отправки'
+                                          : canCompose
+                                          ? 'Сообщение...'
+                                          : 'Отправка сообщений недоступна',
+                                      border: InputBorder.none,
+                                      isDense: true,
+                                    ),
+                                    controller: _controller,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Эмодзи',
+                            icon: const Icon(Icons.emoji_emotions_outlined),
+                            onPressed: canCompose && !_anyComposerRecording
+                                ? _openComposerEmojiPicker
+                                : null,
+                          ),
+                          if (_hasDraftText)
+                            IconButton(
+                              icon: _voiceSending
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.send_rounded),
+                              onPressed: !canCompose || _mediaUploading
+                                  ? null
+                                  : _send,
+                            )
+                          else
+                            Builder(
+                              builder: (context) {
+                                final disabled =
+                                    !canCompose ||
+                                    _mediaUploading ||
+                                    _voiceSending ||
+                                    _anyRecorderStarting;
+                                final activeColor = Theme.of(
+                                  context,
+                                ).colorScheme.primary;
+                                final icon = _voiceRecording
+                                    ? Icons.stop_circle_outlined
+                                    : (_composerMediaMode ==
+                                              _ComposerMediaMode.camera
+                                          ? Icons.radio_button_unchecked_rounded
+                                          : Icons.mic_rounded);
+                                final isArmed =
+                                    _anyComposerRecording ||
+                                    _anyRecorderStarting;
+                                final buttonBaseColor = _voiceRecording
+                                    ? Theme.of(context).colorScheme.error
+                                    : _videoRecording
+                                    ? const Color(0xFF2F80FF)
+                                    : activeColor;
+                                return GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTapDown: (details) =>
+                                      _handleComposerMediaTapDown(
+                                        disabled: disabled,
+                                        context: context,
+                                        canCompose: canCompose,
+                                        details: details,
+                                      ),
+                                  onTapUp: (_) => unawaited(
+                                    _handleComposerMediaTapUp(
+                                      disabled: disabled,
+                                      context: context,
+                                      canCompose: canCompose,
+                                    ),
+                                  ),
+                                  onTapCancel: _handleComposerMediaTapCancel,
+                                  onPanUpdate: _handleComposerMediaPanUpdate,
+                                  onPanEnd: (_) => _handleComposerMediaPanEnd(),
+                                  onPanCancel: _handleComposerMediaPanCancel,
+                                  child: TweenAnimationBuilder<double>(
+                                    duration: const Duration(milliseconds: 180),
+                                    tween: Tween<double>(
+                                      begin: 1,
+                                      end: isArmed ? 1.08 : 1.0,
+                                    ),
+                                    curve: Curves.easeOutBack,
+                                    builder: (ctx, scale, child) =>
+                                        Transform.scale(
+                                          scale: scale,
+                                          child: child,
                                         ),
-                                      )
-                                    : Icon(
-                                        icon,
+                                    child: AnimatedContainer(
+                                      duration: const Duration(
+                                        milliseconds: 180,
+                                      ),
+                                      width: 46,
+                                      height: 46,
+                                      alignment: Alignment.center,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        gradient: disabled
+                                            ? null
+                                            : LinearGradient(
+                                                begin: Alignment.topLeft,
+                                                end: Alignment.bottomRight,
+                                                colors: [
+                                                  buttonBaseColor.withValues(
+                                                    alpha: 0.9,
+                                                  ),
+                                                  buttonBaseColor.withValues(
+                                                    alpha: 0.72,
+                                                  ),
+                                                ],
+                                              ),
                                         color: disabled
                                             ? Theme.of(
                                                 context,
-                                              ).colorScheme.onSurfaceVariant
-                                            : Colors.white,
+                                              ).colorScheme.surfaceContainerHigh
+                                            : null,
+                                        boxShadow: disabled
+                                            ? null
+                                            : [
+                                                BoxShadow(
+                                                  color: buttonBaseColor
+                                                      .withValues(alpha: 0.30),
+                                                  blurRadius: 14,
+                                                  offset: const Offset(0, 5),
+                                                ),
+                                              ],
                                       ),
-                              ),
+                                      child:
+                                          _voiceSending || _anyRecorderStarting
+                                          ? const SizedBox(
+                                              width: 18,
+                                              height: 18,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2.2,
+                                                valueColor:
+                                                    AlwaysStoppedAnimation<
+                                                      Color
+                                                    >(Colors.white),
+                                              ),
+                                            )
+                                          : Icon(
+                                              icon,
+                                              color: disabled
+                                                  ? Theme.of(context)
+                                                        .colorScheme
+                                                        .onSurfaceVariant
+                                                  : Colors.white,
+                                            ),
+                                    ),
+                                  ),
+                                );
+                              },
                             ),
-                          );
-                        },
+                        ],
                       ),
-                  ],
+                    ),
+                  ),
                 ),
-              ),
-            ),
-          ],
-        ],
+              ],
+            ],
           ),
-          if (_videoRecording || _videoStartInProgress)
+          if (_voiceRecording)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: _buildVoiceRecordingBar(Theme.of(context)),
+            ),
+          if (_videoRecording)
             Positioned.fill(
               child: IgnorePointer(
                 ignoring: true,
@@ -5932,6 +6537,13 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
               ),
+            ),
+          if (_videoRecording)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: _buildVideoRecordingBar(Theme.of(context)),
             ),
         ],
       ),

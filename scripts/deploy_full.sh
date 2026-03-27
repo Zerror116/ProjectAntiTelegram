@@ -8,11 +8,14 @@ SERVER="${SERVER:-root@89.23.99.18}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/opt/fenix}"
 REMOTE_TMP_DIR="${REMOTE_TMP_DIR:-/tmp/garphoenix-web}"
 REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/garphoenix.com}"
+REMOTE_DOWNLOADS_DIR="${REMOTE_DOWNLOADS_DIR:-$REMOTE_PROJECT_DIR/server/downloads}"
 REMOTE_SERVICE="${REMOTE_SERVICE:-auto}"
 BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
 HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
+APK_DEFAULT_FILE_NAME="${APK_DEFAULT_FILE_NAME:-fenix-1.0.1.apk}"
+APK_SOURCE="${APK_SOURCE:-}"
 SKIP_BUILD="0"
 NO_COMMIT="0"
 
@@ -36,9 +39,12 @@ Important env vars:
   SSH_PASSWORD=anubis              # optional; requires sshpass
   REMOTE_PROJECT_DIR=/opt/fenix
   REMOTE_WEB_ROOT=/var/www/garphoenix.com
+  REMOTE_DOWNLOADS_DIR=/opt/fenix/server/downloads
   BRANCH=master
   REMOTE_SERVICE=auto              # or explicit, e.g. fenix-api.service
   RUN_ANALYZE=1                    # set 0 to skip flutter analyze
+  APK_DEFAULT_FILE_NAME=fenix-1.0.1.apk
+  APK_SOURCE=build/app/outputs/flutter-apk/app-release.apk
 
 Examples:
   SSH_PASSWORD=anubis ./scripts/deploy_full.sh -m "web+api deploy"
@@ -99,7 +105,7 @@ run_rsync() {
   if [[ "$USE_SSHPASS" == "1" ]]; then
     SSHPASS="$SSH_PASSWORD" sshpass -e rsync -e "ssh ${SSH_OPTS[*]}" "$@"
   else
-    rsync "$@"
+    rsync -e "ssh ${SSH_OPTS[*]}" "$@"
   fi
 }
 
@@ -108,6 +114,26 @@ echo "[deploy_full] branch:  $BRANCH"
 echo "[deploy_full] server:  $SERVER"
 echo "[deploy_full] remote project: $REMOTE_PROJECT_DIR"
 echo "[deploy_full] remote web root: $REMOTE_WEB_ROOT"
+echo "[deploy_full] remote downloads: $REMOTE_DOWNLOADS_DIR"
+
+detect_apk_source() {
+  if [[ -n "$APK_SOURCE" && -f "$APK_SOURCE" ]]; then
+    printf '%s\n' "$APK_SOURCE"
+    return 0
+  fi
+  local candidates=(
+    "$PROJECT_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+    "$PROJECT_ROOT/build/app/outputs/apk/release/app-release.apk"
+  )
+  local candidate=""
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
 strip_web_debug_artifacts() {
   find "$PROJECT_ROOT/build/web" -name '.DS_Store' -delete || true
@@ -117,9 +143,24 @@ strip_web_debug_artifacts() {
     "$PROJECT_ROOT/build/web/flutter_bootstrap.js"
   do
     [[ -f "$file" ]] || continue
-    sed -i.bak '/sourceMappingURL=flutter\.js\.map/d' "$file" || true
+    perl -0pi -e 's/[[:space:]]*\/\/# sourceMappingURL=flutter\.js\.map//g; s/[[:space:]]*sourceMappingURL=flutter\.js\.map# sourceMappingURL=flutter\.js\.map//g' "$file" || true
     rm -f "$file.bak"
   done
+}
+
+normalize_web_build_permissions() {
+  [[ -d "$PROJECT_ROOT/build/web" ]] || return 0
+  find "$PROJECT_ROOT/build/web" -type d -exec chmod 755 {} +
+  find "$PROJECT_ROOT/build/web" -type f -exec chmod 644 {} +
+}
+
+install_custom_service_worker() {
+  local source="$PROJECT_ROOT/web/push_service_worker.js"
+  local target="$PROJECT_ROOT/build/web/flutter_service_worker.js"
+  [[ -f "$source" ]] || return 0
+  [[ -d "$PROJECT_ROOT/build/web" ]] || return 0
+  cp "$source" "$target"
+  chmod 644 "$target"
 }
 
 cd "$PROJECT_ROOT"
@@ -155,16 +196,33 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
   fi
 
   echo "[deploy_full] flutter build web $BUILD_ARGS"
+  rm -rf "$PROJECT_ROOT/.dart_tool/flutter_build" "$PROJECT_ROOT/build/web"
   flutter build web $BUILD_ARGS
 else
   echo "[deploy_full] --skip-build: skip flutter build"
 fi
 
 strip_web_debug_artifacts
+install_custom_service_worker
+normalize_web_build_permissions
+
+APK_SOURCE_RESOLVED=""
+if APK_SOURCE_RESOLVED="$(detect_apk_source)"; then
+  echo "[deploy_full] found APK: $APK_SOURCE_RESOLVED"
+else
+  echo "[deploy_full] APK not found locally, skip APK upload"
+fi
 
 echo "[deploy_full] upload build/web -> $SERVER:$REMOTE_TMP_DIR"
-run_rsync -avz --delete --exclude='.DS_Store' --exclude='.last_build_id' \
+run_rsync -avz --delete --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r --exclude='.DS_Store' --exclude='.last_build_id' \
   "$PROJECT_ROOT/build/web/" "$SERVER:$REMOTE_TMP_DIR/"
+
+if [[ -n "$APK_SOURCE_RESOLVED" ]]; then
+  echo "[deploy_full] upload APK -> $SERVER:$REMOTE_DOWNLOADS_DIR/$APK_DEFAULT_FILE_NAME"
+  run_ssh "$SERVER" "mkdir -p '$REMOTE_DOWNLOADS_DIR'"
+  run_rsync -avz --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+    "$APK_SOURCE_RESOLVED" "$SERVER:$REMOTE_DOWNLOADS_DIR/$APK_DEFAULT_FILE_NAME"
+fi
 
 echo "[deploy_full] apply on server"
 run_ssh "$SERVER" \
@@ -172,7 +230,9 @@ run_ssh "$SERVER" \
   BRANCH="$BRANCH" \
   REMOTE_TMP_DIR="$REMOTE_TMP_DIR" \
   REMOTE_WEB_ROOT="$REMOTE_WEB_ROOT" \
+  REMOTE_DOWNLOADS_DIR="$REMOTE_DOWNLOADS_DIR" \
   REMOTE_SERVICE="$REMOTE_SERVICE" \
+  APK_DEFAULT_FILE_NAME="$APK_DEFAULT_FILE_NAME" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
 
@@ -188,6 +248,14 @@ git reset --hard "origin/$BRANCH"
 
 if [[ -d "$REMOTE_PROJECT_DIR/server" ]]; then
   cd "$REMOTE_PROJECT_DIR/server"
+  if [[ -n "${APK_DEFAULT_FILE_NAME:-}" ]]; then
+    if grep -q '^APP_UPDATE_ANDROID_DEFAULT_FILE=' .env 2>/dev/null; then
+      sed -i.bak "s#^APP_UPDATE_ANDROID_DEFAULT_FILE=.*#APP_UPDATE_ANDROID_DEFAULT_FILE=$APK_DEFAULT_FILE_NAME#" .env
+    else
+      printf '\nAPP_UPDATE_ANDROID_DEFAULT_FILE=%s\n' "$APK_DEFAULT_FILE_NAME" >> .env
+    fi
+    rm -f .env.bak || true
+  fi
   if command -v npm >/dev/null 2>&1; then
     npm ci --omit=dev
   fi
@@ -254,6 +322,10 @@ rsync -av --delete "$REMOTE_TMP_DIR/" "$REMOTE_WEB_ROOT/"
 find "$REMOTE_WEB_ROOT" -name '.DS_Store' -delete || true
 rm -f "$REMOTE_WEB_ROOT/.last_build_id" || true
 chown -R www-data:www-data "$REMOTE_WEB_ROOT"
+if [[ -d "$REMOTE_DOWNLOADS_DIR" ]]; then
+  find "$REMOTE_DOWNLOADS_DIR" -type d -exec chmod 755 {} +
+  find "$REMOTE_DOWNLOADS_DIR" -type f -exec chmod 644 {} +
+fi
 
 nginx -t
 systemctl reload nginx

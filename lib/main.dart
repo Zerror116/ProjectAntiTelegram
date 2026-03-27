@@ -19,6 +19,8 @@ import 'services/auth_service.dart';
 import 'services/input_language_service.dart';
 import 'services/native_update_installer.dart';
 import 'services/offline_purchase_queue_service.dart';
+import 'services/web_notification_service.dart';
+import 'services/web_push_client_service.dart';
 import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
 
@@ -80,6 +82,7 @@ String? _socketBoundUserId;
 String? _socketBoundViewRole;
 String _lastConnectivityHint = '';
 bool _keyboardAssertRecoveredRecently = false;
+Timer? _webPushBadgeSyncTimer;
 const bool _verboseSocketLogs = bool.fromEnvironment(
   'FENIX_VERBOSE_SOCKET_LOGS',
   defaultValue: false,
@@ -1701,13 +1704,22 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
     _lastPlayedMessageId = messageId;
   }
 
-  await playAppSound(AppUiSound.incoming);
-
   final chatId =
       (data is Map
               ? (data['chatId'] ?? message?['chat_id'] ?? message?['chatId'])
               : null)
           ?.toString();
+
+  unawaited(
+    _maybeShowIncomingBrowserNotification(
+      message: message,
+      chatId: chatId,
+      messageId: messageId,
+    ),
+  );
+
+  await playAppSound(AppUiSound.incoming);
+
   if ((chatId?.isNotEmpty ?? false) && activeChatIdNotifier.value == chatId) {
     return;
   }
@@ -1720,6 +1732,41 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
     tone: AppNoticeTone.info,
     duration: const Duration(seconds: 5),
   );
+}
+
+Future<void> _maybeShowIncomingBrowserNotification({
+  required Map<String, dynamic>? message,
+  required String? chatId,
+  required String? messageId,
+}) async {
+  if (!kIsWeb) return;
+  if (!notificationsEnabledNotifier.value) return;
+  if (!WebNotificationService.isSupported) return;
+  if (!WebNotificationService.isDocumentHidden) return;
+  if ((chatId?.isNotEmpty ?? false) && activeChatIdNotifier.value == chatId) {
+    return;
+  }
+
+  final permission = await WebNotificationService.getPermissionState();
+  if (permission != WebNotificationPermissionState.granted) return;
+
+  final senderName = (message?['sender_name'] ?? '').toString().trim();
+  final sender = senderName.isNotEmpty ? senderName : 'Новое сообщение';
+  await WebNotificationService.showSystemNotification(
+    title: sender,
+    body: _incomingMessagePreview(message),
+    tag: (messageId?.isNotEmpty ?? false)
+        ? 'message:$messageId'
+        : ((chatId?.isNotEmpty ?? false) ? 'chat:$chatId' : 'incoming-message'),
+  );
+}
+
+void _scheduleWebPushBadgeSync() {
+  if (!kIsWeb) return;
+  _webPushBadgeSyncTimer?.cancel();
+  _webPushBadgeSyncTimer = Timer(const Duration(milliseconds: 900), () {
+    unawaited(WebPushClientService.syncUnreadBadge(dio));
+  });
 }
 
 // ✅ Функция для безопасного отключения socket
@@ -2064,22 +2111,26 @@ Future<void> _initSocket() async {
     socket?.on('chat:message', (data) {
       _socketVerboseLog('📬 Socket event chat:message -> $data');
       chatEventsController.add({'type': 'chat:message', 'data': data});
+      _scheduleWebPushBadgeSync();
       _maybePlayIncomingMessageSound(data);
     });
 
     socket?.on('chat:message:deleted', (data) {
       _socketVerboseLog('📬 Socket event chat:message:deleted -> $data');
       chatEventsController.add({'type': 'chat:message:deleted', 'data': data});
+      _scheduleWebPushBadgeSync();
     });
 
     socket?.on('chat:cleared', (data) {
       _socketVerboseLog('📬 Socket event chat:cleared -> $data');
       chatEventsController.add({'type': 'chat:cleared', 'data': data});
+      _scheduleWebPushBadgeSync();
     });
 
     socket?.on('chat:message:read', (data) {
       _socketVerboseLog('📬 Socket event chat:message:read -> $data');
       chatEventsController.add({'type': 'chat:message:read', 'data': data});
+      _scheduleWebPushBadgeSync();
     });
 
     socket?.on('tenant:subscription:update', (data) {
@@ -2141,6 +2192,7 @@ Future<void> _initSocket() async {
     socket?.on('chat:message:global', (data) {
       _socketVerboseLog('📬 Socket event chat:message:global -> $data');
       chatEventsController.add({'type': 'chat:message:global', 'data': data});
+      _scheduleWebPushBadgeSync();
       _maybePlayIncomingMessageSound(data);
     });
 
@@ -2161,9 +2213,21 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
   if (!dbReady) return const SetupFailedScreen();
 
-  // ✅ ИСПРАВЛЕНИЕ: Используй tryRefreshOnStartup вместо setAuthHeaderFromStorage
+  if (kIsWeb) {
+    final hasStoredToken = await authService.primeAuthHeaderFromStoredToken()
+        .timeout(const Duration(seconds: 1), onTimeout: () => false);
+    if (hasStoredToken) {
+      debugPrint(
+        'determineInitialScreen: fast web path via stored token -> MainShell',
+      );
+      unawaited(authService.tryRefreshOnStartup());
+      _handlingAuthFailure = false;
+      return const MainShell();
+    }
+  }
+
   final logged = await authService.tryRefreshOnStartup().timeout(
-    const Duration(seconds: 14),
+    const Duration(seconds: 6),
     onTimeout: () => false,
   );
   debugPrint('determineInitialScreen: tryRefreshOnStartup -> $logged');
@@ -2177,43 +2241,29 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
 
   try {
-    final resp = await dio.get(
-      '/api/profile',
-      options: Options(
-        sendTimeout: const Duration(seconds: 8),
-        receiveTimeout: const Duration(seconds: 8),
-      ),
-    );
-    debugPrint(
-      'determineInitialScreen: /api/profile status=${resp.statusCode}',
-    );
-    if (resp.statusCode == 200 &&
-        resp.data is Map &&
-        resp.data['user'] is Map) {
-      final user = Map<String, dynamic>.from(resp.data['user']);
-      final name = user['name'];
-      final phone = user['phone'];
-      final phoneAccessState =
-          (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
-              .toString()
-              .trim()
-              .toLowerCase();
-      debugPrint('determineInitialScreen: user name=$name phone=$phone');
+    final restoredUser = authService.currentUser;
+    if (restoredUser != null) {
+      final name = restoredUser.name;
+      final phone = restoredUser.phone;
+      final phoneAccessState = (restoredUser.phoneAccessState ?? '')
+          .trim()
+          .toLowerCase();
+      debugPrint(
+        'determineInitialScreen: restored user name=$name phone=$phone',
+      );
       if (_isPhoneAccessRestrictedState(phoneAccessState)) {
         return const PhoneAccessPendingScreen();
       }
-      if (name == null ||
-          (phone == null || (phone is String && phone.trim().isEmpty))) {
+      if (name == null || phone == null || phone.trim().isEmpty) {
         return const PhoneNameScreen(isRegisterFlow: false);
       }
       return const MainShell();
-    } else {
-      return const AuthScreen();
     }
   } catch (e, st) {
-    debugPrint('determineInitialScreen error: $e\n$st');
-    return const AuthScreen();
+    debugPrint('determineInitialScreen restored-user error: $e\n$st');
   }
+
+  return const MainShell();
 }
 
 Future<void> main() async {
@@ -2651,6 +2701,16 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       authService = AuthService(dio: dio);
       _attachAuthInterceptor();
       unawaited(inputLanguageService.initialize());
+      if (kIsWeb) {
+        final hasStoredToken = await authService
+            .primeAuthHeaderFromStoredToken()
+            .timeout(const Duration(seconds: 1), onTimeout: () => false);
+        if (hasStoredToken && mounted && _home == null) {
+          setState(() {
+            _home = const MainShell();
+          });
+        }
+      }
 
       // ✅ ИСПРАВЛЕНИЕ: Подписка на изменения аутентификации
       // При logout (user == null) отключаем socket
@@ -2731,9 +2791,10 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             theme: _buildLightTheme(),
             darkTheme: _buildDarkTheme(),
             home: Scaffold(
-              body: PhoenixWingLoadingView(
+              body: PhoenixLoadingView(
                 title: 'Проект Феникс запускается',
                 subtitle: 'Подключаемся к серверу и загружаем данные',
+                size: 72,
               ),
             ),
             builder: (context, child) {

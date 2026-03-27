@@ -51,24 +51,42 @@ strip_web_debug_artifacts() {
     "$PROJECT_ROOT/build/web/flutter_bootstrap.js"
   do
     [[ -f "$file" ]] || continue
-    sed -i.bak '/sourceMappingURL=flutter\.js\.map/d' "$file" || true
+    perl -0pi -e 's/[[:space:]]*\/\/# sourceMappingURL=flutter\.js\.map//g; s/[[:space:]]*sourceMappingURL=flutter\.js\.map# sourceMappingURL=flutter\.js\.map//g' "$file" || true
     rm -f "$file.bak"
   done
+}
+
+normalize_web_build_permissions() {
+  [[ -d "$PROJECT_ROOT/build/web" ]] || return 0
+  find "$PROJECT_ROOT/build/web" -type d -exec chmod 755 {} +
+  find "$PROJECT_ROOT/build/web" -type f -exec chmod 644 {} +
+}
+
+install_custom_service_worker() {
+  local source="$PROJECT_ROOT/web/push_service_worker.js"
+  local target="$PROJECT_ROOT/build/web/flutter_service_worker.js"
+  [[ -f "$source" ]] || return 0
+  [[ -d "$PROJECT_ROOT/build/web" ]] || return 0
+  cp "$source" "$target"
+  chmod 644 "$target"
 }
 
 cd "$PROJECT_ROOT"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
   echo "[deploy_web] building flutter web..."
+  rm -rf "$PROJECT_ROOT/.dart_tool/flutter_build" "$PROJECT_ROOT/build/web"
   flutter build web $BUILD_ARGS
 else
   echo "[deploy_web] skip build requested"
 fi
 
 strip_web_debug_artifacts
+install_custom_service_worker
+normalize_web_build_permissions
 
 echo "[deploy_web] uploading build/web to server tmp..."
-run_rsync -avz --delete --exclude='.DS_Store' --exclude='.last_build_id' \
+run_rsync -avz --delete --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r --exclude='.DS_Store' --exclude='.last_build_id' \
   "$PROJECT_ROOT/build/web/" "$SERVER:$REMOTE_TMP_DIR/"
 
 echo "[deploy_web] applying build on server..."

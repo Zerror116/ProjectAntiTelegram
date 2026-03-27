@@ -32,6 +32,7 @@ const workerRoutes = require("./routes/worker");
 const cartRoutes = require("./routes/cart");
 const supportRoutes = require("./routes/support");
 const appUpdateRoutes = require("./routes/appUpdate");
+const webPushRoutes = require("./routes/webPush");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
 const {
@@ -43,6 +44,7 @@ const {
   rewriteSignedUploadsInPayload,
   signedUploadGuard,
 } = require("./utils/signedUploads");
+const { queueChatMessageWebPushForRooms } = require("./utils/webPush");
 
 // ===================================
 // MIDDLEWARE И КОНФИГУРАЦИЯ
@@ -341,13 +343,31 @@ function patchSocketEmittersWithSignedUploads(io) {
       baseUrl,
     });
 
-  const patchEmitter = (emitter) => {
+  const maybeQueueWebPush = (rooms, eventName, args) => {
+    if (eventName !== "chat:message") return;
+    const normalizedRooms = Array.isArray(rooms) ? rooms : [];
+    if (!normalizedRooms.length) return;
+    const payload = args?.[0];
+    if (!payload || typeof payload !== "object") return;
+    setImmediate(() => {
+      queueChatMessageWebPushForRooms({
+        rooms: normalizedRooms,
+        payload,
+      }).catch((err) => {
+        console.error("queueChatMessageWebPushForRooms error:", err);
+      });
+    });
+  };
+
+  const patchEmitter = (emitter, rooms = []) => {
     if (!emitter || emitter.__signedUploadsPatched === true) return emitter;
     if (typeof emitter.emit !== "function") return emitter;
     const originalEmit = emitter.emit.bind(emitter);
     emitter.emit = (event, ...args) => {
       const signedArgs = args.map(rewrite);
-      return originalEmit(event, ...signedArgs);
+      const result = originalEmit(event, ...signedArgs);
+      maybeQueueWebPush(rooms, event, signedArgs);
+      return result;
     };
     Object.defineProperty(emitter, "__signedUploadsPatched", {
       value: true,
@@ -361,13 +381,13 @@ function patchSocketEmittersWithSignedUploads(io) {
   patchEmitter(io);
 
   const originalTo = io.to.bind(io);
-  io.to = (...rooms) => patchEmitter(originalTo(...rooms));
+  io.to = (...rooms) => patchEmitter(originalTo(...rooms), rooms);
 
   const originalIn = io.in.bind(io);
-  io.in = (...rooms) => patchEmitter(originalIn(...rooms));
+  io.in = (...rooms) => patchEmitter(originalIn(...rooms), rooms);
 
   const originalExcept = io.except.bind(io);
-  io.except = (...rooms) => patchEmitter(originalExcept(...rooms));
+  io.except = (...rooms) => patchEmitter(originalExcept(...rooms), rooms);
 
   if (io.sockets) {
     patchEmitter(io.sockets);
@@ -453,6 +473,7 @@ app.use("/api/worker", workerRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/app/update", appUpdateRoutes);
+app.use("/api/web-push", webPushRoutes);
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();

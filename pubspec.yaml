@@ -39,6 +39,8 @@ dependencies:
   record: ^6.2.0
   flutter_map: ^8.2.2
   latlong2: ^0.9.1
+  video_player: ^2.9.2
+  js: ^0.7.2
 
 dev_dependencies:
   flutter_test:
