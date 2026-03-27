@@ -218,10 +218,10 @@ run_rsync -avz --delete --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r --exclude='.DS_Store' 
   "$PROJECT_ROOT/build/web/" "$SERVER:$REMOTE_TMP_DIR/"
 
 if [[ -n "$APK_SOURCE_RESOLVED" ]]; then
-  echo "[deploy_full] upload APK -> $SERVER:$REMOTE_DOWNLOADS_DIR/$APK_DEFAULT_FILE_NAME"
-  run_ssh "$SERVER" "mkdir -p '$REMOTE_DOWNLOADS_DIR'"
+  REMOTE_APK_TMP_PATH="/tmp/${APK_DEFAULT_FILE_NAME}"
+  echo "[deploy_full] upload APK -> $SERVER:$REMOTE_APK_TMP_PATH"
   run_rsync -avz --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-    "$APK_SOURCE_RESOLVED" "$SERVER:$REMOTE_DOWNLOADS_DIR/$APK_DEFAULT_FILE_NAME"
+    "$APK_SOURCE_RESOLVED" "$SERVER:$REMOTE_APK_TMP_PATH"
 fi
 
 echo "[deploy_full] apply on server"
@@ -233,6 +233,7 @@ run_ssh "$SERVER" \
   REMOTE_DOWNLOADS_DIR="$REMOTE_DOWNLOADS_DIR" \
   REMOTE_SERVICE="$REMOTE_SERVICE" \
   APK_DEFAULT_FILE_NAME="$APK_DEFAULT_FILE_NAME" \
+  REMOTE_APK_TMP_PATH="${REMOTE_APK_TMP_PATH:-}" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
 
@@ -259,6 +260,11 @@ if [[ -d "$REMOTE_PROJECT_DIR/server" ]]; then
   if command -v npm >/dev/null 2>&1; then
     npm ci --omit=dev
   fi
+fi
+
+if [[ -n "${REMOTE_APK_TMP_PATH:-}" && -f "$REMOTE_APK_TMP_PATH" ]]; then
+  mkdir -p "$REMOTE_DOWNLOADS_DIR"
+  install -m 644 "$REMOTE_APK_TMP_PATH" "$REMOTE_DOWNLOADS_DIR/$APK_DEFAULT_FILE_NAME"
 fi
 
 SERVICE="$REMOTE_SERVICE"
