@@ -357,13 +357,39 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
         chatId,
       ])
     ).rowCount > 0;
-  const isMember =
+  let isMember =
     (
       await db.query(
         "SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2 LIMIT 1",
         [chatId, userId],
       )
     ).rowCount > 0;
+
+  const isSupportTicket =
+    String(settings?.kind || "")
+      .toLowerCase()
+      .trim() === "support_ticket" || settings?.support_ticket === true;
+  if (isSupportTicket) {
+    const ticketQ = await db.query(
+      `SELECT customer_id, assignee_id
+       FROM support_tickets
+       WHERE chat_id = $1
+         AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [chatId, tenantId || null],
+    );
+    if (ticketQ.rowCount > 0) {
+      const ticket = ticketQ.rows[0];
+      const userIdText = String(userId || "").trim();
+      isMember =
+        userIdText.length > 0 &&
+        (String(ticket.customer_id || "").trim() === userIdText ||
+          String(ticket.assignee_id || "").trim() === userIdText);
+    } else {
+      isMember = false;
+    }
+  }
 
   return {
     chat,
@@ -401,13 +427,8 @@ function canReadChat(context, userRole, permissions = {}) {
   }
 
   if (isSupportTicketChatContext(context)) {
-    return (
-      role === "admin" ||
-      role === "tenant" ||
-      role === "creator" ||
-      hasPermission(permissions, "chat.write.support") ||
-      hasPermission(permissions, "support.manage")
-    );
+    if (!context.hasMembers) return false;
+    return context.isMember;
   }
 
   if (context.hasMembers) return context.isMember;
@@ -461,12 +482,8 @@ function canPostChat(context, userRole, permissions = {}) {
   }
 
   if (isSupportTicketChatContext(context)) {
-    return (
-      hasPermission(permissions, "chat.write.support") ||
-      role === "worker" ||
-      role === "admin" ||
-      role === "creator"
-    );
+    if (!context.hasMembers) return false;
+    return context.isMember;
   }
   if (context.hasMembers) return context.isMember;
   // Открытые публичные чаты доступны только staff.
@@ -1438,13 +1455,6 @@ router.get("/", requireAuth, async (req, res) => {
     const tenantId = req.user.tenant_id || null;
     const userIdText = String(userId);
     const role = normalizeRole(req.user.role);
-    const permissionSet = await resolvePermissionSet(req.user, db);
-    const supportStaffAccess =
-      role === "admin" ||
-      role === "tenant" ||
-      role === "creator" ||
-      hasPermission(permissionSet.permissions, "chat.write.support") ||
-      hasPermission(permissionSet.permissions, "support.manage");
     const workerOrHigher =
       role === "worker" || role === "admin" || role === "creator";
     const adminOrCreator = role === "admin" || role === "creator";
@@ -1644,6 +1654,8 @@ router.get("/", requireAuth, async (req, res) => {
        LEFT JOIN chat_members cm
          ON cm.chat_id = c.id
         AND cm.user_id = $1
+       LEFT JOIN support_tickets st
+         ON st.chat_id = c.id
        LEFT JOIN user_chat_preferences pref
          ON pref.chat_id = c.id
         AND pref.user_id = $1
@@ -1700,13 +1712,20 @@ router.get("/", requireAuth, async (req, res) => {
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE c.type <> 'channel'
          AND (
-           cm.user_id = $1
-           OR (
-             $4::boolean = true
-             AND (
+           (
+             (
                COALESCE(c.settings->>'kind', '') = 'support_ticket'
                OR COALESCE((c.settings->>'support_ticket')::boolean, false) = true
              )
+             AND (
+               st.customer_id = $1
+               OR st.assignee_id = $1
+             )
+           )
+           OR (
+             COALESCE(c.settings->>'kind', '') <> 'support_ticket'
+             AND COALESCE((c.settings->>'support_ticket')::boolean, false) = false
+             AND cm.user_id = $1
            )
          )
          AND ($3::uuid IS NULL OR c.tenant_id = $3::uuid)
@@ -1716,7 +1735,7 @@ router.get("/", requireAuth, async (req, res) => {
          pref.pinned_at DESC NULLS LAST,
          updated_at DESC NULLS LAST
        LIMIT 100`,
-      [userId, userIdText, tenantId, supportStaffAccess],
+      [userId, userIdText, tenantId],
     );
 
     const byId = new Map();

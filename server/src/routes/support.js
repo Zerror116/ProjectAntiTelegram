@@ -8,7 +8,6 @@ const { requireRole } = require("../utils/roles");
 const { emitToTenant } = require("../utils/socket");
 const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
-const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 const {
   encryptMessageText,
   decryptMessageRow,
@@ -58,16 +57,6 @@ function isStaffRole(rawRole) {
 function isAdminTierRole(rawRole) {
   const role = normalizeRole(rawRole);
   return role === "admin" || role === "tenant" || role === "creator";
-}
-
-function canAccessSharedSupportTickets(rawRole, permissions = {}) {
-  const role = normalizeRole(rawRole);
-  if (role === "client") return false;
-  if (isAdminTierRole(role)) return true;
-  return (
-    hasPermission(permissions, "chat.write.support") ||
-    hasPermission(permissions, "support.manage")
-  );
 }
 
 function normalizeSettings(raw) {
@@ -215,46 +204,6 @@ async function insertSupportMessage(client, { chatId, senderId = null, text, met
   };
 }
 
-async function ensureSupportStaffMembers(client, chatId, tenantId = null) {
-  const staffRes = await client.query(
-    `SELECT id, role, tenant_id
-     FROM users
-     WHERE role IN ('worker', 'admin', 'tenant', 'creator')
-       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)`,
-    [tenantId || null],
-  );
-
-  for (const row of staffRes.rows) {
-    const permissionSet = await resolvePermissionSet(
-      {
-        id: row.id,
-        role: row.role,
-        base_role: row.role,
-        tenant_id: row.tenant_id || tenantId || null,
-      },
-      client,
-    );
-    if (
-      !canAccessSharedSupportTickets(
-        row.role,
-        permissionSet?.permissions || {},
-      )
-    ) {
-      continue;
-    }
-
-    const normalizedRole = normalizeRole(row.role);
-    const memberRole = normalizedRole === "creator" ? "owner" : "moderator";
-    await client.query(
-      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
-       VALUES ($1, $2, $3, now(), $4)
-       ON CONFLICT (chat_id, user_id) DO UPDATE
-       SET role = EXCLUDED.role`,
-      [uuidv4(), chatId, row.id, memberRole],
-    );
-  }
-}
-
 async function ensureSupportMembers(
   client,
   {
@@ -264,6 +213,19 @@ async function ensureSupportMembers(
     tenantId = null,
   },
 ) {
+  const allowedIds = Array.from(
+    new Set(
+      [String(customerId || "").trim(), String(assigneeId || "").trim()].filter(Boolean),
+    ),
+  );
+
+  await client.query(
+    `DELETE FROM chat_members
+     WHERE chat_id = $1
+       AND NOT (user_id = ANY($2::uuid[]))`,
+    [chatId, allowedIds],
+  );
+
   await client.query(
     `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
      VALUES ($1, $2, $3, now(), 'member')
@@ -279,8 +241,6 @@ async function ensureSupportMembers(
       [uuidv4(), chatId, assigneeId],
     );
   }
-
-  await ensureSupportStaffMembers(client, chatId, tenantId);
 }
 
 async function resolveProductCandidate(client, { tenantId = null, messageText }) {
@@ -857,11 +817,6 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
 router.get("/tickets", authMiddleware, async (req, res) => {
   try {
     const role = normalizeRole(req.user.role);
-    const permissionSet = await resolvePermissionSet(req.user, db);
-    const canViewAllSupportTickets = canAccessSharedSupportTickets(
-      role,
-      permissionSet?.permissions || {},
-    );
     const includeArchived = String(req.query.include_archived || "") === "1";
     const statuses = parseTicketStatuses(req.query.status);
 
@@ -880,7 +835,6 @@ router.get("/tickets", authMiddleware, async (req, res) => {
       req.user.tenant_id || null,
       req.user.id,
       role,
-      canViewAllSupportTickets,
     ];
 
     const list = await db.query(
@@ -913,8 +867,7 @@ router.get("/tickets", authMiddleware, async (req, res) => {
          AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
          AND (
            ($4 = 'client' AND st.customer_id = $3)
-           OR ($5::boolean = true)
-           OR ($4 = 'worker' AND st.assignee_id = $3)
+           OR st.assignee_id = $3
          )
        ORDER BY
          CASE st.status
