@@ -1247,34 +1247,31 @@ router.get(
         ownerIds.add(normalizedOwnerId);
       }
 
-      let activeCartOwners = new Set();
+      const activeCartOwnerCounts = new Map();
       if (ownerIds.size > 0) {
         const ownerIdsList = Array.from(ownerIds);
         const activeOwnersQ = await db.query(
-          `SELECT DISTINCT ci.user_id
+          `SELECT ci.user_id,
+                  COUNT(*)::int AS active_items_count
            FROM cart_items ci
            WHERE ci.user_id = ANY($1::uuid[])
-             AND ci.status <> 'delivered'`,
+             AND ci.status <> 'delivered'
+           GROUP BY ci.user_id`,
           [ownerIdsList],
         );
-        activeCartOwners = new Set(
-          activeOwnersQ.rows.map((row) => String(row.user_id || '').trim()).filter(Boolean),
-        );
+        for (const row of activeOwnersQ.rows) {
+          const ownerId = String(row.user_id || '').trim();
+          if (!ownerId) continue;
+          activeCartOwnerCounts.set(ownerId, Number(row.active_items_count || 0));
+        }
       }
 
-      const visibleUsers = matchedUsers.filter((row) => {
+      const visibleUsers = matchedUsers.map((row) => {
         const userId = String(row.id || '').trim();
-        if (!userId) return false;
+        if (!userId) return null;
         const ownerId = effectiveOwnerByUserId.get(userId) || userId;
-        return activeCartOwners.has(ownerId);
-      });
-
-      return res.json({
-        ok: true,
-        data: visibleUsers.map((row) => {
-          const userId = String(row.id || '').trim();
-          const effectiveOwnerId = effectiveOwnerByUserId.get(userId) || userId;
-          return {
+        const activeItemsCount = Number(activeCartOwnerCounts.get(ownerId) || 0);
+        return {
           id: row.id,
           name: row.name || '',
           email: row.email || '',
@@ -1283,10 +1280,26 @@ router.get(
           is_active: row.is_active !== false,
           block_reason: row.block_reason || '',
           created_at: row.created_at || null,
-          effective_cart_owner_id: effectiveOwnerId,
-          shares_cart_with_owner: effectiveOwnerId !== userId,
+          effective_cart_owner_id: ownerId,
+          shares_cart_with_owner: ownerId !== userId,
+          active_cart_items_count: activeItemsCount,
+          has_active_cart: activeItemsCount > 0,
         };
-        }),
+      }).filter(Boolean);
+
+      visibleUsers.sort((a, b) => {
+        const byActive = Number(b.active_cart_items_count || 0) - Number(a.active_cart_items_count || 0);
+        if (byActive != 0) return byActive;
+        const byDate =
+          new Date(String(b.created_at || 0)).getTime() -
+          new Date(String(a.created_at || 0)).getTime();
+        if (byDate != 0) return byDate;
+        return String(a.name || '').localeCompare(String(b.name || ''), 'ru');
+      });
+
+      return res.json({
+        ok: true,
+        data: visibleUsers,
       });
     } catch (err) {
       console.error('cart.admin.clientsByPhone error', err);

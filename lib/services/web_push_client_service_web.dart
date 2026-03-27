@@ -205,11 +205,6 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
       reason: 'permission_not_granted',
     );
   }
-  try {
-    await WebNotificationService.requestPermission();
-  } catch (_) {
-    // ignore
-  }
 
   late final Response<dynamic> configResp;
   try {
