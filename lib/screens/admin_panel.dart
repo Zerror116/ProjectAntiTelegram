@@ -219,6 +219,11 @@ class _AdminPanelState extends State<AdminPanel>
         unawaited(_loadDeliveryDashboard());
         return;
       }
+      if (type == 'support:queue:changed' && _canViewSupportTab()) {
+        unawaited(_loadSupportTickets(silent: true));
+        unawaited(_loadSupportNotificationCenter(silent: true));
+        return;
+      }
       if (type == 'claims:updated' && _canViewSupportTab()) {
         unawaited(_loadReturnsWorkflow(silent: true));
         unawaited(_loadSupportNotificationCenter(silent: true));
