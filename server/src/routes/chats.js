@@ -12,7 +12,7 @@ const { authMiddleware: requireAuth } = require("../utils/auth");
 const { requireRole } = require("../utils/roles");
 const { requireChatPermission } = require("../utils/permissions");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
-const { emitToTenant } = require("../utils/socket");
+const { emitToTenant, emitToUser } = require("../utils/socket");
 const { guardAction } = require("../utils/antifraud");
 const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
@@ -869,6 +869,69 @@ function mapPeerInfo(row, { includeEmail = false } = {}) {
     payload.email = row.email || "";
   }
   return payload;
+}
+
+async function getDirectUserCard(client, userId, tenantId = null) {
+  const normalizedUserId = String(userId || "").trim();
+  if (!normalizedUserId) return null;
+  const q = await client.query(
+    `SELECT u.id,
+            u.name,
+            p.phone,
+            u.avatar_url,
+            COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+            COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+            COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+     FROM users u
+     LEFT JOIN phones p ON p.user_id = u.id
+     WHERE u.id = $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid OR u.tenant_id IS NULL)
+     LIMIT 1`,
+    [normalizedUserId, tenantId || null],
+  );
+  return q.rowCount > 0 ? q.rows[0] : null;
+}
+
+async function getDirectAliasForViewer(
+  client,
+  viewerUserId,
+  counterpartUserId,
+  tenantId = null,
+) {
+  const viewerId = String(viewerUserId || "").trim();
+  const counterpartId = String(counterpartUserId || "").trim();
+  if (!viewerId || !counterpartId) return "";
+  const q = await client.query(
+    `SELECT alias_name
+     FROM user_contacts
+     WHERE user_id = $1
+       AND contact_user_id = $2
+       AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+     LIMIT 1`,
+    [viewerId, counterpartId, tenantId || null],
+  );
+  return q.rowCount > 0 ? String(q.rows[0]?.alias_name || "").trim() : "";
+}
+
+function buildDirectChatPayloadForViewer(chat, counterpart, aliasName = "") {
+  const title =
+    String(aliasName || "").trim() ||
+    String(counterpart?.name || "").trim() ||
+    String(counterpart?.phone || "").trim() ||
+    "Пользователь";
+  return {
+    ...chat,
+    title: "",
+    display_title: title,
+    peer_user_id: counterpart?.id || null,
+    peer_display_name: title,
+    peer_name: counterpart?.name || "",
+    peer_phone: counterpart?.phone || "",
+    peer_avatar_url: counterpart?.avatar_url || null,
+    peer_avatar_focus_x: Number(counterpart?.avatar_focus_x || 0),
+    peer_avatar_focus_y: Number(counterpart?.avatar_focus_y || 0),
+    peer_avatar_zoom: Number(counterpart?.avatar_zoom || 1),
+  };
 }
 
 function toChatMediaUrl(req, file) {
@@ -3373,7 +3436,7 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
          RETURNING id, title, type, settings, created_at, updated_at`,
         [
           uuidv4(),
-          "Диалог",
+          "",
           req.user.id,
           req.user.tenant_id || null,
           JSON.stringify(settings),
@@ -3428,26 +3491,56 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
     const contactInfo =
       contactInfoQ.rowCount > 0 ? contactInfoQ.rows[0] : null;
 
+    const reverseAliasName = await getDirectAliasForViewer(
+      client,
+      peer.id,
+      req.user.id,
+      req.user.tenant_id || null,
+    );
+    const requesterCard = await getDirectUserCard(
+      client,
+      req.user.id,
+      req.user.tenant_id || null,
+    );
+    const requesterChat = buildDirectChatPayloadForViewer(
+      chat,
+      peer,
+      contactInfo?.alias_name || "",
+    );
+    const peerChat = buildDirectChatPayloadForViewer(
+      chat,
+      requesterCard,
+      reverseAliasName,
+    );
+
     await client.query("COMMIT");
 
     const io = req.app.get("io");
     if (io) {
       if (created) {
-        emitToTenant(io, req.user?.tenant_id || null, "chat:created", {
+        emitToUser(io, req.user?.id, "chat:created", {
           chatId: chat.id,
-          chat,
+          chat: requesterChat,
+        });
+        emitToUser(io, peer.id, "chat:created", {
+          chatId: chat.id,
+          chat: peerChat,
         });
       }
-      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+      emitToUser(io, req.user?.id, "chat:updated", {
         chatId: chat.id,
-        chat,
+        chat: requesterChat,
+      });
+      emitToUser(io, peer.id, "chat:updated", {
+        chatId: chat.id,
+        chat: peerChat,
       });
     }
 
     return res.json({
       ok: true,
       data: {
-        chat,
+        chat: requesterChat,
         peer: mapPeerInfo({
           ...peer,
           alias_name: contactInfo?.alias_name || "",
