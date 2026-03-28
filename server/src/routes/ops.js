@@ -2009,6 +2009,9 @@ router.get(
          FROM (
            SELECT st.id::text AS source_id,
                   'support_ticket'::text AS event_type,
+                  st.chat_id::text AS chat_id,
+                  ch.type::text AS chat_type,
+                  ch.settings AS chat_settings,
                   st.status::text AS status,
                   NULL::text AS claim_type,
                   NULL::text AS customer_discount_status,
@@ -2029,6 +2032,9 @@ router.get(
 
            SELECT cc.id::text AS source_id,
                   'claim'::text AS event_type,
+                  NULL::text AS chat_id,
+                  NULL::text AS chat_type,
+                  NULL::jsonb AS chat_settings,
                   cc.status::text AS status,
                   cc.claim_type::text AS claim_type,
                   COALESCE(cc.customer_discount_status, '')::text AS customer_discount_status,
@@ -2141,6 +2147,12 @@ router.get(
         claim_type: claimType || null,
         claim_type_label: claimTypeLabel || null,
         amount,
+        chat_id: row.chat_id ? String(row.chat_id) : null,
+        chat_type: row.chat_type ? String(row.chat_type) : null,
+        chat_settings:
+          row.chat_settings && typeof row.chat_settings === 'object'
+            ? row.chat_settings
+            : null,
         created_at: row.created_at || null,
         updated_at: row.updated_at || null,
         event_at: row.event_at || null,

@@ -391,6 +391,13 @@ class _AdminPanelState extends State<AdminPanel>
     return _hasPermission('chat.write.support');
   }
 
+  bool _canForceCloseSupportTicket() {
+    if (_isCreatorBase()) return false;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasPermission('chat.write.support');
+  }
+
   bool _canViewClientCartsTab() {
     if (_isCreatorBase()) return true;
     final role = authService.effectiveRole;
@@ -3654,7 +3661,10 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
-  Future<void> _archiveSupportTicket(Map<String, dynamic> ticket) async {
+  Future<void> _archiveSupportTicket(
+    Map<String, dynamic> ticket, {
+    bool force = false,
+  }) async {
     final ticketId = (ticket['id'] ?? '').toString().trim();
     if (ticketId.isEmpty) return;
     if (_supportFinishBusyTicketIds.contains(ticketId)) return;
@@ -3666,10 +3676,14 @@ class _AdminPanelState extends State<AdminPanel>
     try {
       await authService.dio.post(
         '/api/support/tickets/$ticketId/archive',
-        data: {'reason': 'assignee_finished'},
+        data: {
+          'reason': force ? 'forced_admin_archive' : 'assignee_finished',
+          if (force) 'force': true,
+        },
       );
       await _loadSupportTickets(silent: true);
       await _loadSupportNotificationCenter(silent: true);
+      unawaited(refreshSupportQueueNotices());
       if (!mounted) return;
       setState(() => _message = 'Диалог закончен');
     } catch (e) {
@@ -3714,6 +3728,36 @@ class _AdminPanelState extends State<AdminPanel>
           chatId: chatId,
           chatTitle: chatTitle,
           chatType: (ticket['chat_type'] ?? 'private').toString(),
+          chatSettings: normalizedSettings,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openSupportNotificationItem(Map<String, dynamic> event) async {
+    final ticketId = (event['id'] ?? '').toString().trim();
+    final chatId = (event['chat_id'] ?? '').toString().trim();
+    if (chatId.isEmpty) return;
+    final settings = _asMap(event['chat_settings']);
+    final status = (event['status'] ?? '').toString().trim().toLowerCase();
+    final normalizedSettings = <String, dynamic>{
+      ...settings,
+      'kind': settings['kind'] ?? 'support_ticket',
+      'support_ticket': true,
+      'support_ticket_status': status,
+      'support_archived': status == 'archived',
+      if (ticketId.isNotEmpty)
+        'support_ticket_id': settings['support_ticket_id'] ?? ticketId,
+    };
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: chatId,
+          chatTitle: (event['related_name'] ?? event['title'] ?? 'Поддержка')
+              .toString(),
+          chatType: (event['chat_type'] ?? 'private').toString(),
           chatSettings: normalizedSettings,
         ),
       ),
@@ -7324,6 +7368,7 @@ class _AdminPanelState extends State<AdminPanel>
     final notificationsSummary = _asMap(_supportNotificationSummary);
     final returnsSummary = _asMap(_returnsAnalytics?['summary']);
     final returnsTopProducts = _asMapList(_returnsAnalytics?['top_products']);
+    final canForceCloseSupport = _canForceCloseSupportTicket();
 
     return RefreshIndicator(
       onRefresh: () async {
@@ -7421,6 +7466,18 @@ class _AdminPanelState extends State<AdminPanel>
                           .toString();
                       final statusLabel = (event['status_label'] ?? '')
                           .toString();
+                      final eventType = (event['type'] ?? '').toString().trim();
+                      final isSupportEvent = eventType == 'support_ticket';
+                      final supportStatus = (event['status'] ?? '')
+                          .toString()
+                          .trim()
+                          .toLowerCase();
+                      final supportTicketId = (event['id'] ?? '')
+                          .toString()
+                          .trim();
+                      final supportFinishBusy = _supportFinishBusyTicketIds.contains(
+                        supportTicketId,
+                      );
                       final priority = (event['priority'] ?? 'normal')
                           .toString();
                       final timeLabel = _formatDateTimeLabel(event['event_at']);
@@ -7433,25 +7490,84 @@ class _AdminPanelState extends State<AdminPanel>
                         priorityColor = Theme.of(context).colorScheme.primary;
                       }
 
-                      return ListTile(
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                        title: Text(title),
-                        subtitle: Text(
-                          [
-                            typeLabel,
-                            if (statusLabel.isNotEmpty) statusLabel,
-                            if (subtitle.isNotEmpty) subtitle,
-                            if (timeLabel.isNotEmpty) timeLabel,
-                          ].join(' • '),
-                        ),
-                        leading: Icon(
-                          event['type'] == 'claim'
-                              ? Icons.assignment_return_outlined
-                              : event['type'] == 'cart_retention'
-                              ? Icons.warning_amber_rounded
-                              : Icons.support_agent_outlined,
-                          color: priorityColor,
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(title),
+                              subtitle: Text(
+                                [
+                                  typeLabel,
+                                  if (statusLabel.isNotEmpty) statusLabel,
+                                  if (subtitle.isNotEmpty) subtitle,
+                                  if (timeLabel.isNotEmpty) timeLabel,
+                                ].join(' • '),
+                              ),
+                              leading: Icon(
+                                eventType == 'claim'
+                                    ? Icons.assignment_return_outlined
+                                    : eventType == 'cart_retention'
+                                    ? Icons.warning_amber_rounded
+                                    : Icons.support_agent_outlined,
+                                color: priorityColor,
+                              ),
+                            ),
+                            if (isSupportEvent)
+                              Padding(
+                                padding: const EdgeInsets.only(left: 4),
+                                child: Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    if (((event['chat_id'] ?? '')
+                                            .toString()
+                                            .trim())
+                                        .isNotEmpty)
+                                      FilledButton.tonalIcon(
+                                        onPressed: () =>
+                                            _openSupportNotificationItem(event),
+                                        icon: const Icon(Icons.forum_outlined),
+                                        label: const Text('Открыть чат'),
+                                      ),
+                                    if (canForceCloseSupport)
+                                      OutlinedButton.icon(
+                                        onPressed:
+                                            supportFinishBusy || _supportArchiveBusy
+                                            ? null
+                                            : () => _archiveSupportTicket(
+                                                {
+                                                  'id': supportTicketId,
+                                                  'chat_id': event['chat_id'],
+                                                },
+                                                force:
+                                                    supportStatus ==
+                                                        'waiting_customer' ||
+                                                    supportStatus == 'resolved' ||
+                                                    supportStatus == 'open',
+                                              ),
+                                        icon: supportFinishBusy || _supportArchiveBusy
+                                            ? const SizedBox(
+                                                width: 16,
+                                                height: 16,
+                                                child: CircularProgressIndicator(
+                                                  strokeWidth: 2,
+                                                ),
+                                              )
+                                            : const Icon(Icons.archive_outlined),
+                                        label: Text(
+                                          supportFinishBusy || _supportArchiveBusy
+                                              ? 'Закрываем...'
+                                              : 'Закрыть заявку',
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                          ],
                         ),
                       );
                     }),
