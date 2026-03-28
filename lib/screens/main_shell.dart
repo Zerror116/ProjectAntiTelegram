@@ -58,6 +58,7 @@ class _MainShellState extends State<MainShell> {
   bool _webNotificationStatusLoaded = false;
   bool _webNotificationBannerDismissed = false;
   bool _webNotificationRequestInProgress = false;
+  Timer? _supportQueueRefreshTimer;
 
   @override
   void initState() {
@@ -91,11 +92,16 @@ class _MainShellState extends State<MainShell> {
     });
     unawaited(_loadWebNotificationPromptState());
     unawaited(refreshSupportQueueNotices());
+    _supportQueueRefreshTimer = Timer.periodic(
+      const Duration(seconds: 12),
+      (_) => unawaited(refreshSupportQueueNotices()),
+    );
   }
 
   @override
   void dispose() {
     _authSub?.cancel();
+    _supportQueueRefreshTimer?.cancel();
     super.dispose();
   }
 
