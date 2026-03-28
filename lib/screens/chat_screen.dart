@@ -1102,25 +1102,48 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _openImagePreview(String imageUrl) {
+    final media = MediaQuery.of(context);
+    final isCompact = media.size.width < 680;
+    final maxWidth = min(
+      media.size.width - (isCompact ? 24 : 120),
+      isCompact ? 420.0 : 980.0,
+    ).clamp(260.0, media.size.width);
+    final maxHeight = min(
+      media.size.height - (isCompact ? 110 : 150),
+      isCompact ? media.size.height * 0.72 : media.size.height * 0.82,
+    ).clamp(220.0, media.size.height);
     showDialog<void>(
       context: context,
       builder: (ctx) => Dialog(
-        insetPadding: const EdgeInsets.all(18),
-        clipBehavior: Clip.antiAlias,
+        backgroundColor: Colors.transparent,
+        insetPadding: EdgeInsets.symmetric(
+          horizontal: isCompact ? 12 : 28,
+          vertical: isCompact ? 16 : 24,
+        ),
         child: Stack(
           children: [
-            InteractiveViewer(
-              minScale: 0.7,
-              maxScale: 4,
-              child: AspectRatio(
-                aspectRatio: 1,
-                child: AdaptiveNetworkImage(
-                  imageUrl,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, error, stackTrace) => Container(
-                    color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                    alignment: Alignment.center,
-                    child: const Icon(Icons.broken_image_outlined, size: 40),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: SizedBox(
+                width: maxWidth,
+                height: maxHeight,
+                child: InteractiveViewer(
+                  minScale: 0.7,
+                  maxScale: 4,
+                  child: AdaptiveNetworkImage(
+                    imageUrl,
+                    width: maxWidth,
+                    height: maxHeight,
+                    fit: BoxFit.contain,
+                    errorBuilder: (_, error, stackTrace) => Container(
+                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                      alignment: Alignment.center,
+                      child: const Icon(Icons.broken_image_outlined, size: 40),
+                    ),
                   ),
                 ),
               ),
@@ -5490,7 +5513,19 @@ class _ChatScreenState extends State<ChatScreen> {
     final canCopyId = !isClient;
     final canOpenImage = imageUrl != null;
     final canReact = hasMessageId && !isDeleted;
-    final maxBubbleWidth = MediaQuery.of(context).size.width * 0.72;
+    final media = MediaQuery.of(context);
+    final maxBubbleWidth = media.size.width * 0.72;
+    final isCompactMedia = media.size.width < 680;
+    final defaultImageWidth = min(
+      maxBubbleWidth,
+      isCompactMedia
+          ? media.size.width * 0.72
+          : (media.size.width < 1180 ? 360.0 : 420.0),
+    ).toDouble();
+    final defaultImageMaxHeight = min(
+      isCompactMedia ? media.size.height * 0.36 : media.size.height * 0.46,
+      440.0,
+    ).clamp(220.0, 440.0);
     final showChatIdentity = !hasBuy && !isReservedOrder;
     final timeLabel = _formatMessageTime(message['created_at']);
     final deliveryStatus = fromMe && showChatIdentity
@@ -5500,17 +5535,22 @@ class _ChatScreenState extends State<ChatScreen> {
     final edited = metaMap['edited'] == true;
     Widget buildMessageImage({double? width}) {
       if (imageUrl == null) return const SizedBox.shrink();
+      final wantsFullWidth = width == double.infinity;
+      final resolvedWidth = wantsFullWidth ? maxBubbleWidth : (width ?? defaultImageWidth);
       return GestureDetector(
         onTap: () => _openImagePreview(imageUrl),
         child: ClipRRect(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(isCompactMedia ? 16 : 18),
           child: SizedBox(
-            width: width ?? 240,
+            width: resolvedWidth,
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 340),
+              constraints: BoxConstraints(
+                maxWidth: resolvedWidth,
+                maxHeight: defaultImageMaxHeight,
+              ),
               child: AdaptiveNetworkImage(
                 imageUrl,
-                width: width ?? 240,
+                width: resolvedWidth,
                 fit: BoxFit.contain,
                 errorBuilder: (_, error, stackTrace) => Container(
                   color: theme.colorScheme.surfaceContainerHighest,

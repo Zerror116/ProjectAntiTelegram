@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -555,6 +556,146 @@ class _ChatsScreenState extends State<ChatsScreen> {
     _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
   }
 
+  Future<void> _openAvatarPreview({
+    required String title,
+    required String? imageUrl,
+    required double focusX,
+    required double focusY,
+    required double zoom,
+  }) async {
+    final resolvedImageUrl = (imageUrl ?? '').trim();
+    if (resolvedImageUrl.isEmpty) return;
+    final media = MediaQuery.of(context);
+    final isCompact = media.size.width < 640;
+    final previewDiameter = math.min(
+      media.size.width - (isCompact ? 36 : 120),
+      media.size.height - (isCompact ? 220 : 260),
+    ).clamp(180.0, isCompact ? 320.0 : 420.0);
+    await showGeneralDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Закрыть аватар',
+      barrierColor: Colors.black.withValues(alpha: 0.72),
+      transitionDuration: const Duration(milliseconds: 180),
+      pageBuilder: (dialogContext, animation, secondaryAnimation) {
+        return SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 28),
+              child: Material(
+                color: Colors.transparent,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: previewDiameter,
+                      height: previewDiameter,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.16),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.24),
+                            blurRadius: 28,
+                            offset: const Offset(0, 16),
+                          ),
+                        ],
+                      ),
+                      child: ClipOval(
+                        child: AppAvatar(
+                          title: title,
+                          imageUrl: resolvedImageUrl,
+                          focusX: focusX,
+                          focusY: focusY,
+                          zoom: zoom,
+                          radius: previewDiameter / 2,
+                          fallbackIcon: Icons.person_outline,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: math.min(media.size.width - 40, 420),
+                      ),
+                      child: Text(
+                        title,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextButton.icon(
+                      onPressed: () => Navigator.of(dialogContext).pop(),
+                      icon: const Icon(Icons.close),
+                      label: const Text('Закрыть'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      transitionBuilder: (context, animation, secondaryAnimation, child) {
+        final curve = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+        );
+        return FadeTransition(
+          opacity: curve,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.94, end: 1).animate(curve),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPreviewableAvatar({
+    required String title,
+    required String? imageUrl,
+    required double focusX,
+    required double focusY,
+    required double zoom,
+    required double radius,
+    IconData fallbackIcon = Icons.forum_outlined,
+  }) {
+    final hasImage = (imageUrl ?? '').trim().isNotEmpty;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onLongPress: !hasImage
+          ? null
+          : () => _openAvatarPreview(
+              title: title,
+              imageUrl: imageUrl,
+              focusX: focusX,
+              focusY: focusY,
+              zoom: zoom,
+            ),
+      child: AppAvatar(
+        title: title,
+        imageUrl: imageUrl,
+        focusX: focusX,
+        focusY: focusY,
+        zoom: zoom,
+        radius: radius,
+        fallbackIcon: fallbackIcon,
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -771,7 +912,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
             ),
             child: Row(
               children: [
-                AppAvatar(
+                _buildPreviewableAvatar(
                   title: title,
                   imageUrl: avatarUrl,
                   focusX: avatarFocusX,
@@ -1435,11 +1576,9 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
       if (chatId.isEmpty) {
         throw Exception('Не удалось открыть чат');
       }
-      final chatTitle = (peer['name'] ?? '').toString().trim().isNotEmpty
-          ? (peer['name'] ?? '').toString().trim()
-          : ((peer['phone'] ?? '').toString().trim().isNotEmpty
-                ? (peer['phone'] ?? '').toString().trim()
-                : 'Пользователь');
+      final chatTitle = (chat['display_title'] ?? '').toString().trim().isNotEmpty
+          ? (chat['display_title'] ?? '').toString().trim()
+          : widget.peerDisplayName(peer);
       final chatSettings = chat['settings'] is Map
           ? Map<String, dynamic>.from(chat['settings'])
           : null;
