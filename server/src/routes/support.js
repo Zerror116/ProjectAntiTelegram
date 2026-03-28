@@ -237,6 +237,44 @@ async function emitChatCreated(req, tenantId, chat) {
   });
 }
 
+async function hydrateSupportQueueTicket(queryable, ticketId) {
+  const result = await queryable.query(
+    `SELECT st.id,
+            st.chat_id,
+            st.customer_id,
+            st.assignee_id,
+            st.category,
+            st.subject,
+            st.product_id,
+            st.status,
+            st.created_at,
+            st.updated_at,
+            p.title AS product_title,
+            COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name
+     FROM support_tickets st
+     LEFT JOIN products p ON p.id = st.product_id
+     LEFT JOIN users cu ON cu.id = st.customer_id
+     WHERE st.id = $1
+     LIMIT 1`,
+    [ticketId],
+  );
+  return result.rows[0] || null;
+}
+
+async function emitSupportQueueTicketEvent(req, tenantId, eventName, ticketId) {
+  const io = req.app.get("io");
+  if (!io || !eventName || !ticketId) return;
+  const payload = await hydrateSupportQueueTicket(db, ticketId);
+  if (!payload) return;
+  emitToTenant(io, tenantId || null, eventName, payload);
+}
+
+function emitSupportQueueClaimedEvent(req, tenantId, payload) {
+  const io = req.app.get("io");
+  if (!io) return;
+  emitToTenant(io, tenantId || null, "support:ticket:claimed", payload);
+}
+
 async function insertSupportMessage(client, { chatId, senderId = null, text, meta = {} }) {
   const plainText = String(text || "");
   const encryptedText = encryptMessageText(plainText);
@@ -831,6 +869,15 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
       );
     }
 
+    if ((result.ticket?.assignee_id ?? null) == null && result.ticket?.id) {
+      await emitSupportQueueTicketEvent(
+        req,
+        req.user.tenant_id || null,
+        "support:ticket:queued",
+        result.ticket.id,
+      );
+    }
+
     const autoReplyText = normalizeText(result.autoReplyMessage?.text || "");
     if (autoReplyText) {
       return res.status(201).json({
@@ -1127,6 +1174,12 @@ router.post("/tickets/:ticketId/claim", authMiddleware, ensureSupportStaffAccess
     });
 
     await client.query("COMMIT");
+
+    emitSupportQueueClaimedEvent(req, req.user.tenant_id || null, {
+      ticket_id: ticket.id,
+      chat_id: ticket.chat_id,
+      assignee_id: req.user.id,
+    });
 
     return res.json({
       ok: true,

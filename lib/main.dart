@@ -374,6 +374,163 @@ final ValueNotifier<_AppNoticePayload?> _appNoticeNotifier =
 int _appNoticeSeq = 0;
 Timer? _appNoticeTimer;
 
+class _SupportQueueNoticePayload {
+  final String ticketId;
+  final String chatId;
+  final String subject;
+  final String category;
+  final String customerName;
+  final String? productTitle;
+
+  const _SupportQueueNoticePayload({
+    required this.ticketId,
+    required this.chatId,
+    required this.subject,
+    required this.category,
+    required this.customerName,
+    required this.productTitle,
+  });
+}
+
+final ValueNotifier<List<_SupportQueueNoticePayload>> _supportQueueNoticeNotifier =
+    ValueNotifier<List<_SupportQueueNoticePayload>>(const []);
+final ValueNotifier<Set<String>> _supportQueueClaimBusyNotifier =
+    ValueNotifier<Set<String>>(<String>{});
+
+bool _canCurrentUserReceiveSupportQueueAlerts() {
+  final user = authService.currentUser;
+  if (user == null) return false;
+  final baseRole = user.role.toLowerCase().trim();
+  if (baseRole == 'creator') return false;
+  final role = authService.effectiveRole.toLowerCase().trim();
+  if (role == 'creator' || role == 'client') return false;
+  if (role == 'admin' || role == 'tenant') return true;
+  if (role == 'worker') {
+    return authService.hasPermission('chat.write.support');
+  }
+  return false;
+}
+
+_SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
+  if (raw is! Map) return null;
+  final map = Map<String, dynamic>.from(raw);
+  final ticketId = (map['id'] ?? map['ticket_id'] ?? '').toString().trim();
+  final chatId = (map['chat_id'] ?? '').toString().trim();
+  if (ticketId.isEmpty || chatId.isEmpty) return null;
+  final subject = (map['subject'] ?? 'Новый вопрос в поддержку')
+      .toString()
+      .trim();
+  final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
+  final category = (map['category'] ?? 'general').toString().trim();
+  final productTitle = (map['product_title'] ?? '').toString().trim();
+  return _SupportQueueNoticePayload(
+    ticketId: ticketId,
+    chatId: chatId,
+    subject: subject.isEmpty ? 'Новый вопрос в поддержку' : subject,
+    category: category.isEmpty ? 'general' : category,
+    customerName: customerName.isEmpty ? 'Клиент' : customerName,
+    productTitle: productTitle.isEmpty ? null : productTitle,
+  );
+}
+
+void _clearSupportQueueNotices() {
+  _supportQueueNoticeNotifier.value = const [];
+  _supportQueueClaimBusyNotifier.value = <String>{};
+}
+
+void _upsertSupportQueueNotice(_SupportQueueNoticePayload notice) {
+  final current = List<_SupportQueueNoticePayload>.from(
+    _supportQueueNoticeNotifier.value,
+  );
+  final index = current.indexWhere((item) => item.ticketId == notice.ticketId);
+  if (index >= 0) {
+    current[index] = notice;
+  } else {
+    current.insert(0, notice);
+  }
+  _supportQueueNoticeNotifier.value = current;
+}
+
+void _removeSupportQueueNotice(String ticketId) {
+  final id = ticketId.trim();
+  if (id.isEmpty) return;
+  _supportQueueNoticeNotifier.value = _supportQueueNoticeNotifier.value
+      .where((item) => item.ticketId != id)
+      .toList(growable: false);
+  final busy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
+  busy.remove(id);
+  _supportQueueClaimBusyNotifier.value = busy;
+}
+
+Future<void> _refreshSupportQueueNotices() async {
+  if (!_canCurrentUserReceiveSupportQueueAlerts()) {
+    _clearSupportQueueNotices();
+    return;
+  }
+  try {
+    final resp = await dio.get('/api/support/tickets/queue');
+    final data = resp.data;
+    final rows = data is Map && data['ok'] == true && data['data'] is List
+        ? List<dynamic>.from(data['data'])
+        : const <dynamic>[];
+    final next = <_SupportQueueNoticePayload>[];
+    for (final row in rows) {
+      final parsed = _parseSupportQueueNotice(row);
+      if (parsed != null) next.add(parsed);
+    }
+    _supportQueueNoticeNotifier.value = next;
+  } on DioException catch (e) {
+    if (e.response?.statusCode == 403 || e.response?.statusCode == 401) {
+      _clearSupportQueueNotices();
+      return;
+    }
+  } catch (_) {}
+}
+
+Future<void> refreshSupportQueueNotices() async {
+  await _refreshSupportQueueNotices();
+}
+
+Future<void> _claimSupportQueueNotice(String ticketId) async {
+  final id = ticketId.trim();
+  if (id.isEmpty) return;
+  final busy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
+  if (busy.contains(id)) return;
+  busy.add(id);
+  _supportQueueClaimBusyNotifier.value = busy;
+  try {
+    await dio.post('/api/support/tickets/$id/claim');
+    _removeSupportQueueNotice(id);
+    showGlobalAppNotice(
+      'Заявка поддержки принята. Теперь этот чат виден только вам.',
+      title: 'Поддержка',
+      tone: AppNoticeTone.success,
+    );
+    chatEventsController.add({
+      'type': 'support:queue:changed',
+      'data': {'ticket_id': id, 'action': 'claimed'},
+    });
+  } on DioException catch (e) {
+    final message = _extractApiErrorMessage(e);
+    showGlobalAppNotice(
+      message.isNotEmpty ? message : 'Не удалось принять заявку',
+      title: 'Поддержка',
+      tone: AppNoticeTone.error,
+    );
+  } catch (_) {
+    showGlobalAppNotice(
+      'Не удалось принять заявку',
+      title: 'Поддержка',
+      tone: AppNoticeTone.error,
+    );
+  } finally {
+    final nextBusy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
+    nextBusy.remove(id);
+    _supportQueueClaimBusyNotifier.value = nextBusy;
+    unawaited(_refreshSupportQueueNotices());
+  }
+}
+
 class _SubscriptionUiPayload {
   final bool blocked;
   final String? blockedTitle;
@@ -1377,6 +1534,19 @@ class _GlobalNoticeHost extends StatelessWidget {
     };
   }
 
+  String _supportCategoryLabel(String raw) {
+    switch (raw.toLowerCase().trim()) {
+      case 'product':
+        return 'Товар';
+      case 'delivery':
+        return 'Доставка';
+      case 'cart':
+        return 'Корзина';
+      default:
+        return 'Общий';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -1486,6 +1656,156 @@ class _GlobalNoticeHost extends StatelessWidget {
                               ),
                             ),
                           ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+        SafeArea(
+          child: Align(
+            alignment: Alignment.topRight,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+              child: ValueListenableBuilder<List<_SupportQueueNoticePayload>>(
+                valueListenable: _supportQueueNoticeNotifier,
+                builder: (context, notices, _) {
+                  if (notices.isEmpty || !_canCurrentUserReceiveSupportQueueAlerts()) {
+                    return const SizedBox.shrink();
+                  }
+                  return ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 380),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        ...notices.take(3).map((notice) {
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 10),
+                            child: ValueListenableBuilder<Set<String>>(
+                              valueListenable: _supportQueueClaimBusyNotifier,
+                              builder: (context, busyIds, _) {
+                                final claimBusy = busyIds.contains(notice.ticketId);
+                                return Material(
+                                  color: theme.colorScheme.surfaceContainerHigh,
+                                  elevation: 10,
+                                  borderRadius: BorderRadius.circular(18),
+                                  child: Container(
+                                    width: 380,
+                                    padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(18),
+                                      border: Border.all(
+                                        color: theme.colorScheme.primary.withValues(alpha: 0.16),
+                                      ),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Container(
+                                              width: 38,
+                                              height: 38,
+                                              decoration: BoxDecoration(
+                                                color: theme.colorScheme.primary.withValues(alpha: 0.12),
+                                                shape: BoxShape.circle,
+                                              ),
+                                              alignment: Alignment.center,
+                                              child: Icon(
+                                                Icons.support_agent_outlined,
+                                                color: theme.colorScheme.primary,
+                                                size: 20,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Expanded(
+                                              child: Column(
+                                                crossAxisAlignment: CrossAxisAlignment.start,
+                                                children: [
+                                                  Text(
+                                                    'Новый вопрос в поддержку',
+                                                    style: theme.textTheme.titleSmall?.copyWith(
+                                                      fontWeight: FontWeight.w800,
+                                                    ),
+                                                  ),
+                                                  Text(
+                                                    'Клиент: ${notice.customerName}',
+                                                    style: theme.textTheme.bodySmall?.copyWith(
+                                                      color: theme.colorScheme.onSurfaceVariant,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 12),
+                                        Text(
+                                          notice.subject,
+                                          style: theme.textTheme.bodyMedium?.copyWith(
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        Wrap(
+                                          spacing: 8,
+                                          runSpacing: 8,
+                                          children: [
+                                            _SupportQueueChip(
+                                              label: _supportCategoryLabel(notice.category),
+                                            ),
+                                            if ((notice.productTitle ?? '').trim().isNotEmpty)
+                                              _SupportQueueChip(
+                                                label: notice.productTitle!.trim(),
+                                              ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 12),
+                                        Align(
+                                          alignment: Alignment.centerRight,
+                                          child: FilledButton.icon(
+                                            onPressed: claimBusy
+                                                ? null
+                                                : () => _claimSupportQueueNotice(notice.ticketId),
+                                            icon: claimBusy
+                                                ? const SizedBox(
+                                                    width: 16,
+                                                    height: 16,
+                                                    child: CircularProgressIndicator(
+                                                      strokeWidth: 2,
+                                                    ),
+                                                  )
+                                                : const Icon(Icons.record_voice_over_outlined),
+                                            label: Text(
+                                              claimBusy ? 'Принимаем...' : 'Принять заявку',
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          );
+                        }),
+                        if (notices.length > 3)
+                          Material(
+                            color: theme.colorScheme.surfaceContainer,
+                            elevation: 4,
+                            borderRadius: BorderRadius.circular(14),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              child: Text(
+                                'Ещё заявок: ${notices.length - 3}',
+                                style: theme.textTheme.labelLarge,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   );
                 },
               ),
@@ -1659,6 +1979,29 @@ class _GlobalNoticeHost extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _SupportQueueChip extends StatelessWidget {
+  final String label;
+
+  const _SupportQueueChip({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Text(
+          label,
+          style: Theme.of(context).textTheme.labelMedium,
+        ),
+      ),
     );
   }
 }
@@ -2076,6 +2419,7 @@ Future<void> _initSocket() async {
 
     socket?.on('connect', (_) {
       debugPrint('✅ Socket connected: ${socket?.id}');
+      unawaited(_refreshSupportQueueNotices());
     });
 
     socket?.on('disconnect', (reason) {
@@ -2186,6 +2530,34 @@ Future<void> _initSocket() async {
     socket?.on('claims:updated', (data) {
       _socketVerboseLog('📬 Socket event claims:updated -> $data');
       chatEventsController.add({'type': 'claims:updated', 'data': data});
+    });
+
+    socket?.on('support:ticket:queued', (data) {
+      _socketVerboseLog('📬 Socket event support:ticket:queued -> $data');
+      chatEventsController.add({'type': 'support:queue:changed', 'data': data});
+      if (!_canCurrentUserReceiveSupportQueueAlerts()) return;
+      final payload = _parseSupportQueueNotice(data);
+      if (payload == null) return;
+      _upsertSupportQueueNotice(payload);
+      showGlobalAppNotice(
+        'Новый вопрос от ${payload.customerName}.',
+        title: 'Поддержка ждёт ответа',
+        tone: AppNoticeTone.warning,
+        duration: const Duration(seconds: 4),
+      );
+      unawaited(playAppSound(AppUiSound.warning));
+    });
+
+    socket?.on('support:ticket:claimed', (data) {
+      _socketVerboseLog('📬 Socket event support:ticket:claimed -> $data');
+      chatEventsController.add({'type': 'support:queue:changed', 'data': data});
+      final map = data is Map ? Map<String, dynamic>.from(data) : null;
+      final ticketId = (map?['ticket_id'] ?? map?['id'] ?? '').toString().trim();
+      if (ticketId.isNotEmpty) {
+        _removeSupportQueueNotice(ticketId);
+      } else {
+        unawaited(_refreshSupportQueueNotices());
+      }
     });
 
     // Global message event (optional)

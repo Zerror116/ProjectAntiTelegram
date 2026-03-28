@@ -67,6 +67,7 @@ class _MainShellState extends State<MainShell> {
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;
       final currentUser = authService.currentUser;
+      unawaited(refreshSupportQueueNotices());
       if (kIsWeb &&
           currentUser != null &&
           _webNotificationPermissionState ==
@@ -89,6 +90,7 @@ class _MainShellState extends State<MainShell> {
       _maybeShowIosAddToHomeHint();
     });
     unawaited(_loadWebNotificationPromptState());
+    unawaited(refreshSupportQueueNotices());
   }
 
   @override
