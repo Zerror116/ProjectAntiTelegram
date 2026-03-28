@@ -8,6 +8,7 @@ const { requireRole } = require("../utils/roles");
 const { emitToTenant } = require("../utils/socket");
 const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
+const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 const {
   encryptMessageText,
   decryptMessageRow,
@@ -21,6 +22,7 @@ const TICKET_STATUSES = new Set([
 ]);
 
 const STAFF_ROLES = new Set(["worker", "admin", "tenant", "creator"]);
+const SUPPORT_CATEGORIES = new Set(["general", "product", "delivery", "cart"]);
 
 const supportAskRateGuard = createRateGuard({
   windowMs: 60 * 1000,
@@ -103,6 +105,53 @@ function inferSupportCategory(message) {
     return "cart";
   }
   return "general";
+}
+
+function normalizeSupportCategory(raw, fallback = "general") {
+  const normalized = String(raw || "")
+    .toLowerCase()
+    .trim();
+  if (SUPPORT_CATEGORIES.has(normalized)) return normalized;
+  return fallback;
+}
+
+function buildSupportSubject(category, productTitle = "") {
+  const safeProductTitle = normalizeText(productTitle);
+  if (category === "product") {
+    return safeProductTitle ? `Вопрос по товару: ${safeProductTitle}` : "Вопрос по товару";
+  }
+  if (category === "delivery") return "Вопрос по доставке";
+  if (category === "cart") return "Вопрос по корзине";
+  return "Общий вопрос";
+}
+
+async function ensureSupportStaffAccess(req, res, next) {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+
+    const role = normalizeRole(req.user.role);
+    if (role === "admin" || role === "tenant") {
+      return next();
+    }
+
+    if (role === "worker") {
+      const resolved = await resolvePermissionSet(req.user, db);
+      if (hasPermission(resolved.permissions, "chat.write.support")) {
+        req.permissionSet = resolved;
+        return next();
+      }
+    }
+
+    return res.status(403).json({
+      ok: false,
+      error: "Недостаточно прав",
+    });
+  } catch (err) {
+    console.error("support.staff_access error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
 }
 
 function parseTicketStatuses(rawStatuses) {
@@ -263,67 +312,59 @@ async function resolveProductCandidate(client, { tenantId = null, messageText })
   return productRes.rows[0];
 }
 
-async function resolveAssignee(
-  client,
-  {
-    tenantId = null,
-    preferredUserId = null,
-    preferWorker = false,
-  },
-) {
-  if (preferredUserId) {
-    const preferred = await client.query(
-      `SELECT id, role, name, email
-       FROM users
-       WHERE id = $1
-         AND is_active = true
-         AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
-       LIMIT 1`,
-      [preferredUserId, tenantId || null],
-    );
-    if (preferred.rowCount > 0 && isStaffRole(preferred.rows[0].role)) {
-      return preferred.rows[0];
-    }
-  }
+async function resolveSupportProductById(client, { tenantId = null, productId = null }) {
+  const normalizedProductId = String(productId || "").trim();
+  if (!normalizedProductId) return null;
 
-  const roleOrder = preferWorker
-    ? ["worker", "admin", "tenant", "creator"]
-    : ["admin", "tenant", "creator", "worker"];
+  const productRes = await client.query(
+    `SELECT p.id,
+            p.title,
+            p.created_by,
+            p.price,
+            p.image_url
+     FROM products p
+     WHERE p.id = $1
+       AND EXISTS (
+         SELECT 1
+         FROM product_publication_queue q
+         JOIN chats c ON c.id = q.channel_id
+         WHERE q.product_id = p.id
+           AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+       )
+     LIMIT 1`,
+    [normalizedProductId, tenantId || null],
+  );
 
-  for (const role of roleOrder) {
-    const result = await client.query(
-      `SELECT id, role, name, email
-       FROM users
-       WHERE role = $1
-         AND is_active = true
-         AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
-       ORDER BY updated_at DESC NULLS LAST, created_at ASC
-       LIMIT 1`,
-      [role, tenantId || null],
-    );
-    if (result.rowCount > 0) return result.rows[0];
-  }
-
-  return null;
+  if (productRes.rowCount === 0) return null;
+  return productRes.rows[0];
 }
 
-async function openOrReuseSupportTicket(client, user, messageText) {
+async function openOrReuseSupportTicket(
+  client,
+  user,
+  messageText,
+  { explicitCategory = null, explicitProductId = null } = {},
+) {
   const tenantId = user.tenant_id || null;
-  const category = inferSupportCategory(messageText);
+  const category = normalizeSupportCategory(
+    explicitCategory,
+    inferSupportCategory(messageText),
+  );
 
   let product = null;
   if (category === "product") {
-    product = await resolveProductCandidate(client, {
-      tenantId,
-      messageText,
-    });
+    product =
+      (await resolveSupportProductById(client, {
+        tenantId,
+        productId: explicitProductId,
+      })) ||
+      (await resolveProductCandidate(client, {
+        tenantId,
+        messageText,
+      }));
   }
 
-  const assignee = await resolveAssignee(client, {
-    tenantId,
-    preferredUserId: product?.created_by || null,
-    preferWorker: category === "product",
-  });
+  const subject = buildSupportSubject(category, product?.title || "");
 
   const existingRes = await client.query(
     `SELECT st.*,
@@ -334,12 +375,17 @@ async function openOrReuseSupportTicket(client, user, messageText) {
      JOIN chats c ON c.id = st.chat_id
      WHERE st.customer_id = $1
        AND st.category = $2
+       AND (
+         $4::uuid IS NULL
+         OR st.product_id = $4::uuid
+         OR st.product_id IS NULL
+       )
        AND st.status IN ('open', 'waiting_customer', 'resolved')
        AND ($3::uuid IS NULL OR st.tenant_id = $3::uuid)
      ORDER BY st.updated_at DESC
      LIMIT 1
      FOR UPDATE`,
-    [user.id, category, tenantId],
+    [user.id, category, tenantId, product?.id || null],
   );
 
   let chatId;
@@ -357,9 +403,8 @@ async function openOrReuseSupportTicket(client, user, messageText) {
 
     await client.query(
       `UPDATE support_tickets
-       SET assignee_id = COALESCE($1::uuid, assignee_id),
-           assigned_role = COALESCE($2, assigned_role),
-           product_id = COALESCE($3::uuid, product_id),
+       SET product_id = COALESCE($1::uuid, product_id),
+           subject = COALESCE(NULLIF($2, ''), subject),
            status = 'open',
            archived_at = NULL,
            archive_reason = NULL,
@@ -367,13 +412,8 @@ async function openOrReuseSupportTicket(client, user, messageText) {
            resolved_by = NULL,
            last_customer_message_at = now(),
            updated_at = now()
-       WHERE id = $4`,
-      [
-        assignee?.id || null,
-        normalizeRole(assignee?.role || "") || null,
-        product?.id || null,
-        ticketId,
-      ],
+       WHERE id = $3`,
+      [product?.id || null, subject, ticketId],
     );
 
     await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [chatId]);
@@ -404,14 +444,7 @@ async function openOrReuseSupportTicket(client, user, messageText) {
       [chatId, "Поддержка", user.id, tenantId, JSON.stringify(settings)],
     );
 
-    ticketSubject =
-      category === "product"
-        ? "Вопрос по товару"
-        : category === "delivery"
-        ? "Вопрос по доставке"
-        : category === "cart"
-        ? "Вопрос по корзине"
-        : "Общий вопрос";
+    ticketSubject = subject;
 
     await client.query(
       `INSERT INTO support_tickets (
@@ -419,8 +452,6 @@ async function openOrReuseSupportTicket(client, user, messageText) {
         tenant_id,
         chat_id,
         customer_id,
-        assignee_id,
-        assigned_role,
         category,
         subject,
         product_id,
@@ -437,8 +468,6 @@ async function openOrReuseSupportTicket(client, user, messageText) {
         $5,
         $6,
         $7,
-        $8,
-        $9,
         'open',
         now(),
         now(),
@@ -449,8 +478,6 @@ async function openOrReuseSupportTicket(client, user, messageText) {
         tenantId,
         chatId,
         user.id,
-        assignee?.id || null,
-        normalizeRole(assignee?.role || "admin") || "admin",
         category,
         ticketSubject,
         product?.id || null,
@@ -465,7 +492,10 @@ async function openOrReuseSupportTicket(client, user, messageText) {
   await ensureSupportMembers(client, {
     chatId,
     customerId: user.id,
-    assigneeId: assignee?.id || null,
+    assigneeId:
+      existingRes.rowCount > 0
+        ? existingRes.rows[0]?.assignee_id || null
+        : null,
     tenantId,
   });
 
@@ -510,10 +540,8 @@ async function openOrReuseSupportTicket(client, user, messageText) {
 
   let introMessage = null;
   if (createdTicket && !autoReplyMessage) {
-    const assigneeName = normalizeText(assignee?.name || assignee?.email || "");
-    const intro = assigneeName
-      ? `Ваш вопрос принят. Ответственный: ${assigneeName}.`
-      : "Ваш вопрос принят. Ответим в этом чате.";
+    const intro =
+      "Ваш вопрос принят. Как только администратор возьмёт его в работу, ответ придёт в этот чат.";
     introMessage = await insertSupportMessage(client, {
       chatId,
       senderId: null,
@@ -552,7 +580,6 @@ async function openOrReuseSupportTicket(client, user, messageText) {
     ticket: ticketRes.rowCount > 0 ? ticketRes.rows[0] : null,
     chat: chatRecord,
     category,
-    assignee,
     createdChat,
     createdTicket,
     customerMessage,
@@ -708,12 +735,17 @@ async function ensureAdminCreatorMembers(client, chatId, tenantId = null) {
 
 router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
   const message = normalizeText(req.body?.message);
+  const requestedCategory = normalizeSupportCategory(
+    req.body?.category,
+    inferSupportCategory(message),
+  );
+  const requestedProductId = normalizeText(req.body?.product_id);
   if (!message) {
     return res.status(400).json({ ok: false, error: "Введите вопрос" });
   }
 
   try {
-    if (isCartSummaryQuestion(message)) {
+    if (requestedCategory === "cart" && isCartSummaryQuestion(message)) {
       const sums = await computeCartSummary(req.user.id);
       return res.json({
         ok: true,
@@ -730,11 +762,37 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
       });
     }
 
+    const autoReply = await buildSupportTemplateAutoReply(db, {
+      tenantId: req.user.tenant_id || null,
+      category: requestedCategory,
+      customerId: req.user.id,
+      subject: buildSupportSubject(requestedCategory),
+      messageText: message,
+    });
+    if (autoReply?.text) {
+      return res.json({
+        ok: true,
+        data: {
+          mode: "quick_reply",
+          reply: autoReply.text,
+          source: "template_auto_reply",
+          template: {
+            id: autoReply.template.id,
+            title: autoReply.template.title,
+            category: autoReply.template.category,
+          },
+        },
+      });
+    }
+
     const client = await db.pool.connect();
     let result;
     try {
       await client.query("BEGIN");
-      result = await openOrReuseSupportTicket(client, req.user, message);
+      result = await openOrReuseSupportTicket(client, req.user, message, {
+        explicitCategory: requestedCategory,
+        explicitProductId: requestedProductId || null,
+      });
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -788,11 +846,8 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
       });
     }
 
-    const assigneeName = normalizeText(
-      result.ticket?.assignee_name || result.assignee?.name || result.assignee?.email || "",
-    );
     const productHint =
-      result.category === "product"
+      requestedCategory === "product"
         ? " Для ускорения приложите в чат фото товара и его название."
         : "";
 
@@ -800,9 +855,9 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
       ok: true,
       data: {
         mode: "ticket",
-        reply: assigneeName
-          ? `Вопрос передан в поддержку. Ответственный: ${assigneeName}.${productHint}`
-          : `Вопрос передан в поддержку. Ответ придёт в отдельный чат.${productHint}`,
+        reply:
+          "Вопрос отправлен в поддержку. Как только администратор возьмёт его в работу, ответ появится в отдельном чате." +
+          productHint,
         chat_id: result.chat?.id || result.ticket?.chat_id,
         chat_title: result.chat?.title || "Поддержка",
         ticket: result.ticket,
@@ -817,6 +872,18 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
 router.get("/tickets", authMiddleware, async (req, res) => {
   try {
     const role = normalizeRole(req.user.role);
+    if (role === "creator") {
+      return res.json({ ok: true, data: [] });
+    }
+    if (role !== "client" && role !== "admin" && role !== "tenant" && role !== "worker") {
+      return res.status(403).json({ ok: false, error: "Недостаточно прав" });
+    }
+    if (role === "worker") {
+      const resolved = await resolvePermissionSet(req.user, db);
+      if (!hasPermission(resolved.permissions, "chat.write.support")) {
+        return res.status(403).json({ ok: false, error: "Недостаточно прав" });
+      }
+    }
     const includeArchived = String(req.query.include_archived || "") === "1";
     const statuses = parseTicketStatuses(req.query.status);
 
@@ -852,6 +919,7 @@ router.get("/tickets", authMiddleware, async (req, res) => {
               st.updated_at,
               st.resolved_at,
               st.archived_at,
+              p.title AS product_title,
               c.title AS chat_title,
               c.type AS chat_type,
               c.settings AS chat_settings,
@@ -861,6 +929,7 @@ router.get("/tickets", authMiddleware, async (req, res) => {
               au.email AS assignee_email
        FROM support_tickets st
        JOIN chats c ON c.id = st.chat_id
+       LEFT JOIN products p ON p.id = st.product_id
        LEFT JOIN users cu ON cu.id = st.customer_id
        LEFT JOIN users au ON au.id = st.assignee_id
        WHERE st.status = ANY($1::text[])
@@ -886,6 +955,193 @@ router.get("/tickets", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("support.tickets.list error", err);
     return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.get("/tickets/queue", authMiddleware, async (req, res) => {
+  try {
+    const role = normalizeRole(req.user.role);
+    if (role === "creator") {
+      return res.json({ ok: true, data: [] });
+    }
+    if (role !== "admin" && role !== "tenant" && role !== "worker") {
+      return res.status(403).json({ ok: false, error: "Недостаточно прав" });
+    }
+    if (role === "worker") {
+      const resolved = await resolvePermissionSet(req.user, db);
+      if (!hasPermission(resolved.permissions, "chat.write.support")) {
+        return res.status(403).json({ ok: false, error: "Недостаточно прав" });
+      }
+    }
+
+    const list = await db.query(
+      `SELECT st.id,
+              st.chat_id,
+              st.customer_id,
+              st.assignee_id,
+              st.assigned_role,
+              st.category,
+              st.subject,
+              st.product_id,
+              st.status,
+              st.created_at,
+              st.updated_at,
+              p.title AS product_title,
+              c.title AS chat_title,
+              c.type AS chat_type,
+              c.settings AS chat_settings,
+              COALESCE(NULLIF(BTRIM(cu.name), ''), NULLIF(BTRIM(cu.email), ''), 'Клиент') AS customer_name,
+              cu.email AS customer_email
+       FROM support_tickets st
+       JOIN chats c ON c.id = st.chat_id
+       LEFT JOIN products p ON p.id = st.product_id
+       LEFT JOIN users cu ON cu.id = st.customer_id
+       WHERE st.assignee_id IS NULL
+         AND st.status = 'open'
+         AND ($1::uuid IS NULL OR st.tenant_id = $1::uuid)
+       ORDER BY st.updated_at DESC, st.created_at DESC
+       LIMIT 300`,
+      [req.user.tenant_id || null],
+    );
+
+    return res.json({ ok: true, data: list.rows });
+  } catch (err) {
+    console.error("support.tickets.queue error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.get("/products/search", authMiddleware, async (req, res) => {
+  try {
+    const q = normalizeText(req.query.q);
+    if (!q) {
+      return res.json({ ok: true, data: [] });
+    }
+
+    const result = await db.query(
+      `WITH ranked AS (
+         SELECT p.id,
+                p.product_code,
+                p.shelf_number,
+                p.title,
+                p.description,
+                p.price,
+                p.quantity,
+                p.image_url,
+                p.status,
+                p.created_at,
+                p.updated_at,
+                ROW_NUMBER() OVER (
+                  PARTITION BY LOWER(TRIM(p.title))
+                  ORDER BY p.created_at DESC, p.updated_at DESC
+                ) AS title_rank
+         FROM products p
+         WHERE (p.title ILIKE $1 OR p.description ILIKE $1)
+           AND EXISTS (
+             SELECT 1
+             FROM product_publication_queue q
+             JOIN chats c ON c.id = q.channel_id
+             WHERE q.product_id = p.id
+               AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+           )
+       )
+       SELECT id,
+              product_code,
+              shelf_number,
+              title,
+              description,
+              price,
+              quantity,
+              image_url,
+              status,
+              created_at,
+              updated_at
+       FROM ranked
+       WHERE title_rank <= 2
+       ORDER BY created_at DESC, updated_at DESC
+       LIMIT 20`,
+      [`%${q}%`, req.user.tenant_id || null],
+    );
+
+    return res.json({ ok: true, data: result.rows });
+  } catch (err) {
+    console.error("support.products.search error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.post("/tickets/:ticketId/claim", authMiddleware, ensureSupportStaffAccess, async (req, res) => {
+  const ticketId = normalizeText(req.params.ticketId);
+  if (!ticketId) {
+    return res.status(400).json({ ok: false, error: "ticketId обязателен" });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const ticketRes = await client.query(
+      `SELECT st.*,
+              c.settings AS chat_settings
+       FROM support_tickets st
+       JOIN chats c ON c.id = st.chat_id
+       WHERE st.id = $1
+         AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
+       LIMIT 1
+       FOR UPDATE`,
+      [ticketId, req.user.tenant_id || null],
+    );
+
+    if (ticketRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Тикет не найден" });
+    }
+
+    const ticket = ticketRes.rows[0];
+    if (ticket.status === "archived") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "Тикет уже в архиве" });
+    }
+    if (ticket.assignee_id && String(ticket.assignee_id) !== String(req.user.id)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "Тикет уже взят в работу" });
+    }
+
+    await client.query(
+      `UPDATE support_tickets
+       SET assignee_id = $1,
+           assigned_role = $2,
+           archived_at = NULL,
+           archive_reason = NULL,
+           status = CASE WHEN status = 'archived' THEN 'open' ELSE status END,
+           updated_at = now()
+       WHERE id = $3`,
+      [req.user.id, normalizeRole(req.user.role) || "admin", ticket.id],
+    );
+
+    await ensureSupportMembers(client, {
+      chatId: ticket.chat_id,
+      customerId: ticket.customer_id,
+      assigneeId: req.user.id,
+      tenantId: req.user.tenant_id || null,
+    });
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      data: {
+        ticket_id: ticket.id,
+        chat_id: ticket.chat_id,
+        assignee_id: req.user.id,
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("support.ticket.claim error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  } finally {
+    client.release();
   }
 });
 
@@ -1021,7 +1277,7 @@ router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
 router.post(
   "/tickets/:ticketId/archive",
   authMiddleware,
-  requireRole("admin", "creator"),
+  ensureSupportStaffAccess,
   async (req, res) => {
     const ticketId = normalizeText(req.params.ticketId);
     const reason = normalizeText(req.body?.reason || "admin_archive");
@@ -1047,24 +1303,33 @@ router.post(
       }
 
       const ticket = ticketRes.rows[0];
+      if (String(ticket.assignee_id || "") !== String(req.user.id || "")) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          error: "Закончить чат может только назначенный администратор",
+        });
+      }
       await client.query(
         `UPDATE support_tickets
          SET status = 'archived',
              archive_reason = $1,
              archived_at = now(),
+             resolved_by = $3::uuid,
+             resolved_at = now(),
              updated_at = now()
          WHERE id = $2`,
-        [reason || "admin_archive", ticket.id],
+        [reason || "assignee_finished", ticket.id, req.user.id || null],
       );
 
       const statusMessage = await insertSupportMessage(client, {
         chatId: ticket.chat_id,
         senderId: null,
-        text: "Диалог перенесён в архив поддержки.",
+        text: "Диалог завершён и перенесён в архив поддержки.",
         meta: {
           kind: "support_ticket_archived",
           support_ticket_id: ticket.id,
-          archive_reason: reason || "admin_archive",
+          archive_reason: reason || "assignee_finished",
         },
       });
 

@@ -161,6 +161,7 @@ class _AdminPanelState extends State<AdminPanel>
   List<Map<String, dynamic>> _lastPublished = [];
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
   List<Map<String, dynamic>> _deliveryBatches = [];
+  List<Map<String, dynamic>> _supportPendingTickets = [];
   List<Map<String, dynamic>> _supportActiveTickets = [];
   List<Map<String, dynamic>> _supportArchivedTickets = [];
   List<Map<String, dynamic>> _supportTemplates = [];
@@ -193,6 +194,8 @@ class _AdminPanelState extends State<AdminPanel>
   String _lastInviteLink = '';
   final Map<String, String> _ticketTemplateById = {};
   final Map<String, String> _roleSelectionByUserId = {};
+  final Set<String> _supportClaimBusyTicketIds = <String>{};
+  final Set<String> _supportFinishBusyTicketIds = <String>{};
   Timer? _supportDraftSaveTimer;
   Timer? _clientCartUndoTimer;
   Future<void> Function()? _clientCartPendingCommit;
@@ -3431,6 +3434,12 @@ class _AdminPanelState extends State<AdminPanel>
       _supportLoading = true;
     }
     try {
+      Response<dynamic>? queueResp;
+      try {
+        queueResp = await authService.dio.get('/api/support/tickets/queue');
+      } on DioException catch (e) {
+        if (e.response?.statusCode != 403) rethrow;
+      }
       final activeResp = await authService.dio.get(
         '/api/support/tickets',
         queryParameters: {'status': 'open,waiting_customer,resolved'},
@@ -3440,10 +3449,17 @@ class _AdminPanelState extends State<AdminPanel>
         queryParameters: {'status': 'archived', 'include_archived': 1},
       );
 
+      final queueData = queueResp?.data;
       final activeData = activeResp.data;
       final archivedData = archivedResp.data;
       if (!mounted) return;
       setState(() {
+        _supportPendingTickets =
+            queueData is Map &&
+                queueData['ok'] == true &&
+                queueData['data'] is List
+            ? List<Map<String, dynamic>>.from(queueData['data'])
+            : [];
         _supportActiveTickets =
             activeData is Map &&
                 activeData['ok'] == true &&
@@ -3572,22 +3588,67 @@ class _AdminPanelState extends State<AdminPanel>
     }
   }
 
+  Future<void> _claimSupportTicket(Map<String, dynamic> ticket) async {
+    final ticketId = (ticket['id'] ?? '').toString().trim();
+    if (ticketId.isEmpty) return;
+    if (_supportClaimBusyTicketIds.contains(ticketId)) return;
+    setState(() {
+      _supportClaimBusyTicketIds.add(ticketId);
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post('/api/support/tickets/$ticketId/claim');
+      final data = resp.data;
+      await _loadSupportTickets(silent: true);
+      await _loadSupportNotificationCenter(silent: true);
+      if (!mounted) return;
+      setState(() => _message = 'Вопрос взят в работу');
+
+      final chatId = data is Map &&
+              data['ok'] == true &&
+              data['data'] is Map
+          ? ((data['data']['chat_id'] ?? '').toString().trim())
+          : '';
+      if (chatId.isNotEmpty) {
+        var updatedTicket = ticket;
+        for (final item in _supportActiveTickets) {
+          if ((item['id'] ?? '').toString().trim() == ticketId) {
+            updatedTicket = item;
+            break;
+          }
+        }
+        await _openSupportChat(updatedTicket);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка назначения: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) {
+        setState(() => _supportClaimBusyTicketIds.remove(ticketId));
+      } else {
+        _supportClaimBusyTicketIds.remove(ticketId);
+      }
+    }
+  }
+
   Future<void> _archiveSupportTicket(Map<String, dynamic> ticket) async {
     final ticketId = (ticket['id'] ?? '').toString().trim();
     if (ticketId.isEmpty) return;
+    if (_supportFinishBusyTicketIds.contains(ticketId)) return;
     setState(() {
       _supportArchiveBusy = true;
+      _supportFinishBusyTicketIds.add(ticketId);
       _message = '';
     });
     try {
       await authService.dio.post(
         '/api/support/tickets/$ticketId/archive',
-        data: {'reason': 'admin_archive'},
+        data: {'reason': 'assignee_finished'},
       );
       await _loadSupportTickets(silent: true);
       await _loadSupportNotificationCenter(silent: true);
       if (!mounted) return;
-      setState(() => _message = 'Тикет перенесён в архив');
+      setState(() => _message = 'Чат завершён и отправлен в архив');
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -3595,9 +3656,13 @@ class _AdminPanelState extends State<AdminPanel>
       });
     } finally {
       if (mounted) {
-        setState(() => _supportArchiveBusy = false);
+        setState(() {
+          _supportArchiveBusy = false;
+          _supportFinishBusyTicketIds.remove(ticketId);
+        });
       } else {
         _supportArchiveBusy = false;
+        _supportFinishBusyTicketIds.remove(ticketId);
       }
     }
   }
@@ -7082,6 +7147,7 @@ class _AdminPanelState extends State<AdminPanel>
   Widget _buildSupportTicketCard(
     Map<String, dynamic> ticket, {
     required bool archived,
+    bool pending = false,
   }) {
     final theme = Theme.of(context);
     final ticketId = (ticket['id'] ?? '').toString().trim();
@@ -7094,6 +7160,10 @@ class _AdminPanelState extends State<AdminPanel>
     final subject = (ticket['subject'] ?? '').toString().trim();
     final updatedAt = _formatDateTimeLabel(ticket['updated_at']);
     final archiveReason = (ticket['archive_reason'] ?? '').toString().trim();
+    final productTitle = (ticket['product_title'] ?? '').toString().trim();
+    final claimBusy = _supportClaimBusyTicketIds.contains(ticketId);
+    final finishBusy = _supportFinishBusyTicketIds.contains(ticketId);
+    final isTemplateEnabled = !archived && !pending && _supportTemplates.isNotEmpty;
 
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
@@ -7119,7 +7189,8 @@ class _AdminPanelState extends State<AdminPanel>
             const SizedBox(height: 8),
             Text('Категория: $category'),
             Text('Клиент: $customer'),
-            Text('Ответственный: $assignee'),
+            Text('Ответственный: ${pending ? 'Свободный' : assignee}'),
+            if (productTitle.isNotEmpty) Text('Товар: $productTitle'),
             if (updatedAt.isNotEmpty) Text('Обновлён: $updatedAt'),
             if (archiveReason.isNotEmpty)
               Text('Причина архива: $archiveReason'),
@@ -7128,26 +7199,37 @@ class _AdminPanelState extends State<AdminPanel>
               spacing: 8,
               runSpacing: 8,
               children: [
-                FilledButton.tonalIcon(
-                  onPressed: () => _openSupportChat(ticket),
-                  icon: const Icon(Icons.forum_outlined),
-                  label: const Text('Открыть чат'),
-                ),
-                if (!archived)
+                if (pending)
+                  FilledButton.icon(
+                    onPressed: claimBusy ? null : () => _claimSupportTicket(ticket),
+                    icon: const Icon(Icons.record_voice_over_outlined),
+                    label: Text(
+                      claimBusy ? 'Назначаем...' : 'Ответить на вопрос',
+                    ),
+                  )
+                else
+                  FilledButton.tonalIcon(
+                    onPressed: () => _openSupportChat(ticket),
+                    icon: const Icon(Icons.forum_outlined),
+                    label: const Text('Открыть чат'),
+                  ),
+                if (!archived && !pending)
                   OutlinedButton.icon(
-                    onPressed: _supportArchiveBusy
+                    onPressed: finishBusy || _supportArchiveBusy
                         ? null
                         : () => _archiveSupportTicket(ticket),
                     icon: const Icon(Icons.archive_outlined),
                     label: Text(
-                      _supportArchiveBusy ? 'Сохранение...' : 'В архив',
+                      finishBusy || _supportArchiveBusy
+                          ? 'Завершаем...'
+                          : 'Закончить чат',
                     ),
                   ),
                 if (ticketId.isNotEmpty)
                   _buildModerationChip('ID ${ticketId.substring(0, 8)}'),
               ],
             ),
-            if (!archived && _supportTemplates.isNotEmpty) ...[
+            if (isTemplateEnabled) ...[
               const SizedBox(height: 10),
               DropdownButtonFormField<String>(
                 key: ValueKey<String>('ticket-template-$ticketId'),
@@ -7806,7 +7888,30 @@ class _AdminPanelState extends State<AdminPanel>
             }),
           const SizedBox(height: 12),
           Text(
-            'Активные тикеты',
+            'Запросы на ответ',
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          if (_supportPendingTickets.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(14),
+                child: Text('Свободных запросов сейчас нет'),
+              ),
+            )
+          else
+            ..._supportPendingTickets.map(
+              (ticket) => _buildSupportTicketCard(
+                ticket,
+                archived: false,
+                pending: true,
+              ),
+            ),
+          const SizedBox(height: 16),
+          Text(
+            'Мои активные чаты поддержки',
             style: Theme.of(
               context,
             ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
@@ -7816,7 +7921,7 @@ class _AdminPanelState extends State<AdminPanel>
             const Card(
               child: Padding(
                 padding: EdgeInsets.all(14),
-                child: Text('Активных тикетов пока нет'),
+                child: Text('У вас нет активных чатов поддержки'),
               ),
             )
           else

@@ -1175,6 +1175,9 @@ async function syncSupportTicketOnMessage({
     const senderIdText = String(senderId || "").trim();
     const senderRoleNormalized = normalizeRole(senderRole);
     const senderIsCustomer = String(ticket.customer_id || "") === senderIdText;
+    const senderIsAssignee =
+      senderIdText.length > 0 &&
+      String(ticket.assignee_id || "").trim() === senderIdText;
     let promptMessageId = null;
     let autoReplyMessageId = null;
 
@@ -1244,9 +1247,10 @@ async function syncSupportTicketOnMessage({
         autoReplyMessageId = inserted.rows[0]?.id || null;
       }
     } else if (isStaffRole(senderRoleNormalized)) {
-      const shouldPrompt =
-        String(ticket.status || "").toLowerCase().trim() !==
-        "waiting_customer";
+      if (ticket.assignee_id && !senderIsAssignee) {
+        await client.query("COMMIT");
+        return { promptMessageId: null, autoReplyMessageId: null };
+      }
 
       await client.query(
         `UPDATE support_tickets
@@ -1269,24 +1273,6 @@ async function syncSupportTicketOnMessage({
           ticket.id,
         ],
       );
-
-      if (shouldPrompt) {
-        const promptText =
-          "Поддержка ответила на ваш вопрос. Решили проблему?";
-        const promptMeta = {
-          kind: "support_feedback_prompt",
-          support_ticket_id: ticket.id,
-          feedback_status: "pending",
-        };
-        const encryptedText = encryptMessageText(promptText);
-        const inserted = await client.query(
-          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-           VALUES ($1, $2, NULL, $3, $4::jsonb, now())
-           RETURNING id`,
-          [uuidv4(), chatId, encryptedText, JSON.stringify(promptMeta)],
-        );
-        promptMessageId = inserted.rows[0]?.id || null;
-      }
     }
 
     await client.query("COMMIT");

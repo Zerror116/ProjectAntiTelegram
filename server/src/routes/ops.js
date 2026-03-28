@@ -1748,7 +1748,7 @@ router.patch('/support/templates/:id', requireAuth, requireRole('admin', 'creato
 router.post(
   '/support/tickets/:ticketId/quick-reply',
   requireAuth,
-  requireRole('worker', 'admin', 'creator'),
+  requireRole('worker', 'admin', 'tenant'),
   requireSupportWritePermission,
   async (req, res) => {
   const ticketId = String(req.params?.ticketId || '').trim();
@@ -1826,10 +1826,12 @@ router.post(
       customer_name: ticketMetaQ.rows[0]?.customer_name || 'Клиент',
       delivery_status: ticketMetaQ.rows[0]?.delivery_status || null,
     };
-    const role = normalizeRole(req.user?.role);
-    if (role === 'worker' && String(ticket.assignee_id || '') !== String(req.user?.id || '')) {
+    if (String(ticket.assignee_id || '') !== String(req.user?.id || '')) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ ok: false, error: 'Работник может отвечать только на свои тикеты' });
+      return res.status(403).json({
+        ok: false,
+        error: 'Отправлять шаблон может только назначенный администратор',
+      });
     }
 
     const templateQ = await client.query(
