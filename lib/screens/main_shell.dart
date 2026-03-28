@@ -65,6 +65,13 @@ class _MainShellState extends State<MainShell> {
     super.initState();
     if (_isAndroidWeb()) return;
     _lastEffectiveRole = authService.effectiveRole;
+    final initialIds = _destinationIdsForRole(_lastEffectiveRole);
+    if (initialIds.isNotEmpty) {
+      activeShellSectionNotifier.value = initialIds[_index.clamp(
+        0,
+        initialIds.length - 1,
+      )];
+    }
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;
       final currentUser = authService.currentUser;
@@ -82,6 +89,13 @@ class _MainShellState extends State<MainShell> {
           _lastEffectiveRole = nextRole;
           _index = nextIndex;
           _activatedDestinations.clear();
+          final nextIds = _destinationIdsForRole(nextRole);
+          if (nextIds.isNotEmpty) {
+            activeShellSectionNotifier.value = nextIds[_index.clamp(
+              0,
+              nextIds.length - 1,
+            )];
+          }
         }
       });
     });
@@ -102,6 +116,7 @@ class _MainShellState extends State<MainShell> {
   void dispose() {
     _authSub?.cancel();
     _supportQueueRefreshTimer?.cancel();
+    activeShellSectionNotifier.value = '';
     super.dispose();
   }
 
@@ -574,6 +589,7 @@ class _MainShellState extends State<MainShell> {
       _index = nextIndex;
       _activatedDestinations.add(allDestinations[nextIndex].id);
     });
+    activeShellSectionNotifier.value = allDestinations[nextIndex].id;
     if (allDestinations[nextIndex].id == 'chats') {
       unawaited(refreshSupportQueueNotices());
     }
@@ -800,6 +816,7 @@ class _MainShellState extends State<MainShell> {
                 _index = nextIndex;
                 _activatedDestinations.add(destinations[nextIndex].id);
               });
+              activeShellSectionNotifier.value = destinations[nextIndex].id;
               if (destinations[nextIndex].id == 'chats') {
                 unawaited(refreshSupportQueueNotices());
               }

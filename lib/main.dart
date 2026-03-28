@@ -383,6 +383,7 @@ class _SupportQueueNoticePayload {
   final String? productTitle;
   final String status;
   final bool claimable;
+  final bool closable;
 
   const _SupportQueueNoticePayload({
     required this.ticketId,
@@ -393,6 +394,7 @@ class _SupportQueueNoticePayload {
     required this.productTitle,
     required this.status,
     required this.claimable,
+    required this.closable,
   });
 }
 
@@ -400,6 +402,9 @@ final ValueNotifier<List<_SupportQueueNoticePayload>> _supportQueueNoticeNotifie
     ValueNotifier<List<_SupportQueueNoticePayload>>(const []);
 final ValueNotifier<Set<String>> _supportQueueClaimBusyNotifier =
     ValueNotifier<Set<String>>(<String>{});
+final ValueNotifier<String> activeShellSectionNotifier = ValueNotifier<String>(
+  '',
+);
 
 bool _canCurrentUserObserveSupportQueueAlerts() {
   final user = authService.currentUser;
@@ -452,6 +457,7 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
     productTitle: productTitle.isEmpty ? null : productTitle,
     status: status.isEmpty ? 'open' : status,
     claimable: claimable,
+    closable: false,
   );
 }
 
@@ -475,6 +481,32 @@ _SupportQueueNoticePayload? _parseSupportCenterNotice(dynamic raw) {
     productTitle: null,
     status: status,
     claimable: false,
+    closable: false,
+  );
+}
+
+_SupportQueueNoticePayload? _parseAssignedSupportNotice(dynamic raw) {
+  if (raw is! Map) return null;
+  final map = Map<String, dynamic>.from(raw);
+  final ticketId = (map['id'] ?? '').toString().trim();
+  if (ticketId.isEmpty) return null;
+  final status = (map['status'] ?? '').toString().trim().toLowerCase();
+  if (status.isEmpty || status == 'archived') return null;
+  final subject = (map['subject'] ?? 'Вопрос в поддержку').toString().trim();
+  final category = (map['category'] ?? 'general').toString().trim();
+  final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
+  final productTitle = (map['product_title'] ?? '').toString().trim();
+  final chatId = (map['chat_id'] ?? '').toString().trim();
+  return _SupportQueueNoticePayload(
+    ticketId: ticketId,
+    chatId: chatId.isEmpty ? null : chatId,
+    subject: subject.isEmpty ? 'Вопрос в поддержку' : subject,
+    category: category.isEmpty ? 'general' : category,
+    customerName: customerName.isEmpty ? 'Клиент' : customerName,
+    productTitle: productTitle.isEmpty ? null : productTitle,
+    status: status,
+    claimable: false,
+    closable: true,
   );
 }
 
@@ -560,8 +592,32 @@ Future<void> _refreshSupportQueueNotices() async {
       }
     }
 
+    if (_canCurrentUserClaimSupportQueueAlerts()) {
+      final activeResp = await dio.get(
+        '/api/support/tickets',
+        queryParameters: {'status': 'open,waiting_customer,resolved'},
+      );
+      final activeData = activeResp.data;
+      final activeRows =
+          activeData is Map &&
+              activeData['ok'] == true &&
+              activeData['data'] is List
+          ? List<dynamic>.from(activeData['data'])
+          : const <dynamic>[];
+      for (final row in activeRows) {
+        final parsed = _parseAssignedSupportNotice(row);
+        if (parsed != null) {
+          nextById[parsed.ticketId] = parsed;
+        }
+      }
+    }
+
     final next = nextById.values.toList(growable: false)
       ..sort((a, b) {
+        final closableOrder = (b.closable ? 1 : 0).compareTo(
+          a.closable ? 1 : 0,
+        );
+        if (closableOrder != 0) return closableOrder;
         final claimableOrder = (b.claimable ? 1 : 0).compareTo(
           a.claimable ? 1 : 0,
         );
@@ -618,6 +674,46 @@ Future<void> _claimSupportQueueNotice(String ticketId) async {
   } catch (_) {
     showGlobalAppNotice(
       'Не удалось принять заявку',
+      title: 'Поддержка',
+      tone: AppNoticeTone.error,
+    );
+  } finally {
+    final nextBusy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
+    nextBusy.remove(id);
+    _supportQueueClaimBusyNotifier.value = nextBusy;
+    unawaited(_refreshSupportQueueNotices());
+  }
+}
+
+Future<void> _closeSupportQueueNotice(String ticketId) async {
+  final id = ticketId.trim();
+  if (id.isEmpty) return;
+  final busy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
+  if (busy.contains(id)) return;
+  busy.add(id);
+  _supportQueueClaimBusyNotifier.value = busy;
+  try {
+    await dio.post('/api/support/tickets/$id/archive');
+    _removeSupportQueueNotice(id);
+    showGlobalAppNotice(
+      'Заявка поддержки завершена и перенесена в архив.',
+      title: 'Поддержка',
+      tone: AppNoticeTone.success,
+    );
+    chatEventsController.add({
+      'type': 'support:queue:changed',
+      'data': {'ticket_id': id, 'action': 'archived'},
+    });
+  } on DioException catch (e) {
+    final message = _extractApiErrorMessage(e);
+    showGlobalAppNotice(
+      message.isNotEmpty ? message : 'Не удалось завершить заявку',
+      title: 'Поддержка',
+      tone: AppNoticeTone.error,
+    );
+  } catch (_) {
+    showGlobalAppNotice(
+      'Не удалось завершить заявку',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
@@ -1775,166 +1871,212 @@ class _GlobalNoticeHost extends StatelessWidget {
         SafeArea(
           child: Align(
             alignment: Alignment.topRight,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-              child: ValueListenableBuilder<List<_SupportQueueNoticePayload>>(
-                valueListenable: _supportQueueNoticeNotifier,
-                builder: (context, notices, _) {
-                  if (notices.isEmpty || !_canCurrentUserObserveSupportQueueAlerts()) {
-                    return const SizedBox.shrink();
-                  }
-                  final canClaim = _canCurrentUserClaimSupportQueueAlerts();
-                  return ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 380),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        ...notices.take(3).map((notice) {
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: ValueListenableBuilder<Set<String>>(
-                              valueListenable: _supportQueueClaimBusyNotifier,
-                              builder: (context, busyIds, _) {
-                                final claimBusy = busyIds.contains(notice.ticketId);
-                                return Material(
-                                  color: theme.colorScheme.surfaceContainerHigh,
-                                  elevation: 10,
-                                  borderRadius: BorderRadius.circular(18),
-                                  child: Container(
-                                    width: 380,
-                                    padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
-                                    decoration: BoxDecoration(
-                                      borderRadius: BorderRadius.circular(18),
-                                      border: Border.all(
-                                        color: theme.colorScheme.primary.withValues(alpha: 0.16),
-                                      ),
-                                    ),
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        Row(
-                                          children: [
-                                            Container(
-                                              width: 38,
-                                              height: 38,
-                                              decoration: BoxDecoration(
-                                                color: theme.colorScheme.primary.withValues(alpha: 0.12),
-                                                shape: BoxShape.circle,
-                                              ),
-                                              alignment: Alignment.center,
-                                              child: Icon(
-                                                Icons.support_agent_outlined,
-                                                color: theme.colorScheme.primary,
-                                                size: 20,
-                                              ),
-                                            ),
-                                            const SizedBox(width: 10),
-                                            Expanded(
-                                              child: Column(
-                                                crossAxisAlignment: CrossAxisAlignment.start,
-                                                children: [
-                                                  Text(
-                                                    notice.claimable
-                                                        ? 'Новый вопрос в поддержку'
-                                                        : 'Активная заявка поддержки',
-                                                    style: theme.textTheme.titleSmall?.copyWith(
-                                                      fontWeight: FontWeight.w800,
-                                                    ),
-                                                  ),
-                                                  Text(
-                                                    'Клиент: ${notice.customerName}',
-                                                    style: theme.textTheme.bodySmall?.copyWith(
-                                                      color: theme.colorScheme.onSurfaceVariant,
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ],
+            child: ValueListenableBuilder<String>(
+              valueListenable: activeShellSectionNotifier,
+              builder: (context, activeSection, _) {
+                if (activeSection != 'chats') {
+                  return const SizedBox.shrink();
+                }
+                final media = MediaQuery.of(context);
+                final compact = media.size.width < 700;
+                final maxCards = compact ? 1 : 3;
+                final cardWidth = compact
+                    ? (media.size.width - 24).clamp(260.0, 420.0)
+                    : 380.0;
+                return Padding(
+                  padding: EdgeInsets.fromLTRB(12, compact ? 8 : 12, 12, 0),
+                  child: ValueListenableBuilder<List<_SupportQueueNoticePayload>>(
+                    valueListenable: _supportQueueNoticeNotifier,
+                    builder: (context, notices, _) {
+                      if (notices.isEmpty || !_canCurrentUserObserveSupportQueueAlerts()) {
+                        return const SizedBox.shrink();
+                      }
+                      final canClaim = _canCurrentUserClaimSupportQueueAlerts();
+                      return ConstrainedBox(
+                        constraints: BoxConstraints(maxWidth: cardWidth),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            ...notices.take(maxCards).map((notice) {
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: ValueListenableBuilder<Set<String>>(
+                                  valueListenable: _supportQueueClaimBusyNotifier,
+                                  builder: (context, busyIds, _) {
+                                    final actionBusy = busyIds.contains(notice.ticketId);
+                                    return Material(
+                                      color: theme.colorScheme.surfaceContainerHigh,
+                                      elevation: compact ? 6 : 10,
+                                      borderRadius: BorderRadius.circular(compact ? 14 : 18),
+                                      child: Container(
+                                        width: cardWidth,
+                                        padding: EdgeInsets.fromLTRB(
+                                          compact ? 12 : 14,
+                                          compact ? 12 : 14,
+                                          compact ? 12 : 14,
+                                          compact ? 12 : 14,
                                         ),
-                                        const SizedBox(height: 12),
-                                        Text(
-                                          notice.subject,
-                                          style: theme.textTheme.bodyMedium?.copyWith(
-                                            fontWeight: FontWeight.w700,
+                                        decoration: BoxDecoration(
+                                          borderRadius: BorderRadius.circular(compact ? 14 : 18),
+                                          border: Border.all(
+                                            color: theme.colorScheme.primary.withValues(alpha: 0.16),
                                           ),
                                         ),
-                                        const SizedBox(height: 6),
-                                        Wrap(
-                                          spacing: 8,
-                                          runSpacing: 8,
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          mainAxisSize: MainAxisSize.min,
                                           children: [
-                                            _SupportQueueChip(
-                                              label: _supportStatusLabel(notice.status),
-                                            ),
-                                            _SupportQueueChip(
-                                              label: _supportCategoryLabel(notice.category),
-                                            ),
-                                            if ((notice.productTitle ?? '').trim().isNotEmpty)
-                                              _SupportQueueChip(
-                                                label: notice.productTitle!.trim(),
-                                              ),
-                                          ],
-                                        ),
-                                        const SizedBox(height: 12),
-                                        if (canClaim && notice.claimable)
-                                          Align(
-                                            alignment: Alignment.centerRight,
-                                            child: FilledButton.icon(
-                                              onPressed: claimBusy
-                                                  ? null
-                                                  : () => _claimSupportQueueNotice(notice.ticketId),
-                                              icon: claimBusy
-                                                  ? const SizedBox(
-                                                      width: 16,
-                                                      height: 16,
-                                                      child: CircularProgressIndicator(
-                                                        strokeWidth: 2,
+                                            Row(
+                                              children: [
+                                                Container(
+                                                  width: compact ? 32 : 38,
+                                                  height: compact ? 32 : 38,
+                                                  decoration: BoxDecoration(
+                                                    color: theme.colorScheme.primary.withValues(alpha: 0.12),
+                                                    shape: BoxShape.circle,
+                                                  ),
+                                                  alignment: Alignment.center,
+                                                  child: Icon(
+                                                    Icons.support_agent_outlined,
+                                                    color: theme.colorScheme.primary,
+                                                    size: compact ? 18 : 20,
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 10),
+                                                Expanded(
+                                                  child: Column(
+                                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                                    children: [
+                                                      Text(
+                                                        notice.claimable
+                                                            ? 'Новый вопрос в поддержку'
+                                                            : 'Активная заявка поддержки',
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow.ellipsis,
+                                                        style: theme.textTheme.titleSmall?.copyWith(
+                                                          fontWeight: FontWeight.w800,
+                                                        ),
                                                       ),
-                                                    )
-                                                  : const Icon(Icons.record_voice_over_outlined),
-                                              label: Text(
-                                                claimBusy ? 'Принимаем...' : 'Принять заявку',
+                                                      Text(
+                                                        'Клиент: ${notice.customerName}',
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow.ellipsis,
+                                                        style: theme.textTheme.bodySmall?.copyWith(
+                                                          color: theme.colorScheme.onSurfaceVariant,
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                            const SizedBox(height: 10),
+                                            Text(
+                                              notice.subject,
+                                              maxLines: compact ? 2 : 3,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: theme.textTheme.bodyMedium?.copyWith(
+                                                fontWeight: FontWeight.w700,
                                               ),
                                             ),
-                                          )
-                                        else
-                                          Text(
-                                            notice.claimable
-                                                ? 'Заявка исчезнет, когда её примет администратор.'
-                                                : 'Уведомление останется, пока заявка не будет закрыта.',
-                                            style: theme.textTheme.bodySmall?.copyWith(
-                                              color: theme.colorScheme.onSurfaceVariant,
+                                            const SizedBox(height: 6),
+                                            Wrap(
+                                              spacing: 8,
+                                              runSpacing: 8,
+                                              children: [
+                                                _SupportQueueChip(
+                                                  label: _supportStatusLabel(notice.status),
+                                                ),
+                                                _SupportQueueChip(
+                                                  label: _supportCategoryLabel(notice.category),
+                                                ),
+                                                if ((notice.productTitle ?? '').trim().isNotEmpty && !compact)
+                                                  _SupportQueueChip(
+                                                    label: notice.productTitle!.trim(),
+                                                  ),
+                                              ],
                                             ),
-                                          ),
-                                      ],
-                                    ),
+                                            const SizedBox(height: 10),
+                                            if (canClaim && notice.claimable)
+                                              Align(
+                                                alignment: Alignment.centerRight,
+                                                child: FilledButton.icon(
+                                                  onPressed: actionBusy
+                                                      ? null
+                                                      : () => _claimSupportQueueNotice(notice.ticketId),
+                                                  icon: actionBusy
+                                                      ? const SizedBox(
+                                                          width: 16,
+                                                          height: 16,
+                                                          child: CircularProgressIndicator(
+                                                            strokeWidth: 2,
+                                                          ),
+                                                        )
+                                                      : const Icon(Icons.record_voice_over_outlined),
+                                                  label: Text(
+                                                    actionBusy ? 'Принимаем...' : 'Принять заявку',
+                                                  ),
+                                                ),
+                                              )
+                                            else if (notice.closable)
+                                              Align(
+                                                alignment: Alignment.centerRight,
+                                                child: OutlinedButton.icon(
+                                                  onPressed: actionBusy
+                                                      ? null
+                                                      : () => _closeSupportQueueNotice(notice.ticketId),
+                                                  icon: actionBusy
+                                                      ? const SizedBox(
+                                                          width: 16,
+                                                          height: 16,
+                                                          child: CircularProgressIndicator(
+                                                            strokeWidth: 2,
+                                                          ),
+                                                        )
+                                                      : const Icon(Icons.archive_outlined),
+                                                  label: Text(
+                                                    actionBusy ? 'Закрываем...' : 'Заявка закрыта',
+                                                  ),
+                                                ),
+                                              )
+                                            else
+                                              Text(
+                                                notice.claimable
+                                                    ? 'Заявка исчезнет, когда её примет администратор.'
+                                                    : 'Уведомление останется, пока заявка не будет закрыта.',
+                                                style: theme.textTheme.bodySmall?.copyWith(
+                                                  color: theme.colorScheme.onSurfaceVariant,
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              );
+                            }),
+                            if (notices.length > maxCards)
+                              Material(
+                                color: theme.colorScheme.surfaceContainer,
+                                elevation: 4,
+                                borderRadius: BorderRadius.circular(14),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                  child: Text(
+                                    'Ещё заявок: ${notices.length - maxCards}',
+                                    style: theme.textTheme.labelLarge,
                                   ),
-                                );
-                              },
-                            ),
-                          );
-                        }),
-                        if (notices.length > 3)
-                          Material(
-                            color: theme.colorScheme.surfaceContainer,
-                            elevation: 4,
-                            borderRadius: BorderRadius.circular(14),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                              child: Text(
-                                'Ещё заявок: ${notices.length - 3}',
-                                style: theme.textTheme.labelLarge,
+                                ),
                               ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  );
-                },
-              ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
             ),
           ),
         ),
