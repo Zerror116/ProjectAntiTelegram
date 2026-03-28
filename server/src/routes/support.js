@@ -275,6 +275,31 @@ function emitSupportQueueClaimedEvent(req, tenantId, payload) {
   emitToTenant(io, tenantId || null, "support:ticket:claimed", payload);
 }
 
+function scheduleSupportArchivedChatRemoval(req, tenantId, ticket) {
+  const io = req.app.get("io");
+  if (!io || !ticket?.chat_id) return;
+
+  const chatId = String(ticket.chat_id || "").trim();
+  if (!chatId) return;
+
+  const userIds = [...new Set([
+    String(ticket.customer_id || "").trim(),
+    String(ticket.assignee_id || "").trim(),
+  ].filter(Boolean))];
+  if (userIds.length === 0) return;
+
+  setTimeout(() => {
+    for (const userId of userIds) {
+      io.to(`user:${userId}`).emit("chat:deleted", {
+        chatId,
+        reason: "support_archived",
+        supportTicketId: String(ticket.id || "").trim(),
+      });
+    }
+    emitToTenant(io, tenantId || null, "chat:updated", { chatId });
+  }, 5000);
+}
+
 async function insertSupportMessage(client, { chatId, senderId = null, text, meta = {} }) {
   const plainText = String(text || "");
   const encryptedText = encryptMessageText(plainText);
@@ -919,10 +944,13 @@ router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
 router.get("/tickets", authMiddleware, async (req, res) => {
   try {
     const role = normalizeRole(req.user.role);
-    if (role === "creator") {
-      return res.json({ ok: true, data: [] });
-    }
-    if (role !== "client" && role !== "admin" && role !== "tenant" && role !== "worker") {
+    if (
+      role !== "client" &&
+      role !== "admin" &&
+      role !== "tenant" &&
+      role !== "worker" &&
+      role !== "creator"
+    ) {
       return res.status(403).json({ ok: false, error: "Недостаточно прав" });
     }
     if (role === "worker") {
@@ -943,12 +971,20 @@ router.get("/tickets", authMiddleware, async (req, res) => {
         effectiveStatuses = ["open", "waiting_customer", "resolved", "archived"];
       }
     }
+    const requestingOnlyArchived =
+      effectiveStatuses.length > 0 &&
+      effectiveStatuses.every((status) => status === "archived");
+
+    if (role === "creator" && !requestingOnlyArchived) {
+      return res.json({ ok: true, data: [] });
+    }
 
     const params = [
       effectiveStatuses,
       req.user.tenant_id || null,
       req.user.id,
       role,
+      requestingOnlyArchived,
     ];
 
     const list = await db.query(
@@ -983,7 +1019,14 @@ router.get("/tickets", authMiddleware, async (req, res) => {
          AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
          AND (
            ($4 = 'client' AND st.customer_id = $3)
-           OR st.assignee_id = $3
+           OR ($4 = 'creator' AND $5::boolean = true)
+           OR (
+             $4 IN ('admin', 'tenant', 'worker')
+             AND (
+               ($5::boolean = true)
+               OR st.assignee_id = $3
+             )
+           )
          )
        ORDER BY
          CASE st.status
@@ -1277,15 +1320,15 @@ router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
       ? "Отлично, вопрос закрыт и отправлен в архив поддержки."
       : "Поняли, вопрос снова открыт. Поддержка ответит в этом чате.";
 
-    const statusMessage = await insertSupportMessage(client, {
-      chatId: ticket.chat_id,
-      senderId: null,
-      text: statusText,
-      meta: {
-        kind: "support_feedback_result",
-        support_ticket_id: ticket.id,
-        feedback_status: resolved ? "resolved" : "reopened",
-      },
+      const statusMessage = await insertSupportMessage(client, {
+        chatId: ticket.chat_id,
+        senderId: null,
+        text: resolved ? "Диалог закончен" : statusText,
+        meta: {
+          kind: "support_feedback_result",
+          support_ticket_id: ticket.id,
+          feedback_status: resolved ? "resolved" : "reopened",
+        },
     });
 
     await client.query("COMMIT");
@@ -1306,6 +1349,9 @@ router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
         statusMessage.chat_id,
         statusMessage.id,
       );
+    }
+    if (resolved) {
+      scheduleSupportArchivedChatRemoval(req, req.user.tenant_id || null, ticket);
     }
 
     return res.json({
@@ -1331,6 +1377,14 @@ router.post(
   async (req, res) => {
     const ticketId = normalizeText(req.params.ticketId);
     const reason = normalizeText(req.body?.reason || "admin_archive");
+    const forceArchive =
+      req.body?.force === true ||
+      String(req.body?.force || "")
+        .toLowerCase()
+        .trim() === "1" ||
+      String(req.body?.force || "")
+        .toLowerCase()
+        .trim() === "true";
     if (!ticketId) {
       return res.status(400).json({ ok: false, error: "ticketId обязателен" });
     }
@@ -1353,7 +1407,13 @@ router.post(
       }
 
       const ticket = ticketRes.rows[0];
-      if (String(ticket.assignee_id || "") !== String(req.user.id || "")) {
+      const requesterId = String(req.user.id || "").trim();
+      const requesterRole = normalizeRole(req.user.role);
+      const isAssignee =
+        String(ticket.assignee_id || "").trim() === requesterId;
+      const canForceArchive =
+        forceArchive && requesterRole !== "creator";
+      if (!isAssignee && !canForceArchive) {
         await client.query("ROLLBACK");
         return res.status(403).json({
           ok: false,
@@ -1365,17 +1425,23 @@ router.post(
          SET status = 'archived',
              archive_reason = $1,
              archived_at = now(),
+             assignee_id = COALESCE(assignee_id, $4::uuid),
              resolved_by = $3::uuid,
              resolved_at = now(),
              updated_at = now()
          WHERE id = $2`,
-        [reason || "assignee_finished", ticket.id, req.user.id || null],
+        [
+          reason || (canForceArchive ? "forced_admin_archive" : "assignee_finished"),
+          ticket.id,
+          req.user.id || null,
+          req.user.id || null,
+        ],
       );
 
       const statusMessage = await insertSupportMessage(client, {
         chatId: ticket.chat_id,
         senderId: null,
-        text: "Диалог завершён и перенесён в архив поддержки.",
+        text: "Диалог закончен",
         meta: {
           kind: "support_ticket_archived",
           support_ticket_id: ticket.id,
@@ -1393,6 +1459,7 @@ router.post(
           statusMessage.id,
         );
       }
+      scheduleSupportArchivedChatRemoval(req, req.user.tenant_id || null, ticket);
 
       return res.json({
         ok: true,

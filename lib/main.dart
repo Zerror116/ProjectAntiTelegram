@@ -434,6 +434,10 @@ bool _canCurrentUserClaimSupportQueueAlerts() {
   return false;
 }
 
+bool _canCurrentUserForceCloseSupportQueueAlerts() {
+  return _canCurrentUserClaimSupportQueueAlerts();
+}
+
 _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
   if (raw is! Map) return null;
   final map = Map<String, dynamic>.from(raw);
@@ -640,10 +644,13 @@ Future<void> _closeSupportQueueNotice(String ticketId) async {
   busy.add(id);
   _supportQueueClaimBusyNotifier.value = busy;
   try {
-    await dio.post('/api/support/tickets/$id/archive');
+    await dio.post(
+      '/api/support/tickets/$id/archive',
+      data: {'force': true, 'reason': 'forced_admin_archive'},
+    );
     _removeSupportQueueNotice(id);
     showGlobalAppNotice(
-      'Заявка поддержки завершена и перенесена в архив.',
+      'Диалог закончен',
       title: 'Поддержка',
       tone: AppNoticeTone.success,
     );
@@ -1839,6 +1846,7 @@ class _GlobalNoticeHost extends StatelessWidget {
                         return const SizedBox.shrink();
                       }
                       final canClaim = _canCurrentUserClaimSupportQueueAlerts();
+                      final canForceClose = _canCurrentUserForceCloseSupportQueueAlerts();
                       return ConstrainedBox(
                         constraints: BoxConstraints(maxWidth: cardWidth),
                         child: Column(
@@ -1945,46 +1953,53 @@ class _GlobalNoticeHost extends StatelessWidget {
                                               ],
                                             ),
                                             const SizedBox(height: 10),
-                                            if (canClaim && notice.claimable)
+                                            if ((canClaim && notice.claimable) ||
+                                                notice.closable ||
+                                                canForceClose)
                                               Align(
                                                 alignment: Alignment.centerRight,
-                                                child: FilledButton.icon(
-                                                  onPressed: actionBusy
-                                                      ? null
-                                                      : () => _claimSupportQueueNotice(notice.ticketId),
-                                                  icon: actionBusy
-                                                      ? const SizedBox(
-                                                          width: 16,
-                                                          height: 16,
-                                                          child: CircularProgressIndicator(
-                                                            strokeWidth: 2,
-                                                          ),
-                                                        )
-                                                      : const Icon(Icons.record_voice_over_outlined),
-                                                  label: Text(
-                                                    actionBusy ? 'Принимаем...' : 'Принять заявку',
-                                                  ),
-                                                ),
-                                              )
-                                            else if (notice.closable)
-                                              Align(
-                                                alignment: Alignment.centerRight,
-                                                child: OutlinedButton.icon(
-                                                  onPressed: actionBusy
-                                                      ? null
-                                                      : () => _closeSupportQueueNotice(notice.ticketId),
-                                                  icon: actionBusy
-                                                      ? const SizedBox(
-                                                          width: 16,
-                                                          height: 16,
-                                                          child: CircularProgressIndicator(
-                                                            strokeWidth: 2,
-                                                          ),
-                                                        )
-                                                      : const Icon(Icons.archive_outlined),
-                                                  label: Text(
-                                                    actionBusy ? 'Закрываем...' : 'Заявка закрыта',
-                                                  ),
+                                                child: Wrap(
+                                                  spacing: 8,
+                                                  runSpacing: 8,
+                                                  alignment: WrapAlignment.end,
+                                                  children: [
+                                                    if (canClaim && notice.claimable)
+                                                      FilledButton.icon(
+                                                        onPressed: actionBusy
+                                                            ? null
+                                                            : () => _claimSupportQueueNotice(notice.ticketId),
+                                                        icon: actionBusy
+                                                            ? const SizedBox(
+                                                                width: 16,
+                                                                height: 16,
+                                                                child: CircularProgressIndicator(
+                                                                  strokeWidth: 2,
+                                                                ),
+                                                              )
+                                                            : const Icon(Icons.record_voice_over_outlined),
+                                                        label: Text(
+                                                          actionBusy ? 'Принимаем...' : 'Принять заявку',
+                                                        ),
+                                                      ),
+                                                    if (notice.closable || canForceClose)
+                                                      OutlinedButton.icon(
+                                                        onPressed: actionBusy
+                                                            ? null
+                                                            : () => _closeSupportQueueNotice(notice.ticketId),
+                                                        icon: actionBusy
+                                                            ? const SizedBox(
+                                                                width: 16,
+                                                                height: 16,
+                                                                child: CircularProgressIndicator(
+                                                                  strokeWidth: 2,
+                                                                ),
+                                                              )
+                                                            : const Icon(Icons.archive_outlined),
+                                                        label: Text(
+                                                          actionBusy ? 'Закрываем...' : 'Закрыть заявку',
+                                                        ),
+                                                      ),
+                                                  ],
                                                 ),
                                               )
                                             else

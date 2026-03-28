@@ -250,6 +250,24 @@ class _ChatScreenState extends State<ChatScreen> {
         }
         return;
       }
+      if (type == 'chat:deleted' && data is Map) {
+        final chatId = data['chatId']?.toString() ?? '';
+        if (chatId != widget.chatId) return;
+        if (!mounted) return;
+        final reason = data['reason']?.toString() ?? '';
+        if (reason == 'support_archived') {
+          showAppNotice(
+            context,
+            'Диалог закончен',
+            tone: AppNoticeTone.info,
+          );
+        }
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          Navigator.of(context).maybePop();
+        });
+        return;
+      }
       if (type == 'chat:message:deleted' && data is Map) {
         final chatId = data['chatId']?.toString() ?? '';
         if (chatId != widget.chatId) return;
@@ -889,6 +907,17 @@ class _ChatScreenState extends State<ChatScreen> {
     return kind == 'support_ticket' || settings['support_ticket'] == true;
   }
 
+  bool _isArchivedSupportTicketChat() {
+    if (!_isSupportTicketChat()) return false;
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    if (settings['support_archived'] == true) return true;
+    final status = (settings['support_ticket_status'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    return status == 'archived';
+  }
+
   bool _isDirectMessageChat() {
     if ((widget.chatType ?? '').toLowerCase().trim() != 'private') return false;
     if (_isSupportTicketChat()) return false;
@@ -899,6 +928,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool _canCompose() {
+    if (_isArchivedSupportTicketChat()) {
+      return false;
+    }
     final role = authService.effectiveRole.toLowerCase().trim();
     if (role == 'client') {
       if (_isPublicChannel()) return false;
@@ -915,6 +947,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String? _composeBlockedReason() {
     if (_canCompose()) return null;
+    if (_isArchivedSupportTicketChat()) {
+      return 'Диалог закончен. История доступна только для просмотра.';
+    }
     if (_isPublicChannel()) {
       return 'В этом публичном канале писать может только администрация';
     }
