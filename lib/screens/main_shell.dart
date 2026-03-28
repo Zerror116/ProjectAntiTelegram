@@ -574,6 +574,9 @@ class _MainShellState extends State<MainShell> {
       _index = nextIndex;
       _activatedDestinations.add(allDestinations[nextIndex].id);
     });
+    if (allDestinations[nextIndex].id == 'chats') {
+      unawaited(refreshSupportQueueNotices());
+    }
   }
 
   Future<void> _submitPhoneAccessOwnerDecision({
@@ -797,6 +800,9 @@ class _MainShellState extends State<MainShell> {
                 _index = nextIndex;
                 _activatedDestinations.add(destinations[nextIndex].id);
               });
+              if (destinations[nextIndex].id == 'chats') {
+                unawaited(refreshSupportQueueNotices());
+              }
             },
             items: visibleDestinations
                 .map(

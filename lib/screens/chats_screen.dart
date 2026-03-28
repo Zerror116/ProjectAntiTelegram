@@ -559,6 +559,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   void initState() {
     super.initState();
     _loadChats(showLoader: true);
+    unawaited(refreshSupportQueueNotices());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_ensureRulesPromptShown());
     });

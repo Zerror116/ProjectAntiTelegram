@@ -316,6 +316,12 @@ class _AdminPanelState extends State<AdminPanel>
     return _asMap(channel['settings']);
   }
 
+  bool _boolValue(dynamic raw) {
+    if (raw is bool) return raw;
+    final normalized = '${raw ?? ''}'.trim().toLowerCase();
+    return normalized == 'true' || normalized == '1' || normalized == 'yes';
+  }
+
   String _channelIdOf(Map<String, dynamic> channel) {
     return (channel['id'] ?? '').toString();
   }
@@ -1188,6 +1194,18 @@ class _AdminPanelState extends State<AdminPanel>
     bool silent = false,
   }) async {
     if (channelId.isEmpty) return null;
+    final channel = _channels.firstWhere(
+      (item) => _channelIdOf(item) == channelId,
+      orElse: () => const <String, dynamic>{},
+    );
+    final settings = _settingsOf(channel);
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    final adminOnly = _boolValue(settings['admin_only']);
+    final isSystemOverviewBlocked =
+        (kind.isNotEmpty && kind != 'channel') || adminOnly;
+    if (isSystemOverviewBlocked) {
+      return null;
+    }
     if (!force && _channelOverviews.containsKey(channelId)) {
       return _channelOverviews[channelId];
     }
@@ -6555,6 +6573,11 @@ class _AdminPanelState extends State<AdminPanel>
     final isReserved = systemKey == 'reserved_orders';
     final isPostsArchive = systemKey == 'posts_archive';
     final isSystemChannel = systemKey.trim().isNotEmpty;
+    final isOverviewAvailable =
+        ((settings['kind'] ?? '').toString().trim().toLowerCase().isEmpty ||
+            (settings['kind'] ?? '').toString().trim().toLowerCase() ==
+                'channel') &&
+        !_boolValue(settings['admin_only']);
     final canDelete = !isSystemChannel;
     final focusX = _toFocus(settings['avatar_focus_x']);
     final focusY = _toFocus(settings['avatar_focus_y']);
@@ -6569,7 +6592,7 @@ class _AdminPanelState extends State<AdminPanel>
       margin: EdgeInsets.zero,
       child: ExpansionTile(
         onExpansionChanged: (expanded) {
-          if (expanded) {
+          if (expanded && isOverviewAvailable) {
             unawaited(_loadChannelOverview(id, silent: true));
           }
         },
@@ -6634,12 +6657,14 @@ class _AdminPanelState extends State<AdminPanel>
                   label: const Text('Убрать фото'),
                 ),
               OutlinedButton.icon(
-                onPressed: _overviewLoading.contains(id)
+                onPressed: !isOverviewAvailable || _overviewLoading.contains(id)
                     ? null
                     : () => _loadChannelOverview(id, force: true),
                 icon: const Icon(Icons.analytics_outlined),
                 label: Text(
-                  _overviewLoading.contains(id)
+                  !isOverviewAvailable
+                      ? 'Недоступно'
+                      : _overviewLoading.contains(id)
                       ? 'Загрузка...'
                       : 'Обновить данные',
                 ),
