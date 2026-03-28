@@ -376,11 +376,13 @@ Timer? _appNoticeTimer;
 
 class _SupportQueueNoticePayload {
   final String ticketId;
-  final String chatId;
+  final String? chatId;
   final String subject;
   final String category;
   final String customerName;
   final String? productTitle;
+  final String status;
+  final bool claimable;
 
   const _SupportQueueNoticePayload({
     required this.ticketId,
@@ -389,6 +391,8 @@ class _SupportQueueNoticePayload {
     required this.category,
     required this.customerName,
     required this.productTitle,
+    required this.status,
+    required this.claimable,
   });
 }
 
@@ -429,21 +433,48 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
   if (raw is! Map) return null;
   final map = Map<String, dynamic>.from(raw);
   final ticketId = (map['id'] ?? map['ticket_id'] ?? '').toString().trim();
-  final chatId = (map['chat_id'] ?? '').toString().trim();
-  if (ticketId.isEmpty || chatId.isEmpty) return null;
+  final chatIdRaw = (map['chat_id'] ?? '').toString().trim();
+  if (ticketId.isEmpty) return null;
   final subject = (map['subject'] ?? 'Новый вопрос в поддержку')
       .toString()
       .trim();
   final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
   final category = (map['category'] ?? 'general').toString().trim();
   final productTitle = (map['product_title'] ?? '').toString().trim();
+  final status = (map['status'] ?? 'open').toString().trim().toLowerCase();
+  final claimable = (map['claimable'] ?? map['assignee_id'] == null) == true;
   return _SupportQueueNoticePayload(
     ticketId: ticketId,
-    chatId: chatId,
+    chatId: chatIdRaw.isEmpty ? null : chatIdRaw,
     subject: subject.isEmpty ? 'Новый вопрос в поддержку' : subject,
     category: category.isEmpty ? 'general' : category,
     customerName: customerName.isEmpty ? 'Клиент' : customerName,
     productTitle: productTitle.isEmpty ? null : productTitle,
+    status: status.isEmpty ? 'open' : status,
+    claimable: claimable,
+  );
+}
+
+_SupportQueueNoticePayload? _parseSupportCenterNotice(dynamic raw) {
+  if (raw is! Map) return null;
+  final map = Map<String, dynamic>.from(raw);
+  final type = (map['type'] ?? '').toString().trim().toLowerCase();
+  if (type != 'support_ticket') return null;
+  final status = (map['status'] ?? '').toString().trim().toLowerCase();
+  if (status.isEmpty || status == 'archived') return null;
+  final ticketId = (map['id'] ?? '').toString().trim();
+  if (ticketId.isEmpty) return null;
+  final title = (map['title'] ?? 'Вопрос в поддержку').toString().trim();
+  final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
+  return _SupportQueueNoticePayload(
+    ticketId: ticketId,
+    chatId: null,
+    subject: title.isEmpty ? 'Вопрос в поддержку' : title,
+    category: 'general',
+    customerName: customerName.isEmpty ? 'Клиент' : customerName,
+    productTitle: null,
+    status: status,
+    claimable: false,
   );
 }
 
@@ -482,16 +513,61 @@ Future<void> _refreshSupportQueueNotices() async {
     return;
   }
   try {
-    final resp = await dio.get('/api/support/tickets/queue');
-    final data = resp.data;
-    final rows = data is Map && data['ok'] == true && data['data'] is List
-        ? List<dynamic>.from(data['data'])
-        : const <dynamic>[];
-    final next = <_SupportQueueNoticePayload>[];
-    for (final row in rows) {
-      final parsed = _parseSupportQueueNotice(row);
-      if (parsed != null) next.add(parsed);
+    final nextById = <String, _SupportQueueNoticePayload>{};
+
+    final user = authService.currentUser;
+    final role = authService.effectiveRole.toLowerCase().trim();
+    final baseRole = (user?.role ?? '').toLowerCase().trim();
+    final canUseCenter =
+        baseRole == 'creator' ||
+        role == 'creator' ||
+        role == 'admin' ||
+        role == 'tenant';
+
+    if (canUseCenter) {
+      final centerResp = await dio.get(
+        '/api/admin/ops/notifications/center',
+        queryParameters: {'limit': 60},
+      );
+      final centerData = centerResp.data;
+      final centerRows =
+          centerData is Map &&
+              centerData['ok'] == true &&
+              centerData['data'] is Map &&
+              centerData['data']['items'] is List
+          ? List<dynamic>.from(centerData['data']['items'])
+          : const <dynamic>[];
+      for (final row in centerRows) {
+        final parsed = _parseSupportCenterNotice(row);
+        if (parsed != null) {
+          nextById[parsed.ticketId] = parsed;
+        }
+      }
     }
+
+    if (_canCurrentUserClaimSupportQueueAlerts()) {
+      final queueResp = await dio.get('/api/support/tickets/queue');
+      final queueData = queueResp.data;
+      final queueRows =
+          queueData is Map && queueData['ok'] == true && queueData['data'] is List
+          ? List<dynamic>.from(queueData['data'])
+          : const <dynamic>[];
+      for (final row in queueRows) {
+        final parsed = _parseSupportQueueNotice(row);
+        if (parsed != null) {
+          nextById[parsed.ticketId] = parsed;
+        }
+      }
+    }
+
+    final next = nextById.values.toList(growable: false)
+      ..sort((a, b) {
+        final claimableOrder = (b.claimable ? 1 : 0).compareTo(
+          a.claimable ? 1 : 0,
+        );
+        if (claimableOrder != 0) return claimableOrder;
+        return a.ticketId.compareTo(b.ticketId);
+      });
     _supportQueueNoticeNotifier.value = next;
   } on DioException catch (e) {
     if (e.response?.statusCode == 403 || e.response?.statusCode == 401) {
@@ -1569,6 +1645,18 @@ class _GlobalNoticeHost extends StatelessWidget {
     }
   }
 
+  String _supportStatusLabel(String raw) {
+    switch (raw.toLowerCase().trim()) {
+      case 'waiting_customer':
+        return 'Ждёт клиента';
+      case 'resolved':
+        return 'Ожидает закрытия';
+      case 'open':
+      default:
+        return 'Открыт';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -1748,7 +1836,9 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                 crossAxisAlignment: CrossAxisAlignment.start,
                                                 children: [
                                                   Text(
-                                                    'Новый вопрос в поддержку',
+                                                    notice.claimable
+                                                        ? 'Новый вопрос в поддержку'
+                                                        : 'Активная заявка поддержки',
                                                     style: theme.textTheme.titleSmall?.copyWith(
                                                       fontWeight: FontWeight.w800,
                                                     ),
@@ -1777,6 +1867,9 @@ class _GlobalNoticeHost extends StatelessWidget {
                                           runSpacing: 8,
                                           children: [
                                             _SupportQueueChip(
+                                              label: _supportStatusLabel(notice.status),
+                                            ),
+                                            _SupportQueueChip(
                                               label: _supportCategoryLabel(notice.category),
                                             ),
                                             if ((notice.productTitle ?? '').trim().isNotEmpty)
@@ -1786,7 +1879,7 @@ class _GlobalNoticeHost extends StatelessWidget {
                                           ],
                                         ),
                                         const SizedBox(height: 12),
-                                        if (canClaim)
+                                        if (canClaim && notice.claimable)
                                           Align(
                                             alignment: Alignment.centerRight,
                                             child: FilledButton.icon(
@@ -1809,7 +1902,9 @@ class _GlobalNoticeHost extends StatelessWidget {
                                           )
                                         else
                                           Text(
-                                            'Заявка исчезнет, когда её примет администратор.',
+                                            notice.claimable
+                                                ? 'Заявка исчезнет, когда её примет администратор.'
+                                                : 'Уведомление останется, пока заявка не будет закрыта.',
                                             style: theme.textTheme.bodySmall?.copyWith(
                                               color: theme.colorScheme.onSurfaceVariant,
                                             ),
@@ -2582,13 +2677,7 @@ Future<void> _initSocket() async {
     socket?.on('support:ticket:claimed', (data) {
       _socketVerboseLog('📬 Socket event support:ticket:claimed -> $data');
       chatEventsController.add({'type': 'support:queue:changed', 'data': data});
-      final map = data is Map ? Map<String, dynamic>.from(data) : null;
-      final ticketId = (map?['ticket_id'] ?? map?['id'] ?? '').toString().trim();
-      if (ticketId.isNotEmpty) {
-        _removeSupportQueueNotice(ticketId);
-      } else {
-        unawaited(_refreshSupportQueueNotices());
-      }
+      unawaited(_refreshSupportQueueNotices());
     });
 
     // Global message event (optional)
