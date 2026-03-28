@@ -1008,10 +1008,7 @@ router.get("/tickets", authMiddleware, async (req, res) => {
 router.get("/tickets/queue", authMiddleware, async (req, res) => {
   try {
     const role = normalizeRole(req.user.role);
-    if (role === "creator") {
-      return res.json({ ok: true, data: [] });
-    }
-    if (role !== "admin" && role !== "tenant" && role !== "worker") {
+    if (role !== "admin" && role !== "tenant" && role !== "worker" && role !== "creator") {
       return res.status(403).json({ ok: false, error: "Недостаточно прав" });
     }
     if (role === "worker") {
