@@ -461,30 +461,6 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
   );
 }
 
-_SupportQueueNoticePayload? _parseSupportCenterNotice(dynamic raw) {
-  if (raw is! Map) return null;
-  final map = Map<String, dynamic>.from(raw);
-  final type = (map['type'] ?? '').toString().trim().toLowerCase();
-  if (type != 'support_ticket') return null;
-  final status = (map['status'] ?? '').toString().trim().toLowerCase();
-  if (status.isEmpty || status == 'archived') return null;
-  final ticketId = (map['id'] ?? '').toString().trim();
-  if (ticketId.isEmpty) return null;
-  final title = (map['title'] ?? 'Вопрос в поддержку').toString().trim();
-  final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
-  return _SupportQueueNoticePayload(
-    ticketId: ticketId,
-    chatId: null,
-    subject: title.isEmpty ? 'Вопрос в поддержку' : title,
-    category: 'general',
-    customerName: customerName.isEmpty ? 'Клиент' : customerName,
-    productTitle: null,
-    status: status,
-    claimable: false,
-    closable: false,
-  );
-}
-
 _SupportQueueNoticePayload? _parseAssignedSupportNotice(dynamic raw) {
   if (raw is! Map) return null;
   final map = Map<String, dynamic>.from(raw);
@@ -546,38 +522,9 @@ Future<void> _refreshSupportQueueNotices() async {
   }
   try {
     final nextById = <String, _SupportQueueNoticePayload>{};
+    final canClaim = _canCurrentUserClaimSupportQueueAlerts();
 
-    final user = authService.currentUser;
-    final role = authService.effectiveRole.toLowerCase().trim();
-    final baseRole = (user?.role ?? '').toLowerCase().trim();
-    final canUseCenter =
-        baseRole == 'creator' ||
-        role == 'creator' ||
-        role == 'admin' ||
-        role == 'tenant';
-
-    if (canUseCenter) {
-      final centerResp = await dio.get(
-        '/api/admin/ops/notifications/center',
-        queryParameters: {'limit': 60},
-      );
-      final centerData = centerResp.data;
-      final centerRows =
-          centerData is Map &&
-              centerData['ok'] == true &&
-              centerData['data'] is Map &&
-              centerData['data']['items'] is List
-          ? List<dynamic>.from(centerData['data']['items'])
-          : const <dynamic>[];
-      for (final row in centerRows) {
-        final parsed = _parseSupportCenterNotice(row);
-        if (parsed != null) {
-          nextById[parsed.ticketId] = parsed;
-        }
-      }
-    }
-
-    if (_canCurrentUserClaimSupportQueueAlerts()) {
+    {
       final queueResp = await dio.get('/api/support/tickets/queue');
       final queueData = queueResp.data;
       final queueRows =
@@ -592,7 +539,7 @@ Future<void> _refreshSupportQueueNotices() async {
       }
     }
 
-    if (_canCurrentUserClaimSupportQueueAlerts()) {
+    if (canClaim) {
       final activeResp = await dio.get(
         '/api/support/tickets',
         queryParameters: {'status': 'open,waiting_customer,resolved'},
