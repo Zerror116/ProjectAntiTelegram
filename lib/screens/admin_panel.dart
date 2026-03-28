@@ -3671,7 +3671,7 @@ class _AdminPanelState extends State<AdminPanel>
       await _loadSupportTickets(silent: true);
       await _loadSupportNotificationCenter(silent: true);
       if (!mounted) return;
-      setState(() => _message = 'Чат завершён и отправлен в архив');
+      setState(() => _message = 'Диалог закончен');
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -3700,6 +3700,9 @@ class _AdminPanelState extends State<AdminPanel>
       ...settings,
       'kind': settings['kind'] ?? 'support_ticket',
       'support_ticket': true,
+      'support_ticket_status': (ticket['status'] ?? '').toString().trim(),
+      'support_archived':
+          (ticket['status'] ?? '').toString().trim().toLowerCase() == 'archived',
       if (ticketId.isNotEmpty)
         'support_ticket_id': settings['support_ticket_id'] ?? ticketId,
     };

@@ -2023,6 +2023,7 @@ router.get(
            LEFT JOIN users cu ON cu.id = st.customer_id
            LEFT JOIN chats ch ON ch.id = st.chat_id
            WHERE ($1::uuid IS NULL OR st.tenant_id = $1::uuid)
+             AND st.status IN ('open', 'waiting_customer', 'resolved')
 
            UNION ALL
 

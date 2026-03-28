@@ -371,7 +371,7 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
       .trim() === "support_ticket" || settings?.support_ticket === true;
   if (isSupportTicket) {
     const ticketQ = await db.query(
-      `SELECT customer_id, assignee_id
+      `SELECT customer_id, assignee_id, status, archived_at
        FROM support_tickets
        WHERE chat_id = $1
          AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
@@ -386,6 +386,20 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
         userIdText.length > 0 &&
         (String(ticket.customer_id || "").trim() === userIdText ||
           String(ticket.assignee_id || "").trim() === userIdText);
+      return {
+        chat,
+        settings,
+        visibility: normalizeVisibility(chat.type, settings),
+        hasMembers,
+        isMember,
+        isBlacklisted: isUserBlacklisted(settings, userId),
+        supportTicket: {
+          customerId: String(ticket.customer_id || "").trim(),
+          assigneeId: String(ticket.assignee_id || "").trim(),
+          status: String(ticket.status || "").trim().toLowerCase(),
+          archivedAt: ticket.archived_at || null,
+        },
+      };
     } else {
       isMember = false;
     }
@@ -428,7 +442,18 @@ function canReadChat(context, userRole, permissions = {}) {
 
   if (isSupportTicketChatContext(context)) {
     if (!context.hasMembers) return false;
-    return context.isMember;
+    if (context.isMember) return true;
+    const status = String(context.supportTicket?.status || "")
+      .toLowerCase()
+      .trim();
+    if (status !== "archived") return false;
+    if (role === "admin" || role === "tenant" || role === "creator") {
+      return true;
+    }
+    if (role === "worker") {
+      return hasPermission(permissions, "chat.write.support");
+    }
+    return false;
   }
 
   if (context.hasMembers) return context.isMember;
@@ -483,6 +508,12 @@ function canPostChat(context, userRole, permissions = {}) {
 
   if (isSupportTicketChatContext(context)) {
     if (!context.hasMembers) return false;
+    const status = String(context.supportTicket?.status || "")
+      .toLowerCase()
+      .trim();
+    if (status === "archived") {
+      return false;
+    }
     return context.isMember;
   }
   if (context.hasMembers) return context.isMember;
@@ -1706,6 +1737,11 @@ router.get("/", requireAuth, async (req, res) => {
              AND (
                st.customer_id = $1
                OR st.assignee_id = $1
+             )
+             AND (
+               COALESCE(st.status, 'open') <> 'archived'
+               OR st.archived_at IS NULL
+               OR st.archived_at > now() - interval '5 seconds'
              )
            )
            OR (
