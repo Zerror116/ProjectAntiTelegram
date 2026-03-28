@@ -397,7 +397,21 @@ final ValueNotifier<List<_SupportQueueNoticePayload>> _supportQueueNoticeNotifie
 final ValueNotifier<Set<String>> _supportQueueClaimBusyNotifier =
     ValueNotifier<Set<String>>(<String>{});
 
-bool _canCurrentUserReceiveSupportQueueAlerts() {
+bool _canCurrentUserObserveSupportQueueAlerts() {
+  final user = authService.currentUser;
+  if (user == null) return false;
+  final baseRole = user.role.toLowerCase().trim();
+  final role = authService.effectiveRole.toLowerCase().trim();
+  if (role == 'client') return false;
+  if (baseRole == 'creator' || role == 'creator') return true;
+  if (role == 'admin' || role == 'tenant') return true;
+  if (role == 'worker') {
+    return authService.hasPermission('chat.write.support');
+  }
+  return false;
+}
+
+bool _canCurrentUserClaimSupportQueueAlerts() {
   final user = authService.currentUser;
   if (user == null) return false;
   final baseRole = user.role.toLowerCase().trim();
@@ -463,7 +477,7 @@ void _removeSupportQueueNotice(String ticketId) {
 }
 
 Future<void> _refreshSupportQueueNotices() async {
-  if (!_canCurrentUserReceiveSupportQueueAlerts()) {
+  if (!_canCurrentUserObserveSupportQueueAlerts()) {
     _clearSupportQueueNotices();
     return;
   }
@@ -494,6 +508,14 @@ Future<void> refreshSupportQueueNotices() async {
 Future<void> _claimSupportQueueNotice(String ticketId) async {
   final id = ticketId.trim();
   if (id.isEmpty) return;
+  if (!_canCurrentUserClaimSupportQueueAlerts()) {
+    showGlobalAppNotice(
+      'Эти заявки доступны для принятия только администраторам поддержки.',
+      title: 'Поддержка',
+      tone: AppNoticeTone.info,
+    );
+    return;
+  }
   final busy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
   if (busy.contains(id)) return;
   busy.add(id);
@@ -1670,9 +1692,10 @@ class _GlobalNoticeHost extends StatelessWidget {
               child: ValueListenableBuilder<List<_SupportQueueNoticePayload>>(
                 valueListenable: _supportQueueNoticeNotifier,
                 builder: (context, notices, _) {
-                  if (notices.isEmpty || !_canCurrentUserReceiveSupportQueueAlerts()) {
+                  if (notices.isEmpty || !_canCurrentUserObserveSupportQueueAlerts()) {
                     return const SizedBox.shrink();
                   }
+                  final canClaim = _canCurrentUserClaimSupportQueueAlerts();
                   return ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 380),
                     child: Column(
@@ -1763,26 +1786,34 @@ class _GlobalNoticeHost extends StatelessWidget {
                                           ],
                                         ),
                                         const SizedBox(height: 12),
-                                        Align(
-                                          alignment: Alignment.centerRight,
-                                          child: FilledButton.icon(
-                                            onPressed: claimBusy
-                                                ? null
-                                                : () => _claimSupportQueueNotice(notice.ticketId),
-                                            icon: claimBusy
-                                                ? const SizedBox(
-                                                    width: 16,
-                                                    height: 16,
-                                                    child: CircularProgressIndicator(
-                                                      strokeWidth: 2,
-                                                    ),
-                                                  )
-                                                : const Icon(Icons.record_voice_over_outlined),
-                                            label: Text(
-                                              claimBusy ? 'Принимаем...' : 'Принять заявку',
+                                        if (canClaim)
+                                          Align(
+                                            alignment: Alignment.centerRight,
+                                            child: FilledButton.icon(
+                                              onPressed: claimBusy
+                                                  ? null
+                                                  : () => _claimSupportQueueNotice(notice.ticketId),
+                                              icon: claimBusy
+                                                  ? const SizedBox(
+                                                      width: 16,
+                                                      height: 16,
+                                                      child: CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                      ),
+                                                    )
+                                                  : const Icon(Icons.record_voice_over_outlined),
+                                              label: Text(
+                                                claimBusy ? 'Принимаем...' : 'Принять заявку',
+                                              ),
+                                            ),
+                                          )
+                                        else
+                                          Text(
+                                            'Заявка исчезнет, когда её примет администратор.',
+                                            style: theme.textTheme.bodySmall?.copyWith(
+                                              color: theme.colorScheme.onSurfaceVariant,
                                             ),
                                           ),
-                                        ),
                                       ],
                                     ),
                                   ),
@@ -2535,7 +2566,7 @@ Future<void> _initSocket() async {
     socket?.on('support:ticket:queued', (data) {
       _socketVerboseLog('📬 Socket event support:ticket:queued -> $data');
       chatEventsController.add({'type': 'support:queue:changed', 'data': data});
-      if (!_canCurrentUserReceiveSupportQueueAlerts()) return;
+      if (!_canCurrentUserObserveSupportQueueAlerts()) return;
       final payload = _parseSupportQueueNotice(data);
       if (payload == null) return;
       _upsertSupportQueueNotice(payload);
