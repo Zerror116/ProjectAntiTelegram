@@ -34,7 +34,7 @@ String _runtimeApiBaseUrl = _initialApiBaseUrl;
 final Dio dio = Dio(
   BaseOptions(
     baseUrl: _runtimeApiBaseUrl,
-    connectTimeout: const Duration(seconds: 8),
+    connectTimeout: Duration(seconds: kIsWeb ? 15 : 10),
     sendTimeout: const Duration(seconds: 20),
     receiveTimeout: const Duration(seconds: 20),
   ),
@@ -2822,6 +2822,27 @@ Future<void> _initSocket() async {
   }
 }
 
+Widget _buildInitialScreenFromRestoredUser(User? restoredUser) {
+  if (restoredUser == null) {
+    return const MainShell();
+  }
+  final name = restoredUser.name;
+  final phone = restoredUser.phone;
+  final phoneAccessState = (restoredUser.phoneAccessState ?? '')
+      .trim()
+      .toLowerCase();
+  debugPrint(
+    'determineInitialScreen: restored user name=$name phone=$phone',
+  );
+  if (_isPhoneAccessRestrictedState(phoneAccessState)) {
+    return const PhoneAccessPendingScreen();
+  }
+  if (name == null || phone == null || phone.trim().isEmpty) {
+    return const PhoneNameScreen(isRegisterFlow: false);
+  }
+  return const MainShell();
+}
+
 Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
   if (kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
@@ -2829,22 +2850,28 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
   if (!dbReady) return const SetupFailedScreen();
 
-  if (kIsWeb) {
-    final hasStoredToken = await authService.primeAuthHeaderFromStoredToken()
-        .timeout(const Duration(seconds: 1), onTimeout: () => false);
-    if (hasStoredToken) {
-      debugPrint(
-        'determineInitialScreen: fast web path via stored token -> MainShell',
-      );
-      unawaited(authService.tryRefreshOnStartup());
-      _handlingAuthFailure = false;
-      return const MainShell();
-    }
+  final hasStoredToken = await authService.primeAuthHeaderFromStoredToken()
+      .timeout(const Duration(seconds: 1), onTimeout: () => false);
+  if (hasStoredToken && authService.currentUser != null) {
+    debugPrint(
+      'determineInitialScreen: fast path via stored token -> local session',
+    );
+    unawaited(authService.tryRefreshOnStartup());
+    _handlingAuthFailure = false;
+    return _buildInitialScreenFromRestoredUser(authService.currentUser);
   }
 
   final logged = await authService.tryRefreshOnStartup().timeout(
     const Duration(seconds: 6),
-    onTimeout: () => false,
+    onTimeout: () {
+      final restored = authService.currentUser != null;
+      if (restored) {
+        debugPrint(
+          'determineInitialScreen: tryRefreshOnStartup timed out, using local session',
+        );
+      }
+      return restored;
+    },
   );
   debugPrint('determineInitialScreen: tryRefreshOnStartup -> $logged');
 
@@ -2857,24 +2884,7 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
 
   try {
-    final restoredUser = authService.currentUser;
-    if (restoredUser != null) {
-      final name = restoredUser.name;
-      final phone = restoredUser.phone;
-      final phoneAccessState = (restoredUser.phoneAccessState ?? '')
-          .trim()
-          .toLowerCase();
-      debugPrint(
-        'determineInitialScreen: restored user name=$name phone=$phone',
-      );
-      if (_isPhoneAccessRestrictedState(phoneAccessState)) {
-        return const PhoneAccessPendingScreen();
-      }
-      if (name == null || phone == null || phone.trim().isEmpty) {
-        return const PhoneNameScreen(isRegisterFlow: false);
-      }
-      return const MainShell();
-    }
+    return _buildInitialScreenFromRestoredUser(authService.currentUser);
   } catch (e, st) {
     debugPrint('determineInitialScreen restored-user error: $e\n$st');
   }
