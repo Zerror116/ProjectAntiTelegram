@@ -433,11 +433,16 @@ function canReadChat(context, userRole, permissions = {}) {
 
     const adminOnly = isAdminOnlyChannel(context.chat, context.settings);
     if (adminOnly) {
-      return role === "admin" || role === "creator";
+      return isAdminOrCreator(role);
     }
     if (context.visibility === "public") return true;
     if (context.isMember) return true;
-    return role === "worker" || role === "admin" || role === "creator";
+    return (
+      role === "worker" ||
+      role === "admin" ||
+      role === "tenant" ||
+      role === "creator"
+    );
   }
 
   if (isSupportTicketChatContext(context)) {
@@ -482,16 +487,14 @@ function canPostChat(context, userRole, permissions = {}) {
     const adminOnly = isAdminOnlyChannel(context.chat, context.settings);
     if (adminOnly) {
       return (
-        role === "admin" ||
-        role === "creator" ||
+        isAdminOrCreator(role) ||
         hasPermission(permissions, "chat.write.public")
       );
     }
     // В публичных каналах постит только staff с правом chat.write.public
     if (context.visibility === "public") {
       return (
-        role === "admin" ||
-        role === "creator" ||
+        isAdminOrCreator(role) ||
         hasPermission(permissions, "chat.write.public")
       );
     }
@@ -499,6 +502,7 @@ function canPostChat(context, userRole, permissions = {}) {
     if (
       role === "worker" ||
       role === "admin" ||
+      role === "tenant" ||
       role === "creator" ||
       hasPermission(permissions, "chat.write.private")
     )
@@ -529,7 +533,7 @@ function canPostChat(context, userRole, permissions = {}) {
 
 function isAdminOrCreator(role) {
   const normalized = normalizeRole(role);
-  return normalized === "admin" || normalized === "creator";
+  return normalized === "admin" || normalized === "tenant" || normalized === "creator";
 }
 
 function parseMeta(raw) {
@@ -1536,8 +1540,9 @@ router.get("/", requireAuth, async (req, res) => {
     const userIdText = String(userId);
     const role = normalizeRole(req.user.role);
     const workerOrHigher =
-      role === "worker" || role === "admin" || role === "creator";
-    const adminOrCreator = role === "admin" || role === "creator";
+      role === "worker" || role === "admin" || role === "tenant" || role === "creator";
+    const adminOrCreator =
+      role === "admin" || role === "tenant" || role === "creator";
 
     const publicAndChannelQ = await db.query(
       `SELECT c.id,
@@ -1608,7 +1613,7 @@ router.get("/", requireAuth, async (req, res) => {
          WHERE m.chat_id = c.id
            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $4::text)
            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-         ORDER BY m.created_at DESC
+         ORDER BY m.created_at DESC, m.id DESC
          LIMIT 1
        ) AS last_msg ON true
        LEFT JOIN LATERAL (
@@ -1771,7 +1776,7 @@ router.get("/", requireAuth, async (req, res) => {
          WHERE m.chat_id = c.id
            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-         ORDER BY m.created_at DESC
+         ORDER BY m.created_at DESC, m.id DESC
          LIMIT 1
        ) AS last_msg ON true
        LEFT JOIN LATERAL (
@@ -1961,7 +1966,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
        WHERE m.chat_id = $1
          AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
          AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-       ORDER BY m.created_at ASC
+       ORDER BY m.created_at ASC, m.id ASC
        LIMIT 1000`,
       [chatId, String(userId)],
     );

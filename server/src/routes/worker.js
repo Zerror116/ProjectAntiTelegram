@@ -962,19 +962,19 @@ router.get(
                   q.created_at,
                   c.title AS channel_title,
                   p.product_code,
-                  p.shelf_number AS product_shelf_number,
-                  p.title AS product_title,
-                  p.description AS product_description,
-                  p.price AS product_price,
-                  p.quantity AS product_quantity,
-                  p.image_url AS product_image_url
+                  COALESCE(NULLIF(q.payload->>'shelf_number', '')::int, p.shelf_number) AS product_shelf_number,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'title'), ''), p.title) AS product_title,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'description'), ''), p.description) AS product_description,
+                  COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
+                  COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'image_url'), ''), p.image_url) AS product_image_url
            FROM product_publication_queue q
            JOIN products p ON p.id = q.product_id
            JOIN chats c ON c.id = q.channel_id
            WHERE q.queued_by = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
-           ORDER BY q.created_at DESC`,
+           ORDER BY q.created_at DESC, q.id DESC`,
           [actorUserId]
         );
       });
@@ -1025,40 +1025,22 @@ router.patch(
       const result = await runInRequestTenantScope(req, async () => {
         const actorUserId = await resolveActorUserId(db, req.user);
         return db.query(
-          `WITH target AS (
-             SELECT q.id, q.product_id
-             FROM product_publication_queue q
-             WHERE q.id = $1
-               AND q.queued_by = $2
-               AND q.status = 'pending'
-               AND COALESCE(q.is_sent, false) = false
-             LIMIT 1
-           ),
-           product_upd AS (
-             UPDATE products p
-             SET title = $3,
-                 description = $4,
-                 price = $5,
-                 quantity = $6,
-                 shelf_number = COALESCE($7::int, p.shelf_number),
-                 updated_at = now()
-             FROM target t
-             WHERE p.id = t.product_id
-             RETURNING p.id, p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url
-           )
-           UPDATE product_publication_queue q
+          `UPDATE product_publication_queue q
            SET payload = jsonb_strip_nulls(
+                 COALESCE(q.payload, '{}'::jsonb) ||
                  jsonb_build_object(
                    'title', $3,
                    'description', $4,
                    'price', $5,
                    'quantity', $6,
-                   'shelf_number', (SELECT shelf_number FROM product_upd LIMIT 1),
-                   'image_url', (SELECT image_url FROM product_upd LIMIT 1)
+                   'shelf_number', COALESCE($7::int, NULLIF(q.payload->>'shelf_number', '')::int),
+                   'image_url', NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), '')
                  )
                )
            WHERE q.id = $1
-             AND EXISTS (SELECT 1 FROM target)
+             AND q.queued_by = $2
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
            RETURNING q.id`,
           [
             queueId,

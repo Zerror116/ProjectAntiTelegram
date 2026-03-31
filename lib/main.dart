@@ -344,6 +344,11 @@ String _buildConnectivityHint() {
   return 'Проверьте, что сервер запущен и доступен по адресу $base';
 }
 
+Duration _bootstrapRetryDelay(int attemptIndex) {
+  final clamped = attemptIndex.clamp(0, 4);
+  return Duration(milliseconds: 900 + (clamped * 1200));
+}
+
 bool _isLoopbackApiBase(String base) {
   final uri = Uri.tryParse(base);
   final host = (uri?.host ?? '').toLowerCase().trim();
@@ -2361,61 +2366,76 @@ Future<void> disconnectSocket() async {
   }
 }
 
-Future<bool> ensureDatabaseExists() async {
+Future<bool> ensureDatabaseExists({int attempts = 4}) async {
   final candidates = _buildApiBaseCandidates();
   Object? lastError;
+  final totalAttempts = attempts < 1 ? 1 : attempts;
 
-  for (final base in candidates) {
-    _setRuntimeApiBaseUrl(base);
-    try {
-      debugPrint('ensureDatabaseExists: checking /health at $base');
-      final health = await dio.get(
-        '/health',
-        options: Options(
-          sendTimeout: const Duration(seconds: 4),
-          receiveTimeout: const Duration(seconds: 4),
-        ),
-      );
-      debugPrint(
-        'ensureDatabaseExists: /health[$base] status=${health.statusCode}, data=${health.data}',
-      );
-      if (health.statusCode == 200) {
-        final data = health.data;
-        _lastConnectivityHint = '';
-        if (data is Map && data['ok'] == true) return true;
-        return true;
-      }
-    } catch (e) {
-      lastError = e;
-      debugPrint('ensureDatabaseExists: /health[$base] failed: $e');
-    }
-
-    if (_isLoopbackApiBase(base)) {
+  for (var attemptIndex = 0; attemptIndex < totalAttempts; attemptIndex++) {
+    for (final base in candidates) {
+      _setRuntimeApiBaseUrl(base);
       try {
-        debugPrint('ensureDatabaseExists: fallback /api/setup at $base');
-        final resp = await dio.post(
-          '/api/setup',
+        debugPrint(
+          'ensureDatabaseExists: attempt=${attemptIndex + 1}/$totalAttempts checking /health at $base',
+        );
+        final health = await dio.get(
+          '/health',
           options: Options(
-            sendTimeout: const Duration(seconds: 6),
-            receiveTimeout: const Duration(seconds: 6),
+            sendTimeout: const Duration(seconds: 4),
+            receiveTimeout: const Duration(seconds: 4),
           ),
         );
         debugPrint(
-          'ensureDatabaseExists: /api/setup[$base] status=${resp.statusCode}, data=${resp.data}',
+          'ensureDatabaseExists: /health[$base] status=${health.statusCode}, data=${health.data}',
         );
-        if (resp.statusCode == 200) {
-          final data = resp.data;
+        if (health.statusCode == 200) {
+          final data = health.data;
           _lastConnectivityHint = '';
           if (data is Map && data['ok'] == true) return true;
+          return true;
         }
       } catch (e) {
         lastError = e;
-        debugPrint('ensureDatabaseExists fallback[$base] error: $e');
+        debugPrint('ensureDatabaseExists: /health[$base] failed: $e');
       }
-    } else {
+
+      if (_isLoopbackApiBase(base)) {
+        try {
+          debugPrint('ensureDatabaseExists: fallback /api/setup at $base');
+          final resp = await dio.post(
+            '/api/setup',
+            options: Options(
+              sendTimeout: const Duration(seconds: 6),
+              receiveTimeout: const Duration(seconds: 6),
+            ),
+          );
+          debugPrint(
+            'ensureDatabaseExists: /api/setup[$base] status=${resp.statusCode}, data=${resp.data}',
+          );
+          if (resp.statusCode == 200) {
+            final data = resp.data;
+            _lastConnectivityHint = '';
+            if (data is Map && data['ok'] == true) return true;
+          }
+        } catch (e) {
+          lastError = e;
+          debugPrint('ensureDatabaseExists fallback[$base] error: $e');
+        }
+      } else {
+        debugPrint(
+          'ensureDatabaseExists: skip /api/setup for non-local base $base',
+        );
+      }
+
+      _lastConnectivityHint = '';
+    }
+
+    if (attemptIndex < totalAttempts - 1) {
+      final wait = _bootstrapRetryDelay(attemptIndex);
       debugPrint(
-        'ensureDatabaseExists: skip /api/setup for non-local base $base',
+        'ensureDatabaseExists: all candidates failed on attempt ${attemptIndex + 1}, retry in ${wait.inMilliseconds}ms',
       );
+      await Future.delayed(wait);
     }
   }
 
@@ -3434,23 +3454,90 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   }
 }
 
-class SetupFailedScreen extends StatelessWidget {
+class SetupFailedScreen extends StatefulWidget {
   const SetupFailedScreen({super.key});
+
+  @override
+  State<SetupFailedScreen> createState() => _SetupFailedScreenState();
+}
+
+class _SetupFailedScreenState extends State<SetupFailedScreen> {
+  bool _retrying = false;
+  Timer? _retryTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleAutoRetry();
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    super.dispose();
+  }
+
+  void _scheduleAutoRetry() {
+    _retryTimer?.cancel();
+    _retryTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted || _retrying) return;
+      unawaited(_retryConnection(silent: true));
+    });
+  }
+
+  Future<void> _retryConnection({bool silent = false}) async {
+    if (_retrying) return;
+    setState(() => _retrying = true);
+    try {
+      final ok = await ensureDatabaseExists(attempts: 3);
+      if (!mounted) return;
+      if (ok) {
+        final next = await determineInitialScreen(true);
+        if (!mounted) return;
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => next),
+        );
+        return;
+      }
+      if (!silent) {
+        showAppNotice(
+          context,
+          'Сервер пока недоступен. Мы попробуем снова.',
+          tone: AppNoticeTone.warning,
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _retrying = false);
+        _scheduleAutoRetry();
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final hint = _lastConnectivityHint.trim();
     return Scaffold(
-      appBar: AppBar(title: const Text('Ошибка инициализации')),
+      appBar: AppBar(title: const Text('Сервер временно недоступен')),
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text(
-                'Не удалось инициализировать базу данных на сервере.',
+              Text(
+                'Похоже, сервер Феникса был временно недоступен или перезапускался.',
                 textAlign: TextAlign.center,
+                style: theme.textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Мы уже пытаемся переподключиться автоматически. Обычно это занимает несколько секунд.',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
               ),
               const SizedBox(height: 8),
               Text(
@@ -3474,23 +3561,24 @@ class SetupFailedScreen extends StatelessWidget {
                 ),
               ],
               const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: () async {
-                  final ok = await ensureDatabaseExists();
-                  if (!context.mounted) return;
-                  if (ok) {
-                    Navigator.of(context).pushReplacement(
-                      MaterialPageRoute(builder: (_) => const AuthScreen()),
-                    );
-                  } else {
-                    showAppNotice(
-                      context,
-                      'Попытка подключения провалилась',
-                      tone: AppNoticeTone.error,
-                    );
-                  }
-                },
-                child: const Text('Повторить'),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_retrying) ...[
+                    const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2.4),
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                  ElevatedButton(
+                    onPressed: _retrying
+                        ? null
+                        : () => _retryConnection(silent: false),
+                    child: Text(_retrying ? 'Подключаемся...' : 'Повторить сейчас'),
+                  ),
+                ],
               ),
             ],
           ),

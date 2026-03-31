@@ -3529,12 +3529,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (lines.length > 1) {
-      final candidate = lines[1];
-      if (!candidate.toLowerCase().startsWith('id товара:') &&
-          !candidate.toLowerCase().startsWith('цена:') &&
-          !candidate.toLowerCase().startsWith('количество')) {
-        description = candidate;
+      final descriptionLines = <String>[];
+      for (final candidate in lines.skip(1)) {
+        final lower = candidate.toLowerCase();
+        if (lower.startsWith('id товара:') ||
+            lower.startsWith('цена:') ||
+            lower.startsWith('количество') ||
+            lower.startsWith('нажмите "купить"') ||
+            lower.startsWith('нажмите «купить»')) {
+          break;
+        }
+        descriptionLines.add(candidate);
       }
+      description = descriptionLines.join('\n').trim();
     }
 
     return {'title': title, 'description': description};
@@ -5537,6 +5544,39 @@ class _ChatScreenState extends State<ChatScreen> {
       if (imageUrl == null) return const SizedBox.shrink();
       final wantsFullWidth = width == double.infinity;
       final resolvedWidth = wantsFullWidth ? maxBubbleWidth : (width ?? defaultImageWidth);
+      final placeholderHeight = (defaultImageMaxHeight * 0.58).clamp(160.0, 280.0);
+      Widget buildImagePlaceholder({bool loading = false}) => Container(
+        constraints: BoxConstraints(
+          minHeight: placeholderHeight,
+          maxHeight: defaultImageMaxHeight,
+        ),
+        color: theme.colorScheme.surfaceContainerHighest,
+        alignment: Alignment.center,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (loading)
+              const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else
+              Icon(
+                Icons.image_outlined,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            const SizedBox(height: 10),
+            Text(
+              loading ? 'Загружаем фото...' : 'Фото недоступно',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      );
       return GestureDetector(
         onTap: () => _openImagePreview(imageUrl),
         child: ClipRRect(
@@ -5552,14 +5592,11 @@ class _ChatScreenState extends State<ChatScreen> {
                 imageUrl,
                 width: resolvedWidth,
                 fit: BoxFit.contain,
-                errorBuilder: (_, error, stackTrace) => Container(
-                  color: theme.colorScheme.surfaceContainerHighest,
-                  alignment: Alignment.center,
-                  child: Icon(
-                    Icons.broken_image_outlined,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
+                loadingBuilder: (context, child, loadingProgress) {
+                  if (loadingProgress == null) return child;
+                  return buildImagePlaceholder(loading: true);
+                },
+                errorBuilder: (_, error, stackTrace) => buildImagePlaceholder(),
               ),
             ),
           ),
@@ -5786,7 +5823,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               if ((catalogTexts['description'] ?? '').isNotEmpty) ...[
                 const SizedBox(height: 6),
-                Text(
+                _buildHighlightedText(
                   catalogTexts['description'] ?? '',
                   style: TextStyle(
                     color: theme.colorScheme.onSurfaceVariant,

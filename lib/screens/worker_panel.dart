@@ -360,7 +360,23 @@ class _WorkerPanelState extends State<WorkerPanel>
     return normalized;
   }
 
-  Future<void> _showShelfFullscreenNotice(int shelfNumber) async {
+  Map<String, dynamic> _productFromOwnQueuedPost(Map<String, dynamic> post) {
+    return {
+      'id': (post['product_id'] ?? '').toString(),
+      'title': (post['product_title'] ?? '').toString(),
+      'description': (post['product_description'] ?? '').toString(),
+      'price': post['product_price'],
+      'quantity': post['product_quantity'],
+      'image_url': (post['product_image_url'] ?? '').toString(),
+      'product_code': post['product_code'],
+      'shelf_number': post['product_shelf_number'],
+    };
+  }
+
+  Future<void> _showShelfFullscreenNotice(
+    int shelfNumber, {
+    String? productLabel,
+  }) async {
     if (!mounted) return;
     await showGeneralDialog<void>(
       context: context,
@@ -395,6 +411,44 @@ class _WorkerPanelState extends State<WorkerPanel>
                           fontWeight: FontWeight.w800,
                         ),
                       ),
+                      if ((productLabel ?? '').trim().isNotEmpty) ...[
+                        const SizedBox(height: 18),
+                        Text(
+                          'ID товара',
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            color: theme.colorScheme.onErrorContainer
+                                .withValues(alpha: 0.86),
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.4,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 14,
+                          ),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.onErrorContainer
+                                .withValues(alpha: 0.09),
+                            borderRadius: BorderRadius.circular(24),
+                            border: Border.all(
+                              color: theme.colorScheme.onErrorContainer
+                                  .withValues(alpha: 0.18),
+                            ),
+                          ),
+                          child: Text(
+                            productLabel!.trim(),
+                            textAlign: TextAlign.center,
+                            style: theme.textTheme.headlineMedium?.copyWith(
+                              color: theme.colorScheme.onErrorContainer,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 1.2,
+                            ),
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 10),
                       Text(
                         'Нажмите в любом месте, чтобы закрыть',
@@ -1345,7 +1399,10 @@ class _WorkerPanelState extends State<WorkerPanel>
             duration: const Duration(milliseconds: 1400),
           );
           if (shelfNumber != null) {
-            await _showShelfFullscreenNotice(shelfNumber);
+            await _showShelfFullscreenNotice(
+              shelfNumber,
+              productLabel: productLabel,
+            );
           }
         }
         await playAppSound(AppUiSound.success);
@@ -1510,7 +1567,10 @@ class _WorkerPanelState extends State<WorkerPanel>
             tone: AppNoticeTone.success,
           );
           if (shelfNumber != null) {
-            await _showShelfFullscreenNotice(shelfNumber);
+            await _showShelfFullscreenNotice(
+              shelfNumber,
+              productLabel: productLabel,
+            );
           }
         }
         await playAppSound(AppUiSound.success);
@@ -1608,7 +1668,10 @@ class _WorkerPanelState extends State<WorkerPanel>
             tone: AppNoticeTone.success,
           );
           if (shelfNumber != null) {
-            await _showShelfFullscreenNotice(shelfNumber);
+            await _showShelfFullscreenNotice(
+              shelfNumber,
+              productLabel: productLabel,
+            );
           }
         }
         await playAppSound(AppUiSound.success);
@@ -2329,12 +2392,28 @@ class _WorkerPanelState extends State<WorkerPanel>
                       ),
                     ),
                     const SizedBox(width: 8),
-                    FilledButton.tonalIcon(
-                      onPressed: _savingOwnPost
-                          ? null
-                          : () => _editOwnQueuedPost(post),
-                      icon: const Icon(Icons.edit_outlined, size: 18),
-                      label: const Text('Изменить'),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      alignment: WrapAlignment.end,
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed: _savingOwnPost
+                              ? null
+                              : () => _editOwnQueuedPost(post),
+                          icon: const Icon(Icons.edit_outlined, size: 18),
+                          label: const Text('Изменить'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _posting
+                              ? null
+                              : () => _quickDuplicateProduct(
+                                  _productFromOwnQueuedPost(post),
+                                ),
+                          icon: const Icon(Icons.content_copy_outlined, size: 18),
+                          label: const Text('Дубль'),
+                        ),
+                      ],
                     ),
                   ],
                 ),

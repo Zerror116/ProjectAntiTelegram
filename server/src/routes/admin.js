@@ -2718,7 +2718,7 @@ router.post(
 router.get(
   "/channels/pending_posts",
   requireAuth,
-  requireRole("admin", "creator"),
+  requireRole("admin", "tenant", "creator"),
   requireProductPublishPermission,
   async (req, res) => {
     try {
@@ -2735,12 +2735,12 @@ router.get(
                   q.payload,
                   q.created_at,
                   c.title AS channel_title,
-                  p.title AS product_title,
-                  p.description AS product_description,
-                  p.price AS product_price,
-                  p.quantity AS product_quantity,
-                  p.shelf_number AS product_shelf_number,
-                  p.image_url AS product_image_url,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'title'), ''), p.title) AS product_title,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'description'), ''), p.description) AS product_description,
+                  COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
+                  COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
+                  COALESCE(NULLIF(q.payload->>'shelf_number', '')::int, p.shelf_number) AS product_shelf_number,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'image_url'), ''), p.image_url) AS product_image_url,
                   p.product_code,
                   u.email AS queued_by_email,
                   u.name AS queued_by_name
@@ -2751,7 +2751,7 @@ router.get(
            WHERE q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
              AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
-           ORDER BY q.created_at ASC`,
+           ORDER BY q.created_at ASC, q.id ASC`,
             [req.user.tenant_id || null],
           );
           const reservedStats = await db.query(
@@ -2784,7 +2784,7 @@ router.get(
 router.patch(
   "/channels/pending_posts/:queueId",
   requireAuth,
-  requireRole("admin", "creator"),
+  requireRole("admin", "tenant", "creator"),
   requireProductPublishPermission,
   async (req, res) => {
     const queueId = String(req.params.queueId || "").trim();
@@ -2824,41 +2824,27 @@ router.patch(
     }
     try {
       const updated = await db.query(
-         `WITH target AS (
-           SELECT q.id, q.product_id
-           FROM product_publication_queue q
-           JOIN chats c ON c.id = q.channel_id
-           WHERE q.id = $1
-             AND q.status = 'pending'
-             AND COALESCE(q.is_sent, false) = false
-             AND ($7::uuid IS NULL OR c.tenant_id = $7::uuid)
-           LIMIT 1
-         ),
-         product_upd AS (
-           UPDATE products p
-           SET title = $2,
-               description = $3,
-               price = $4,
-               quantity = $5,
-               shelf_number = COALESCE($6::int, p.shelf_number),
-                updated_at = now()
-           FROM target t
-           WHERE p.id = t.product_id
-           RETURNING p.id, p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url, p.product_code
-         )
-         UPDATE product_publication_queue q
+         `UPDATE product_publication_queue q
          SET payload = jsonb_strip_nulls(
+               COALESCE(q.payload, '{}'::jsonb) ||
                jsonb_build_object(
                  'title', $2,
                  'description', $3,
                  'price', $4,
                  'quantity', $5,
-                 'shelf_number', (SELECT shelf_number FROM product_upd LIMIT 1),
-                 'image_url', (SELECT image_url FROM product_upd LIMIT 1)
+                 'shelf_number', COALESCE($6::int, NULLIF(q.payload->>'shelf_number', '')::int),
+                 'image_url', NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), '')
                )
              )
          WHERE q.id = $1
-           AND EXISTS (SELECT 1 FROM target)
+           AND q.status = 'pending'
+           AND COALESCE(q.is_sent, false) = false
+           AND EXISTS (
+             SELECT 1
+             FROM chats c
+             WHERE c.id = q.channel_id
+               AND ($7::uuid IS NULL OR c.tenant_id = $7::uuid)
+           )
          RETURNING q.id`,
         [
           queueId,
@@ -3422,7 +3408,7 @@ router.post(
 router.post(
   "/channels/publish_pending",
   requireAuth,
-  requireRole("admin", "creator"),
+  requireRole("admin", "tenant", "creator"),
   requireProductPublishPermission,
   antifraudGuard("admin.publish_pending", (req) => ({
     channel_id: req.body?.channel_id || null,
@@ -3470,7 +3456,7 @@ router.post(
                WHERE c.id = q.channel_id
                  AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
              )
-           ORDER BY q.created_at ASC
+           ORDER BY q.created_at ASC, q.id ASC
            FOR UPDATE OF q`,
           [queueIds, req.user.tenant_id || null],
         );
@@ -3491,7 +3477,7 @@ router.post(
              LEFT JOIN users u ON u.id = q.queued_by
              LEFT JOIN phones ph ON ph.user_id = q.queued_by
              WHERE q.id = ANY($1::uuid[])
-             ORDER BY q.created_at ASC`,
+             ORDER BY q.created_at ASC, q.id ASC`,
             [lockedIds],
           );
           rows = detailsQ.rows;
@@ -3509,7 +3495,7 @@ router.post(
                WHERE c.id = q.channel_id
                  AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
              )
-           ORDER BY q.created_at ASC
+           ORDER BY q.created_at ASC, q.id ASC
            FOR UPDATE OF q`,
           [channelId, req.user.tenant_id || null],
         );
@@ -3530,7 +3516,7 @@ router.post(
              LEFT JOIN users u ON u.id = q.queued_by
              LEFT JOIN phones ph ON ph.user_id = q.queued_by
              WHERE q.id = ANY($1::uuid[])
-             ORDER BY q.created_at ASC`,
+             ORDER BY q.created_at ASC, q.id ASC`,
             [lockedIds],
           );
           rows = detailsQ.rows;
@@ -3577,9 +3563,9 @@ router.post(
 
         const rawNextPrice = Number(payload.price ?? row.price ?? 0);
         const fallbackPrice = Number(row.price ?? 0);
-        const nextPrice = Number.isFinite(rawNextPrice) && rawNextPrice >= 0
+        const nextPrice = Number.isFinite(rawNextPrice) && rawNextPrice > 0
           ? rawNextPrice
-          : (Number.isFinite(fallbackPrice) && fallbackPrice >= 0 ? fallbackPrice : 0);
+          : (Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : 0);
 
         const rawNextQuantity = Number(payload.quantity ?? row.quantity ?? 1);
         const fallbackQuantity = Number(row.quantity ?? 1);
@@ -3588,6 +3574,13 @@ router.post(
           : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
             ? Math.floor(fallbackQuantity)
             : 1);
+        if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+          skipped.push({
+            queue_id: row.id,
+            reason: "Цена товара должна быть больше нуля",
+          });
+          continue;
+        }
         const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 0);
         const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
           ? Math.floor(rawNextShelf)
@@ -3649,7 +3642,7 @@ router.post(
 
         const messageInsert = await client.query(
           `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-         VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+         VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
           [
             uuidv4(),
@@ -3710,7 +3703,7 @@ router.post(
           };
           const archiveMessageInsert = await client.query(
             `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-             VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+             VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
              RETURNING id`,
             [
               uuidv4(),
