@@ -14,10 +14,12 @@ BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
 HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
-APK_DEFAULT_FILE_NAME="${APK_DEFAULT_FILE_NAME:-fenix-1.0.1.apk}"
+APK_DEFAULT_FILE_NAME="${APK_DEFAULT_FILE_NAME:-}"
 APK_SOURCE="${APK_SOURCE:-}"
 SKIP_BUILD="0"
 NO_COMMIT="0"
+APP_VERSION_NAME=""
+APP_BUILD_NUMBER=""
 
 CURRENT_BRANCH="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD)"
 BRANCH="${BRANCH:-$CURRENT_BRANCH}"
@@ -43,7 +45,7 @@ Important env vars:
   BRANCH=master
   REMOTE_SERVICE=auto              # or explicit, e.g. fenix-api.service
   RUN_ANALYZE=1                    # set 0 to skip flutter analyze
-  APK_DEFAULT_FILE_NAME=fenix-1.0.1.apk
+  APK_DEFAULT_FILE_NAME=fenix-<app-version>.apk
   APK_SOURCE=build/app/outputs/flutter-apk/app-release.apk
 
 Examples:
@@ -115,6 +117,38 @@ echo "[deploy_full] server:  $SERVER"
 echo "[deploy_full] remote project: $REMOTE_PROJECT_DIR"
 echo "[deploy_full] remote web root: $REMOTE_WEB_ROOT"
 echo "[deploy_full] remote downloads: $REMOTE_DOWNLOADS_DIR"
+
+resolve_app_version_info() {
+  local version_line raw version_name build_number
+  version_line="$(sed -n 's/^version:[[:space:]]*//p' "$PROJECT_ROOT/pubspec.yaml" | head -n 1 | tr -d '\r')"
+  raw="$(printf '%s' "$version_line" | xargs)"
+  if [[ -z "$raw" ]]; then
+    return 1
+  fi
+  version_name="${raw%%+*}"
+  build_number="${raw#*+}"
+  if [[ "$build_number" == "$raw" ]]; then
+    build_number=""
+  fi
+  if [[ -z "$version_name" ]]; then
+    return 1
+  fi
+  APP_VERSION_NAME="$version_name"
+  APP_BUILD_NUMBER="$build_number"
+  if [[ -z "$APK_DEFAULT_FILE_NAME" ]]; then
+    APK_DEFAULT_FILE_NAME="fenix-${APP_VERSION_NAME}.apk"
+  fi
+}
+
+if resolve_app_version_info; then
+  echo "[deploy_full] app version: ${APP_VERSION_NAME}+${APP_BUILD_NUMBER:-0}"
+  echo "[deploy_full] apk file:    $APK_DEFAULT_FILE_NAME"
+else
+  echo "[deploy_full] warning: could not parse version from pubspec.yaml"
+  if [[ -z "$APK_DEFAULT_FILE_NAME" ]]; then
+    APK_DEFAULT_FILE_NAME="fenix-latest.apk"
+  fi
+fi
 
 detect_apk_source() {
   if [[ -n "$APK_SOURCE" && -f "$APK_SOURCE" ]]; then
@@ -233,6 +267,8 @@ run_ssh "$SERVER" \
   REMOTE_DOWNLOADS_DIR="$REMOTE_DOWNLOADS_DIR" \
   REMOTE_SERVICE="$REMOTE_SERVICE" \
   APK_DEFAULT_FILE_NAME="$APK_DEFAULT_FILE_NAME" \
+  APP_VERSION_NAME="$APP_VERSION_NAME" \
+  APP_BUILD_NUMBER="$APP_BUILD_NUMBER" \
   REMOTE_APK_TMP_PATH="${REMOTE_APK_TMP_PATH:-}" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
@@ -250,10 +286,29 @@ git reset --hard "origin/$BRANCH"
 if [[ -d "$REMOTE_PROJECT_DIR/server" ]]; then
   cd "$REMOTE_PROJECT_DIR/server"
   if [[ -n "${APK_DEFAULT_FILE_NAME:-}" ]]; then
+    if grep -q '^APP_UPDATE_ANDROID_ENABLED=' .env 2>/dev/null; then
+      sed -i.bak "s#^APP_UPDATE_ANDROID_ENABLED=.*#APP_UPDATE_ANDROID_ENABLED=true#" .env
+    else
+      printf '\nAPP_UPDATE_ANDROID_ENABLED=true\n' >> .env
+    fi
     if grep -q '^APP_UPDATE_ANDROID_DEFAULT_FILE=' .env 2>/dev/null; then
       sed -i.bak "s#^APP_UPDATE_ANDROID_DEFAULT_FILE=.*#APP_UPDATE_ANDROID_DEFAULT_FILE=$APK_DEFAULT_FILE_NAME#" .env
     else
       printf '\nAPP_UPDATE_ANDROID_DEFAULT_FILE=%s\n' "$APK_DEFAULT_FILE_NAME" >> .env
+    fi
+    if [[ -n "${APP_VERSION_NAME:-}" ]]; then
+      if grep -q '^APP_UPDATE_ANDROID_LATEST_VERSION=' .env 2>/dev/null; then
+        sed -i.bak "s#^APP_UPDATE_ANDROID_LATEST_VERSION=.*#APP_UPDATE_ANDROID_LATEST_VERSION=$APP_VERSION_NAME#" .env
+      else
+        printf 'APP_UPDATE_ANDROID_LATEST_VERSION=%s\n' "$APP_VERSION_NAME" >> .env
+      fi
+    fi
+    if [[ -n "${APP_BUILD_NUMBER:-}" ]]; then
+      if grep -q '^APP_UPDATE_ANDROID_LATEST_BUILD=' .env 2>/dev/null; then
+        sed -i.bak "s#^APP_UPDATE_ANDROID_LATEST_BUILD=.*#APP_UPDATE_ANDROID_LATEST_BUILD=$APP_BUILD_NUMBER#" .env
+      else
+        printf 'APP_UPDATE_ANDROID_LATEST_BUILD=%s\n' "$APP_BUILD_NUMBER" >> .env
+      fi
     fi
     rm -f .env.bak || true
   fi

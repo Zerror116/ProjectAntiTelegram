@@ -673,7 +673,7 @@ async function canUserAccessChat(user, chatId) {
       kind === "bug_reports" ||
       isBugReportsByTitle;
     if (adminOnly) {
-      return role === "admin" || role === "creator";
+      return role === "admin" || role === "tenant" || role === "creator";
     }
     const visibility =
       String(settings.visibility || "public").toLowerCase() === "private"

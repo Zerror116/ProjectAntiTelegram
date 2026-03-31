@@ -377,7 +377,17 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   bool _canViewModerationTab() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
     return _hasAnyPermission(const ['product.publish', 'reservation.fulfill']);
+  }
+
+  bool _canPublishProducts() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    if (role == 'admin' || role == 'tenant') return true;
+    return _hasPermission('product.publish');
   }
 
   bool _canViewDeliveryTab() {
@@ -5564,10 +5574,10 @@ class _AdminPanelState extends State<AdminPanel>
   }
 
   Future<void> _publishPendingPosts() async {
-    if (!_ensurePermission(
-      'product.publish',
-      'Недостаточно прав для публикации постов',
-    )) {
+    if (!_canPublishProducts()) {
+      if (mounted) {
+        setState(() => _message = 'Недостаточно прав для публикации постов');
+      }
       return;
     }
     setState(() {
@@ -6992,7 +7002,7 @@ class _AdminPanelState extends State<AdminPanel>
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
-              onPressed: (_publishing || !_hasPermission('product.publish'))
+              onPressed: (_publishing || !_canPublishProducts())
                   ? null
                   : _publishPendingPosts,
               icon: _publishing
@@ -7123,7 +7133,7 @@ class _AdminPanelState extends State<AdminPanel>
                                 children: [
                                   _buildModerationChip('ID $productLabel'),
                                   _buildModerationChip(
-                                    '${_toInt(p['product_price'])} ₽',
+                                    _formatMoney(p['product_price']),
                                   ),
                                   _buildModerationChip(
                                     'x${_toInt(p['product_quantity'])}',
