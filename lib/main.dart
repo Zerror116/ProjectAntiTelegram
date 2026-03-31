@@ -1235,6 +1235,7 @@ String? _resolveAppUpdatePlatform() {
 }
 
 bool _nativeDesktopUpdateBusy = false;
+bool _nativeAndroidUpdateBusy = false;
 
 Uri? _resolveUpdateUri(String rawUrl) {
   final trimmed = rawUrl.trim();
@@ -1268,13 +1269,111 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   required Uri uri,
   required _AppUpdateVersion latest,
 }) async {
-  final savePath = await NativeUpdateInstaller.downloadPackage(
-    url: uri,
-    fallbackFileName: _fallbackInstallerNameForPlatform('android', latest),
-    headers: const {'X-Fenix-Platform': 'android'},
-  );
-  if (savePath == null || savePath.trim().isEmpty) return false;
-  return NativeUpdateInstaller.openDownloadedPackage(savePath);
+  if (_nativeAndroidUpdateBusy) {
+    showGlobalAppNotice(
+      'Обновление уже скачивается. Дождитесь завершения текущей загрузки.',
+      title: 'Обновление Феникс',
+      tone: AppNoticeTone.info,
+    );
+    return true;
+  }
+
+  _nativeAndroidUpdateBusy = true;
+  final progress = ValueNotifier<double?>(null);
+  final stage = ValueNotifier<String>('Скачиваем обновление...');
+  BuildContext? dialogContext;
+  final context = navigatorKey.currentContext;
+
+  if (context != null && context.mounted) {
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) {
+          dialogContext = ctx;
+          return PopScope(
+            canPop: false,
+            child: AlertDialog(
+              title: const Text('Обновление Феникс'),
+              content: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 360),
+                child: ValueListenableBuilder<String>(
+                  valueListenable: stage,
+                  builder: (context, stageText, _) {
+                    return ValueListenableBuilder<double?>(
+                      valueListenable: progress,
+                      builder: (context, value, child) {
+                        final percentText = value == null
+                            ? 'Подождите, это может занять до пары минут.'
+                            : '${(value * 100).clamp(0, 100).toStringAsFixed(0)}%';
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(stageText),
+                            const SizedBox(height: 12),
+                            LinearProgressIndicator(value: value),
+                            const SizedBox(height: 12),
+                            Text(
+                              percentText,
+                              style: Theme.of(
+                                context,
+                              ).textTheme.bodySmall?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+  }
+
+  try {
+    final savePath = await NativeUpdateInstaller.downloadPackage(
+      url: uri,
+      fallbackFileName: _fallbackInstallerNameForPlatform('android', latest),
+      headers: const {'X-Fenix-Platform': 'android'},
+      onProgress: (received, total) {
+        if (total > 0) {
+          progress.value = (received / total).clamp(0, 1).toDouble();
+        } else {
+          progress.value = null;
+        }
+      },
+    );
+    if (savePath == null || savePath.trim().isEmpty) {
+      return false;
+    }
+
+    stage.value = 'Открываем установщик...';
+    final opened = await NativeUpdateInstaller.openDownloadedPackage(savePath);
+    if (opened) return true;
+
+    stage.value = 'Не удалось открыть установщик, пробуем через браузер...';
+    try {
+      return await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      return false;
+    }
+  } finally {
+    if (dialogContext != null && dialogContext!.mounted) {
+      Navigator.of(dialogContext!).pop();
+    }
+    progress.dispose();
+    stage.dispose();
+    _nativeAndroidUpdateBusy = false;
+  }
 }
 
 Future<void> _downloadAndInstallDesktopUpdateInBackground({
@@ -3178,6 +3277,8 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           final successMessage =
               info.platform == 'windows' || info.platform == 'macos'
               ? 'Обновление скачивается в фоне. После загрузки запустится установщик, и приложение закроется автоматически.'
+              : info.platform == 'android'
+              ? 'APK скачан. Если Android спросит разрешение, разрешите установку неизвестных приложений для Феникс.'
               : 'Открыта ссылка на обновление Феникс.';
           showGlobalAppNotice(
             successMessage,
