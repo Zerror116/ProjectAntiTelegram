@@ -442,6 +442,36 @@ class AuthService {
     }
   }
 
+  Future<bool> _restoreLocalSessionFallback({String? token}) async {
+    try {
+      _currentUser ??= await _readStoredUserSnapshot();
+      final candidateToken = token ?? await getToken();
+      if (_currentUser == null &&
+          candidateToken != null &&
+          candidateToken.trim().isNotEmpty) {
+        _currentUser = _decodeUserFromTokenUnsafe(candidateToken);
+      }
+      if (_currentUser == null) return false;
+
+      final prefs = await SharedPreferences.getInstance();
+      if (_currentUser?.role.toLowerCase().trim() == 'creator') {
+        _viewRole = prefs.getString(_viewRoleKey);
+      } else {
+        _viewRole = null;
+      }
+      try {
+        _authController.add(_currentUser);
+      } catch (_) {}
+      debugPrint(
+        '⚠️ Restored local auth session without fresh server confirmation: ${_currentUser?.email}',
+      );
+      return true;
+    } catch (e) {
+      debugPrint('⚠️ Failed to restore local auth session: $e');
+      return false;
+    }
+  }
+
   User? _decodeUserFromTokenUnsafe(String token) {
     try {
       final parts = token.split('.');
@@ -927,9 +957,10 @@ class AuthService {
 
   /// Попытка обновить токен при старте (восстановить сессию)
   Future<bool> tryRefreshOnStartup() async {
+    String? token;
     try {
       debugPrint('🔄 tryRefreshOnStartup called');
-      final token = await getToken();
+      token = await getToken();
       if (token == null || token.isEmpty) {
         debugPrint('❌ No token in storage');
         return false;
@@ -937,6 +968,7 @@ class AuthService {
 
       debugPrint('✅ Token found in storage, setting auth header');
       _setAuthHeader(token);
+      await _restoreLocalSessionFallback(token: token);
 
       // Проверяем, валиден ли токен, запрашивая профиль
       final resp = await dio.get(
@@ -970,16 +1002,32 @@ class AuthService {
       return false;
     } on DioException catch (e) {
       final status = e.response?.statusCode;
-      debugPrint('❌ tryRefreshOnStartup dio error: $e');
       // Временная недоступность сервера не должна выбрасывать пользователя из сессии.
       // Очищаем токен только если сервер явно вернул auth-ошибку.
       if (status == 401 || status == 403) {
+        debugPrint('❌ tryRefreshOnStartup auth error: $e');
         await clearToken();
+        return false;
       }
-      return false;
+      final restored = await _restoreLocalSessionFallback(token: token);
+      if (restored) {
+        debugPrint(
+          '⚠️ tryRefreshOnStartup dio warning, using local session fallback: $e',
+        );
+      } else {
+        debugPrint('❌ tryRefreshOnStartup dio error: $e');
+      }
+      return restored;
     } catch (e) {
-      debugPrint('❌ tryRefreshOnStartup error: $e');
-      return false;
+      final restored = await _restoreLocalSessionFallback(token: token);
+      if (restored) {
+        debugPrint(
+          '⚠️ tryRefreshOnStartup warning, using local session fallback: $e',
+        );
+      } else {
+        debugPrint('❌ tryRefreshOnStartup error: $e');
+      }
+      return restored;
     }
   }
 

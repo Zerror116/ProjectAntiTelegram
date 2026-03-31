@@ -78,6 +78,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _buyLoading = false;
   bool _mediaUploading = false;
   bool _markingPlaced = false;
+  bool _messagesLoadInFlight = false;
   bool _searchMode = false;
   bool _voiceRecording = false;
   bool _voiceSending = false;
@@ -1052,40 +1053,105 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _loadMessages() async {
-    setState(() => _loading = true);
+    if (_messagesLoadInFlight) return;
+    _messagesLoadInFlight = true;
+    if (mounted) {
+      setState(() => _loading = true);
+    }
     try {
-      final resp = await authService.dio.get(
-        '/api/chats/${widget.chatId}/messages',
-      );
-      final data = resp.data;
-      if (data is Map && data['ok'] == true && data['data'] is List) {
-        final messages = List<Map<String, dynamic>>.from(data['data'])
-          ..sort(_compareByCreatedAt);
-        setState(() {
-          _messages = messages;
-          _incomingQueue.clear();
-          _appearingMessageIds.clear();
-          _messageIds
-            ..clear()
-            ..addAll(
-              messages
-                  .map((m) => m['id']?.toString())
-                  .where((id) => id != null && id.isNotEmpty)
-                  .cast<String>(),
-            );
-          _messageItemKeys.removeWhere((id, _) => !_messageIds.contains(id));
-        });
-        _incomingTimer?.cancel();
-        _incomingTimer = null;
-        _recomputeSearchResults(keepCurrent: false);
-        _scrollToBottom(animated: false);
-        _scheduleReadSync();
+      const maxAttempts = 3;
+      Object? lastError;
+      for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          final resp = await authService.dio.get(
+            '/api/chats/${widget.chatId}/messages',
+            options: Options(
+              connectTimeout: const Duration(seconds: 15),
+              sendTimeout: const Duration(seconds: 15),
+              receiveTimeout: const Duration(seconds: 20),
+            ),
+          );
+          final data = resp.data;
+          if (data is Map && data['ok'] == true && data['data'] is List) {
+            final messages = List<Map<String, dynamic>>.from(data['data'])
+              ..sort(_compareByCreatedAt);
+            if (mounted) {
+              setState(() {
+                _messages = messages;
+                _incomingQueue.clear();
+                _appearingMessageIds.clear();
+                _messageIds
+                  ..clear()
+                  ..addAll(
+                    messages
+                        .map((m) => m['id']?.toString())
+                        .where((id) => id != null && id.isNotEmpty)
+                        .cast<String>(),
+                  );
+                _messageItemKeys.removeWhere(
+                  (id, _) => !_messageIds.contains(id),
+                );
+              });
+            } else {
+              _messages = messages;
+            }
+            _incomingTimer?.cancel();
+            _incomingTimer = null;
+            _recomputeSearchResults(keepCurrent: false);
+            _scrollToBottom(animated: false);
+            _scheduleReadSync();
+          }
+          lastError = null;
+          break;
+        } catch (e) {
+          lastError = e;
+          debugPrint(
+            'Error loading messages (attempt $attempt/$maxAttempts): $e',
+          );
+          final shouldRetry =
+              _isTransientMessageLoadError(e) && attempt < maxAttempts;
+          if (!shouldRetry) {
+            break;
+          }
+          await Future<void>.delayed(
+            Duration(milliseconds: 700 * attempt),
+          );
+        }
       }
-    } catch (e) {
-      debugPrint('Error loading messages: $e');
+      if (lastError != null) {
+        debugPrint('Error loading messages: $lastError');
+        if (mounted && _messages.isEmpty && _isTransientMessageLoadError(lastError)) {
+          showAppNotice(
+            context,
+            'Сеть нестабильна, пробуем загрузить чат повторно',
+            tone: AppNoticeTone.warning,
+            duration: const Duration(seconds: 2),
+          );
+        }
+      }
     } finally {
+      _messagesLoadInFlight = false;
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  bool _isTransientMessageLoadError(Object error) {
+    if (error is! DioException) return false;
+    if (error.type == DioExceptionType.connectionError ||
+        error.type == DioExceptionType.connectionTimeout ||
+        error.type == DioExceptionType.sendTimeout ||
+        error.type == DioExceptionType.receiveTimeout) {
+      return true;
+    }
+    final text = (error.message ?? '').toLowerCase();
+    return text.contains('xmlhttprequest error') ||
+        text.contains('network error') ||
+        text.contains('connection refused') ||
+        text.contains('failed host lookup') ||
+        text.contains('socketexception') ||
+        text.contains('network is unreachable') ||
+        text.contains('http2') ||
+        text.contains('ping failed');
   }
 
   Future<void> _copyText(String text) async {
