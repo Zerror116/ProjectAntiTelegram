@@ -390,6 +390,12 @@ class _AdminPanelState extends State<AdminPanel>
     return _hasPermission('product.publish');
   }
 
+  bool _canDeletePendingPost() {
+    if (_isCreatorBase()) return true;
+    final role = authService.effectiveRole;
+    return role == 'admin' || role == 'tenant';
+  }
+
   bool _canViewDeliveryTab() {
     return _hasPermission('delivery.manage') || _isCreatorBase();
   }
@@ -5960,6 +5966,53 @@ class _AdminPanelState extends State<AdminPanel>
     descCtrl.dispose();
   }
 
+  Future<void> _deletePendingPost(Map<String, dynamic> post) async {
+    final title = (post['product_title'] ?? 'этот пост').toString().trim();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Удалить пост из модерации?'),
+        content: Text(
+          'Удалить "$title" из очереди модерации?\n\nПосле этого он не уйдёт на канал.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    setState(() {
+      _saving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.delete(
+        '/api/admin/channels/pending_posts/${post['id']}',
+      );
+      await _loadPendingPosts();
+      if (!mounted) return;
+      setState(() => _message = 'Пост удалён из модерации');
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка удаления поста: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      }
+    }
+  }
+
   Future<void> _openClientsDialog(String channelId, String channelTitle) async {
     final overview = await _loadChannelOverview(channelId, force: true);
     if (!mounted || overview == null) return;
@@ -7160,10 +7213,29 @@ class _AdminPanelState extends State<AdminPanel>
                           ),
                         ),
                         const SizedBox(width: 8),
-                        FilledButton.tonalIcon(
-                          onPressed: _saving ? null : () => _editPendingPost(p),
-                          icon: const Icon(Icons.edit_outlined, size: 18),
-                          label: const Text('Изменить'),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            FilledButton.tonalIcon(
+                              onPressed: _saving
+                                  ? null
+                                  : () => _editPendingPost(p),
+                              icon: const Icon(Icons.edit_outlined, size: 18),
+                              label: const Text('Изменить'),
+                            ),
+                            if (_canDeletePendingPost())
+                              OutlinedButton.icon(
+                                onPressed: _saving
+                                    ? null
+                                    : () => _deletePendingPost(p),
+                                icon: const Icon(
+                                  Icons.delete_outline,
+                                  size: 18,
+                                ),
+                                label: const Text('Удалить'),
+                              ),
+                          ],
                         ),
                       ],
                     ),

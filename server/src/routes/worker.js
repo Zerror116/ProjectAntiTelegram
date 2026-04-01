@@ -1067,6 +1067,43 @@ router.patch(
   }
 );
 
+router.delete(
+  '/queue/:queueId',
+  authMiddleware,
+  requireRole('worker', 'admin', 'tenant', 'creator'),
+  async (req, res) => {
+    const queueId = String(req.params.queueId || '').trim();
+    if (!queueId) {
+      return res.status(400).json({ ok: false, error: 'queueId обязателен' });
+    }
+
+    try {
+      const result = await runInRequestTenantScope(req, async () => {
+        const actorUserId = await resolveActorUserId(db, req.user);
+        return db.query(
+          `DELETE FROM product_publication_queue q
+           WHERE q.id = $1
+             AND q.queued_by = $2
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+           RETURNING q.id`,
+          [queueId, actorUserId]
+        );
+      });
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: 'Пост не найден, уже опубликован или не принадлежит вам',
+        });
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('worker.queue.delete error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  }
+);
+
 router.get(
   '/revision/dates',
   authMiddleware,
