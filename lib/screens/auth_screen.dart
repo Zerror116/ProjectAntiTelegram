@@ -43,6 +43,7 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _handledIncomingAuthAction = false;
   bool _emailRecoveryEnabled = false;
   bool _emailRecoveryStatusLoaded = false;
+  bool _registrationEmailCodeEnabled = false;
 
   late final AuthService _authService;
 
@@ -764,18 +765,154 @@ class _AuthScreenState extends State<AuthScreen> {
       final magicLinkEnabled =
           payload['magic_link_enabled'] == true ||
           payload['mail_configured'] == true;
+      final registrationEmailCodeEnabled =
+          payload['registration_email_code_enabled'] == true ||
+          payload['mail_configured'] == true;
       if (!mounted) return;
       setState(() {
         _emailRecoveryEnabled = passwordResetEnabled || magicLinkEnabled;
+        _registrationEmailCodeEnabled = registrationEmailCodeEnabled;
         _emailRecoveryStatusLoaded = true;
       });
     } catch (_) {
       if (!mounted) return;
       setState(() {
         _emailRecoveryEnabled = false;
+        _registrationEmailCodeEnabled = false;
         _emailRecoveryStatusLoaded = true;
       });
     }
+  }
+
+  Future<String?> _requestRegistrationEmailVerification(String email) async {
+    Future<void> sendCode({bool resent = false}) async {
+      final resp = await _authService.dio.post(
+        '/api/auth/register/email-code/request',
+        data: {'email': email},
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        _extractSuccessMessage(
+          resp.data,
+          fallback: resent
+              ? 'Мы отправили новый код подтверждения на почту'
+              : 'Мы отправили 6-значный код подтверждения на почту',
+        ),
+        tone: AppNoticeTone.success,
+      );
+    }
+
+    await sendCode();
+    while (mounted) {
+      if (!mounted) return null;
+      final codeController = TextEditingController();
+      try {
+        final action = await showDialog<String>(
+          context: context,
+          barrierDismissible: false,
+          builder: (dialogContext) {
+            return AlertDialog(
+              title: const Text('Подтвердите почту'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Мы отправили код на $email'),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: codeController,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      labelText: 'Код из 6 цифр',
+                      hintText: '123456',
+                    ),
+                    autofocus: true,
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Отмена'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop('__resend__'),
+                  child: const Text('Отправить заново'),
+                ),
+                FilledButton(
+                  onPressed: () =>
+                      Navigator.of(dialogContext).pop(codeController.text.trim()),
+                  child: const Text('Подтвердить'),
+                ),
+              ],
+            );
+          },
+        );
+        if (action == null) return null;
+        if (action == '__resend__') {
+          await sendCode(resent: true);
+          continue;
+        }
+        final code = action.trim();
+        if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+          if (!mounted) return null;
+          showAppNotice(
+            context,
+            'Введите 6-значный код из письма',
+            tone: AppNoticeTone.warning,
+          );
+          continue;
+        }
+
+        final resp = await _authService.dio.post(
+          '/api/auth/register/email-code/verify',
+          data: {
+            'email': email,
+            'code': code,
+          },
+        );
+        final data =
+            resp.data is Map
+                ? Map<String, dynamic>.from(resp.data as Map)
+                : const <String, dynamic>{};
+        final verificationToken =
+            (data['registration_email_token'] ?? '').toString().trim();
+        if (verificationToken.isEmpty) {
+          throw Exception('Сервер не вернул токен подтверждения');
+        }
+        if (!mounted) return null;
+        showAppNotice(
+          context,
+          _extractSuccessMessage(
+            data,
+            fallback: 'Почта подтверждена. Продолжаем регистрацию.',
+          ),
+          tone: AppNoticeTone.success,
+        );
+        return verificationToken;
+      } on DioException catch (e) {
+        if (!mounted) return null;
+        showAppNotice(
+          context,
+          _extractServerMessage(
+            e,
+            fallback: 'Не удалось подтвердить код',
+          ),
+          tone: AppNoticeTone.error,
+        );
+      } catch (e) {
+        if (!mounted) return null;
+        showAppNotice(
+          context,
+          'Ошибка подтверждения: $e',
+          tone: AppNoticeTone.error,
+        );
+      } finally {
+        codeController.dispose();
+      }
+    }
+    return null;
   }
 
   @override
@@ -833,6 +970,9 @@ class _AuthScreenState extends State<AuthScreen> {
 
     try {
       if (_isRegister) {
+        if (!_emailRecoveryStatusLoaded) {
+          await _loadEmailRecoveryAvailability();
+        }
         // Сначала проверяем, занят ли email
         final exists = await _checkEmailExists(email);
         if (exists) {
@@ -843,11 +983,27 @@ class _AuthScreenState extends State<AuthScreen> {
           return;
         }
 
+        String? registrationEmailToken;
+        if (_registrationEmailCodeEnabled) {
+          registrationEmailToken = await _requestRegistrationEmailVerification(
+            email,
+          );
+          if (registrationEmailToken == null ||
+              registrationEmailToken.trim().isEmpty) {
+            setState(() {
+              _message = 'Подтверждение почты отменено';
+              _loading = false;
+            });
+            return;
+          }
+        }
+
         // Email свободен — сохраняем pending данные и переходим на экран ввода имени+телефона
         _authService.setPendingCredentials(
           email: email,
           password: password,
           accessKey: accessKey,
+          registrationEmailToken: registrationEmailToken,
         );
         if (!mounted) return;
 

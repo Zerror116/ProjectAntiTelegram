@@ -7,7 +7,7 @@ const validator = require('validator');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db'); // предполагается, что db экспортирует функцию query
 const { authMiddleware } = require('../utils/auth');
-const { signJwt } = require('../utils/jwt');
+const { signJwt, verifyJwt } = require('../utils/jwt');
 const {
   PLATFORM_CREATOR_EMAIL,
   normalizeAccessKey,
@@ -66,6 +66,15 @@ const PASSWORD_RESET_TTL_MINUTES = Math.max(
   5,
   Math.min(Number(process.env.AUTH_PASSWORD_RESET_TTL_MINUTES || 15) || 15, 60),
 );
+const REGISTRATION_CODE_TTL_MINUTES = Math.max(
+  5,
+  Math.min(Number(process.env.AUTH_REGISTRATION_CODE_TTL_MINUTES || 10) || 10, 30),
+);
+const REGISTRATION_VERIFY_TTL_MINUTES = Math.max(
+  10,
+  Math.min(Number(process.env.AUTH_REGISTRATION_VERIFY_TTL_MINUTES || 30) || 30, 120),
+);
+const REGISTRATION_EMAIL_VERIFY_PURPOSE = 'registration_email_verification';
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -714,6 +723,36 @@ function normalizeAuthEmailToken(rawValue) {
   return value;
 }
 
+function generateSixDigitCode() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+function normalizeRegistrationCode(rawValue) {
+  return String(rawValue || '')
+    .replace(/\D+/g, '')
+    .trim();
+}
+
+function signRegistrationEmailVerificationToken(email) {
+  return signJwt(
+    {
+      purpose: REGISTRATION_EMAIL_VERIFY_PURPOSE,
+      email: String(email || '').trim().toLowerCase(),
+    },
+    { expiresIn: `${REGISTRATION_VERIFY_TTL_MINUTES}m` },
+  );
+}
+
+function verifyRegistrationEmailVerificationToken(token, email) {
+  const decoded = verifyJwt(String(token || '').trim());
+  if (!decoded || decoded.purpose !== REGISTRATION_EMAIL_VERIFY_PURPOSE) {
+    return false;
+  }
+  const decodedEmail = String(decoded.email || '').trim().toLowerCase();
+  const expectedEmail = String(email || '').trim().toLowerCase();
+  return Boolean(decodedEmail) && decodedEmail === expectedEmail;
+}
+
 function buildGenericRecoveryResponse(kind) {
   if (kind === 'magic_login') {
     return {
@@ -751,6 +790,19 @@ async function invalidateUnusedAuthEmailTokens(queryable, userId, kind) {
        AND kind = $2
        AND used_at IS NULL`,
     [userId, kind],
+  );
+  return result.rowCount || 0;
+}
+
+async function invalidateUnusedRegistrationCodes(queryable, email) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) return 0;
+  const result = await queryable.query(
+    `UPDATE registration_email_codes
+     SET consumed_at = now()
+     WHERE lower(email) = $1
+       AND consumed_at IS NULL`,
+    [normalizedEmail],
   );
   return result.rowCount || 0;
 }
@@ -802,6 +854,46 @@ async function issueAuthEmailToken(
   return token;
 }
 
+async function issueRegistrationEmailCode(queryable, { email, req }) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) {
+    const error = new Error('Введите корректный email');
+    error.statusCode = 400;
+    throw error;
+  }
+  const code = generateSixDigitCode();
+  const codeHash = sha256Hex(code);
+  await invalidateUnusedRegistrationCodes(queryable, normalizedEmail);
+  await queryable.query(
+    `INSERT INTO registration_email_codes (
+       id,
+       email,
+       code_hash,
+       requested_ip,
+       requested_user_agent,
+       expires_at,
+       created_at
+     )
+     VALUES (
+       gen_random_uuid(),
+       $1,
+       $2,
+       NULLIF($3, ''),
+       NULLIF($4, ''),
+       now() + make_interval(mins => $5::int),
+       now()
+     )`,
+    [
+      normalizedEmail,
+      codeHash,
+      getRequestIp(req),
+      req.get('user-agent') || '',
+      REGISTRATION_CODE_TTL_MINUTES,
+    ],
+  );
+  return code;
+}
+
 async function claimAuthEmailToken(queryable, { token, kind, req }) {
   const normalizedToken = normalizeAuthEmailToken(token);
   if (!normalizedToken) return null;
@@ -848,6 +940,66 @@ async function claimAuthEmailToken(queryable, { token, kind, req }) {
     ],
   );
   return result.rows[0] || null;
+}
+
+async function consumeRegistrationEmailCode(queryable, { email, code }) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const normalizedCode = normalizeRegistrationCode(code);
+  if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
+    return { ok: false, status: 400, error: 'Введите корректный email' };
+  }
+  if (!/^\d{6}$/.test(normalizedCode)) {
+    return { ok: false, status: 400, error: 'Введите 6-значный код' };
+  }
+
+  const codeResult = await queryable.query(
+    `SELECT id, code_hash
+     FROM registration_email_codes
+     WHERE lower(email) = $1
+       AND consumed_at IS NULL
+       AND expires_at > now()
+     ORDER BY created_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedEmail],
+  );
+  if (codeResult.rowCount === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Код не найден или устарел. Запросите новый.',
+    };
+  }
+
+  const row = codeResult.rows[0];
+  const codeHash = sha256Hex(normalizedCode);
+  const mismatch = !constantTimeEquals(codeHash, row.code_hash);
+  await queryable.query(
+    `UPDATE registration_email_codes
+     SET attempts_count = attempts_count + 1
+     WHERE id = $1`,
+    [row.id],
+  );
+  if (mismatch) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'Неверный код подтверждения',
+    };
+  }
+
+  await queryable.query(
+    `UPDATE registration_email_codes
+     SET consumed_at = now()
+     WHERE id = $1`,
+    [row.id],
+  );
+  return {
+    ok: true,
+    registrationEmailToken: signRegistrationEmailVerificationToken(
+      normalizedEmail,
+    ),
+  };
 }
 
 async function resolveTenantForEmailAuthRequest(req, normalizedEmail) {
@@ -1097,6 +1249,33 @@ function buildMagicLinkEmail({ req, user, token }) {
   };
 }
 
+function buildRegistrationCodeEmail({ email, code }) {
+  return {
+    subject: 'Код подтверждения почты Fenix',
+    text: [
+      `Здравствуйте, ${email}.`,
+      '',
+      'Для завершения регистрации в Fenix введите этот код:',
+      code,
+      '',
+      `Код действует ${REGISTRATION_CODE_TTL_MINUTES} минут.`,
+      'Если вы не запрашивали регистрацию, просто проигнорируйте письмо.',
+    ].join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#1f2937">
+        <h2 style="margin-bottom:12px">Подтверждение почты Fenix</h2>
+        <p>Здравствуйте, ${email}.</p>
+        <p>Для завершения регистрации введите этот код:</p>
+        <div style="font-size:30px;font-weight:800;letter-spacing:8px;padding:14px 18px;background:#f3f4f6;border-radius:12px;display:inline-block">
+          ${code}
+        </div>
+        <p>Код действует ${REGISTRATION_CODE_TTL_MINUTES} минут.</p>
+        <p>Если вы не запрашивали регистрацию, просто проигнорируйте письмо.</p>
+      </div>
+    `,
+  };
+}
+
 /**
  * POST /api/auth/check_email
  * body: { email }
@@ -1137,11 +1316,101 @@ router.get('/email-auth/status', async (req, res) => {
         mail_configured: enabled,
         password_reset_enabled: enabled,
         magic_link_enabled: enabled,
+        registration_email_code_enabled: enabled,
       },
     });
   } catch (err) {
     console.error('auth.emailAuth.status error', err);
     return res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/register/email-code/request', async (req, res) => {
+  try {
+    if (!isMailConfigured()) {
+      return res.status(503).json({
+        error:
+          'Подтверждение регистрации по почте пока не настроено на сервере.',
+      });
+    }
+    const normalizedEmail = validator.normalizeEmail(req.body?.email || '');
+    if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Введите корректный email' });
+    }
+
+    const existing = await db.platformQuery(
+      'SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1',
+      [normalizedEmail],
+    );
+    if (existing.rowCount > 0) {
+      return res.status(409).json({ error: 'Email уже занят' });
+    }
+
+    const code = await issueRegistrationEmailCode(db, {
+      email: normalizedEmail,
+      req,
+    });
+    await sendMail({
+      to: normalizedEmail,
+      ...buildRegistrationCodeEmail({
+        email: normalizedEmail,
+        code,
+      }),
+    });
+
+    return res.json({
+      ok: true,
+      message: 'Мы отправили 6-значный код подтверждения на почту',
+    });
+  } catch (err) {
+    console.error('auth.register.emailCode.request error', err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || 'Ошибка сервера' });
+  }
+});
+
+router.post('/register/email-code/verify', async (req, res) => {
+  const normalizedEmail = validator.normalizeEmail(req.body?.email || '');
+  if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
+    return res.status(400).json({ error: 'Введите корректный email' });
+  }
+  if (!isMailConfigured()) {
+    return res.status(503).json({
+      error:
+        'Подтверждение регистрации по почте пока не настроено на сервере.',
+    });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const verification = await consumeRegistrationEmailCode(client, {
+      email: normalizedEmail,
+      code: req.body?.code,
+    });
+    if (!verification.ok) {
+      await client.query('ROLLBACK');
+      return res
+        .status(verification.status || 400)
+        .json({ error: verification.error || 'Неверный код подтверждения' });
+    }
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      registration_email_token: verification.registrationEmailToken,
+      message: 'Почта подтверждена. Продолжайте регистрацию.',
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('auth.register.emailCode.verify error', err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || 'Ошибка сервера' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1224,6 +1493,7 @@ router.post('/register', async (req, res) => {
       invite_code,
       group_name,
       main_channel_title,
+      registration_email_token,
     } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
@@ -1233,6 +1503,17 @@ router.post('/register', async (req, res) => {
     }
     if (typeof password !== 'string' || password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+    if (
+      isMailConfigured() &&
+      !verifyRegistrationEmailVerificationToken(
+        registration_email_token,
+        normalizedEmail,
+      )
+    ) {
+      return res.status(400).json({
+        error: 'Сначала подтвердите email кодом из письма',
+      });
     }
     const requiredDeviceFingerprint = ensureDeviceFingerprint(device_fingerprint);
 
