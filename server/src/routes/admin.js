@@ -2829,10 +2829,10 @@ router.patch(
            SET payload = jsonb_strip_nulls(
                  COALESCE(q.payload, '{}'::jsonb) ||
                  jsonb_build_object(
-                   'title', $2,
-                   'description', $3,
-                   'price', $4,
-                   'quantity', $5,
+                   'title', $2::text,
+                   'description', $3::text,
+                   'price', $4::numeric,
+                   'quantity', $5::int,
                    'shelf_number', COALESCE($6::int, NULLIF(q.payload->>'shelf_number', '')::int),
                    'image_url', NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), '')
                  )
