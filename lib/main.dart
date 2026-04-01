@@ -208,6 +208,26 @@ String _defaultApiBaseUrl() {
   return '$scheme://$host$portPart';
 }
 
+bool _hasIncomingAuthActionFromUri() {
+  if (!kIsWeb) return false;
+  try {
+    final uri = Uri.base;
+    final action = (uri.queryParameters['auth_action'] ?? '').trim();
+    final token = (uri.queryParameters['token'] ?? '').trim();
+    if (action.isNotEmpty && token.isNotEmpty) return true;
+    if (uri.fragment.isNotEmpty) {
+      final fragment = uri.fragment;
+      final qIndex = fragment.indexOf('?');
+      if (qIndex >= 0 && qIndex + 1 < fragment.length) {
+        final inFragment = Uri.splitQueryString(fragment.substring(qIndex + 1));
+        return (inFragment['auth_action'] ?? '').trim().isNotEmpty &&
+            (inFragment['token'] ?? '').trim().isNotEmpty;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
 String _resolveApiBaseUrl(String raw) {
   final fallback = _defaultApiBaseUrl();
   final source = raw.trim();
@@ -2952,6 +2972,10 @@ Widget _buildInitialScreenFromRestoredUser(User? restoredUser) {
 Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
   if (kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    return const AuthScreen();
+  }
+  if (_hasIncomingAuthActionFromUri()) {
+    debugPrint('determineInitialScreen: incoming auth action -> AuthScreen');
     return const AuthScreen();
   }
   if (!dbReady) return const SetupFailedScreen();

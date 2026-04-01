@@ -1,4 +1,6 @@
 // lib/screens/auth_screen.dart
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -38,6 +40,9 @@ class _AuthScreenState extends State<AuthScreen> {
   String? _apkDownloadUrl;
   String _apkInfoMessage = '';
   String _tenantCodeFromLink = '';
+  bool _handledIncomingAuthAction = false;
+  bool _emailRecoveryEnabled = false;
+  bool _emailRecoveryStatusLoaded = false;
 
   late final AuthService _authService;
 
@@ -77,6 +82,8 @@ class _AuthScreenState extends State<AuthScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _prepareWebExperience();
+      unawaited(_loadEmailRecoveryAvailability());
+      unawaited(_handleIncomingAuthActionIfNeeded());
     });
   }
 
@@ -368,6 +375,409 @@ class _AuthScreenState extends State<AuthScreen> {
     return value;
   }
 
+  String _extractUriParam(Iterable<String> keys) {
+    try {
+      final uri = Uri.base;
+      for (final key in keys) {
+        final direct = (uri.queryParameters[key] ?? '').trim();
+        if (direct.isNotEmpty) return direct;
+      }
+      if (uri.fragment.isNotEmpty) {
+        final fragment = uri.fragment;
+        final qIndex = fragment.indexOf('?');
+        if (qIndex >= 0 && qIndex + 1 < fragment.length) {
+          final inFragment = Uri.splitQueryString(fragment.substring(qIndex + 1));
+          for (final key in keys) {
+            final value = (inFragment[key] ?? '').trim();
+            if (value.isNotEmpty) return value;
+          }
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  String _extractAuthActionFromUri() {
+    return _extractUriParam(const ['auth_action']).trim().toLowerCase();
+  }
+
+  String _extractAuthTokenFromUri() {
+    return _extractUriParam(const ['token']).trim();
+  }
+
+  String _extractSuccessMessage(
+    Object? payload, {
+    required String fallback,
+  }) {
+    if (payload is Map && (payload['message'] != null || payload['success'] != null)) {
+      return (payload['message'] ?? payload['success']).toString();
+    }
+    return fallback;
+  }
+
+  Future<void> _navigateAfterSuccessfulAuth() async {
+    try {
+      final resp = await _authService.dio.get('/api/profile');
+      final data = resp.data as Map<String, dynamic>? ?? {};
+      final user = data['user'] as Map<String, dynamic>? ?? {};
+      final name = (user['name'] ?? '').toString().trim();
+      final phone = (user['phone'] ?? '').toString().trim();
+      final phoneAccessState =
+          (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
+              .toString()
+              .trim()
+              .toLowerCase();
+      final hasName = name.isNotEmpty;
+      final hasPhone = phone.isNotEmpty;
+
+      if (phoneAccessState == 'pending' || phoneAccessState == 'rejected') {
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const PhoneAccessPendingScreen()),
+        );
+        return;
+      }
+
+      if (!hasName || !hasPhone) {
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => const PhoneNameScreen(isRegisterFlow: false),
+          ),
+        );
+        return;
+      }
+
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const MainShell()),
+      );
+      return;
+    } catch (e) {
+      debugPrint('auth.login: profile check failed, continue to MainShell: $e');
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const MainShell()),
+      );
+    }
+  }
+
+  Future<void> _requestEmailAction({
+    required bool magicLink,
+  }) async {
+    final controller = TextEditingController(text: _emailController.text.trim());
+    final enteredEmail = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: Text(
+            magicLink ? 'Войти по ссылке' : 'Сбросить пароль',
+          ),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.emailAddress,
+            decoration: InputDecoration(
+              labelText: magicLink ? 'Почта для входа' : 'Почта для сброса',
+              hintText: 'name@example.com',
+            ),
+            autofocus: true,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(controller.text.trim()),
+              child: Text(magicLink ? 'Отправить ссылку' : 'Отправить письмо'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    final email = enteredEmail?.trim() ?? '';
+    if (email.isEmpty) return;
+    if (!email.contains('@')) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Введите корректный email',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _message = '';
+      _requiresTwoFactor = false;
+    });
+
+    try {
+      final resp = await _authService.dio.post(
+        magicLink
+            ? '/api/auth/magic-link/request'
+            : '/api/auth/password-reset/request',
+        data: {'email': email},
+      );
+      _emailController.text = email;
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        _extractSuccessMessage(
+          resp.data,
+          fallback: magicLink
+              ? 'Если аккаунт существует, мы отправили ссылку для входа на почту'
+              : 'Если аккаунт существует, мы отправили письмо для сброса пароля',
+        ),
+        tone: AppNoticeTone.success,
+      );
+    } on DioException catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = _extractServerMessage(
+          e,
+          fallback: magicLink
+              ? 'Не удалось отправить ссылку для входа'
+              : 'Не удалось отправить письмо для сброса пароля',
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _showPasswordResetDialog(String token) async {
+    final newPasswordController = TextEditingController();
+    final confirmPasswordController = TextEditingController();
+    try {
+      final passwords = await showDialog<List<String>>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: const Text('Новый пароль'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: newPasswordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Новый пароль',
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: confirmPasswordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Повторите пароль',
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('Позже'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop([
+                  newPasswordController.text,
+                  confirmPasswordController.text,
+                ]),
+                child: const Text('Сохранить пароль'),
+              ),
+            ],
+          );
+        },
+      );
+      if (passwords == null || passwords.length < 2) return;
+      final newPassword = passwords[0].trim();
+      final confirmPassword = passwords[1].trim();
+      if (newPassword.length < 8) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Пароль должен быть не менее 8 символов',
+          tone: AppNoticeTone.warning,
+        );
+        return;
+      }
+      if (newPassword != confirmPassword) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Пароли не совпадают',
+          tone: AppNoticeTone.warning,
+        );
+        return;
+      }
+
+      setState(() {
+        _loading = true;
+        _message = '';
+        _isRegister = false;
+      });
+      try {
+        final resp = await _authService.dio.post(
+          '/api/auth/password-reset/confirm',
+          data: {
+            'token': token,
+            'new_password': newPassword,
+          },
+        );
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          _extractSuccessMessage(
+            resp.data,
+            fallback: 'Пароль обновлён. Теперь можно войти с новым паролем.',
+          ),
+          tone: AppNoticeTone.success,
+        );
+      } on DioException catch (e) {
+        if (!mounted) return;
+        setState(
+          () => _message = _extractServerMessage(
+            e,
+            fallback: 'Не удалось обновить пароль',
+          ),
+        );
+      } finally {
+        if (mounted) {
+          setState(() => _loading = false);
+        }
+      }
+    } finally {
+      newPasswordController.dispose();
+      confirmPasswordController.dispose();
+    }
+  }
+
+  Future<void> _consumeMagicLogin(String token) async {
+    if (_isAndroidWebRestricted()) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Вход по ссылке в Android-браузере не поддерживается. Откройте письмо на компьютере или войдите в установленном приложении.',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _message = '';
+      _isRegister = false;
+      _requiresTwoFactor = false;
+    });
+    try {
+      final fingerprint = await _authService.getDeviceFingerprintForRequest();
+      final resp = await _authService.dio.post(
+        '/api/auth/magic-link/consume',
+        data: {
+          'token': token,
+          if (fingerprint != null && fingerprint.trim().isNotEmpty)
+            'device_fingerprint': fingerprint.trim(),
+        },
+      );
+      final payload =
+          resp.data is Map<String, dynamic>
+              ? resp.data as Map<String, dynamic>
+              : Map<String, dynamic>.from(resp.data as Map);
+      final nextToken = (payload['token'] ?? '').toString().trim();
+      final userMap =
+          payload['user'] is Map
+              ? Map<String, dynamic>.from(payload['user'] as Map)
+              : null;
+      if (nextToken.isEmpty || userMap == null) {
+        throw Exception('Сервер не вернул данные входа');
+      }
+      await _authService.applyLoginResponse(nextToken, userMap);
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Вход по ссылке выполнен',
+        tone: AppNoticeTone.success,
+      );
+      await _navigateAfterSuccessfulAuth();
+    } on DioException catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = _extractServerMessage(
+          e,
+          fallback: 'Не удалось выполнить вход по ссылке',
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка входа по ссылке: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _handleIncomingAuthActionIfNeeded() async {
+    if (_handledIncomingAuthAction || !mounted) return;
+    final action = _extractAuthActionFromUri();
+    final token = _extractAuthTokenFromUri();
+    if (action.isEmpty || token.isEmpty) return;
+    _handledIncomingAuthAction = true;
+    if (action == 'magic_login') {
+      await _consumeMagicLogin(token);
+      return;
+    }
+    if (action == 'password_reset') {
+      await _showPasswordResetDialog(token);
+    }
+  }
+
+  Future<void> _loadEmailRecoveryAvailability() async {
+    try {
+      final resp = await _authService.dio.get(
+        '/api/auth/email-auth/status',
+        options: Options(
+          sendTimeout: const Duration(seconds: 5),
+          receiveTimeout: const Duration(seconds: 5),
+        ),
+      );
+      final data = resp.data is Map ? Map<String, dynamic>.from(resp.data as Map) : const <String, dynamic>{};
+      final payload =
+          data['data'] is Map
+              ? Map<String, dynamic>.from(data['data'] as Map)
+              : const <String, dynamic>{};
+      final passwordResetEnabled =
+          payload['password_reset_enabled'] == true ||
+          payload['mail_configured'] == true;
+      final magicLinkEnabled =
+          payload['magic_link_enabled'] == true ||
+          payload['mail_configured'] == true;
+      if (!mounted) return;
+      setState(() {
+        _emailRecoveryEnabled = passwordResetEnabled || magicLinkEnabled;
+        _emailRecoveryStatusLoaded = true;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _emailRecoveryEnabled = false;
+        _emailRecoveryStatusLoaded = true;
+      });
+    }
+  }
+
   @override
   void dispose() {
     // Удаляем слушатели корректно
@@ -460,59 +870,8 @@ class _AuthScreenState extends State<AuthScreen> {
         _requiresTwoFactor = false;
       }
 
-      // После логина — проверяем профиль и переходим
-      try {
-        final resp = await _authService.dio.get('/api/profile');
-        final data = resp.data as Map<String, dynamic>? ?? {};
-        final user = data['user'] as Map<String, dynamic>? ?? {};
-        final name = (user['name'] ?? '').toString().trim();
-        final phone = (user['phone'] ?? '').toString().trim();
-        final phoneAccessState =
-            (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
-                .toString()
-                .trim()
-                .toLowerCase();
-        final hasName = name.isNotEmpty;
-        final hasPhone = phone.isNotEmpty;
-
-        if (phoneAccessState == 'pending' || phoneAccessState == 'rejected') {
-          if (!mounted) return;
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (_) => const PhoneAccessPendingScreen()),
-          );
-          return;
-        }
-
-        // Экран добора данных нужен только если имя/номер действительно отсутствуют.
-        if (!hasName || !hasPhone) {
-          if (!mounted) return;
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (_) => const PhoneNameScreen(isRegisterFlow: false),
-            ),
-          );
-          return;
-        }
-
-        if (!mounted) return;
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const MainShell()),
-        );
-        return;
-      } catch (e) {
-        debugPrint(
-          'auth.login: profile check failed, continue to MainShell: $e',
-        );
-        if (!mounted) return;
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const MainShell()),
-        );
-        return;
-      }
+      await _navigateAfterSuccessfulAuth();
+      return;
     } on DioException catch (e) {
       String friendly = 'Ошибка';
       final status = e.response?.statusCode;
@@ -853,6 +1212,31 @@ class _AuthScreenState extends State<AuthScreen> {
                           : Text(_isRegister ? 'Далее' : 'Войти'),
                     ),
                   ),
+                  if (!_isRegister &&
+                      _emailRecoveryStatusLoaded &&
+                      _emailRecoveryEnabled) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextButton(
+                            onPressed: _loading
+                                ? null
+                                : () => _requestEmailAction(magicLink: false),
+                            child: const Text('Забыли пароль?'),
+                          ),
+                        ),
+                        Expanded(
+                          child: TextButton(
+                            onPressed: _loading
+                                ? null
+                                : () => _requestEmailAction(magicLink: true),
+                            child: const Text('Войти без пароля'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
