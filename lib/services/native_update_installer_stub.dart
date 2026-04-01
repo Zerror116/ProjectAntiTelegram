@@ -20,6 +20,10 @@ Future<bool> openDownloadedPackage(
   return false;
 }
 
+Future<bool> openDownloadsUi() async {
+  return false;
+}
+
 Future<void> exitCurrentAppForUpdate({
   Duration delay = const Duration(milliseconds: 1200),
 }) async {}

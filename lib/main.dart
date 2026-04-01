@@ -1280,7 +1280,7 @@ Future<bool> _downloadAndInstallAndroidUpdate({
 
   _nativeAndroidUpdateBusy = true;
   final progress = ValueNotifier<double?>(null);
-  final stage = ValueNotifier<String>('Скачиваем обновление...');
+  final stage = ValueNotifier<String>('Запускаем системную загрузку Android...');
   BuildContext? dialogContext;
   final context = navigatorKey.currentContext;
 
@@ -1345,6 +1345,7 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       fallbackFileName: _fallbackInstallerNameForPlatform('android', latest),
       headers: const {'X-Fenix-Platform': 'android'},
       onProgress: (received, total) {
+        stage.value = 'Скачиваем обновление через систему Android...';
         if (total > 0) {
           progress.value = (received / total).clamp(0, 1).toDouble();
         } else {
@@ -1360,12 +1361,18 @@ Future<bool> _downloadAndInstallAndroidUpdate({
     final opened = await NativeUpdateInstaller.openDownloadedPackage(savePath);
     if (opened) return true;
 
-    stage.value = 'Не удалось открыть установщик, пробуем через браузер...';
-    try {
-      return await launchUrl(uri, mode: LaunchMode.externalApplication);
-    } catch (_) {
-      return false;
+    stage.value = 'Установщик не открылся автоматически. Открываем Загрузки Android...';
+    final openedDownloads = await NativeUpdateInstaller.openDownloadsUi();
+    if (openedDownloads) {
+      showGlobalAppNotice(
+        'Обновление уже скачивается или скачано. Прогресс виден в системных загрузках Android.',
+        title: 'Обновление Феникс',
+        tone: AppNoticeTone.info,
+        duration: const Duration(seconds: 5),
+      );
+      return true;
     }
+    return false;
   } finally {
     if (dialogContext != null && dialogContext!.mounted) {
       Navigator.of(dialogContext!).pop();
