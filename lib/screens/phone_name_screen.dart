@@ -102,6 +102,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
       authService.pendingEmail = null;
       authService.pendingPassword = null;
       authService.pendingAccessKey = null;
+      authService.pendingRegistrationEmailToken = null;
       if (!mounted) return;
       Navigator.of(context).pushNamedAndRemoveUntil('/auth', (route) => false);
     }
@@ -240,6 +241,9 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
             'device_fingerprint': deviceFingerprint.trim(),
           if ((authService.pendingAccessKey ?? '').trim().isNotEmpty)
             'access_key': authService.pendingAccessKey!.trim(),
+          if ((authService.pendingRegistrationEmailToken ?? '').trim().isNotEmpty)
+            'registration_email_token':
+                authService.pendingRegistrationEmailToken!.trim(),
         };
         if (_isCreatorPending) data['secret'] = secret;
         if (_isTenantKeyRegistration) {
@@ -275,6 +279,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           authService.pendingEmail = null;
           authService.pendingPassword = null;
           authService.pendingAccessKey = null;
+          authService.pendingRegistrationEmailToken = null;
         } catch (_) {}
 
         if (!mounted) return;

@@ -117,6 +117,7 @@ class AuthService {
   String? pendingEmail;
   String? pendingPassword;
   String? pendingAccessKey;
+  String? pendingRegistrationEmailToken;
 
   // Current authenticated user (populated after login / profile fetch)
   User? _currentUser;
@@ -386,6 +387,7 @@ class AuthService {
       pendingEmail = null;
       pendingPassword = null;
       pendingAccessKey = null;
+      pendingRegistrationEmailToken = null;
       _currentUser = null;
       _viewRole = null;
 
@@ -730,6 +732,7 @@ class AuthService {
     pendingEmail = null;
     pendingPassword = null;
     pendingAccessKey = null;
+    pendingRegistrationEmailToken = null;
     debugPrint('✅ login complete');
     return {
       'access': resp.data['token'] ?? resp.data['access'],
@@ -855,6 +858,7 @@ class AuthService {
     pendingEmail = null;
     pendingPassword = null;
     pendingAccessKey = null;
+    pendingRegistrationEmailToken = null;
     debugPrint('✅ register complete');
     return {
       'access': resp.data['token'] ?? resp.data['access'],
@@ -867,10 +871,12 @@ class AuthService {
     required String email,
     required String password,
     String? accessKey,
+    String? registrationEmailToken,
   }) {
     pendingEmail = email;
     pendingPassword = password;
     pendingAccessKey = accessKey?.trim();
+    pendingRegistrationEmailToken = registrationEmailToken?.trim();
     debugPrint('📋 AuthService.setPendingCredentials -> email saved');
   }
 
@@ -898,6 +904,9 @@ class AuthService {
         'phone': phone,
         'secret': secret,
         'device_fingerprint': fingerprint,
+        if (pendingRegistrationEmailToken != null &&
+            pendingRegistrationEmailToken!.trim().isNotEmpty)
+          'registration_email_token': pendingRegistrationEmailToken!.trim(),
       },
     );
 
@@ -905,6 +914,7 @@ class AuthService {
     pendingEmail = null;
     pendingPassword = null;
     pendingAccessKey = null;
+    pendingRegistrationEmailToken = null;
   }
 
   bool hasAnyRole(List<String> roles) =>
