@@ -444,6 +444,8 @@ const applyForWriteMethods = (limiter) => (req, res, next) => {
 app.use("/api", globalApiLimiter);
 app.use("/api/auth/register", authLimiter);
 app.use("/api/auth/login", authLimiter);
+app.use("/api/auth/password-reset", authLimiter);
+app.use("/api/auth/magic-link", authLimiter);
 app.use("/api/chats", applyForWriteMethods(heavyWriteLimiter));
 app.use("/api/worker", applyForWriteMethods(heavyWriteLimiter));
 app.use("/api/admin/delivery", applyForWriteMethods(heavyWriteLimiter));

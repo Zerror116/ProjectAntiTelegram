@@ -44,6 +44,7 @@ const {
   hashBackupCode,
   generateBackupCodes,
 } = require('../utils/twoFactor');
+const { isMailConfigured, sendMail } = require('../utils/mailer');
 const { ensureSystemChannels } = require("../utils/systemChannels");
 require('dotenv').config();
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
@@ -57,6 +58,14 @@ const CREATOR_SECRET_HASH = String(process.env.CREATOR_SECRET_HASH || '')
 const MAX_ACCOUNTS_PER_DEVICE = 2;
 const TRUST_DEVICE_2FA_DAYS = 30;
 const BACKUP_CODES_DEFAULT_COUNT = 10;
+const MAGIC_LINK_TTL_MINUTES = Math.max(
+  5,
+  Math.min(Number(process.env.AUTH_MAGIC_LINK_TTL_MINUTES || 15) || 15, 60),
+);
+const PASSWORD_RESET_TTL_MINUTES = Math.max(
+  5,
+  Math.min(Number(process.env.AUTH_PASSWORD_RESET_TTL_MINUTES || 15) || 15, 60),
+);
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -669,6 +678,425 @@ async function resolveDefaultTenant() {
   return result.rowCount > 0 ? result.rows[0] : null;
 }
 
+function getRequestIp(req) {
+  return String(
+    req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+      req.ip ||
+      '',
+  ).trim();
+}
+
+function buildPublicAppUrl(req) {
+  const configured = String(
+    process.env.AUTH_EMAIL_LINK_BASE || process.env.PUBLIC_BASE_URL || '',
+  ).trim();
+  if (configured) {
+    return configured.replace(/\/+$/, '');
+  }
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function buildAuthActionLink(req, action, token) {
+  const url = new URL(buildPublicAppUrl(req));
+  url.searchParams.set('auth_action', action);
+  url.searchParams.set('token', token);
+  return url.toString();
+}
+
+function generateAuthEmailToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function normalizeAuthEmailToken(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (value.length < 32 || value.length > 200) return '';
+  return value;
+}
+
+function buildGenericRecoveryResponse(kind) {
+  if (kind === 'magic_login') {
+    return {
+      ok: true,
+      message:
+        'Если аккаунт существует, мы отправили ссылку для входа на указанную почту',
+    };
+  }
+  return {
+    ok: true,
+    message:
+      'Если аккаунт существует, мы отправили ссылку для сброса пароля на указанную почту',
+  };
+}
+
+async function revokeAllUserSessions({ queryable = db, userId }) {
+  if (!userId) return 0;
+  const result = await queryable.query(
+    `UPDATE user_sessions
+     SET is_active = false
+     WHERE user_id = $1
+       AND is_active = true
+     RETURNING id`,
+    [userId],
+  );
+  return result.rowCount || 0;
+}
+
+async function invalidateUnusedAuthEmailTokens(queryable, userId, kind) {
+  if (!userId || !kind) return 0;
+  const result = await queryable.query(
+    `UPDATE auth_email_tokens
+     SET used_at = now()
+     WHERE user_id = $1
+       AND kind = $2
+       AND used_at IS NULL`,
+    [userId, kind],
+  );
+  return result.rowCount || 0;
+}
+
+async function issueAuthEmailToken(
+  queryable,
+  { userId, tenantId = null, email, kind, ttlMinutes, req },
+) {
+  const token = generateAuthEmailToken();
+  const tokenHash = sha256Hex(token);
+  const safeTtlMinutes = Math.max(5, Math.min(Number(ttlMinutes) || 15, 60));
+  await invalidateUnusedAuthEmailTokens(queryable, userId, kind);
+  await queryable.query(
+    `INSERT INTO auth_email_tokens (
+       id,
+       user_id,
+       tenant_id,
+       email,
+       kind,
+       token_hash,
+       requested_ip,
+       requested_user_agent,
+       expires_at,
+       created_at
+     )
+     VALUES (
+       gen_random_uuid(),
+       $1,
+       $2,
+       $3,
+       $4,
+       $5,
+       NULLIF($6, ''),
+       NULLIF($7, ''),
+       now() + make_interval(mins => $8::int),
+       now()
+     )`,
+    [
+      userId,
+      tenantId || null,
+      String(email || '').trim().toLowerCase(),
+      kind,
+      tokenHash,
+      getRequestIp(req),
+      req.get('user-agent') || '',
+      safeTtlMinutes,
+    ],
+  );
+  return token;
+}
+
+async function claimAuthEmailToken(queryable, { token, kind, req }) {
+  const normalizedToken = normalizeAuthEmailToken(token);
+  if (!normalizedToken) return null;
+  const tokenHash = sha256Hex(normalizedToken);
+  const result = await queryable.query(
+    `WITH claimed AS (
+       UPDATE auth_email_tokens
+       SET used_at = now(),
+           consumed_ip = NULLIF($2, ''),
+           consumed_user_agent = NULLIF($3, '')
+       WHERE token_hash = $1
+         AND kind = $4
+         AND used_at IS NULL
+         AND expires_at > now()
+       RETURNING id, user_id, tenant_id, email, kind, expires_at
+     )
+     SELECT c.id AS token_id,
+            c.user_id,
+            c.tenant_id,
+            c.email,
+            c.kind,
+            c.expires_at,
+            u.id,
+            u.email AS user_email,
+            u.name,
+            u.role,
+            u.is_active,
+            u.block_reason,
+            u.tenant_id AS user_tenant_id,
+            u.two_factor_enabled,
+            t.code AS tenant_code,
+            t.name AS tenant_name,
+            t.status AS tenant_status,
+            t.subscription_expires_at
+     FROM claimed c
+     JOIN users u ON u.id = c.user_id
+     LEFT JOIN tenants t ON t.id = u.tenant_id
+     LIMIT 1`,
+    [
+      tokenHash,
+      getRequestIp(req),
+      req.get('user-agent') || '',
+      kind,
+    ],
+  );
+  return result.rows[0] || null;
+}
+
+async function resolveTenantForEmailAuthRequest(req, normalizedEmail) {
+  const isPlatformCreator =
+    normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase();
+  if (isPlatformCreator) {
+    return { tenant: null, isPlatformCreator: true };
+  }
+
+  let tenant = null;
+  const tenantCodeHint = extractTenantCodeHint(req);
+  if (tenantCodeHint) {
+    tenant = await db.resolveTenantByCode(tenantCodeHint);
+  }
+  if (!tenant) {
+    tenant = await resolveTenantByUserEmail(normalizedEmail);
+  }
+  return { tenant, isPlatformCreator: false };
+}
+
+async function findUserForEmailAuthRequest(req, normalizedEmail) {
+  const { tenant, isPlatformCreator } = await resolveTenantForEmailAuthRequest(
+    req,
+    normalizedEmail,
+  );
+  if (!isPlatformCreator && !tenant) {
+    return { user: null, tenant: null, isPlatformCreator: false };
+  }
+
+  const user = await db.runWithTenantRow(
+    isPlatformCreator ? null : tenant,
+    async () => {
+      const q = await db.query(
+        `SELECT u.id,
+                u.email,
+                u.name,
+                u.role,
+                u.is_active,
+                u.block_reason,
+                u.tenant_id,
+                u.two_factor_enabled,
+                t.code AS tenant_code,
+                t.name AS tenant_name,
+                t.status AS tenant_status,
+                t.subscription_expires_at
+         FROM users u
+         LEFT JOIN tenants t ON t.id = u.tenant_id
+         WHERE lower(u.email) = $1
+         LIMIT 1`,
+        [normalizedEmail],
+      );
+      return q.rows[0] || null;
+    },
+  );
+
+  return {
+    user,
+    tenant,
+    isPlatformCreator,
+  };
+}
+
+async function resolvePhoneAccessForUser({
+  user,
+  tenant,
+  isPlatformCreator = false,
+}) {
+  let phoneAccess = { state: 'none' };
+  if (!isPlatformCreator && user?.tenant_id) {
+    try {
+      phoneAccess = await db.runWithTenantRow(tenant, async () =>
+        await resolvePhoneAccessState(db, {
+          requesterUserId: user.id,
+          tenantId: user.tenant_id || tenant?.id || null,
+        }),
+      );
+    } catch (err) {
+      console.error('auth.phoneAccess state resolve error', err);
+    }
+  }
+  return phoneAccess;
+}
+
+async function createAuthenticatedSession({
+  client,
+  user,
+  req,
+  deviceFingerprint = null,
+}) {
+  const normalizedFingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+  await assertDeviceAccountLimit(
+    client,
+    normalizedFingerprint,
+    user.id,
+    user.tenant_id || null,
+  );
+  await upsertDevice(client, user.id, normalizedFingerprint);
+
+  const sessionId = uuidv4();
+  const sessionExpiresAt = buildSessionExpiry();
+  await createUserSession({
+    queryable: client,
+    userId: user.id,
+    sessionId,
+    deviceFingerprint: normalizedFingerprint,
+    userAgent: req.get('user-agent') || '',
+    ipAddress: getRequestIp(req),
+    expiresAt: sessionExpiresAt,
+  });
+  return {
+    sessionId,
+    normalizedFingerprint,
+  };
+}
+
+async function buildSuccessfulAuthResponse({
+  req,
+  user,
+  tenant,
+  sessionId,
+  isPlatformCreator = false,
+  twoFactor = null,
+}) {
+  if (!isPlatformCreator) {
+    try {
+      await upsertTenantUserIndex({
+        tenantId: user?.tenant_id || tenant?.id || null,
+        userId: user?.id || null,
+        email: user?.email || '',
+        role: user?.role || 'client',
+        isActive: user?.is_active !== false,
+      });
+    } catch (err) {
+      console.error('auth.buildSuccessfulAuthResponse tenantUserIndex error', err);
+    }
+  }
+
+  const phoneAccess = await resolvePhoneAccessForUser({
+    user,
+    tenant,
+    isPlatformCreator,
+  });
+  const effectiveTenantCode = tenant?.code || user?.tenant_code || null;
+  const token = signToken({
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    tenant_id: user.tenant_id || null,
+    tenant_code: effectiveTenantCode,
+    sid: sessionId,
+  });
+
+  return {
+    token,
+    session_id: sessionId,
+    two_factor: twoFactor || {
+      enabled: false,
+      method: 'disabled',
+      trust_device_applied: false,
+    },
+    user: {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tenant_id: user.tenant_id || null,
+      tenant_code: effectiveTenantCode,
+      tenant_name: user.tenant_name || tenant?.name || null,
+      phone_access_state: phoneAccess.state || 'none',
+      phone_access: phoneAccess,
+    },
+    tenant: user.tenant_id
+      ? {
+          id: user.tenant_id,
+          code: effectiveTenantCode,
+          name: user.tenant_name || tenant?.name || null,
+          status: user.tenant_status || tenant?.status || null,
+          subscription_expires_at:
+            user.subscription_expires_at || tenant?.subscription_expires_at || null,
+        }
+      : null,
+  };
+}
+
+function buildPasswordResetEmail({ req, user, token }) {
+  const link = buildAuthActionLink(req, 'password_reset', token);
+  const greeting = String(user?.name || '').trim() || String(user?.email || '').trim();
+  return {
+    subject: 'Сброс пароля Fenix',
+    text: [
+      `Здравствуйте, ${greeting}.`,
+      '',
+      'Вы запросили сброс пароля для входа в Fenix.',
+      'Откройте ссылку ниже и задайте новый пароль:',
+      link,
+      '',
+      `Ссылка действует ${PASSWORD_RESET_TTL_MINUTES} минут и работает только один раз.`,
+      'Если это были не вы, просто проигнорируйте письмо.',
+    ].join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#1f2937">
+        <h2 style="margin-bottom:12px">Сброс пароля Fenix</h2>
+        <p>Здравствуйте, ${greeting}.</p>
+        <p>Вы запросили сброс пароля для входа в Fenix.</p>
+        <p>
+          <a href="${link}" style="display:inline-block;padding:12px 18px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px">
+            Сбросить пароль
+          </a>
+        </p>
+        <p style="word-break:break-all">${link}</p>
+        <p>Ссылка действует ${PASSWORD_RESET_TTL_MINUTES} минут и работает только один раз.</p>
+        <p>Если это были не вы, просто проигнорируйте письмо.</p>
+      </div>
+    `,
+  };
+}
+
+function buildMagicLinkEmail({ req, user, token }) {
+  const link = buildAuthActionLink(req, 'magic_login', token);
+  const greeting = String(user?.name || '').trim() || String(user?.email || '').trim();
+  return {
+    subject: 'Вход в Fenix по ссылке',
+    text: [
+      `Здравствуйте, ${greeting}.`,
+      '',
+      'Вы запросили вход в Fenix без пароля.',
+      'Откройте ссылку ниже для входа:',
+      link,
+      '',
+      `Ссылка действует ${MAGIC_LINK_TTL_MINUTES} минут и работает только один раз.`,
+      'Если это были не вы, просто проигнорируйте письмо.',
+    ].join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#1f2937">
+        <h2 style="margin-bottom:12px">Вход в Fenix по ссылке</h2>
+        <p>Здравствуйте, ${greeting}.</p>
+        <p>Вы запросили вход в Fenix без пароля.</p>
+        <p>
+          <a href="${link}" style="display:inline-block;padding:12px 18px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px">
+            Войти в Fenix
+          </a>
+        </p>
+        <p style="word-break:break-all">${link}</p>
+        <p>Ссылка действует ${MAGIC_LINK_TTL_MINUTES} минут и работает только один раз.</p>
+        <p>Если это были не вы, просто проигнорируйте письмо.</p>
+      </div>
+    `,
+  };
+}
+
 /**
  * POST /api/auth/check_email
  * body: { email }
@@ -697,6 +1125,23 @@ router.post('/check_email', async (req, res) => {
     }
     console.error('check_email error', err);
     return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/email-auth/status', async (req, res) => {
+  try {
+    const enabled = isMailConfigured();
+    return res.json({
+      ok: true,
+      data: {
+        mail_configured: enabled,
+        password_reset_enabled: enabled,
+        magic_link_enabled: enabled,
+      },
+    });
+  } catch (err) {
+    console.error('auth.emailAuth.status error', err);
+    return res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
 
@@ -1398,75 +1843,275 @@ router.post('/login', async (req, res) => {
       }
       return res.status(result?.status || 500).json(payload);
     }
-    if (!isPlatformCreator) {
-      try {
-        await upsertTenantUserIndex({
-          tenantId: result.user?.tenant_id || tenant?.id || null,
-          userId: result.user?.id || null,
-          email: result.user?.email || normalizedEmail,
-          role: result.user?.role || 'client',
-          isActive: result.user?.is_active !== false,
-        });
-      } catch (err) {
-        console.error('auth.login tenantUserIndex error', err);
-      }
-    }
-
-    let phoneAccess = { state: 'none' };
-    if (!isPlatformCreator && result.user?.tenant_id) {
-      try {
-        phoneAccess = await db.runWithTenantRow(tenant, async () =>
-          await resolvePhoneAccessState(db, {
-            requesterUserId: result.user.id,
-            tenantId: result.user.tenant_id || tenant?.id || null,
-          }),
-        );
-      } catch (err) {
-        console.error('auth.login phoneAccess state error', err);
-      }
-    }
-
-    const effectiveTenantCode = tenant?.code || result.user.tenant_code || null;
-    const token = signToken({
-      id: result.user.id,
-      email: result.user.email,
-      role: result.user.role,
-      tenant_id: result.user.tenant_id || null,
-      tenant_code: effectiveTenantCode,
-      sid: result.sessionId,
-    });
-    return res.json({
-      token,
-      session_id: result.sessionId,
-      two_factor: result.twoFactor || {
-        enabled: false,
-        method: 'disabled',
-        trust_device_applied: false,
-      },
-      user: {
-        id: result.user.id,
-        email: result.user.email,
-        role: result.user.role,
-        tenant_id: result.user.tenant_id || null,
-        tenant_code: effectiveTenantCode,
-        tenant_name: result.user.tenant_name || tenant?.name || null,
-        phone_access_state: phoneAccess.state || 'none',
-        phone_access: phoneAccess,
-      },
-      tenant: result.user.tenant_id
-        ? {
-            id: result.user.tenant_id,
-            code: effectiveTenantCode,
-            name: result.user.tenant_name || tenant?.name || null,
-            status: result.user.tenant_status || tenant?.status || null,
-            subscription_expires_at:
-              result.user.subscription_expires_at || tenant?.subscription_expires_at || null,
-          }
-        : null,
-    });
+    return res.json(
+      await buildSuccessfulAuthResponse({
+        req,
+        user: result.user,
+        tenant,
+        sessionId: result.sessionId,
+        isPlatformCreator,
+        twoFactor: result.twoFactor,
+      }),
+    );
   } catch (err) {
     console.error('auth.login error', err);
     return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+router.post('/password-reset/request', async (req, res) => {
+  try {
+    if (!isMailConfigured()) {
+      return res.status(503).json({
+        error:
+          'Восстановление по почте пока не настроено на сервере. Обратитесь к создателю приложения.',
+      });
+    }
+
+    const normalizedEmail = validator.normalizeEmail(req.body?.email || '');
+    if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Введите корректный email' });
+    }
+
+    const result = await findUserForEmailAuthRequest(req, normalizedEmail);
+    if (result.user && result.user.is_active !== false) {
+      const token = await issueAuthEmailToken(db, {
+        userId: result.user.id,
+        tenantId: result.user.tenant_id || result.tenant?.id || null,
+        email: result.user.email,
+        kind: 'password_reset',
+        ttlMinutes: PASSWORD_RESET_TTL_MINUTES,
+        req,
+      });
+      await sendMail({
+        to: result.user.email,
+        ...buildPasswordResetEmail({
+          req,
+          user: result.user,
+          token,
+        }),
+      });
+    }
+
+    return res.json(buildGenericRecoveryResponse('password_reset'));
+  } catch (err) {
+    console.error('auth.passwordReset.request error', err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || 'Ошибка сервера' });
+  }
+});
+
+router.post('/magic-link/request', async (req, res) => {
+  try {
+    if (!isMailConfigured()) {
+      return res.status(503).json({
+        error:
+          'Вход по ссылке пока не настроен на сервере. Обратитесь к создателю приложения.',
+      });
+    }
+
+    const normalizedEmail = validator.normalizeEmail(req.body?.email || '');
+    if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Введите корректный email' });
+    }
+
+    const result = await findUserForEmailAuthRequest(req, normalizedEmail);
+    if (result.user && result.user.is_active !== false) {
+      const token = await issueAuthEmailToken(db, {
+        userId: result.user.id,
+        tenantId: result.user.tenant_id || result.tenant?.id || null,
+        email: result.user.email,
+        kind: 'magic_login',
+        ttlMinutes: MAGIC_LINK_TTL_MINUTES,
+        req,
+      });
+      await sendMail({
+        to: result.user.email,
+        ...buildMagicLinkEmail({
+          req,
+          user: result.user,
+          token,
+        }),
+      });
+    }
+
+    return res.json(buildGenericRecoveryResponse('magic_login'));
+  } catch (err) {
+    console.error('auth.magicLink.request error', err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || 'Ошибка сервера' });
+  }
+});
+
+router.post('/magic-link/consume', async (req, res) => {
+  const token = req.body?.token;
+  const deviceFingerprint = req.body?.device_fingerprint;
+  if (!normalizeAuthEmailToken(token)) {
+    return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claimed = await claimAuthEmailToken(client, {
+      token,
+      kind: 'magic_login',
+      req,
+    });
+    if (!claimed) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
+    }
+    if (claimed.is_active === false) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: String(claimed.block_reason || '').trim() ||
+          'Вас заблокировали за нарушение правил',
+      });
+    }
+
+    const isPlatformCreator =
+      String(claimed.user_email || claimed.email || '').trim().toLowerCase() ===
+      CREATOR_EMAIL.toLowerCase();
+    const userRole = String(claimed.role || '').toLowerCase().trim();
+    const shouldEnforceTenantSubscription =
+      !isPlatformCreator &&
+      (userRole === 'tenant' || userRole === 'admin' || userRole === 'worker');
+    if (shouldEnforceTenantSubscription) {
+      const tenantState = isTenantActive({
+        status: claimed.tenant_status,
+        subscription_expires_at: claimed.subscription_expires_at,
+      });
+      if (!tenantState.ok) {
+        await client.query('ROLLBACK');
+        return res.status(tenantState.reason === 'tenant_expired' ? 402 : 403).json({
+          error: tenantState.error,
+        });
+      }
+    }
+
+    const user = {
+      id: claimed.id,
+      email: claimed.user_email || claimed.email,
+      role: claimed.role,
+      tenant_id: claimed.user_tenant_id || null,
+      tenant_code: claimed.tenant_code || null,
+      tenant_name: claimed.tenant_name || null,
+      tenant_status: claimed.tenant_status || null,
+      subscription_expires_at: claimed.subscription_expires_at || null,
+      is_active: claimed.is_active !== false,
+    };
+    const tenant = user.tenant_id
+      ? {
+          id: user.tenant_id,
+          code: claimed.tenant_code || null,
+          name: claimed.tenant_name || null,
+          status: claimed.tenant_status || null,
+          subscription_expires_at: claimed.subscription_expires_at || null,
+        }
+      : null;
+    const session = await createAuthenticatedSession({
+      client,
+      user,
+      req,
+      deviceFingerprint,
+    });
+    const payload = await buildSuccessfulAuthResponse({
+      req,
+      user,
+      tenant,
+      sessionId: session.sessionId,
+      isPlatformCreator,
+      twoFactor: {
+        enabled: false,
+        method: 'magic_link',
+        trust_device_applied: false,
+      },
+    });
+
+    await client.query('COMMIT');
+    return res.json(payload);
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('auth.magicLink.consume error', err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || 'Ошибка сервера' });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/password-reset/confirm', async (req, res) => {
+  const token = req.body?.token;
+  const newPassword = String(
+    req.body?.new_password || req.body?.password || '',
+  );
+  if (!normalizeAuthEmailToken(token)) {
+    return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
+  }
+  if (newPassword.trim().length < 8) {
+    return res.status(400).json({
+      error: 'Пароль должен быть не менее 8 символов',
+    });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claimed = await claimAuthEmailToken(client, {
+      token,
+      kind: 'password_reset',
+      req,
+    });
+    if (!claimed) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
+    }
+    if (claimed.is_active === false) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: String(claimed.block_reason || '').trim() ||
+          'Вас заблокировали за нарушение правил',
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+    await client.query(
+      `UPDATE users
+       SET password_hash = $2
+       WHERE id = $1`,
+      [claimed.id, passwordHash],
+    );
+    await revokeAllUserSessions({ queryable: client, userId: claimed.id });
+    await revokeAllTwoFactorTrustedDevices(client, claimed.id);
+    await client.query(
+      `UPDATE auth_email_tokens
+       SET used_at = COALESCE(used_at, now())
+       WHERE user_id = $1
+         AND used_at IS NULL`,
+      [claimed.id],
+    );
+
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      message: 'Пароль обновлён. Теперь войдите с новым паролем.',
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('auth.passwordReset.confirm error', err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ error: err.message || 'Ошибка сервера' });
+  } finally {
+    client.release();
   }
 });
 
