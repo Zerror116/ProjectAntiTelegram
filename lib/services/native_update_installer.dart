@@ -35,6 +35,10 @@ class NativeUpdateInstaller {
     return impl.openDownloadedPackage(filePath, detached: detached);
   }
 
+  static Future<bool> openDownloadsUi() {
+    return impl.openDownloadsUi();
+  }
+
   static Future<void> exitCurrentAppForUpdate({
     Duration delay = const Duration(milliseconds: 1200),
   }) {
