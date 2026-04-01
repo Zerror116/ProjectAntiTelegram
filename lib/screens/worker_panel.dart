@@ -2256,6 +2256,55 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
+  Future<void> _deleteOwnQueuedPost(Map<String, dynamic> post) async {
+    final title = (post['product_title'] ?? 'этот пост').toString().trim();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Удалить свой пост?'),
+        content: Text(
+          'Удалить "$title" из очереди?\n\nПосле этого пост не уйдёт на канал.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    if (mounted) {
+      setState(() => _savingOwnPost = true);
+    }
+    try {
+      await authService.dio.delete('/api/worker/queue/${post['id']}');
+      await _loadOwnQueuedPosts();
+      if (!mounted) return;
+      setState(() => _message = 'Пост удалён из очереди');
+      showAppNotice(
+        context,
+        'Пост удалён. Он больше не уйдёт на канал.',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка удаления поста: ${_extractRequestError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _savingOwnPost = false);
+      }
+    }
+  }
+
   Widget _buildOwnPostsTab() {
     final theme = Theme.of(context);
     if (_loadingOwnPosts) {
@@ -2403,6 +2452,13 @@ class _WorkerPanelState extends State<WorkerPanel>
                               : () => _editOwnQueuedPost(post),
                           icon: const Icon(Icons.edit_outlined, size: 18),
                           label: const Text('Изменить'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: (_savingOwnPost || _posting)
+                              ? null
+                              : () => _deleteOwnQueuedPost(post),
+                          icon: const Icon(Icons.delete_outline, size: 18),
+                          label: const Text('Удалить'),
                         ),
                         OutlinedButton.icon(
                           onPressed: _posting

@@ -2872,6 +2872,47 @@ router.patch(
   },
 );
 
+router.delete(
+  "/channels/pending_posts/:queueId",
+  requireAuth,
+  requireRole("admin", "creator"),
+  requireProductPublishPermission,
+  async (req, res) => {
+    const queueId = String(req.params.queueId || "").trim();
+    if (!queueId) {
+      return res.status(400).json({ ok: false, error: "queueId обязателен" });
+    }
+    try {
+      const deleted = await runInRequestTenantScope(req, async () =>
+        db.query(
+          `DELETE FROM product_publication_queue q
+           WHERE q.id = $1
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+             AND EXISTS (
+               SELECT 1
+               FROM chats c
+               WHERE c.id = q.channel_id
+                 AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+             )
+           RETURNING q.id`,
+          [queueId, req.user.tenant_id || null],
+        ),
+      );
+      if (deleted.rowCount === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: "Пост не найден или уже опубликован",
+        });
+      }
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("admin.channels.pending_posts.delete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 // Отправить заказы клиентов в канал "Забронированный товар"
 router.post(
   "/orders/dispatch_reserved",
