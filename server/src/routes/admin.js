@@ -2823,38 +2823,40 @@ router.patch(
         .json({ ok: false, error: "Количество должно быть больше нуля" });
     }
     try {
-      const updated = await db.query(
-         `UPDATE product_publication_queue q
-         SET payload = jsonb_strip_nulls(
-               COALESCE(q.payload, '{}'::jsonb) ||
-               jsonb_build_object(
-                 'title', $2,
-                 'description', $3,
-                 'price', $4,
-                 'quantity', $5,
-                 'shelf_number', COALESCE($6::int, NULLIF(q.payload->>'shelf_number', '')::int),
-                 'image_url', NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), '')
+      const updated = await runInRequestTenantScope(req, async () =>
+        db.query(
+          `UPDATE product_publication_queue q
+           SET payload = jsonb_strip_nulls(
+                 COALESCE(q.payload, '{}'::jsonb) ||
+                 jsonb_build_object(
+                   'title', $2,
+                   'description', $3,
+                   'price', $4,
+                   'quantity', $5,
+                   'shelf_number', COALESCE($6::int, NULLIF(q.payload->>'shelf_number', '')::int),
+                   'image_url', NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), '')
+                 )
                )
+           WHERE q.id = $1
+             AND q.status = 'pending'
+             AND COALESCE(q.is_sent, false) = false
+             AND EXISTS (
+               SELECT 1
+               FROM chats c
+               WHERE c.id = q.channel_id
+                 AND ($7::uuid IS NULL OR c.tenant_id = $7::uuid)
              )
-         WHERE q.id = $1
-           AND q.status = 'pending'
-           AND COALESCE(q.is_sent, false) = false
-           AND EXISTS (
-             SELECT 1
-             FROM chats c
-             WHERE c.id = q.channel_id
-               AND ($7::uuid IS NULL OR c.tenant_id = $7::uuid)
-           )
-         RETURNING q.id`,
-        [
-          queueId,
-          title,
-          description,
-          price,
-          Math.floor(quantity),
-          shelfNumber,
-          req.user.tenant_id || null,
-        ],
+           RETURNING q.id`,
+          [
+            queueId,
+            title,
+            description,
+            price,
+            Math.floor(quantity),
+            shelfNumber,
+            req.user.tenant_id || null,
+          ],
+        ),
       );
       if (updated.rowCount === 0) {
         return res.status(404).json({

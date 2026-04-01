@@ -3129,6 +3129,11 @@ class _ChatScreenState extends State<ChatScreen> {
     return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
+  bool _canMarkReservedOrderPlaced() {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return role == 'admin' || role == 'creator';
+  }
+
   bool _requiresManualShelfOnPlaced() {
     final role = authService.effectiveRole.toLowerCase().trim();
     return role == 'admin' || role == 'tenant' || role == 'creator';
@@ -5610,12 +5615,13 @@ class _ChatScreenState extends State<ChatScreen> {
       if (imageUrl == null) return const SizedBox.shrink();
       final wantsFullWidth = width == double.infinity;
       final resolvedWidth = wantsFullWidth ? maxBubbleWidth : (width ?? defaultImageWidth);
-      final placeholderHeight = (defaultImageMaxHeight * 0.58).clamp(160.0, 280.0);
+      final reservedHeight = min(
+        defaultImageMaxHeight,
+        max(220.0, resolvedWidth * (isCompactMedia ? 0.84 : 0.72)),
+      );
       Widget buildImagePlaceholder({bool loading = false}) => Container(
-        constraints: BoxConstraints(
-          minHeight: placeholderHeight,
-          maxHeight: defaultImageMaxHeight,
-        ),
+        width: resolvedWidth,
+        height: reservedHeight,
         color: theme.colorScheme.surfaceContainerHighest,
         alignment: Alignment.center,
         child: Column(
@@ -5649,20 +5655,22 @@ class _ChatScreenState extends State<ChatScreen> {
           borderRadius: BorderRadius.circular(isCompactMedia ? 16 : 18),
           child: SizedBox(
             width: resolvedWidth,
-            child: ConstrainedBox(
-              constraints: BoxConstraints(
-                maxWidth: resolvedWidth,
-                maxHeight: defaultImageMaxHeight,
-              ),
-              child: AdaptiveNetworkImage(
-                imageUrl,
-                width: resolvedWidth,
-                fit: BoxFit.contain,
-                loadingBuilder: (context, child, loadingProgress) {
-                  if (loadingProgress == null) return child;
-                  return buildImagePlaceholder(loading: true);
-                },
-                errorBuilder: (_, error, stackTrace) => buildImagePlaceholder(),
+            height: reservedHeight,
+            child: ColoredBox(
+              color: theme.colorScheme.surfaceContainerHighest,
+              child: Center(
+                child: AdaptiveNetworkImage(
+                  imageUrl,
+                  width: resolvedWidth,
+                  height: reservedHeight,
+                  fit: BoxFit.contain,
+                  loadingBuilder: (context, child, loadingProgress) {
+                    if (loadingProgress == null) return child;
+                    return buildImagePlaceholder(loading: true);
+                  },
+                  errorBuilder: (_, error, stackTrace) =>
+                      buildImagePlaceholder(),
+                ),
               ),
             ),
           ),
@@ -5974,7 +5982,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: ElevatedButton.icon(
                   icon: const Icon(Icons.inventory_2_outlined),
                   onPressed:
-                      (!_isAdminOrCreator() || isPlaced || _markingPlaced)
+                      (!_canMarkReservedOrderPlaced() ||
+                              isPlaced ||
+                              _markingPlaced)
                       ? null
                       : () => _markReservedOrderPlaced(metaMap),
                   label: Text(
