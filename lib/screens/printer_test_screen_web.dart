@@ -79,27 +79,32 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         width: 115mm;
         height: 70mm;
         box-sizing: border-box;
+        border: 1mm solid #000;
         display: flex;
         flex-direction: column;
-        justify-content: center;
-        align-items: center;
-        text-align: center;
+        padding: 5mm 6mm 5mm 0.8mm;
       }
 
       .phone {
-        font-size: 13.8mm;
+        font-size: 15mm;
         line-height: 1;
         font-weight: 900;
-        letter-spacing: 0;
+        letter-spacing: 0.15mm;
       }
 
       .name {
-        margin-top: 3.2mm;
-        font-size: 9.6mm;
+        margin-top: 3.5mm;
+        font-size: 10.8mm;
         line-height: 1.05;
         font-weight: 800;
         word-break: break-word;
-        max-width: 80mm;
+      }
+
+      .footer {
+        margin-top: auto;
+        font-size: 3mm;
+        font-weight: 700;
+        color: #555;
       }
     </style>
   </head>
@@ -107,6 +112,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     <div class="sheet">
       <div class="phone">$safePhone</div>
       <div class="name">$safeName</div>
+      <div class="footer">Феникс • тестовая наклейка • 115x70 мм</div>
     </div>
   </body>
 </html>
@@ -204,8 +210,9 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       aspectRatio: 115 / 70,
       child: Container(
         decoration: BoxDecoration(
-          color: const Color(0xFFE7E7E7),
+          color: Colors.white,
           borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.black, width: 1.8),
           boxShadow: const [
             BoxShadow(
               color: Color(0x14000000),
@@ -214,45 +221,50 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
             ),
           ],
         ),
-        alignment: Alignment.center,
-        child: Container(
-          width: 280,
-          height: 170,
-          decoration: BoxDecoration(
-            color: Colors.white,
-            border: Border.all(color: const Color(0xFFD6D6D6), width: 1),
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                phone,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 29,
-                  fontWeight: FontWeight.w900,
-                  color: Colors.black,
-                  letterSpacing: 0,
-                ),
+        padding: const EdgeInsets.fromLTRB(6, 14, 18, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    phone,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.3,
+                      color: Colors.black,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                      height: 1.05,
+                      color: Colors.black,
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(height: 10),
-              Text(
-                name,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.w800,
-                  height: 1.05,
-                  color: Colors.black,
-                ),
+            ),
+            const Text(
+              'Феникс • тестовая наклейка • 115x70 мм',
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF555555),
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
