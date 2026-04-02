@@ -10,6 +10,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../services/auth_service.dart';
 import '../main.dart'; // глобальный authService и dio
 import '../widgets/input_language_badge.dart';
+import '../widgets/submit_on_enter.dart';
 
 import 'pwa_guide_screen.dart';
 import 'phone_name_screen.dart';
@@ -416,55 +417,49 @@ class _AuthScreenState extends State<AuthScreen> {
     return fallback;
   }
 
+  void _replaceAppRoot(Widget screen) {
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => screen),
+      (route) => false,
+    );
+  }
+
   Future<void> _navigateAfterSuccessfulAuth() async {
+    Widget nextScreen = const MainShell();
     try {
-      final resp = await _authService.dio.get('/api/profile');
-      final data = resp.data as Map<String, dynamic>? ?? {};
-      final user = data['user'] as Map<String, dynamic>? ?? {};
-      final name = (user['name'] ?? '').toString().trim();
-      final phone = (user['phone'] ?? '').toString().trim();
-      final phoneAccessState =
-          (user['phone_access_state'] ?? user['phoneAccessState'] ?? '')
-              .toString()
-              .trim()
-              .toLowerCase();
+      final refreshed = await _authService.tryRefreshOnStartup().timeout(
+        const Duration(seconds: 8),
+        onTimeout: () => _authService.currentUser != null,
+      );
+      final user = _authService.currentUser;
+      if (user == null) {
+        _replaceAppRoot(nextScreen);
+        return;
+      }
+      final name = (user.name ?? '').trim();
+      final phone = (user.phone ?? '').trim();
+      final phoneAccessState = (user.phoneAccessState ?? '')
+          .trim()
+          .toLowerCase();
       final hasName = name.isNotEmpty;
       final hasPhone = phone.isNotEmpty;
 
       if (phoneAccessState == 'pending' || phoneAccessState == 'rejected') {
-        if (!mounted) return;
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const PhoneAccessPendingScreen()),
-        );
-        return;
+        nextScreen = const PhoneAccessPendingScreen();
+      } else if (!hasName || !hasPhone) {
+        if (refreshed && !_authService.lastStartupRefreshUsedFallback) {
+          nextScreen = const PhoneNameScreen(isRegisterFlow: false);
+        } else {
+          debugPrint(
+            'auth.login: profile is incomplete or not freshly confirmed, keep MainShell for now',
+          );
+        }
       }
-
-      if (!hasName || !hasPhone) {
-        if (!mounted) return;
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (_) => const PhoneNameScreen(isRegisterFlow: false),
-          ),
-        );
-        return;
-      }
-
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const MainShell()),
-      );
-      return;
     } catch (e) {
       debugPrint('auth.login: profile check failed, continue to MainShell: $e');
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const MainShell()),
-      );
     }
+    _replaceAppRoot(nextScreen);
   }
 
   Future<void> _requestEmailAction({
@@ -1246,10 +1241,13 @@ class _AuthScreenState extends State<AuthScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            Form(
-              key: _formKey,
-              child: Column(
-                children: [
+            SubmitOnEnter(
+              enabled: !_loading,
+              onSubmit: () => unawaited(_onSubmitPressed()),
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  children: [
                   TextFormField(
                     controller: _emailController,
                     decoration: withInputLanguageBadge(
@@ -1368,32 +1366,33 @@ class _AuthScreenState extends State<AuthScreen> {
                           : Text(_isRegister ? 'Далее' : 'Войти'),
                     ),
                   ),
-                  if (!_isRegister &&
-                      _emailRecoveryStatusLoaded &&
-                      _emailRecoveryEnabled) ...[
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextButton(
-                            onPressed: _loading
-                                ? null
-                                : () => _requestEmailAction(magicLink: false),
-                            child: const Text('Забыли пароль?'),
+                    if (!_isRegister &&
+                        _emailRecoveryStatusLoaded &&
+                        _emailRecoveryEnabled) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextButton(
+                              onPressed: _loading
+                                  ? null
+                                  : () => _requestEmailAction(magicLink: false),
+                              child: const Text('Забыли пароль?'),
+                            ),
                           ),
-                        ),
-                        Expanded(
-                          child: TextButton(
-                            onPressed: _loading
-                                ? null
-                                : () => _requestEmailAction(magicLink: true),
-                            child: const Text('Войти без пароля'),
+                          Expanded(
+                            child: TextButton(
+                              onPressed: _loading
+                                  ? null
+                                  : () => _requestEmailAction(magicLink: true),
+                              child: const Text('Войти без пароля'),
+                            ),
                           ),
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
             const SizedBox(height: 12),

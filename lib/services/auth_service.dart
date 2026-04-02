@@ -122,7 +122,9 @@ class AuthService {
   // Current authenticated user (populated after login / profile fetch)
   User? _currentUser;
   String? _cachedToken;
+  bool _lastStartupRefreshUsedFallback = false;
   User? get currentUser => _currentUser;
+  bool get lastStartupRefreshUsedFallback => _lastStartupRefreshUsedFallback;
   String? _viewRole;
   String? get viewRole => _viewRole;
   String get effectiveRole {
@@ -969,6 +971,7 @@ class AuthService {
   Future<bool> tryRefreshOnStartup() async {
     String? token;
     try {
+      _lastStartupRefreshUsedFallback = false;
       debugPrint('🔄 tryRefreshOnStartup called');
       token = await getToken();
       if (token == null || token.isEmpty) {
@@ -1003,6 +1006,7 @@ class AuthService {
             _authController.add(_currentUser);
           } catch (_) {}
           await _maybeEnsureWebPushSubscription();
+          _lastStartupRefreshUsedFallback = false;
           debugPrint(
             '✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}',
           );
@@ -1016,10 +1020,12 @@ class AuthService {
       // Очищаем токен только если сервер явно вернул auth-ошибку.
       if (status == 401 || status == 403) {
         debugPrint('❌ tryRefreshOnStartup auth error: $e');
+        _lastStartupRefreshUsedFallback = false;
         await clearToken();
         return false;
       }
       final restored = await _restoreLocalSessionFallback(token: token);
+      _lastStartupRefreshUsedFallback = restored;
       if (restored) {
         debugPrint(
           '⚠️ tryRefreshOnStartup dio warning, using local session fallback: $e',
@@ -1030,6 +1036,7 @@ class AuthService {
       return restored;
     } catch (e) {
       final restored = await _restoreLocalSessionFallback(token: token);
+      _lastStartupRefreshUsedFallback = restored;
       if (restored) {
         debugPrint(
           '⚠️ tryRefreshOnStartup warning, using local session fallback: $e',

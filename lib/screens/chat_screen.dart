@@ -14,6 +14,7 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart' as vp;
 
 import '../main.dart';
@@ -62,6 +63,9 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  static const String _chatScrollOffsetKeyPrefix = 'chat_scroll_offset_v2:';
+  static final Map<String, double> _inMemoryScrollOffsets = <String, double>{};
+
   final _controller = TextEditingController();
   final _searchController = TextEditingController();
   final _inputFocusNode = FocusNode();
@@ -95,6 +99,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _offlineSyncBusy = false;
   bool _showScrollToBottomButton = false;
   bool _keepBottomAnchor = true;
+  bool _initialViewportApplied = false;
   int _offlineQueuedCount = 0;
 
   String _searchQuery = '';
@@ -123,6 +128,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _offlineQueueRefreshTimer;
   Timer? _composerMediaHoldTimer;
   Timer? _bottomAnchorTimer;
+  Timer? _persistScrollOffsetTimer;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -147,6 +153,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Map<String, dynamic>? _activePin;
   final List<String> _recentReactionEmojis = <String>[];
   final List<String> _recentComposerEmojis = <String>[];
+  double? _savedScrollOffset;
 
   static const List<String> _quickReactions = <String>[
     '👍',
@@ -192,7 +199,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     activeChatIdNotifier.value = widget.chatId;
-    _loadMessages();
+    unawaited(_initializeChat());
     _loadPinnedMessage();
     _joinRoom();
     unawaited(_refreshOfflineQueueCount());
@@ -330,6 +337,12 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  Future<void> _initializeChat() async {
+    await _restoreSavedScrollOffset();
+    if (!mounted) return;
+    await _loadMessages();
+  }
+
   @override
   void dispose() {
     if (activeChatIdNotifier.value == widget.chatId) {
@@ -342,6 +355,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _offlineQueueRefreshTimer?.cancel();
     _composerMediaHoldTimer?.cancel();
     _bottomAnchorTimer?.cancel();
+    _persistScrollOffsetTimer?.cancel();
     _chatSub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
@@ -367,6 +381,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _searchController.dispose();
     _inputFocusNode.dispose();
     _scrollController.removeListener(_handleScroll);
+    unawaited(_persistCurrentScrollOffset());
     _scrollController.dispose();
     _messageItemKeys.clear();
     super.dispose();
@@ -415,8 +430,52 @@ class _ChatScreenState extends State<ChatScreen> {
     return (p.maxScrollExtent - p.pixels) <= 120;
   }
 
+  String get _chatScrollOffsetStorageKey =>
+      '$_chatScrollOffsetKeyPrefix${widget.chatId}';
+
+  Future<void> _restoreSavedScrollOffset() async {
+    final cached = _inMemoryScrollOffsets[widget.chatId];
+    if (cached != null && cached.isFinite && cached >= 0) {
+      _savedScrollOffset = cached;
+      return;
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getDouble(_chatScrollOffsetStorageKey);
+      if (saved != null && saved.isFinite && saved >= 0) {
+        _savedScrollOffset = saved;
+        _inMemoryScrollOffsets[widget.chatId] = saved;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _persistCurrentScrollOffset() async {
+    if (!_scrollController.hasClients) return;
+    final rawOffset = _scrollController.position.pixels;
+    if (!rawOffset.isFinite) return;
+    final offset = rawOffset.clamp(
+      0.0,
+      _scrollController.position.maxScrollExtent,
+    ).toDouble();
+    _savedScrollOffset = offset;
+    _inMemoryScrollOffsets[widget.chatId] = offset;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_chatScrollOffsetStorageKey, offset);
+    } catch (_) {}
+  }
+
+  void _queuePersistCurrentScrollOffset() {
+    _persistScrollOffsetTimer?.cancel();
+    _persistScrollOffsetTimer = Timer(
+      const Duration(milliseconds: 240),
+      () => unawaited(_persistCurrentScrollOffset()),
+    );
+  }
+
   void _handleScroll() {
     if (!mounted) return;
+    _queuePersistCurrentScrollOffset();
     final nearBottom = _isNearBottom();
     if (!nearBottom) {
       _keepBottomAnchor = false;
@@ -440,6 +499,40 @@ class _ChatScreenState extends State<ChatScreen> {
       } else {
         _scrollController.jumpTo(target);
       }
+      _handleScroll();
+    });
+  }
+
+  void _applyInitialViewportAfterLoad() {
+    if (_initialViewportApplied) return;
+    _initialViewportApplied = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final savedOffset = _savedScrollOffset;
+      if (savedOffset != null) {
+        _restoreSavedViewport(savedOffset, passes: 3);
+        return;
+      }
+      if (_messages.isNotEmpty) {
+        _keepBottomAnchor = true;
+        _stabilizeBottomAnchor(passes: 7);
+      } else {
+        _handleScroll();
+      }
+    });
+  }
+
+  void _restoreSavedViewport(double savedOffset, {int passes = 1}) {
+    if (!mounted || !_scrollController.hasClients || passes <= 0) return;
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    final target = savedOffset.clamp(0.0, maxExtent).toDouble();
+    _keepBottomAnchor = (maxExtent - target) <= 120;
+    _scrollController.jumpTo(target);
+    _handleScroll();
+    if (passes == 1) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _restoreSavedViewport(savedOffset, passes: passes - 1);
     });
   }
 
@@ -1176,9 +1269,8 @@ class _ChatScreenState extends State<ChatScreen> {
       } else {
         _loading = false;
       }
-      if (loadedSuccessfully && _messages.isNotEmpty) {
-        _keepBottomAnchor = true;
-        _stabilizeBottomAnchor(passes: 7);
+      if (loadedSuccessfully) {
+        _applyInitialViewportAfterLoad();
       }
     }
   }
