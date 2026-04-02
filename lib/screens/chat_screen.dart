@@ -64,7 +64,11 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const String _chatScrollOffsetKeyPrefix = 'chat_scroll_offset_v2:';
+  static const String _chatScrollFractionKeyPrefix =
+      'chat_scroll_fraction_v1:';
   static final Map<String, double> _inMemoryScrollOffsets = <String, double>{};
+  static final Map<String, double> _inMemoryScrollFractions =
+      <String, double>{};
 
   final _controller = TextEditingController();
   final _searchController = TextEditingController();
@@ -154,6 +158,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<String> _recentReactionEmojis = <String>[];
   final List<String> _recentComposerEmojis = <String>[];
   double? _savedScrollOffset;
+  double? _savedScrollFraction;
 
   static const List<String> _quickReactions = <String>[
     '👍',
@@ -433,11 +438,20 @@ class _ChatScreenState extends State<ChatScreen> {
   String get _chatScrollOffsetStorageKey =>
       '$_chatScrollOffsetKeyPrefix${widget.chatId}';
 
+  String get _chatScrollFractionStorageKey =>
+      '$_chatScrollFractionKeyPrefix${widget.chatId}';
+
   Future<void> _restoreSavedScrollOffset() async {
     final cached = _inMemoryScrollOffsets[widget.chatId];
     if (cached != null && cached.isFinite && cached >= 0) {
       _savedScrollOffset = cached;
-      return;
+    }
+    final cachedFraction = _inMemoryScrollFractions[widget.chatId];
+    if (cachedFraction != null &&
+        cachedFraction.isFinite &&
+        cachedFraction >= 0 &&
+        cachedFraction <= 1) {
+      _savedScrollFraction = cachedFraction;
     }
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -445,6 +459,14 @@ class _ChatScreenState extends State<ChatScreen> {
       if (saved != null && saved.isFinite && saved >= 0) {
         _savedScrollOffset = saved;
         _inMemoryScrollOffsets[widget.chatId] = saved;
+      }
+      final savedFraction = prefs.getDouble(_chatScrollFractionStorageKey);
+      if (savedFraction != null &&
+          savedFraction.isFinite &&
+          savedFraction >= 0 &&
+          savedFraction <= 1) {
+        _savedScrollFraction = savedFraction;
+        _inMemoryScrollFractions[widget.chatId] = savedFraction;
       }
     } catch (_) {}
   }
@@ -457,11 +479,18 @@ class _ChatScreenState extends State<ChatScreen> {
       0.0,
       _scrollController.position.maxScrollExtent,
     ).toDouble();
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    final fraction = maxExtent <= 0
+        ? 1.0
+        : (offset / maxExtent).clamp(0.0, 1.0).toDouble();
     _savedScrollOffset = offset;
+    _savedScrollFraction = fraction;
     _inMemoryScrollOffsets[widget.chatId] = offset;
+    _inMemoryScrollFractions[widget.chatId] = fraction;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble(_chatScrollOffsetStorageKey, offset);
+      await prefs.setDouble(_chatScrollFractionStorageKey, fraction);
     } catch (_) {}
   }
 
@@ -509,8 +538,13 @@ class _ChatScreenState extends State<ChatScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
       final savedOffset = _savedScrollOffset;
-      if (savedOffset != null) {
-        _restoreSavedViewport(savedOffset, passes: 3);
+      final savedFraction = _savedScrollFraction;
+      if (savedOffset != null || savedFraction != null) {
+        _restoreSavedViewport(
+          savedOffset: savedOffset,
+          savedFraction: savedFraction,
+          passes: 4,
+        );
         return;
       }
       if (_messages.isNotEmpty) {
@@ -522,17 +556,33 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  void _restoreSavedViewport(double savedOffset, {int passes = 1}) {
+  void _restoreSavedViewport({
+    double? savedOffset,
+    double? savedFraction,
+    int passes = 1,
+  }) {
     if (!mounted || !_scrollController.hasClients || passes <= 0) return;
     final maxExtent = _scrollController.position.maxScrollExtent;
-    final target = savedOffset.clamp(0.0, maxExtent).toDouble();
+    final hasSavedFraction =
+        savedFraction != null &&
+        savedFraction.isFinite &&
+        savedFraction >= 0 &&
+        savedFraction <= 1;
+    final normalizedFraction = savedFraction ?? 0.0;
+    final target = hasSavedFraction
+        ? (maxExtent * normalizedFraction).clamp(0.0, maxExtent).toDouble()
+        : (savedOffset ?? 0.0).clamp(0.0, maxExtent).toDouble();
     _keepBottomAnchor = (maxExtent - target) <= 120;
     _scrollController.jumpTo(target);
     _handleScroll();
     if (passes == 1) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _restoreSavedViewport(savedOffset, passes: passes - 1);
+      _restoreSavedViewport(
+        savedOffset: savedOffset,
+        savedFraction: savedFraction,
+        passes: passes - 1,
+      );
     });
   }
 

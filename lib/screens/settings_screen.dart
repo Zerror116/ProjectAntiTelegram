@@ -1050,7 +1050,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 leading: const Icon(Icons.print_outlined),
                 title: const Text('Термопринтер (Bluetooth / USB)'),
                 subtitle: const Text(
-                  'Подключение и пробная печать наклейки',
+                  'Подключение по Bluetooth или USB-кабелю и пробная печать наклейки',
                 ),
                 onTap: _openPrinterTest,
               ),
