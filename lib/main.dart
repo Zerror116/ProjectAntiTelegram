@@ -2993,6 +2993,19 @@ Widget _buildInitialScreenFromRestoredUser(User? restoredUser) {
   return const MainShell();
 }
 
+bool _restoredUserNeedsProfileCompletion(User? restoredUser) {
+  if (restoredUser == null) return false;
+  final phoneAccessState = (restoredUser.phoneAccessState ?? '')
+      .trim()
+      .toLowerCase();
+  if (_isPhoneAccessRestrictedState(phoneAccessState)) {
+    return false;
+  }
+  final name = (restoredUser.name ?? '').trim();
+  final phone = (restoredUser.phone ?? '').trim();
+  return name.isEmpty || phone.isEmpty;
+}
+
 Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
   if (kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
@@ -3007,12 +3020,33 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   final hasStoredToken = await authService.primeAuthHeaderFromStoredToken()
       .timeout(const Duration(seconds: 1), onTimeout: () => false);
   if (hasStoredToken && authService.currentUser != null) {
+    final localUser = authService.currentUser;
+    if (_restoredUserNeedsProfileCompletion(localUser)) {
+      debugPrint(
+        'determineInitialScreen: local session incomplete, waiting for fresh profile',
+      );
+      final refreshed = await authService.tryRefreshOnStartup().timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => false,
+      );
+      if (refreshed &&
+          authService.currentUser != null &&
+          !authService.lastStartupRefreshUsedFallback) {
+        _handlingAuthFailure = false;
+        return _buildInitialScreenFromRestoredUser(authService.currentUser);
+      }
+      debugPrint(
+        'determineInitialScreen: incomplete local profile without fresh confirmation, fallback to MainShell',
+      );
+      _handlingAuthFailure = false;
+      return const MainShell();
+    }
     debugPrint(
       'determineInitialScreen: fast path via stored token -> local session',
     );
     unawaited(authService.tryRefreshOnStartup());
     _handlingAuthFailure = false;
-    return _buildInitialScreenFromRestoredUser(authService.currentUser);
+    return _buildInitialScreenFromRestoredUser(localUser);
   }
 
   final logged = await authService.tryRefreshOnStartup().timeout(
