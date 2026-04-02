@@ -10,6 +10,7 @@ import '../main.dart';
 import '../services/web_notification_service.dart';
 import '../widgets/web_notification_prompt.dart';
 import 'bug_report_screen.dart';
+import 'printer_test_screen.dart';
 import 'support_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -41,6 +42,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool get _canOpenSupport => true;
 
   bool get _canReportProblem => _canOpenSupport;
+
+  bool get _canOpenThermalPrinter {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return role == 'admin' || role == 'creator';
+  }
 
   bool get _isAndroidWeb =>
       kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -143,6 +149,82 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Future<void> _showNotificationGuide() async {
+    if (kIsWeb) {
+      await showWebNotificationHelpSheet(
+        context,
+        permissionState: _webNotificationPermissionState,
+        isIosWeb: defaultTargetPlatform == TargetPlatform.iOS,
+        isAndroidWeb: defaultTargetPlatform == TargetPlatform.android,
+        isStandalone: WebNotificationService.isStandaloneDisplayMode,
+      );
+      return;
+    }
+
+    final isAndroid = defaultTargetPlatform == TargetPlatform.android;
+    final steps = isAndroid
+        ? const <String>[
+            '1. Нажмите «Открыть системные настройки».',
+            '2. Для Android 13 и новее разрешите приложению уведомления.',
+            '3. Внутри настроек Феникс включите звук, показ на экране блокировки и всплывающие уведомления.',
+            '4. Если телефон экономит батарею слишком агрессивно, разрешите Феникс работу в фоне, чтобы важные уведомления не задерживались.',
+          ]
+        : const <String>[
+            '1. Нажмите «Открыть системные настройки».',
+            '2. Найдите Феникс -> Уведомления.',
+            '3. Включите «Допуск уведомлений», баннеры, звук и показ в центре уведомлений.',
+            '4. Если уведомления уже были запрещены раньше, включите их вручную в настройках системы.',
+          ];
+
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        final theme = Theme.of(sheetContext);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 6, 18, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Как включить уведомления',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  isAndroid
+                      ? 'Android показывает системные уведомления только после явного разрешения пользователя. Лучше включать их прямо в настройках приложения и системы.'
+                      : 'На iPhone уведомления начинают работать только после системного разрешения. Баннеры, звук и центр уведомлений настраиваются отдельно.',
+                  style: theme.textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 12),
+                ...steps.map(
+                  (step) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text(step, style: theme.textTheme.bodyMedium),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                FilledButton.icon(
+                  onPressed: () {
+                    Navigator.of(sheetContext).pop();
+                    unawaited(_openSystemNotificationSettings());
+                  },
+                  icon: const Icon(Icons.open_in_new_rounded),
+                  label: const Text('Открыть системные настройки'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Future<void> _loadWebNotificationPermissionState() async {
     if (!kIsWeb) return;
     final state = await WebNotificationService.getPermissionState();
@@ -150,6 +232,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       _webNotificationPermissionState = state;
     });
+  }
+
+  Future<void> _openPrinterTest() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const PrinterTestScreen()),
+    );
   }
 
   bool _isTwoFactorEligibleRole() {
@@ -927,6 +1016,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       appBar: AppBar(title: const Text('Настройки')),
       body: SafeArea(
         child: ListView(
+          physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics(),
+          ),
           padding: const EdgeInsets.all(16),
           children: [
             SwitchListTile(
@@ -945,6 +1037,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               onTap: _openSystemNotificationSettings,
             ),
+            ListTile(
+              leading: const Icon(Icons.help_outline_rounded),
+              title: const Text('Как включить уведомления'),
+              subtitle: const Text(
+                'Короткая инструкция для телефона и браузера',
+              ),
+              onTap: _showNotificationGuide,
+            ),
+            if (_canOpenThermalPrinter)
+              ListTile(
+                leading: const Icon(Icons.print_outlined),
+                title: const Text('Bluetooth-термопринтер'),
+                subtitle: const Text(
+                  'Подключение и пробная печать наклейки',
+                ),
+                onTap: _openPrinterTest,
+              ),
             SwitchListTile(
               value: _darkMode,
               onChanged: _toggleDarkMode,

@@ -1360,6 +1360,27 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   }
 
   try {
+    var notificationsAllowed = false;
+    try {
+      stage.value = 'Проверяем системные уведомления Android...';
+      notificationsAllowed = await NativeUpdateInstaller.canPostNotifications();
+      if (!notificationsAllowed) {
+        stage.value = 'Просим Android разрешить уведомления для загрузки...';
+        notificationsAllowed =
+            await NativeUpdateInstaller.requestNotificationPermission();
+      }
+    } catch (_) {
+      notificationsAllowed = false;
+    }
+    if (!notificationsAllowed) {
+      showGlobalAppNotice(
+        'Обновление всё равно начнётся, но прогресс может не появиться в шторке Android, пока для Феникс не разрешены системные уведомления.',
+        title: 'Обновление Феникс',
+        tone: AppNoticeTone.warning,
+        duration: const Duration(seconds: 6),
+      );
+    }
+
     final savePath = await NativeUpdateInstaller.downloadPackage(
       url: uri,
       fallbackFileName: _fallbackInstallerNameForPlatform('android', latest),
@@ -2413,6 +2434,13 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
               ? (data['chatId'] ?? message?['chat_id'] ?? message?['chatId'])
               : null)
           ?.toString();
+  final activeChatId = activeChatIdNotifier.value;
+  final documentHidden = kIsWeb && WebNotificationService.isDocumentHidden;
+  if ((chatId?.isNotEmpty ?? false) &&
+      activeChatId == chatId &&
+      !documentHidden) {
+    return;
+  }
 
   unawaited(
     _maybeShowIncomingBrowserNotification(
@@ -2423,10 +2451,6 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
   );
 
   await playAppSound(AppUiSound.incoming);
-
-  if ((chatId?.isNotEmpty ?? false) && activeChatIdNotifier.value == chatId) {
-    return;
-  }
 
   final senderName = (message?['sender_name'] ?? '').toString().trim();
   final sender = senderName.isNotEmpty ? senderName : 'Новое сообщение';
@@ -3222,68 +3246,137 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           final minSupportedLabel = info.minSupported == null
               ? null
               : '${info.minSupported!.version}+${info.minSupported!.build}';
-          return AlertDialog(
-            title: Text(
-              info.required
-                  ? 'Требуется обновление Феникс'
-                  : (info.title.isNotEmpty
-                        ? info.title
-                        : 'Доступно обновление Феникс'),
-            ),
-            content: ConstrainedBox(
+          return Dialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 24),
+            backgroundColor: Colors.transparent,
+            child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 520),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Платформа: $platformLabel\n'
-                    'Текущая версия: $currentLabel\n'
-                    'Новая версия: $latestLabel',
-                    style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(28),
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFF12D95B), Color(0xFF17C9C7)],
                   ),
-                  if (minSupportedLabel != null) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      'Минимально поддерживаемая: $minSupportedLabel',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF17C9C7).withValues(alpha: 0.24),
+                      blurRadius: 28,
+                      offset: const Offset(0, 16),
+                    ),
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            width: 44,
+                            height: 44,
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.20),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: const Icon(
+                              Icons.system_update_alt_rounded,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              info.required
+                                  ? 'Требуется обновление Феникс'
+                                  : (info.title.isNotEmpty
+                                        ? info.title
+                                        : 'Доступно обновление Феникс'),
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                  ],
-                  if ((info.message ?? '').trim().isNotEmpty) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      info.message!.trim(),
-                      style: theme.textTheme.bodyMedium,
-                    ),
-                  ],
-                  if ((info.downloadUrl ?? '').trim().isEmpty) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      'Ссылка на обновление не настроена на сервере. '
-                      'Обратитесь к администратору.',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.error,
-                        fontWeight: FontWeight.w600,
+                      const SizedBox(height: 14),
+                      Text(
+                        'Платформа: $platformLabel\n'
+                        'Текущая версия: $currentLabel\n'
+                        'Новая версия: $latestLabel',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          height: 1.4,
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    ),
-                  ],
-                ],
+                      if (minSupportedLabel != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Минимально поддерживаемая: $minSupportedLabel',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: Colors.white.withValues(alpha: 0.90),
+                          ),
+                        ),
+                      ],
+                      if ((info.message ?? '').trim().isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          info.message!.trim(),
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                      if ((info.downloadUrl ?? '').trim().isEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          'Ссылка на обновление не настроена на сервере. Обратитесь к администратору.',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 16),
+                      if (!info.required)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: TextButton(
+                            onPressed: () =>
+                                Navigator.of(dialogContext).pop('later'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white,
+                            ),
+                            child: const Text('Позже'),
+                          ),
+                        ),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: () =>
+                              Navigator.of(dialogContext).pop('update'),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: Colors.white,
+                            foregroundColor: const Color(0xFF0F6667),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                          ),
+                          icon: const Icon(Icons.system_update_alt_rounded),
+                          label: const Text('Обновить Феникс'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
-            actions: [
-              if (!info.required)
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop('later'),
-                  child: const Text('Позже'),
-                ),
-              FilledButton.icon(
-                onPressed: () => Navigator.of(dialogContext).pop('update'),
-                icon: const Icon(Icons.system_update_alt_rounded),
-                label: const Text('Обновить Феникс'),
-              ),
-            ],
           );
         },
       );

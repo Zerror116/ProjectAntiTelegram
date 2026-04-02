@@ -24,6 +24,14 @@ Future<bool> openDownloadsUi() async {
   return false;
 }
 
+Future<bool> canPostNotifications() async {
+  return false;
+}
+
+Future<bool> requestNotificationPermission() async {
+  return false;
+}
+
 Future<void> exitCurrentAppForUpdate({
   Duration delay = const Duration(milliseconds: 1200),
 }) async {}

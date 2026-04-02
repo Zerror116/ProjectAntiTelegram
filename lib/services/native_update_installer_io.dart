@@ -201,6 +201,22 @@ Future<bool> openDownloadsUi() async {
   return opened ?? false;
 }
 
+Future<bool> canPostNotifications() async {
+  if (!Platform.isAndroid) return false;
+  final allowed = await _androidUpdateInstallerChannel.invokeMethod<bool>(
+    'canPostNotifications',
+  );
+  return allowed ?? false;
+}
+
+Future<bool> requestNotificationPermission() async {
+  if (!Platform.isAndroid) return false;
+  final allowed = await _androidUpdateInstallerChannel.invokeMethod<bool>(
+    'requestNotificationPermission',
+  );
+  return allowed ?? false;
+}
+
 Future<void> exitCurrentAppForUpdate({
   Duration delay = const Duration(milliseconds: 1200),
 }) async {

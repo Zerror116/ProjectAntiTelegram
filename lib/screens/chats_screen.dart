@@ -1030,6 +1030,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
               )
             : _error.isNotEmpty
             ? ListView(
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
                 children: [
                   Padding(
                     padding: const EdgeInsets.all(16),
@@ -1049,6 +1052,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
               )
             : _chats.isEmpty
             ? ListView(
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
                 padding: const EdgeInsets.all(24),
                 children: [
                   const SizedBox(height: 80),
@@ -1067,6 +1073,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ],
               )
             : ListView.builder(
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
                 padding: const EdgeInsets.symmetric(vertical: 10),
                 itemCount: _chats.length,
                 itemBuilder: (context, i) => _buildItem(_chats[i]),
