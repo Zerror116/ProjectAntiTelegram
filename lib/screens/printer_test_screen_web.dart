@@ -82,7 +82,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         border: 1mm solid #000;
         display: flex;
         flex-direction: column;
-        padding: 5mm 6mm 5mm 0.8mm;
+        padding: 3.2mm 4mm 3.2mm 1mm;
       }
 
       .content {
@@ -94,17 +94,17 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       }
 
       .phone {
-        font-size: 18mm;
+        font-size: 21mm;
         line-height: 1;
         font-weight: 900;
-        letter-spacing: 0.15mm;
+        letter-spacing: 0.08mm;
         white-space: nowrap;
         overflow: hidden;
       }
 
       .name {
-        margin-top: 3.5mm;
-        font-size: 13mm;
+        margin-top: 2.6mm;
+        font-size: 15.5mm;
         line-height: 1.05;
         font-weight: 800;
         word-break: break-word;
@@ -112,7 +112,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
 
       .footer {
         margin-top: auto;
-        font-size: 3mm;
+        font-size: 2.3mm;
         font-weight: 700;
         color: #555;
       }
@@ -145,16 +145,16 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
           phone.style.fontSize = '';
           name.style.fontSize = '';
 
-          fitElement(phone, 70, 24);
-          fitElement(name, 52, 18);
+          fitElement(phone, 100, 30);
+          fitElement(name, 74, 22);
 
           let attempts = 0;
           const content = document.querySelector('.content');
           while (attempts < 40 && content && content.scrollHeight > content.clientHeight) {
             const phoneSize = parseFloat(getComputedStyle(phone).fontSize);
             const nameSize = parseFloat(getComputedStyle(name).fontSize);
-            phone.style.fontSize = Math.max(24, phoneSize - 1) + 'px';
-            name.style.fontSize = Math.max(18, nameSize - 1) + 'px';
+            phone.style.fontSize = Math.max(30, phoneSize - 1) + 'px';
+            name.style.fontSize = Math.max(22, nameSize - 1) + 'px';
             attempts += 1;
           }
         }
@@ -272,7 +272,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
             ),
           ],
         ),
-        padding: const EdgeInsets.fromLTRB(6, 14, 18, 14),
+        padding: const EdgeInsets.fromLTRB(6, 10, 14, 10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -292,13 +292,13 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
                             phone,
                             maxLines: 1,
                             style: const TextStyle(
-                              fontSize: 44,
+                              fontSize: 58,
                               fontWeight: FontWeight.w900,
-                              letterSpacing: 0.3,
+                              letterSpacing: 0.2,
                               color: Colors.black,
                             ),
                           ),
-                          const SizedBox(height: 10),
+                          const SizedBox(height: 8),
                           ConstrainedBox(
                             constraints: BoxConstraints(maxWidth: constraints.maxWidth),
                             child: Text(
@@ -306,7 +306,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
                               maxLines: 2,
                               overflow: TextOverflow.visible,
                               style: const TextStyle(
-                                fontSize: 31,
+                                fontSize: 42,
                                 fontWeight: FontWeight.w800,
                                 height: 1.05,
                                 color: Colors.black,
