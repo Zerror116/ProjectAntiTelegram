@@ -80,7 +80,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         height: 70mm;
         box-sizing: border-box;
         border: 1mm solid #000;
-        padding: 5mm 6mm 5mm 4mm;
+        padding: 5mm 6mm 5mm 0.8mm;
         display: flex;
         flex-direction: column;
       }
@@ -221,7 +221,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
             ),
           ],
         ),
-        padding: const EdgeInsets.fromLTRB(16, 14, 18, 14),
+        padding: const EdgeInsets.fromLTRB(6, 14, 18, 14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
