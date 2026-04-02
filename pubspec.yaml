@@ -2,7 +2,7 @@ name: projectphoenix
 description: "A new Flutter project."
 publish_to: 'none'
 
-version: 1.0.6+7
+version: 1.0.7+8
 
 environment:
   sdk: ^3.11.0
@@ -41,7 +41,7 @@ dependencies:
   latlong2: ^0.9.1
   video_player: ^2.9.2
   js: ^0.7.2
-  print_bluetooth_thermal: ^1.1.9
+  flutter_thermal_printer: ^2.0.1
 
 dev_dependencies:
   flutter_test:

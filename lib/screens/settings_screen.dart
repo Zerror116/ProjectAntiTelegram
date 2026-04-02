@@ -1048,7 +1048,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             if (_canOpenThermalPrinter)
               ListTile(
                 leading: const Icon(Icons.print_outlined),
-                title: const Text('Bluetooth-термопринтер'),
+                title: const Text('Термопринтер (Bluetooth / USB)'),
                 subtitle: const Text(
                   'Подключение и пробная печать наклейки',
                 ),
