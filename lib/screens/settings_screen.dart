@@ -45,7 +45,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool get _canOpenThermalPrinter {
     final role = authService.effectiveRole.toLowerCase().trim();
-    return role == 'admin' || role == 'creator';
+    final desktopWeb =
+        kIsWeb &&
+        defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS;
+    return desktopWeb && (role == 'admin' || role == 'creator');
   }
 
   bool get _isAndroidWeb =>
@@ -1050,7 +1054,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 leading: const Icon(Icons.print_outlined),
                 title: const Text('Термопринтер (Bluetooth / USB)'),
                 subtitle: const Text(
-                  'Подключение по Bluetooth или USB-кабелю и пробная печать наклейки',
+                  'Печать с десктоп-сайта через системный диалог браузера',
                 ),
                 onTap: _openPrinterTest,
               ),
