@@ -104,6 +104,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _showScrollToBottomButton = false;
   bool _keepBottomAnchor = true;
   bool _initialViewportApplied = false;
+  bool _initialViewportReady = false;
   int _offlineQueuedCount = 0;
 
   String _searchQuery = '';
@@ -509,7 +510,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!nearBottom) {
       _keepBottomAnchor = false;
     }
-    final shouldShow = !nearBottom;
+    final shouldShow = _initialViewportReady && !nearBottom;
     if (_showScrollToBottomButton == shouldShow) return;
     setState(() => _showScrollToBottomButton = shouldShow);
   }
@@ -536,30 +537,51 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_initialViewportApplied) return;
     _initialViewportApplied = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scrollController.hasClients) return;
-      final savedOffset = _savedScrollOffset;
-      final savedFraction = _savedScrollFraction;
-      if (savedOffset != null || savedFraction != null) {
-        _restoreSavedViewport(
-          savedOffset: savedOffset,
-          savedFraction: savedFraction,
-          passes: 4,
-        );
+      _performInitialViewportRestore();
+    });
+  }
+
+  void _performInitialViewportRestore({int attempts = 8}) {
+    if (!mounted) return;
+    if (_messages.isEmpty) {
+      _markInitialViewportReady();
+      return;
+    }
+    if (!_scrollController.hasClients) {
+      if (attempts <= 0) {
+        _markInitialViewportReady();
         return;
       }
-      if (_messages.isNotEmpty) {
-        _keepBottomAnchor = true;
-        _stabilizeBottomAnchor(passes: 7);
-      } else {
-        _handleScroll();
-      }
-    });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _performInitialViewportRestore(attempts: attempts - 1);
+      });
+      return;
+    }
+
+    final savedOffset = _savedScrollOffset;
+    final savedFraction = _savedScrollFraction;
+    if (savedOffset != null || savedFraction != null) {
+      _restoreSavedViewport(
+        savedOffset: savedOffset,
+        savedFraction: savedFraction,
+        passes: 4,
+        onComplete: _markInitialViewportReady,
+      );
+      return;
+    }
+
+    _keepBottomAnchor = true;
+    _stabilizeBottomAnchor(
+      passes: 7,
+      onComplete: _markInitialViewportReady,
+    );
   }
 
   void _restoreSavedViewport({
     double? savedOffset,
     double? savedFraction,
     int passes = 1,
+    VoidCallback? onComplete,
   }) {
     if (!mounted || !_scrollController.hasClients || passes <= 0) return;
     final maxExtent = _scrollController.position.maxScrollExtent;
@@ -575,13 +597,17 @@ class _ChatScreenState extends State<ChatScreen> {
     _keepBottomAnchor = (maxExtent - target) <= 120;
     _scrollController.jumpTo(target);
     _handleScroll();
-    if (passes == 1) return;
+    if (passes == 1) {
+      onComplete?.call();
+      return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _restoreSavedViewport(
         savedOffset: savedOffset,
         savedFraction: savedFraction,
         passes: passes - 1,
+        onComplete: onComplete,
       );
     });
   }
@@ -589,15 +615,28 @@ class _ChatScreenState extends State<ChatScreen> {
   void _stabilizeBottomAnchor({
     int passes = 5,
     Duration interval = const Duration(milliseconds: 180),
+    VoidCallback? onComplete,
   }) {
     if (passes <= 0) return;
     _bottomAnchorTimer?.cancel();
     _scrollToBottom(animated: false);
-    if (passes == 1) return;
+    if (passes == 1) {
+      onComplete?.call();
+      return;
+    }
     _bottomAnchorTimer = Timer(interval, () {
       if (!mounted || !_keepBottomAnchor) return;
-      _stabilizeBottomAnchor(passes: passes - 1, interval: interval);
+      _stabilizeBottomAnchor(
+        passes: passes - 1,
+        interval: interval,
+        onComplete: onComplete,
+      );
     });
+  }
+
+  void _markInitialViewportReady() {
+    if (!mounted || _initialViewportReady) return;
+    setState(() => _initialViewportReady = true);
   }
 
   void _onMediaFramePainted() {
@@ -1321,6 +1360,8 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       if (loadedSuccessfully) {
         _applyInitialViewportAfterLoad();
+      } else {
+        _markInitialViewportReady();
       }
     }
   }
@@ -6633,6 +6674,11 @@ class _ChatScreenState extends State<ChatScreen> {
                     ? const PhoenixLoadingView(
                         title: 'Загрузка чата',
                         subtitle: 'Подтягиваем сообщения и медиа',
+                      )
+                    : !_initialViewportReady
+                    ? const PhoenixLoadingView(
+                        title: 'Открываем чат',
+                        subtitle: 'Восстанавливаем последнее место в переписке',
                       )
                     : timeline.isEmpty
                     ? Center(
