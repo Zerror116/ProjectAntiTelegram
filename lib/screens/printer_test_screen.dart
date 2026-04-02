@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:print_bluetooth_thermal/print_bluetooth_thermal.dart';
+import 'package:flutter_thermal_printer/flutter_thermal_printer.dart';
+import 'package:flutter_thermal_printer/utils/printer.dart';
 
 import '../main.dart';
 
@@ -18,135 +20,192 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
   final TextEditingController _nameController = TextEditingController(
     text: 'Василя',
   );
+  final FlutterThermalPrinter _printerPlugin = FlutterThermalPrinter.instance;
 
-  bool _statusLoading = true;
-  bool _pairedLoading = false;
+  StreamSubscription<List<Printer>>? _devicesSubscription;
+
+  bool _scanBluetooth = true;
+  bool _scanUsb = true;
+  bool _loading = true;
+  bool _scanning = false;
   bool _connecting = false;
   bool _printing = false;
-  bool _permissionGranted = false;
-  bool _bluetoothEnabled = false;
-  bool _connected = false;
-  String _statusText = 'Проверяем Bluetooth...';
-  String? _connectedMac;
-  List<BluetoothInfo> _pairedPrinters = const [];
+  String _statusText = 'Подготавливаем поиск термопринтера...';
+  String? _activePrinterId;
+  List<Printer> _printers = const [];
 
-  bool get _supported => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  bool get _supported {
+    if (kIsWeb) return false;
+    return defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+  }
+
+  bool get _supportsUsb {
+    if (kIsWeb) return false;
+    return defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.macOS;
+  }
+
+  String _printerId(Printer printer) {
+    return [
+      printer.connectionType?.name ?? '',
+      printer.vendorId ?? '',
+      printer.productId ?? '',
+      printer.address ?? '',
+      printer.name ?? '',
+    ].join('|');
+  }
 
   @override
   void initState() {
     super.initState();
     if (_supported) {
-      _refreshStatus();
+      _printerPlugin.bleConfig = const BleConfig(
+        connectionStabilizationDelay: Duration(seconds: 2),
+      );
+      _devicesSubscription = _printerPlugin.devicesStream.listen((items) {
+        if (!mounted) return;
+        final next = List<Printer>.from(items);
+        next.sort((a, b) {
+          final typeCmp = (a.connectionType?.name ?? '').compareTo(
+            b.connectionType?.name ?? '',
+          );
+          if (typeCmp != 0) return typeCmp;
+          return (a.name ?? '').toLowerCase().compareTo(
+            (b.name ?? '').toLowerCase(),
+          );
+        });
+        setState(() {
+          _printers = next;
+          _loading = false;
+          _scanning = next.isNotEmpty;
+          if (next.isEmpty) {
+            _statusText =
+                'Принтеров пока не найдено. Нажмите «Найти принтеры».';
+          }
+        });
+      });
+      unawaited(_refreshPrinters());
     }
   }
 
   @override
   void dispose() {
+    _devicesSubscription?.cancel();
+    unawaited(_printerPlugin.stopScan());
     _phoneController.dispose();
     _nameController.dispose();
     super.dispose();
   }
 
-  Future<void> _refreshStatus() async {
+  List<ConnectionType> _selectedConnectionTypes() {
+    final types = <ConnectionType>[];
+    if (_scanBluetooth) {
+      types.add(ConnectionType.BLE);
+    }
+    if (_scanUsb && _supportsUsb) {
+      types.add(ConnectionType.USB);
+    }
+    return types;
+  }
+
+  Future<void> _refreshPrinters() async {
     if (!_supported) return;
-    if (mounted) {
-      setState(() => _statusLoading = true);
-    }
-    try {
-      final permissionGranted =
-          await PrintBluetoothThermal.isPermissionBluetoothGranted;
-      final bluetoothEnabled = await PrintBluetoothThermal.bluetoothEnabled;
-      final connected = await PrintBluetoothThermal.connectionStatus;
-      if (!mounted) return;
+    final types = _selectedConnectionTypes();
+    if (types.isEmpty) {
       setState(() {
-        _permissionGranted = permissionGranted;
-        _bluetoothEnabled = bluetoothEnabled;
-        _connected = connected;
-        _statusText = !permissionGranted
-            ? 'Android пока не дал доступ к Bluetooth. Разрешите Bluetooth/Nearby devices для Феникс в системных настройках и вернитесь сюда.'
-            : !bluetoothEnabled
-            ? 'Bluetooth на телефоне выключен. Включите его перед поиском принтера.'
-            : connected
-            ? 'Принтер подключён${_connectedMac == null ? '' : ' ($_connectedMac)'}.'
-            : 'Bluetooth включён. Теперь можно искать сопряжённые принтеры.';
+        _statusText = 'Выберите хотя бы один способ подключения: Bluetooth или USB.';
+        _printers = const [];
+        _loading = false;
       });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _statusText = 'Не удалось проверить Bluetooth: $e';
-      });
-    } finally {
-      if (mounted) {
-        setState(() => _statusLoading = false);
-      }
-    }
-  }
-
-  Future<void> _loadPairedPrinters() async {
-    if (!_supported || _pairedLoading) return;
-    setState(() => _pairedLoading = true);
-    try {
-      final items = await PrintBluetoothThermal.pairedBluetooths;
-      if (!mounted) return;
-      setState(() {
-        _pairedPrinters = items;
-        if (items.isEmpty) {
-          _statusText = 'Сопряжённых принтеров не найдено. Сначала свяжите принтер с телефоном в настройках Bluetooth.';
-        } else {
-          _statusText = 'Нажмите на принтер ниже, чтобы подключиться и распечатать тест.';
-        }
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _statusText = 'Не удалось получить список принтеров: $e';
-      });
-      showAppNotice(
-        context,
-        'Ошибка поиска принтера: $e',
-        tone: AppNoticeTone.error,
-      );
-    } finally {
-      if (mounted) {
-        setState(() => _pairedLoading = false);
-      }
-    }
-  }
-
-  Future<void> _connectPrinter(BluetoothInfo printer) async {
-    if (_connecting) return;
-    final mac = printer.macAdress.trim();
-    if (mac.isEmpty) {
-      showAppNotice(
-        context,
-        'У этого принтера нет MAC-адреса для подключения',
-        tone: AppNoticeTone.warning,
-      );
       return;
     }
 
     setState(() {
-      _connecting = true;
-      _statusText = 'Подключаемся к ${printer.name}...';
+      _loading = true;
+      _scanning = true;
+      _statusText = _supportsUsb
+          ? 'Ищем USB и Bluetooth-принтеры...'
+          : 'Ищем Bluetooth-принтеры...';
     });
+
     try {
-      final connected = await PrintBluetoothThermal.connect(
-        macPrinterAddress: mac,
+      await _printerPlugin.stopScan();
+      await _printerPlugin.getPrinters(
+        connectionTypes: types,
+        refreshDuration: const Duration(seconds: 2),
       );
       if (!mounted) return;
       setState(() {
-        _connected = connected;
-        _connectedMac = connected ? mac : null;
-        _statusText = connected
-            ? 'Подключено к ${printer.name}. Можно печатать тестовую наклейку.'
-            : 'Подключение к ${printer.name} не удалось.';
+        _loading = false;
+        _statusText =
+            'Выберите принтер из списка ниже и подключитесь для тестовой печати.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _scanning = false;
+        _statusText = 'Не удалось получить список принтеров: $e';
       });
       showAppNotice(
         context,
-        connected
-            ? 'Принтер подключён'
-            : 'Не удалось подключиться к принтеру',
-        tone: connected ? AppNoticeTone.success : AppNoticeTone.error,
+        'Ошибка поиска принтеров: $e',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  Future<void> _stopScan() async {
+    try {
+      await _printerPlugin.stopScan();
+      if (!mounted) return;
+      setState(() {
+        _scanning = false;
+        _statusText = 'Поиск остановлен. Можно снова запустить сканирование.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось остановить поиск: $e',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  Future<void> _toggleConnection(Printer printer) async {
+    if (_connecting) return;
+    final id = _printerId(printer);
+    setState(() {
+      _connecting = true;
+      _activePrinterId = id;
+      _statusText = (printer.isConnected ?? false)
+          ? 'Отключаем принтер ${printer.name ?? printer.address ?? ''}...'
+          : 'Подключаем принтер ${printer.name ?? printer.address ?? ''}...';
+    });
+
+    try {
+      if (printer.isConnected ?? false) {
+        await _printerPlugin.disconnect(printer);
+      } else {
+        final connected = await _printerPlugin.connect(printer);
+        if (!connected) {
+          throw StateError('Принтер не подтвердил подключение');
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      await _refreshPrinters();
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        (printer.isConnected ?? false)
+            ? 'Принтер отключён'
+            : 'Принтер подключён',
+        tone: AppNoticeTone.success,
       );
     } catch (e) {
       if (!mounted) return;
@@ -155,91 +214,54 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       });
       showAppNotice(
         context,
-        'Ошибка подключения: $e',
+        'Ошибка подключения к принтеру: $e',
         tone: AppNoticeTone.error,
       );
     } finally {
       if (mounted) {
-        setState(() => _connecting = false);
+        setState(() {
+          _connecting = false;
+          _activePrinterId = null;
+        });
       }
     }
   }
 
-  Future<void> _disconnectPrinter() async {
-    try {
-      await PrintBluetoothThermal.disconnect;
-      if (!mounted) return;
-      setState(() {
-        _connected = false;
-        _connectedMac = null;
-        _statusText = 'Принтер отключён.';
-      });
-      showAppNotice(
-        context,
-        'Принтер отключён',
-        tone: AppNoticeTone.info,
-      );
-    } catch (e) {
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        'Не удалось отключить принтер: $e',
-        tone: AppNoticeTone.error,
-      );
-    }
-  }
-
-  Future<void> _printTestSticker() async {
+  Future<void> _printTestLabel(Printer printer) async {
     if (_printing) return;
     final phone = _phoneController.text.trim();
     final name = _nameController.text.trim();
     if (phone.isEmpty || name.isEmpty) {
       showAppNotice(
         context,
-        'Заполните телефон и имя для пробной наклейки',
+        'Заполните телефон и имя для тестовой наклейки',
         tone: AppNoticeTone.warning,
       );
       return;
     }
 
-    final connected = await PrintBluetoothThermal.connectionStatus;
-    if (!connected) {
-      if (!mounted) return;
-      setState(() {
-        _connected = false;
-        _statusText = 'Сначала подключите Bluetooth-принтер.';
-      });
-      showAppNotice(
-        context,
-        'Сначала подключите принтер',
-        tone: AppNoticeTone.warning,
-      );
-      return;
-    }
-
-    setState(() => _printing = true);
+    setState(() {
+      _printing = true;
+      _activePrinterId = _printerId(printer);
+      _statusText = 'Печатаем тестовую наклейку...';
+    });
     try {
-      final now = DateTime.now();
-      final stamp =
-          '${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year} ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
-      await PrintBluetoothThermal.writeBytes('\n'.codeUnits);
-      await PrintBluetoothThermal.writeString(
-        printText: PrintTextSize(size: 1, text: 'ФЕНИКС\n'),
-      );
-      await PrintBluetoothThermal.writeString(
-        printText: PrintTextSize(size: 4, text: '$phone\n'),
-      );
-      await PrintBluetoothThermal.writeString(
-        printText: PrintTextSize(size: 3, text: '$name\n'),
-      );
-      await PrintBluetoothThermal.writeString(
-        printText: PrintTextSize(
-          size: 1,
-          text: 'Тестовая наклейка 120x75\n$stamp\n\n',
+      await _printerPlugin.printWidget(
+        context,
+        printer: printer,
+        paperSize: PaperSize.mm80,
+        cutAfterPrinted: true,
+        widget: _buildStickerPreview(
+          phone: phone,
+          name: name,
+          printer: printer,
         ),
       );
-      await PrintBluetoothThermal.writeBytes('\n\n'.codeUnits);
       if (!mounted) return;
+      setState(() {
+        _statusText =
+            'Тестовая наклейка отправлена. Проверьте печать на принтере.';
+      });
       showAppNotice(
         context,
         'Тестовая наклейка отправлена на принтер',
@@ -247,6 +269,9 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       );
     } catch (e) {
       if (!mounted) return;
+      setState(() {
+        _statusText = 'Ошибка печати: $e';
+      });
       showAppNotice(
         context,
         'Ошибка печати: $e',
@@ -254,26 +279,260 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       );
     } finally {
       if (mounted) {
-        setState(() => _printing = false);
+        setState(() {
+          _printing = false;
+          _activePrinterId = null;
+        });
       }
     }
   }
 
+  Widget _buildStickerPreview({
+    required String phone,
+    required String name,
+    required Printer printer,
+  }) {
+    final now = DateTime.now();
+    final stamp =
+        '${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year} '
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Center(
+        child: SizedBox(
+          width: 720,
+          child: AspectRatio(
+            aspectRatio: 120 / 75,
+            child: Material(
+              color: Colors.white,
+              child: Container(
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.black, width: 3),
+                ),
+                padding: const EdgeInsets.fromLTRB(28, 22, 28, 22),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'ФЕНИКС',
+                      style: const TextStyle(
+                        fontSize: 26,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1.8,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      phone,
+                      style: const TextStyle(
+                        fontSize: 44,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1.4,
+                        height: 1.0,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 38,
+                            fontWeight: FontWeight.w800,
+                            height: 1.05,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Тестовая наклейка',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.grey.shade800,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          printer.connectionTypeString,
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.grey.shade800,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      stamp,
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: Colors.grey.shade700,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _platformHelpText() {
+    if (kIsWeb) {
+      return 'Веб-версия не умеет печатать на термопринтер напрямую.';
+    }
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return 'Android: можно искать Bluetooth- и USB-принтеры. Для USB обычно нужен OTG-кабель и разрешение Android на доступ к USB-устройству.';
+    }
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return 'Windows: можно искать USB-принтеры и совместимые Bluetooth-устройства. Для USB убедитесь, что драйвер принтера установлен.';
+    }
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      return 'macOS: можно искать USB- и Bluetooth-принтеры. Проверьте, что принтер виден в системе.';
+    }
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return 'iPhone/iPad: доступен только Bluetooth-поиск совместимых принтеров.';
+    }
+    return 'Подключите принтер и выполните тестовую печать.';
+  }
+
+  Widget _buildConnectionFilters() {
+    return Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: [
+        FilterChip(
+          selected: _scanBluetooth,
+          onSelected: (value) {
+            setState(() => _scanBluetooth = value);
+          },
+          label: const Text('Bluetooth'),
+          avatar: const Icon(Icons.bluetooth_rounded, size: 18),
+        ),
+        if (_supportsUsb)
+          FilterChip(
+            selected: _scanUsb,
+            onSelected: (value) {
+              setState(() => _scanUsb = value);
+            },
+            label: const Text('USB'),
+            avatar: const Icon(Icons.usb_rounded, size: 18),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildPrinterTile(Printer printer) {
+    final id = _printerId(printer);
+    final busy = _activePrinterId == id && (_connecting || _printing);
+    final connected = printer.isConnected ?? false;
+    final connectionType = printer.connectionTypeString;
+    final subtitleParts = <String>[
+      if ((printer.address ?? '').trim().isNotEmpty) printer.address!.trim(),
+      if ((printer.vendorId ?? '').trim().isNotEmpty)
+        'VID: ${printer.vendorId!.trim()}',
+      if ((printer.productId ?? '').trim().isNotEmpty)
+        'PID: ${printer.productId!.trim()}',
+    ];
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(8),
+        child: Column(
+          children: [
+            ListTile(
+              leading: CircleAvatar(
+                child: Icon(
+                  printer.connectionType == ConnectionType.USB
+                      ? Icons.usb_rounded
+                      : Icons.bluetooth_rounded,
+                ),
+              ),
+              title: Text(
+                (printer.name ?? '').trim().isEmpty
+                    ? 'Безымянный принтер'
+                    : printer.name!.trim(),
+              ),
+              subtitle: Text(
+                [
+                  connectionType,
+                  ...subtitleParts,
+                ].join(' • '),
+              ),
+              trailing: busy
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(strokeWidth: 2.2),
+                    )
+                  : Icon(
+                      connected
+                          ? Icons.check_circle_rounded
+                          : Icons.radio_button_unchecked_rounded,
+                      color: connected
+                          ? Colors.green
+                          : Theme.of(context).colorScheme.outline,
+                    ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: busy ? null : () => _toggleConnection(printer),
+                      icon: Icon(
+                        connected
+                            ? Icons.link_off_rounded
+                            : Icons.link_rounded,
+                      ),
+                      label: Text(connected ? 'Отключить' : 'Подключить'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: busy || !connected
+                          ? null
+                          : () => _printTestLabel(printer),
+                      icon: const Icon(Icons.print_rounded),
+                      label: const Text('Тест печати'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
     if (!_supported) {
       return Scaffold(
         appBar: AppBar(title: const Text('Термопринтер')),
-        body: const SafeArea(
-          child: Center(
-            child: Padding(
-              padding: EdgeInsets.all(24),
-              child: Text(
-                'Сейчас тест Bluetooth-термопринтера доступен только в Android-приложении.',
-                textAlign: TextAlign.center,
-              ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(
+              'Сейчас тест термопринтера доступен только в приложении на поддерживаемых устройствах.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
             ),
           ),
         ),
@@ -289,162 +548,103 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
           ),
           padding: const EdgeInsets.all(16),
           children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerLow,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: theme.colorScheme.outlineVariant),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Тестовая наклейка',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w800,
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Тест подключения и печати',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Это первый этап: подключение к ESC/POS Bluetooth-принтеру и пробная печать наклейки в духе образца. Точную финальную вёрстку под реальные стикеры можно будет отдельно довести после теста на железе.',
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
-                      height: 1.35,
+                    const SizedBox(height: 10),
+                    Text(
+                      _platformHelpText(),
+                      style: Theme.of(context).textTheme.bodyMedium,
                     ),
-                  ),
-                  const SizedBox(height: 12),
-                  if (_statusLoading)
-                    const LinearProgressIndicator()
-                  else
-                    Text(_statusText),
-                  const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 10,
-                    runSpacing: 10,
-                    children: [
-                      FilledButton.tonalIcon(
-                        onPressed: _statusLoading ? null : _refreshStatus,
-                        icon: const Icon(Icons.refresh_rounded),
-                        label: const Text('Обновить статус'),
+                    const SizedBox(height: 14),
+                    _buildConnectionFilters(),
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: _loading ? null : _refreshPrinters,
+                            icon: const Icon(Icons.search_rounded),
+                            label: Text(
+                              _loading ? 'Ищем...' : 'Найти принтеры',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _scanning ? _stopScan : null,
+                            icon: const Icon(Icons.stop_circle_outlined),
+                            label: const Text('Остановить'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _statusText,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
-                      FilledButton.icon(
-                        onPressed:
-                            _pairedLoading ||
-                                !_permissionGranted ||
-                                !_bluetoothEnabled
-                            ? null
-                            : _loadPairedPrinters,
-                        icon: _pairedLoading
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.bluetooth_searching_rounded),
-                        label: const Text('Сопряжённые принтеры'),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: _connected ? _disconnectPrinter : null,
-                        icon: const Icon(Icons.link_off_rounded),
-                        label: const Text('Отключить'),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 18),
-            TextField(
-              controller: _phoneController,
-              decoration: const InputDecoration(
-                labelText: 'Телефон для тестовой наклейки',
+                    ),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _nameController,
-              decoration: const InputDecoration(
-                labelText: 'Имя/подпись на наклейке',
-              ),
-            ),
-            const SizedBox(height: 14),
-            FilledButton.icon(
-              onPressed:
-                  _printing || !_permissionGranted || !_bluetoothEnabled
-                  ? null
-                  : _printTestSticker,
-              icon: _printing
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.print_rounded),
-              label: Text(
-                _printing ? 'Печатаем...' : 'Печать пробной наклейки',
-              ),
-            ),
-            const SizedBox(height: 18),
-            Text(
-              'Сопряжённые принтеры',
-              style: theme.textTheme.titleSmall?.copyWith(
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-            const SizedBox(height: 10),
-            if (_pairedPrinters.isEmpty)
-              Container(
+            Card(
+              child: Padding(
                 padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surfaceContainerLow,
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Пробная наклейка',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _phoneController,
+                      keyboardType: TextInputType.phone,
+                      decoration: const InputDecoration(
+                        labelText: 'Телефон на наклейке',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _nameController,
+                      decoration: const InputDecoration(
+                        labelText: 'Имя на наклейке',
+                      ),
+                    ),
+                  ],
                 ),
-                child: Text(
-                  'Пока список пуст. Включите Bluetooth, свяжите принтер с телефоном в системных настройках и нажмите «Сопряжённые принтеры».',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (_printers.isEmpty)
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Text(
+                    'После поиска здесь появятся найденные Bluetooth- и USB-принтеры.',
+                    style: Theme.of(context).textTheme.bodyMedium,
                   ),
                 ),
               )
             else
-              ..._pairedPrinters.map(
-                (printer) => Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: Material(
-                    color: theme.colorScheme.surfaceContainerLow,
-                    borderRadius: BorderRadius.circular(18),
-                    child: ListTile(
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(18),
-                        side: BorderSide(
-                          color: theme.colorScheme.outlineVariant,
-                        ),
-                      ),
-                      leading: const Icon(Icons.print_rounded),
-                      title: Text(
-                        printer.name.trim().isEmpty
-                            ? 'Без названия'
-                            : printer.name,
-                      ),
-                      subtitle: Text(printer.macAdress),
-                      trailing: _connecting && _connectedMac == printer.macAdress
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : Icon(
-                              _connected && _connectedMac == printer.macAdress
-                                  ? Icons.check_circle_rounded
-                                  : Icons.chevron_right_rounded,
-                            ),
-                      onTap: _connecting ? null : () => _connectPrinter(printer),
-                    ),
-                  ),
-                ),
-              ),
+              ..._printers.map(_buildPrinterTile),
           ],
         ),
       ),
