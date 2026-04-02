@@ -360,7 +360,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
                 decoration: withInputLanguageBadge(
                   const InputDecoration(
                     labelText: 'Номер телефона',
-                    hintText: 'Например: +7 (999) 171-45-51 или 89991714551',
+                    hintText: 'Например: +7 (123) 456-78-90 или 81234567890',
                   ),
                   controller: _phoneCtrl,
                 ),

@@ -93,6 +93,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _pinLoading = false;
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
+  bool _showScrollToBottomButton = false;
+  bool _keepBottomAnchor = true;
   int _offlineQueuedCount = 0;
 
   String _searchQuery = '';
@@ -120,6 +122,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _videoRecordingTimer;
   Timer? _offlineQueueRefreshTimer;
   Timer? _composerMediaHoldTimer;
+  Timer? _bottomAnchorTimer;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -215,9 +218,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _inputFocusNode.addListener(() {
       if (_inputFocusNode.hasFocus) {
+        _keepBottomAnchor = true;
         _scrollToBottom(animated: true);
       }
     });
+    _scrollController.addListener(_handleScroll);
 
     _voicePositionSub = _voicePlayer.onPositionChanged.listen((position) {
       if (!mounted) return;
@@ -336,6 +341,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _videoRecordingTimer?.cancel();
     _offlineQueueRefreshTimer?.cancel();
     _composerMediaHoldTimer?.cancel();
+    _bottomAnchorTimer?.cancel();
     _chatSub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
@@ -360,6 +366,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.dispose();
     _searchController.dispose();
     _inputFocusNode.dispose();
+    _scrollController.removeListener(_handleScroll);
     _scrollController.dispose();
     _messageItemKeys.clear();
     super.dispose();
@@ -408,10 +415,22 @@ class _ChatScreenState extends State<ChatScreen> {
     return (p.maxScrollExtent - p.pixels) <= 120;
   }
 
+  void _handleScroll() {
+    if (!mounted) return;
+    final nearBottom = _isNearBottom();
+    if (!nearBottom) {
+      _keepBottomAnchor = false;
+    }
+    final shouldShow = !nearBottom;
+    if (_showScrollToBottomButton == shouldShow) return;
+    setState(() => _showScrollToBottomButton = shouldShow);
+  }
+
   void _scrollToBottom({bool animated = true}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
       final target = _scrollController.position.maxScrollExtent;
+      _keepBottomAnchor = true;
       if (animated) {
         _scrollController.animateTo(
           target,
@@ -422,6 +441,25 @@ class _ChatScreenState extends State<ChatScreen> {
         _scrollController.jumpTo(target);
       }
     });
+  }
+
+  void _stabilizeBottomAnchor({
+    int passes = 5,
+    Duration interval = const Duration(milliseconds: 180),
+  }) {
+    if (passes <= 0) return;
+    _bottomAnchorTimer?.cancel();
+    _scrollToBottom(animated: false);
+    if (passes == 1) return;
+    _bottomAnchorTimer = Timer(interval, () {
+      if (!mounted || !_keepBottomAnchor) return;
+      _stabilizeBottomAnchor(passes: passes - 1, interval: interval);
+    });
+  }
+
+  void _onMediaFramePainted() {
+    if (!_keepBottomAnchor && !_isNearBottom()) return;
+    _stabilizeBottomAnchor(passes: 2, interval: const Duration(milliseconds: 120));
   }
 
   Map<String, dynamic> _normalizeMessage(Map<String, dynamic> message) {
@@ -482,6 +520,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _recomputeSearchResults();
 
     if (autoScroll) {
+      _keepBottomAnchor = true;
       _scrollToBottom(animated: true);
     }
   }
@@ -1055,6 +1094,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _loadMessages() async {
     if (_messagesLoadInFlight) return;
     _messagesLoadInFlight = true;
+    var loadedSuccessfully = false;
     if (mounted) {
       setState(() => _loading = true);
     }
@@ -1098,8 +1138,8 @@ class _ChatScreenState extends State<ChatScreen> {
             _incomingTimer?.cancel();
             _incomingTimer = null;
             _recomputeSearchResults(keepCurrent: false);
-            _scrollToBottom(animated: false);
             _scheduleReadSync();
+            loadedSuccessfully = true;
           }
           lastError = null;
           break;
@@ -1131,7 +1171,15 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } finally {
       _messagesLoadInFlight = false;
-      if (mounted) setState(() => _loading = false);
+      if (mounted) {
+        setState(() => _loading = false);
+      } else {
+        _loading = false;
+      }
+      if (loadedSuccessfully && _messages.isNotEmpty) {
+        _keepBottomAnchor = true;
+        _stabilizeBottomAnchor(passes: 7);
+      }
     }
   }
 
@@ -5614,7 +5662,9 @@ class _ChatScreenState extends State<ChatScreen> {
     Widget buildMessageImage({double? width}) {
       if (imageUrl == null) return const SizedBox.shrink();
       final wantsFullWidth = width == double.infinity;
-      final resolvedWidth = wantsFullWidth ? maxBubbleWidth : (width ?? defaultImageWidth);
+      final resolvedWidth = wantsFullWidth
+          ? maxBubbleWidth
+          : (width ?? defaultImageWidth);
       final reservedHeight = min(
         defaultImageMaxHeight,
         max(220.0, resolvedWidth * (isCompactMedia ? 0.84 : 0.72)),
@@ -5627,17 +5677,10 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (loading)
-              const SizedBox(
-                width: 22,
-                height: 22,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            else
-              Icon(
-                Icons.image_outlined,
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
+            Icon(
+              loading ? Icons.image_search_outlined : Icons.image_outlined,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
             const SizedBox(height: 10),
             Text(
               loading ? 'Загружаем фото...' : 'Фото недоступно',
@@ -5656,14 +5699,23 @@ class _ChatScreenState extends State<ChatScreen> {
           child: SizedBox(
             width: resolvedWidth,
             height: reservedHeight,
-            child: ColoredBox(
-              color: theme.colorScheme.surfaceContainerHighest,
-              child: Center(
+            child: RepaintBoundary(
+              child: ColoredBox(
+                color: theme.colorScheme.surfaceContainerHighest,
                 child: AdaptiveNetworkImage(
                   imageUrl,
                   width: resolvedWidth,
                   height: reservedHeight,
                   fit: BoxFit.contain,
+                  alignment: Alignment.center,
+                  frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+                    if (wasSynchronouslyLoaded || frame != null) {
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        _onMediaFramePainted();
+                      });
+                    }
+                    return child;
+                  },
                   loadingBuilder: (context, child, loadingProgress) {
                     if (loadingProgress == null) return child;
                     return buildImagePlaceholder(loading: true);
@@ -5959,7 +6011,20 @@ class _ChatScreenState extends State<ChatScreen> {
                 const SizedBox(height: 6),
               ],
               Text('Покупатель: $clientName'),
-              Text('Телефон: $clientPhone'),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Expanded(child: Text('Телефон: $clientPhone')),
+                  IconButton(
+                    tooltip: 'Скопировать номер',
+                    icon: const Icon(Icons.copy_rounded, size: 18),
+                    visualDensity: VisualDensity.compact,
+                    onPressed: clientPhone.trim().isEmpty || clientPhone == '—'
+                        ? null
+                        : () => _copyText(clientPhone),
+                  ),
+                ],
+              ),
               Text('Статус: ${isPlaced ? 'Обработано' : 'Ожидание обработки'}'),
               if (isPlaced)
                 Text(
@@ -6229,6 +6294,11 @@ class _ChatScreenState extends State<ChatScreen> {
     final visibleMessages = _visibleMessages();
     final timeline = _buildTimeline(visibleMessages);
     final recordingOverlayActive = _voiceRecording || _videoRecording;
+    final media = MediaQuery.of(context);
+    final scrollButtonBottom =
+        media.viewInsets.bottom +
+        media.viewPadding.bottom +
+        (_searchMode ? 18 : 92);
 
     return Scaffold(
       appBar: AppBar(
@@ -6432,6 +6502,12 @@ class _ChatScreenState extends State<ChatScreen> {
                       )
                     : ListView.builder(
                         controller: _scrollController,
+                        physics: const BouncingScrollPhysics(
+                          parent: AlwaysScrollableScrollPhysics(),
+                        ),
+                        keyboardDismissBehavior:
+                            ScrollViewKeyboardDismissBehavior.onDrag,
+                        cacheExtent: media.size.height * 1.4,
                         itemCount: timeline.length,
                         itemBuilder: (context, i) {
                           final row = timeline[i];
@@ -6691,6 +6767,32 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ],
             ],
+          ),
+          Positioned(
+            right: 14,
+            bottom: scrollButtonBottom,
+            child: IgnorePointer(
+              ignoring: !_showScrollToBottomButton,
+              child: AnimatedSlide(
+                duration: const Duration(milliseconds: 180),
+                offset: _showScrollToBottomButton
+                    ? Offset.zero
+                    : const Offset(0, 0.6),
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 180),
+                  opacity: _showScrollToBottomButton ? 1 : 0,
+                  child: FloatingActionButton.small(
+                    heroTag: 'chat-scroll-bottom',
+                    tooltip: 'В конец чата',
+                    onPressed: () {
+                      _keepBottomAnchor = true;
+                      _scrollToBottom(animated: true);
+                    },
+                    child: const Icon(Icons.keyboard_double_arrow_down_rounded),
+                  ),
+                ),
+              ),
+            ),
           ),
           if (_voiceRecording)
             Positioned(

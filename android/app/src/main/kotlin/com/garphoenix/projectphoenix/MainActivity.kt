@@ -1,10 +1,14 @@
 package com.garphoenix.projectphoenix
 
+import android.Manifest
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -15,7 +19,10 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL_NAME =
             "com.garphoenix.projectphoenix/native_update_installer"
         private const val APK_MIME = "application/vnd.android.package-archive"
+        private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 6104
     }
+
+    private var pendingNotificationPermissionResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -155,6 +162,34 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "canPostNotifications" -> {
+                    result.success(canPostNotifications())
+                }
+
+                "requestNotificationPermission" -> {
+                    if (canPostNotifications()) {
+                        result.success(true)
+                        return@setMethodCallHandler
+                    }
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                        result.success(true)
+                        return@setMethodCallHandler
+                    }
+                    if (pendingNotificationPermissionResult != null) {
+                        result.error(
+                            "permission_request_busy",
+                            "Another notification permission request is already in progress",
+                            null,
+                        )
+                        return@setMethodCallHandler
+                    }
+                    pendingNotificationPermissionResult = result
+                    requestPermissions(
+                        arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                        NOTIFICATION_PERMISSION_REQUEST_CODE,
+                    )
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -184,5 +219,31 @@ class MainActivity : FlutterActivity() {
             DownloadManager.STATUS_FAILED -> "failed"
             else -> "unknown"
         }
+    }
+
+    private fun canPostNotifications(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return true
+        }
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != NOTIFICATION_PERMISSION_REQUEST_CODE) {
+            return
+        }
+        val granted =
+            grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+        pendingNotificationPermissionResult?.success(granted)
+        pendingNotificationPermissionResult = null
     }
 }

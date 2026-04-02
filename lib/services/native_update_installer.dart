@@ -39,6 +39,14 @@ class NativeUpdateInstaller {
     return impl.openDownloadsUi();
   }
 
+  static Future<bool> canPostNotifications() {
+    return impl.canPostNotifications();
+  }
+
+  static Future<bool> requestNotificationPermission() {
+    return impl.requestNotificationPermission();
+  }
+
   static Future<void> exitCurrentAppForUpdate({
     Duration delay = const Duration(milliseconds: 1200),
   }) {
