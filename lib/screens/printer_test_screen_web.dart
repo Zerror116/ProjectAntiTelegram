@@ -76,21 +76,29 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         print-color-adjust: exact;
       }
 
-      .sheet {
+      .page {
         width: 115mm;
         height: 70mm;
-        box-sizing: border-box;
-        position: relative;
         overflow: hidden;
+        position: relative;
+      }
+
+      .sheet {
+        width: 108.5mm;
+        height: 63.5mm;
+        margin: 2.1mm 3.2mm 4.4mm 2.1mm;
+        box-sizing: border-box;
+        overflow: hidden;
+        position: relative;
         display: flex;
         flex-direction: column;
-        padding: 4.6mm 5mm 4mm 2.6mm;
+        padding: 4.2mm 4.2mm 3.1mm 2mm;
       }
 
       .sheet::before {
         content: "";
         position: absolute;
-        inset: 1.4mm;
+        inset: 0;
         border: 0.7mm solid #000;
         box-sizing: border-box;
         pointer-events: none;
@@ -125,7 +133,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
 
       .footer {
         margin-top: auto;
-        font-size: 2.3mm;
+        font-size: 1.8mm;
         font-weight: 700;
         color: #555;
         position: relative;
@@ -134,12 +142,14 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     </style>
   </head>
   <body>
-    <div class="sheet">
-      <div class="content">
-        <div class="phone" id="sticker-phone">$safePhone</div>
-        <div class="name" id="sticker-name">$safeName</div>
+    <div class="page">
+      <div class="sheet">
+        <div class="content">
+          <div class="phone" id="sticker-phone">$safePhone</div>
+          <div class="name" id="sticker-name">$safeName</div>
+        </div>
+        <div class="footer">Феникс • тестовая наклейка • 115x70 мм</div>
       </div>
-      <div class="footer">Феникс • тестовая наклейка • 115x70 мм</div>
     </div>
     <script>
       (function() {
@@ -287,13 +297,13 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
           ],
         ),
         child: Padding(
-          padding: const EdgeInsets.all(6),
+          padding: const EdgeInsets.fromLTRB(5, 5, 8, 8),
           child: Container(
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(12),
               border: Border.all(color: Colors.black, width: 1.4),
             ),
-            padding: const EdgeInsets.fromLTRB(2.5, 10, 10, 8),
+            padding: const EdgeInsets.fromLTRB(2.5, 9, 8, 7),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
