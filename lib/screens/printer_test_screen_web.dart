@@ -57,15 +57,15 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     <title>Наклейка Феникс</title>
     <style>
       @page {
-        size: 120mm 75mm;
+        size: 115mm 70mm;
         margin: 0;
       }
 
       html, body {
         margin: 0;
         padding: 0;
-        width: 120mm;
-        height: 75mm;
+        width: 115mm;
+        height: 70mm;
         background: #fff;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
       }
@@ -76,25 +76,25 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       }
 
       .sheet {
-        width: 120mm;
-        height: 75mm;
+        width: 115mm;
+        height: 70mm;
         box-sizing: border-box;
-        border: 1.2mm solid #000;
-        padding: 7mm 9mm;
+        border: 1mm solid #000;
+        padding: 5mm 6mm 5mm 4mm;
         display: flex;
         flex-direction: column;
       }
 
       .phone {
-        font-size: 18mm;
+        font-size: 15mm;
         line-height: 1;
         font-weight: 900;
-        letter-spacing: 0.4mm;
+        letter-spacing: 0.15mm;
       }
 
       .name {
-        margin-top: 5mm;
-        font-size: 14mm;
+        margin-top: 3.5mm;
+        font-size: 10.8mm;
         line-height: 1.05;
         font-weight: 800;
         word-break: break-word;
@@ -102,7 +102,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
 
       .footer {
         margin-top: auto;
-        font-size: 3.5mm;
+        font-size: 3mm;
         font-weight: 700;
         color: #555;
       }
@@ -112,7 +112,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     <div class="sheet">
       <div class="phone">$safePhone</div>
       <div class="name">$safeName</div>
-      <div class="footer">Феникс • тестовая наклейка • 120x75 мм</div>
+      <div class="footer">Феникс • тестовая наклейка • 115x70 мм</div>
     </div>
   </body>
 </html>
@@ -207,7 +207,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         : _nameController.text.trim();
 
     return AspectRatio(
-      aspectRatio: 120 / 75,
+      aspectRatio: 115 / 70,
       child: Container(
         decoration: BoxDecoration(
           color: Colors.white,
@@ -221,7 +221,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
             ),
           ],
         ),
-        padding: const EdgeInsets.fromLTRB(24, 18, 24, 18),
+        padding: const EdgeInsets.fromLTRB(16, 14, 18, 14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -235,19 +235,19 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                      fontSize: 38,
+                      fontSize: 32,
                       fontWeight: FontWeight.w900,
-                      letterSpacing: 0.8,
+                      letterSpacing: 0.3,
                       color: Colors.black,
                     ),
                   ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 10),
                   Text(
                     name,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                      fontSize: 30,
+                      fontSize: 24,
                       fontWeight: FontWeight.w800,
                       height: 1.05,
                       color: Colors.black,
@@ -257,9 +257,9 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
               ),
             ),
             const Text(
-              'Феникс • тестовая наклейка • 120x75 мм',
+              'Феникс • тестовая наклейка • 115x70 мм',
               style: TextStyle(
-                fontSize: 11,
+                fontSize: 10,
                 fontWeight: FontWeight.w700,
                 color: Color(0xFF555555),
               ),
