@@ -68,6 +68,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         height: 70mm;
         background: #fff;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+        overflow: hidden;
       }
 
       body {
@@ -79,10 +80,20 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         width: 115mm;
         height: 70mm;
         box-sizing: border-box;
-        border: 1mm solid #000;
+        position: relative;
+        overflow: hidden;
         display: flex;
         flex-direction: column;
-        padding: 3.2mm 4mm 3.2mm 1mm;
+        padding: 4.6mm 5mm 4mm 2.6mm;
+      }
+
+      .sheet::before {
+        content: "";
+        position: absolute;
+        inset: 1.4mm;
+        border: 0.7mm solid #000;
+        box-sizing: border-box;
+        pointer-events: none;
       }
 
       .content {
@@ -91,6 +102,8 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         display: flex;
         flex-direction: column;
         justify-content: center;
+        position: relative;
+        z-index: 1;
       }
 
       .phone {
@@ -115,6 +128,8 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         font-size: 2.3mm;
         font-weight: 700;
         color: #555;
+        position: relative;
+        z-index: 1;
       }
     </style>
   </head>
@@ -263,7 +278,6 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.black, width: 1.8),
           boxShadow: const [
             BoxShadow(
               color: Color(0x14000000),
@@ -272,63 +286,72 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
             ),
           ],
         ),
-        padding: const EdgeInsets.fromLTRB(6, 10, 14, 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  return FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.centerLeft,
-                    child: SizedBox(
-                      width: constraints.maxWidth,
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            phone,
-                            maxLines: 1,
-                            style: const TextStyle(
-                              fontSize: 58,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: 0.2,
-                              color: Colors.black,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          ConstrainedBox(
-                            constraints: BoxConstraints(maxWidth: constraints.maxWidth),
-                            child: Text(
-                              name,
-                              maxLines: 2,
-                              overflow: TextOverflow.visible,
-                              style: const TextStyle(
-                                fontSize: 42,
-                                fontWeight: FontWeight.w800,
-                                height: 1.05,
-                                color: Colors.black,
+        child: Padding(
+          padding: const EdgeInsets.all(6),
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.black, width: 1.4),
+            ),
+            padding: const EdgeInsets.fromLTRB(2.5, 10, 10, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      return FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: SizedBox(
+                          width: constraints.maxWidth,
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                phone,
+                                maxLines: 1,
+                                style: const TextStyle(
+                                  fontSize: 58,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 0.2,
+                                  color: Colors.black,
+                                ),
                               ),
-                            ),
+                              const SizedBox(height: 8),
+                              ConstrainedBox(
+                                constraints: BoxConstraints(maxWidth: constraints.maxWidth),
+                                child: Text(
+                                  name,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.visible,
+                                  style: const TextStyle(
+                                    fontSize: 42,
+                                    fontWeight: FontWeight.w800,
+                                    height: 1.05,
+                                    color: Colors.black,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-              ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const Text(
+                  'Феникс • тестовая наклейка • 115x70 мм',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    color: Color(0xFF555555),
+                  ),
+                ),
+              ],
             ),
-            const Text(
-              'Феникс • тестовая наклейка • 115x70 мм',
-              style: TextStyle(
-                fontSize: 10,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF555555),
-              ),
-            ),
-          ],
+          ),
         ),
       ),
     );
