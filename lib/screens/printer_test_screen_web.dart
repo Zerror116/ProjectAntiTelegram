@@ -85,16 +85,26 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
         padding: 5mm 6mm 5mm 0.8mm;
       }
 
+      .content {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+
       .phone {
-        font-size: 15mm;
+        font-size: 18mm;
         line-height: 1;
         font-weight: 900;
         letter-spacing: 0.15mm;
+        white-space: nowrap;
+        overflow: hidden;
       }
 
       .name {
         margin-top: 3.5mm;
-        font-size: 10.8mm;
+        font-size: 13mm;
         line-height: 1.05;
         font-weight: 800;
         word-break: break-word;
@@ -110,10 +120,51 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
   </head>
   <body>
     <div class="sheet">
-      <div class="phone">$safePhone</div>
-      <div class="name">$safeName</div>
+      <div class="content">
+        <div class="phone" id="sticker-phone">$safePhone</div>
+        <div class="name" id="sticker-name">$safeName</div>
+      </div>
       <div class="footer">Феникс • тестовая наклейка • 115x70 мм</div>
     </div>
+    <script>
+      (function() {
+        function fitElement(el, maxPx, minPx) {
+          let size = maxPx;
+          el.style.fontSize = size + 'px';
+          while (size > minPx && (el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight)) {
+            size -= 1;
+            el.style.fontSize = size + 'px';
+          }
+        }
+
+        function fitSticker() {
+          const phone = document.getElementById('sticker-phone');
+          const name = document.getElementById('sticker-name');
+          if (!phone || !name) return;
+
+          phone.style.fontSize = '';
+          name.style.fontSize = '';
+
+          fitElement(phone, 70, 24);
+          fitElement(name, 52, 18);
+
+          let attempts = 0;
+          const content = document.querySelector('.content');
+          while (attempts < 40 && content && content.scrollHeight > content.clientHeight) {
+            const phoneSize = parseFloat(getComputedStyle(phone).fontSize);
+            const nameSize = parseFloat(getComputedStyle(name).fontSize);
+            phone.style.fontSize = Math.max(24, phoneSize - 1) + 'px';
+            name.style.fontSize = Math.max(18, nameSize - 1) + 'px';
+            attempts += 1;
+          }
+        }
+
+        window.addEventListener('load', fitSticker);
+        window.addEventListener('resize', fitSticker);
+        window.addEventListener('beforeprint', fitSticker);
+        setTimeout(fitSticker, 50);
+      })();
+    </script>
   </body>
 </html>
 ''';
@@ -226,34 +277,47 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Expanded(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    phone,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 32,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0.3,
-                      color: Colors.black,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  return FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: SizedBox(
+                      width: constraints.maxWidth,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            phone,
+                            maxLines: 1,
+                            style: const TextStyle(
+                              fontSize: 44,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0.3,
+                              color: Colors.black,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          ConstrainedBox(
+                            constraints: BoxConstraints(maxWidth: constraints.maxWidth),
+                            child: Text(
+                              name,
+                              maxLines: 2,
+                              overflow: TextOverflow.visible,
+                              style: const TextStyle(
+                                fontSize: 31,
+                                fontWeight: FontWeight.w800,
+                                height: 1.05,
+                                color: Colors.black,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.w800,
-                      height: 1.05,
-                      color: Colors.black,
-                    ),
-                  ),
-                ],
+                  );
+                },
               ),
             ),
             const Text(
