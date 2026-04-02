@@ -11,7 +11,7 @@ class PrinterTestScreen extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Text(
-            'Тест термопринтера доступен только в установленном приложении на поддерживаемом устройстве.',
+            'Тест термопринтера доступен только на десктоп-версии сайта.',
             textAlign: TextAlign.center,
             style: Theme.of(context).textTheme.titleMedium,
           ),
