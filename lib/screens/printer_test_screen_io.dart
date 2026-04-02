@@ -292,10 +292,6 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     required String name,
     required Printer printer,
   }) {
-    final now = DateTime.now();
-    final stamp =
-        '${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year} '
-        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
     return Directionality(
       textDirection: TextDirection.ltr,
       child: Center(
@@ -307,76 +303,48 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
               color: Colors.white,
               child: Container(
                 decoration: BoxDecoration(
-                  border: Border.all(color: Colors.black, width: 3),
+                  border: Border.all(color: Colors.black, width: 2),
                 ),
-                padding: const EdgeInsets.fromLTRB(28, 22, 28, 22),
+                padding: const EdgeInsets.fromLTRB(30, 18, 30, 18),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Text(
-                      'ФЕНИКС',
-                      style: const TextStyle(
-                        fontSize: 26,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 1.8,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      phone,
-                      style: const TextStyle(
-                        fontSize: 44,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 1.4,
-                        height: 1.0,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
                     Expanded(
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: Text(
-                          name,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 38,
-                            fontWeight: FontWeight.w800,
-                            height: 1.05,
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            'Тестовая наклейка',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                              color: Colors.grey.shade800,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            phone,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 52,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 1.0,
+                              height: 1.0,
                             ),
                           ),
-                        ),
-                        Text(
-                          printer.connectionTypeString,
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.grey.shade800,
+                          const SizedBox(height: 16),
+                          Text(
+                            name,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 42,
+                              fontWeight: FontWeight.w800,
+                              height: 1.02,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                    const SizedBox(height: 4),
                     Text(
-                      stamp,
+                      'Тестовая наклейка • ${printer.connectionTypeString} • 120x75',
                       style: TextStyle(
-                        fontSize: 16,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
                         color: Colors.grey.shade700,
-                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ],
@@ -394,7 +362,7 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
       return 'Веб-версия не умеет печатать на термопринтер напрямую.';
     }
     if (defaultTargetPlatform == TargetPlatform.android) {
-      return 'Android: можно искать Bluetooth- и USB-принтеры. Для USB обычно нужен OTG-кабель и разрешение Android на доступ к USB-устройству.';
+      return 'Android: можно искать Bluetooth- и USB-принтеры. Для USB обычно нужен OTG-кабель или прямой USB-переходник и разрешение Android на доступ к устройству.';
     }
     if (defaultTargetPlatform == TargetPlatform.windows) {
       return 'Windows: можно искать USB-принтеры и совместимые Bluetooth-устройства. Для USB убедитесь, что драйвер принтера установлен.';
@@ -564,6 +532,13 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
                     Text(
                       _platformHelpText(),
                       style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Макет тестовой наклейки собран по образцу из файла «Наклейки.docx»: крупный номер и имя на формате 120x75.',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                     const SizedBox(height: 14),
                     _buildConnectionFilters(),
