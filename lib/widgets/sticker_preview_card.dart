@@ -16,7 +16,6 @@ class StickerPreviewCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final phone = job.phone.trim().isEmpty ? '89277613521' : job.phone.trim();
     final name = job.name.trim().isEmpty ? 'Василя' : job.name.trim();
-    final kindLabel = (job.kindLabel ?? '').trim();
     final title = (job.productTitle ?? '').trim();
     final price = (job.priceLabel ?? '').trim();
     final footer = (job.footerText ?? 'Феникс').trim();
@@ -78,26 +77,9 @@ class StickerPreviewCard extends StatelessWidget {
                           ),
                         ),
                       ];
-                      if (kindLabel.isNotEmpty) {
-                        lines.addAll([
-                          const SizedBox(height: 4),
-                          Text(
-                            kindLabel,
-                            maxLines: 1,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              fontSize: 34,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 1.2,
-                              color: Colors.black,
-                              height: 1.0,
-                            ),
-                          ),
-                        ]);
-                      }
                       if (title.isNotEmpty) {
                         lines.addAll([
-                          const SizedBox(height: 3),
+                          const SizedBox(height: 5),
                           Text(
                             title,
                             maxLines: 3,
