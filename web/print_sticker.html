@@ -115,19 +115,8 @@
         text-align: center;
       }
 
-      .kind {
-        margin-top: 1.4mm;
-        width: 100%;
-        font-size: 7.2mm;
-        line-height: 1.02;
-        font-weight: 800;
-        letter-spacing: 0.35mm;
-        text-transform: uppercase;
-        text-align: center;
-      }
-
       .title {
-        margin-top: 0.9mm;
+        margin-top: 1.4mm;
         width: 100%;
         font-size: 8.1mm;
         line-height: 1.0;
@@ -175,7 +164,6 @@
         <div class="content" id="sticker-content">
           <div class="phone" id="sticker-phone"></div>
           <div class="name" id="sticker-name"></div>
-          <div class="kind hidden" id="sticker-kind"></div>
           <div class="title hidden" id="sticker-title"></div>
           <div class="price hidden" id="sticker-price"></div>
         </div>
@@ -231,30 +219,27 @@
           const content = byId("sticker-content");
           const phone = byId("sticker-phone");
           const name = byId("sticker-name");
-          const kind = byId("sticker-kind");
           const title = byId("sticker-title");
           const price = byId("sticker-price");
           if (!content || !phone || !name) return;
 
           phone.style.fontSize = "";
           name.style.fontSize = "";
-          if (kind) kind.style.fontSize = "";
           if (title) title.style.fontSize = "";
           if (price) price.style.fontSize = "";
 
           fitElement(phone, 224, 68);
           fitElement(name, 144, 40);
-          fitElement(kind, 52, 18);
           fitElement(title, 66, 22);
           fitElement(price, 78, 24);
 
           let attempts = 0;
           while (attempts < 60 && content.scrollHeight > content.clientHeight) {
-            const nodes = [phone, name, kind, title, price].filter(Boolean);
+            const nodes = [phone, name, title, price].filter(Boolean);
             for (const node of nodes) {
               const size = parseFloat(getComputedStyle(node).fontSize);
               const minimum =
-                node === phone ? 68 : node === name ? 40 : node === price ? 24 : node === title ? 22 : 18;
+                node === phone ? 68 : node === name ? 40 : node === price ? 24 : 22;
               node.style.fontSize = Math.max(minimum, size - 1) + "px";
             }
             attempts += 1;
@@ -264,7 +249,6 @@
         function applyPayload(payload) {
           const phone = safeText(payload.phone);
           const name = safeText(payload.name);
-          const kind = safeText(payload.kindLabel);
           const title = safeText(payload.productTitle);
           const price = safeText(payload.priceLabel);
           const footer = safeText(payload.footerText);
@@ -272,7 +256,6 @@
 
           byId("sticker-phone").textContent = phone;
           byId("sticker-name").textContent = name;
-          toggleNode(byId("sticker-kind"), kind.length > 0, kind);
           toggleNode(byId("sticker-title"), title.length > 0, title);
           toggleNode(byId("sticker-price"), price.length > 0, price);
           toggleNode(byId("sticker-footer"), showFooter, footer);
