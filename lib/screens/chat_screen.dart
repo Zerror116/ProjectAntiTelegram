@@ -848,8 +848,10 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Future<void> _warmUpVisibleImageDimensions(
+  Future<bool> _warmUpVisibleImageDimensions(
     List<Map<String, dynamic>> messages,
+    {int limit = 10,
+    bool refreshAfterWarmUp = false}
   ) async {
     final savedAnchorMessageId = _savedScrollAnchorMessageId;
     var centerIndex = messages.isEmpty ? 0 : messages.length - 1;
@@ -884,21 +886,36 @@ class _ChatScreenState extends State<ChatScreen> {
         url: imageUrl,
       ));
     }
-    if (candidates.isEmpty) return;
+    if (candidates.isEmpty) return false;
 
     candidates.sort((a, b) => a.distance.compareTo(b.distance));
-    final sample = candidates.take(18).toList();
-    for (final item in sample) {
+    final sample = candidates.take(limit).toList();
+    var updated = false;
+    await Future.wait(sample.map((item) async {
       final size = await warmUpChatMessageImageSize(item.url);
-      if (size == null || size.width <= 0 || size.height <= 0) continue;
+      if (size == null || size.width <= 0 || size.height <= 0) return;
       final meta = _metaMapOf(item.message['meta']);
-      meta['image_width'] = size.width.round();
-      meta['image_height'] = size.height.round();
+      final nextWidth = size.width.round();
+      final nextHeight = size.height.round();
+      final currentWidth = _positiveMediaDimension(meta['image_width'])?.round();
+      final currentHeight = _positiveMediaDimension(meta['image_height'])
+          ?.round();
+      if (currentWidth == nextWidth && currentHeight == nextHeight) {
+        return;
+      }
+      meta['image_width'] = nextWidth;
+      meta['image_height'] = nextHeight;
       meta['image_aspect_ratio'] = (size.width / size.height).toStringAsFixed(
         4,
       );
       item.message['meta'] = meta;
+      updated = true;
+    }));
+
+    if (updated && refreshAfterWarmUp && mounted) {
+      setState(() {});
     }
+    return updated;
   }
 
   Map<String, dynamic> _normalizeMessage(Map<String, dynamic> message) {
@@ -1554,7 +1571,6 @@ class _ChatScreenState extends State<ChatScreen> {
           if (data is Map && data['ok'] == true && data['data'] is List) {
             final messages = List<Map<String, dynamic>>.from(data['data'])
               ..sort(_compareByCreatedAt);
-            await _warmUpVisibleImageDimensions(messages);
             if (mounted) {
               setState(() {
                 _messages = messages;
@@ -1579,6 +1595,13 @@ class _ChatScreenState extends State<ChatScreen> {
             _incomingTimer = null;
             _recomputeSearchResults(keepCurrent: false);
             _scheduleReadSync();
+            unawaited(
+              _warmUpVisibleImageDimensions(
+                messages,
+                limit: 10,
+                refreshAfterWarmUp: true,
+              ),
+            );
             loadedSuccessfully = true;
           }
           lastError = null;
@@ -7067,7 +7090,8 @@ class _ChatScreenState extends State<ChatScreen> {
                                   ),
                                   keyboardDismissBehavior:
                                       ScrollViewKeyboardDismissBehavior.onDrag,
-                                  cacheExtent: media.size.height * 1.4,
+                                  cacheExtent: media.size.height *
+                                      (_isPublicChannel() ? 0.7 : 1.0),
                                   itemCount: timeline.length,
                                   itemBuilder: (context, i) {
                                     final row = timeline[i];
