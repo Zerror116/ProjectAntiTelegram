@@ -44,7 +44,7 @@ class StickerPreviewCard extends StatelessWidget {
               borderRadius: BorderRadius.circular(12),
               border: Border.all(color: Colors.black, width: 1.4),
             ),
-            padding: const EdgeInsets.fromLTRB(6, 7, 6, 6),
+            padding: const EdgeInsets.fromLTRB(5, 5, 5, 5),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -57,54 +57,56 @@ class StickerPreviewCard extends StatelessWidget {
                           maxLines: 1,
                           textAlign: TextAlign.center,
                           style: const TextStyle(
-                            fontSize: 64,
+                            fontSize: 124,
                             fontWeight: FontWeight.w900,
                             letterSpacing: 0.2,
                             color: Colors.black,
+                            height: 0.95,
                           ),
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 4),
                         Text(
                           name,
                           maxLines: 2,
                           overflow: TextOverflow.visible,
                           textAlign: TextAlign.center,
                           style: const TextStyle(
-                            fontSize: 48,
+                            fontSize: 90,
                             fontWeight: FontWeight.w800,
-                            height: 1.05,
+                            height: 0.98,
                             color: Colors.black,
                           ),
                         ),
                       ];
                       if (kindLabel.isNotEmpty) {
                         lines.addAll([
-                          const SizedBox(height: 8),
+                          const SizedBox(height: 4),
                           Text(
                             kindLabel,
                             maxLines: 1,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 18,
+                              fontSize: 34,
                               fontWeight: FontWeight.w800,
                               letterSpacing: 1.2,
                               color: Colors.black,
+                              height: 1.0,
                             ),
                           ),
                         ]);
                       }
                       if (title.isNotEmpty) {
                         lines.addAll([
-                          const SizedBox(height: 6),
+                          const SizedBox(height: 3),
                           Text(
                             title,
                             maxLines: 3,
                             overflow: TextOverflow.visible,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 22,
+                              fontSize: 42,
                               fontWeight: FontWeight.w700,
-                              height: 1.08,
+                              height: 1.0,
                               color: Colors.black,
                             ),
                           ),
@@ -112,15 +114,16 @@ class StickerPreviewCard extends StatelessWidget {
                       }
                       if (price.isNotEmpty) {
                         lines.addAll([
-                          const SizedBox(height: 6),
+                          const SizedBox(height: 3),
                           Text(
                             price,
                             maxLines: 1,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 27,
+                              fontSize: 48,
                               fontWeight: FontWeight.w900,
                               color: Colors.black,
+                              height: 0.98,
                             ),
                           ),
                         ]);
