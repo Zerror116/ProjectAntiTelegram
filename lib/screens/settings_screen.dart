@@ -1054,7 +1054,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 leading: const Icon(Icons.print_outlined),
                 title: const Text('Термопринтер (Bluetooth / USB)'),
                 subtitle: const Text(
-                  'Печать с десктоп-сайта через системный диалог браузера',
+                  'Обычная и габаритная тестовая печать с десктоп-сайта',
                 ),
                 onTap: _openPrinterTest,
               ),

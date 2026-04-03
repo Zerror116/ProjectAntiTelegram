@@ -16,6 +16,7 @@ import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
+import '../services/sticker_print_service.dart';
 import 'chat_screen.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
@@ -3001,6 +3002,11 @@ class _AdminPanelState extends State<AdminPanel>
     return formatDateTimeValue(raw, fallback: '');
   }
 
+  bool get _canPrintDeliverySticker {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return isStickerPrintSupported && (role == 'admin' || role == 'creator');
+  }
+
   Color _deliveryRouteColor(ThemeData theme, int index) {
     const palette = [
       Color(0xFFEF5350),
@@ -3643,16 +3649,16 @@ class _AdminPanelState extends State<AdminPanel>
       _message = '';
     });
     try {
-      final resp = await authService.dio.post('/api/support/tickets/$ticketId/claim');
+      final resp = await authService.dio.post(
+        '/api/support/tickets/$ticketId/claim',
+      );
       final data = resp.data;
       await _loadSupportTickets(silent: true);
       await _loadSupportNotificationCenter(silent: true);
       if (!mounted) return;
       setState(() => _message = 'Вопрос взят в работу');
 
-      final chatId = data is Map &&
-              data['ok'] == true &&
-              data['data'] is Map
+      final chatId = data is Map && data['ok'] == true && data['data'] is Map
           ? ((data['data']['chat_id'] ?? '').toString().trim())
           : '';
       if (chatId.isNotEmpty) {
@@ -3732,7 +3738,8 @@ class _AdminPanelState extends State<AdminPanel>
       'support_ticket': true,
       'support_ticket_status': (ticket['status'] ?? '').toString().trim(),
       'support_archived':
-          (ticket['status'] ?? '').toString().trim().toLowerCase() == 'archived',
+          (ticket['status'] ?? '').toString().trim().toLowerCase() ==
+          'archived',
       if (ticketId.isNotEmpty)
         'support_ticket_id': settings['support_ticket_id'] ?? ticketId,
     };
@@ -5579,6 +5586,55 @@ class _AdminPanelState extends State<AdminPanel>
     return e.toString();
   }
 
+  Future<void> _printDeliveryCustomerSticker(
+    Map<String, dynamic> customer,
+  ) async {
+    final phone = (customer['customer_phone'] ?? '').toString().trim();
+    final name = (customer['customer_name'] ?? 'Клиент').toString().trim();
+    if (!_canPrintDeliverySticker) {
+      showAppNotice(
+        context,
+        'Печать доступна только на десктоп-сайте под ролью админа или создателя',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    if (phone.isEmpty) {
+      showAppNotice(
+        context,
+        'У клиента нет телефона для наклейки',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+
+    try {
+      await printStickerJob(
+        StickerPrintJob(
+          phone: phone,
+          name: name.isEmpty ? 'Клиент' : name,
+          showFooter: true,
+          footerText: 'Феникс',
+        ),
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Меню печати клиентской наклейки открыто',
+        tone: AppNoticeTone.info,
+        duration: const Duration(seconds: 3),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось открыть печать: $e',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 3),
+      );
+    }
+  }
+
   Future<void> _publishPendingPosts() async {
     if (!_canPublishProducts()) {
       if (mounted) {
@@ -7322,7 +7378,8 @@ class _AdminPanelState extends State<AdminPanel>
     final productTitle = (ticket['product_title'] ?? '').toString().trim();
     final claimBusy = _supportClaimBusyTicketIds.contains(ticketId);
     final finishBusy = _supportFinishBusyTicketIds.contains(ticketId);
-    final isTemplateEnabled = !archived && !pending && _supportTemplates.isNotEmpty;
+    final isTemplateEnabled =
+        !archived && !pending && _supportTemplates.isNotEmpty;
 
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
@@ -7360,7 +7417,9 @@ class _AdminPanelState extends State<AdminPanel>
               children: [
                 if (pending)
                   FilledButton.icon(
-                    onPressed: claimBusy ? null : () => _claimSupportTicket(ticket),
+                    onPressed: claimBusy
+                        ? null
+                        : () => _claimSupportTicket(ticket),
                     icon: const Icon(Icons.record_voice_over_outlined),
                     label: Text(
                       claimBusy ? 'Назначаем...' : 'Ответить на вопрос',
@@ -7557,9 +7616,8 @@ class _AdminPanelState extends State<AdminPanel>
                       final supportTicketId = (event['id'] ?? '')
                           .toString()
                           .trim();
-                      final supportFinishBusy = _supportFinishBusyTicketIds.contains(
-                        supportTicketId,
-                      );
+                      final supportFinishBusy = _supportFinishBusyTicketIds
+                          .contains(supportTicketId);
                       final priority = (event['priority'] ?? 'normal')
                           .toString();
                       final timeLabel = _formatDateTimeLabel(event['event_at']);
@@ -7618,7 +7676,8 @@ class _AdminPanelState extends State<AdminPanel>
                                     if (canForceCloseSupport)
                                       OutlinedButton.icon(
                                         onPressed:
-                                            supportFinishBusy || _supportArchiveBusy
+                                            supportFinishBusy ||
+                                                _supportArchiveBusy
                                             ? null
                                             : () => _archiveSupportTicket(
                                                 {
@@ -7628,20 +7687,27 @@ class _AdminPanelState extends State<AdminPanel>
                                                 force:
                                                     supportStatus ==
                                                         'waiting_customer' ||
-                                                    supportStatus == 'resolved' ||
+                                                    supportStatus ==
+                                                        'resolved' ||
                                                     supportStatus == 'open',
                                               ),
-                                        icon: supportFinishBusy || _supportArchiveBusy
+                                        icon:
+                                            supportFinishBusy ||
+                                                _supportArchiveBusy
                                             ? const SizedBox(
                                                 width: 16,
                                                 height: 16,
-                                                child: CircularProgressIndicator(
-                                                  strokeWidth: 2,
-                                                ),
+                                                child:
+                                                    CircularProgressIndicator(
+                                                      strokeWidth: 2,
+                                                    ),
                                               )
-                                            : const Icon(Icons.archive_outlined),
+                                            : const Icon(
+                                                Icons.archive_outlined,
+                                              ),
                                         label: Text(
-                                          supportFinishBusy || _supportArchiveBusy
+                                          supportFinishBusy ||
+                                                  _supportArchiveBusy
                                               ? 'Закрываем...'
                                               : 'Закрыть заявку',
                                         ),
@@ -9445,6 +9511,20 @@ class _AdminPanelState extends State<AdminPanel>
                 style: theme.textTheme.labelLarge?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
+              ),
+            ],
+            if (_canPrintDeliverySticker) ...[
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: () => _printDeliveryCustomerSticker(customer),
+                    icon: const Icon(Icons.print_outlined),
+                    label: const Text('Распечатать стикер'),
+                  ),
+                ],
               ),
             ],
             if (canManualDecide) ...[
