@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>Наклейка Феникс</title>
+    <style>
+      @page {
+        size: 115mm 70mm;
+        margin: 0;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 115mm;
+        height: 70mm;
+        background: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial,
+          sans-serif;
+        overflow: hidden;
+      }
+
+      body {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
+      .page {
+        width: 115mm;
+        height: 70mm;
+        overflow: hidden;
+        position: relative;
+      }
+
+      .sheet {
+        width: 108.5mm;
+        height: 63.5mm;
+        margin: 2.1mm 3.2mm 4.4mm 2.1mm;
+        box-sizing: border-box;
+        overflow: hidden;
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        padding: 4.2mm 4.2mm 3.1mm 2mm;
+      }
+
+      .sheet::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border: 0.7mm solid #000;
+        box-sizing: border-box;
+        pointer-events: none;
+      }
+
+      .content {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        position: relative;
+        z-index: 1;
+      }
+
+      .phone {
+        font-size: 21mm;
+        line-height: 1;
+        font-weight: 900;
+        letter-spacing: 0.08mm;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+
+      .name {
+        margin-top: 2.6mm;
+        font-size: 15.5mm;
+        line-height: 1.05;
+        font-weight: 800;
+        word-break: break-word;
+      }
+
+      .kind {
+        margin-top: 2.3mm;
+        font-size: 4.2mm;
+        line-height: 1.1;
+        font-weight: 800;
+        letter-spacing: 0.35mm;
+        text-transform: uppercase;
+      }
+
+      .title {
+        margin-top: 1.4mm;
+        font-size: 4.9mm;
+        line-height: 1.08;
+        font-weight: 700;
+        word-break: break-word;
+      }
+
+      .price {
+        margin-top: 1.2mm;
+        font-size: 5.4mm;
+        line-height: 1.05;
+        font-weight: 900;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+
+      .footer {
+        margin-top: auto;
+        align-self: flex-end;
+        text-align: right;
+        font-size: 2.3mm;
+        font-weight: 800;
+        color: #222;
+        position: relative;
+        z-index: 1;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="sheet">
+        <div class="content" id="sticker-content">
+          <div class="phone" id="sticker-phone"></div>
+          <div class="name" id="sticker-name"></div>
+          <div class="kind hidden" id="sticker-kind"></div>
+          <div class="title hidden" id="sticker-title"></div>
+          <div class="price hidden" id="sticker-price"></div>
+        </div>
+        <div class="footer hidden" id="sticker-footer"></div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        function byId(id) {
+          return document.getElementById(id);
+        }
+
+        function safeText(value) {
+          return (value == null ? "" : String(value)).trim();
+        }
+
+        function toggleNode(node, visible, text) {
+          if (!node) return;
+          node.textContent = text || "";
+          if (visible) {
+            node.classList.remove("hidden");
+          } else {
+            node.classList.add("hidden");
+          }
+        }
+
+        function fitElement(el, maxPx, minPx) {
+          if (!el) return;
+          let size = maxPx;
+          el.style.fontSize = size + "px";
+          while (
+            size > minPx &&
+            (el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight)
+          ) {
+            size -= 1;
+            el.style.fontSize = size + "px";
+          }
+        }
+
+        function fitSticker() {
+          const content = byId("sticker-content");
+          const phone = byId("sticker-phone");
+          const name = byId("sticker-name");
+          const kind = byId("sticker-kind");
+          const title = byId("sticker-title");
+          const price = byId("sticker-price");
+          if (!content || !phone || !name) return;
+
+          phone.style.fontSize = "";
+          name.style.fontSize = "";
+          if (kind) kind.style.fontSize = "";
+          if (title) title.style.fontSize = "";
+          if (price) price.style.fontSize = "";
+
+          fitElement(phone, 100, 30);
+          fitElement(name, 74, 22);
+          fitElement(kind, 22, 12);
+          fitElement(title, 28, 12);
+          fitElement(price, 32, 14);
+
+          let attempts = 0;
+          while (attempts < 60 && content.scrollHeight > content.clientHeight) {
+            const nodes = [phone, name, kind, title, price].filter(Boolean);
+            for (const node of nodes) {
+              const size = parseFloat(getComputedStyle(node).fontSize);
+              const minimum =
+                node === phone ? 30 : node === name ? 22 : node === price ? 14 : 12;
+              node.style.fontSize = Math.max(minimum, size - 1) + "px";
+            }
+            attempts += 1;
+          }
+        }
+
+        function applyPayload(payload) {
+          const phone = safeText(payload.phone);
+          const name = safeText(payload.name);
+          const kind = safeText(payload.kindLabel);
+          const title = safeText(payload.productTitle);
+          const price = safeText(payload.priceLabel);
+          const footer = safeText(payload.footerText);
+          const showFooter = payload.showFooter === true && footer.length > 0;
+
+          byId("sticker-phone").textContent = phone;
+          byId("sticker-name").textContent = name;
+          toggleNode(byId("sticker-kind"), kind.length > 0, kind);
+          toggleNode(byId("sticker-title"), title.length > 0, title);
+          toggleNode(byId("sticker-price"), price.length > 0, price);
+          toggleNode(byId("sticker-footer"), showFooter, footer);
+
+          fitSticker();
+          setTimeout(fitSticker, 50);
+          setTimeout(function () {
+            window.__PHOENIX_STICKER_READY__ = true;
+          }, 80);
+        }
+
+        function readPayloadFromHash() {
+          const raw = window.location.hash.replace(/^#/, "").trim();
+          if (!raw) return null;
+          try {
+            return JSON.parse(decodeURIComponent(raw));
+          } catch (_) {
+            return null;
+          }
+        }
+
+        window.__PHOENIX_STICKER_READY__ = false;
+        const payload = readPayloadFromHash();
+        if (payload) {
+          applyPayload(payload);
+        }
+
+        window.addEventListener("resize", fitSticker);
+        window.addEventListener("beforeprint", fitSticker);
+      })();
+    </script>
+  </body>
+</html>
