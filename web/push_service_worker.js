@@ -1,9 +1,22 @@
+const RUNTIME_CACHE_PREFIX = 'projectphoenix-runtime-';
+const IMAGE_RUNTIME_CACHE = `${RUNTIME_CACHE_PREFIX}images-v1`;
+const IMAGE_RUNTIME_CACHE_LIMIT = 120;
+const IMAGE_PRECACHE_BATCH_SIZE = 10;
+
 self.addEventListener('install', (event) => {
   event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(
+      keys
+        .filter((key) => key.startsWith(RUNTIME_CACHE_PREFIX) && key !== IMAGE_RUNTIME_CACHE)
+        .map((key) => caches.delete(key)),
+    );
+    await self.clients.claim();
+  })());
 });
 
 async function syncBadge(count) {
@@ -23,11 +36,101 @@ async function syncBadge(count) {
   }
 }
 
+function isRuntimeImageRequest(request) {
+  if (!request || request.method !== 'GET') return false;
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch (_) {
+    return false;
+  }
+  if (url.origin !== self.location.origin) return false;
+  if (request.destination === 'image') return true;
+  return (
+    url.pathname.startsWith('/uploads/') ||
+    url.pathname.startsWith('/api/chats/media/')
+  );
+}
+
+async function trimRuntimeCache(cacheName, limit) {
+  const cache = await caches.open(cacheName);
+  const keys = await cache.keys();
+  if (keys.length <= limit) return;
+  const overflow = keys.length - limit;
+  for (let index = 0; index < overflow; index += 1) {
+    await cache.delete(keys[index]);
+  }
+}
+
+async function cacheImageResponse(request, response) {
+  if (!response || !response.ok) return response;
+  const cache = await caches.open(IMAGE_RUNTIME_CACHE);
+  await cache.put(request, response.clone());
+  await trimRuntimeCache(IMAGE_RUNTIME_CACHE, IMAGE_RUNTIME_CACHE_LIMIT);
+  return response;
+}
+
+async function fetchAndCacheImage(request) {
+  const response = await fetch(request);
+  await cacheImageResponse(request, response);
+  return response;
+}
+
+async function handleImageRuntimeRequest(event) {
+  const cache = await caches.open(IMAGE_RUNTIME_CACHE);
+  const cached = await cache.match(event.request);
+  if (cached) {
+    event.waitUntil(fetchAndCacheImage(event.request).catch(() => null));
+    return cached;
+  }
+  return fetchAndCacheImage(event.request);
+}
+
+async function precacheImageBatch(urls) {
+  if (!Array.isArray(urls) || urls.length === 0) return;
+  const cache = await caches.open(IMAGE_RUNTIME_CACHE);
+  const uniqueUrls = Array.from(new Set(urls))
+    .filter((value) => typeof value === 'string' && value.trim().length > 0)
+    .slice(0, IMAGE_PRECACHE_BATCH_SIZE);
+
+  for (const rawUrl of uniqueUrls) {
+    try {
+      const url = new URL(rawUrl, self.location.origin);
+      if (
+        url.origin !== self.location.origin ||
+        (!url.pathname.startsWith('/uploads/') &&
+          !url.pathname.startsWith('/api/chats/media/'))
+      ) {
+        continue;
+      }
+      const request = new Request(url.toString(), {
+        method: 'GET',
+        credentials: 'same-origin',
+      });
+      const existing = await cache.match(request);
+      if (existing) continue;
+      const response = await fetch(request);
+      await cacheImageResponse(request, response);
+    } catch (_) {
+      // ignore bad URLs and transient network errors
+    }
+  }
+}
+
 self.addEventListener('message', (event) => {
   const data = event.data || {};
   if (data.type === 'badge-sync') {
     event.waitUntil(syncBadge(data.count));
+    return;
   }
+  if (data.type === 'precache-images') {
+    event.waitUntil(precacheImageBatch(data.urls || []));
+  }
+});
+
+self.addEventListener('fetch', (event) => {
+  if (!isRuntimeImageRequest(event.request)) return;
+  event.respondWith(handleImageRuntimeRequest(event));
 });
 
 self.addEventListener('push', (event) => {
