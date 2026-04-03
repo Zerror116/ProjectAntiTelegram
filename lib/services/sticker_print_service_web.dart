@@ -12,14 +12,23 @@ bool get isStickerPrintSupported =>
     defaultTargetPlatform != TargetPlatform.android &&
     defaultTargetPlatform != TargetPlatform.iOS;
 
-Future<void> _waitForPrintDocumentReady(html.Document document) async {
+Future<void> _waitForPrintDocumentReady(js.JsObject windowRef) async {
   final deadline = DateTime.now().add(const Duration(seconds: 3));
   while (DateTime.now().isBefore(deadline)) {
-    final readyState = (document.readyState ?? '').toLowerCase();
-    if ((readyState == 'interactive' || readyState == 'complete') &&
-        document.querySelector('body') != null &&
-        document.getElementById('sticker-content') != null) {
-      return;
+    final documentRef = windowRef['document'];
+    if (documentRef != null) {
+      final docObject = js.JsObject.fromBrowserObject(documentRef);
+      final readyState = (docObject['readyState'] ?? '').toString().toLowerCase();
+      final body = docObject.callMethod('querySelector', <Object>['body']);
+      final content = docObject.callMethod(
+        'getElementById',
+        <Object>['sticker-content'],
+      );
+      if ((readyState == 'interactive' || readyState == 'complete') &&
+          body != null &&
+          content != null) {
+        return;
+      }
     }
     await Future<void>.delayed(const Duration(milliseconds: 30));
   }
@@ -247,6 +256,7 @@ Future<void> printStickerJob(StickerPrintJob job) async {
 
   final markup = _stickerMarkup(job);
   final frame = html.IFrameElement()
+    ..src = 'about:blank'
     ..style.position = 'fixed'
     ..style.right = '0'
     ..style.bottom = '0'
@@ -256,20 +266,24 @@ Future<void> printStickerJob(StickerPrintJob job) async {
     ..style.opacity = '0'
     ..style.pointerEvents = 'none';
 
+  final completer = Completer<void>();
+  late StreamSubscription<html.Event> loadSub;
+  loadSub = frame.onLoad.listen((_) async {
+    await loadSub.cancel();
+    if (!completer.isCompleted) completer.complete();
+  });
+
+  frame.srcdoc = markup;
   body.append(frame);
   try {
+    await completer.future.timeout(const Duration(seconds: 5));
     final frameWindow = frame.contentWindow;
     if (frameWindow == null) {
       throw StateError('Не удалось открыть встроенное окно печати');
     }
-    final frameDocument = (frameWindow as html.Window).document;
-    final documentRef = js.JsObject.fromBrowserObject(frameDocument);
-    documentRef.callMethod('open');
-    documentRef.callMethod('write', <Object>[markup]);
-    documentRef.callMethod('close');
-    await _waitForPrintDocumentReady(frameDocument);
-    await Future<void>.delayed(const Duration(milliseconds: 180));
     final windowRef = js.JsObject.fromBrowserObject(frameWindow);
+    await _waitForPrintDocumentReady(windowRef);
+    await Future<void>.delayed(const Duration(milliseconds: 180));
     windowRef.callMethod('focus');
     windowRef.callMethod('print');
   } finally {
