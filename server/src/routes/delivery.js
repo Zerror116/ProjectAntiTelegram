@@ -1560,6 +1560,7 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
             c.user_id::text AS user_id,
             c.product_id::text AS product_id,
             c.quantity,
+            COALESCE(c.processing_mode, 'standard') AS processing_mode,
             c.created_at,
             c.updated_at,
             p.price,
@@ -1638,6 +1639,8 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
         address_text: decodeAddressFromRow(row) || "",
         lat: row.lat == null ? null : Number(row.lat),
         lng: row.lng == null ? null : Number(row.lng),
+        bulky_places: 0,
+        bulky_titles: [],
         processed_sum: 0,
         processed_items_count: 0,
         items: [],
@@ -1646,11 +1649,25 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
     const bucket = grouped.get(key);
     bucket.processed_sum = toMoney(bucket.processed_sum + lineTotal);
     bucket.processed_items_count += Number(row.quantity) || 0;
+    if (String(row.processing_mode || "standard") === "oversize") {
+      const bulkyQuantity = Math.max(1, Number(row.quantity) || 0);
+      const bulkyTitleBase =
+        String(row.product_title || "").trim() || "Габаритный товар";
+      const bulkyTitle =
+        bulkyQuantity > 1
+          ? `${bulkyTitleBase} x${bulkyQuantity}`
+          : bulkyTitleBase;
+      bucket.bulky_places += bulkyQuantity;
+      if (!bucket.bulky_titles.includes(bulkyTitle)) {
+        bucket.bulky_titles.push(bulkyTitle);
+      }
+    }
     bucket.items.push({
       cart_item_id: row.cart_item_id,
       user_id: row.user_id,
       product_id: row.product_id,
       quantity: Number(row.quantity) || 0,
+      processing_mode: String(row.processing_mode || "standard"),
       unit_price: toMoney(row.price),
       line_total: lineTotal,
       product_code: row.product_code == null ? null : Number(row.product_code),
@@ -1667,10 +1684,21 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
     };
     const rawProcessed = toMoney(entry.processed_sum);
     const adjusted = toMoney(Math.max(0, rawProcessed - claimInfo.claims_total));
+    const bulkyTitles = Array.isArray(entry.bulky_titles)
+      ? entry.bulky_titles
+      : [];
+    const visibleBulkyTitles = bulkyTitles.slice(0, 3);
+    const bulkyOverflow = Math.max(0, bulkyTitles.length - visibleBulkyTitles.length);
     return {
       ...entry,
       raw_processed_sum: rawProcessed,
       processed_sum: adjusted,
+      bulky_note:
+        visibleBulkyTitles.length == 0
+          ? ""
+          : `${visibleBulkyTitles.join(", ")}${
+              bulkyOverflow > 0 ? ` +${bulkyOverflow}` : ""
+            }`,
       claim_return_sum: toMoney(claimInfo.claim_return_sum),
       claim_discount_sum: toMoney(claimInfo.claim_discount_sum),
       claims_total: toMoney(claimInfo.claims_total),
@@ -1750,6 +1778,7 @@ async function createDeliveryBatch(
          processed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
          address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
          lat, lng,
+         bulky_places, bulky_note,
          call_status, delivery_status, created_at, updated_at
        )
        VALUES (
@@ -1757,6 +1786,7 @@ async function createDeliveryBatch(
          $6, $7, $8, $9, $10, $11,
          $12, NULL, $13, $14, $15, $16, $17,
          $18, $19,
+         $20, $21,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1779,6 +1809,8 @@ async function createDeliveryBatch(
         encryptedAddress.encryptedAt,
         candidate.lat,
         candidate.lng,
+        candidate.bulky_places || 0,
+        candidate.bulky_note || null,
       ],
     );
 
@@ -1869,6 +1901,8 @@ async function addEligibleCustomersToBatch(
              eta_to = NULL,
              preferred_time_from = NULL,
              preferred_time_to = NULL,
+             bulky_places = $18,
+             bulky_note = $19,
              locked_courier_slot = NULL,
              locked_courier_name = NULL,
              locked_courier_code = NULL,
@@ -1892,6 +1926,8 @@ async function addEligibleCustomersToBatch(
           encryptedAddress.encryptedAt,
           candidate.lat,
           candidate.lng,
+          candidate.bulky_places || 0,
+          candidate.bulky_note || null,
         ],
       );
 
@@ -1913,6 +1949,7 @@ async function addEligibleCustomersToBatch(
          processed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
          address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
          lat, lng,
+         bulky_places, bulky_note,
          call_status, delivery_status, created_at, updated_at
        )
        VALUES (
@@ -1920,6 +1957,7 @@ async function addEligibleCustomersToBatch(
          $6, $7, $8, $9, $10, $11,
          $12, NULL, $13, $14, $15, $16, $17,
          $18, $19,
+         $20, $21,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1942,6 +1980,8 @@ async function addEligibleCustomersToBatch(
         encryptedAddress.encryptedAt,
         candidate.lat,
         candidate.lng,
+        candidate.bulky_places || 0,
+        candidate.bulky_note || null,
       ],
     );
 

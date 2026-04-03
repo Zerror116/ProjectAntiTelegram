@@ -18,11 +18,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart' as vp;
 
 import '../main.dart';
+import '../services/sticker_print_service.dart';
 import '../services/web_media_capture_permission_service.dart';
+import '../src/utils/chat_image_preprocessor.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/adaptive_network_image.dart';
+import '../widgets/chat_message_image.dart';
 import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
@@ -34,12 +37,18 @@ class _ChatUploadFile {
     this.path,
     this.bytes,
     this.mimeType,
+    this.width,
+    this.height,
+    this.preprocessTag,
   });
 
   final String filename;
   final String? path;
   final Uint8List? bytes;
   final String? mimeType;
+  final int? width;
+  final int? height;
+  final String? preprocessTag;
 }
 
 enum _ComposerMediaMode { voice, camera }
@@ -64,16 +73,24 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const String _chatScrollOffsetKeyPrefix = 'chat_scroll_offset_v2:';
-  static const String _chatScrollFractionKeyPrefix =
-      'chat_scroll_fraction_v1:';
+  static const String _chatScrollFractionKeyPrefix = 'chat_scroll_fraction_v1:';
+  static const String _chatScrollAnchorMessageIdKeyPrefix =
+      'chat_scroll_anchor_message_id_v1:';
+  static const String _chatScrollAnchorOffsetKeyPrefix =
+      'chat_scroll_anchor_offset_v1:';
   static final Map<String, double> _inMemoryScrollOffsets = <String, double>{};
   static final Map<String, double> _inMemoryScrollFractions =
+      <String, double>{};
+  static final Map<String, String> _inMemoryScrollAnchorMessageIds =
+      <String, String>{};
+  static final Map<String, double> _inMemoryScrollAnchorOffsets =
       <String, double>{};
 
   final _controller = TextEditingController();
   final _searchController = TextEditingController();
   final _inputFocusNode = FocusNode();
   final _scrollController = ScrollController();
+  final GlobalKey _messagesViewportKey = GlobalKey();
   final ImagePicker _imagePicker = ImagePicker();
   final AudioRecorder _voiceRecorder = AudioRecorder();
   final AudioPlayer _voicePlayer = AudioPlayer();
@@ -160,6 +177,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<String> _recentComposerEmojis = <String>[];
   double? _savedScrollOffset;
   double? _savedScrollFraction;
+  String? _savedScrollAnchorMessageId;
+  double? _savedScrollAnchorOffset;
 
   static const List<String> _quickReactions = <String>[
     '👍',
@@ -275,11 +294,7 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!mounted) return;
         final reason = data['reason']?.toString() ?? '';
         if (reason == 'support_archived') {
-          showAppNotice(
-            context,
-            'Диалог закончен',
-            tone: AppNoticeTone.info,
-          );
+          showAppNotice(context, 'Диалог закончен', tone: AppNoticeTone.info);
         }
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
@@ -442,6 +457,12 @@ class _ChatScreenState extends State<ChatScreen> {
   String get _chatScrollFractionStorageKey =>
       '$_chatScrollFractionKeyPrefix${widget.chatId}';
 
+  String get _chatScrollAnchorMessageIdStorageKey =>
+      '$_chatScrollAnchorMessageIdKeyPrefix${widget.chatId}';
+
+  String get _chatScrollAnchorOffsetStorageKey =>
+      '$_chatScrollAnchorOffsetKeyPrefix${widget.chatId}';
+
   Future<void> _restoreSavedScrollOffset() async {
     final cached = _inMemoryScrollOffsets[widget.chatId];
     if (cached != null && cached.isFinite && cached >= 0) {
@@ -453,6 +474,16 @@ class _ChatScreenState extends State<ChatScreen> {
         cachedFraction >= 0 &&
         cachedFraction <= 1) {
       _savedScrollFraction = cachedFraction;
+    }
+    final cachedAnchorMessageId =
+        _inMemoryScrollAnchorMessageIds[widget.chatId];
+    if (cachedAnchorMessageId != null &&
+        cachedAnchorMessageId.trim().isNotEmpty) {
+      _savedScrollAnchorMessageId = cachedAnchorMessageId.trim();
+    }
+    final cachedAnchorOffset = _inMemoryScrollAnchorOffsets[widget.chatId];
+    if (cachedAnchorOffset != null && cachedAnchorOffset.isFinite) {
+      _savedScrollAnchorOffset = cachedAnchorOffset;
     }
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -469,17 +500,69 @@ class _ChatScreenState extends State<ChatScreen> {
         _savedScrollFraction = savedFraction;
         _inMemoryScrollFractions[widget.chatId] = savedFraction;
       }
+      final savedAnchorMessageId = prefs.getString(
+        _chatScrollAnchorMessageIdStorageKey,
+      );
+      if (savedAnchorMessageId != null &&
+          savedAnchorMessageId.trim().isNotEmpty) {
+        _savedScrollAnchorMessageId = savedAnchorMessageId.trim();
+        _inMemoryScrollAnchorMessageIds[widget.chatId] = savedAnchorMessageId
+            .trim();
+      }
+      final savedAnchorOffset = prefs.getDouble(
+        _chatScrollAnchorOffsetStorageKey,
+      );
+      if (savedAnchorOffset != null && savedAnchorOffset.isFinite) {
+        _savedScrollAnchorOffset = savedAnchorOffset;
+        _inMemoryScrollAnchorOffsets[widget.chatId] = savedAnchorOffset;
+      }
     } catch (_) {}
+  }
+
+  ({String messageId, double offset})? _currentScrollAnchor() {
+    final viewportContext = _messagesViewportKey.currentContext;
+    final viewportObject = viewportContext?.findRenderObject();
+    if (viewportObject is! RenderBox) return null;
+
+    ({String messageId, double offset})? best;
+    var bestDistance = double.infinity;
+
+    for (final entry in _messageItemKeys.entries) {
+      final messageId = entry.key.trim();
+      if (messageId.isEmpty) continue;
+      final itemContext = entry.value.currentContext;
+      final itemObject = itemContext?.findRenderObject();
+      if (itemObject is! RenderBox || !itemObject.hasSize) continue;
+      final topLeft = itemObject.localToGlobal(
+        Offset.zero,
+        ancestor: viewportObject,
+      );
+      final top = topLeft.dy;
+      final bottom = top + itemObject.size.height;
+      if (bottom <= 0 || top >= viewportObject.size.height) continue;
+      final distance = top.abs();
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = (
+          messageId: messageId,
+          offset: top.clamp(
+            -viewportObject.size.height,
+            viewportObject.size.height,
+          ),
+        );
+      }
+    }
+
+    return best;
   }
 
   Future<void> _persistCurrentScrollOffset() async {
     if (!_scrollController.hasClients) return;
     final rawOffset = _scrollController.position.pixels;
     if (!rawOffset.isFinite) return;
-    final offset = rawOffset.clamp(
-      0.0,
-      _scrollController.position.maxScrollExtent,
-    ).toDouble();
+    final offset = rawOffset
+        .clamp(0.0, _scrollController.position.maxScrollExtent)
+        .toDouble();
     final maxExtent = _scrollController.position.maxScrollExtent;
     final fraction = maxExtent <= 0
         ? 1.0
@@ -488,10 +571,24 @@ class _ChatScreenState extends State<ChatScreen> {
     _savedScrollFraction = fraction;
     _inMemoryScrollOffsets[widget.chatId] = offset;
     _inMemoryScrollFractions[widget.chatId] = fraction;
+    final anchor = _currentScrollAnchor();
+    if (anchor != null) {
+      _savedScrollAnchorMessageId = anchor.messageId;
+      _savedScrollAnchorOffset = anchor.offset;
+      _inMemoryScrollAnchorMessageIds[widget.chatId] = anchor.messageId;
+      _inMemoryScrollAnchorOffsets[widget.chatId] = anchor.offset;
+    }
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble(_chatScrollOffsetStorageKey, offset);
       await prefs.setDouble(_chatScrollFractionStorageKey, fraction);
+      if (anchor != null) {
+        await prefs.setString(
+          _chatScrollAnchorMessageIdStorageKey,
+          anchor.messageId,
+        );
+        await prefs.setDouble(_chatScrollAnchorOffsetStorageKey, anchor.offset);
+      }
     } catch (_) {}
   }
 
@@ -560,6 +657,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final savedOffset = _savedScrollOffset;
     final savedFraction = _savedScrollFraction;
+    final savedAnchorMessageId = _savedScrollAnchorMessageId;
+    final savedAnchorOffset = _savedScrollAnchorOffset;
+    if (savedAnchorMessageId != null && savedAnchorMessageId.isNotEmpty) {
+      unawaited(
+        _restoreSavedViewportByAnchor(
+          messageId: savedAnchorMessageId,
+          desiredOffset: savedAnchorOffset ?? 0,
+          passes: 5,
+        ),
+      );
+      return;
+    }
     if (savedOffset != null || savedFraction != null) {
       _restoreSavedViewport(
         savedOffset: savedOffset,
@@ -571,10 +680,89 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     _keepBottomAnchor = true;
-    _stabilizeBottomAnchor(
-      passes: 7,
-      onComplete: _markInitialViewportReady,
-    );
+    _stabilizeBottomAnchor(passes: 7, onComplete: _markInitialViewportReady);
+  }
+
+  Future<void> _restoreSavedViewportByAnchor({
+    required String messageId,
+    required double desiredOffset,
+    int passes = 4,
+  }) async {
+    if (!mounted || passes <= 0) {
+      _markInitialViewportReady();
+      return;
+    }
+    final targetContext = await _resolveMessageContextWithScroll(messageId);
+    if (!mounted || targetContext == null || !_scrollController.hasClients) {
+      if (passes <= 1) {
+        _performInitialViewportRestore(attempts: 0);
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreSavedViewportByAnchor(
+          messageId: messageId,
+          desiredOffset: desiredOffset,
+          passes: passes - 1,
+        );
+      });
+      return;
+    }
+
+    final viewportContext = _messagesViewportKey.currentContext;
+    final viewportObject = viewportContext?.findRenderObject();
+    if (!targetContext.mounted) {
+      if (passes <= 1) {
+        _markInitialViewportReady();
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreSavedViewportByAnchor(
+          messageId: messageId,
+          desiredOffset: desiredOffset,
+          passes: passes - 1,
+        );
+      });
+      return;
+    }
+    final targetObject = targetContext.findRenderObject();
+    if (viewportObject is! RenderBox || targetObject is! RenderBox) {
+      if (passes <= 1) {
+        _markInitialViewportReady();
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreSavedViewportByAnchor(
+          messageId: messageId,
+          desiredOffset: desiredOffset,
+          passes: passes - 1,
+        );
+      });
+      return;
+    }
+
+    final currentTop = targetObject
+        .localToGlobal(Offset.zero, ancestor: viewportObject)
+        .dy;
+    final correction = currentTop - desiredOffset;
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    final nextOffset = (_scrollController.offset + correction)
+        .clamp(0.0, maxExtent)
+        .toDouble();
+    _scrollController.jumpTo(nextOffset);
+    _keepBottomAnchor = false;
+    _handleScroll();
+
+    if (passes == 1) {
+      _markInitialViewportReady();
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _restoreSavedViewportByAnchor(
+        messageId: messageId,
+        desiredOffset: desiredOffset,
+        passes: passes - 1,
+      );
+    });
   }
 
   void _restoreSavedViewport({
@@ -640,8 +828,77 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _onMediaFramePainted() {
+    if (!_initialViewportReady) {
+      final anchorMessageId = _savedScrollAnchorMessageId;
+      if (anchorMessageId != null && anchorMessageId.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _restoreSavedViewportByAnchor(
+            messageId: anchorMessageId,
+            desiredOffset: _savedScrollAnchorOffset ?? 0,
+            passes: 2,
+          );
+        });
+      }
+      return;
+    }
     if (!_keepBottomAnchor && !_isNearBottom()) return;
-    _stabilizeBottomAnchor(passes: 2, interval: const Duration(milliseconds: 120));
+    _stabilizeBottomAnchor(
+      passes: 2,
+      interval: const Duration(milliseconds: 120),
+    );
+  }
+
+  Future<void> _warmUpVisibleImageDimensions(
+    List<Map<String, dynamic>> messages,
+  ) async {
+    final savedAnchorMessageId = _savedScrollAnchorMessageId;
+    var centerIndex = messages.isEmpty ? 0 : messages.length - 1;
+    if (savedAnchorMessageId != null && savedAnchorMessageId.isNotEmpty) {
+      final anchorIndex = messages.indexWhere(
+        (message) => (message['id'] ?? '').toString() == savedAnchorMessageId,
+      );
+      if (anchorIndex >= 0) {
+        centerIndex = anchorIndex;
+      }
+    } else if (_savedScrollFraction != null && messages.length > 1) {
+      centerIndex = (_savedScrollFraction! * (messages.length - 1))
+          .round()
+          .clamp(0, messages.length - 1);
+    }
+
+    final candidates =
+        <({int distance, Map<String, dynamic> message, String url})>[];
+    for (var index = 0; index < messages.length; index++) {
+      final message = messages[index];
+      final meta = _metaMapOf(message['meta']);
+      final imageUrl = _resolveImageUrl(meta['image_url']?.toString());
+      if (imageUrl == null || imageUrl.isEmpty) continue;
+      final hasKnownWidth =
+          _positiveMediaDimension(meta['image_width']) != null;
+      final hasKnownHeight =
+          _positiveMediaDimension(meta['image_height']) != null;
+      if (hasKnownWidth && hasKnownHeight) continue;
+      candidates.add((
+        distance: (index - centerIndex).abs(),
+        message: message,
+        url: imageUrl,
+      ));
+    }
+    if (candidates.isEmpty) return;
+
+    candidates.sort((a, b) => a.distance.compareTo(b.distance));
+    final sample = candidates.take(18).toList();
+    for (final item in sample) {
+      final size = await warmUpChatMessageImageSize(item.url);
+      if (size == null || size.width <= 0 || size.height <= 0) continue;
+      final meta = _metaMapOf(item.message['meta']);
+      meta['image_width'] = size.width.round();
+      meta['image_height'] = size.height.round();
+      meta['image_aspect_ratio'] = (size.width / size.height).toStringAsFixed(
+        4,
+      );
+      item.message['meta'] = meta;
+    }
   }
 
   Map<String, dynamic> _normalizeMessage(Map<String, dynamic> message) {
@@ -1297,6 +1554,7 @@ class _ChatScreenState extends State<ChatScreen> {
           if (data is Map && data['ok'] == true && data['data'] is List) {
             final messages = List<Map<String, dynamic>>.from(data['data'])
               ..sort(_compareByCreatedAt);
+            await _warmUpVisibleImageDimensions(messages);
             if (mounted) {
               setState(() {
                 _messages = messages;
@@ -1335,14 +1593,14 @@ class _ChatScreenState extends State<ChatScreen> {
           if (!shouldRetry) {
             break;
           }
-          await Future<void>.delayed(
-            Duration(milliseconds: 700 * attempt),
-          );
+          await Future<void>.delayed(Duration(milliseconds: 700 * attempt));
         }
       }
       if (lastError != null) {
         debugPrint('Error loading messages: $lastError');
-        if (mounted && _messages.isEmpty && _isTransientMessageLoadError(lastError)) {
+        if (mounted &&
+            _messages.isEmpty &&
+            _isTransientMessageLoadError(lastError)) {
           showAppNotice(
             context,
             'Сеть нестабильна, пробуем загрузить чат повторно',
@@ -1773,40 +2031,43 @@ class _ChatScreenState extends State<ChatScreen> {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.image,
         allowMultiple: false,
-        withData: kIsWeb,
+        withData: true,
       );
       final picked = result?.files.single;
       if (picked == null) return null;
-      if (kIsWeb) {
-        final bytes = picked.bytes;
-        if (bytes == null || bytes.isEmpty) return null;
-        return _ChatUploadFile(
-          filename: picked.name.isNotEmpty ? picked.name : 'image.jpg',
-          bytes: bytes,
-        );
-      }
-      final path = picked.path;
-      if (path == null || path.trim().isEmpty) return null;
+      final bytes = picked.bytes;
+      if (bytes == null || bytes.isEmpty) return null;
+      final preprocessed = await preprocessChatImageForMessage(
+        bytes: bytes,
+        filename: picked.name.isNotEmpty ? picked.name : 'image.jpg',
+      );
       return _ChatUploadFile(
-        filename: picked.name.isNotEmpty ? picked.name : path.split('/').last,
-        path: path,
+        filename: preprocessed.filename,
+        bytes: preprocessed.bytes,
+        mimeType: preprocessed.mimeType,
+        width: preprocessed.width,
+        height: preprocessed.height,
+        preprocessTag: preprocessed.preprocessTag,
       );
     }
 
     final picked = await _imagePicker.pickImage(source: source);
     if (picked == null) return null;
-    if (kIsWeb) {
-      final bytes = await picked.readAsBytes();
-      return _ChatUploadFile(
-        filename: picked.name.isNotEmpty ? picked.name : 'image.jpg',
-        bytes: bytes,
-      );
-    }
-    return _ChatUploadFile(
+    final bytes = await picked.readAsBytes();
+    if (bytes.isEmpty) return null;
+    final preprocessed = await preprocessChatImageForMessage(
+      bytes: bytes,
       filename: picked.name.isNotEmpty
           ? picked.name
           : picked.path.split('/').last,
-      path: picked.path,
+    );
+    return _ChatUploadFile(
+      filename: preprocessed.filename,
+      bytes: preprocessed.bytes,
+      mimeType: preprocessed.mimeType,
+      width: preprocessed.width,
+      height: preprocessed.height,
+      preprocessTag: preprocessed.preprocessTag,
     );
   }
 
@@ -1829,6 +2090,18 @@ class _ChatScreenState extends State<ChatScreen> {
       final form = FormData.fromMap({
         if (attachmentType == 'image')
           'image': await _multipartFromUpload(upload),
+        if (attachmentType == 'image' && (upload.width ?? 0) > 0)
+          'image_width': upload.width,
+        if (attachmentType == 'image' && (upload.height ?? 0) > 0)
+          'image_height': upload.height,
+        if (attachmentType == 'image' &&
+            (upload.width ?? 0) > 0 &&
+            (upload.height ?? 0) > 0)
+          'image_aspect_ratio': (upload.width! / upload.height!)
+              .toStringAsFixed(4),
+        if (attachmentType == 'image' &&
+            (upload.preprocessTag ?? '').trim().isNotEmpty)
+          'image_preprocess': upload.preprocessTag!.trim(),
         if (attachmentType == 'voice')
           'voice': await _multipartFromUpload(
             upload,
@@ -2365,7 +2638,8 @@ class _ChatScreenState extends State<ChatScreen> {
               allowAudioOnlyFallback: false,
             );
         final granted = _applyWebCapturePermissionState(access);
-        if (!granted || access != WebMediaCaptureAccessState.grantedAudioVideo) {
+        if (!granted ||
+            access != WebMediaCaptureAccessState.grantedAudioVideo) {
           if (!mounted) return;
           showAppNotice(
             context,
@@ -3370,6 +3644,51 @@ class _ChatScreenState extends State<ChatScreen> {
     return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
+  bool get _canUseDesktopStickerPrinting {
+    return isStickerPrintSupported && _canMarkReservedOrderPlaced();
+  }
+
+  String _reservedOrderPriceLabel(dynamic raw) {
+    final text = (raw ?? '').toString().trim();
+    if (text.isEmpty) return '';
+    return text.contains('₽') ? text : '$text ₽';
+  }
+
+  StickerPrintJob _reservedOrderStickerJob(
+    Map<String, dynamic> meta, {
+    required bool oversize,
+  }) {
+    final phone = (meta['client_phone'] ?? '').toString().trim();
+    final name = (meta['client_name'] ?? '').toString().trim();
+    final title = (meta['title'] ?? '').toString().trim();
+    final priceLabel = _reservedOrderPriceLabel(meta['price']);
+    return StickerPrintJob(
+      phone: phone.isEmpty ? '—' : phone,
+      name: name.isEmpty ? 'Клиент' : name,
+      productTitle: oversize && title.isNotEmpty ? title : null,
+      priceLabel: oversize && priceLabel.isNotEmpty ? priceLabel : null,
+      kindLabel: oversize ? 'Габарит' : null,
+      showFooter: true,
+      footerText: 'Феникс',
+    );
+  }
+
+  Future<void> _openReservedOrderStickerPrint(
+    Map<String, dynamic> meta, {
+    required bool oversize,
+  }) async {
+    await printStickerJob(_reservedOrderStickerJob(meta, oversize: oversize));
+    if (!mounted) return;
+    showAppNotice(
+      context,
+      oversize
+          ? 'Печать габаритной наклейки открыта'
+          : 'Печать клиентской наклейки открыта',
+      tone: AppNoticeTone.info,
+      duration: const Duration(seconds: 3),
+    );
+  }
+
   bool _isClientRole() {
     return authService.effectiveRole.toLowerCase().trim() == 'client';
   }
@@ -3543,7 +3862,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _markReservedOrderPlaced(Map<String, dynamic> meta) async {
+  Future<void> _markReservedOrderPlaced(
+    Map<String, dynamic> meta, {
+    String processingMode = 'standard',
+  }) async {
     final reservationId = meta['reservation_id']?.toString();
     final cartItemId = meta['cart_item_id']?.toString();
     if ((reservationId == null || reservationId.isEmpty) &&
@@ -3561,6 +3883,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final knownShelf = (knownShelfRaw != null && knownShelfRaw > 0)
         ? knownShelfRaw
         : null;
+    final oversize = processingMode == 'oversize';
 
     setState(() => _markingPlaced = true);
     try {
@@ -3579,6 +3902,7 @@ class _ChatScreenState extends State<ChatScreen> {
             if (reservationIdValue.isNotEmpty)
               'reservation_id': reservationIdValue,
             if (cartItemIdValue.isNotEmpty) 'cart_item_id': cartItemIdValue,
+            'processing_mode': processingMode,
             if (shelfValue.isNotEmpty) 'shelf_number': shelfValue,
             if (manualShelf) 'manual_shelf': true,
           },
@@ -3587,11 +3911,27 @@ class _ChatScreenState extends State<ChatScreen> {
 
       Response<dynamic> resp;
       final requiresManualByRole = _requiresManualShelfOnPlaced();
+      if (oversize && _canUseDesktopStickerPrinting) {
+        try {
+          await _openReservedOrderStickerPrint(meta, oversize: true);
+        } catch (printError) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Не удалось открыть печать габарита: $printError',
+            tone: AppNoticeTone.error,
+            duration: const Duration(seconds: 3),
+          );
+          return;
+        }
+      }
       try {
         // Для админского потока не подставляем полку автоматически:
         // первый товар должен быть подтвержден ручным вводом.
         resp = await sendMarkPlaced(
-          shelfNumber: requiresManualByRole ? null : knownShelf,
+          shelfNumber: oversize
+              ? null
+              : (requiresManualByRole ? null : knownShelf),
         );
       } on DioException catch (e) {
         final rawData = e.response?.data;
@@ -3607,7 +3947,23 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!needsManualShelf) rethrow;
         if (!mounted) return;
 
+        if (_canUseDesktopStickerPrinting) {
+          try {
+            await _openReservedOrderStickerPrint(meta, oversize: false);
+          } catch (printError) {
+            if (!mounted) return;
+            showAppNotice(
+              context,
+              'Не удалось открыть печать клиентской наклейки: $printError',
+              tone: AppNoticeTone.error,
+              duration: const Duration(seconds: 3),
+            );
+            return;
+          }
+        }
+
         var shelfDraft = '';
+        if (!mounted) return;
         final manualShelf = await showDialog<int>(
           context: context,
           builder: (ctx) => AlertDialog(
@@ -3659,7 +4015,9 @@ class _ChatScreenState extends State<ChatScreen> {
         });
         showAppNotice(
           context,
-          'Товар отмечен как обработанный',
+          oversize
+              ? 'Габарит отмечен как обработанный'
+              : 'Товар отмечен как обработанный',
           tone: AppNoticeTone.success,
           duration: const Duration(milliseconds: 1300),
         );
@@ -3691,6 +4049,17 @@ class _ChatScreenState extends State<ChatScreen> {
       } catch (_) {}
     }
     return <String, dynamic>{};
+  }
+
+  double? _positiveMediaDimension(dynamic raw) {
+    if (raw is num) {
+      final value = raw.toDouble();
+      if (value.isFinite && value > 0) return value;
+      return null;
+    }
+    final parsed = double.tryParse((raw ?? '').toString().trim());
+    if (parsed == null || !parsed.isFinite || parsed <= 0) return null;
+    return parsed;
   }
 
   bool _messageMatchesSearch(Map<String, dynamic> message, String query) {
@@ -5736,7 +6105,15 @@ class _ChatScreenState extends State<ChatScreen> {
     final isPlaced =
         metaMap['placed'] == true ||
         (cartItemId.isNotEmpty && _placedCartItemIds.contains(cartItemId));
-    final shelf = metaMap['shelf_number']?.toString() ?? 'не назначена';
+    final processingMode = (metaMap['processing_mode'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final isOversizePlaced =
+        processingMode == 'oversize' || metaMap['is_oversize'] == true;
+    final shelf = isOversizePlaced
+        ? 'Габарит'
+        : (metaMap['shelf_number']?.toString() ?? 'не назначена');
     final reservedDescription = metaMap['description']?.toString().trim() ?? '';
     final clientName = metaMap['client_name']?.toString() ?? '—';
     final clientPhone = metaMap['client_phone']?.toString() ?? '—';
@@ -5844,6 +6221,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final edited = metaMap['edited'] == true;
     Widget buildMessageImage({double? width}) {
       if (imageUrl == null) return const SizedBox.shrink();
+      final cachedSize = cachedChatMessageImageSize(imageUrl);
       final wantsFullWidth = width == double.infinity;
       final resolvedWidth = wantsFullWidth
           ? maxBubbleWidth
@@ -5852,64 +6230,21 @@ class _ChatScreenState extends State<ChatScreen> {
         defaultImageMaxHeight,
         max(220.0, resolvedWidth * (isCompactMedia ? 0.84 : 0.72)),
       );
-      Widget buildImagePlaceholder({bool loading = false}) => Container(
-        width: resolvedWidth,
-        height: reservedHeight,
-        color: theme.colorScheme.surfaceContainerHighest,
-        alignment: Alignment.center,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              loading ? Icons.image_search_outlined : Icons.image_outlined,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(height: 10),
-            Text(
-              loading ? 'Загружаем фото...' : 'Фото недоступно',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ],
-        ),
-      );
-      return GestureDetector(
+      return ChatMessageImage(
+        imageUrl: imageUrl,
+        preferredWidth: resolvedWidth,
+        maxBubbleWidth: maxBubbleWidth,
+        maxHeight: reservedHeight,
+        expandToMaxWidth: wantsFullWidth,
+        borderRadius: isCompactMedia ? 16 : 18,
+        knownWidth:
+            _positiveMediaDimension(metaMap['image_width']) ??
+            cachedSize?.width,
+        knownHeight:
+            _positiveMediaDimension(metaMap['image_height']) ??
+            cachedSize?.height,
         onTap: () => _openImagePreview(imageUrl),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(isCompactMedia ? 16 : 18),
-          child: SizedBox(
-            width: resolvedWidth,
-            height: reservedHeight,
-            child: RepaintBoundary(
-              child: ColoredBox(
-                color: theme.colorScheme.surfaceContainerHighest,
-                child: AdaptiveNetworkImage(
-                  imageUrl,
-                  width: resolvedWidth,
-                  height: reservedHeight,
-                  fit: BoxFit.contain,
-                  alignment: Alignment.center,
-                  frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-                    if (wasSynchronouslyLoaded || frame != null) {
-                      WidgetsBinding.instance.addPostFrameCallback((_) {
-                        _onMediaFramePainted();
-                      });
-                    }
-                    return child;
-                  },
-                  loadingBuilder: (context, child, loadingProgress) {
-                    if (loadingProgress == null) return child;
-                    return buildImagePlaceholder(loading: true);
-                  },
-                  errorBuilder: (_, error, stackTrace) =>
-                      buildImagePlaceholder(),
-                ),
-              ),
-            ),
-          ),
-        ),
+        onFramePainted: _onMediaFramePainted,
       );
     }
 
@@ -6208,7 +6543,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ],
               ),
-              Text('Статус: ${isPlaced ? 'Обработано' : 'Ожидание обработки'}'),
+              Text(
+                'Статус: ${isPlaced ? (isOversizePlaced ? 'Обработано • Габарит' : 'Обработано') : 'Ожидание обработки'}',
+              ),
               if (isPlaced)
                 Text(
                   'Кто обработал: ${processedByName.isNotEmpty ? processedByName : '—'}',
@@ -6222,25 +6559,56 @@ class _ChatScreenState extends State<ChatScreen> {
                   _catalogMetaBadge(theme, 'Цена', '$price ₽'),
                   _catalogMetaBadge(theme, 'Куплено', quantity),
                   _catalogMetaBadge(theme, 'Полка', shelf),
+                  if (isOversizePlaced)
+                    _catalogMetaBadge(theme, 'Режим', 'Габарит'),
                 ],
               ),
               const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.inventory_2_outlined),
-                  onPressed:
-                      (!_canMarkReservedOrderPlaced() ||
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  SizedBox(
+                    width: 190,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.inventory_2_outlined),
+                      onPressed:
+                          (!_canMarkReservedOrderPlaced() ||
                               isPlaced ||
                               _markingPlaced)
-                      ? null
-                      : () => _markReservedOrderPlaced(metaMap),
-                  label: Text(
-                    isPlaced
-                        ? 'Обработано'
-                        : (_markingPlaced ? 'Сохранение...' : 'Положил'),
+                          ? null
+                          : () => _markReservedOrderPlaced(
+                              metaMap,
+                              processingMode: 'standard',
+                            ),
+                      label: Text(
+                        isPlaced
+                            ? 'Обработано'
+                            : (_markingPlaced ? 'Сохранение...' : 'Положил'),
+                      ),
+                    ),
                   ),
-                ),
+                  SizedBox(
+                    width: 190,
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.all_inbox_outlined),
+                      onPressed:
+                          (!_canMarkReservedOrderPlaced() ||
+                              isPlaced ||
+                              _markingPlaced)
+                          ? null
+                          : () => _markReservedOrderPlaced(
+                              metaMap,
+                              processingMode: 'oversize',
+                            ),
+                      label: Text(
+                        isPlaced && isOversizePlaced
+                            ? 'Габарит'
+                            : (_markingPlaced ? 'Сохранение...' : 'Габарит'),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ] else ...[
               if (isVoiceMessage) ...[
@@ -6675,11 +7043,6 @@ class _ChatScreenState extends State<ChatScreen> {
                         title: 'Загрузка чата',
                         subtitle: 'Подтягиваем сообщения и медиа',
                       )
-                    : !_initialViewportReady
-                    ? const PhoenixLoadingView(
-                        title: 'Открываем чат',
-                        subtitle: 'Восстанавливаем последнее место в переписке',
-                      )
                     : timeline.isEmpty
                     ? Center(
                         child: Text(
@@ -6688,27 +7051,49 @@ class _ChatScreenState extends State<ChatScreen> {
                               : 'Ничего не найдено',
                         ),
                       )
-                    : ListView.builder(
-                        controller: _scrollController,
-                        physics: const BouncingScrollPhysics(
-                          parent: AlwaysScrollableScrollPhysics(),
-                        ),
-                        keyboardDismissBehavior:
-                            ScrollViewKeyboardDismissBehavior.onDrag,
-                        cacheExtent: media.size.height * 1.4,
-                        itemCount: timeline.length,
-                        itemBuilder: (context, i) {
-                          final row = timeline[i];
-                          if (row['type'] == 'date') {
-                            return _buildDateDivider(
-                              (row['label'] ?? 'Без даты').toString(),
-                            );
-                          }
-                          final message = Map<String, dynamic>.from(
-                            row['data'] as Map,
-                          );
-                          return _buildMessageItem(message);
-                        },
+                    : Stack(
+                        children: [
+                          SizedBox.expand(
+                            key: _messagesViewportKey,
+                            child: IgnorePointer(
+                              ignoring: !_initialViewportReady,
+                              child: AnimatedOpacity(
+                                duration: const Duration(milliseconds: 120),
+                                opacity: _initialViewportReady ? 1 : 0,
+                                child: ListView.builder(
+                                  controller: _scrollController,
+                                  physics: const BouncingScrollPhysics(
+                                    parent: AlwaysScrollableScrollPhysics(),
+                                  ),
+                                  keyboardDismissBehavior:
+                                      ScrollViewKeyboardDismissBehavior.onDrag,
+                                  cacheExtent: media.size.height * 1.4,
+                                  itemCount: timeline.length,
+                                  itemBuilder: (context, i) {
+                                    final row = timeline[i];
+                                    if (row['type'] == 'date') {
+                                      return _buildDateDivider(
+                                        (row['label'] ?? 'Без даты').toString(),
+                                      );
+                                    }
+                                    final message = Map<String, dynamic>.from(
+                                      row['data'] as Map,
+                                    );
+                                    return _buildMessageItem(message);
+                                  },
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (!_initialViewportReady)
+                            const Positioned.fill(
+                              child: PhoenixLoadingView(
+                                title: 'Открываем чат',
+                                subtitle:
+                                    'Восстанавливаем последнее место в переписке',
+                              ),
+                            ),
+                        ],
                       ),
               ),
               if (!_searchMode) ...[

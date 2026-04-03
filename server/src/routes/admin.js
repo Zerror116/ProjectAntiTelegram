@@ -3082,14 +3082,28 @@ router.post(
   async (req, res) => {
     const reservationId = String(req.body?.reservation_id || "").trim();
     const cartItemId = String(req.body?.cart_item_id || "").trim();
+    const processingModeRaw = String(req.body?.processing_mode || "standard")
+      .trim()
+      .toLowerCase();
     const shelfRaw = Number(req.body?.shelf_number);
     const manualShelf =
       Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
     const manualShelfConfirmed = ["1", "true", "yes", "y"].includes(
       String(req.body?.manual_shelf ?? "").toLowerCase().trim(),
     );
-    // В этом потоке (админ/создатель/арендатор) первая полка всегда вводится вручную.
-    const requiresManualShelf = true;
+    if (
+      processingModeRaw !== "standard" &&
+      processingModeRaw !== "oversize"
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "Некорректный processing_mode",
+      });
+    }
+    const processingMode = processingModeRaw;
+    // Для габаритного товара полка не спрашивается:
+    // он уходит в отдельную зону логистики.
+    const requiresManualShelf = processingMode !== "oversize";
 
     if (!reservationId && !cartItemId) {
       return res
@@ -3217,25 +3231,28 @@ router.post(
         });
       }
 
-      let finalShelf = manualShelf;
-      if (finalShelf == null) {
-        finalShelf = canReuseExistingShelf ? existingShelf : null;
+      let finalShelf = null;
+      if (requiresManualShelf) {
+        finalShelf = manualShelf;
+        if (finalShelf == null) {
+          finalShelf = canReuseExistingShelf ? existingShelf : null;
+        }
+        if (finalShelf == null || finalShelf <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            error: "Не удалось определить полку. Укажите номер полки вручную",
+          });
+        }
+        await client.query(
+          `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
+           VALUES ($1, $2, now(), now())
+           ON CONFLICT (user_id) DO UPDATE
+             SET shelf_number = EXCLUDED.shelf_number,
+                 updated_at = now()`,
+          [item.user_id, finalShelf],
+        );
       }
-      if (finalShelf == null || finalShelf <= 0) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          error: "Не удалось определить полку. Укажите номер полки вручную",
-        });
-      }
-      await client.query(
-        `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
-         VALUES ($1, $2, now(), now())
-         ON CONFLICT (user_id) DO UPDATE
-           SET shelf_number = EXCLUDED.shelf_number,
-               updated_at = now()`,
-        [item.user_id, finalShelf],
-      );
 
       await client.query(
         `UPDATE reservations
@@ -3252,9 +3269,10 @@ router.post(
         await client.query(
           `UPDATE cart_items
            SET status = 'processed',
+               processing_mode = $2,
                updated_at = now()
            WHERE id = $1`,
-          [targetCartItemId],
+          [targetCartItemId, processingMode],
         );
       }
 
@@ -3277,50 +3295,72 @@ router.post(
          SET meta = jsonb_set(
            jsonb_set(
              jsonb_set(
-               jsonb_set(COALESCE(meta, '{}'::jsonb), '{placed}', 'true'::jsonb, true),
+               jsonb_set(
+                 jsonb_set(
+                   jsonb_set(
+                     COALESCE(meta, '{}'::jsonb),
+                     '{placed}',
+                     'true'::jsonb,
+                     true
+                   ),
+                   '{processing_mode}',
+                   to_jsonb($3::text),
+                   true
+                 ),
+                 '{is_oversize}',
+                 to_jsonb(($3::text = 'oversize')),
+                 true
+               ),
                '{shelf_number}',
-               to_jsonb($2::int),
+               CASE
+                 WHEN $2::int IS NULL THEN 'null'::jsonb
+                 ELSE to_jsonb($2::int)
+               END,
                true
              ),
              '{processed_by_id}',
-             to_jsonb($3::text),
+             to_jsonb($4::text),
              true
            ),
            '{processed_by_name}',
-           to_jsonb($4::text),
+           to_jsonb($5::text),
            true
          )
          WHERE chat_id = $1
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
            AND (
-             COALESCE(meta->>'reservation_id', '') = $5
-             OR ($6 <> '' AND COALESCE(meta->>'cart_item_id', '') = $6)
+             COALESCE(meta->>'reservation_id', '') = $6
+             OR ($7 <> '' AND COALESCE(meta->>'cart_item_id', '') = $7)
            )
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
         [
           reservedChannel.id,
           finalShelf,
+          processingMode,
           String(req.user.id),
           processedByName,
           String(item.id),
           targetCartItemId,
         ],
       );
-      const syncedPendingClientMessages = await client.query(
-        `UPDATE messages
-         SET meta = jsonb_set(
-               COALESCE(meta, '{}'::jsonb),
-               '{shelf_number}',
-               to_jsonb($2::int),
-               true
-             )
-         WHERE chat_id = $1
-           AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
-           AND COALESCE(meta->>'user_id', '') = $3
-           AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
-         RETURNING id, chat_id, sender_id, text, meta, created_at`,
-        [reservedChannel.id, finalShelf, String(item.user_id)],
-      );
+      const syncedPendingClientMessages =
+        finalShelf == null
+          ? { rows: [] }
+          : await client.query(
+              `UPDATE messages
+               SET meta = jsonb_set(
+                     COALESCE(meta, '{}'::jsonb),
+                     '{shelf_number}',
+                     to_jsonb($2::int),
+                     true
+                   )
+               WHERE chat_id = $1
+                 AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
+                 AND COALESCE(meta->>'user_id', '') = $3
+                 AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
+               RETURNING id, chat_id, sender_id, text, meta, created_at`,
+              [reservedChannel.id, finalShelf, String(item.user_id)],
+            );
 
       let hiddenCatalogMessages = [];
       const productIdText = String(item.product_id || "").trim();
@@ -3412,8 +3452,9 @@ router.post(
           cart_item_id: targetCartItemId || null,
           status: "processed",
           shelf_number: finalShelf,
+          processing_mode: processingMode,
           processed_by_name: processedByName,
-            reason: "item_processed",
+          reason: "item_processed",
         });
         for (const hiddenMessage of hiddenCatalogMessages) {
           io.to(`chat:${hiddenMessage.chat_id}`).emit("chat:message", {
@@ -3433,6 +3474,7 @@ router.post(
           cart_item_id: targetCartItemId || null,
           status: "processed",
           shelf_number: finalShelf,
+          processing_mode: processingMode,
           processed_by_name: processedByName,
           product_hidden_after_sellout: hiddenCatalogMessages.length > 0,
         },

@@ -94,6 +94,12 @@ const CHAT_MEDIA_MAX_FILE_SIZE_MB = Math.max(
   Math.round(CHAT_MEDIA_MAX_FILE_SIZE_BYTES / (1024 * 1024)),
 );
 
+function parsePositiveMediaNumber(raw, { round = true } = {}) {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return round ? Math.round(value) : Number(value.toFixed(4));
+}
+
 function isVoiceMimeAllowed(mimeRaw, originalNameRaw) {
   const mime = String(mimeRaw || "").toLowerCase().trim();
   const originalName = String(originalNameRaw || "").toLowerCase().trim();
@@ -2531,6 +2537,20 @@ router.post(
       const durationMs = Number.isFinite(durationMsRaw) && durationMsRaw > 0
         ? durationMsRaw
         : 0;
+      const imageWidth = attachmentType === "image"
+        ? parsePositiveMediaNumber(req.body?.image_width)
+        : null;
+      const imageHeight = attachmentType === "image"
+        ? parsePositiveMediaNumber(req.body?.image_height)
+        : null;
+      const imageAspectRatio = attachmentType === "image"
+        ? parsePositiveMediaNumber(req.body?.image_aspect_ratio, {
+            round: false,
+          })
+        : null;
+      const imagePreprocess = attachmentType === "image"
+        ? String(req.body?.image_preprocess || "").trim().slice(0, 64)
+        : "";
       const hasCaption = caption.length > 0;
       const text = attachmentType === "image"
         ? (hasCaption ? caption : "Фото")
@@ -2543,6 +2563,10 @@ router.post(
         ...(attachmentType === "image"
           ? {
               image_url: mediaUrl,
+              ...(imageWidth ? { image_width: imageWidth } : {}),
+              ...(imageHeight ? { image_height: imageHeight } : {}),
+              ...(imageAspectRatio ? { image_aspect_ratio: imageAspectRatio } : {}),
+              ...(imagePreprocess ? { image_preprocess: imagePreprocess } : {}),
             }
           : attachmentType === "voice"
           ? {
