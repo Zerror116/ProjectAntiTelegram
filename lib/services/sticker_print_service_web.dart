@@ -231,12 +231,9 @@ Future<void> printStickerJob(StickerPrintJob job) async {
     throw StateError('Не удалось получить документ для печати');
   }
 
-  final blob = html.Blob(<Object>[
-    _stickerMarkup(job),
-  ], 'text/html;charset=utf-8');
-  final blobUrl = html.Url.createObjectUrlFromBlob(blob);
+  final markup = _stickerMarkup(job);
   final frame = html.IFrameElement()
-    ..src = blobUrl
+    ..src = 'about:blank'
     ..style.position = 'fixed'
     ..style.right = '0'
     ..style.bottom = '0'
@@ -253,6 +250,7 @@ Future<void> printStickerJob(StickerPrintJob job) async {
     if (!completer.isCompleted) completer.complete();
   });
 
+  frame.srcdoc = markup;
   body.append(frame);
   try {
     await completer.future.timeout(const Duration(seconds: 5));
@@ -267,7 +265,6 @@ Future<void> printStickerJob(StickerPrintJob job) async {
   } finally {
     Future<void>.delayed(const Duration(seconds: 20), () {
       frame.remove();
-      html.Url.revokeObjectUrl(blobUrl);
     });
   }
 }
