@@ -70,7 +70,7 @@
         position: relative;
         display: flex;
         flex-direction: column;
-        padding: 4.2mm 4.2mm 3.1mm 2mm;
+        padding: 3.1mm 2.4mm 2.8mm 2.4mm;
       }
 
       .sheet::before {
@@ -88,51 +88,63 @@
         display: flex;
         flex-direction: column;
         justify-content: center;
+        align-items: center;
         position: relative;
         z-index: 1;
+        text-align: center;
       }
 
       .phone {
-        font-size: 21mm;
+        width: 100%;
+        font-size: 23mm;
         line-height: 1;
         font-weight: 900;
         letter-spacing: 0.08mm;
         white-space: nowrap;
         overflow: hidden;
+        text-align: center;
       }
 
       .name {
         margin-top: 2.6mm;
-        font-size: 15.5mm;
+        width: 100%;
+        font-size: 17.2mm;
         line-height: 1.05;
         font-weight: 800;
         word-break: break-word;
+        text-align: center;
       }
 
       .kind {
         margin-top: 2.3mm;
-        font-size: 4.2mm;
+        width: 100%;
+        font-size: 4.8mm;
         line-height: 1.1;
         font-weight: 800;
         letter-spacing: 0.35mm;
         text-transform: uppercase;
+        text-align: center;
       }
 
       .title {
         margin-top: 1.4mm;
-        font-size: 4.9mm;
+        width: 100%;
+        font-size: 5.6mm;
         line-height: 1.08;
         font-weight: 700;
         word-break: break-word;
+        text-align: center;
       }
 
       .price {
         margin-top: 1.2mm;
-        font-size: 5.4mm;
+        width: 100%;
+        font-size: 6.2mm;
         line-height: 1.05;
         font-weight: 900;
         white-space: nowrap;
         overflow: hidden;
+        text-align: center;
       }
 
       .footer {
@@ -230,11 +242,11 @@
           if (title) title.style.fontSize = "";
           if (price) price.style.fontSize = "";
 
-          fitElement(phone, 100, 30);
-          fitElement(name, 74, 22);
-          fitElement(kind, 22, 12);
-          fitElement(title, 28, 12);
-          fitElement(price, 32, 14);
+          fitElement(phone, 112, 38);
+          fitElement(name, 82, 26);
+          fitElement(kind, 26, 14);
+          fitElement(title, 34, 14);
+          fitElement(price, 38, 16);
 
           let attempts = 0;
           while (attempts < 60 && content.scrollHeight > content.clientHeight) {
@@ -242,7 +254,7 @@
             for (const node of nodes) {
               const size = parseFloat(getComputedStyle(node).fontSize);
               const minimum =
-                node === phone ? 30 : node === name ? 22 : node === price ? 14 : 12;
+                node === phone ? 38 : node === name ? 26 : node === price ? 16 : 14;
               node.style.fontSize = Math.max(minimum, size - 1) + "px";
             }
             attempts += 1;
