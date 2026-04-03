@@ -19,6 +19,7 @@ import 'package:video_player/video_player.dart' as vp;
 
 import '../main.dart';
 import '../services/sticker_print_service.dart';
+import '../services/web_image_cache_service.dart';
 import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/chat_image_preprocessor.dart';
 import '../src/utils/media_url.dart';
@@ -918,6 +919,41 @@ class _ChatScreenState extends State<ChatScreen> {
     return updated;
   }
 
+  List<String> _initialChannelImageBatch(List<Map<String, dynamic>> messages) {
+    if (messages.isEmpty) return const <String>[];
+
+    final savedAnchorMessageId = _savedScrollAnchorMessageId;
+    var centerIndex = messages.length - 1;
+    if (savedAnchorMessageId != null && savedAnchorMessageId.isNotEmpty) {
+      final anchorIndex = messages.indexWhere(
+        (message) => (message['id'] ?? '').toString() == savedAnchorMessageId,
+      );
+      if (anchorIndex >= 0) {
+        centerIndex = anchorIndex;
+      }
+    } else if (_savedScrollFraction != null && messages.length > 1) {
+      centerIndex = (_savedScrollFraction! * (messages.length - 1))
+          .round()
+          .clamp(0, messages.length - 1);
+    }
+
+    final candidates =
+        <({int distance, String url})>[];
+    for (var index = 0; index < messages.length; index++) {
+      final meta = _metaMapOf(messages[index]['meta']);
+      final imageUrl = _resolveImageUrl(meta['image_url']?.toString());
+      if (imageUrl == null || imageUrl.isEmpty) continue;
+      candidates.add((distance: (index - centerIndex).abs(), url: imageUrl));
+    }
+    if (candidates.isEmpty) return const <String>[];
+    candidates.sort((a, b) => a.distance.compareTo(b.distance));
+    return candidates
+        .map((entry) => entry.url)
+        .toSet()
+        .take(10)
+        .toList(growable: false);
+  }
+
   Map<String, dynamic> _normalizeMessage(Map<String, dynamic> message) {
     final normalized = Map<String, dynamic>.from(message);
     final meta = _metaMapOf(normalized['meta']);
@@ -1595,6 +1631,9 @@ class _ChatScreenState extends State<ChatScreen> {
             _incomingTimer = null;
             _recomputeSearchResults(keepCurrent: false);
             _scheduleReadSync();
+            if (kIsWeb) {
+              unawaited(primeWebImageCache(_initialChannelImageBatch(messages)));
+            }
             unawaited(
               _warmUpVisibleImageDimensions(
                 messages,

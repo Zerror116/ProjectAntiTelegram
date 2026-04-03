@@ -45,7 +45,6 @@ function isRuntimeImageRequest(request) {
     return false;
   }
   if (url.origin !== self.location.origin) return false;
-  if (request.destination === 'image') return true;
   return (
     url.pathname.startsWith('/uploads/') ||
     url.pathname.startsWith('/api/chats/media/')
@@ -70,20 +69,24 @@ async function cacheImageResponse(request, response) {
   return response;
 }
 
-async function fetchAndCacheImage(request) {
-  const response = await fetch(request);
-  await cacheImageResponse(request, response);
-  return response;
-}
-
 async function handleImageRuntimeRequest(event) {
   const cache = await caches.open(IMAGE_RUNTIME_CACHE);
   const cached = await cache.match(event.request);
   if (cached) {
-    event.waitUntil(fetchAndCacheImage(event.request).catch(() => null));
+    event.waitUntil(
+      fetch(event.request)
+        .then((response) => cacheImageResponse(event.request, response))
+        .catch(() => null),
+    );
     return cached;
   }
-  return fetchAndCacheImage(event.request);
+  const networkFetch = fetch(event.request);
+  event.waitUntil(
+    networkFetch
+      .then((response) => cacheImageResponse(event.request, response))
+      .catch(() => null),
+  );
+  return networkFetch;
 }
 
 async function precacheImageBatch(urls) {
