@@ -8,21 +8,72 @@ function parseBooleanEnv(rawValue, fallback = false) {
   return ['1', 'true', 'yes', 'on', 'y'].includes(normalized);
 }
 
+function deriveMailHost() {
+  const candidates = [
+    process.env.AUTH_EMAIL_LINK_BASE,
+    process.env.PUBLIC_BASE_URL,
+    process.env.API_PUBLIC_BASE_URL,
+  ];
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim();
+    if (!raw) continue;
+    try {
+      const url = new URL(raw);
+      let host = String(url.hostname || '').trim().toLowerCase();
+      if (host.startsWith('www.')) {
+        host = host.slice(4);
+      }
+      if (!host) continue;
+      if (host === 'localhost') continue;
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) continue;
+      return host;
+    } catch (_) {
+      continue;
+    }
+  }
+  return '';
+}
+
+function resolveFromAddress() {
+  const configured = String(process.env.SMTP_FROM || '').trim();
+  if (configured) return configured;
+  const host = deriveMailHost();
+  if (!host) return '';
+  return `Fenix <no-reply@${host}>`;
+}
+
+function canUseDirectFallback() {
+  return parseBooleanEnv(
+    process.env.MAIL_DIRECT_FALLBACK,
+    String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production',
+  );
+}
+
 function getMailerConfig() {
+  const from = resolveFromAddress();
   const smtpUrl = String(process.env.SMTP_URL || '').trim();
   if (smtpUrl) {
     return {
       transport: smtpUrl,
-      from: String(process.env.SMTP_FROM || '').trim(),
+      from,
+      mode: 'smtp_url',
     };
   }
 
   const host = String(process.env.SMTP_HOST || '').trim();
   if (!host) {
-    return {
-      transport: null,
-      from: String(process.env.SMTP_FROM || '').trim(),
-    };
+    const directHost = deriveMailHost();
+    if (canUseDirectFallback() && directHost && from) {
+      return {
+        transport: {
+          direct: true,
+          name: directHost,
+        },
+        from,
+        mode: 'direct',
+      };
+    }
+    return { transport: null, from, mode: 'disabled' };
   }
 
   const port = Math.max(1, Number(process.env.SMTP_PORT || 587) || 587);
@@ -37,7 +88,8 @@ function getMailerConfig() {
       secure,
       auth: user ? { user, pass } : undefined,
     },
-    from: String(process.env.SMTP_FROM || '').trim(),
+    from,
+    mode: 'smtp_host',
   };
 }
 
@@ -77,13 +129,14 @@ async function sendMail({ to, subject, text, html }) {
     throw error;
   }
 
-  return await transporter.sendMail({
+  const result = await transporter.sendMail({
     from: config.from,
     to,
     subject,
     text,
     html,
   });
+  return result;
 }
 
 module.exports = {
