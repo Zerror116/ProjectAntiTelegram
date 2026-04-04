@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const directTransport = require('nodemailer-direct-transport');
 
 function parseBooleanEnv(rawValue, fallback = false) {
   if (rawValue === undefined || rawValue === null || rawValue === '') {
@@ -43,10 +44,7 @@ function resolveFromAddress() {
 }
 
 function canUseDirectFallback() {
-  return parseBooleanEnv(
-    process.env.MAIL_DIRECT_FALLBACK,
-    String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production',
-  );
+  return parseBooleanEnv(process.env.MAIL_DIRECT_FALLBACK, false);
 }
 
 function getMailerConfig() {
@@ -65,10 +63,11 @@ function getMailerConfig() {
     const directHost = deriveMailHost();
     if (canUseDirectFallback() && directHost && from) {
       return {
-        transport: {
-          direct: true,
+        transport: directTransport({
           name: directHost,
-        },
+          debug: parseBooleanEnv(process.env.SMTP_DEBUG, false),
+          logger: parseBooleanEnv(process.env.SMTP_LOGGER, false),
+        }),
         from,
         mode: 'direct',
       };
@@ -106,8 +105,9 @@ function getTransporter() {
   if (!config.transport || !config.from) return null;
 
   const transportKey = JSON.stringify({
-    transport: config.transport,
+    mode: config.mode,
     from: config.from,
+    transport: config.mode === 'direct' ? { direct: true } : config.transport,
   });
   if (cachedTransporter && cachedTransportKey === transportKey) {
     return cachedTransporter;
