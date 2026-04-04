@@ -152,6 +152,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _composerMediaHoldTimer;
   Timer? _bottomAnchorTimer;
   Timer? _persistScrollOffsetTimer;
+  Timer? _initialViewportFailsafeTimer;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -378,6 +379,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _composerMediaHoldTimer?.cancel();
     _bottomAnchorTimer?.cancel();
     _persistScrollOffsetTimer?.cancel();
+    _initialViewportFailsafeTimer?.cancel();
     _chatSub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
@@ -634,6 +636,14 @@ class _ChatScreenState extends State<ChatScreen> {
   void _applyInitialViewportAfterLoad() {
     if (_initialViewportApplied) return;
     _initialViewportApplied = true;
+    _initialViewportFailsafeTimer?.cancel();
+    _initialViewportFailsafeTimer = Timer(
+      const Duration(seconds: 4),
+      () {
+        if (!mounted || _initialViewportReady) return;
+        _fallbackAfterAnchorRestoreFailure();
+      },
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _performInitialViewportRestore();
     });
@@ -696,7 +706,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final targetContext = await _resolveMessageContextWithScroll(messageId);
     if (!mounted || targetContext == null || !_scrollController.hasClients) {
       if (passes <= 1) {
-        _performInitialViewportRestore(attempts: 0);
+        _fallbackAfterAnchorRestoreFailure();
         return;
       }
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -825,7 +835,39 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _markInitialViewportReady() {
     if (!mounted || _initialViewportReady) return;
+    _initialViewportFailsafeTimer?.cancel();
     setState(() => _initialViewportReady = true);
+  }
+
+  Future<void> _clearSavedScrollAnchor() async {
+    _savedScrollAnchorMessageId = null;
+    _savedScrollAnchorOffset = null;
+    _inMemoryScrollAnchorMessageIds.remove(widget.chatId);
+    _inMemoryScrollAnchorOffsets.remove(widget.chatId);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_chatScrollAnchorMessageIdStorageKey);
+      await prefs.remove(_chatScrollAnchorOffsetStorageKey);
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  void _fallbackAfterAnchorRestoreFailure() {
+    unawaited(_clearSavedScrollAnchor());
+    final savedOffset = _savedScrollOffset;
+    final savedFraction = _savedScrollFraction;
+    if (_scrollController.hasClients &&
+        (savedOffset != null || savedFraction != null)) {
+      _restoreSavedViewport(
+        savedOffset: savedOffset,
+        savedFraction: savedFraction,
+        passes: 2,
+        onComplete: _markInitialViewportReady,
+      );
+      return;
+    }
+    _markInitialViewportReady();
   }
 
   void _onMediaFramePainted() {
