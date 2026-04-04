@@ -1,5 +1,4 @@
 const nodemailer = require('nodemailer');
-const directTransport = require('nodemailer-direct-transport');
 
 function parseBooleanEnv(rawValue, fallback = false) {
   if (rawValue === undefined || rawValue === null || rawValue === '') {
@@ -43,12 +42,17 @@ function resolveFromAddress() {
   return `Fenix <no-reply@${host}>`;
 }
 
-function canUseDirectFallback() {
-  return parseBooleanEnv(process.env.MAIL_DIRECT_FALLBACK, false);
-}
-
 function getMailerConfig() {
   const from = resolveFromAddress();
+  const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
+  if (resendApiKey) {
+    return {
+      apiKey: resendApiKey,
+      from,
+      mode: 'resend_api',
+    };
+  }
+
   const smtpUrl = String(process.env.SMTP_URL || '').trim();
   if (smtpUrl) {
     return {
@@ -60,18 +64,6 @@ function getMailerConfig() {
 
   const host = String(process.env.SMTP_HOST || '').trim();
   if (!host) {
-    const directHost = deriveMailHost();
-    if (canUseDirectFallback() && directHost && from) {
-      return {
-        transport: directTransport({
-          name: directHost,
-          debug: parseBooleanEnv(process.env.SMTP_DEBUG, false),
-          logger: parseBooleanEnv(process.env.SMTP_LOGGER, false),
-        }),
-        from,
-        mode: 'direct',
-      };
-    }
     return { transport: null, from, mode: 'disabled' };
   }
 
@@ -97,17 +89,18 @@ let cachedTransportKey = '';
 
 function isMailConfigured() {
   const config = getMailerConfig();
-  return Boolean(config.transport && config.from);
+  return Boolean((config.apiKey || config.transport) && config.from);
 }
 
 function getTransporter() {
   const config = getMailerConfig();
+  if (config.mode === 'resend_api') return null;
   if (!config.transport || !config.from) return null;
 
   const transportKey = JSON.stringify({
     mode: config.mode,
     from: config.from,
-    transport: config.mode === 'direct' ? { direct: true } : config.transport,
+    transport: config.transport,
   });
   if (cachedTransporter && cachedTransportKey === transportKey) {
     return cachedTransporter;
@@ -118,8 +111,50 @@ function getTransporter() {
   return cachedTransporter;
 }
 
+async function sendViaResendApi({ apiKey, from, to, subject, text, html }) {
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from,
+      to: Array.isArray(to) ? to : [to],
+      subject,
+      text,
+      html,
+    }),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message =
+      payload.message ||
+      payload.error ||
+      'Resend не принял письмо для отправки';
+    const error = new Error(message);
+    error.statusCode = response.status;
+    error.responsePayload = payload;
+    throw error;
+  }
+
+  return payload;
+}
+
 async function sendMail({ to, subject, text, html }) {
   const config = getMailerConfig();
+  if (config.mode === 'resend_api' && config.apiKey && config.from) {
+    return sendViaResendApi({
+      apiKey: config.apiKey,
+      from: config.from,
+      to,
+      subject,
+      text,
+      html,
+    });
+  }
+
   const transporter = getTransporter();
   if (!config.from || !transporter) {
     const error = new Error(
