@@ -585,7 +585,9 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
       (sum, day) => sum + toNumber(day.posted_amount),
       0,
     );
-    worker.history_14_days.sort((a, b) => String(a.day).compareTo(String(b.day)));
+    worker.history_14_days.sort((a, b) =>
+      String(a.day || "").localeCompare(String(b.day || "")),
+    );
     return worker;
   });
 
