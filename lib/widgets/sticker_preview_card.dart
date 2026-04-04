@@ -56,7 +56,7 @@ class StickerPreviewCard extends StatelessWidget {
                           maxLines: 1,
                           textAlign: TextAlign.center,
                           style: const TextStyle(
-                            fontSize: 104,
+                            fontSize: 90,
                             fontWeight: FontWeight.w900,
                             letterSpacing: 0.08,
                             color: Colors.black,
@@ -86,7 +86,7 @@ class StickerPreviewCard extends StatelessWidget {
                             overflow: TextOverflow.visible,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 42,
+                              fontSize: 54,
                               fontWeight: FontWeight.w700,
                               height: 1.0,
                               color: Colors.black,
@@ -102,7 +102,7 @@ class StickerPreviewCard extends StatelessWidget {
                             maxLines: 1,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 48,
+                              fontSize: 60,
                               fontWeight: FontWeight.w900,
                               color: Colors.black,
                               height: 0.98,
@@ -133,7 +133,7 @@ class StickerPreviewCard extends StatelessWidget {
                       footer,
                       textAlign: TextAlign.right,
                       style: const TextStyle(
-                        fontSize: 10,
+                        fontSize: 14,
                         fontWeight: FontWeight.w800,
                         color: Color(0xFF222222),
                       ),

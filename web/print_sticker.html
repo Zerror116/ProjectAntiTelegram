@@ -96,7 +96,7 @@
 
       .phone {
         width: 100%;
-        font-size: 29mm;
+        font-size: 26mm;
         line-height: 0.95;
         font-weight: 900;
         letter-spacing: 0.03mm;
@@ -118,7 +118,7 @@
       .title {
         margin-top: 1.4mm;
         width: 100%;
-        font-size: 8.1mm;
+        font-size: 10.3mm;
         line-height: 1.0;
         font-weight: 700;
         word-break: break-word;
@@ -128,7 +128,7 @@
       .price {
         margin-top: 0.9mm;
         width: 100%;
-        font-size: 9.2mm;
+        font-size: 11.8mm;
         line-height: 0.98;
         font-weight: 900;
         white-space: nowrap;
@@ -140,7 +140,7 @@
         margin-top: auto;
         align-self: flex-end;
         text-align: right;
-        font-size: 2.3mm;
+        font-size: 3.5mm;
         font-weight: 800;
         color: #222;
         position: relative;
@@ -228,10 +228,10 @@
           if (title) title.style.fontSize = "";
           if (price) price.style.fontSize = "";
 
-          fitElement(phone, 188, 58);
+          fitElement(phone, 170, 52);
           fitElement(name, 144, 40);
-          fitElement(title, 66, 22);
-          fitElement(price, 78, 24);
+          fitElement(title, 84, 24);
+          fitElement(price, 96, 28);
 
           let attempts = 0;
           while (attempts < 60 && content.scrollHeight > content.clientHeight) {
@@ -239,7 +239,7 @@
             for (const node of nodes) {
               const size = parseFloat(getComputedStyle(node).fontSize);
               const minimum =
-                node === phone ? 68 : node === name ? 40 : node === price ? 24 : 22;
+                node === phone ? 52 : node === name ? 40 : node === price ? 28 : 24;
               node.style.fontSize = Math.max(minimum, size - 1) + "px";
             }
             attempts += 1;
