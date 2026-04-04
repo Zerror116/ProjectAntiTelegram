@@ -2,12 +2,33 @@
 
 // ignore_for_file: avoid_web_libraries_in_flutter
 
+import 'dart:async';
 import 'dart:html' as html;
+
+const _rootWorkerUrl = '/flutter_service_worker.js';
+
+Future<html.ServiceWorkerRegistration?> _ensureImageWorkerRegistration() async {
+  final sw = html.window.navigator.serviceWorker;
+  if (sw == null) return null;
+  try {
+    final dynamic existing = await sw.getRegistration();
+    if (existing != null) return existing;
+  } catch (_) {
+    // ignore
+  }
+  try {
+    return await sw.register(_rootWorkerUrl);
+  } catch (_) {
+    return null;
+  }
+}
 
 Future<void> primeWebImageCache(List<String> urls) async {
   if (urls.isEmpty) return;
   final sw = html.window.navigator.serviceWorker;
   if (sw == null) return;
+  final registration = await _ensureImageWorkerRegistration();
+  if (registration == null) return;
 
   final cleanedUrls = urls
       .map((value) => value.trim())
@@ -29,11 +50,14 @@ Future<void> primeWebImageCache(List<String> urls) async {
   }
 
   postTo(sw.controller);
+  postTo(registration.active);
+  postTo(registration.waiting);
+  postTo(registration.installing);
   try {
-    final registration = await sw.ready;
-    postTo(registration.active);
-    postTo(registration.waiting);
-    postTo(registration.installing);
+    final ready = await sw.ready.timeout(const Duration(seconds: 2));
+    postTo(ready.active);
+    postTo(ready.waiting);
+    postTo(ready.installing);
   } catch (_) {
     // ignore
   }
