@@ -42,7 +42,8 @@ class _AuthScreenState extends State<AuthScreen> {
   String _apkInfoMessage = '';
   String _tenantCodeFromLink = '';
   bool _handledIncomingAuthAction = false;
-  bool _emailRecoveryEnabled = false;
+  bool _passwordResetEnabled = false;
+  bool _magicLinkEnabled = false;
   bool _emailRecoveryStatusLoaded = false;
   bool _registrationEmailCodeEnabled = false;
 
@@ -732,6 +733,14 @@ class _AuthScreenState extends State<AuthScreen> {
     if (action.isEmpty || token.isEmpty) return;
     _handledIncomingAuthAction = true;
     if (action == 'magic_login') {
+      if (!_magicLinkEnabled) {
+        if (!mounted) return;
+        setState(() {
+          _message =
+              'Вход без пароля отключён. Используйте обычный вход или восстановление пароля.';
+        });
+        return;
+      }
       await _consumeMagicLogin(token);
       return;
     }
@@ -755,24 +764,29 @@ class _AuthScreenState extends State<AuthScreen> {
               ? Map<String, dynamic>.from(data['data'] as Map)
               : const <String, dynamic>{};
       final passwordResetEnabled =
-          payload['password_reset_enabled'] == true ||
-          payload['mail_configured'] == true;
+          payload.containsKey('password_reset_enabled')
+              ? payload['password_reset_enabled'] == true
+              : payload['mail_configured'] == true;
       final magicLinkEnabled =
-          payload['magic_link_enabled'] == true ||
-          payload['mail_configured'] == true;
+          payload.containsKey('magic_link_enabled')
+              ? payload['magic_link_enabled'] == true
+              : payload['mail_configured'] == true;
       final registrationEmailCodeEnabled =
-          payload['registration_email_code_enabled'] == true ||
-          payload['mail_configured'] == true;
+          payload.containsKey('registration_email_code_enabled')
+              ? payload['registration_email_code_enabled'] == true
+              : payload['mail_configured'] == true;
       if (!mounted) return;
       setState(() {
-        _emailRecoveryEnabled = passwordResetEnabled || magicLinkEnabled;
+        _passwordResetEnabled = passwordResetEnabled;
+        _magicLinkEnabled = magicLinkEnabled;
         _registrationEmailCodeEnabled = registrationEmailCodeEnabled;
         _emailRecoveryStatusLoaded = true;
       });
     } catch (_) {
       if (!mounted) return;
       setState(() {
-        _emailRecoveryEnabled = false;
+        _passwordResetEnabled = false;
+        _magicLinkEnabled = false;
         _registrationEmailCodeEnabled = false;
         _emailRecoveryStatusLoaded = true;
       });
@@ -1368,26 +1382,32 @@ class _AuthScreenState extends State<AuthScreen> {
                   ),
                     if (!_isRegister &&
                         _emailRecoveryStatusLoaded &&
-                        _emailRecoveryEnabled) ...[
+                        (_passwordResetEnabled || _magicLinkEnabled)) ...[
                       const SizedBox(height: 8),
                       Row(
                         children: [
-                          Expanded(
-                            child: TextButton(
-                              onPressed: _loading
-                                  ? null
-                                  : () => _requestEmailAction(magicLink: false),
-                              child: const Text('Забыли пароль?'),
+                          if (_passwordResetEnabled)
+                            Expanded(
+                              child: TextButton(
+                                onPressed: _loading
+                                    ? null
+                                    : () => _requestEmailAction(
+                                          magicLink: false,
+                                        ),
+                                child: const Text('Забыли пароль?'),
+                              ),
                             ),
-                          ),
-                          Expanded(
-                            child: TextButton(
-                              onPressed: _loading
-                                  ? null
-                                  : () => _requestEmailAction(magicLink: true),
-                              child: const Text('Войти без пароля'),
+                          if (_magicLinkEnabled)
+                            Expanded(
+                              child: TextButton(
+                                onPressed: _loading
+                                    ? null
+                                    : () => _requestEmailAction(
+                                          magicLink: true,
+                                        ),
+                                child: const Text('Войти без пароля'),
+                              ),
                             ),
-                          ),
                         ],
                       ),
                     ],

@@ -75,6 +75,9 @@ const REGISTRATION_VERIFY_TTL_MINUTES = Math.max(
   Math.min(Number(process.env.AUTH_REGISTRATION_VERIFY_TTL_MINUTES || 30) || 30, 120),
 );
 const REGISTRATION_EMAIL_VERIFY_PURPOSE = 'registration_email_verification';
+const MAGIC_LINK_LOGIN_ENABLED = parseBooleanFlag(
+  process.env.AUTH_MAGIC_LINK_ENABLED,
+);
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -1309,14 +1312,19 @@ router.post('/check_email', async (req, res) => {
 
 router.get('/email-auth/status', async (req, res) => {
   try {
-    const enabled = isMailConfigured();
+    const mailConfigured = isMailConfigured();
+    const passwordResetEnabled = mailConfigured;
+    const registrationEmailCodeEnabled = mailConfigured;
+    const magicLinkEnabled = mailConfigured && MAGIC_LINK_LOGIN_ENABLED;
     return res.json({
       ok: true,
       data: {
-        mail_configured: enabled,
-        password_reset_enabled: enabled,
-        magic_link_enabled: enabled,
-        registration_email_code_enabled: enabled,
+        // Intentionally false so older clients do not treat generic mail support
+        // as permission to show "Войти без пароля".
+        mail_configured: false,
+        password_reset_enabled: passwordResetEnabled,
+        magic_link_enabled: magicLinkEnabled,
+        registration_email_code_enabled: registrationEmailCodeEnabled,
       },
     });
   } catch (err) {
@@ -2185,6 +2193,12 @@ router.post('/password-reset/request', async (req, res) => {
 
 router.post('/magic-link/request', async (req, res) => {
   try {
+    if (!MAGIC_LINK_LOGIN_ENABLED) {
+      return res.status(403).json({
+        error:
+          'Вход без пароля отключён. Используйте обычный вход или восстановление пароля.',
+      });
+    }
     if (!isMailConfigured()) {
       return res.status(503).json({
         error:
@@ -2227,6 +2241,12 @@ router.post('/magic-link/request', async (req, res) => {
 });
 
 router.post('/magic-link/consume', async (req, res) => {
+  if (!MAGIC_LINK_LOGIN_ENABLED) {
+    return res.status(403).json({
+      error:
+        'Вход без пароля отключён. Используйте обычный вход или восстановление пароля.',
+    });
+  }
   const token = req.body?.token;
   const deviceFingerprint = req.body?.device_fingerprint;
   if (!normalizeAuthEmailToken(token)) {
