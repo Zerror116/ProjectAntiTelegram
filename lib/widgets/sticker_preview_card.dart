@@ -56,9 +56,9 @@ class StickerPreviewCard extends StatelessWidget {
                           maxLines: 1,
                           textAlign: TextAlign.center,
                           style: const TextStyle(
-                            fontSize: 124,
+                            fontSize: 104,
                             fontWeight: FontWeight.w900,
-                            letterSpacing: 0.2,
+                            letterSpacing: 0.08,
                             color: Colors.black,
                             height: 0.95,
                           ),
