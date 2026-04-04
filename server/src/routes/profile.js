@@ -381,7 +381,8 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
      post_counts AS (
        SELECT p.created_by AS worker_id,
               date_trunc('day', timezone($1, p.created_at)) AS day_local,
-              COUNT(*)::int AS posts_count
+              COUNT(*)::int AS posts_count,
+              COALESCE(SUM(COALESCE(p.price, 0)), 0)::numeric(12,2) AS posted_amount
        FROM products p
        JOIN worker_candidates wc ON wc.id = p.created_by
        WHERE timezone($1, p.created_at) >= (
@@ -406,7 +407,9 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
                 THEN 'current_week'
               ELSE 'previous_week'
             END AS period,
-            COALESCE(pc.posts_count, 0)::int AS posts_count
+            COALESCE(pc.posts_count, 0)::int AS posts_count,
+            COALESCE(pc.posted_amount, 0)::numeric(12,2) AS posted_amount,
+            (ds.day_local = date_trunc('day', timezone($1, now()))) AS is_today
      FROM worker_candidates wc
      CROSS JOIN day_series ds
      LEFT JOIN post_counts pc
@@ -486,8 +489,14 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
         worker_name: String(workerName || "Работник"),
         days_current_week: [],
         days_previous_week: [],
+        history_14_days: [],
+        posts_today: 0,
+        posted_amount_today: 0,
+        active_today: false,
         posts_current_week: 0,
         posts_previous_week: 0,
+        posted_amount_current_week: 0,
+        posted_amount_previous_week: 0,
         days_worked_current_week: 0,
         days_worked_previous_week: 0,
         post_downtime: {
@@ -506,15 +515,24 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     const worker = ensureWorker(row.worker_id, row.worker_name);
     if (!worker) continue;
     const postsCount = toNumber(row.posts_count);
+    const postedAmount = toNumber(row.posted_amount);
     const dayEntry = {
       day: String(row.day || ""),
       posts_count: postsCount,
+      posted_amount: postedAmount,
       worked: postsCount > 0,
+      is_today: row.is_today === true,
     };
     if (String(row.period || "") === "current_week") {
       worker.days_current_week.push(dayEntry);
     } else {
       worker.days_previous_week.push(dayEntry);
+    }
+    worker.history_14_days.push(dayEntry);
+    if (row.is_today === true) {
+      worker.posts_today = postsCount;
+      worker.posted_amount_today = postedAmount;
+      worker.active_today = postsCount > 0;
     }
   }
 
@@ -559,6 +577,15 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
       (sum, day) => sum + (day.worked ? 1 : 0),
       0,
     );
+    worker.posted_amount_current_week = worker.days_current_week.reduce(
+      (sum, day) => sum + toNumber(day.posted_amount),
+      0,
+    );
+    worker.posted_amount_previous_week = worker.days_previous_week.reduce(
+      (sum, day) => sum + toNumber(day.posted_amount),
+      0,
+    );
+    worker.history_14_days.sort((a, b) => String(a.day).compareTo(String(b.day)));
     return worker;
   });
 
@@ -566,9 +593,16 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
   const workersActiveCurrentWeek = workers.filter(
     (worker) => worker.posts_current_week > 0,
   ).length;
+  const workersActiveToday = workers.filter(
+    (worker) => worker.active_today === true,
+  ).length;
   const workersActivePreviousWeek = workers.filter(
     (worker) => worker.posts_previous_week > 0,
   ).length;
+  const postsToday = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.posts_today),
+    0,
+  );
   const postsCurrentWeek = workers.reduce(
     (sum, worker) => sum + toNumber(worker.posts_current_week),
     0,
@@ -577,14 +611,21 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     (sum, worker) => sum + toNumber(worker.posts_previous_week),
     0,
   );
+  const postedAmountToday = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.posted_amount_today),
+    0,
+  );
 
   return {
     summary: {
       workers_total: workersTotal,
+      workers_active_today: workersActiveToday,
       workers_active_current_week: workersActiveCurrentWeek,
       workers_active_previous_week: workersActivePreviousWeek,
+      posts_today: postsToday,
       posts_current_week: postsCurrentWeek,
       posts_previous_week: postsPreviousWeek,
+      posted_amount_today: toNumber(postedAmountToday.toFixed(2)),
       overall_avg_gap_minutes:
         weightedGapCount > 0
           ? toNumber((weightedGapTotal / weightedGapCount).toFixed(2))
