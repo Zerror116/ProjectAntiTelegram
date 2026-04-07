@@ -1918,6 +1918,14 @@ router.post(
     );
 
     await client.query('UPDATE chats SET updated_at = now() WHERE id = $1', [ticket.chat_id]);
+    await client.query(
+      `UPDATE user_chat_preferences
+       SET hidden = false,
+           updated_at = now()
+       WHERE chat_id = $1
+         AND hidden = true`,
+      [ticket.chat_id],
+    );
 
     await client.query('COMMIT');
 

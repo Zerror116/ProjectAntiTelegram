@@ -20,6 +20,7 @@ import '../services/sticker_print_service.dart';
 import 'chat_screen.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
+import '../utils/phone_utils.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/input_language_badge.dart';
 
@@ -5586,10 +5587,20 @@ class _AdminPanelState extends State<AdminPanel>
     return e.toString();
   }
 
+  String _displayPhone(String raw, {String fallback = '—'}) {
+    final formatted = PhoneUtils.formatForDisplay(raw);
+    if (formatted.isNotEmpty) return formatted;
+    final trimmed = raw.trim();
+    return trimmed.isNotEmpty ? trimmed : fallback;
+  }
+
   Future<void> _printDeliveryCustomerSticker(
     Map<String, dynamic> customer,
   ) async {
-    final phone = (customer['customer_phone'] ?? '').toString().trim();
+    final phone = _displayPhone(
+      (customer['customer_phone'] ?? '').toString().trim(),
+      fallback: '',
+    );
     final name = (customer['customer_name'] ?? 'Клиент').toString().trim();
     if (!_canPrintDeliverySticker) {
       showAppNotice(
@@ -9421,7 +9432,9 @@ class _AdminPanelState extends State<AdminPanel>
   ) {
     final theme = Theme.of(context);
     final name = (customer['customer_name'] ?? 'Клиент').toString();
-    final phone = (customer['customer_phone'] ?? '—').toString();
+    final phone = _displayPhone(
+      (customer['customer_phone'] ?? '').toString(),
+    );
     final sum = _formatMoney(
       customer['agreed_sum'] ?? customer['processed_sum'],
     );

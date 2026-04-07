@@ -1123,6 +1123,71 @@ async function autoDismantleStaleCart(
     );
   }
 
+  for (const productId of productTotals.keys()) {
+    const activeCartItemsQ = await queryable.query(
+      `SELECT 1
+       FROM cart_items c
+       JOIN users u ON u.id = c.user_id
+       WHERE c.product_id = $1
+         AND c.status <> 'delivered'
+         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+       LIMIT 1`,
+      [productId, scopedTenantId],
+    );
+    if (activeCartItemsQ.rowCount > 0) continue;
+
+    const unresolvedReservationsQ = await queryable.query(
+      `SELECT 1
+       FROM reservations r
+       JOIN users u ON u.id = r.user_id
+       WHERE r.product_id = $1
+         AND r.is_fulfilled = false
+         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+       LIMIT 1`,
+      [productId, scopedTenantId],
+    );
+    if (unresolvedReservationsQ.rowCount > 0) continue;
+
+    const activeDeliveryQ = await queryable.query(
+      `SELECT 1
+       FROM delivery_batch_items di
+       JOIN delivery_batches dbt ON dbt.id = di.batch_id
+       WHERE di.product_id = $1
+         AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
+       LIMIT 1`,
+      [productId],
+    );
+    if (activeDeliveryQ.rowCount > 0) continue;
+
+    await queryable.query(
+      `UPDATE products
+       SET status = 'archived',
+           quantity = 0,
+           reusable_at = now(),
+           updated_at = now()
+       WHERE id = $1`,
+      [productId],
+    );
+    await queryable.query(
+      `UPDATE messages
+       SET meta = jsonb_set(
+             jsonb_set(
+               COALESCE(meta, '{}'::jsonb),
+               '{hidden_for_all}',
+               'true'::jsonb,
+               true
+             ),
+             '{archived_after_cart_dismantle}',
+             'true'::jsonb,
+             true
+           )
+       WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
+         AND COALESCE(meta->>'product_id', '') = $1::text
+         AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false`,
+      [productId],
+    );
+  }
+
   await queryable.query(
     `DELETE FROM cart_items
      WHERE id = ANY($1::uuid[])`,
@@ -5241,6 +5306,23 @@ router.post(
              handed_off_at = now(),
              updated_at = now()
          WHERE id = $1`,
+        [batchId],
+      );
+
+      await client.query(
+        `UPDATE products
+         SET reusable_at = now(),
+             updated_at = now()
+         WHERE status = 'archived'
+           AND id IN (
+             SELECT DISTINCT i.product_id
+             FROM delivery_batch_items i
+             JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
+             WHERE i.batch_id = $1
+               AND c.call_status = 'accepted'
+               AND c.courier_name IS NOT NULL
+               AND c.courier_name <> ''
+           )`,
         [batchId],
       );
 

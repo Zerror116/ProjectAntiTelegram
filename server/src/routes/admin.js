@@ -156,6 +156,20 @@ function normalizeSettings(raw) {
   return raw;
 }
 
+function normalizePhoneDigits(raw) {
+  return String(raw || "").replace(/\D/g, "").slice(0, 20);
+}
+
+function formatPhoneForDisplay(raw) {
+  const digits = normalizePhoneDigits(raw);
+  if (digits.length === 10) return `8${digits}`;
+  if (digits.length === 11) {
+    if (digits.startsWith("8")) return digits;
+    if (digits.startsWith("7")) return `8${digits.slice(1)}`;
+  }
+  return String(raw || "").trim() || "—";
+}
+
 function schedulePublishedMessages(io, published, tenantId = null) {
   if (!io || !Array.isArray(published) || published.length === 0) return;
   published.forEach((item, index) => {
@@ -416,7 +430,7 @@ function reservedOrderMessageText(order) {
       ? `Описание: ${String(order.product_description).trim()}`
       : null,
     `Клиент: ${order.client_name || "—"}`,
-    `Телефон: ${order.client_phone || "—"}`,
+    `Телефон: ${formatPhoneForDisplay(order.client_phone)}`,
     `ID товара: ${productLabel}`,
     `Цена: ${order.product_price} ₽`,
     `Куплено: ${order.quantity}`,
@@ -2945,14 +2959,28 @@ router.post(
                 p.image_url AS product_image_url,
                 u.name AS client_name,
                 ph.phone AS client_phone,
-                NULL::int AS shelf_number
+                regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g') AS client_phone_digits,
+                us.shelf_number
          FROM reservations r
          JOIN products p ON p.id = r.product_id
          JOIN users u ON u.id = r.user_id
          LEFT JOIN phones ph ON ph.user_id = r.user_id
+         LEFT JOIN user_shelves us ON us.user_id = r.user_id
          WHERE r.is_fulfilled = false
            AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
-         ORDER BY r.created_at ASC
+         ORDER BY DATE(COALESCE(r.created_at, now())) ASC,
+                  COALESCE(us.shelf_number, p.shelf_number, 2147483647) ASC,
+                  CASE
+                    WHEN regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g') = '' THEN '89999999999'
+                    WHEN length(regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g')) = 10
+                      THEN '8' || regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g')
+                    WHEN regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g') ~ '^7\\d{10}$'
+                      THEN '8' || substr(regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g'), 2)
+                    ELSE regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g')
+                  END ASC,
+                  lower(COALESCE(u.name, '')) ASC,
+                  r.created_at ASC,
+                  r.id ASC
          FOR UPDATE OF r`,
         [req.user.tenant_id || null],
       );
@@ -2977,7 +3005,7 @@ router.post(
           quantity: Number(row.quantity),
           image_url: row.product_image_url,
           client_name: row.client_name || "—",
-          client_phone: row.client_phone || "—",
+          client_phone: formatPhoneForDisplay(row.client_phone),
           shelf_number: row.shelf_number,
           placed: false,
         };
@@ -3066,6 +3094,157 @@ router.post(
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("admin.orders.dispatch_reserved error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/orders/change_shelf",
+  requireAuth,
+  requireRole("admin", "creator"),
+  requireReservationFulfillPermission,
+  async (req, res) => {
+    const reservationId = String(req.body?.reservation_id || "").trim();
+    const cartItemId = String(req.body?.cart_item_id || "").trim();
+    const shelfRaw = Number(req.body?.shelf_number);
+    const shelfNumber =
+      Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
+
+    if (!reservationId && !cartItemId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "reservation_id или cart_item_id обязателен" });
+    }
+    if (shelfNumber == null || shelfNumber <= 0) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Укажите корректный номер полки" });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { reservedChannel } = await ensureSystemChannels(
+        client,
+        req.user.id,
+        req.user.tenant_id,
+      );
+
+      const reservationQ = await client.query(
+        `SELECT r.id,
+                r.user_id,
+                r.cart_item_id
+         FROM reservations r
+         JOIN users buyer ON buyer.id = r.user_id
+         WHERE (
+           ($1::uuid IS NOT NULL AND r.id = $1::uuid)
+           OR
+           ($1::uuid IS NULL AND $2::uuid IS NOT NULL AND r.cart_item_id = $2::uuid)
+         )
+           AND ($3::uuid IS NULL OR buyer.tenant_id = $3::uuid)
+         ORDER BY r.created_at DESC
+         LIMIT 1
+         FOR UPDATE OF r`,
+        [reservationId || null, cartItemId || null, req.user.tenant_id || null],
+      );
+      if (reservationQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Резерв не найден" });
+      }
+
+      const item = reservationQ.rows[0];
+      const userIdText = String(item.user_id || "").trim();
+      await client.query(
+        `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
+         VALUES ($1, $2, now(), now())
+         ON CONFLICT (user_id) DO UPDATE
+           SET shelf_number = EXCLUDED.shelf_number,
+               updated_at = now()`,
+        [userIdText, shelfNumber],
+      );
+
+      const updatedReservedMessages = await client.query(
+        `UPDATE messages
+         SET meta = jsonb_set(
+               COALESCE(meta, '{}'::jsonb),
+               '{shelf_number}',
+               to_jsonb($2::int),
+               true
+             )
+         WHERE chat_id = $1
+           AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
+           AND COALESCE(meta->>'user_id', '') = $3
+           AND lower(COALESCE(meta->>'processing_mode', 'standard')) <> 'oversize'
+         RETURNING id, chat_id, sender_id, text, meta, created_at`,
+        [reservedChannel.id, shelfNumber, userIdText],
+      );
+
+      const updatedDeliveryCustomers = await client.query(
+        `UPDATE delivery_batch_customers c
+         SET shelf_number = $1,
+             updated_at = now()
+         WHERE c.user_id = $2::uuid
+           AND EXISTS (
+             SELECT 1
+             FROM delivery_batches b
+             JOIN users u ON u.id = c.user_id
+             WHERE b.id = c.batch_id
+               AND b.status IN ('calling', 'couriers_assigned', 'handed_off')
+               AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
+           )
+         RETURNING c.batch_id::text AS batch_id`,
+        [shelfNumber, userIdText, req.user.tenant_id || null],
+      );
+
+      if (updatedReservedMessages.rowCount > 0) {
+        await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+          reservedChannel.id,
+        ]);
+      }
+
+      await client.query("COMMIT");
+
+      const io = req.app.get("io");
+      if (io) {
+        for (const message of updatedReservedMessages.rows) {
+          io.to(`chat:${reservedChannel.id}`).emit("chat:message", {
+            chatId: reservedChannel.id,
+            message: decryptMessageRow(message),
+          });
+        }
+        if (updatedReservedMessages.rowCount > 0) {
+          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+            chatId: reservedChannel.id,
+          });
+        }
+        emitToTenant(io, req.user?.tenant_id || null, "delivery:updated", {
+          batchId: "reset",
+          updatedAt: new Date().toISOString(),
+        });
+        io.to(`user:${userIdText}`).emit("cart:updated", {
+          userId: userIdText,
+          shelf_number: shelfNumber,
+          reason: "shelf_changed",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          reservation_id: String(item.id),
+          cart_item_id: item.cart_item_id ? String(item.cart_item_id) : null,
+          user_id: userIdText,
+          shelf_number: shelfNumber,
+          updated_reserved_messages: updatedReservedMessages.rowCount,
+          updated_delivery_customers: updatedDeliveryCustomers.rowCount,
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("admin.orders.change_shelf error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();
@@ -4312,7 +4491,7 @@ router.post(
   },
 );
 
-// Архивировать товар и освободить ID через 60 дней
+// Архивировать товар и сразу освободить номер товара для повторного использования
 router.post(
   "/products/:id/archive",
   requireAuth,
@@ -4323,7 +4502,7 @@ router.post(
       const upd = await db.query(
         `UPDATE products
        SET status = 'archived',
-           reusable_at = now() + interval '60 days',
+           reusable_at = now(),
            updated_at = now()
        WHERE id = $1
        RETURNING id, product_code, title, status, reusable_at`,

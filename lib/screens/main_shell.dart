@@ -67,10 +67,13 @@ class _MainShellState extends State<MainShell> {
     _lastEffectiveRole = authService.effectiveRole;
     final initialIds = _destinationIdsForRole(_lastEffectiveRole);
     if (initialIds.isNotEmpty) {
-      activeShellSectionNotifier.value = initialIds[_index.clamp(
-        0,
-        initialIds.length - 1,
-      )];
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        activeShellSectionNotifier.value = initialIds[_index.clamp(
+          0,
+          initialIds.length - 1,
+        )];
+      });
     }
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;

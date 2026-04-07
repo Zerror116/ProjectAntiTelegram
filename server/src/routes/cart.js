@@ -162,6 +162,100 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
+async function archiveProductAfterCartDismissal(
+  client,
+  {
+    productId,
+    tenantId = null,
+  } = {},
+) {
+  const productIdText = String(productId || '').trim();
+  if (!productIdText) {
+    return { archived: false, hiddenCatalogMessages: [] };
+  }
+
+  const activeCartItemsQ = await client.query(
+    `SELECT 1
+     FROM cart_items c
+     JOIN users u ON u.id = c.user_id
+     WHERE c.product_id = $1
+       AND c.status <> 'delivered'
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     LIMIT 1`,
+    [productIdText, tenantId || null],
+  );
+  if (activeCartItemsQ.rowCount > 0) {
+    return { archived: false, hiddenCatalogMessages: [] };
+  }
+
+  const unresolvedReservationsQ = await client.query(
+    `SELECT 1
+     FROM reservations r
+     JOIN users u ON u.id = r.user_id
+     WHERE r.product_id = $1
+       AND r.is_fulfilled = false
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+     LIMIT 1`,
+    [productIdText, tenantId || null],
+  );
+  if (unresolvedReservationsQ.rowCount > 0) {
+    return { archived: false, hiddenCatalogMessages: [] };
+  }
+
+  const activeDeliveryQ = await client.query(
+    `SELECT 1
+     FROM delivery_batch_items di
+     JOIN delivery_batches dbt ON dbt.id = di.batch_id
+     WHERE di.product_id = $1
+       AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
+     LIMIT 1`,
+    [productIdText],
+  );
+  if (activeDeliveryQ.rowCount > 0) {
+    return { archived: false, hiddenCatalogMessages: [] };
+  }
+
+  const archivedQ = await client.query(
+    `UPDATE products
+     SET status = 'archived',
+         quantity = 0,
+         reusable_at = now(),
+         updated_at = now()
+     WHERE id = $1
+       AND status <> 'archived'
+     RETURNING id`,
+    [productIdText],
+  );
+  if (archivedQ.rowCount === 0) {
+    return { archived: false, hiddenCatalogMessages: [] };
+  }
+
+  const hiddenQ = await client.query(
+    `UPDATE messages
+     SET meta = jsonb_set(
+           jsonb_set(
+             COALESCE(meta, '{}'::jsonb),
+             '{hidden_for_all}',
+             'true'::jsonb,
+             true
+           ),
+           '{archived_after_cart_dismantle}',
+           'true'::jsonb,
+           true
+         )
+     WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
+       AND COALESCE(meta->>'product_id', '') = $1::text
+       AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [productIdText],
+  );
+
+  return {
+    archived: true,
+    hiddenCatalogMessages: hiddenQ.rows || [],
+  };
+}
+
 function buildCartRetentionWarning(row) {
   if (!row || !row.oldest_created_at) return null;
   const oldestCreatedAt = new Date(row.oldest_created_at);
@@ -338,6 +432,14 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
     ],
   );
 
+  const archiveResult =
+    remainingQuantity <= 0
+      ? await archiveProductAfterCartDismissal(client, {
+          productId: item.product_id,
+          tenantId,
+        })
+      : { archived: false, hiddenCatalogMessages: [] };
+
   return {
     ok: true,
     item,
@@ -345,6 +447,8 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
     cancelQuantity,
     remainingQuantity,
     updatedCatalogMessages: msgUpdate.rows || [],
+    hiddenCatalogMessages: archiveResult.hiddenCatalogMessages || [],
+    productArchivedAfterDismissal: archiveResult.archived === true,
     updatedReservedMessage,
     removedReservedMessage,
   };
@@ -1068,6 +1172,14 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       ]
     );
 
+    const archiveResult =
+      remainingQuantity <= 0
+        ? await archiveProductAfterCartDismissal(client, {
+            productId: item.product_id,
+            tenantId: req.user?.tenant_id || null,
+          })
+        : { archived: false, hiddenCatalogMessages: [] };
+
     await client.query('COMMIT');
 
     const io = req.app.get('io');
@@ -1099,13 +1211,22 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
           chatId: removedReservedMessage.chat_id,
         });
       }
+      for (const message of archiveResult.hiddenCatalogMessages || []) {
+        io.to(`chat:${message.chat_id}`).emit('chat:message', {
+          chatId: message.chat_id,
+          message: decryptMessageRow(message),
+        });
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: message.chat_id,
+        });
+      }
     }
 
     emitCartUpdated(req, userId, {
       product_id: item.product_id,
       cart_item_id: cartItemId,
       status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
-      available_in_stock: Number(updatedProduct.quantity),
+      available_in_stock: archiveResult.archived ? 0 : Number(updatedProduct.quantity),
       reason: remainingQuantity > 0 ? 'item_cancelled_partial' : 'item_cancelled',
     }, actorUserId && actorUserId !== userId ? [actorUserId] : []);
 
@@ -1117,7 +1238,8 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
         status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
         restored_quantity: cancelQuantity,
         remaining_quantity: remainingQuantity,
-        available_in_stock: Number(updatedProduct.quantity),
+        available_in_stock: archiveResult.archived ? 0 : Number(updatedProduct.quantity),
+        product_archived_after_dismantle: archiveResult.archived === true,
       },
     });
   } catch (err) {
@@ -1566,6 +1688,15 @@ router.delete(
             chatId: message.chat_id,
           });
         }
+        for (const message of adjustResult.hiddenCatalogMessages || []) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message', {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+        }
         if (adjustResult.updatedReservedMessage) {
           io.to(`chat:${adjustResult.updatedReservedMessage.chat_id}`).emit('chat:message', {
             chatId: adjustResult.updatedReservedMessage.chat_id,
@@ -1593,6 +1724,9 @@ router.delete(
         cart_item_id: adjustResult.item.id,
         product_id: adjustResult.item.product_id,
         status: adjustResult.remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
+        available_in_stock: adjustResult.productArchivedAfterDismissal
+          ? 0
+          : Number(adjustResult.updatedProduct.quantity || 0),
       });
 
       return res.json({
@@ -1602,7 +1736,11 @@ router.delete(
           product_id: adjustResult.item.product_id,
           removed_quantity: adjustResult.cancelQuantity,
           remaining_quantity: adjustResult.remainingQuantity,
-          available_in_stock: Number(adjustResult.updatedProduct.quantity || 0),
+          available_in_stock: adjustResult.productArchivedAfterDismissal
+            ? 0
+            : Number(adjustResult.updatedProduct.quantity || 0),
+          product_archived_after_dismantle:
+            adjustResult.productArchivedAfterDismissal === true,
         },
       });
     } catch (err) {
@@ -1662,6 +1800,7 @@ router.post(
       let removedUnits = 0;
       const blockedItemIds = [];
       const updatedCatalogMessages = [];
+      const hiddenCatalogMessages = [];
       let updatedReservedMessages = [];
       let removedReservedMessages = [];
       for (const row of cartIdsQ.rows) {
@@ -1679,6 +1818,7 @@ router.post(
         removedCount += 1;
         removedUnits += Number(adjustResult.cancelQuantity || 0);
         updatedCatalogMessages.push(...(adjustResult.updatedCatalogMessages || []));
+        hiddenCatalogMessages.push(...(adjustResult.hiddenCatalogMessages || []));
         if (adjustResult.updatedReservedMessage) {
           updatedReservedMessages.push(adjustResult.updatedReservedMessage);
         }
@@ -1692,6 +1832,15 @@ router.post(
       const io = req.app.get('io');
       if (io) {
         for (const message of updatedCatalogMessages) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message', {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+        }
+        for (const message of hiddenCatalogMessages) {
           io.to(`chat:${message.chat_id}`).emit('chat:message', {
             chatId: message.chat_id,
             message: decryptMessageRow(message),

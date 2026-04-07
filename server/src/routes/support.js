@@ -217,6 +217,15 @@ async function emitChatMessage(req, tenantId, chatId, messageId) {
   const message = await hydrateMessageById(messageId, null);
   if (!message) return;
 
+  await db.query(
+    `UPDATE user_chat_preferences
+     SET hidden = false,
+         updated_at = now()
+     WHERE chat_id = $1
+       AND hidden = true`,
+    [chatId],
+  );
+
   io.to(`chat:${chatId}`).emit("chat:message", {
     chatId,
     message,
@@ -1559,6 +1568,14 @@ router.post("/bug-report", authMiddleware, supportBugRateGuard, async (req, res)
 
     const io = req.app.get("io");
     if (io) {
+      await db.query(
+        `UPDATE user_chat_preferences
+         SET hidden = false,
+             updated_at = now()
+         WHERE chat_id = $1
+           AND hidden = true`,
+        [channel.id],
+      );
       if (created) {
         emitToTenant(io, reporter.tenant_id || null, "chat:created", {
           chatId: channel.id,
