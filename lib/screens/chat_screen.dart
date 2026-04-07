@@ -24,6 +24,7 @@ import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/chat_image_preprocessor.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
+import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/chat_message_image.dart';
@@ -3758,11 +3759,20 @@ class _ChatScreenState extends State<ChatScreen> {
     return text.contains('₽') ? text : '$text ₽';
   }
 
+  String _formatDisplayPhone(String raw, {String fallback = '—'}) {
+    final formatted = PhoneUtils.formatForDisplay(raw);
+    if (formatted.isNotEmpty) return formatted;
+    final trimmed = raw.trim();
+    return trimmed.isNotEmpty ? trimmed : fallback;
+  }
+
   StickerPrintJob _reservedOrderStickerJob(
     Map<String, dynamic> meta, {
     required bool oversize,
   }) {
-    final phone = (meta['client_phone'] ?? '').toString().trim();
+    final phone = _formatDisplayPhone(
+      (meta['client_phone'] ?? '').toString().trim(),
+    );
     final name = (meta['client_name'] ?? '').toString().trim();
     final title = (meta['title'] ?? '').toString().trim();
     final priceLabel = _reservedOrderPriceLabel(meta['price']);
@@ -3791,6 +3801,166 @@ class _ChatScreenState extends State<ChatScreen> {
       tone: AppNoticeTone.info,
       duration: const Duration(seconds: 3),
     );
+  }
+
+  void _patchReservedOrderMessageLocally({
+    String? reservationId,
+    String? cartItemId,
+    required Map<String, dynamic> patch,
+  }) {
+    final reservationKey = (reservationId ?? '').trim();
+    final cartItemKey = (cartItemId ?? '').trim();
+    if (reservationKey.isEmpty && cartItemKey.isEmpty) return;
+    setState(() {
+      _messages = _messages.map((message) {
+        final meta = _metaMapOf(message['meta']);
+        if (meta['kind']?.toString() != 'reserved_order_item') return message;
+        final messageReservationId = (meta['reservation_id'] ?? '')
+            .toString()
+            .trim();
+        final messageCartItemId = (meta['cart_item_id'] ?? '')
+            .toString()
+            .trim();
+        final matchesReservation =
+            reservationKey.isNotEmpty && messageReservationId == reservationKey;
+        final matchesCartItem =
+            cartItemKey.isNotEmpty && messageCartItemId == cartItemKey;
+        if (!matchesReservation && !matchesCartItem) return message;
+        return {
+          ...message,
+          'meta': Map<String, dynamic>.from(meta)..addAll(patch),
+        };
+      }).toList();
+    });
+  }
+
+  void _patchReservedUserShelfLocally({
+    required String userId,
+    required int shelfNumber,
+  }) {
+    final userKey = userId.trim();
+    if (userKey.isEmpty || shelfNumber <= 0) return;
+    setState(() {
+      _messages = _messages.map((message) {
+        final meta = _metaMapOf(message['meta']);
+        if (meta['kind']?.toString() != 'reserved_order_item') return message;
+        final messageUserId = (meta['user_id'] ?? '').toString().trim();
+        final processingMode = (meta['processing_mode'] ?? 'standard')
+            .toString()
+            .trim()
+            .toLowerCase();
+        if (messageUserId != userKey || processingMode == 'oversize') {
+          return message;
+        }
+        return {
+          ...message,
+          'meta': Map<String, dynamic>.from(meta)..['shelf_number'] = shelfNumber,
+        };
+      }).toList();
+    });
+  }
+
+  Future<int?> _promptShelfNumber({
+    String title = 'Укажите полку',
+    String initialValue = '',
+  }) async {
+    var shelfDraft = initialValue.trim();
+    if (!mounted) return null;
+    return showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextFormField(
+          initialValue: shelfDraft,
+          onChanged: (value) => shelfDraft = value,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+            labelText: 'Номер полки',
+            hintText: 'Например: 3',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final parsed = int.tryParse(shelfDraft.trim());
+              if (parsed == null || parsed <= 0) {
+                showAppNotice(
+                  context,
+                  'Введите корректный номер полки',
+                  tone: AppNoticeTone.warning,
+                  duration: const Duration(seconds: 2),
+                );
+                return;
+              }
+              Navigator.of(ctx).pop(parsed);
+            },
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _changeReservedOrderShelf(Map<String, dynamic> meta) async {
+    if (!_canMarkReservedOrderPlaced()) return;
+    final reservationId = (meta['reservation_id'] ?? '').toString().trim();
+    final cartItemId = (meta['cart_item_id'] ?? '').toString().trim();
+    if (reservationId.isEmpty && cartItemId.isEmpty) return;
+    final currentShelf = int.tryParse((meta['shelf_number'] ?? '').toString());
+    final nextShelf = await _promptShelfNumber(
+      title: 'Смена полки',
+      initialValue: currentShelf == null || currentShelf <= 0
+          ? ''
+          : currentShelf.toString(),
+    );
+    if (nextShelf == null) return;
+
+    setState(() => _markingPlaced = true);
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/orders/change_shelf',
+        data: {
+          if (reservationId.isNotEmpty) 'reservation_id': reservationId,
+          if (cartItemId.isNotEmpty) 'cart_item_id': cartItemId,
+          'shelf_number': nextShelf,
+        },
+      );
+      final data = resp.data is Map<String, dynamic>
+          ? resp.data as Map<String, dynamic>
+          : <String, dynamic>{};
+      final payload = data['data'] is Map<String, dynamic>
+          ? data['data'] as Map<String, dynamic>
+          : <String, dynamic>{};
+      final userId = (payload['user_id'] ?? meta['user_id'] ?? '')
+          .toString()
+          .trim();
+      if (!mounted) return;
+      _patchReservedUserShelfLocally(userId: userId, shelfNumber: nextShelf);
+      showAppNotice(
+        context,
+        'Полка изменена на $nextShelf',
+        tone: AppNoticeTone.success,
+        duration: const Duration(milliseconds: 1400),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка смены полки: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _markingPlaced = false);
+      } else {
+        _markingPlaced = false;
+      }
+    }
   }
 
   bool _isClientRole() {
@@ -4066,45 +4236,7 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         }
 
-        var shelfDraft = '';
-        if (!mounted) return;
-        final manualShelf = await showDialog<int>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: const Text('Укажите полку'),
-            content: TextFormField(
-              initialValue: shelfDraft,
-              onChanged: (value) => shelfDraft = value,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Номер полки',
-                hintText: 'Например: 3',
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(),
-                child: const Text('Отмена'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  final parsed = int.tryParse(shelfDraft.trim());
-                  if (parsed == null || parsed <= 0) {
-                    showAppNotice(
-                      context,
-                      'Введите корректный номер полки',
-                      tone: AppNoticeTone.warning,
-                      duration: const Duration(seconds: 2),
-                    );
-                    return;
-                  }
-                  Navigator.of(ctx).pop(parsed);
-                },
-                child: const Text('Сохранить'),
-              ),
-            ],
-          ),
-        );
+        final manualShelf = await _promptShelfNumber();
         if (manualShelf == null) return;
         resp = await sendMarkPlaced(
           shelfNumber: manualShelf,
@@ -4112,6 +4244,27 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
       if ((resp.statusCode == 200 || resp.statusCode == 201) && mounted) {
+        final data = resp.data is Map<String, dynamic>
+            ? resp.data as Map<String, dynamic>
+            : <String, dynamic>{};
+        final payload = data['data'] is Map<String, dynamic>
+            ? data['data'] as Map<String, dynamic>
+            : <String, dynamic>{};
+        final resolvedMode = (payload['processing_mode'] ?? processingMode)
+            .toString()
+            .trim();
+        _patchReservedOrderMessageLocally(
+          reservationId: reservationId,
+          cartItemId: cartItemId,
+          patch: {
+            'placed': true,
+            'processing_mode': resolvedMode,
+            'is_oversize': resolvedMode == 'oversize',
+            'shelf_number': payload['shelf_number'],
+            'processed_by_name':
+                (payload['processed_by_name'] ?? '').toString().trim(),
+          },
+        );
         setState(() {
           if (cartItemId != null && cartItemId.isNotEmpty) {
             _placedCartItemIds.add(cartItemId);
@@ -6220,7 +6373,9 @@ class _ChatScreenState extends State<ChatScreen> {
         : (metaMap['shelf_number']?.toString() ?? 'не назначена');
     final reservedDescription = metaMap['description']?.toString().trim() ?? '';
     final clientName = metaMap['client_name']?.toString() ?? '—';
-    final clientPhone = metaMap['client_phone']?.toString() ?? '—';
+    final clientPhone = _formatDisplayPhone(
+      metaMap['client_phone']?.toString() ?? '',
+    );
     final processedByName =
         metaMap['processed_by_name']?.toString().trim() ?? '';
     final senderName = _senderNameOf(message);
@@ -6237,7 +6392,10 @@ class _ChatScreenState extends State<ChatScreen> {
       metaMap['delivery_date'],
       fallback: '',
     );
-    final offerPhone = (metaMap['customer_phone'] ?? '').toString().trim();
+    final offerPhone = _formatDisplayPhone(
+      (metaMap['customer_phone'] ?? '').toString().trim(),
+      fallback: '—',
+    );
     final offerProcessedSum = (metaMap['processed_sum'] ?? 0).toString();
     final offerAddress = (metaMap['address_text'] ?? '').toString().trim();
     final offerPreferredAfter = (metaMap['preferred_time_from'] ?? '')
@@ -6675,19 +6833,27 @@ class _ChatScreenState extends State<ChatScreen> {
                   SizedBox(
                     width: 190,
                     child: ElevatedButton.icon(
-                      icon: const Icon(Icons.inventory_2_outlined),
-                      onPressed:
-                          (!_canMarkReservedOrderPlaced() ||
-                              isPlaced ||
-                              _markingPlaced)
+                      icon: Icon(
+                        isPlaced
+                            ? Icons.print_outlined
+                            : Icons.inventory_2_outlined,
+                      ),
+                      onPressed: (!_canMarkReservedOrderPlaced() || _markingPlaced)
                           ? null
+                          : isPlaced
+                          ? (_canUseDesktopStickerPrinting
+                                ? () => _openReservedOrderStickerPrint(
+                                    metaMap,
+                                    oversize: isOversizePlaced,
+                                  )
+                                : null)
                           : () => _markReservedOrderPlaced(
                               metaMap,
                               processingMode: 'standard',
                             ),
                       label: Text(
                         isPlaced
-                            ? 'Обработано'
+                            ? 'Дай стикер'
                             : (_markingPlaced ? 'Сохранение...' : 'Положил'),
                       ),
                     ),
@@ -6710,6 +6876,19 @@ class _ChatScreenState extends State<ChatScreen> {
                             ? 'Габарит'
                             : (_markingPlaced ? 'Сохранение...' : 'Габарит'),
                       ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 190,
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.swap_horiz_outlined),
+                      onPressed:
+                          (!_canMarkReservedOrderPlaced() ||
+                              _markingPlaced ||
+                              isOversizePlaced)
+                          ? null
+                          : () => _changeReservedOrderShelf(metaMap),
+                      label: const Text('Смена полки'),
                     ),
                   ),
                 ],
