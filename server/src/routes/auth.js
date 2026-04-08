@@ -46,6 +46,7 @@ const {
 } = require('../utils/twoFactor');
 const { isMailConfigured, sendMail } = require('../utils/mailer');
 const { ensureSystemChannels } = require("../utils/systemChannels");
+const { createNotificationInboxItem } = require("../utils/notifications");
 require('dotenv').config();
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
@@ -91,6 +92,46 @@ if (
 
 function signToken(payload) {
   return signJwt(payload, { expiresIn: '7d' });
+}
+
+async function createSecurityInboxNotification({
+  user,
+  title,
+  body,
+  deepLink = "/notifications",
+  payload = {},
+  sourceType = "security_event",
+  sourceId = "",
+  priority = "high",
+}) {
+  if (!user?.id) return null;
+  try {
+    return await createNotificationInboxItem({
+      user: {
+        id: user.id,
+        role: user.role,
+        tenant_id: user.tenant_id || null,
+      },
+      category: "security",
+      priority,
+      channel: "mixed",
+      title,
+      body,
+      deepLink,
+      payload,
+      sourceType,
+      sourceId,
+      collapseKey: sourceId ? `security:${sourceId}` : "security:event",
+      ttlSeconds: 60 * 60 * 12,
+      forceShow: true,
+      isActionable: true,
+      emit: true,
+      attemptPush: true,
+    });
+  } catch (err) {
+    console.error("auth.createSecurityInboxNotification error", err);
+    return null;
+  }
 }
 
 function buildSessionExpiry() {
@@ -2332,8 +2373,22 @@ router.post('/magic-link/consume', async (req, res) => {
       },
     });
 
-    await client.query('COMMIT');
-    return res.json(payload);
+	    await client.query('COMMIT');
+	    await createSecurityInboxNotification({
+	      user,
+	      title: 'Вход по magic-link',
+	      body: 'В ваш аккаунт вошли по одноразовой ссылке. Если это были не вы, срочно смените пароль.',
+	      deepLink: '/notifications',
+	      payload: {
+	        event: 'magic_login',
+	        method: 'magic_link',
+	        tenant_id: user.tenant_id || null,
+	      },
+	      sourceType: 'auth_magic_login',
+	      sourceId: session.sessionId,
+	      priority: 'high',
+	    });
+	    return res.json(payload);
   } catch (err) {
     try {
       await client.query('ROLLBACK');
@@ -2398,10 +2453,27 @@ router.post('/password-reset/confirm', async (req, res) => {
       [claimed.id],
     );
 
-    await client.query('COMMIT');
-    return res.json({
-      ok: true,
-      message: 'Пароль обновлён. Теперь войдите с новым паролем.',
+	    await client.query('COMMIT');
+	    await createSecurityInboxNotification({
+	      user: {
+	        id: claimed.id,
+	        role: claimed.role,
+	        tenant_id: claimed.user_tenant_id || null,
+	      },
+	      title: 'Пароль был сброшен',
+	      body: 'Пароль вашего аккаунта успешно обновлён. Если это были не вы, сразу обратитесь к администратору.',
+	      deepLink: '/notifications',
+	      payload: {
+	        event: 'password_reset_confirmed',
+	        email: claimed.user_email || claimed.email || null,
+	      },
+	      sourceType: 'auth_password_reset',
+	      sourceId: claimed.id,
+	      priority: 'critical',
+	    });
+	    return res.json({
+	      ok: true,
+	      message: 'Пароль обновлён. Теперь войдите с новым паролем.',
     });
   } catch (err) {
     try {
@@ -3085,10 +3157,22 @@ router.post('/change_password', authMiddleware, async (req, res) => {
     const match = await bcrypt.compare(oldPassword, currentHash);
     if (!match) return res.status(403).json({ error: 'Старый пароль неверный' });
 
-    const newHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
-    await db.query('UPDATE users SET password_hash=$1 WHERE id=$2', [newHash, userId]);
+	    const newHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+	    await db.query('UPDATE users SET password_hash=$1 WHERE id=$2', [newHash, userId]);
+	    await createSecurityInboxNotification({
+	      user: req.user,
+	      title: 'Пароль изменён',
+	      body: 'Пароль вашего аккаунта успешно изменён из настроек безопасности.',
+	      deepLink: '/settings',
+	      payload: {
+	        event: 'password_changed',
+	      },
+	      sourceType: 'auth_password_change',
+	      sourceId: userId,
+	      priority: 'high',
+	    });
 
-    return res.json({ ok: true, message: 'Пароль изменён' });
+	    return res.json({ ok: true, message: 'Пароль изменён' });
   } catch (err) {
     console.error('auth.change_password error', err);
     return res.status(500).json({ error: 'Ошибка сервера' });

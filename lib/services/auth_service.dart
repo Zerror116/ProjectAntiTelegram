@@ -7,6 +7,8 @@ import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
 import '../src/utils/device_utils.dart';
+import 'notification_device_service.dart';
+import 'native_push_service.dart';
 import 'web_notification_service.dart';
 import 'web_push_client_service.dart';
 
@@ -359,6 +361,12 @@ class AuthService {
       _authController.add(_currentUser);
     } catch (_) {}
     await _maybeEnsureWebPushSubscription();
+    try {
+      await NotificationDeviceService.syncCurrentEndpoint(dio);
+    } catch (_) {}
+    try {
+      await NativePushService.syncCurrentEndpoint(dio);
+    } catch (_) {}
     debugPrint(
       '✅ AuthService.setToken -> token set, user=${_currentUser?.email}',
     );
@@ -373,6 +381,12 @@ class AuthService {
     }
     _isLoggingOut = true;
     try {
+      try {
+        await NotificationDeviceService.unregisterCurrentEndpoint(dio);
+      } catch (_) {}
+      try {
+        await NativePushService.unregisterCurrentEndpoint(dio);
+      } catch (_) {}
       try {
         if (kIsWeb) {
           await WebPushClientService.unsubscribe(dio);
@@ -1006,6 +1020,12 @@ class AuthService {
             _authController.add(_currentUser);
           } catch (_) {}
           await _maybeEnsureWebPushSubscription();
+          try {
+            await NotificationDeviceService.syncCurrentEndpoint(dio);
+          } catch (_) {}
+          try {
+            await NativePushService.syncCurrentEndpoint(dio);
+          } catch (_) {}
           _lastStartupRefreshUsedFallback = false;
           debugPrint(
             '✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}',

@@ -162,6 +162,66 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
+async function restoreCatalogProductAfterCartReturn(client, product) {
+  const productIdText = String(product?.id || '').trim();
+  if (!productIdText) {
+    return { updatedProduct: product, updatedCatalogMessages: [] };
+  }
+
+  let updatedProduct = product;
+  if (
+    (Number(product?.quantity) || 0) > 0 &&
+    String(product?.status || '').trim() === 'archived'
+  ) {
+    const republishedQ = await client.query(
+      `UPDATE products
+       SET status = 'published',
+           reusable_at = NULL,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, product_code, title, description, price, quantity, image_url, status`,
+      [productIdText],
+    );
+    if (republishedQ.rowCount > 0) {
+      updatedProduct = republishedQ.rows[0];
+    }
+  }
+
+  const updatedCatalogMessagesQ = await client.query(
+    `UPDATE messages
+     SET text = $1,
+         meta = jsonb_set(
+           jsonb_set(
+             (COALESCE(meta, '{}'::jsonb) - 'archived_after_cart_dismantle' - 'sold_out_processed'),
+             '{hidden_for_all}',
+             'false'::jsonb,
+             true
+           ),
+           '{quantity}',
+           to_jsonb($2::int),
+           true
+         )
+     WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
+       AND COALESCE(meta->>'product_id', '') = $3
+       AND (
+         COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+         OR COALESCE((meta->>'archived_after_cart_dismantle')::boolean, false) = true
+         OR COALESCE((meta->>'sold_out_processed')::boolean, false) = true
+       )
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [
+      encryptMessageText(productMessageText(updatedProduct)),
+      Number(updatedProduct.quantity) || 0,
+      productIdText,
+    ],
+  );
+
+  return {
+    updatedProduct,
+    updatedCatalogMessages: updatedCatalogMessagesQ.rows || [],
+  };
+}
+
 async function archiveProductAfterCartDismissal(
   client,
   {
@@ -413,42 +473,20 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
     );
   }
 
-  const msgUpdate = await client.query(
-    `UPDATE messages
-     SET text = $1,
-         meta = jsonb_set(
-           COALESCE(meta, '{}'::jsonb),
-           '{quantity}',
-           to_jsonb($2::int),
-           true
-         )
-     WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
-       AND COALESCE(meta->>'product_id', '') = $3
-     RETURNING id, chat_id, sender_id, text, meta, created_at`,
-    [
-      encryptMessageText(productMessageText(updatedProduct)),
-      Number(updatedProduct.quantity),
-      String(item.product_id),
-    ],
+  const restoreResult = await restoreCatalogProductAfterCartReturn(
+    client,
+    updatedProduct,
   );
-
-  const archiveResult =
-    remainingQuantity <= 0
-      ? await archiveProductAfterCartDismissal(client, {
-          productId: item.product_id,
-          tenantId,
-        })
-      : { archived: false, hiddenCatalogMessages: [] };
 
   return {
     ok: true,
     item,
-    updatedProduct,
+    updatedProduct: restoreResult.updatedProduct,
     cancelQuantity,
     remainingQuantity,
-    updatedCatalogMessages: msgUpdate.rows || [],
-    hiddenCatalogMessages: archiveResult.hiddenCatalogMessages || [],
-    productArchivedAfterDismissal: archiveResult.archived === true,
+    updatedCatalogMessages: restoreResult.updatedCatalogMessages || [],
+    hiddenCatalogMessages: [],
+    productArchivedAfterDismissal: false,
     updatedReservedMessage,
     removedReservedMessage,
   };
@@ -1153,38 +1191,16 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       );
     }
 
-    const msgUpdate = await client.query(
-      `UPDATE messages
-       SET text = $1,
-           meta = jsonb_set(
-             COALESCE(meta, '{}'::jsonb),
-             '{quantity}',
-             to_jsonb($2::int),
-             true
-           )
-       WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
-         AND COALESCE(meta->>'product_id', '') = $3
-       RETURNING id, chat_id, sender_id, text, meta, created_at`,
-      [
-        encryptMessageText(productMessageText(updatedProduct)),
-        Number(updatedProduct.quantity),
-        String(item.product_id),
-      ]
+    const restoreResult = await restoreCatalogProductAfterCartReturn(
+      client,
+      updatedProduct,
     );
-
-    const archiveResult =
-      remainingQuantity <= 0
-        ? await archiveProductAfterCartDismissal(client, {
-            productId: item.product_id,
-            tenantId: req.user?.tenant_id || null,
-          })
-        : { archived: false, hiddenCatalogMessages: [] };
 
     await client.query('COMMIT');
 
     const io = req.app.get('io');
     if (io) {
-      for (const message of msgUpdate.rows) {
+      for (const message of restoreResult.updatedCatalogMessages || []) {
         io.to(`chat:${message.chat_id}`).emit('chat:message', {
           chatId: message.chat_id,
           message: decryptMessageRow(message),
@@ -1211,22 +1227,13 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
           chatId: removedReservedMessage.chat_id,
         });
       }
-      for (const message of archiveResult.hiddenCatalogMessages || []) {
-        io.to(`chat:${message.chat_id}`).emit('chat:message', {
-          chatId: message.chat_id,
-          message: decryptMessageRow(message),
-        });
-        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
-          chatId: message.chat_id,
-        });
-      }
     }
 
     emitCartUpdated(req, userId, {
       product_id: item.product_id,
       cart_item_id: cartItemId,
       status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
-      available_in_stock: archiveResult.archived ? 0 : Number(updatedProduct.quantity),
+      available_in_stock: Number(restoreResult.updatedProduct.quantity),
       reason: remainingQuantity > 0 ? 'item_cancelled_partial' : 'item_cancelled',
     }, actorUserId && actorUserId !== userId ? [actorUserId] : []);
 
@@ -1238,8 +1245,8 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
         status: remainingQuantity > 0 ? 'pending_processing' : 'cancelled',
         restored_quantity: cancelQuantity,
         remaining_quantity: remainingQuantity,
-        available_in_stock: archiveResult.archived ? 0 : Number(updatedProduct.quantity),
-        product_archived_after_dismantle: archiveResult.archived === true,
+        available_in_stock: Number(restoreResult.updatedProduct.quantity),
+        product_archived_after_dismantle: false,
       },
     });
   } catch (err) {
@@ -1893,6 +1900,136 @@ router.post(
         await client.query('ROLLBACK');
       } catch (_) {}
       console.error('cart.admin.clearClientCart error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  '/admin/clients/:userId/self-pickup',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      const userId = String(req.params?.userId || '').trim();
+      if (!userId) {
+        return res.status(400).json({ ok: false, error: 'userId обязателен' });
+      }
+
+      const targetQ = await client.query(
+        `SELECT id
+         FROM users
+         WHERE id = $1
+           AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+         LIMIT 1`,
+        [userId, req.user?.tenant_id || null],
+      );
+      if (targetQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: 'Клиент не найден' });
+      }
+
+      const effectiveOwnerId = await resolveAdminCartTargetUserId(
+        client,
+        userId,
+        req.user?.tenant_id || null,
+      );
+      const cartOwnerId = String(effectiveOwnerId || '').trim() || userId;
+      const pickupNote = normalizeNullableText(req.body?.note, { max: 240 }) ||
+        `Самовывоз ${new Date().toLocaleDateString('ru-RU')}`;
+
+      await client.query('BEGIN');
+
+      const updatedItemsQ = await client.query(
+        `UPDATE cart_items c
+         SET status = 'delivered',
+             updated_at = now()
+         FROM users u
+         WHERE c.user_id = $1
+           AND u.id = c.user_id
+           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+           AND c.status <> 'delivered'
+         RETURNING c.id, c.user_id`,
+        [cartOwnerId, req.user?.tenant_id || null],
+      );
+
+      const affectedDeliveryCustomersQ = await client.query(
+        `UPDATE delivery_batch_customers dbc
+         SET call_status = CASE
+               WHEN dbc.call_status = 'pending' THEN 'accepted'
+               ELSE dbc.call_status
+             END,
+             delivery_status = 'completed',
+             notes = CASE
+               WHEN COALESCE(BTRIM(dbc.notes), '') = '' THEN $3
+               ELSE CONCAT(dbc.notes, E'\n', $3)
+             END,
+             updated_at = now()
+         FROM users u, delivery_batches b
+         WHERE dbc.user_id = $1
+           AND u.id = dbc.user_id
+           AND b.id = dbc.batch_id
+           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+           AND COALESCE(dbc.delivery_status, '') IN (
+             'awaiting_call',
+             'offer_sent',
+             'preparing_delivery',
+             'handing_to_courier',
+             'in_delivery'
+           )
+         RETURNING dbc.id, dbc.batch_id, dbc.user_id`,
+        [cartOwnerId, req.user?.tenant_id || null, pickupNote],
+      );
+
+      const affectedBatchIds = [
+        ...new Set(
+          affectedDeliveryCustomersQ.rows
+            .map((row) => String(row.batch_id || '').trim())
+            .filter(Boolean),
+        ),
+      ];
+      if (affectedBatchIds.isNotEmpty) {
+        await client.query(
+          `UPDATE delivery_batches
+           SET updated_at = now()
+           WHERE id = ANY($1::uuid[])`,
+          [affectedBatchIds],
+        );
+      }
+
+      await client.query('COMMIT');
+
+      emitCartUpdated(req, cartOwnerId, {
+        status: 'delivered',
+        reason: 'admin_self_pickup',
+        self_pickup: true,
+      }, userId == cartOwnerId ? [] : [userId]);
+
+      const io = req.app.get('io');
+      if (io) {
+        for (const batchId of affectedBatchIds) {
+          emitToTenant(io, req.user?.tenant_id || null, 'delivery:updated', {
+            batchId,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          updated_items: updatedItemsQ.rowCount,
+          affected_delivery_customers: affectedDeliveryCustomersQ.rowCount,
+          affected_batches: affectedBatchIds.length,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('cart.admin.selfPickup error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
     } finally {
       client.release();

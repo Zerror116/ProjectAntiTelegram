@@ -147,7 +147,10 @@ class _AuthScreenState extends State<AuthScreen> {
         if (data is Map) {
           final android = data['android'];
           if (android is Map) {
-            final raw = (android['download_url'] ?? '').toString().trim();
+            final raw =
+                ((android['landing_url'] ?? android['download_url']) ?? '')
+                    .toString()
+                    .trim();
             if (raw.isNotEmpty) {
               nextUrl = raw;
             }
@@ -389,7 +392,9 @@ class _AuthScreenState extends State<AuthScreen> {
         final fragment = uri.fragment;
         final qIndex = fragment.indexOf('?');
         if (qIndex >= 0 && qIndex + 1 < fragment.length) {
-          final inFragment = Uri.splitQueryString(fragment.substring(qIndex + 1));
+          final inFragment = Uri.splitQueryString(
+            fragment.substring(qIndex + 1),
+          );
           for (final key in keys) {
             final value = (inFragment[key] ?? '').trim();
             if (value.isNotEmpty) return value;
@@ -408,11 +413,9 @@ class _AuthScreenState extends State<AuthScreen> {
     return _extractUriParam(const ['token']).trim();
   }
 
-  String _extractSuccessMessage(
-    Object? payload, {
-    required String fallback,
-  }) {
-    if (payload is Map && (payload['message'] != null || payload['success'] != null)) {
+  String _extractSuccessMessage(Object? payload, {required String fallback}) {
+    if (payload is Map &&
+        (payload['message'] != null || payload['success'] != null)) {
       return (payload['message'] ?? payload['success']).toString();
     }
     return fallback;
@@ -463,17 +466,15 @@ class _AuthScreenState extends State<AuthScreen> {
     _replaceAppRoot(nextScreen);
   }
 
-  Future<void> _requestEmailAction({
-    required bool magicLink,
-  }) async {
-    final controller = TextEditingController(text: _emailController.text.trim());
+  Future<void> _requestEmailAction({required bool magicLink}) async {
+    final controller = TextEditingController(
+      text: _emailController.text.trim(),
+    );
     final enteredEmail = await showDialog<String>(
       context: context,
       builder: (dialogContext) {
         return AlertDialog(
-          title: Text(
-            magicLink ? 'Войти по ссылке' : 'Сбросить пароль',
-          ),
+          title: Text(magicLink ? 'Войти по ссылке' : 'Сбросить пароль'),
           content: TextField(
             controller: controller,
             keyboardType: TextInputType.emailAddress,
@@ -568,9 +569,7 @@ class _AuthScreenState extends State<AuthScreen> {
                 TextField(
                   controller: newPasswordController,
                   obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Новый пароль',
-                  ),
+                  decoration: const InputDecoration(labelText: 'Новый пароль'),
                 ),
                 const SizedBox(height: 12),
                 TextField(
@@ -628,10 +627,7 @@ class _AuthScreenState extends State<AuthScreen> {
       try {
         final resp = await _authService.dio.post(
           '/api/auth/password-reset/confirm',
-          data: {
-            'token': token,
-            'new_password': newPassword,
-          },
+          data: {'token': token, 'new_password': newPassword},
         );
         if (!mounted) return;
         showAppNotice(
@@ -688,15 +684,13 @@ class _AuthScreenState extends State<AuthScreen> {
             'device_fingerprint': fingerprint.trim(),
         },
       );
-      final payload =
-          resp.data is Map<String, dynamic>
-              ? resp.data as Map<String, dynamic>
-              : Map<String, dynamic>.from(resp.data as Map);
+      final payload = resp.data is Map<String, dynamic>
+          ? resp.data as Map<String, dynamic>
+          : Map<String, dynamic>.from(resp.data as Map);
       final nextToken = (payload['token'] ?? '').toString().trim();
-      final userMap =
-          payload['user'] is Map
-              ? Map<String, dynamic>.from(payload['user'] as Map)
-              : null;
+      final userMap = payload['user'] is Map
+          ? Map<String, dynamic>.from(payload['user'] as Map)
+          : null;
       if (nextToken.isEmpty || userMap == null) {
         throw Exception('Сервер не вернул данные входа');
       }
@@ -758,23 +752,22 @@ class _AuthScreenState extends State<AuthScreen> {
           receiveTimeout: const Duration(seconds: 5),
         ),
       );
-      final data = resp.data is Map ? Map<String, dynamic>.from(resp.data as Map) : const <String, dynamic>{};
-      final payload =
-          data['data'] is Map
-              ? Map<String, dynamic>.from(data['data'] as Map)
-              : const <String, dynamic>{};
-      final passwordResetEnabled =
-          payload.containsKey('password_reset_enabled')
-              ? payload['password_reset_enabled'] == true
-              : payload['mail_configured'] == true;
-      final magicLinkEnabled =
-          payload.containsKey('magic_link_enabled')
-              ? payload['magic_link_enabled'] == true
-              : payload['mail_configured'] == true;
+      final data = resp.data is Map
+          ? Map<String, dynamic>.from(resp.data as Map)
+          : const <String, dynamic>{};
+      final payload = data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'] as Map)
+          : const <String, dynamic>{};
+      final passwordResetEnabled = payload.containsKey('password_reset_enabled')
+          ? payload['password_reset_enabled'] == true
+          : payload['mail_configured'] == true;
+      final magicLinkEnabled = payload.containsKey('magic_link_enabled')
+          ? payload['magic_link_enabled'] == true
+          : payload['mail_configured'] == true;
       final registrationEmailCodeEnabled =
           payload.containsKey('registration_email_code_enabled')
-              ? payload['registration_email_code_enabled'] == true
-              : payload['mail_configured'] == true;
+          ? payload['registration_email_code_enabled'] == true
+          : payload['mail_configured'] == true;
       if (!mounted) return;
       setState(() {
         _passwordResetEnabled = passwordResetEnabled;
@@ -846,12 +839,14 @@ class _AuthScreenState extends State<AuthScreen> {
                   child: const Text('Отмена'),
                 ),
                 TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop('__resend__'),
+                  onPressed: () =>
+                      Navigator.of(dialogContext).pop('__resend__'),
                   child: const Text('Отправить заново'),
                 ),
                 FilledButton(
-                  onPressed: () =>
-                      Navigator.of(dialogContext).pop(codeController.text.trim()),
+                  onPressed: () => Navigator.of(
+                    dialogContext,
+                  ).pop(codeController.text.trim()),
                   child: const Text('Подтвердить'),
                 ),
               ],
@@ -876,17 +871,14 @@ class _AuthScreenState extends State<AuthScreen> {
 
         final resp = await _authService.dio.post(
           '/api/auth/register/email-code/verify',
-          data: {
-            'email': email,
-            'code': code,
-          },
+          data: {'email': email, 'code': code},
         );
-        final data =
-            resp.data is Map
-                ? Map<String, dynamic>.from(resp.data as Map)
-                : const <String, dynamic>{};
-        final verificationToken =
-            (data['registration_email_token'] ?? '').toString().trim();
+        final data = resp.data is Map
+            ? Map<String, dynamic>.from(resp.data as Map)
+            : const <String, dynamic>{};
+        final verificationToken = (data['registration_email_token'] ?? '')
+            .toString()
+            .trim();
         if (verificationToken.isEmpty) {
           throw Exception('Сервер не вернул токен подтверждения');
         }
@@ -904,10 +896,7 @@ class _AuthScreenState extends State<AuthScreen> {
         if (!mounted) return null;
         showAppNotice(
           context,
-          _extractServerMessage(
-            e,
-            fallback: 'Не удалось подтвердить код',
-          ),
+          _extractServerMessage(e, fallback: 'Не удалось подтвердить код'),
           tone: AppNoticeTone.error,
         );
       } catch (e) {
@@ -1262,124 +1251,132 @@ class _AuthScreenState extends State<AuthScreen> {
                 key: _formKey,
                 child: Column(
                   children: [
-                  TextFormField(
-                    controller: _emailController,
-                    decoration: withInputLanguageBadge(
-                      const InputDecoration(labelText: 'Email'),
+                    TextFormField(
                       controller: _emailController,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(labelText: 'Email'),
+                        controller: _emailController,
+                      ),
+                      keyboardType: TextInputType.emailAddress,
+                      validator: (v) {
+                        if (v == null || v.isEmpty) return 'Введите email';
+                        if (!v.contains('@')) return 'Неверный формат email';
+                        return null;
+                      },
                     ),
-                    keyboardType: TextInputType.emailAddress,
-                    validator: (v) {
-                      if (v == null || v.isEmpty) return 'Введите email';
-                      if (!v.contains('@')) return 'Неверный формат email';
-                      return null;
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _passwordController,
-                    decoration: withInputLanguageBadge(
-                      const InputDecoration(labelText: 'Пароль'),
-                      controller: _passwordController,
-                    ),
-                    obscureText: true,
-                    validator: (v) {
-                      if (v == null || v.isEmpty) return 'Введите пароль';
-                      if (v.length < 8) {
-                        return 'Пароль должен быть не менее 8 символов';
-                      }
-                      return null;
-                    },
-                  ),
-                  if (!_isRegister && _requiresTwoFactor) ...[
                     const SizedBox(height: 12),
                     TextFormField(
-                      controller: _otpController,
+                      controller: _passwordController,
                       decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Код 2FA',
-                          hintText: '6 цифр или резервный код (ABCD-EFGH)',
-                        ),
+                        const InputDecoration(labelText: 'Пароль'),
+                        controller: _passwordController,
+                      ),
+                      obscureText: true,
+                      validator: (v) {
+                        if (v == null || v.isEmpty) return 'Введите пароль';
+                        if (v.length < 8) {
+                          return 'Пароль должен быть не менее 8 символов';
+                        }
+                        return null;
+                      },
+                    ),
+                    if (!_isRegister && _requiresTwoFactor) ...[
+                      const SizedBox(height: 12),
+                      TextFormField(
                         controller: _otpController,
-                      ),
-                      keyboardType: TextInputType.text,
-                      validator: (v) {
-                        if (!_requiresTwoFactor) return null;
-                        final value = (v ?? '').trim();
-                        final digitsOnly = value.replaceAll(RegExp(r'\s+'), '');
-                        final backupNormalized = value.toUpperCase().replaceAll(
-                          RegExp(r'[^A-Z0-9]'),
-                          '',
-                        );
-                        if (value.isEmpty) return 'Введите код 2FA';
-                        final isTotp = RegExp(r'^\d{6}$').hasMatch(digitsOnly);
-                        final isBackup = RegExp(
-                          r'^[A-Z0-9]{8}$',
-                        ).hasMatch(backupNormalized);
-                        if (!isTotp && !isBackup) {
-                          return 'Введите 6 цифр или резервный код ABCD-EFGH';
-                        }
-                        return null;
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    CheckboxListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      value: _trustDeviceFor30Days,
-                      onChanged: (value) {
-                        setState(() => _trustDeviceFor30Days = value == true);
-                      },
-                      title: const Text('Доверять устройству 30 дней'),
-                      subtitle: const Text(
-                        'На этом устройстве не будем спрашивать 2FA-код при следующем входе',
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 12),
-                  if (_isRegister) ...[
-                    TextFormField(
-                      controller: _accessKeyController,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(
-                          labelText: 'Ключ арендатора или код приглашения',
-                          hintText:
-                              'Арендатор: PHX-.... или сотрудник/клиент: INV-....',
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Код 2FA',
+                            hintText: '6 цифр или резервный код (ABCD-EFGH)',
+                          ),
+                          controller: _otpController,
                         ),
-                        controller: _accessKeyController,
+                        keyboardType: TextInputType.text,
+                        validator: (v) {
+                          if (!_requiresTwoFactor) return null;
+                          final value = (v ?? '').trim();
+                          final digitsOnly = value.replaceAll(
+                            RegExp(r'\s+'),
+                            '',
+                          );
+                          final backupNormalized = value
+                              .toUpperCase()
+                              .replaceAll(RegExp(r'[^A-Z0-9]'), '');
+                          if (value.isEmpty) return 'Введите код 2FA';
+                          final isTotp = RegExp(
+                            r'^\d{6}$',
+                          ).hasMatch(digitsOnly);
+                          final isBackup = RegExp(
+                            r'^[A-Z0-9]{8}$',
+                          ).hasMatch(backupNormalized);
+                          if (!isTotp && !isBackup) {
+                            return 'Введите 6 цифр или резервный код ABCD-EFGH';
+                          }
+                          return null;
+                        },
                       ),
-                      validator: (v) {
-                        final mail = _emailController.text.trim().toLowerCase();
-                        final isCreator = mail == _creatorEmail.toLowerCase();
-                        if (isCreator) return null;
-                        if (v == null || v.trim().isEmpty) {
-                          return 'Введите ключ арендатора или код приглашения';
-                        }
-                        if (v.trim().length < 6) {
-                          return 'Код слишком короткий';
-                        }
-                        return null;
-                      },
+                      const SizedBox(height: 8),
+                      CheckboxListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        value: _trustDeviceFor30Days,
+                        onChanged: (value) {
+                          setState(() => _trustDeviceFor30Days = value == true);
+                        },
+                        title: const Text('Доверять устройству 30 дней'),
+                        subtitle: const Text(
+                          'На этом устройстве не будем спрашивать 2FA-код при следующем входе',
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    if (_isRegister) ...[
+                      TextFormField(
+                        controller: _accessKeyController,
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText: 'Ключ арендатора или код приглашения',
+                            hintText:
+                                'Арендатор: PHX-.... или сотрудник/клиент: INV-....',
+                          ),
+                          controller: _accessKeyController,
+                        ),
+                        validator: (v) {
+                          final mail = _emailController.text
+                              .trim()
+                              .toLowerCase();
+                          final isCreator = mail == _creatorEmail.toLowerCase();
+                          if (isCreator) return null;
+                          if (v == null || v.trim().isEmpty) {
+                            return 'Введите ключ арендатора или код приглашения';
+                          }
+                          if (v.trim().length < 6) {
+                            return 'Код слишком короткий';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 16),
+                    ] else
+                      const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: _loading ? null : _onSubmitPressed,
+                        child: _loading
+                            ? SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onPrimary,
+                                ),
+                              )
+                            : Text(_isRegister ? 'Далее' : 'Войти'),
+                      ),
                     ),
-                    const SizedBox(height: 16),
-                  ] else
-                    const SizedBox(height: 16),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: _loading ? null : _onSubmitPressed,
-                      child: _loading
-                          ? SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Theme.of(context).colorScheme.onPrimary,
-                              ),
-                            )
-                          : Text(_isRegister ? 'Далее' : 'Войти'),
-                    ),
-                  ),
                     if (!_isRegister &&
                         _emailRecoveryStatusLoaded &&
                         (_passwordResetEnabled || _magicLinkEnabled)) ...[
@@ -1391,9 +1388,8 @@ class _AuthScreenState extends State<AuthScreen> {
                               child: TextButton(
                                 onPressed: _loading
                                     ? null
-                                    : () => _requestEmailAction(
-                                          magicLink: false,
-                                        ),
+                                    : () =>
+                                          _requestEmailAction(magicLink: false),
                                 child: const Text('Забыли пароль?'),
                               ),
                             ),
@@ -1402,9 +1398,8 @@ class _AuthScreenState extends State<AuthScreen> {
                               child: TextButton(
                                 onPressed: _loading
                                     ? null
-                                    : () => _requestEmailAction(
-                                          magicLink: true,
-                                        ),
+                                    : () =>
+                                          _requestEmailAction(magicLink: true),
                                 child: const Text('Войти без пароля'),
                               ),
                             ),

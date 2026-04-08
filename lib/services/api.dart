@@ -9,10 +9,13 @@ class ApiService {
 
   ApiService._(this.dio, this.storage);
 
+  static const String _localDebugBaseUrl = 'http://127.0.0.1:3001';
+  static const String _legacyLocalDebugBaseUrl = 'http://127.0.0.1:3000';
+
   static String _resolveBaseUrl(String rawBaseUrl) {
     final source = rawBaseUrl.trim();
     if (source.isNotEmpty) return source;
-    if (!kIsWeb) return 'http://127.0.0.1:3000';
+    if (!kIsWeb) return _localDebugBaseUrl;
 
     final uri = Uri.base;
     final scheme = uri.scheme.toLowerCase();
@@ -21,7 +24,7 @@ class ApiService {
       final portPart = uri.hasPort ? ':${uri.port}' : '';
       return '$scheme://$host$portPart';
     }
-    return 'http://127.0.0.1:3000';
+    return _legacyLocalDebugBaseUrl;
   }
 
   factory ApiService({String baseUrl = ''}) {

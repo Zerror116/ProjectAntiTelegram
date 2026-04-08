@@ -120,6 +120,45 @@ async function precacheImageBatch(urls) {
   }
 }
 
+function buildNotificationTapPayload(sourcePayload = {}) {
+  const data = sourcePayload.data && typeof sourcePayload.data === 'object'
+    ? sourcePayload.data
+    : {};
+  return {
+    id: sourcePayload.id || sourcePayload.message_id || '',
+    category: sourcePayload.category || sourcePayload.type || '',
+    priority: sourcePayload.priority || 'normal',
+    title: sourcePayload.title || 'Проект Феникс',
+    body: sourcePayload.body || '',
+    deep_link: sourcePayload.deep_link || sourcePayload.url || '/',
+    media: sourcePayload.media && typeof sourcePayload.media === 'object'
+      ? sourcePayload.media
+      : {},
+    payload: sourcePayload.payload && typeof sourcePayload.payload === 'object'
+      ? sourcePayload.payload
+      : {},
+    force_show: sourcePayload.forceShow === true || sourcePayload.force_show === true,
+    badge_count: Number(sourcePayload.badgeCount || sourcePayload.badge_count || 0) || 0,
+    inbox_item_id: sourcePayload.inbox_item_id || data.inboxItemId || '',
+    campaign_id: sourcePayload.campaign_id || sourcePayload.campaignId || '',
+    cta_label: sourcePayload.cta_label || sourcePayload.ctaLabel || '',
+    version: sourcePayload.version || '',
+    required_update:
+      sourcePayload.required_update === true || sourcePayload.requiredUpdate === true,
+    thread_id: sourcePayload.thread_id || sourcePayload.threadId || data.chatId || '',
+  };
+}
+
+function buildNotificationOpenUrl(targetUrl, payload) {
+  try {
+    const url = new URL(targetUrl || '/', self.location.origin);
+    url.searchParams.set('notification_payload', JSON.stringify(payload));
+    return url.toString();
+  } catch (_) {
+    return targetUrl || '/';
+  }
+}
+
 self.addEventListener('message', (event) => {
   const data = event.data || {};
   if (data.type === 'badge-sync') {
@@ -150,6 +189,7 @@ self.addEventListener('push', (event) => {
   const url = payload.url || '/';
   const badgeCount = Number(payload.badgeCount || 0) || 0;
   const forceShow = payload.forceShow === true;
+  const tapPayload = buildNotificationTapPayload(payload);
 
   event.waitUntil((async () => {
     await syncBadge(badgeCount);
@@ -177,6 +217,7 @@ self.addEventListener('push', (event) => {
       data: {
         url,
         chatId: payload.data && payload.data.chatId ? payload.data.chatId : null,
+        payload: tapPayload,
       },
     });
   })());
@@ -184,8 +225,12 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl =
-    (event.notification.data && event.notification.data.url) || '/';
+  const notificationData = event.notification.data || {};
+  const tapPayload = notificationData.payload || buildNotificationTapPayload({});
+  const targetUrl = buildNotificationOpenUrl(
+    notificationData.url || '/',
+    tapPayload,
+  );
 
   event.waitUntil((async () => {
     const windows = await self.clients.matchAll({

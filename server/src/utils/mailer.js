@@ -1,4 +1,20 @@
-const nodemailer = require('nodemailer');
+let cachedNodemailer = undefined;
+
+function getNodemailerModule() {
+  if (cachedNodemailer !== undefined) {
+    return cachedNodemailer;
+  }
+  try {
+    cachedNodemailer = require('nodemailer');
+  } catch (error) {
+    if (error && error.code === 'MODULE_NOT_FOUND') {
+      cachedNodemailer = null;
+      return null;
+    }
+    throw error;
+  }
+  return cachedNodemailer;
+}
 
 function parseBooleanEnv(rawValue, fallback = false) {
   if (rawValue === undefined || rawValue === null || rawValue === '') {
@@ -96,6 +112,14 @@ function getTransporter() {
   const config = getMailerConfig();
   if (config.mode === 'resend_api') return null;
   if (!config.transport || !config.from) return null;
+  const nodemailer = getNodemailerModule();
+  if (!nodemailer) {
+    const error = new Error(
+      'На сервере не установлен nodemailer для SMTP-отправки писем',
+    );
+    error.statusCode = 500;
+    throw error;
+  }
 
   const transportKey = JSON.stringify({
     mode: config.mode,

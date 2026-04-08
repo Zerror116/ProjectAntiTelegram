@@ -23,11 +23,13 @@ import '../services/web_image_cache_service.dart';
 import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/chat_image_preprocessor.dart';
 import '../src/utils/media_url.dart';
+import '../src/utils/messenger_ui_helpers.dart';
 import '../utils/date_time_utils.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
-import '../widgets/adaptive_network_image.dart';
+import '../widgets/chat_media_viewer.dart';
 import '../widgets/chat_message_image.dart';
+import '../widgets/delivery_address_picker_dialog.dart';
 import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
@@ -124,7 +126,12 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _keepBottomAnchor = true;
   bool _initialViewportApplied = false;
   bool _initialViewportReady = false;
+  bool _loadingOlderMessages = false;
+  bool _loadingNewerMessages = false;
+  bool _draftSyncInFlight = false;
+  bool _hasMoreBefore = false;
   int _offlineQueuedCount = 0;
+  int _unreadCount = 0;
 
   String _searchQuery = '';
   List<String> _searchResultIds = const [];
@@ -154,6 +161,10 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _bottomAnchorTimer;
   Timer? _persistScrollOffsetTimer;
   Timer? _initialViewportFailsafeTimer;
+  Timer? _draftSyncTimer;
+  Timer? _serverChatStateSyncTimer;
+  Timer? _reconnectReplayTimer;
+  Timer? _searchDebounceTimer;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -176,12 +187,27 @@ class _ChatScreenState extends State<ChatScreen> {
   final Set<String> _supportFeedbackBusyTicketIds = {};
   final Map<String, GlobalKey> _messageItemKeys = {};
   Map<String, dynamic>? _activePin;
+  List<Map<String, dynamic>> _serverSearchMessages = const [];
+  bool _serverSearchLoading = false;
+  bool _serverSearchLoaded = false;
   final List<String> _recentReactionEmojis = <String>[];
   final List<String> _recentComposerEmojis = <String>[];
   double? _savedScrollOffset;
   double? _savedScrollFraction;
   String? _savedScrollAnchorMessageId;
   double? _savedScrollAnchorOffset;
+  String? _firstUnreadMessageId;
+  String? _lastSeenMessageId;
+  String? _oldestLoadedMessageId;
+  String? _oldestLoadedCreatedAt;
+  String? _newestLoadedMessageId;
+  String? _newestLoadedCreatedAt;
+  String? _replyToMessageId;
+  String? _replyPreviewText;
+  String? _replyPreviewSenderName;
+  bool _applyingServerDraft = false;
+  MessengerReservedQuickFilter _reservedQuickFilter =
+      MessengerReservedQuickFilter.all;
 
   static const List<String> _quickReactions = <String>[
     '👍',
@@ -222,6 +248,114 @@ class _ChatScreenState extends State<ChatScreen> {
     '👀',
     '⭐',
   ];
+  static const Map<String, List<String>> _reactionEmojiCategories =
+      <String, List<String>>{
+        'Частые': <String>[
+          '👍',
+          '❤️',
+          '🔥',
+          '👏',
+          '🎉',
+          '😂',
+          '😢',
+          '🙏',
+          '🤝',
+          '💯',
+          '✅',
+          '👀',
+        ],
+        'Лица': <String>[
+          '😀',
+          '😁',
+          '😅',
+          '😂',
+          '😊',
+          '😍',
+          '😘',
+          '🤔',
+          '😎',
+          '🥳',
+          '😭',
+          '😡',
+          '😴',
+          '🥲',
+          '😱',
+          '🤯',
+          '🤩',
+          '🙃',
+          '😇',
+          '🫶',
+        ],
+        'Жесты': <String>[
+          '👍',
+          '👎',
+          '👏',
+          '🙌',
+          '🙏',
+          '🤝',
+          '👌',
+          '✌️',
+          '🤞',
+          '👊',
+          '🤟',
+          '🫡',
+          '💪',
+          '☝️',
+          '👆',
+          '👇',
+          '👉',
+          '👈',
+        ],
+        'Сердца': <String>[
+          '❤️',
+          '🩷',
+          '🧡',
+          '💛',
+          '💚',
+          '🩵',
+          '💙',
+          '💜',
+          '🤍',
+          '🖤',
+          '🤎',
+          '💔',
+          '❤️‍🔥',
+          '❤️‍🩹',
+        ],
+        'Работа': <String>[
+          '✅',
+          '❌',
+          '⚠️',
+          '⏳',
+          '🚀',
+          '📌',
+          '🛠️',
+          '📦',
+          '🧾',
+          '💬',
+          '📞',
+          '📍',
+          '💸',
+          '📈',
+          '🔒',
+        ],
+        'Праздник': <String>[
+          '🎉',
+          '🔥',
+          '⭐',
+          '🌟',
+          '💯',
+          '🏆',
+          '🎁',
+          '🍾',
+          '🥂',
+          '🎈',
+          '🎊',
+          '🍀',
+          '🌈',
+          '☀️',
+        ],
+      };
 
   @override
   void initState() {
@@ -239,8 +373,23 @@ class _ChatScreenState extends State<ChatScreen> {
     _searchController.addListener(() {
       final next = _searchController.text.trim();
       if (next == _searchQuery) return;
-      setState(() => _searchQuery = next);
-      _recomputeSearchResults(keepCurrent: false);
+      setState(() {
+        _searchQuery = next;
+        if (next.isEmpty) {
+          _serverSearchMessages = const [];
+          _serverSearchLoaded = false;
+          _serverSearchLoading = false;
+        } else {
+          _serverSearchMessages = const [];
+          _serverSearchLoaded = true;
+          _serverSearchLoading = true;
+        }
+      });
+      if (next.isEmpty) {
+        _recomputeSearchResults(keepCurrent: false);
+      } else {
+        _scheduleServerSearch();
+      }
     });
 
     _hasDraftText = _controller.text.trim().isNotEmpty;
@@ -249,6 +398,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (nextHasDraft != _hasDraftText && mounted) {
         setState(() => _hasDraftText = nextHasDraft);
       }
+      _scheduleDraftSync();
     });
 
     _inputFocusNode.addListener(() {
@@ -343,6 +493,13 @@ class _ChatScreenState extends State<ChatScreen> {
         );
         return;
       }
+      if (type == 'socket:connected') {
+        _reconnectReplayTimer?.cancel();
+        _reconnectReplayTimer = Timer(const Duration(milliseconds: 220), () {
+          unawaited(_replayMissedMessagesAfterReconnect());
+        });
+        return;
+      }
       if (type == 'chat:pinned' && data is Map) {
         final chatId = data['chatId']?.toString() ?? '';
         if (chatId != widget.chatId) return;
@@ -363,6 +520,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _initializeChat() async {
     await _restoreSavedScrollOffset();
+    await _loadServerChatState();
     if (!mounted) return;
     await _loadMessages();
   }
@@ -381,6 +539,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _bottomAnchorTimer?.cancel();
     _persistScrollOffsetTimer?.cancel();
     _initialViewportFailsafeTimer?.cancel();
+    _draftSyncTimer?.cancel();
+    _serverChatStateSyncTimer?.cancel();
+    _reconnectReplayTimer?.cancel();
+    _searchDebounceTimer?.cancel();
     _chatSub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
@@ -441,6 +603,22 @@ class _ChatScreenState extends State<ChatScreen> {
       (_) => random.nextInt(16).toRadixString(16),
     ).join();
     return '${hex(8)}-${hex(4)}-4${hex(3)}-${(8 + random.nextInt(4)).toRadixString(16)}${hex(3)}-${hex(12)}';
+  }
+
+  String _messageIdOf(Map<String, dynamic> message) =>
+      (message['id'] ?? '').toString().trim();
+
+  String? _messageCreatedAtCursorOf(Map<String, dynamic> message) {
+    final parsed = _parseDate(message['created_at']);
+    if (parsed != null) return parsed.toUtc().toIso8601String();
+    final raw = (message['created_at'] ?? '').toString().trim();
+    return raw.isEmpty ? null : raw;
+  }
+
+  Map<String, dynamic> _chatStateMapOf(dynamic raw) {
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return <String, dynamic>{};
   }
 
   bool _isOwnMessage(Map<String, dynamic> message) {
@@ -523,6 +701,168 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (_) {}
   }
 
+  void _refreshLoadedMessageBounds() {
+    if (_messages.isEmpty) {
+      _oldestLoadedMessageId = null;
+      _oldestLoadedCreatedAt = null;
+      _newestLoadedMessageId = null;
+      _newestLoadedCreatedAt = null;
+      return;
+    }
+    final ordered = [..._messages]..sort(_compareByCreatedAt);
+    final oldest = ordered.first;
+    final newest = ordered.last;
+    _oldestLoadedMessageId = _messageIdOf(oldest);
+    _oldestLoadedCreatedAt = _messageCreatedAtCursorOf(oldest);
+    _newestLoadedMessageId = _messageIdOf(newest);
+    _newestLoadedCreatedAt = _messageCreatedAtCursorOf(newest);
+  }
+
+  void _applyServerChatState(
+    Map<String, dynamic> state, {
+    bool restoreDraft = true,
+    bool restoreScroll = true,
+  }) {
+    _lastSeenMessageId =
+        (state['last_seen_message_id'] ?? '').toString().trim().isEmpty
+        ? null
+        : (state['last_seen_message_id'] ?? '').toString().trim();
+    _firstUnreadMessageId =
+        (state['first_unread_message_id'] ?? '').toString().trim().isEmpty
+        ? null
+        : (state['first_unread_message_id'] ?? '').toString().trim();
+    _unreadCount = int.tryParse('${state['unread_count'] ?? 0}') ?? 0;
+
+    if (restoreScroll) {
+      final serverAnchorId = (state['scroll_anchor_message_id'] ?? '')
+          .toString()
+          .trim();
+      final serverAnchorOffset = double.tryParse(
+        '${state['scroll_anchor_offset'] ?? ''}',
+      );
+      if (serverAnchorId.isNotEmpty) {
+        _savedScrollAnchorMessageId = serverAnchorId;
+        _savedScrollAnchorOffset = serverAnchorOffset ?? 0;
+        _inMemoryScrollAnchorMessageIds[widget.chatId] = serverAnchorId;
+        _inMemoryScrollAnchorOffsets[widget.chatId] = serverAnchorOffset ?? 0;
+      }
+    }
+
+    if (restoreDraft) {
+      final serverDraft = (state['draft_text'] ?? '').toString();
+      if (serverDraft.trim().isNotEmpty && _controller.text.trim().isEmpty) {
+        _applyingServerDraft = true;
+        _controller.value = TextEditingValue(
+          text: serverDraft,
+          selection: TextSelection.collapsed(offset: serverDraft.length),
+        );
+        _applyingServerDraft = false;
+        _hasDraftText = serverDraft.trim().isNotEmpty;
+      }
+    }
+  }
+
+  Future<void> _loadServerChatState({bool restoreDraft = true}) async {
+    try {
+      final resp = await authService.dio.get('/api/chats/${widget.chatId}/state');
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! Map) return;
+      final state = _chatStateMapOf(data['data']);
+      if (!mounted) {
+        _applyServerChatState(state, restoreDraft: restoreDraft);
+        return;
+      }
+      setState(() {
+        _applyServerChatState(state, restoreDraft: restoreDraft);
+      });
+    } catch (_) {
+      // Ignore state bootstrap failures; local fallback will still work.
+    }
+  }
+
+  Future<void> _patchServerChatState(Map<String, dynamic> patch) async {
+    if (patch.isEmpty) return;
+    await authService.dio.patch('/api/chats/${widget.chatId}/state', data: patch);
+  }
+
+  void _scheduleDraftSync() {
+    if (_applyingServerDraft) return;
+    _draftSyncTimer?.cancel();
+    _draftSyncTimer = Timer(const Duration(milliseconds: 480), () {
+      unawaited(_syncDraftToServer());
+    });
+  }
+
+  Future<void> _syncDraftToServer() async {
+    if (_draftSyncInFlight) return;
+    _draftSyncInFlight = true;
+    try {
+      await _patchServerChatState({
+        'draft_text': _controller.text,
+        'draft_updated_at': DateTime.now().toUtc().toIso8601String(),
+      });
+    } catch (_) {
+      // keep draft local, we'll retry on next edit
+    } finally {
+      _draftSyncInFlight = false;
+    }
+  }
+
+  String? _lastVisibleMessageId() {
+    final viewportContext = _messagesViewportKey.currentContext;
+    final viewportObject = viewportContext?.findRenderObject();
+    if (viewportObject is! RenderBox) return null;
+    String? bestId;
+    var bestBottom = double.negativeInfinity;
+    for (final entry in _messageItemKeys.entries) {
+      final itemContext = entry.value.currentContext;
+      final itemObject = itemContext?.findRenderObject();
+      if (itemObject is! RenderBox || !itemObject.hasSize) continue;
+      final topLeft = itemObject.localToGlobal(
+        Offset.zero,
+        ancestor: viewportObject,
+      );
+      final top = topLeft.dy;
+      final bottom = top + itemObject.size.height;
+      if (bottom <= 0 || top >= viewportObject.size.height) continue;
+      if (bottom > bestBottom) {
+        bestBottom = bottom;
+        bestId = entry.key.trim();
+      }
+    }
+    return bestId;
+  }
+
+  void _scheduleServerViewportSync() {
+    _serverChatStateSyncTimer?.cancel();
+    _serverChatStateSyncTimer = Timer(const Duration(milliseconds: 700), () {
+      unawaited(_syncViewportStateToServer());
+    });
+  }
+
+  Future<void> _syncViewportStateToServer() async {
+    final anchor = _currentScrollAnchor();
+    final visibleLastMessageId = _isNearBottom()
+        ? _newestLoadedMessageId
+        : _lastVisibleMessageId();
+    final patch = <String, dynamic>{};
+    if (anchor != null) {
+      patch['scroll_anchor_message_id'] = anchor.messageId;
+      patch['scroll_anchor_offset'] = anchor.offset;
+    }
+    if ((visibleLastMessageId ?? '').trim().isNotEmpty) {
+      patch['last_seen_message_id'] = visibleLastMessageId!.trim();
+    }
+    if (patch.isEmpty) return;
+    try {
+      await _patchServerChatState(patch);
+      _lastSeenMessageId = (patch['last_seen_message_id'] ?? _lastSeenMessageId)
+          ?.toString();
+    } catch (_) {
+      // ignore best-effort sync errors
+    }
+  }
+
   ({String messageId, double offset})? _currentScrollAnchor() {
     final viewportContext = _messagesViewportKey.currentContext;
     final viewportObject = viewportContext?.findRenderObject();
@@ -602,14 +942,21 @@ class _ChatScreenState extends State<ChatScreen> {
       const Duration(milliseconds: 240),
       () => unawaited(_persistCurrentScrollOffset()),
     );
+    _scheduleServerViewportSync();
   }
 
   void _handleScroll() {
     if (!mounted) return;
     _queuePersistCurrentScrollOffset();
+    if (_scrollController.hasClients && _scrollController.position.pixels <= 280) {
+      unawaited(_loadOlderMessages());
+    }
     final nearBottom = _isNearBottom();
     if (!nearBottom) {
       _keepBottomAnchor = false;
+    }
+    if (nearBottom && _unreadCount > 0) {
+      _scheduleReadSync();
     }
     final shouldShow = _initialViewportReady && !nearBottom;
     if (_showScrollToBottomButton == shouldShow) return;
@@ -838,6 +1185,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || _initialViewportReady) return;
     _initialViewportFailsafeTimer?.cancel();
     setState(() => _initialViewportReady = true);
+    if (_isNearBottom()) {
+      _scheduleReadSync();
+    }
   }
 
   Future<void> _clearSavedScrollAnchor() async {
@@ -1011,6 +1361,74 @@ class _ChatScreenState extends State<ChatScreen> {
     return normalized;
   }
 
+  int _messageIndexInList(
+    List<Map<String, dynamic>> messages, {
+    String? messageId,
+    String? clientMsgId,
+  }) {
+    final normalizedId = (messageId ?? '').trim();
+    final normalizedClientMsgId = (clientMsgId ?? '').trim();
+    if (normalizedId.isNotEmpty) {
+      final byId = messages.indexWhere(
+        (m) => (m['id']?.toString() ?? '').trim() == normalizedId,
+      );
+      if (byId >= 0) return byId;
+    }
+    if (normalizedClientMsgId.isNotEmpty) {
+      return messages.indexWhere(
+        (m) => (m['client_msg_id']?.toString() ?? '').trim() == normalizedClientMsgId,
+      );
+    }
+    return -1;
+  }
+
+  List<Map<String, dynamic>> _mergeServerMessagesWithLocalState(
+    List<Map<String, dynamic>> serverMessages,
+  ) {
+    final merged = serverMessages
+        .map((message) => _normalizeMessage(message))
+        .toList(growable: true);
+    final localOnlyMessages = _messages.where((message) {
+      final meta = _metaMapOf(message['meta']);
+      return meta['local_only'] == true;
+    });
+
+    for (final localMessage in localOnlyMessages) {
+      final localId = _messageIdOf(localMessage);
+      final clientMsgId = (localMessage['client_msg_id'] ?? '')
+          .toString()
+          .trim();
+      final existingIndex = _messageIndexInList(
+        merged,
+        messageId: localId.startsWith('temp-') ? null : localId,
+        clientMsgId: clientMsgId,
+      );
+      if (existingIndex >= 0) {
+        continue;
+      }
+      merged.add(_normalizeMessage(Map<String, dynamic>.from(localMessage)));
+    }
+
+    merged.sort(_compareByCreatedAt);
+    return merged;
+  }
+
+  void _patchMessageLocally({
+    required String clientMsgId,
+    Map<String, dynamic> Function(Map<String, dynamic> message)? transform,
+  }) {
+    final normalizedClientMsgId = clientMsgId.trim();
+    if (normalizedClientMsgId.isEmpty) return;
+    final index = _messageIndexInList(
+      _messages,
+      clientMsgId: normalizedClientMsgId,
+    );
+    if (index < 0) return;
+    final current = Map<String, dynamic>.from(_messages[index]);
+    final next = transform == null ? current : transform(current);
+    _upsertMessage(next);
+  }
+
   void _upsertMessage(Map<String, dynamic> msg, {bool autoScroll = false}) {
     final normalized = _normalizeMessage(msg);
     final msgId = normalized['id']?.toString();
@@ -1023,12 +1441,11 @@ class _ChatScreenState extends State<ChatScreen> {
         inserted = true;
         _messages = [..._messages, normalized]..sort(_compareByCreatedAt);
       } else {
-        var index = _messages.indexWhere((m) => m['id']?.toString() == msgId);
-        if (index < 0 && clientMsgId.isNotEmpty) {
-          index = _messages.indexWhere(
-            (m) => (m['client_msg_id']?.toString() ?? '') == clientMsgId,
-          );
-        }
+        final index = _messageIndexInList(
+          _messages,
+          messageId: msgId,
+          clientMsgId: clientMsgId,
+        );
         if (index >= 0) {
           final previousId = _messages[index]['id']?.toString();
           _messages[index] = {..._messages[index], ...normalized};
@@ -1268,6 +1685,113 @@ class _ChatScreenState extends State<ChatScreen> {
     return 'Закрепленное сообщение';
   }
 
+  Map<String, dynamic>? _activePinnedMessage() {
+    final pin = _activePin;
+    if (pin == null) return null;
+    final messageRaw = pin['message'];
+    if (messageRaw is! Map) return null;
+    return Map<String, dynamic>.from(messageRaw);
+  }
+
+  String _pinPreviewSubtitle() {
+    final message = _activePinnedMessage();
+    final sender = message == null ? '' : _senderNameOf(message);
+    final pinnedBy = (_activePin?['pinned_by_name'] ?? '').toString().trim();
+    final parts = <String>[
+      if (sender.isNotEmpty) sender,
+      if (pinnedBy.isNotEmpty && pinnedBy != sender) 'закрепил $pinnedBy',
+    ];
+    return parts.join(' • ');
+  }
+
+  Widget _buildActivePinPreview(ThemeData theme) {
+    if (_activePin == null) return const SizedBox.shrink();
+    final subtitle = _pinPreviewSubtitle();
+    return GestureDetector(
+      onTap: _jumpToPinnedMessage,
+      child: Container(
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              alignment: Alignment.center,
+              child: Icon(
+                Icons.push_pin_rounded,
+                size: 18,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Закреплённое сообщение',
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _pinPreviewText(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (subtitle.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            Column(
+              children: [
+                if (_canPinMessages())
+                  IconButton(
+                    tooltip: 'Открепить',
+                    icon: const Icon(Icons.close, size: 18),
+                    onPressed: _unpinMessage,
+                  ),
+                Icon(
+                  Icons.arrow_outward_rounded,
+                  size: 16,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   bool _isMessagePinned(String messageId) {
     final pin = _activePin;
     if (pin == null) return false;
@@ -1357,6 +1881,19 @@ class _ChatScreenState extends State<ChatScreen> {
     final messageId = (pin['message_id'] ?? '').toString().trim();
     if (messageId.isEmpty) return;
 
+    await _jumpToMessageById(messageId);
+  }
+
+  Future<void> _jumpToFirstUnread() async {
+    final messageId = (_firstUnreadMessageId ?? '').trim();
+    if (messageId.isEmpty) return;
+    await _jumpToMessageById(messageId);
+  }
+
+  Future<void> _jumpToMessageById(String messageId) async {
+    final trimmedMessageId = messageId.trim();
+    if (trimmedMessageId.isEmpty) return;
+
     if (_searchMode || _searchQuery.isNotEmpty) {
       setState(() {
         _searchMode = false;
@@ -1369,12 +1906,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted) return;
 
     BuildContext? targetContext = await _resolveMessageContextWithScroll(
-      messageId,
+      trimmedMessageId,
     );
     if (targetContext == null) {
       try {
         final resp = await authService.dio.get(
-          '/api/chats/${widget.chatId}/messages/$messageId',
+          '/api/chats/${widget.chatId}/messages/$trimmedMessageId',
         );
         final data = resp.data;
         if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -1384,7 +1921,7 @@ class _ChatScreenState extends State<ChatScreen> {
           );
           await Future<void>.delayed(const Duration(milliseconds: 16));
           if (!mounted) return;
-          targetContext = await _resolveMessageContextWithScroll(messageId);
+          targetContext = await _resolveMessageContextWithScroll(trimmedMessageId);
         }
       } catch (_) {}
     }
@@ -1407,9 +1944,13 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _markChatAsRead() async {
+    if (!_initialViewportReady || !_isNearBottom()) return;
+    final visibleUntilMessageId = (_newestLoadedMessageId ?? '').trim();
+    if (visibleUntilMessageId.isEmpty) return;
     try {
       final resp = await authService.dio.post(
         '/api/chats/${widget.chatId}/read',
+        data: {'visible_until_message_id': visibleUntilMessageId},
       );
       final data = resp.data;
       if (data is Map && data['data'] is Map) {
@@ -1418,6 +1959,15 @@ class _ChatScreenState extends State<ChatScreen> {
             .where((e) => e.isNotEmpty)
             .toSet();
         _applyReadState(ids, readByMe: true);
+        if (!mounted) {
+          _firstUnreadMessageId = null;
+          _unreadCount = 0;
+        } else {
+          setState(() {
+            _firstUnreadMessageId = null;
+            _unreadCount = 0;
+          });
+        }
       }
     } catch (_) {}
   }
@@ -1491,6 +2041,186 @@ class _ChatScreenState extends State<ChatScreen> {
         .toLowerCase()
         .trim();
     return status == 'archived';
+  }
+
+  String _supportTicketStatusLabel() {
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    return messengerSupportStatusLabel(
+      (settings['support_ticket_status'] ?? '').toString(),
+    );
+  }
+
+  String _supportTicketAssigneeName() {
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    return (settings['support_assignee_name'] ?? '').toString().trim();
+  }
+
+  bool _supportTicketWaitingCustomer() {
+    final settings = widget.chatSettings ?? const <String, dynamic>{};
+    final raw = settings['support_waiting_customer'];
+    if (raw is bool) return raw;
+    final normalized = raw?.toString().trim().toLowerCase() ?? '';
+    return normalized == 'true' || normalized == '1';
+  }
+
+  ({
+    Color background,
+    Color foreground,
+    Color border,
+    IconData icon,
+  }) _supportBannerPalette(String statusRaw, ThemeData theme) {
+    return switch (messengerSupportStatusTone(statusRaw)) {
+      MessengerSupportStatusTone.success => (
+        background: theme.colorScheme.tertiaryContainer,
+        foreground: theme.colorScheme.onTertiaryContainer,
+        border: theme.colorScheme.tertiary.withValues(alpha: 0.35),
+        icon: Icons.task_alt_rounded,
+      ),
+      MessengerSupportStatusTone.secondary => (
+        background: theme.colorScheme.secondaryContainer,
+        foreground: theme.colorScheme.onSecondaryContainer,
+        border: theme.colorScheme.secondary.withValues(alpha: 0.35),
+        icon: Icons.schedule_rounded,
+      ),
+      MessengerSupportStatusTone.neutral => (
+        background: theme.colorScheme.surfaceContainerHigh,
+        foreground: theme.colorScheme.onSurface,
+        border: theme.colorScheme.outlineVariant,
+        icon: Icons.archive_outlined,
+      ),
+      MessengerSupportStatusTone.primary => (
+        background: theme.colorScheme.primaryContainer,
+        foreground: theme.colorScheme.onPrimaryContainer,
+        border: theme.colorScheme.primary.withValues(alpha: 0.35),
+        icon: Icons.support_agent_rounded,
+      ),
+    };
+  }
+
+  Widget _buildSupportBannerChip(
+    ThemeData theme, {
+    required IconData icon,
+    required String label,
+    required Color background,
+    required Color foreground,
+    required Color border,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: foreground),
+          const SizedBox(width: 5),
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: foreground,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSupportTicketBanner() {
+    if (!_isSupportTicketChat()) return const SizedBox.shrink();
+    final statusLabel = _supportTicketStatusLabel();
+    final assigneeName = _supportTicketAssigneeName();
+    if (statusLabel.isEmpty && assigneeName.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final theme = Theme.of(context);
+    final isArchived = _isArchivedSupportTicketChat();
+    final statusRaw = ((widget.chatSettings ?? const <String, dynamic>{})['support_ticket_status'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final palette = _supportBannerPalette(statusRaw, theme);
+    final background = palette.background;
+    final foreground = palette.foreground;
+    final border = palette.border;
+    final icon = palette.icon;
+    final chipBackground = foreground.withValues(alpha: 0.08);
+    final chipBorder = foreground.withValues(alpha: 0.16);
+    final chips = <Widget>[
+      if (statusLabel.isNotEmpty)
+        _buildSupportBannerChip(
+          theme,
+          icon: icon,
+          label: statusLabel,
+          background: chipBackground,
+          foreground: foreground,
+          border: chipBorder,
+        ),
+      if (statusRaw == 'open')
+        _buildSupportBannerChip(
+          theme,
+          icon: Icons.hourglass_bottom_rounded,
+          label: messengerSupportWaitingLabel(
+            waitingCustomer: _supportTicketWaitingCustomer(),
+          ),
+          background: chipBackground,
+          foreground: foreground,
+          border: chipBorder,
+        ),
+      if (assigneeName.isNotEmpty)
+        _buildSupportBannerChip(
+          theme,
+          icon: Icons.person_outline_rounded,
+          label: assigneeName,
+          background: chipBackground,
+          foreground: foreground,
+          border: chipBorder,
+        ),
+    ];
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: foreground),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isArchived ? 'Обращение закрыто' : 'Статус обращения',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: foreground,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                if (chips.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: chips,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   bool _isDirectMessageChat() {
@@ -1626,11 +2356,11 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (_) {}
   }
 
-  Future<void> _loadMessages() async {
+  Future<void> _loadMessages({bool showLoader = true}) async {
     if (_messagesLoadInFlight) return;
     _messagesLoadInFlight = true;
     var loadedSuccessfully = false;
-    if (mounted) {
+    if (mounted && showLoader) {
       setState(() => _loading = true);
     }
     try {
@@ -1640,6 +2370,7 @@ class _ChatScreenState extends State<ChatScreen> {
         try {
           final resp = await authService.dio.get(
             '/api/chats/${widget.chatId}/messages',
+            queryParameters: const {'limit': 80},
             options: Options(
               connectTimeout: const Duration(seconds: 15),
               sendTimeout: const Duration(seconds: 15),
@@ -1648,13 +2379,17 @@ class _ChatScreenState extends State<ChatScreen> {
           );
           final data = resp.data;
           if (data is Map && data['ok'] == true && data['data'] is List) {
-            final messages = List<Map<String, dynamic>>.from(data['data'])
+            final serverMessages = List<Map<String, dynamic>>.from(data['data'])
               ..sort(_compareByCreatedAt);
+            final messages = _mergeServerMessagesWithLocalState(serverMessages);
+            final paging = _chatStateMapOf(data['paging']);
+            final state = _chatStateMapOf(data['state']);
             if (mounted) {
               setState(() {
                 _messages = messages;
                 _incomingQueue.clear();
                 _appearingMessageIds.clear();
+                _hasMoreBefore = paging['has_more_before'] == true;
                 _messageIds
                   ..clear()
                   ..addAll(
@@ -1666,14 +2401,18 @@ class _ChatScreenState extends State<ChatScreen> {
                 _messageItemKeys.removeWhere(
                   (id, _) => !_messageIds.contains(id),
                 );
+                _applyServerChatState(state, restoreDraft: false);
+                _refreshLoadedMessageBounds();
               });
             } else {
               _messages = messages;
+              _hasMoreBefore = paging['has_more_before'] == true;
+              _applyServerChatState(state, restoreDraft: false);
+              _refreshLoadedMessageBounds();
             }
             _incomingTimer?.cancel();
             _incomingTimer = null;
             _recomputeSearchResults(keepCurrent: false);
-            _scheduleReadSync();
             if (kIsWeb) {
               unawaited(primeWebImageCache(_initialChannelImageBatch(messages)));
             }
@@ -1716,9 +2455,9 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } finally {
       _messagesLoadInFlight = false;
-      if (mounted) {
+      if (mounted && showLoader) {
         setState(() => _loading = false);
-      } else {
+      } else if (!mounted) {
         _loading = false;
       }
       if (loadedSuccessfully) {
@@ -1726,6 +2465,186 @@ class _ChatScreenState extends State<ChatScreen> {
       } else {
         _markInitialViewportReady();
       }
+    }
+  }
+
+  Future<void> _loadOlderMessages() async {
+    if (_loadingOlderMessages ||
+        _messagesLoadInFlight ||
+        !_hasMoreBefore ||
+        _oldestLoadedMessageId == null ||
+        _oldestLoadedCreatedAt == null) {
+      return;
+    }
+    _loadingOlderMessages = true;
+    final hadClients = _scrollController.hasClients;
+    final previousPixels = hadClients ? _scrollController.position.pixels : 0.0;
+    final previousMaxExtent = hadClients
+        ? _scrollController.position.maxScrollExtent
+        : 0.0;
+    try {
+      final resp = await authService.dio.get(
+        '/api/chats/${widget.chatId}/messages',
+        queryParameters: {
+          'before_created_at': _oldestLoadedCreatedAt,
+          'before_id': _oldestLoadedMessageId,
+          'limit': 60,
+        },
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) return;
+      final pageMessages = List<Map<String, dynamic>>.from(data['data'])
+        ..sort(_compareByCreatedAt);
+      final paging = _chatStateMapOf(data['paging']);
+      final state = _chatStateMapOf(data['state']);
+      if (pageMessages.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _hasMoreBefore = paging['has_more_before'] == true;
+            _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+          });
+        } else {
+          _hasMoreBefore = paging['has_more_before'] == true;
+          _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+        }
+        return;
+      }
+      final existingIds = _messages.map(_messageIdOf).where((id) => id.isNotEmpty).toSet();
+      final toInsert = pageMessages
+          .where((message) => !existingIds.contains(_messageIdOf(message)))
+          .toList(growable: false);
+      if (toInsert.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _hasMoreBefore = paging['has_more_before'] == true;
+            _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+          });
+        } else {
+          _hasMoreBefore = paging['has_more_before'] == true;
+          _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+        }
+        return;
+      }
+      if (mounted) {
+        setState(() {
+          _messages = [...toInsert, ..._messages]..sort(_compareByCreatedAt);
+          _hasMoreBefore = paging['has_more_before'] == true;
+          _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+          _messageIds
+            ..clear()
+            ..addAll(
+              _messages
+                  .map(_messageIdOf)
+                  .where((id) => id.isNotEmpty),
+            );
+          _refreshLoadedMessageBounds();
+        });
+      } else {
+        _messages = [...toInsert, ..._messages]..sort(_compareByCreatedAt);
+        _hasMoreBefore = paging['has_more_before'] == true;
+        _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+        _refreshLoadedMessageBounds();
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) return;
+        final nextMaxExtent = _scrollController.position.maxScrollExtent;
+        final delta = nextMaxExtent - previousMaxExtent;
+        final target = (previousPixels + max(0.0, delta))
+            .clamp(0.0, nextMaxExtent)
+            .toDouble();
+        _scrollController.jumpTo(target);
+      });
+    } catch (_) {
+      // ignore transient older-page failures
+    } finally {
+      _loadingOlderMessages = false;
+    }
+  }
+
+  Future<void> _replayMissedMessagesAfterReconnect() async {
+    if (_loadingNewerMessages || _messagesLoadInFlight) return;
+    final newestId = _newestLoadedMessageId;
+    final newestCreatedAt = _newestLoadedCreatedAt;
+    if ((newestId ?? '').isEmpty || (newestCreatedAt ?? '').isEmpty) {
+      await _loadMessages(showLoader: false);
+      return;
+    }
+    _loadingNewerMessages = true;
+    try {
+      final resp = await authService.dio.get(
+        '/api/chats/${widget.chatId}/messages',
+        queryParameters: {
+          'after_created_at': newestCreatedAt,
+          'after_id': newestId,
+          'limit': 80,
+        },
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) {
+        return;
+      }
+      final pageMessages = List<Map<String, dynamic>>.from(data['data'])
+        ..sort(_compareByCreatedAt);
+      final paging = _chatStateMapOf(data['paging']);
+      final state = _chatStateMapOf(data['state']);
+      if (mounted) {
+        setState(() {
+          for (final message in pageMessages) {
+            final id = _messageIdOf(message);
+            final clientMsgId = (message['client_msg_id'] ?? '')
+                .toString()
+                .trim();
+            final index = _messageIndexInList(
+              _messages,
+              messageId: id,
+              clientMsgId: clientMsgId,
+            );
+            if (index >= 0) {
+              _messages[index] = {..._messages[index], ...message};
+            } else {
+              _messages.add(message);
+            }
+          }
+          _messages.sort(_compareByCreatedAt);
+          _hasMoreBefore = paging['has_more_before'] == true;
+          _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+          _messageIds
+            ..clear()
+            ..addAll(
+              _messages.map(_messageIdOf).where((id) => id.isNotEmpty),
+            );
+          _refreshLoadedMessageBounds();
+        });
+      } else {
+        for (final message in pageMessages) {
+          final id = _messageIdOf(message);
+          final clientMsgId = (message['client_msg_id'] ?? '')
+              .toString()
+              .trim();
+          final index = _messageIndexInList(
+            _messages,
+            messageId: id,
+            clientMsgId: clientMsgId,
+          );
+          if (index >= 0) {
+            _messages[index] = {..._messages[index], ...message};
+          } else {
+            _messages.add(message);
+          }
+        }
+        _messages.sort(_compareByCreatedAt);
+        _hasMoreBefore = paging['has_more_before'] == true;
+        _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
+        _refreshLoadedMessageBounds();
+      }
+      _recomputeSearchResults();
+      if (_isNearBottom()) {
+        _scheduleReadSync();
+      }
+    } catch (_) {
+      // ignore replay issues; next socket/API refresh will recover
+    } finally {
+      _loadingNewerMessages = false;
     }
   }
 
@@ -1761,64 +2680,64 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  void _openImagePreview(String imageUrl) {
-    final media = MediaQuery.of(context);
-    final isCompact = media.size.width < 680;
-    final maxWidth = min(
-      media.size.width - (isCompact ? 24 : 120),
-      isCompact ? 420.0 : 980.0,
-    ).clamp(260.0, media.size.width);
-    final maxHeight = min(
-      media.size.height - (isCompact ? 110 : 150),
-      isCompact ? media.size.height * 0.72 : media.size.height * 0.82,
-    ).clamp(220.0, media.size.height);
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => Dialog(
-        backgroundColor: Colors.transparent,
-        insetPadding: EdgeInsets.symmetric(
-          horizontal: isCompact ? 12 : 28,
-          vertical: isCompact ? 16 : 24,
+  List<ChatMediaViewerEntry> _chatMediaViewerEntries() {
+    final entries = <ChatMediaViewerEntry>[];
+    for (final item in _messages) {
+      final meta = _metaMapOf(item['meta']);
+      final imageUrl = _resolveImageUrl(meta['image_url']?.toString());
+      if (imageUrl == null || imageUrl.isEmpty) continue;
+      if (_isHiddenForAll(item)) continue;
+      final entryId =
+          _messageIdOf(item).trim().isNotEmpty
+              ? _messageIdOf(item).trim()
+              : '${item['client_msg_id'] ?? imageUrl}-${item['created_at'] ?? ''}';
+      entries.add(
+        ChatMediaViewerEntry(
+          id: entryId,
+          imageUrl: imageUrl,
+          caption: _captionTextOf(item, meta),
+          senderName: _senderNameOf(item),
+          timeLabel: _formatMessageTime(item['created_at']),
         ),
-        child: Stack(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                borderRadius: BorderRadius.circular(24),
-              ),
-              child: SizedBox(
-                width: maxWidth,
-                height: maxHeight,
-                child: InteractiveViewer(
-                  minScale: 0.7,
-                  maxScale: 4,
-                  child: AdaptiveNetworkImage(
-                    imageUrl,
-                    width: maxWidth,
-                    height: maxHeight,
-                    fit: BoxFit.contain,
-                    errorBuilder: (_, error, stackTrace) => Container(
-                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.broken_image_outlined, size: 40),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            Positioned(
-              top: 8,
-              right: 8,
-              child: IconButton.filledTonal(
-                onPressed: () => Navigator.of(ctx).pop(),
-                icon: const Icon(Icons.close),
-              ),
-            ),
-          ],
-        ),
-      ),
+      );
+    }
+    return entries;
+  }
+
+  Future<void> _openImagePreviewForMessage(
+    Map<String, dynamic> message,
+    String imageUrl,
+  ) async {
+    final gallery = _chatMediaViewerEntries();
+    if (gallery.isEmpty) {
+      await showChatMediaViewer(
+        context,
+        entries: <ChatMediaViewerEntry>[
+          ChatMediaViewerEntry(
+            id: _messageIdOf(message).trim().isNotEmpty
+                ? _messageIdOf(message).trim()
+                : imageUrl,
+            imageUrl: imageUrl,
+            caption: _captionTextOf(message, _metaMapOf(message['meta'])),
+            senderName: _senderNameOf(message),
+            timeLabel: _formatMessageTime(message['created_at']),
+          ),
+        ],
+      );
+      return;
+    }
+
+    final targetId = _messageIdOf(message).trim();
+    var initialIndex = gallery.indexWhere((entry) => entry.id == targetId);
+    if (initialIndex < 0) {
+      initialIndex = gallery.indexWhere((entry) => entry.imageUrl == imageUrl);
+    }
+    if (initialIndex < 0) initialIndex = 0;
+
+    await showChatMediaViewer(
+      context,
+      entries: gallery,
+      initialIndex: initialIndex,
     );
   }
 
@@ -2176,6 +3095,84 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<void> _postMediaMessage({
+    required _ChatUploadFile upload,
+    required String attachmentType,
+    required String clientMsgId,
+    required String caption,
+    required Map<String, dynamic> replyPayload,
+    int? durationMs,
+  }) async {
+    var lastReportedBucket = -1;
+    final form = FormData.fromMap({
+      if (attachmentType == 'image') 'image': await _multipartFromUpload(upload),
+      if (attachmentType == 'image' && (upload.width ?? 0) > 0)
+        'image_width': upload.width,
+      if (attachmentType == 'image' && (upload.height ?? 0) > 0)
+        'image_height': upload.height,
+      if (attachmentType == 'image' &&
+          (upload.width ?? 0) > 0 &&
+          (upload.height ?? 0) > 0)
+        'image_aspect_ratio':
+            (upload.width! / upload.height!).toStringAsFixed(4),
+      if (attachmentType == 'image' &&
+          (upload.preprocessTag ?? '').trim().isNotEmpty)
+        'image_preprocess': upload.preprocessTag!.trim(),
+      if (attachmentType == 'voice')
+        'voice': await _multipartFromUpload(
+          upload,
+          contentType: _voiceContentTypeForUpload(upload),
+        ),
+      if (attachmentType == 'video')
+        'video': await _multipartFromUpload(
+          upload,
+          contentType: _videoContentTypeForUpload(upload),
+        ),
+      'client_msg_id': clientMsgId,
+      ...replyPayload,
+      if (caption.trim().isNotEmpty) 'text': caption.trim(),
+      if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
+    });
+
+    final resp = await authService.dio.post(
+      '/api/chats/${widget.chatId}/messages/media',
+      data: form,
+      onSendProgress: (sent, total) {
+        if (total <= 0) return;
+        final progress = (sent / total).clamp(0.0, 1.0).toDouble();
+        final bucket = (progress * 100).floor();
+        if (bucket == lastReportedBucket) return;
+        lastReportedBucket = bucket;
+        _patchMessageLocally(
+          clientMsgId: clientMsgId,
+          transform: (current) {
+            final nextMeta = _metaMapOf(current['meta']);
+            nextMeta['delivery_status'] = progress >= 0.995
+                ? 'sending'
+                : 'uploading';
+            nextMeta['local_upload_progress'] = progress;
+            nextMeta.remove('error_message');
+            return {
+              ...current,
+              'meta': nextMeta,
+            };
+          },
+        );
+      },
+    );
+
+    if (resp.statusCode == 200 || resp.statusCode == 201) {
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        _upsertMessage(Map<String, dynamic>.from(data['data']), autoScroll: true);
+        return;
+      }
+      await _loadMessages(showLoader: false);
+      return;
+    }
+    throw Exception('Сервер не принял вложение');
+  }
+
   Future<void> _sendMediaMessage({
     required _ChatUploadFile upload,
     required String attachmentType,
@@ -2183,71 +3180,52 @@ class _ChatScreenState extends State<ChatScreen> {
   }) async {
     if (!_canCompose()) return;
     final clientMsgId = _generateClientMessageId();
+    final replyPayload = _currentReplyPayload();
     final caption = attachmentType == 'image' || attachmentType == 'video'
         ? _controller.text.trim()
         : '';
-    final previousText = _controller.text;
+    final optimisticMessage = _buildOptimisticMediaMessage(
+      clientMsgId: clientMsgId,
+      upload: upload,
+      attachmentType: attachmentType,
+      caption: caption,
+      replyPayload: replyPayload,
+      durationMs: durationMs,
+    );
+    if (attachmentType == 'image' || attachmentType == 'video') {
+      _controller.clear();
+    }
+    _clearReplyComposer();
+    _upsertMessage(optimisticMessage, autoScroll: true);
     setState(() {
       _mediaUploading = attachmentType == 'image' || attachmentType == 'video';
       _voiceSending = attachmentType == 'voice';
     });
     try {
-      final form = FormData.fromMap({
-        if (attachmentType == 'image')
-          'image': await _multipartFromUpload(upload),
-        if (attachmentType == 'image' && (upload.width ?? 0) > 0)
-          'image_width': upload.width,
-        if (attachmentType == 'image' && (upload.height ?? 0) > 0)
-          'image_height': upload.height,
-        if (attachmentType == 'image' &&
-            (upload.width ?? 0) > 0 &&
-            (upload.height ?? 0) > 0)
-          'image_aspect_ratio': (upload.width! / upload.height!)
-              .toStringAsFixed(4),
-        if (attachmentType == 'image' &&
-            (upload.preprocessTag ?? '').trim().isNotEmpty)
-          'image_preprocess': upload.preprocessTag!.trim(),
-        if (attachmentType == 'voice')
-          'voice': await _multipartFromUpload(
-            upload,
-            contentType: _voiceContentTypeForUpload(upload),
-          ),
-        if (attachmentType == 'video')
-          'video': await _multipartFromUpload(
-            upload,
-            contentType: _videoContentTypeForUpload(upload),
-          ),
-        'client_msg_id': clientMsgId,
-        if (caption.isNotEmpty) 'text': caption,
-        if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
-      });
-      final resp = await authService.dio.post(
-        '/api/chats/${widget.chatId}/messages/media',
-        data: form,
+      await _postMediaMessage(
+        upload: upload,
+        attachmentType: attachmentType,
+        clientMsgId: clientMsgId,
+        caption: caption,
+        replyPayload: replyPayload,
+        durationMs: durationMs,
       );
-      if (resp.statusCode == 200 || resp.statusCode == 201) {
-        final data = resp.data;
-        if (data is Map && data['ok'] == true && data['data'] is Map) {
-          if (attachmentType == 'image' || attachmentType == 'video') {
-            _controller.clear();
-          }
-          _upsertMessage(
-            Map<String, dynamic>.from(data['data']),
-            autoScroll: true,
-          );
-          await playAppSound(AppUiSound.sent);
-          return;
-        }
-      }
-      throw Exception('Сервер не принял вложение');
+      await playAppSound(AppUiSound.sent);
     } catch (e) {
+      _patchMessageLocally(
+        clientMsgId: clientMsgId,
+        transform: (current) {
+          final nextMeta = _metaMapOf(current['meta']);
+          nextMeta['delivery_status'] = 'error';
+          nextMeta['error_message'] = _extractDioError(e);
+          nextMeta.remove('local_upload_progress');
+          return {
+            ...current,
+            'meta': nextMeta,
+          };
+        },
+      );
       if (!mounted) return;
-      if (attachmentType == 'image') {
-        _controller.text = previousText;
-        _controller.selection = TextSelection.fromPosition(
-          TextPosition(offset: _controller.text.length),
-        );
-      }
       showAppNotice(
         context,
         attachmentType == 'image'
@@ -2372,6 +3350,97 @@ class _ChatScreenState extends State<ChatScreen> {
       _recentReactionEmojis,
       _quickReactions,
       maxCount: 9,
+    );
+  }
+
+  Future<String?> _openFullReactionPicker() async {
+    final baseCategories = _reactionEmojiCategories.entries
+        .where((entry) => entry.value.isNotEmpty)
+        .toList(growable: false);
+    final categories = <MapEntry<String, List<String>>>[
+      if (_recentReactionEmojis.isNotEmpty)
+        MapEntry('Недавние', List<String>.from(_recentReactionEmojis)),
+      ...baseCategories,
+    ];
+    if (categories.isEmpty) return null;
+
+    return showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return DefaultTabController(
+          length: categories.length,
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+              child: SizedBox(
+                height: MediaQuery.of(ctx).size.height * 0.66,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Выберите реакцию',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TabBar(
+                      isScrollable: true,
+                      tabAlignment: TabAlignment.start,
+                      tabs: categories
+                          .map((entry) => Tab(text: entry.key))
+                          .toList(growable: false),
+                    ),
+                    const SizedBox(height: 10),
+                    Expanded(
+                      child: TabBarView(
+                        children: categories.map((entry) {
+                          final emojis = entry.value;
+                          return GridView.builder(
+                            padding: const EdgeInsets.only(top: 4),
+                            itemCount: emojis.length,
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: 6,
+                                  mainAxisSpacing: 8,
+                                  crossAxisSpacing: 8,
+                                  childAspectRatio: 1,
+                                ),
+                            itemBuilder: (context, index) {
+                              final emoji = emojis[index];
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(14),
+                                onTap: () => Navigator.of(ctx).pop(emoji),
+                                child: Ink(
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(14),
+                                    color: theme
+                                        .colorScheme
+                                        .surfaceContainerHighest,
+                                  ),
+                                  child: Center(
+                                    child: Text(
+                                      emoji,
+                                      style: const TextStyle(fontSize: 28),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          );
+                        }).toList(growable: false),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -3479,6 +4548,360 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Map<String, dynamic> _currentReplyPayload() {
+    final replyId = (_replyToMessageId ?? '').trim();
+    if (replyId.isEmpty) return const <String, dynamic>{};
+    final payload = <String, dynamic>{'reply_to_message_id': replyId};
+    final previewText = (_replyPreviewText ?? '').trim();
+    final previewSender = (_replyPreviewSenderName ?? '').trim();
+    if (previewText.isNotEmpty) {
+      payload['reply_preview_text'] = previewText;
+    }
+    if (previewSender.isNotEmpty) {
+      payload['reply_preview_sender_name'] = previewSender;
+    }
+    return payload;
+  }
+
+  Map<String, dynamic> _buildTextRetryPayload({
+    required String text,
+    required Map<String, dynamic> replyPayload,
+  }) {
+    return <String, dynamic>{
+      'kind': 'text',
+      'text': text,
+      if ((replyPayload['reply_to_message_id'] ?? '').toString().trim().isNotEmpty)
+        'reply_to_message_id': replyPayload['reply_to_message_id'],
+      if ((replyPayload['reply_preview_text'] ?? '').toString().trim().isNotEmpty)
+        'reply_preview_text': replyPayload['reply_preview_text'],
+      if ((replyPayload['reply_preview_sender_name'] ?? '')
+          .toString()
+          .trim()
+          .isNotEmpty)
+        'reply_preview_sender_name': replyPayload['reply_preview_sender_name'],
+    };
+  }
+
+  Map<String, dynamic> _extractReplyPayloadFromRetryPayload(
+    Map<String, dynamic> retryPayload,
+  ) {
+    final replyPayload = <String, dynamic>{};
+    for (final key in <String>[
+      'reply_to_message_id',
+      'reply_preview_text',
+      'reply_preview_sender_name',
+    ]) {
+      final value = (retryPayload[key] ?? '').toString().trim();
+      if (value.isNotEmpty) {
+        replyPayload[key] = value;
+      }
+    }
+    return replyPayload;
+  }
+
+  String _optimisticMediaText(String attachmentType, {required String caption}) {
+    if (caption.trim().isNotEmpty) return caption.trim();
+    switch (attachmentType) {
+      case 'image':
+        return 'Фото';
+      case 'video':
+        return 'Видеосообщение';
+      case 'voice':
+        return 'Голосовое сообщение';
+      default:
+        return 'Вложение';
+    }
+  }
+
+  String? _localImagePreviewUrl(_ChatUploadFile upload) {
+    final bytes = upload.bytes;
+    if (bytes == null || bytes.isEmpty) return null;
+    final mimeType = (upload.mimeType ?? '').trim().isNotEmpty
+        ? upload.mimeType!.trim()
+        : 'image/jpeg';
+    return 'data:$mimeType;base64,${base64Encode(bytes)}';
+  }
+
+  Map<String, dynamic> _buildMediaRetryPayload({
+    required _ChatUploadFile upload,
+    required String attachmentType,
+    required Map<String, dynamic> replyPayload,
+    required String caption,
+    int? durationMs,
+  }) {
+    return <String, dynamic>{
+      'kind': 'media',
+      'attachment_type': attachmentType,
+      'filename': upload.filename,
+      if ((upload.path ?? '').trim().isNotEmpty) 'path': upload.path!.trim(),
+      if (upload.bytes != null) 'bytes': upload.bytes,
+      if ((upload.mimeType ?? '').trim().isNotEmpty)
+        'mime_type': upload.mimeType!.trim(),
+      if (upload.width != null) 'width': upload.width,
+      if (upload.height != null) 'height': upload.height,
+      if ((upload.preprocessTag ?? '').trim().isNotEmpty)
+        'preprocess_tag': upload.preprocessTag!.trim(),
+      if (caption.trim().isNotEmpty) 'caption': caption.trim(),
+      if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
+      ...replyPayload,
+    };
+  }
+
+  _ChatUploadFile? _uploadFromRetryPayload(Map<String, dynamic> retryPayload) {
+    final filename = (retryPayload['filename'] ?? '').toString().trim();
+    final path = (retryPayload['path'] ?? '').toString().trim();
+    final rawBytes = retryPayload['bytes'];
+    Uint8List? bytes;
+    if (rawBytes is Uint8List) {
+      bytes = rawBytes;
+    } else if (rawBytes is List<int>) {
+      bytes = Uint8List.fromList(rawBytes);
+    } else if (rawBytes is List) {
+      final ints = rawBytes
+          .map((item) => item is int ? item : int.tryParse('$item') ?? -1)
+          .where((value) => value >= 0 && value <= 255)
+          .cast<int>()
+          .toList(growable: false);
+      if (ints.isNotEmpty) {
+        bytes = Uint8List.fromList(ints);
+      }
+    }
+    if (path.isEmpty && (bytes == null || bytes.isEmpty)) {
+      return null;
+    }
+    return _ChatUploadFile(
+      filename: filename.isNotEmpty ? filename : 'attachment.bin',
+      path: path.isNotEmpty ? path : null,
+      bytes: bytes,
+      mimeType: (retryPayload['mime_type'] ?? '').toString().trim().isNotEmpty
+          ? (retryPayload['mime_type'] ?? '').toString().trim()
+          : null,
+      width: retryPayload['width'] is num
+          ? (retryPayload['width'] as num).toInt()
+          : int.tryParse('${retryPayload['width'] ?? ''}'),
+      height: retryPayload['height'] is num
+          ? (retryPayload['height'] as num).toInt()
+          : int.tryParse('${retryPayload['height'] ?? ''}'),
+      preprocessTag:
+          (retryPayload['preprocess_tag'] ?? '').toString().trim().isNotEmpty
+          ? (retryPayload['preprocess_tag'] ?? '').toString().trim()
+          : null,
+    );
+  }
+
+  bool _retryPayloadCanBeRetried(Map<String, dynamic> retryPayload) {
+    final kind = (retryPayload['kind'] ?? '').toString().trim();
+    if (kind == 'text') {
+      return (retryPayload['text'] ?? '').toString().trim().isNotEmpty;
+    }
+    if (kind == 'media') {
+      return _uploadFromRetryPayload(retryPayload) != null;
+    }
+    return false;
+  }
+
+  Map<String, dynamic> _buildOptimisticMediaMessage({
+    required String clientMsgId,
+    required _ChatUploadFile upload,
+    required String attachmentType,
+    required String caption,
+    required Map<String, dynamic> replyPayload,
+    int? durationMs,
+  }) {
+    final currentUser = authService.currentUser;
+    final previewUrl = attachmentType == 'image'
+        ? _localImagePreviewUrl(upload)
+        : null;
+    final retryPayload = _buildMediaRetryPayload(
+      upload: upload,
+      attachmentType: attachmentType,
+      replyPayload: replyPayload,
+      caption: caption,
+      durationMs: durationMs,
+    );
+    final meta = <String, dynamic>{
+      'attachment_type': attachmentType,
+      'local_only': true,
+      'delivery_status': 'uploading',
+      'local_upload_progress': 0.0,
+      'retry_payload': retryPayload,
+      ...replyPayload,
+      if (attachmentType == 'image' && previewUrl != null) 'image_url': previewUrl,
+      if (attachmentType == 'image' && (upload.width ?? 0) > 0)
+        'image_width': upload.width,
+      if (attachmentType == 'image' && (upload.height ?? 0) > 0)
+        'image_height': upload.height,
+      if (attachmentType == 'voice' && (durationMs ?? 0) > 0)
+        'voice_duration_ms': durationMs,
+      if (attachmentType == 'video' && (durationMs ?? 0) > 0)
+        'video_duration_ms': durationMs,
+      if (caption.trim().isNotEmpty && attachmentType != 'voice')
+        'caption': caption.trim(),
+    };
+    return <String, dynamic>{
+      'id': 'temp-$clientMsgId',
+      'client_msg_id': clientMsgId,
+      'chat_id': widget.chatId,
+      'sender_id': currentUser?.id,
+      'sender_name': currentUser?.name?.trim().isNotEmpty == true
+          ? currentUser!.name!.trim()
+          : 'Вы',
+      'text': _optimisticMediaText(attachmentType, caption: caption),
+      'created_at': DateTime.now().toIso8601String(),
+      'from_me': true,
+      'read_by_others': false,
+      'read_count': 0,
+      'meta': meta,
+    };
+  }
+
+  Map<String, dynamic> _retryPayloadOf(Map<String, dynamic> meta) {
+    final raw = meta['retry_payload'];
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return const <String, dynamic>{};
+  }
+
+  bool _isRetryableFailedMessage(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    if (meta['local_only'] != true) return false;
+    if ((meta['delivery_status'] ?? '').toString().trim() != 'error') {
+      return false;
+    }
+    final retryPayload = _retryPayloadOf(meta);
+    return _retryPayloadCanBeRetried(retryPayload);
+  }
+
+  Future<void> _retryFailedMessage(Map<String, dynamic> message) async {
+    if (!_isRetryableFailedMessage(message)) return;
+    final meta = _metaMapOf(message['meta']);
+    final retryPayload = _retryPayloadOf(meta);
+    final retryKind = (retryPayload['kind'] ?? '').toString().trim();
+    if (retryKind == 'media') {
+      final upload = _uploadFromRetryPayload(retryPayload);
+      final attachmentType = (retryPayload['attachment_type'] ?? '')
+          .toString()
+          .trim();
+      if (upload == null || attachmentType.isEmpty) return;
+      final replyPayload = _extractReplyPayloadFromRetryPayload(retryPayload);
+      final nextClientMsgId = _generateClientMessageId();
+      final sendingMessage = _buildOptimisticMediaMessage(
+        clientMsgId: nextClientMsgId,
+        upload: upload,
+        attachmentType: attachmentType,
+        caption: (retryPayload['caption'] ?? '').toString(),
+        replyPayload: replyPayload,
+        durationMs: int.tryParse('${retryPayload['duration_ms'] ?? 0}'),
+      );
+      _upsertMessage(
+        {
+          ...message,
+          'id': 'temp-$nextClientMsgId',
+          'client_msg_id': nextClientMsgId,
+          'text': sendingMessage['text'],
+          'meta': sendingMessage['meta'],
+        },
+        autoScroll: true,
+      );
+      try {
+        await _postMediaMessage(
+          upload: upload,
+          attachmentType: attachmentType,
+          clientMsgId: nextClientMsgId,
+          caption: (retryPayload['caption'] ?? '').toString(),
+          replyPayload: replyPayload,
+          durationMs: int.tryParse('${retryPayload['duration_ms'] ?? 0}'),
+        );
+        await playAppSound(AppUiSound.sent);
+      } catch (e) {
+        _patchMessageLocally(
+          clientMsgId: nextClientMsgId,
+          transform: (current) {
+            final nextMeta = _metaMapOf(current['meta']);
+            nextMeta['delivery_status'] = 'error';
+            nextMeta['error_message'] = _extractDioError(e);
+            nextMeta.remove('local_upload_progress');
+            return {
+              ...current,
+              'meta': nextMeta,
+            };
+          },
+        );
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Не удалось повторно отправить вложение',
+          tone: AppNoticeTone.error,
+          duration: const Duration(seconds: 2),
+        );
+      }
+      return;
+    }
+
+    final text = (retryPayload['text'] ?? message['text'] ?? '')
+        .toString()
+        .trim();
+    if (text.isEmpty) return;
+
+    final nextClientMsgId = _generateClientMessageId();
+    final replyPayload = _extractReplyPayloadFromRetryPayload(retryPayload);
+
+    final sendingMeta = <String, dynamic>{
+      ...meta,
+      ...replyPayload,
+      'local_only': true,
+      'delivery_status': 'sending',
+      'retry_payload': retryPayload,
+    };
+    sendingMeta.remove('error_message');
+
+    _upsertMessage({
+      ...message,
+      'client_msg_id': nextClientMsgId,
+      'meta': sendingMeta,
+    });
+
+    try {
+      final resp = await authService.dio.post(
+        '/api/chats/${widget.chatId}/messages',
+        data: {
+          'text': text,
+          'client_msg_id': nextClientMsgId,
+          ...replyPayload,
+        },
+      );
+      if (resp.statusCode == 200 || resp.statusCode == 201) {
+        final data = resp.data;
+        if (data is Map && data['ok'] == true && data['data'] is Map) {
+          _upsertMessage(
+            Map<String, dynamic>.from(data['data']),
+            autoScroll: true,
+          );
+          await playAppSound(AppUiSound.sent);
+          return;
+        }
+      }
+      throw Exception('Сервер не принял повторную отправку');
+    } catch (e) {
+      _upsertMessage({
+        ...message,
+        'client_msg_id': nextClientMsgId,
+        'meta': {
+          ...sendingMeta,
+          'delivery_status': 'error',
+          'error_message': _extractDioError(e),
+        },
+      });
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось повторно отправить сообщение',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+    }
+  }
+
   Future<void> _send() async {
     if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
@@ -3488,6 +4911,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     final currentUser = authService.currentUser;
     final clientMsgId = _generateClientMessageId();
+    final replyPayload = _currentReplyPayload();
     final optimisticMessage = <String, dynamic>{
       'id': 'temp-$clientMsgId',
       'client_msg_id': clientMsgId,
@@ -3501,15 +4925,24 @@ class _ChatScreenState extends State<ChatScreen> {
       'from_me': true,
       'read_by_others': false,
       'read_count': 0,
-      'meta': {'delivery_status': 'sending', 'local_only': true},
+      'meta': {
+        'delivery_status': 'sending',
+        'local_only': true,
+        'retry_payload': _buildTextRetryPayload(
+          text: text,
+          replyPayload: replyPayload,
+        ),
+        ...replyPayload,
+      },
     };
     _controller.clear();
+    _clearReplyComposer();
     _upsertMessage(optimisticMessage, autoScroll: true);
 
     try {
       final resp = await authService.dio.post(
         '/api/chats/${widget.chatId}/messages',
-        data: {'text': text, 'client_msg_id': clientMsgId},
+        data: {'text': text, 'client_msg_id': clientMsgId, ...replyPayload},
       );
       if (resp.statusCode == 200 || resp.statusCode == 201) {
         final data = resp.data;
@@ -3527,6 +4960,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ..._metaMapOf(optimisticMessage['meta']),
         'delivery_status': 'error',
         'local_only': true,
+        'error_message': _extractDioError(e),
       };
       _upsertMessage(failed, autoScroll: true);
       if (!mounted) return;
@@ -3722,6 +5156,197 @@ class _ChatScreenState extends State<ChatScreen> {
       return normalizedTextCode;
     }
     return null;
+  }
+
+  String _reservedDateLabelOf(Map<String, dynamic> message) {
+    final date = _parseDate(message['created_at']);
+    return date == null ? 'Без даты' : _formatDateLabel(date);
+  }
+
+  DateTime? _reservedDayOf(Map<String, dynamic> message) {
+    final date = _parseDate(message['created_at']);
+    if (date == null) return null;
+    return DateTime(date.year, date.month, date.day);
+  }
+
+  String _reservedShelfLabelOf(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final processingMode = (meta['processing_mode'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    if (processingMode == 'oversize' || meta['is_oversize'] == true) {
+      return 'Габарит';
+    }
+    final shelf = (meta['shelf_number'] ?? '').toString().trim();
+    return shelf.isEmpty ? 'Без полки' : 'Полка $shelf';
+  }
+
+  int _reservedShelfSortKeyOf(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final processingMode = (meta['processing_mode'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    if (processingMode == 'oversize' || meta['is_oversize'] == true) {
+      return 1 << 20;
+    }
+    final shelf = int.tryParse((meta['shelf_number'] ?? '').toString().trim());
+    return shelf ?? ((1 << 20) - 1);
+  }
+
+  String _reservedClientNameOf(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final name = (meta['client_name'] ?? '').toString().trim();
+    if (name.isNotEmpty) return name;
+    final senderName = _senderNameOf(message).trim();
+    return senderName.isNotEmpty ? senderName : 'Клиент';
+  }
+
+  String _reservedClientPhoneOf(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    return _formatDisplayPhone(
+      (meta['client_phone'] ?? '').toString().trim(),
+      fallback: '',
+    );
+  }
+
+  int _compareReservedTimelineMessages(
+    Map<String, dynamic> a,
+    Map<String, dynamic> b,
+  ) {
+    final dayA = _reservedDayOf(a);
+    final dayB = _reservedDayOf(b);
+    if (dayA == null && dayB != null) return -1;
+    if (dayA != null && dayB == null) return 1;
+    if (dayA != null && dayB != null) {
+      final byDay = dayA.compareTo(dayB);
+      if (byDay != 0) return byDay;
+    }
+
+    final byShelf = _reservedShelfSortKeyOf(a).compareTo(_reservedShelfSortKeyOf(b));
+    if (byShelf != 0) return byShelf;
+
+    final byClientName = _reservedClientNameOf(a).toLowerCase().compareTo(
+      _reservedClientNameOf(b).toLowerCase(),
+    );
+    if (byClientName != 0) return byClientName;
+
+    final byClientPhone = _reservedClientPhoneOf(a).compareTo(
+      _reservedClientPhoneOf(b),
+    );
+    if (byClientPhone != 0) return byClientPhone;
+
+    final byTime = _compareByCreatedAt(a, b);
+    if (byTime != 0) return byTime;
+
+    final productA = int.tryParse(_reservedProductCodeOf(a) ?? '') ?? 0;
+    final productB = int.tryParse(_reservedProductCodeOf(b) ?? '') ?? 0;
+    return productA.compareTo(productB);
+  }
+
+  String _reservedSectionKeyOf(Map<String, dynamic> message) {
+    return [
+      _reservedDateLabelOf(message),
+      _reservedShelfLabelOf(message),
+      _reservedClientNameOf(message),
+      _reservedClientPhoneOf(message),
+    ].join('|');
+  }
+
+  bool _reservedIsPlaced(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final cartItemId = (meta['cart_item_id'] ?? '').toString().trim();
+    return meta['placed'] == true ||
+        (cartItemId.isNotEmpty && _placedCartItemIds.contains(cartItemId));
+  }
+
+  bool _reservedIsOversize(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final processingMode = (meta['processing_mode'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    return processingMode == 'oversize' || meta['is_oversize'] == true;
+  }
+
+  String _reservedShelfNumberValue(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    return (meta['shelf_number'] ?? '').toString().trim();
+  }
+
+  bool _matchesReservedQuickFilter(
+    Map<String, dynamic> message, {
+    MessengerReservedQuickFilter? filter,
+  }) {
+    if (!_isReservedOrdersChat() && !_isReservedOrder(message)) return true;
+    return messengerMatchesReservedQuickFilter(
+      filter: filter ?? _reservedQuickFilter,
+      isPlaced: _reservedIsPlaced(message),
+      isOversize: _reservedIsOversize(message),
+      shelfNumber: _reservedShelfNumberValue(message),
+    );
+  }
+
+  List<Map<String, dynamic>> _messagesMatchingCurrentSearch() {
+    if (_searchQuery.trim().isNotEmpty && _serverSearchLoaded) {
+      return [..._serverSearchMessages]..sort(_compareByCreatedAt);
+    }
+    return _messages.where((m) => _messageMatchesSearch(m, _searchQuery)).toList()
+      ..sort(_compareByCreatedAt);
+  }
+
+  int _reservedQuickFilterCount(MessengerReservedQuickFilter filter) {
+    return _messagesMatchingCurrentSearch()
+        .where((message) => _matchesReservedQuickFilter(message, filter: filter))
+        .length;
+  }
+
+  Widget _buildReservedQuickFilterBar() {
+    if (!_isReservedOrdersChat()) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final baseMessages = _messagesMatchingCurrentSearch();
+    if (baseMessages.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: MessengerReservedQuickFilter.values.map((filter) {
+            final count = _reservedQuickFilterCount(filter);
+            final selected = _reservedQuickFilter == filter;
+            return Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: ChoiceChip(
+                label: Text(
+                  '${messengerReservedQuickFilterLabel(filter)} · $count',
+                ),
+                selected: selected,
+                onSelected: (_) {
+                  if (!mounted) return;
+                  setState(() => _reservedQuickFilter = filter);
+                },
+                visualDensity: const VisualDensity(horizontal: -1, vertical: -1),
+                selectedColor: theme.colorScheme.secondaryContainer,
+                side: BorderSide(
+                  color: selected
+                      ? theme.colorScheme.secondary
+                      : theme.colorScheme.outlineVariant,
+                ),
+                labelStyle: theme.textTheme.labelMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
+                  color: selected
+                      ? theme.colorScheme.onSecondaryContainer
+                      : theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            );
+          }).toList(growable: false),
+        ),
+      ),
+    );
   }
 
   bool _isDeliveryOffer(Map<String, dynamic> message) {
@@ -3984,88 +5609,51 @@ class _ChatScreenState extends State<ChatScreen> {
     String addressText = '';
     String preferredTimeFrom = '';
     String preferredTimeTo = '';
+    String entrance = '';
+    String comment = '';
+    double? lat;
+    double? lng;
+    String? provider;
+    String? providerAddressId;
+    Map<String, dynamic>? addressStructured;
+    bool saveAsDefault = true;
+    bool confirmSelection = false;
     if (accepted) {
-      var addressDraft = (meta['address_text'] ?? '').toString();
-      var afterDraft = (meta['preferred_time_from'] ?? '').toString();
-      var beforeDraft = (meta['preferred_time_to'] ?? '').toString();
-      final result = await showDialog<Map<String, String>>(
+      final result = await showDialog<Map<String, dynamic>>(
         context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Адрес доставки'),
-          content: SizedBox(
-            width: 420,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextFormField(
-                  initialValue: addressDraft,
-                  onChanged: (value) => addressDraft = value,
-                  minLines: 2,
-                  maxLines: 4,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      hintText: 'Самара, улица, дом, подъезд',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextFormField(
-                        initialValue: afterDraft,
-                        onChanged: (value) => afterDraft = value,
-                        decoration: withInputLanguageBadge(
-                          const InputDecoration(
-                            labelText: 'После',
-                            hintText: '10:00',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextFormField(
-                        initialValue: beforeDraft,
-                        onChanged: (value) => beforeDraft = value,
-                        decoration: withInputLanguageBadge(
-                          const InputDecoration(
-                            labelText: 'До',
-                            hintText: '16:00',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Отмена'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(ctx).pop({
-                'address_text': addressDraft.trim(),
-                'preferred_time_from': afterDraft.trim(),
-                'preferred_time_to': beforeDraft.trim(),
-              }),
-              child: const Text('Отправить'),
-            ),
-          ],
+        builder: (ctx) => DeliveryAddressPickerDialog(
+          title: 'Адрес доставки',
+          initialAddressText: (meta['address_text'] ?? '').toString(),
+          initialEntrance: (meta['entrance'] ?? '').toString(),
+          initialComment: (meta['comment'] ?? '').toString(),
+          initialPreferredTimeFrom: (meta['preferred_time_from'] ?? '')
+              .toString(),
+          initialPreferredTimeTo: (meta['preferred_time_to'] ?? '').toString(),
         ),
       );
-      if (result == null || (result['address_text'] ?? '').trim().isEmpty) {
+      if (result == null || (result['address_text'] ?? '').toString().trim().isEmpty) {
         return;
       }
-      addressText = (result['address_text'] ?? '').trim();
-      preferredTimeFrom = (result['preferred_time_from'] ?? '').trim();
-      preferredTimeTo = (result['preferred_time_to'] ?? '').trim();
+      addressText = (result['address_text'] ?? '').toString().trim();
+      preferredTimeFrom =
+          (result['preferred_time_from'] ?? '').toString().trim();
+      preferredTimeTo = (result['preferred_time_to'] ?? '').toString().trim();
+      entrance = (result['entrance'] ?? '').toString().trim();
+      comment = (result['comment'] ?? '').toString().trim();
+      lat = (result['lat'] is num) ? (result['lat'] as num).toDouble() : null;
+      lng = (result['lng'] is num) ? (result['lng'] as num).toDouble() : null;
+      provider = (result['provider'] ?? '').toString().trim().isEmpty
+          ? null
+          : (result['provider'] ?? '').toString().trim();
+      providerAddressId =
+          (result['provider_address_id'] ?? '').toString().trim().isEmpty
+          ? null
+          : (result['provider_address_id'] ?? '').toString().trim();
+      addressStructured = result['address_structured'] is Map
+          ? Map<String, dynamic>.from(result['address_structured'] as Map)
+          : null;
+      saveAsDefault = result['save_as_default'] != false;
+      confirmSelection = result['confirm_selection'] == true;
     }
 
     try {
@@ -4074,6 +5662,17 @@ class _ChatScreenState extends State<ChatScreen> {
         data: {
           'accepted': accepted,
           if (accepted) 'address_text': addressText,
+          if (accepted && lat != null) 'lat': lat,
+          if (accepted && lng != null) 'lng': lng,
+          if (accepted && entrance.isNotEmpty) 'entrance': entrance,
+          if (accepted && comment.isNotEmpty) 'comment': comment,
+          if (accepted && provider != null) 'provider': provider,
+          if (accepted && providerAddressId != null)
+            'provider_address_id': providerAddressId,
+          if (accepted && addressStructured != null)
+            'address_structured': addressStructured,
+          if (accepted) 'save_as_default': saveAsDefault,
+          if (accepted && confirmSelection) 'confirm_selection': true,
           if (accepted && preferredTimeFrom.isNotEmpty)
             'preferred_time_from': preferredTimeFrom,
           if (accepted && preferredTimeTo.isNotEmpty)
@@ -4319,36 +5918,87 @@ class _ChatScreenState extends State<ChatScreen> {
     return parsed;
   }
 
+  void _scheduleServerSearch() {
+    _searchDebounceTimer?.cancel();
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 280), () {
+      unawaited(_performServerSearch());
+    });
+  }
+
+  Future<void> _performServerSearch() async {
+    final query = _searchQuery.trim();
+    if (query.isEmpty) return;
+    if (mounted) {
+      setState(() {
+        _serverSearchLoading = true;
+      });
+    } else {
+      _serverSearchLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/chats/${widget.chatId}/search',
+        queryParameters: {'q': query},
+      );
+      final data = resp.data;
+      final results =
+          (data is Map && data['ok'] == true && data['data'] is List)
+          ? (List<Map<String, dynamic>>.from(data['data'])
+            ..sort(_compareByCreatedAt))
+          : const <Map<String, dynamic>>[];
+      if (_searchQuery.trim() != query) return;
+      if (!mounted) {
+        _serverSearchMessages = results;
+        _serverSearchLoaded = true;
+        _serverSearchLoading = false;
+        _recomputeSearchResults(keepCurrent: false);
+        return;
+      }
+      setState(() {
+        _serverSearchMessages = results;
+        _serverSearchLoaded = true;
+        _serverSearchLoading = false;
+      });
+      _recomputeSearchResults(keepCurrent: false);
+    } catch (_) {
+      if (_searchQuery.trim() != query) return;
+      if (!mounted) {
+        _serverSearchMessages = const [];
+        _serverSearchLoaded = true;
+        _serverSearchLoading = false;
+        _recomputeSearchResults(keepCurrent: false);
+        return;
+      }
+      setState(() {
+        _serverSearchMessages = const [];
+        _serverSearchLoaded = true;
+        _serverSearchLoading = false;
+      });
+      _recomputeSearchResults(keepCurrent: false);
+    }
+  }
+
   bool _messageMatchesSearch(Map<String, dynamic> message, String query) {
     if (query.isEmpty) return true;
-    final rawQuery = query.trim();
-    if (rawQuery.isEmpty) return true;
-    if (RegExp(r'^\d+$').hasMatch(rawQuery) &&
-        (_isReservedOrdersChat() || _isReservedOrder(message))) {
-      final productCode = _reservedProductCodeOf(message);
-      if (productCode == null || productCode.isEmpty) return false;
-      return productCode == rawQuery;
-    }
-
-    final q = query.toLowerCase();
     final text = (message['text'] ?? '').toString().toLowerCase();
     final meta = _metaMapOf(message['meta']);
-    final blobs = [
-      text,
-      (meta['title'] ?? '').toString().toLowerCase(),
-      (meta['description'] ?? '').toString().toLowerCase(),
-      (meta['client_name'] ?? '').toString().toLowerCase(),
-      (meta['product_code'] ?? '').toString().toLowerCase(),
-      (meta['client_phone'] ?? '').toString().toLowerCase(),
-    ];
-    return blobs.any((x) => x.contains(q));
+    return messengerMatchesReservedSearch(
+      query: query,
+      reservedContext: _isReservedOrdersChat() || _isReservedOrder(message),
+      text: text,
+      title: (meta['title'] ?? '').toString(),
+      description: (meta['description'] ?? '').toString(),
+      clientName: (meta['client_name'] ?? '').toString(),
+      productCode: _reservedProductCodeOf(message) ?? '',
+      clientPhone: (meta['client_phone'] ?? '').toString(),
+    );
   }
 
   List<Map<String, dynamic>> _visibleMessages() {
-    final filtered =
-        _messages.where((m) => _messageMatchesSearch(m, _searchQuery)).toList()
-          ..sort(_compareByCreatedAt);
-    return filtered;
+    return _messagesMatchingCurrentSearch()
+      .where((message) => _matchesReservedQuickFilter(message))
+      .toList()
+      ..sort(_compareByCreatedAt);
   }
 
   void _recomputeSearchResults({bool keepCurrent = true}) {
@@ -4428,9 +6078,83 @@ class _ChatScreenState extends State<ChatScreen> {
   List<Map<String, dynamic>> _buildTimeline(
     List<Map<String, dynamic>> messages,
   ) {
+    if (_isReservedOrdersChat()) {
+      final sorted = [...messages]..sort(_compareReservedTimelineMessages);
+      final items = <Map<String, dynamic>>[];
+      final unreadDividerMessageId = messengerShouldShowUnreadDivider(
+            searchQuery: _searchQuery,
+            firstUnreadMessageId: _firstUnreadMessageId,
+          )
+          ? (_firstUnreadMessageId ?? '').trim()
+          : '';
+      final groupCounts = <String, int>{};
+      for (final message in sorted) {
+        groupCounts.update(
+          _reservedSectionKeyOf(message),
+          (value) => value + 1,
+          ifAbsent: () => 1,
+        );
+      }
+
+      String? previousDate;
+      String? previousGroup;
+      var insertedUnreadDivider = false;
+      for (final message in sorted) {
+        final messageId = _messageIdOf(message);
+        if (!insertedUnreadDivider &&
+            unreadDividerMessageId.isNotEmpty &&
+            messageId == unreadDividerMessageId) {
+          items.add({
+            'type': 'unread_divider',
+            'unread_count': _unreadCount,
+          });
+          insertedUnreadDivider = true;
+        }
+
+        final dateLabel = _reservedDateLabelOf(message);
+        if (dateLabel != previousDate) {
+          items.add({'type': 'reserved_date_section', 'label': dateLabel});
+          previousDate = dateLabel;
+          previousGroup = null;
+        }
+
+        final groupKey = _reservedSectionKeyOf(message);
+        if (groupKey != previousGroup) {
+          items.add({
+            'type': 'reserved_group_header',
+            'label': _reservedClientNameOf(message),
+            'client_phone': _reservedClientPhoneOf(message),
+            'shelf_label': _reservedShelfLabelOf(message),
+            'count': groupCounts[groupKey] ?? 1,
+          });
+          previousGroup = groupKey;
+        }
+
+        items.add({'type': 'message', 'data': message});
+      }
+      return items;
+    }
+
     final items = <Map<String, dynamic>>[];
     String? prevDate;
+    final unreadDividerMessageId = messengerShouldShowUnreadDivider(
+          searchQuery: _searchQuery,
+          firstUnreadMessageId: _firstUnreadMessageId,
+        )
+        ? (_firstUnreadMessageId ?? '').trim()
+        : '';
+    var insertedUnreadDivider = false;
     for (final message in messages) {
+      final messageId = _messageIdOf(message);
+      if (!insertedUnreadDivider &&
+          unreadDividerMessageId.isNotEmpty &&
+          messageId == unreadDividerMessageId) {
+        items.add({
+          'type': 'unread_divider',
+          'unread_count': _unreadCount,
+        });
+        insertedUnreadDivider = true;
+      }
       final d = _parseDate(message['created_at']);
       final dateLabel = d == null ? 'Без даты' : _formatDateLabel(d);
       if (dateLabel != prevDate) {
@@ -4440,6 +6164,156 @@ class _ChatScreenState extends State<ChatScreen> {
       items.add({'type': 'message', 'data': message});
     }
     return items;
+  }
+
+  Widget _buildUnreadDivider() {
+    final unreadLabel = _unreadCount > 0
+        ? 'Непрочитанные • $_unreadCount'
+        : 'Непрочитанные';
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Divider(
+              color: theme.colorScheme.primary.withValues(alpha: 0.35),
+            ),
+          ),
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.primaryContainer,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              unreadLabel,
+              style: TextStyle(
+                color: theme.colorScheme.onPrimaryContainer,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Divider(
+              color: theme.colorScheme.primary.withValues(alpha: 0.35),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReservedDateSection(String label) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 14, 12, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Divider(
+              color: theme.colorScheme.outlineVariant.withValues(alpha: 0.65),
+            ),
+          ),
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: theme.colorScheme.outlineVariant),
+            ),
+            child: Text(
+              label,
+              style: TextStyle(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Divider(
+              color: theme.colorScheme.outlineVariant.withValues(alpha: 0.65),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReservedGroupHeader(
+    ThemeData theme, {
+    required String shelfLabel,
+    required String clientName,
+    required String clientPhone,
+    required int count,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerLowest,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                shelfLabel,
+                style: TextStyle(
+                  color: theme.colorScheme.onPrimaryContainer,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+            Text(
+              clientName.isEmpty ? 'Клиент' : clientName,
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            if (clientPhone.trim().isNotEmpty)
+              Text(
+                clientPhone,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.secondaryContainer,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                count == 1 ? '1 товар' : '$count шт.',
+                style: TextStyle(
+                  color: theme.colorScheme.onSecondaryContainer,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Map<String, String> _extractCatalogTexts(String text) {
@@ -4712,12 +6586,225 @@ class _ChatScreenState extends State<ChatScreen> {
     return value.clamp(1.0, 4.0);
   }
 
+  String? _replyToMessageIdOf(Map<String, dynamic> meta) {
+    final value = (meta['reply_to_message_id'] ?? '').toString().trim();
+    return value.isEmpty ? null : value;
+  }
+
+  String _replyPreviewTextOf(Map<String, dynamic> meta) {
+    final value = (meta['reply_preview_text'] ?? '').toString().trim();
+    return value;
+  }
+
+  String _replyPreviewSenderNameOf(Map<String, dynamic> meta) {
+    final value = (meta['reply_preview_sender_name'] ?? '').toString().trim();
+    return value;
+  }
+
+  String _forwardedSenderNameOf(Map<String, dynamic> meta) {
+    return (meta['forwarded_from_sender_name'] ?? '').toString().trim();
+  }
+
+  Widget _buildForwardedHeader(ThemeData theme, Map<String, dynamic> meta) {
+    final forwardedBy = _forwardedSenderNameOf(meta);
+    if (forwardedBy.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Icon(
+            Icons.forward_to_inbox_outlined,
+            size: 14,
+            color: theme.colorScheme.primary,
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              messengerForwardedHeaderText(forwardedBy),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: theme.colorScheme.primary,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReplyPreviewBubble(
+    ThemeData theme,
+    Map<String, dynamic> meta, {
+    required bool fromMe,
+  }) {
+    final replyMessageId = _replyToMessageIdOf(meta);
+    final previewText = _replyPreviewTextOf(meta);
+    final previewSender = _replyPreviewSenderNameOf(meta);
+    if (replyMessageId == null && previewText.isEmpty && previewSender.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return GestureDetector(
+      onTap: replyMessageId == null ? null : () => _jumpToMessageById(replyMessageId),
+      child: Container(
+        width: double.infinity,
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+        decoration: BoxDecoration(
+          color: fromMe
+              ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
+              : theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.7),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: theme.colorScheme.outlineVariant,
+          ),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 4,
+              height: 34,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    messengerReplyHeaderText(previewSender),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: theme.colorScheme.primary,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 12,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    previewText.isEmpty ? 'Сообщение' : previewText,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: fromMe
+                          ? theme.colorScheme.onPrimaryContainer
+                          : theme.colorScheme.onSurfaceVariant,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (replyMessageId != null)
+              Icon(
+                Icons.arrow_upward_rounded,
+                size: 16,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   String _deliveryStatusOf(Map<String, dynamic> message) {
     final meta = _metaMapOf(message['meta']);
     final forced = (meta['delivery_status'] ?? '').toString().trim();
     if (forced.isNotEmpty) return forced;
     if (message['read_by_others'] == true) return 'read';
     return 'sent';
+  }
+
+  String _editedBadgeText(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    return messengerEditedBadgeText(
+      editedByRole: (meta['edited_by_role'] ?? '').toString(),
+      editedByName: (meta['edited_by_name'] ?? '').toString(),
+      senderName: (message['sender_name'] ?? '').toString(),
+    );
+  }
+
+  Future<void> _openEditHistory(Map<String, dynamic> message) async {
+    final messageId = _messageIdOf(message);
+    if (messageId.isEmpty) return;
+    try {
+      final resp = await authService.dio.get(
+        '/api/chats/${widget.chatId}/messages/$messageId/edit-history',
+      );
+      final data = resp.data;
+      final rows = data is Map && data['ok'] == true && data['data'] is List
+          ? List<Map<String, dynamic>>.from(data['data'])
+          : const <Map<String, dynamic>>[];
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        builder: (ctx) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'История правок',
+                  style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (rows.isEmpty)
+                  const Text('История пока пуста')
+                else
+                  Flexible(
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: rows.length,
+                      separatorBuilder: (_, _) => const Divider(height: 18),
+                      itemBuilder: (_, index) {
+                        final row = rows[index];
+                        final previousText = (row['previous_text'] ?? '')
+                            .toString()
+                            .trim();
+                        final editedByName = (row['edited_by_name'] ?? 'Система')
+                            .toString()
+                            .trim();
+                        final editedAt = formatDateTimeValue(row['edited_at']);
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '$editedByName • $editedAt',
+                              style: Theme.of(ctx).textTheme.labelMedium,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(previousText.isEmpty ? 'Без текста' : previousText),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось открыть историю правок: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
   }
 
   Widget _buildDeliveryStatusIcon(
@@ -4728,6 +6815,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!fromMe) return const SizedBox.shrink();
 
     final (icon, color) = switch (status) {
+      'uploading' => (
+        Icons.cloud_upload_outlined,
+        theme.colorScheme.onPrimaryContainer.withValues(alpha: 0.78),
+      ),
       'sending' => (
         Icons.schedule_rounded,
         theme.colorScheme.onPrimaryContainer.withValues(alpha: 0.78),
@@ -4741,6 +6832,92 @@ class _ChatScreenState extends State<ChatScreen> {
     };
 
     return Icon(icon, size: 16, color: color);
+  }
+
+  Widget _buildLocalLifecycleRow(
+    ThemeData theme,
+    Map<String, dynamic> message,
+    Map<String, dynamic> meta,
+  ) {
+    if (meta['local_only'] != true) return const SizedBox.shrink();
+    final status = (meta['delivery_status'] ?? '').toString().trim();
+    if (status != 'uploading' && status != 'sending' && status != 'error') {
+      return const SizedBox.shrink();
+    }
+
+    final retryable = _isRetryableFailedMessage(message);
+    final progressRaw = meta['local_upload_progress'];
+    final progress = progressRaw is num
+        ? progressRaw.toDouble().clamp(0.0, 1.0)
+        : double.tryParse('${meta['local_upload_progress'] ?? ''}')
+            ?.clamp(0.0, 1.0);
+    final progressPercent = progress == null
+        ? null
+        : (progress * 100).round().clamp(0, 100);
+    final label = messengerLocalDeliveryLabel(
+      status,
+      progress: progressPercent == null ? null : progress,
+      retryable: retryable,
+    );
+    final chipBackground = switch (status) {
+      'uploading' || 'sending' => theme.colorScheme.surfaceContainerHigh,
+      'error' => theme.colorScheme.errorContainer,
+      _ => theme.colorScheme.surfaceContainerHigh,
+    };
+    final chipForeground = switch (status) {
+      'uploading' || 'sending' => theme.colorScheme.onSurfaceVariant,
+      'error' => theme.colorScheme.onErrorContainer,
+      _ => theme.colorScheme.onSurfaceVariant,
+    };
+    final chipChild = status == 'uploading' || status == 'sending'
+        ? const SizedBox(
+            width: 12,
+            height: 12,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          )
+        : const Icon(Icons.error_outline_rounded, size: 14);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: chipBackground,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconTheme(
+                  data: IconThemeData(color: chipForeground, size: 14),
+                  child: chipChild,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: chipForeground,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (status == 'error' && retryable)
+            TextButton.icon(
+              onPressed: () => _retryFailedMessage(message),
+              icon: const Icon(Icons.refresh_rounded, size: 16),
+              label: const Text('Повторить'),
+            ),
+        ],
+      ),
+    );
   }
 
   Future<void> _editMessage(Map<String, dynamic> message) async {
@@ -4897,18 +7074,190 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _replyToMessage(String text) {
+  void _clearReplyComposer() {
+    if (!mounted) {
+      _replyToMessageId = null;
+      _replyPreviewText = null;
+      _replyPreviewSenderName = null;
+      return;
+    }
+    setState(() {
+      _replyToMessageId = null;
+      _replyPreviewText = null;
+      _replyPreviewSenderName = null;
+    });
+  }
+
+  bool _canForwardMessage(Map<String, dynamic> message) {
+    if (_isReservedOrder(message)) return false;
+    final meta = _metaMapOf(message['meta']);
+    final kind = (meta['kind'] ?? '').toString().trim().toLowerCase();
+    if (kind == 'delivery_offer' || kind == 'delivery_status') return false;
+    return !_isHiddenForAll(message);
+  }
+
+  String _forwardTextOf(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final attachmentType = _attachmentTypeOf(meta);
+    final text = (message['text'] ?? '').toString().trim();
+    final caption = _captionTextOf(message, meta).trim();
+    switch (attachmentType) {
+      case 'image':
+        return caption.isNotEmpty ? caption : 'Фото';
+      case 'voice':
+        return 'Голосовое сообщение';
+      case 'video':
+        return caption.isNotEmpty ? caption : 'Видеосообщение';
+      default:
+        return text;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _pickForwardTargetChat() async {
+    try {
+      final resp = await authService.dio.get('/api/chats/list');
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) {
+        return null;
+      }
+      final chats = List<Map<String, dynamic>>.from(data['data'])
+          .where((chat) {
+            final kind = (_chatStateMapOf(chat['settings'])['kind'] ?? '')
+                .toString()
+                .trim()
+                .toLowerCase();
+            return kind != 'reserved_orders' &&
+                kind != 'delivery' &&
+                kind != 'delivery_chat';
+          })
+          .where((chat) => (chat['id'] ?? '').toString().trim() != widget.chatId)
+          .toList()
+        ..sort((a, b) {
+          final ad = _parseDate(a['updated_at'] ?? a['time']);
+          final bd = _parseDate(b['updated_at'] ?? b['time']);
+          if (ad == null && bd == null) return 0;
+          if (ad == null) return 1;
+          if (bd == null) return -1;
+          return bd.compareTo(ad);
+        });
+      if (!mounted) return null;
+      return showModalBottomSheet<Map<String, dynamic>>(
+        context: context,
+        showDragHandle: true,
+        builder: (ctx) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Переслать в чат',
+                  style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Flexible(
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: chats.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final chat = chats[index];
+                      final title = (chat['display_title'] ?? chat['title'] ?? 'Чат')
+                          .toString()
+                          .trim();
+                      final subtitle = (chat['last_message'] ?? '').toString().trim();
+                      return ListTile(
+                        title: Text(title.isEmpty ? 'Чат' : title),
+                        subtitle: subtitle.isEmpty
+                            ? null
+                            : Text(
+                                subtitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                        onTap: () => Navigator.of(ctx).pop(chat),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _forwardMessage(Map<String, dynamic> message) async {
+    if (!_canForwardMessage(message)) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Эту карточку пока нельзя пересылать',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    final text = _forwardTextOf(message).trim();
+    if (text.isEmpty) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'В этом сообщении пока нечего пересылать',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    final targetChat = await _pickForwardTargetChat();
+    if (!mounted || targetChat == null) return;
+    final targetChatId = (targetChat['id'] ?? '').toString().trim();
+    if (targetChatId.isEmpty) return;
+    try {
+      await authService.dio.post(
+        '/api/chats/$targetChatId/messages',
+        data: {
+          'text': text,
+          'forwarded_from_message_id': _messageIdOf(message),
+          'forwarded_from_chat_id': widget.chatId,
+          'forwarded_from_sender_name': _senderNameOf(message),
+        },
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Сообщение переслано',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось переслать: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+      );
+    }
+  }
+
+  void _replyToMessage(Map<String, dynamic> message) {
+    final messageId = _messageIdOf(message);
+    if (messageId.isEmpty) return;
+    final text = _captionTextOf(message, _metaMapOf(message['meta']));
     final snippet = text.trim().replaceAll('\n', ' ');
-    if (snippet.isEmpty) return;
     final bounded = snippet.length > 120
         ? '${snippet.substring(0, 120)}…'
         : snippet;
-    final prefix = '↪ $bounded\n';
-    final old = _controller.text;
-    _controller.text = old.isEmpty ? prefix : '$old\n$prefix';
-    _controller.selection = TextSelection.fromPosition(
-      TextPosition(offset: _controller.text.length),
-    );
+    final preview = bounded.isEmpty ? 'Сообщение' : bounded;
+    final sender = _senderNameOf(message);
+    setState(() {
+      _replyToMessageId = messageId;
+      _replyPreviewText = preview;
+      _replyPreviewSenderName = sender;
+    });
     _inputFocusNode.requestFocus();
     _scrollToBottom(animated: true);
   }
@@ -4940,10 +7289,10 @@ class _ChatScreenState extends State<ChatScreen> {
         await _copyText(text);
       } else if (action == 'open_image') {
         if (imageUrl != null) {
-          _openImagePreview(imageUrl);
+          await _openImagePreviewForMessage(message, imageUrl);
         }
       } else if (action == 'reply') {
-        _replyToMessage(text);
+        _replyToMessage(message);
       } else if (action == 'edit') {
         await _editMessage(message);
       } else if (action == 'delete_me') {
@@ -4965,13 +7314,7 @@ class _ChatScreenState extends State<ChatScreen> {
           await _copyText(id);
         }
       } else if (action == 'forward') {
-        if (!mounted) return;
-        showAppNotice(
-          context,
-          'Пересылка появится в следующем обновлении',
-          tone: AppNoticeTone.warning,
-          duration: const Duration(seconds: 2),
-        );
+        await _forwardMessage(message);
       } else if (action == 'select') {
         if (!mounted) return;
         showAppNotice(
@@ -4981,10 +7324,18 @@ class _ChatScreenState extends State<ChatScreen> {
           duration: const Duration(seconds: 2),
         );
       } else if (action.startsWith('react:') && canReact) {
-        final messageId = message['id']?.toString() ?? '';
-        final emoji = action.substring('react:'.length).trim();
-        if (messageId.isNotEmpty && emoji.isNotEmpty) {
-          await _toggleMessageReaction(messageId, emoji);
+        final payload = action.substring('react:'.length).trim();
+        if (payload == 'more') {
+          final picked = await _openFullReactionPicker();
+          final messageId = message['id']?.toString() ?? '';
+          if (messageId.isNotEmpty && (picked ?? '').trim().isNotEmpty) {
+            await _toggleMessageReaction(messageId, picked!.trim());
+          }
+        } else {
+          final messageId = message['id']?.toString() ?? '';
+          if (messageId.isNotEmpty && payload.isNotEmpty) {
+            await _toggleMessageReaction(messageId, payload);
+          }
         }
       }
     }
@@ -5152,7 +7503,29 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           ),
                         );
-                      }).toList(),
+                      }).toList()
+                        ..add(
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 3),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(999),
+                              onTap: () =>
+                                  Navigator.of(ctx).pop('react:more'),
+                              child: Ink(
+                                padding: const EdgeInsets.all(7),
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: theme.colorScheme.surface,
+                                ),
+                                child: Icon(
+                                  Icons.add_reaction_outlined,
+                                  size: 24,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                     ),
                   ),
                 ),
@@ -6358,16 +8731,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final price = metaMap['price']?.toString() ?? '—';
     final quantity = metaMap['quantity']?.toString() ?? '—';
     final quantityInt = int.tryParse(quantity) ?? 0;
-    final cartItemId = metaMap['cart_item_id']?.toString() ?? '';
-    final isPlaced =
-        metaMap['placed'] == true ||
-        (cartItemId.isNotEmpty && _placedCartItemIds.contains(cartItemId));
-    final processingMode = (metaMap['processing_mode'] ?? '')
-        .toString()
-        .trim()
-        .toLowerCase();
-    final isOversizePlaced =
-        processingMode == 'oversize' || metaMap['is_oversize'] == true;
+    final isPlaced = _reservedIsPlaced(message);
+    final isOversizePlaced = _reservedIsOversize(message);
     final shelf = isOversizePlaced
         ? 'Габарит'
         : (metaMap['shelf_number']?.toString() ?? 'не назначена');
@@ -6460,7 +8825,16 @@ class _ChatScreenState extends State<ChatScreen> {
         (isImageMessage && captionText.isNotEmpty);
     final canCopyId = !isClient;
     final canOpenImage = imageUrl != null;
-    final canReact = hasMessageId && !isDeleted;
+    final reactionKind = (metaMap['kind'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final canReact =
+        hasMessageId &&
+        !isDeleted &&
+        !isReservedOrder &&
+        reactionKind != 'delivery_offer' &&
+        reactionKind != 'delivery_status';
     final media = MediaQuery.of(context);
     final maxBubbleWidth = media.size.width * 0.72;
     final isCompactMedia = media.size.width < 680;
@@ -6505,7 +8879,7 @@ class _ChatScreenState extends State<ChatScreen> {
         knownHeight:
             _positiveMediaDimension(metaMap['image_height']) ??
             cachedSize?.height,
-        onTap: () => _openImagePreview(imageUrl),
+        onTap: () => _openImagePreviewForMessage(message, imageUrl),
         onFramePainted: _onMediaFramePainted,
       );
     }
@@ -6522,6 +8896,7 @@ class _ChatScreenState extends State<ChatScreen> {
         if (byCount != 0) return byCount;
         return a.key.compareTo(b.key);
       });
+    final showLocalLifecycle = metaMap['local_only'] == true;
 
     final bubble = GestureDetector(
       onSecondaryTapDown: (details) => _showMessageActions(
@@ -6584,6 +8959,12 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               const SizedBox(height: 8),
             ],
+            if (_forwardedSenderNameOf(metaMap).isNotEmpty)
+              _buildForwardedHeader(theme, metaMap),
+            if (_replyToMessageIdOf(metaMap) != null ||
+                _replyPreviewTextOf(metaMap).isNotEmpty ||
+                _replyPreviewSenderNameOf(metaMap).isNotEmpty)
+              _buildReplyPreviewBubble(theme, metaMap, fromMe: fromMe),
             if (isDeliveryOffer) ...[
               Text(
                 offerDeliveryLabel,
@@ -6949,13 +9330,23 @@ class _ChatScreenState extends State<ChatScreen> {
               if (edited && !isDeleted && isPlainMessage)
                 Padding(
                   padding: const EdgeInsets.only(top: 4),
-                  child: Text(
-                    'изменено',
-                    style: TextStyle(
-                      color: fromMe
-                          ? theme.colorScheme.onPrimaryContainer
-                          : theme.colorScheme.onSurfaceVariant,
-                      fontSize: 11,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => _openEditHistory(message),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 2,
+                        vertical: 2,
+                      ),
+                      child: Text(
+                        _editedBadgeText(message),
+                        style: TextStyle(
+                          color: fromMe
+                              ? theme.colorScheme.onPrimaryContainer
+                              : theme.colorScheme.onSurfaceVariant,
+                          fontSize: 11,
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -7006,6 +9397,8 @@ class _ChatScreenState extends State<ChatScreen> {
                     }).toList(),
                   ),
                 ),
+              if (showLocalLifecycle)
+                _buildLocalLifecycleRow(theme, message, metaMap),
               if (timeLabel.isNotEmpty) ...[
                 const SizedBox(height: 6),
                 Align(
@@ -7112,6 +9505,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     final platform = defaultTargetPlatform;
+    final theme = Theme.of(context);
     final viewportWidth = MediaQuery.sizeOf(context).width;
     final isMobileLikePlatform =
         platform == TargetPlatform.android || platform == TargetPlatform.iOS;
@@ -7234,6 +9628,8 @@ class _ChatScreenState extends State<ChatScreen> {
                     ],
                   ),
                 ),
+              if (_isSupportTicketChat()) _buildSupportTicketBanner(),
+              if (_isReservedOrdersChat()) _buildReservedQuickFilterBar(),
               if (_isClientRole() && _offlineQueuedCount > 0)
                 Container(
                   width: double.infinity,
@@ -7280,59 +9676,19 @@ class _ChatScreenState extends State<ChatScreen> {
                     ],
                   ),
                 ),
-              if (_activePin != null)
-                GestureDetector(
-                  onTap: _jumpToPinnedMessage,
-                  child: Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-                    padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(
-                        color: Theme.of(context).colorScheme.outlineVariant,
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.push_pin,
-                          size: 18,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _pinPreviewText(),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodyMedium,
-                          ),
-                        ),
-                        if (_canPinMessages())
-                          IconButton(
-                            tooltip: 'Открепить',
-                            icon: const Icon(Icons.close, size: 18),
-                            onPressed: _unpinMessage,
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
+              if (_activePin != null) _buildActivePinPreview(theme),
               Expanded(
                 child: _loading
-                    ? const PhoenixLoadingView(
-                        title: 'Загрузка чата',
-                        subtitle: 'Подтягиваем сообщения и медиа',
-                      )
+                    ? const _ChatTimelineLoadingView()
                     : timeline.isEmpty
                     ? Center(
-                        child: Text(
-                          _searchQuery.isEmpty
-                              ? 'Нет сообщений'
-                              : 'Ничего не найдено',
-                        ),
+                        child: _searchQuery.isNotEmpty && _serverSearchLoading
+                            ? const CircularProgressIndicator()
+                            : Text(
+                                _searchQuery.isEmpty
+                                    ? 'Нет сообщений'
+                                    : 'Ничего не найдено',
+                              ),
                       )
                     : Stack(
                         children: [
@@ -7360,6 +9716,28 @@ class _ChatScreenState extends State<ChatScreen> {
                                         (row['label'] ?? 'Без даты').toString(),
                                       );
                                     }
+                                    if (row['type'] == 'reserved_date_section') {
+                                      return _buildReservedDateSection(
+                                        (row['label'] ?? 'Без даты').toString(),
+                                      );
+                                    }
+                                    if (row['type'] == 'reserved_group_header') {
+                                      return _buildReservedGroupHeader(
+                                        theme,
+                                        shelfLabel: (row['shelf_label'] ?? '')
+                                            .toString(),
+                                        clientName: (row['label'] ?? '')
+                                            .toString(),
+                                        clientPhone: (row['client_phone'] ?? '')
+                                            .toString(),
+                                        count:
+                                            int.tryParse('${row['count'] ?? 1}') ??
+                                            1,
+                                      );
+                                    }
+                                    if (row['type'] == 'unread_divider') {
+                                      return _buildUnreadDivider();
+                                    }
                                     final message = Map<String, dynamic>.from(
                                       row['data'] as Map,
                                     );
@@ -7369,6 +9747,13 @@ class _ChatScreenState extends State<ChatScreen> {
                               ),
                             ),
                           ),
+                          if (_loadingOlderMessages)
+                            const Positioned(
+                              top: 8,
+                              left: 16,
+                              right: 16,
+                              child: LinearProgressIndicator(minHeight: 3),
+                            ),
                           if (!_initialViewportReady)
                             const Positioned.fill(
                               child: PhoenixLoadingView(
@@ -7393,6 +9778,72 @@ class _ChatScreenState extends State<ChatScreen> {
                       style: TextStyle(
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                         fontSize: 12,
+                      ),
+                      ),
+                    ),
+                if ((_replyToMessageId ?? '').trim().isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 4,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              color: Theme.of(context).colorScheme.primary,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  (_replyPreviewSenderName ?? '').trim().isEmpty
+                                      ? 'Ответ'
+                                      : (_replyPreviewSenderName ?? '').trim(),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: Theme.of(context).colorScheme.primary,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  (_replyPreviewText ?? '').trim().isEmpty
+                                      ? 'Сообщение'
+                                      : (_replyPreviewText ?? '').trim(),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Отменить ответ',
+                            onPressed: _clearReplyComposer,
+                            icon: const Icon(Icons.close_rounded, size: 18),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        ],
                       ),
                     ),
                   ),
@@ -7628,27 +10079,44 @@ class _ChatScreenState extends State<ChatScreen> {
           Positioned(
             right: 14,
             bottom: scrollButtonBottom,
-            child: IgnorePointer(
-              ignoring: !_showScrollToBottomButton,
-              child: AnimatedSlide(
-                duration: const Duration(milliseconds: 180),
-                offset: _showScrollToBottomButton
-                    ? Offset.zero
-                    : const Offset(0, 0.6),
-                child: AnimatedOpacity(
-                  duration: const Duration(milliseconds: 180),
-                  opacity: _showScrollToBottomButton ? 1 : 0,
-                  child: FloatingActionButton.small(
-                    heroTag: 'chat-scroll-bottom',
-                    tooltip: 'В конец чата',
-                    onPressed: () {
-                      _keepBottomAnchor = true;
-                      _scrollToBottom(animated: true);
-                    },
-                    child: const Icon(Icons.keyboard_double_arrow_down_rounded),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                if ((_firstUnreadMessageId ?? '').trim().isNotEmpty &&
+                    _unreadCount > 0 &&
+                    !_searchMode)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: FloatingActionButton.small(
+                      heroTag: 'chat-jump-first-unread',
+                      tooltip: 'К первому непрочитанному',
+                      onPressed: _jumpToFirstUnread,
+                      child: const Icon(Icons.mark_chat_unread_outlined),
+                    ),
+                  ),
+                IgnorePointer(
+                  ignoring: !_showScrollToBottomButton,
+                  child: AnimatedSlide(
+                    duration: const Duration(milliseconds: 180),
+                    offset: _showScrollToBottomButton
+                        ? Offset.zero
+                        : const Offset(0, 0.6),
+                    child: AnimatedOpacity(
+                      duration: const Duration(milliseconds: 180),
+                      opacity: _showScrollToBottomButton ? 1 : 0,
+                      child: FloatingActionButton.small(
+                        heroTag: 'chat-scroll-bottom',
+                        tooltip: 'В конец чата',
+                        onPressed: () {
+                          _keepBottomAnchor = true;
+                          _scrollToBottom(animated: true);
+                        },
+                        child: const Icon(Icons.keyboard_double_arrow_down_rounded),
+                      ),
+                    ),
                   ),
                 ),
-              ),
+              ],
             ),
           ),
           if (_voiceRecording)
@@ -7693,6 +10161,165 @@ class _ChatScreenState extends State<ChatScreen> {
               child: _buildVideoRecordingBar(Theme.of(context)),
             ),
         ],
+      ),
+    );
+  }
+}
+
+class _ChatTimelineLoadingView extends StatelessWidget {
+  const _ChatTimelineLoadingView();
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      physics: const NeverScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 18),
+      children: const [
+        _ChatSkeletonDateDivider(),
+        SizedBox(height: 10),
+        _ChatSkeletonBubble(
+          alignEnd: false,
+          widthFactor: 0.62,
+          height: 92,
+          showThumb: true,
+        ),
+        SizedBox(height: 12),
+        _ChatSkeletonBubble(
+          alignEnd: true,
+          widthFactor: 0.54,
+          height: 64,
+        ),
+        SizedBox(height: 18),
+        _ChatSkeletonDateDivider(),
+        SizedBox(height: 10),
+        _ChatSkeletonBubble(
+          alignEnd: false,
+          widthFactor: 0.78,
+          height: 72,
+        ),
+        SizedBox(height: 12),
+        _ChatSkeletonBubble(
+          alignEnd: true,
+          widthFactor: 0.66,
+          height: 118,
+          showThumb: true,
+        ),
+      ],
+    );
+  }
+}
+
+class _ChatSkeletonDateDivider extends StatelessWidget {
+  const _ChatSkeletonDateDivider();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Container(
+        width: 108,
+        height: 26,
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(999),
+        ),
+      ),
+    );
+  }
+}
+
+class _ChatSkeletonBubble extends StatelessWidget {
+  const _ChatSkeletonBubble({
+    required this.alignEnd,
+    required this.widthFactor,
+    required this.height,
+    this.showThumb = false,
+  });
+
+  final bool alignEnd;
+  final double widthFactor;
+  final double height;
+  final bool showThumb;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final bubbleColor = alignEnd
+        ? theme.colorScheme.primaryContainer.withValues(alpha: 0.72)
+        : theme.colorScheme.surfaceContainerHigh;
+    final lineColor = alignEnd
+        ? theme.colorScheme.primary.withValues(alpha: 0.12)
+        : theme.colorScheme.surfaceContainerHighest;
+    final width = MediaQuery.of(context).size.width * widthFactor;
+    return Align(
+      alignment: alignEnd ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        constraints: BoxConstraints(maxWidth: width.clamp(220.0, 520.0)),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: bubbleColor,
+          borderRadius: BorderRadius.only(
+            topLeft: const Radius.circular(20),
+            topRight: const Radius.circular(20),
+            bottomLeft: Radius.circular(alignEnd ? 20 : 8),
+            bottomRight: Radius.circular(alignEnd ? 8 : 20),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (showThumb) ...[
+              Container(
+                height: height - 36,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(14),
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      lineColor,
+                      lineColor.withValues(alpha: 0.66),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+            FractionallySizedBox(
+              widthFactor: 0.86,
+              child: Container(
+                height: 12,
+                decoration: BoxDecoration(
+                  color: lineColor,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            FractionallySizedBox(
+              widthFactor: 0.58,
+              child: Container(
+                height: 12,
+                decoration: BoxDecoration(
+                  color: lineColor.withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Container(
+                width: 42,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: lineColor.withValues(alpha: 0.86),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -17,10 +17,14 @@ import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
 import 'services/input_language_service.dart';
+import 'services/native_push_service.dart';
 import 'services/native_update_installer.dart';
+import 'services/notification_open_tracker_service.dart';
 import 'services/offline_purchase_queue_service.dart';
 import 'services/web_notification_service.dart';
 import 'services/web_push_client_service.dart';
+import 'src/utils/media_url.dart';
+import 'src/utils/notification_navigation.dart';
 import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
 
@@ -45,7 +49,10 @@ late final AuthService authService;
 io.Socket? socket;
 final StreamController<Map<String, dynamic>> chatEventsController =
     StreamController.broadcast();
+final StreamController<Map<String, dynamic>> notificationEventsController =
+    StreamController<Map<String, dynamic>>.broadcast();
 final ValueNotifier<bool> notificationsEnabledNotifier = ValueNotifier(true);
+final ValueNotifier<int> notificationBadgeCountNotifier = ValueNotifier<int>(0);
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(
   ThemeMode.light,
 );
@@ -87,6 +94,13 @@ const bool _verboseSocketLogs = bool.fromEnvironment(
   'FENIX_VERBOSE_SOCKET_LOGS',
   defaultValue: false,
 );
+const String _localLoopbackHost = '127.0.0.1';
+const int _preferredLocalApiPort = 3001;
+const int _legacyLocalApiPort = 3000;
+
+String _buildLocalApiBaseUrl(int port, {String host = _localLoopbackHost}) {
+  return 'http://$host:$port';
+}
 
 void _socketVerboseLog(String message) {
   if (kDebugMode && _verboseSocketLogs) {
@@ -112,6 +126,12 @@ class _AppUpdateInfo {
   final String title;
   final String? message;
   final String? downloadUrl;
+  final String? changelog;
+  final String? channel;
+  final String? publishedAt;
+  final int? fileSize;
+  final String? sha256;
+  final Map<String, dynamic>? androidManifestEnvelope;
   final String platform;
   final _AppUpdateVersion current;
   final _AppUpdateVersion latest;
@@ -122,11 +142,61 @@ class _AppUpdateInfo {
     required this.title,
     required this.message,
     required this.downloadUrl,
+    required this.changelog,
+    required this.channel,
+    required this.publishedAt,
+    required this.fileSize,
+    required this.sha256,
+    required this.androidManifestEnvelope,
     required this.platform,
     required this.current,
     required this.latest,
     required this.minSupported,
   });
+
+  bool get hasAndroidManagedManifest =>
+      platform == 'android' && androidManifestEnvelope != null;
+}
+
+class _UpdateMetaChip extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _UpdateMetaChip({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: Colors.white.withValues(alpha: 0.84),
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class PhoneAccessOwnerRequest {
@@ -186,7 +256,7 @@ Map<String, dynamic> _phoneAccessRequestToEventMap(
 }
 
 String _defaultApiBaseUrl() {
-  const nativeDebugFallback = 'http://127.0.0.1:3000';
+  final nativeDebugFallback = _buildLocalApiBaseUrl(_preferredLocalApiPort);
   const nativeReleaseFallback = String.fromEnvironment(
     'FENIX_NATIVE_RELEASE_API_BASE_URL',
     defaultValue: 'https://garphoenix.com',
@@ -320,6 +390,20 @@ List<String> _buildApiBaseCandidates() {
   final scheme = (uri?.scheme.isNotEmpty ?? false) ? uri!.scheme : 'http';
   final path = (uri?.path ?? '').trim();
   final pathPart = path.isEmpty || path == '/' ? '' : path;
+  final isLocalLoopback =
+      host == '127.0.0.1' || host == 'localhost' || host == '0.0.0.0';
+
+  if (isLocalLoopback) {
+    for (final candidateHost in <String>{host, '127.0.0.1', 'localhost'}) {
+      for (final candidatePort in <int>{
+        _preferredLocalApiPort,
+        port,
+        _legacyLocalApiPort,
+      }) {
+        out.add('$scheme://$candidateHost:$candidatePort$pathPart');
+      }
+    }
+  }
 
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     if (host == '127.0.0.1' || host == 'localhost') {
@@ -350,7 +434,7 @@ String _buildConnectivityHint() {
   final base = _runtimeApiBaseUrl;
   final uri = Uri.tryParse(base);
   final host = uri?.host.toLowerCase().trim() ?? '';
-  final port = uri?.hasPort == true ? uri!.port : 3000;
+  final port = uri?.hasPort == true ? uri!.port : _preferredLocalApiPort;
 
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     if (host == '127.0.0.1' || host == 'localhost') {
@@ -360,6 +444,11 @@ String _buildConnectivityHint() {
           '2) Или запустите с LAN IP Mac:\n'
           '   flutter run --dart-define=FENIX_API_BASE_URL=http://<IP_Mac>:$port';
     }
+  }
+  if (!kIsWeb && (host == '127.0.0.1' || host == 'localhost')) {
+    return 'Проверьте, что локальный сервер запущен. '
+        'На этой машине мы обычно используем ${_buildLocalApiBaseUrl(_preferredLocalApiPort)} '
+        '(старый fallback: ${_buildLocalApiBaseUrl(_legacyLocalApiPort)}).';
   }
   return 'Проверьте, что сервер запущен и доступен по адресу $base';
 }
@@ -398,6 +487,12 @@ final ValueNotifier<_AppNoticePayload?> _appNoticeNotifier =
     ValueNotifier<_AppNoticePayload?>(null);
 int _appNoticeSeq = 0;
 Timer? _appNoticeTimer;
+bool _notificationFullscreenDialogOpen = false;
+bool _appUpdateDialogVisible = false;
+String? _dismissedForegroundUpdateToken;
+String? _lastForegroundUpdateToken;
+final Map<String, DateTime> _recentNotificationPresentationTimestamps =
+    <String, DateTime>{};
 
 class _SupportQueueNoticePayload {
   final String ticketId;
@@ -423,8 +518,10 @@ class _SupportQueueNoticePayload {
   });
 }
 
-final ValueNotifier<List<_SupportQueueNoticePayload>> _supportQueueNoticeNotifier =
-    ValueNotifier<List<_SupportQueueNoticePayload>>(const []);
+final ValueNotifier<List<_SupportQueueNoticePayload>>
+_supportQueueNoticeNotifier = ValueNotifier<List<_SupportQueueNoticePayload>>(
+  const [],
+);
 final ValueNotifier<Set<String>> _supportQueueClaimBusyNotifier =
     ValueNotifier<Set<String>>(<String>{});
 final ValueNotifier<String> activeShellSectionNotifier = ValueNotifier<String>(
@@ -557,7 +654,9 @@ Future<void> _refreshSupportQueueNotices() async {
       final queueResp = await dio.get('/api/support/tickets/queue');
       final queueData = queueResp.data;
       final queueRows =
-          queueData is Map && queueData['ok'] == true && queueData['data'] is List
+          queueData is Map &&
+              queueData['ok'] == true &&
+              queueData['data'] is List
           ? List<dynamic>.from(queueData['data'])
           : const <dynamic>[];
       for (final row in queueRows) {
@@ -1245,6 +1344,44 @@ int _compareVersionWithBuild(_AppUpdateVersion a, _AppUpdateVersion b) {
   return a.build.compareTo(b.build);
 }
 
+String _formatBytesRu(num rawBytes) {
+  final bytes = rawBytes < 0 ? 0 : rawBytes.toDouble();
+  const units = ['Б', 'КБ', 'МБ', 'ГБ'];
+  var value = bytes;
+  var unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  final digits = value >= 10 || unitIndex == 0 ? 0 : 1;
+  return '${value.toStringAsFixed(digits)} ${units[unitIndex]}';
+}
+
+String _formatEtaRu(int etaSeconds) {
+  if (etaSeconds < 0) return 'Время уточняется';
+  if (etaSeconds < 60) return '$etaSeconds сек';
+  final minutes = etaSeconds ~/ 60;
+  final seconds = etaSeconds % 60;
+  if (minutes < 60) {
+    if (seconds == 0) return '$minutes мин';
+    return '$minutes мин $seconds сек';
+  }
+  final hours = minutes ~/ 60;
+  final leftMinutes = minutes % 60;
+  if (leftMinutes == 0) return '$hours ч';
+  return '$hours ч $leftMinutes мин';
+}
+
+String? _formatRuDateTime(String? rawValue) {
+  final normalized = (rawValue ?? '').trim();
+  if (normalized.isEmpty) return null;
+  final parsed = DateTime.tryParse(normalized);
+  if (parsed == null) return null;
+  final local = parsed.toLocal();
+  return '${_twoDigits(local.day)}.${_twoDigits(local.month)}.${local.year} '
+      '${_twoDigits(local.hour)}:${_twoDigits(local.minute)}';
+}
+
 String? _resolveAppUpdatePlatform() {
   if (kIsWeb) return null;
   if (defaultTargetPlatform == TargetPlatform.android) return 'android';
@@ -1286,12 +1423,20 @@ String _fallbackInstallerNameForPlatform(
 }
 
 Future<bool> _downloadAndInstallAndroidUpdate({
-  required Uri uri,
-  required _AppUpdateVersion latest,
+  required _AppUpdateInfo info,
 }) async {
+  final envelope = info.androidManifestEnvelope;
+  if (envelope == null) {
+    showGlobalAppNotice(
+      'Manifest обновления не настроен на сервере. Попробуйте позже.',
+      title: 'Обновление Феникс',
+      tone: AppNoticeTone.error,
+    );
+    return false;
+  }
   if (_nativeAndroidUpdateBusy) {
     showGlobalAppNotice(
-      'Обновление уже скачивается. Дождитесь завершения текущей загрузки.',
+      'Обновление уже подготавливается. Можно вернуться к нему чуть позже.',
       title: 'Обновление Феникс',
       tone: AppNoticeTone.info,
     );
@@ -1299,73 +1444,24 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   }
 
   _nativeAndroidUpdateBusy = true;
-  final progress = ValueNotifier<double?>(null);
-  final stage = ValueNotifier<String>('Запускаем системную загрузку Android...');
-  BuildContext? dialogContext;
-  final context = navigatorKey.currentContext;
-
-  if (context != null && context.mounted) {
-    unawaited(
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) {
-          dialogContext = ctx;
-          return PopScope(
-            canPop: false,
-            child: AlertDialog(
-              title: const Text('Обновление Феникс'),
-              content: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 360),
-                child: ValueListenableBuilder<String>(
-                  valueListenable: stage,
-                  builder: (context, stageText, _) {
-                    return ValueListenableBuilder<double?>(
-                      valueListenable: progress,
-                      builder: (context, value, child) {
-                        final percentText = value == null
-                            ? 'Подождите, это может занять до пары минут.'
-                            : '${(value * 100).clamp(0, 100).toStringAsFixed(0)}%';
-                        return Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(stageText),
-                            const SizedBox(height: 12),
-                            LinearProgressIndicator(value: value),
-                            const SizedBox(height: 12),
-                            Text(
-                              percentText,
-                              style: Theme.of(
-                                context,
-                              ).textTheme.bodySmall?.copyWith(
-                                color: Theme.of(
-                                  context,
-                                ).colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ],
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-            ),
-          );
-        },
-      ),
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 80));
+  final context =
+      navigatorKey.currentContext ?? navigatorKey.currentState?.context;
+  if (context == null || !context.mounted) {
+    _nativeAndroidUpdateBusy = false;
+    return false;
   }
+
+  final statusNotifier = ValueNotifier<ManagedAndroidUpdateState>(
+    const ManagedAndroidUpdateState.idle(),
+  );
+  Timer? poller;
+  var pendingInstallAfterPermission = false;
 
   try {
     var notificationsAllowed = false;
     try {
-      stage.value = 'Проверяем системные уведомления Android...';
       notificationsAllowed = await NativeUpdateInstaller.canPostNotifications();
       if (!notificationsAllowed) {
-        stage.value = 'Просим Android разрешить уведомления для загрузки...';
         notificationsAllowed =
             await NativeUpdateInstaller.requestNotificationPermission();
       }
@@ -1381,45 +1477,423 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       );
     }
 
-    final savePath = await NativeUpdateInstaller.downloadPackage(
-      url: uri,
-      fallbackFileName: _fallbackInstallerNameForPlatform('android', latest),
-      headers: const {'X-Fenix-Platform': 'android'},
-      onProgress: (received, total) {
-        stage.value = 'Скачиваем обновление через систему Android...';
-        if (total > 0) {
-          progress.value = (received / total).clamp(0, 1).toDouble();
-        } else {
-          progress.value = null;
-        }
-      },
+    final currentState = await NativeUpdateInstaller.getManagedUpdateStatus();
+    if (currentState.versionToken.isNotEmpty &&
+        currentState.versionToken != info.latest.token) {
+      await NativeUpdateInstaller.clearManagedUpdateState();
+    }
+
+    final started = await NativeUpdateInstaller.startManagedUpdateDownload(
+      envelope,
     );
-    if (savePath == null || savePath.trim().isEmpty) {
+    if (!started) {
       return false;
     }
 
-    stage.value = 'Открываем установщик...';
-    final opened = await NativeUpdateInstaller.openDownloadedPackage(savePath);
-    if (opened) return true;
+    statusNotifier.value = await NativeUpdateInstaller.getManagedUpdateStatus();
+    poller = Timer.periodic(const Duration(milliseconds: 750), (_) async {
+      try {
+        final state = await NativeUpdateInstaller.getManagedUpdateStatus();
+        statusNotifier.value = state;
+        if (pendingInstallAfterPermission && state.readyToInstall) {
+          final canInstall =
+              await NativeUpdateInstaller.canRequestPackageInstalls();
+          if (canInstall) {
+            pendingInstallAfterPermission = false;
+            await NativeUpdateInstaller.installManagedUpdate();
+          }
+        }
+      } catch (_) {
+        // ignore: polling should not crash update dialog
+      }
+    });
 
-    stage.value = 'Установщик не открылся автоматически. Открываем Загрузки Android...';
-    final openedDownloads = await NativeUpdateInstaller.openDownloadsUi();
-    if (openedDownloads) {
-      showGlobalAppNotice(
-        'Обновление уже скачивается или скачано. Прогресс виден в системных загрузках Android.',
-        title: 'Обновление Феникс',
-        tone: AppNoticeTone.info,
-        duration: const Duration(seconds: 5),
-      );
-      return true;
+    if (!context.mounted) {
+      return false;
     }
-    return false;
+
+    await showDialog<String>(
+      context: context,
+      barrierDismissible: !info.required,
+      builder: (dialogContext) {
+        final theme = Theme.of(dialogContext);
+        final currentLabel = '${info.current.version}+${info.current.build}';
+        final latestLabel = '${info.latest.version}+${info.latest.build}';
+        final publishedLabel =
+            _formatRuDateTime(info.publishedAt) ?? 'Не указана';
+        final changelogLines = (info.changelog ?? '')
+            .split('\n')
+            .map((line) => line.trim())
+            .where((line) => line.isNotEmpty)
+            .toList(growable: false);
+
+        Future<void> handleInstallRequest() async {
+          final canInstall =
+              await NativeUpdateInstaller.canRequestPackageInstalls();
+          if (canInstall) {
+            final opened = await NativeUpdateInstaller.installManagedUpdate();
+            if (!opened) {
+              showGlobalAppNotice(
+                'Android не открыл установку APK. Попробуйте ещё раз.',
+                title: 'Обновление Феникс',
+                tone: AppNoticeTone.error,
+              );
+            }
+            return;
+          }
+          pendingInstallAfterPermission = true;
+          await NativeUpdateInstaller.openUnknownAppSourcesSettings();
+          showGlobalAppNotice(
+            'Разрешите установку APK для Феникс и вернитесь в приложение. Мы продолжим автоматически.',
+            title: 'Разрешение на установку',
+            tone: AppNoticeTone.info,
+            duration: const Duration(seconds: 6),
+          );
+        }
+
+        return PopScope(
+          canPop: !info.required,
+          child: Dialog(
+            insetPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 20,
+            ),
+            backgroundColor: Colors.transparent,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(28),
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFF10D56F), Color(0xFF16B6D4)],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF16B6D4).withValues(alpha: 0.22),
+                      blurRadius: 30,
+                      offset: const Offset(0, 16),
+                    ),
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+                  child: ValueListenableBuilder<ManagedAndroidUpdateState>(
+                    valueListenable: statusNotifier,
+                    builder: (context, state, _) {
+                      final progress = state.progress;
+                      final stageText = state.stage.trim().isNotEmpty
+                          ? state.stage.trim()
+                          : 'Подготавливаем обновление...';
+                      final progressText = progress == null
+                          ? 'Подождите, это может занять пару минут.'
+                          : '${(progress * 100).clamp(0, 100).toStringAsFixed(0)}%';
+                      final transferText =
+                          '${_formatBytesRu(state.receivedBytes)} / '
+                          '${state.totalBytes > 0 ? _formatBytesRu(state.totalBytes) : 'размер уточняется'}';
+                      final speedText = state.speedBytesPerSec > 0
+                          ? '${_formatBytesRu(state.speedBytesPerSec)}/с'
+                          : 'скорость уточняется';
+                      final etaText = _formatEtaRu(state.etaSeconds);
+                      final isBusy =
+                          state.isChecking ||
+                          state.isDownloading ||
+                          state.isVerifying ||
+                          state.isInstalling;
+
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                width: 46,
+                                height: 46,
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.18),
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                                child: const Icon(
+                                  Icons.system_update_alt_rounded,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  info.required
+                                      ? 'Требуется обновление Феникс'
+                                      : 'Что нового в версии ${info.latest.version}',
+                                  style: theme.textTheme.titleMedium?.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Текущая версия: $currentLabel\n'
+                            'Новая версия: $latestLabel\n'
+                            'Канал: ${(info.channel ?? 'stable').trim()}',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                              height: 1.35,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 10,
+                            runSpacing: 10,
+                            children: [
+                              _UpdateMetaChip(
+                                label: 'Дата',
+                                value: publishedLabel,
+                              ),
+                              _UpdateMetaChip(
+                                label: 'Размер',
+                                value: info.fileSize != null
+                                    ? _formatBytesRu(info.fileSize!)
+                                    : 'Уточняется',
+                              ),
+                              _UpdateMetaChip(
+                                label: 'SHA-256',
+                                value: (info.sha256 ?? '').trim().isEmpty
+                                    ? 'Не указан'
+                                    : '${info.sha256!.substring(0, info.sha256!.length < 16 ? info.sha256!.length : 16)}…',
+                              ),
+                            ],
+                          ),
+                          if ((info.message ?? '').trim().isNotEmpty) ...[
+                            const SizedBox(height: 14),
+                            Text(
+                              info.message!.trim(),
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: Colors.white,
+                              ),
+                            ),
+                          ],
+                          if (changelogLines.isNotEmpty) ...[
+                            const SizedBox(height: 14),
+                            Text(
+                              'Что нового',
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            ...changelogLines.map(
+                              (line) => Padding(
+                                padding: const EdgeInsets.only(bottom: 6),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Padding(
+                                      padding: EdgeInsets.only(top: 6),
+                                      child: Icon(
+                                        Icons.circle,
+                                        size: 8,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        line,
+                                        style: theme.textTheme.bodyMedium
+                                            ?.copyWith(color: Colors.white),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 16),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.12),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  stageText,
+                                  style: theme.textTheme.titleSmall?.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                LinearProgressIndicator(
+                                  value: progress,
+                                  minHeight: 10,
+                                  borderRadius: BorderRadius.circular(999),
+                                  backgroundColor: Colors.white.withValues(
+                                    alpha: 0.18,
+                                  ),
+                                  valueColor:
+                                      const AlwaysStoppedAnimation<Color>(
+                                        Colors.white,
+                                      ),
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  progressText,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  transferText,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: Colors.white.withValues(alpha: 0.92),
+                                  ),
+                                ),
+                                if (state.isDownloading) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Скорость: $speedText · Осталось: $etaText',
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.92,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                                if (state.readyToInstall) ...[
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'APK уже в приложении. Можно открывать установку.',
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.92,
+                                      ),
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                                if (state.isInstalledPendingRestart) ...[
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'Android завершил установку. Можно открыть новую версию.',
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.92,
+                                      ),
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                                if (state.isFailed &&
+                                    state.errorMessage.trim().isNotEmpty) ...[
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    state.errorMessage.trim(),
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          Wrap(
+                            spacing: 12,
+                            runSpacing: 12,
+                            children: [
+                              if (!info.required)
+                                TextButton(
+                                  onPressed: () => Navigator.of(
+                                    dialogContext,
+                                  ).pop(isBusy ? 'hide' : 'later'),
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                  ),
+                                  child: Text(isBusy ? 'Скрыть' : 'Позже'),
+                                ),
+                              if (state.isFailed && state.canResume)
+                                FilledButton.icon(
+                                  onPressed: () async {
+                                    await NativeUpdateInstaller.startManagedUpdateDownload(
+                                      envelope,
+                                    );
+                                  },
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: Colors.white,
+                                    foregroundColor: const Color(0xFF0F6667),
+                                  ),
+                                  icon: const Icon(Icons.refresh_rounded),
+                                  label: const Text('Продолжить загрузку'),
+                                )
+                              else if (state.readyToInstall)
+                                FilledButton.icon(
+                                  onPressed: handleInstallRequest,
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: Colors.white,
+                                    foregroundColor: const Color(0xFF0F6667),
+                                  ),
+                                  icon: const Icon(
+                                    Icons.install_mobile_rounded,
+                                  ),
+                                  label: const Text('Установить'),
+                                )
+                              else if (state.isInstalledPendingRestart)
+                                FilledButton.icon(
+                                  onPressed: () =>
+                                      Navigator.of(dialogContext).pop('done'),
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: Colors.white,
+                                    foregroundColor: const Color(0xFF0F6667),
+                                  ),
+                                  icon: const Icon(
+                                    Icons.check_circle_outline_rounded,
+                                  ),
+                                  label: const Text('Готово'),
+                                )
+                              else
+                                FilledButton.icon(
+                                  onPressed: null,
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: Colors.white,
+                                    foregroundColor: const Color(0xFF0F6667),
+                                  ),
+                                  icon: const Icon(Icons.downloading_rounded),
+                                  label: const Text('Идёт обновление'),
+                                ),
+                            ],
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+
+    return true;
   } finally {
-    if (dialogContext != null && dialogContext!.mounted) {
-      Navigator.of(dialogContext!).pop();
-    }
-    progress.dispose();
-    stage.dispose();
+    poller?.cancel();
+    statusNotifier.dispose();
     _nativeAndroidUpdateBusy = false;
   }
 }
@@ -1496,28 +1970,27 @@ Future<void> _downloadAndInstallDesktopUpdateInBackground({
   }
 }
 
-Future<bool> _openUpdateUrl(
-  String rawUrl, {
-  required String platform,
-  required _AppUpdateVersion latest,
-}) async {
-  final uri = _resolveUpdateUri(rawUrl);
-  if (uri == null) return false;
+Future<bool> _openUpdateUrl(_AppUpdateInfo info) async {
+  final platform = info.platform;
 
   if (!kIsWeb && platform == 'android') {
     try {
-      return await _downloadAndInstallAndroidUpdate(uri: uri, latest: latest);
+      return await _downloadAndInstallAndroidUpdate(info: info);
     } catch (_) {
       return false;
     }
   }
+
+  final rawUrl = (info.downloadUrl ?? '').trim();
+  final uri = _resolveUpdateUri(rawUrl);
+  if (uri == null) return false;
 
   if (!kIsWeb && (platform == 'windows' || platform == 'macos')) {
     unawaited(
       _downloadAndInstallDesktopUpdateInBackground(
         platform: platform,
         uri: uri,
-        latest: latest,
+        latest: info.latest,
       ),
     );
     return true;
@@ -1542,6 +2015,11 @@ Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
 
   final response = await dio.get(
     '/api/app/update',
+    queryParameters: <String, dynamic>{
+      'platform': platform,
+      'current_version': current.version,
+      'current_build': current.build,
+    },
     options: Options(
       sendTimeout: const Duration(seconds: 6),
       receiveTimeout: const Duration(seconds: 6),
@@ -1595,15 +2073,116 @@ Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
   final title = (platformConfig['title'] ?? '').toString().trim();
   final message = (platformConfig['message'] ?? '').toString().trim();
   final downloadUrl = (platformConfig['download_url'] ?? '').toString().trim();
+  final changelog = (platformConfig['changelog'] ?? '').toString().trim();
+  final channel = (platformConfig['channel'] ?? '').toString().trim();
+  final publishedAt = (platformConfig['published_at'] ?? '').toString().trim();
+  final fileSize = _safePositiveInt(platformConfig['file_size'], fallback: 0);
+  final sha256 = (platformConfig['sha256'] ?? '').toString().trim();
+
+  Map<String, dynamic>? androidManifestEnvelope;
+  var resolvedLatest = latest;
+  var resolvedRequired = required;
+  var resolvedTitle = title.isNotEmpty ? title : 'Доступно обновление Феникс';
+  var resolvedMessage = message.isNotEmpty ? message : null;
+  var resolvedDownloadUrl = downloadUrl.isNotEmpty ? downloadUrl : null;
+  var resolvedChangelog = changelog.isNotEmpty ? changelog : null;
+  var resolvedChannel = channel.isNotEmpty ? channel : null;
+  var resolvedPublishedAt = publishedAt.isNotEmpty ? publishedAt : null;
+  var resolvedFileSize = fileSize > 0 ? fileSize : null;
+  var resolvedSha256 = sha256.isNotEmpty ? sha256 : null;
+
+  if (platform == 'android') {
+    try {
+      final manifestResp = await dio.get(
+        '/api/app/update/android/manifest',
+        queryParameters: <String, dynamic>{
+          'current_version': current.version,
+          'current_build': current.build,
+        },
+        options: Options(
+          sendTimeout: const Duration(seconds: 6),
+          receiveTimeout: const Duration(seconds: 6),
+        ),
+      );
+      final manifestRoot = manifestResp.data;
+      if (manifestRoot is Map && manifestRoot['ok'] == true) {
+        final data = manifestRoot['data'];
+        if (data is Map) {
+          androidManifestEnvelope = Map<String, dynamic>.from(data);
+          final manifestRaw = data['manifest'];
+          if (manifestRaw is Map) {
+            final manifest = Map<String, dynamic>.from(manifestRaw);
+            final manifestVersion = _normalizeVersion(
+              (manifest['version'] ?? latest.version).toString(),
+            );
+            final manifestBuild = _safePositiveInt(
+              manifest['build'],
+              fallback: latest.build,
+            );
+            resolvedLatest = _AppUpdateVersion(
+              version: manifestVersion,
+              build: manifestBuild,
+            );
+            resolvedRequired =
+                _toBool(manifest['required'], fallback: required) ||
+                belowMinSupported;
+            final manifestTitle = (manifest['title'] ?? '').toString().trim();
+            final manifestMessage = (manifest['message'] ?? '')
+                .toString()
+                .trim();
+            final manifestDownloadUrl = (manifest['download_url'] ?? '')
+                .toString()
+                .trim();
+            final manifestChangelog = (manifest['changelog'] ?? '')
+                .toString()
+                .trim();
+            final manifestChannel = (manifest['channel'] ?? '')
+                .toString()
+                .trim();
+            final manifestPublishedAt = (manifest['published_at'] ?? '')
+                .toString()
+                .trim();
+            final manifestSha256 = (manifest['sha256'] ?? '').toString().trim();
+            final manifestFileSize = _safePositiveInt(
+              manifest['file_size'],
+              fallback: resolvedFileSize ?? 0,
+            );
+            if (manifestTitle.isNotEmpty) resolvedTitle = manifestTitle;
+            if (manifestMessage.isNotEmpty) resolvedMessage = manifestMessage;
+            if (manifestDownloadUrl.isNotEmpty) {
+              resolvedDownloadUrl = manifestDownloadUrl;
+            }
+            if (manifestChangelog.isNotEmpty) {
+              resolvedChangelog = manifestChangelog;
+            }
+            if (manifestChannel.isNotEmpty) resolvedChannel = manifestChannel;
+            if (manifestPublishedAt.isNotEmpty) {
+              resolvedPublishedAt = manifestPublishedAt;
+            }
+            if (manifestFileSize > 0) resolvedFileSize = manifestFileSize;
+            if (manifestSha256.isNotEmpty) resolvedSha256 = manifestSha256;
+          }
+        }
+      }
+    } catch (_) {
+      // ignore: base update info remains available even if manifest endpoint is temporarily unavailable
+    }
+  }
 
   return _AppUpdateInfo(
-    required: required,
-    title: title.isNotEmpty ? title : 'Доступно обновление Феникс',
-    message: message.isNotEmpty ? message : null,
-    downloadUrl: downloadUrl.isNotEmpty ? downloadUrl : null,
+    required: resolvedRequired,
+    title: resolvedTitle,
+    message: resolvedMessage,
+    downloadUrl: resolvedDownloadUrl,
+    changelog: resolvedChangelog,
+    channel: resolvedChannel,
+    publishedAt: resolvedPublishedAt,
+    fileSize: resolvedFileSize,
+    sha256: resolvedSha256,
+    androidManifestEnvelope: androidManifestEnvelope,
     platform: platform,
     current: current,
-    latest: latest,
+    latest: resolvedLatest,
     minSupported: minSupported,
   );
 }
@@ -1994,11 +2573,13 @@ class _GlobalNoticeHost extends StatelessWidget {
                   child: ValueListenableBuilder<List<_SupportQueueNoticePayload>>(
                     valueListenable: _supportQueueNoticeNotifier,
                     builder: (context, notices, _) {
-                      if (notices.isEmpty || !_canCurrentUserObserveSupportQueueAlerts()) {
+                      if (notices.isEmpty ||
+                          !_canCurrentUserObserveSupportQueueAlerts()) {
                         return const SizedBox.shrink();
                       }
                       final canClaim = _canCurrentUserClaimSupportQueueAlerts();
-                      final canForceClose = _canCurrentUserForceCloseSupportQueueAlerts();
+                      final canForceClose =
+                          _canCurrentUserForceCloseSupportQueueAlerts();
                       return ConstrainedBox(
                         constraints: BoxConstraints(maxWidth: cardWidth),
                         child: Column(
@@ -2009,13 +2590,20 @@ class _GlobalNoticeHost extends StatelessWidget {
                               return Padding(
                                 padding: const EdgeInsets.only(bottom: 8),
                                 child: ValueListenableBuilder<Set<String>>(
-                                  valueListenable: _supportQueueClaimBusyNotifier,
+                                  valueListenable:
+                                      _supportQueueClaimBusyNotifier,
                                   builder: (context, busyIds, _) {
-                                    final actionBusy = busyIds.contains(notice.ticketId);
+                                    final actionBusy = busyIds.contains(
+                                      notice.ticketId,
+                                    );
                                     return Material(
-                                      color: theme.colorScheme.surfaceContainerHigh,
+                                      color: theme
+                                          .colorScheme
+                                          .surfaceContainerHigh,
                                       elevation: compact ? 6 : 10,
-                                      borderRadius: BorderRadius.circular(compact ? 14 : 18),
+                                      borderRadius: BorderRadius.circular(
+                                        compact ? 14 : 18,
+                                      ),
                                       child: Container(
                                         width: cardWidth,
                                         padding: EdgeInsets.fromLTRB(
@@ -2025,13 +2613,17 @@ class _GlobalNoticeHost extends StatelessWidget {
                                           compact ? 12 : 14,
                                         ),
                                         decoration: BoxDecoration(
-                                          borderRadius: BorderRadius.circular(compact ? 14 : 18),
+                                          borderRadius: BorderRadius.circular(
+                                            compact ? 14 : 18,
+                                          ),
                                           border: Border.all(
-                                            color: theme.colorScheme.primary.withValues(alpha: 0.16),
+                                            color: theme.colorScheme.primary
+                                                .withValues(alpha: 0.16),
                                           ),
                                         ),
                                         child: Column(
-                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
                                             Row(
@@ -2040,38 +2632,60 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                   width: compact ? 32 : 38,
                                                   height: compact ? 32 : 38,
                                                   decoration: BoxDecoration(
-                                                    color: theme.colorScheme.primary.withValues(alpha: 0.12),
+                                                    color: theme
+                                                        .colorScheme
+                                                        .primary
+                                                        .withValues(
+                                                          alpha: 0.12,
+                                                        ),
                                                     shape: BoxShape.circle,
                                                   ),
                                                   alignment: Alignment.center,
                                                   child: Icon(
-                                                    Icons.support_agent_outlined,
-                                                    color: theme.colorScheme.primary,
+                                                    Icons
+                                                        .support_agent_outlined,
+                                                    color: theme
+                                                        .colorScheme
+                                                        .primary,
                                                     size: compact ? 18 : 20,
                                                   ),
                                                 ),
                                                 const SizedBox(width: 10),
                                                 Expanded(
                                                   child: Column(
-                                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
                                                     children: [
                                                       Text(
                                                         notice.claimable
                                                             ? 'Новый вопрос в поддержку'
                                                             : 'Активная заявка поддержки',
                                                         maxLines: 1,
-                                                        overflow: TextOverflow.ellipsis,
-                                                        style: theme.textTheme.titleSmall?.copyWith(
-                                                          fontWeight: FontWeight.w800,
-                                                        ),
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: theme
+                                                            .textTheme
+                                                            .titleSmall
+                                                            ?.copyWith(
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w800,
+                                                            ),
                                                       ),
                                                       Text(
                                                         'Клиент: ${notice.customerName}',
                                                         maxLines: 1,
-                                                        overflow: TextOverflow.ellipsis,
-                                                        style: theme.textTheme.bodySmall?.copyWith(
-                                                          color: theme.colorScheme.onSurfaceVariant,
-                                                        ),
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: theme
+                                                            .textTheme
+                                                            .bodySmall
+                                                            ?.copyWith(
+                                                              color: theme
+                                                                  .colorScheme
+                                                                  .onSurfaceVariant,
+                                                            ),
                                                       ),
                                                     ],
                                                   ),
@@ -2083,9 +2697,10 @@ class _GlobalNoticeHost extends StatelessWidget {
                                               notice.subject,
                                               maxLines: compact ? 2 : 3,
                                               overflow: TextOverflow.ellipsis,
-                                              style: theme.textTheme.bodyMedium?.copyWith(
-                                                fontWeight: FontWeight.w700,
-                                              ),
+                                              style: theme.textTheme.bodyMedium
+                                                  ?.copyWith(
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
                                             ),
                                             const SizedBox(height: 6),
                                             Wrap(
@@ -2093,62 +2708,92 @@ class _GlobalNoticeHost extends StatelessWidget {
                                               runSpacing: 8,
                                               children: [
                                                 _SupportQueueChip(
-                                                  label: _supportStatusLabel(notice.status),
+                                                  label: _supportStatusLabel(
+                                                    notice.status,
+                                                  ),
                                                 ),
                                                 _SupportQueueChip(
-                                                  label: _supportCategoryLabel(notice.category),
+                                                  label: _supportCategoryLabel(
+                                                    notice.category,
+                                                  ),
                                                 ),
-                                                if ((notice.productTitle ?? '').trim().isNotEmpty && !compact)
+                                                if ((notice.productTitle ?? '')
+                                                        .trim()
+                                                        .isNotEmpty &&
+                                                    !compact)
                                                   _SupportQueueChip(
-                                                    label: notice.productTitle!.trim(),
+                                                    label: notice.productTitle!
+                                                        .trim(),
                                                   ),
                                               ],
                                             ),
                                             const SizedBox(height: 10),
-                                            if ((canClaim && notice.claimable) ||
+                                            if ((canClaim &&
+                                                    notice.claimable) ||
                                                 notice.closable ||
                                                 canForceClose)
                                               Align(
-                                                alignment: Alignment.centerRight,
+                                                alignment:
+                                                    Alignment.centerRight,
                                                 child: Wrap(
                                                   spacing: 8,
                                                   runSpacing: 8,
                                                   alignment: WrapAlignment.end,
                                                   children: [
-                                                    if (canClaim && notice.claimable)
+                                                    if (canClaim &&
+                                                        notice.claimable)
                                                       FilledButton.icon(
                                                         onPressed: actionBusy
                                                             ? null
-                                                            : () => _claimSupportQueueNotice(notice.ticketId),
+                                                            : () => _claimSupportQueueNotice(
+                                                                notice.ticketId,
+                                                              ),
                                                         icon: actionBusy
                                                             ? const SizedBox(
                                                                 width: 16,
                                                                 height: 16,
-                                                                child: CircularProgressIndicator(
-                                                                  strokeWidth: 2,
-                                                                ),
+                                                                child:
+                                                                    CircularProgressIndicator(
+                                                                      strokeWidth:
+                                                                          2,
+                                                                    ),
                                                               )
-                                                            : const Icon(Icons.record_voice_over_outlined),
+                                                            : const Icon(
+                                                                Icons
+                                                                    .record_voice_over_outlined,
+                                                              ),
                                                         label: Text(
-                                                          actionBusy ? 'Принимаем...' : 'Принять заявку',
+                                                          actionBusy
+                                                              ? 'Принимаем...'
+                                                              : 'Принять заявку',
                                                         ),
                                                       ),
-                                                    if (notice.closable || canForceClose)
+                                                    if (notice.closable ||
+                                                        canForceClose)
                                                       OutlinedButton.icon(
                                                         onPressed: actionBusy
                                                             ? null
-                                                            : () => _closeSupportQueueNotice(notice.ticketId),
+                                                            : () => _closeSupportQueueNotice(
+                                                                notice.ticketId,
+                                                              ),
                                                         icon: actionBusy
                                                             ? const SizedBox(
                                                                 width: 16,
                                                                 height: 16,
-                                                                child: CircularProgressIndicator(
-                                                                  strokeWidth: 2,
-                                                                ),
+                                                                child:
+                                                                    CircularProgressIndicator(
+                                                                      strokeWidth:
+                                                                          2,
+                                                                    ),
                                                               )
-                                                            : const Icon(Icons.archive_outlined),
+                                                            : const Icon(
+                                                                Icons
+                                                                    .archive_outlined,
+                                                              ),
                                                         label: Text(
-                                                          actionBusy ? 'Закрываем...' : 'Закрыть заявку',
+                                                          actionBusy
+                                                              ? 'Закрываем...'
+                                                              : 'Закрыть заявку',
                                                         ),
                                                       ),
                                                   ],
@@ -2159,9 +2804,12 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                 notice.claimable
                                                     ? 'Заявка исчезнет, когда её примет администратор.'
                                                     : 'Уведомление останется, пока заявка не будет закрыта.',
-                                                style: theme.textTheme.bodySmall?.copyWith(
-                                                  color: theme.colorScheme.onSurfaceVariant,
-                                                ),
+                                                style: theme.textTheme.bodySmall
+                                                    ?.copyWith(
+                                                      color: theme
+                                                          .colorScheme
+                                                          .onSurfaceVariant,
+                                                    ),
                                               ),
                                           ],
                                         ),
@@ -2177,7 +2825,10 @@ class _GlobalNoticeHost extends StatelessWidget {
                                 elevation: 4,
                                 borderRadius: BorderRadius.circular(14),
                                 child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 8,
+                                  ),
                                   child: Text(
                                     'Ещё заявок: ${notices.length - maxCards}',
                                     style: theme.textTheme.labelLarge,
@@ -2379,10 +3030,7 @@ class _SupportQueueChip extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        child: Text(
-          label,
-          style: Theme.of(context).textTheme.labelMedium,
-        ),
+        child: Text(label, style: Theme.of(context).textTheme.labelMedium),
       ),
     );
   }
@@ -2403,6 +3051,571 @@ String _incomingMessagePreview(Map<String, dynamic>? message) {
     if (title.isNotEmpty) return title;
   }
   return 'Новое сообщение';
+}
+
+int _notificationUnreadCountFrom(dynamic raw) {
+  final parsed = int.tryParse('${raw ?? ''}') ?? 0;
+  if (parsed < 0) return 0;
+  return parsed;
+}
+
+void _setNotificationBadgeCount(int count, {bool syncWebBadge = true}) {
+  final normalized = count < 0 ? 0 : count;
+  notificationBadgeCountNotifier.value = normalized;
+  if (kIsWeb && syncWebBadge) {
+    unawaited(WebPushClientService.syncUnreadBadge(dio));
+  }
+}
+
+Future<void> refreshNotificationBadgeCount() async {
+  if (authService.currentUser == null) {
+    _setNotificationBadgeCount(0, syncWebBadge: false);
+    return;
+  }
+  try {
+    final response = await dio.get('/api/notifications/badge-count');
+    final root = response.data;
+    final data = root is Map && root['data'] is Map
+        ? Map<String, dynamic>.from(root['data'])
+        : const <String, dynamic>{};
+    final unreadCount = root is Map
+        ? _notificationUnreadCountFrom(
+            root['unread_count'] ?? data['unread_count'] ?? 0,
+          )
+        : 0;
+    _setNotificationBadgeCount(unreadCount, syncWebBadge: false);
+    if (kIsWeb) {
+      unawaited(WebPushClientService.syncUnreadBadge(dio));
+    }
+  } catch (e) {
+    debugPrint('refreshNotificationBadgeCount skipped: $e');
+  }
+}
+
+AppNoticeTone _notificationToneForCategory(String rawCategory) {
+  switch (rawCategory.trim().toLowerCase()) {
+    case 'security':
+      return AppNoticeTone.error;
+    case 'support':
+    case 'reserved':
+    case 'delivery':
+      return AppNoticeTone.warning;
+    case 'promo':
+    case 'updates':
+      return AppNoticeTone.info;
+    default:
+      return AppNoticeTone.info;
+  }
+}
+
+String _notificationTitle(Map<String, dynamic> payload) {
+  final title = (payload['title'] ?? '').toString().trim();
+  if (title.isNotEmpty) return title;
+  final category = (payload['category'] ?? '').toString().trim().toLowerCase();
+  switch (category) {
+    case 'security':
+      return 'Безопасность';
+    case 'support':
+      return 'Поддержка';
+    case 'reserved':
+      return 'Забронированный товар';
+    case 'delivery':
+      return 'Доставка';
+    case 'promo':
+      return 'Акция';
+    case 'updates':
+      return 'Обновление';
+    default:
+      return 'Уведомление';
+  }
+}
+
+String _notificationBody(Map<String, dynamic> payload) {
+  final body = (payload['body'] ?? '').toString().trim();
+  if (body.isNotEmpty) return body;
+  return 'Появилось новое уведомление.';
+}
+
+Map<String, dynamic> _notificationMetaPayload(Map<String, dynamic> payload) {
+  final raw = payload['payload'];
+  if (raw is Map<String, dynamic>) return raw;
+  if (raw is Map) return Map<String, dynamic>.from(raw);
+  return const <String, dynamic>{};
+}
+
+String _notificationDeepLink(Map<String, dynamic> payload) {
+  final direct = (payload['deep_link'] ?? '').toString().trim();
+  if (direct.isNotEmpty) return direct;
+  final nested = _notificationMetaPayload(payload);
+  return (nested['deep_link'] ?? nested['url'] ?? '/').toString().trim();
+}
+
+String _notificationPresentationKey(Map<String, dynamic> payload) {
+  final inboxItemId = (payload['inbox_item_id'] ?? '').toString().trim();
+  if (inboxItemId.isNotEmpty) return 'inbox:$inboxItemId';
+  final id = (payload['id'] ?? '').toString().trim();
+  if (id.isNotEmpty) return 'id:$id';
+  final category = (payload['category'] ?? '').toString().trim().toLowerCase();
+  final deepLink = _notificationDeepLink(payload);
+  final version = (payload['version'] ?? '').toString().trim();
+  return 'fallback:$category:$deepLink:$version';
+}
+
+String? _notificationUpdateToken(Map<String, dynamic> payload) {
+  final nested = _notificationMetaPayload(payload);
+  final platform = (nested['platform'] ?? payload['platform'] ?? '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  final version = (payload['version'] ?? nested['version'] ?? '')
+      .toString()
+      .trim();
+  if (version.isEmpty) return null;
+  return platform.isEmpty ? version : '$platform:$version';
+}
+
+void _pruneRecentNotificationPresentations() {
+  final cutoff = DateTime.now().subtract(const Duration(minutes: 2));
+  _recentNotificationPresentationTimestamps.removeWhere(
+    (_, seenAt) => seenAt.isBefore(cutoff),
+  );
+}
+
+bool _wasNotificationPresentedRecently(
+  Map<String, dynamic> payload, {
+  Duration window = const Duration(seconds: 6),
+}) {
+  _pruneRecentNotificationPresentations();
+  final key = _notificationPresentationKey(payload);
+  final previous = _recentNotificationPresentationTimestamps[key];
+  if (previous == null) return false;
+  return DateTime.now().difference(previous) <= window;
+}
+
+void _rememberNotificationPresentation(Map<String, dynamic> payload) {
+  _pruneRecentNotificationPresentations();
+  _recentNotificationPresentationTimestamps[_notificationPresentationKey(
+        payload,
+      )] =
+      DateTime.now();
+}
+
+bool _shouldSuppressUpdateFullscreen(Map<String, dynamic> payload) {
+  final token = _notificationUpdateToken(payload);
+  if (token == null || token.isEmpty) return false;
+  if (_appUpdateDialogVisible) return true;
+  if (_lastForegroundUpdateToken == token) return true;
+  if (_dismissedForegroundUpdateToken == token) return true;
+  return false;
+}
+
+Future<void> _reportNotificationOpenedIfNeeded(
+  Map<String, dynamic> payload,
+) async {
+  final inboxItemId = (payload['inbox_item_id'] ?? '').toString().trim();
+  if (inboxItemId.isEmpty || authService.currentUser == null) return;
+  await NotificationOpenTrackerService.reportOpened(dio, inboxItemId);
+}
+
+Future<void> handleNotificationPayloadEntry(
+  Map<String, dynamic> payload, {
+  required bool fromTap,
+  required bool coldStart,
+  String source = 'runtime',
+}) {
+  return _handleIncomingNotificationPayload(
+    payload,
+    fromTap: fromTap,
+    coldStart: coldStart,
+    source: source,
+  );
+}
+
+bool _isClientBaseNotificationUser() {
+  return authService.effectiveRole.toLowerCase().trim() == 'client';
+}
+
+String? _notificationImageUrl(Map<String, dynamic> payload) {
+  final media = payload['media'];
+  if (media is! Map) return null;
+  final map = Map<String, dynamic>.from(media);
+  final raw = (map['image_url'] ?? map['url'] ?? map['thumbnail_url'] ?? '')
+      .toString()
+      .trim();
+  if (raw.isEmpty) return null;
+  return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
+}
+
+Future<void> _showFullscreenNotificationDialog(
+  Map<String, dynamic> payload,
+) async {
+  if (_notificationFullscreenDialogOpen) return;
+  final context = navigatorKey.currentContext;
+  if (context == null || !context.mounted) return;
+
+  final deepLink = (payload['deep_link'] ?? '').toString().trim();
+  final title = _notificationTitle(payload);
+  final body = _notificationBody(payload);
+  final imageUrl = _notificationImageUrl(payload);
+  final category = (payload['category'] ?? '').toString().trim().toLowerCase();
+  final ctaLabel = (payload['cta_label'] ?? '').toString().trim();
+  final accent = category == 'updates'
+      ? const Color(0xFF16C47F)
+      : const Color(0xFFFF8A3D);
+
+  _notificationFullscreenDialogOpen = true;
+  try {
+    await showGeneralDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      barrierLabel: 'notification-fullscreen',
+      barrierColor: Colors.black.withValues(alpha: 0.72),
+      pageBuilder: (dialogContext, animation, secondaryAnimation) {
+        return const SizedBox.shrink();
+      },
+      transitionBuilder: (context, animation, secondaryAnimation, child) {
+        return FadeTransition(
+          opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(32),
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            accent.withValues(alpha: 0.96),
+                            const Color(0xFF1F1733),
+                          ],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: accent.withValues(alpha: 0.24),
+                            blurRadius: 28,
+                            offset: const Offset(0, 18),
+                          ),
+                        ],
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  width: 46,
+                                  height: 46,
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withValues(alpha: 0.16),
+                                    borderRadius: BorderRadius.circular(16),
+                                  ),
+                                  child: Icon(
+                                    category == 'updates'
+                                        ? Icons.system_update_alt_rounded
+                                        : Icons.local_offer_outlined,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    title,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleLarge
+                                        ?.copyWith(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                  ),
+                                ),
+                                IconButton(
+                                  onPressed: () => Navigator.of(context).pop(),
+                                  icon: const Icon(Icons.close_rounded),
+                                  color: Colors.white,
+                                  tooltip: 'Закрыть',
+                                ),
+                              ],
+                            ),
+                            if (imageUrl != null) ...[
+                              const SizedBox(height: 16),
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(24),
+                                child: AspectRatio(
+                                  aspectRatio: 16 / 10,
+                                  child: Image.network(
+                                    imageUrl,
+                                    fit: BoxFit.cover,
+                                    errorBuilder: (context, error, stackTrace) {
+                                      return Container(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.10,
+                                        ),
+                                        alignment: Alignment.center,
+                                        child: const Icon(
+                                          Icons.image_not_supported_outlined,
+                                          color: Colors.white,
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 16),
+                            Text(
+                              body,
+                              style: Theme.of(context).textTheme.bodyLarge
+                                  ?.copyWith(color: Colors.white, height: 1.45),
+                            ),
+                            const SizedBox(height: 18),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(),
+                                    style: OutlinedButton.styleFrom(
+                                      foregroundColor: Colors.white,
+                                      side: BorderSide(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.28,
+                                        ),
+                                      ),
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 14,
+                                      ),
+                                    ),
+                                    child: const Text('Позже'),
+                                  ),
+                                ),
+                                if (deepLink.isNotEmpty) ...[
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: FilledButton(
+                                      onPressed: () async {
+                                        Navigator.of(context).pop();
+                                        final activeContext =
+                                            navigatorKey.currentContext;
+                                        if (activeContext == null ||
+                                            !activeContext.mounted) {
+                                          return;
+                                        }
+                                        await openNotificationDeepLink(
+                                          activeContext,
+                                          deepLink,
+                                          payload: payload,
+                                        );
+                                      },
+                                      style: FilledButton.styleFrom(
+                                        backgroundColor: Colors.white,
+                                        foregroundColor: accent,
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 14,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        ctaLabel.isNotEmpty
+                                            ? ctaLabel
+                                            : (category == 'updates'
+                                                  ? 'Открыть обновление'
+                                                  : 'Открыть предложение'),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  } finally {
+    _notificationFullscreenDialogOpen = false;
+  }
+}
+
+Future<void> _handleIncomingNotificationPayload(
+  Map<String, dynamic> rawPayload, {
+  required bool fromTap,
+  required bool coldStart,
+  String source = 'runtime',
+}) async {
+  final map = Map<String, dynamic>.from(rawPayload);
+  final unreadCount = _notificationUnreadCountFrom(
+    map['badge_count'] ?? map['unread_count'] ?? 0,
+  );
+  if (unreadCount > 0 ||
+      map.containsKey('badge_count') ||
+      map.containsKey('unread_count')) {
+    _setNotificationBadgeCount(unreadCount);
+  }
+
+  notificationEventsController.add({
+    'type': fromTap ? 'notification:opened' : 'notification:new',
+    'data': map,
+    'source': source,
+    'cold_start': coldStart,
+  });
+
+  if (!fromTap && _wasNotificationPresentedRecently(map)) {
+    return;
+  }
+  _rememberNotificationPresentation(map);
+
+  if (fromTap) {
+    await _reportNotificationOpenedIfNeeded(map);
+  }
+
+  final category = (map['category'] ?? '').toString().trim().toLowerCase();
+  final context = navigatorKey.currentContext;
+  final deepLink = _notificationDeepLink(map);
+  final nestedPayload = _notificationMetaPayload(map);
+
+  if (_isClientBaseNotificationUser()) {
+    final shouldShowPromoFullscreen = category == 'promo';
+    final shouldShowUpdateFullscreen =
+        category == 'updates' &&
+        (fromTap || map['force_show'] == true) &&
+        !_shouldSuppressUpdateFullscreen(map);
+
+    if (shouldShowPromoFullscreen || shouldShowUpdateFullscreen) {
+      await _showFullscreenNotificationDialog({
+        ...map,
+        if (deepLink.isNotEmpty) 'deep_link': deepLink,
+      });
+      return;
+    }
+
+    if (fromTap && context != null && context.mounted && deepLink.isNotEmpty) {
+      final opened = await openNotificationDeepLink(
+        context,
+        deepLink,
+        payload: nestedPayload.isNotEmpty ? nestedPayload : map,
+      );
+      if (!opened && category == 'updates') {
+        activeShellSectionNotifier.value = 'settings';
+      }
+      return;
+    }
+
+    if (!fromTap && category == 'security') {
+      await playAppSound(AppUiSound.warning);
+    }
+    return;
+  }
+
+  if (fromTap) {
+    if (context != null && context.mounted && deepLink.isNotEmpty) {
+      final opened = await openNotificationDeepLink(
+        context,
+        deepLink,
+        payload: nestedPayload.isNotEmpty ? nestedPayload : map,
+      );
+      if (opened) {
+        if (category == 'security') {
+          await playAppSound(AppUiSound.warning);
+        }
+        return;
+      }
+    }
+    showGlobalAppNotice(
+      _notificationBody(map),
+      title: _notificationTitle(map),
+      tone: _notificationToneForCategory(category),
+      duration: const Duration(seconds: 6),
+    );
+    if (category == 'security') {
+      await playAppSound(AppUiSound.warning);
+    }
+    return;
+  }
+
+  if (category == 'chat' || category == 'updates') return;
+  if (kIsWeb && WebNotificationService.isDocumentHidden) return;
+  if (activeShellSectionNotifier.value == 'notifications') return;
+
+  showGlobalAppNotice(
+    _notificationBody(map),
+    title: _notificationTitle(map),
+    tone: _notificationToneForCategory(category),
+    duration: const Duration(seconds: 6),
+  );
+  if (category == 'security') {
+    await playAppSound(AppUiSound.warning);
+  }
+}
+
+void _handleSocketNotificationBadge(dynamic data) {
+  final map = data is Map
+      ? Map<String, dynamic>.from(data)
+      : <String, dynamic>{};
+  final unreadCount = _notificationUnreadCountFrom(
+    map['unread_count'] ?? map['badge_count'] ?? 0,
+  );
+  _setNotificationBadgeCount(unreadCount);
+  notificationEventsController.add({'type': 'notification:badge', 'data': map});
+}
+
+Future<void> _handleSocketNotificationNew(dynamic data) async {
+  final map = data is Map
+      ? Map<String, dynamic>.from(data)
+      : <String, dynamic>{};
+  await _handleIncomingNotificationPayload(
+    map,
+    fromTap: false,
+    coldStart: false,
+    source: 'socket',
+  );
+}
+
+void _handleSocketNotificationRead(dynamic data) {
+  final map = data is Map
+      ? Map<String, dynamic>.from(data)
+      : <String, dynamic>{};
+  final unreadCount = _notificationUnreadCountFrom(
+    map['unread_count'] ?? map['badge_count'] ?? 0,
+  );
+  if (map.containsKey('unread_count') || map.containsKey('badge_count')) {
+    _setNotificationBadgeCount(unreadCount);
+  }
+  notificationEventsController.add({'type': 'notification:read', 'data': map});
+}
+
+void _handleSocketNotificationCampaignStatus(dynamic data) {
+  final map = data is Map
+      ? Map<String, dynamic>.from(data)
+      : <String, dynamic>{};
+  notificationEventsController.add({
+    'type': 'notification:campaign-status',
+    'data': map,
+  });
+  final status = (map['status'] ?? '').toString().trim().toLowerCase();
+  final sentCount = (map['sent_count'] ?? 0).toString();
+  showGlobalAppNotice(
+    status == 'sent'
+        ? 'Кампания отправлена. Получателей: $sentCount.'
+        : 'Статус кампании обновился: ${status.isEmpty ? 'неизвестно' : status}.',
+    title: 'Промо-кампания',
+    tone: status == 'sent' ? AppNoticeTone.success : AppNoticeTone.info,
+  );
 }
 
 Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
@@ -2801,8 +4014,12 @@ Future<void> _initSocket() async {
 
     await disconnectSocket();
     final socketAuth = <String, dynamic>{'token': token};
+    final socketHeaders = <String, dynamic>{'Authorization': 'Bearer $token'};
+    final socketQuery = <String, dynamic>{'token': token};
     if (currentRole == 'creator' && viewRole != null && viewRole.isNotEmpty) {
       socketAuth['view_role'] = viewRole;
+      socketHeaders['X-View-Role'] = viewRole;
+      socketQuery['view_role'] = viewRole;
     }
 
     // Build options
@@ -2812,6 +4029,8 @@ Future<void> _initSocket() async {
           .setTransports(['websocket', 'polling'])
           .disableAutoConnect()
           .setAuth(socketAuth)
+          .setExtraHeaders(socketHeaders)
+          .setQuery(socketQuery)
           .build(),
     );
     _socketBoundUserId = userId;
@@ -2819,7 +4038,12 @@ Future<void> _initSocket() async {
 
     socket?.on('connect', (_) {
       debugPrint('✅ Socket connected: ${socket?.id}');
+      chatEventsController.add({
+        'type': 'socket:connected',
+        'data': {'socketId': socket?.id},
+      });
       unawaited(_refreshSupportQueueNotices());
+      unawaited(refreshNotificationBadgeCount());
     });
 
     socket?.on('disconnect', (reason) {
@@ -2875,6 +4099,28 @@ Future<void> _initSocket() async {
       _socketVerboseLog('📬 Socket event chat:message:read -> $data');
       chatEventsController.add({'type': 'chat:message:read', 'data': data});
       _scheduleWebPushBadgeSync();
+    });
+
+    socket?.on('notification:new', (data) {
+      _socketVerboseLog('📬 Socket event notification:new -> $data');
+      unawaited(_handleSocketNotificationNew(data));
+    });
+
+    socket?.on('notification:badge', (data) {
+      _socketVerboseLog('📬 Socket event notification:badge -> $data');
+      _handleSocketNotificationBadge(data);
+    });
+
+    socket?.on('notification:read', (data) {
+      _socketVerboseLog('📬 Socket event notification:read -> $data');
+      _handleSocketNotificationRead(data);
+    });
+
+    socket?.on('notification:campaign-status', (data) {
+      _socketVerboseLog(
+        '📬 Socket event notification:campaign-status -> $data',
+      );
+      _handleSocketNotificationCampaignStatus(data);
     });
 
     socket?.on('tenant:subscription:update', (data) {
@@ -2981,9 +4227,7 @@ Widget _buildInitialScreenFromRestoredUser(User? restoredUser) {
   final phoneAccessState = (restoredUser.phoneAccessState ?? '')
       .trim()
       .toLowerCase();
-  debugPrint(
-    'determineInitialScreen: restored user name=$name phone=$phone',
-  );
+  debugPrint('determineInitialScreen: restored user name=$name phone=$phone');
   if (_isPhoneAccessRestrictedState(phoneAccessState)) {
     return const PhoneAccessPendingScreen();
   }
@@ -3017,7 +4261,8 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   }
   if (!dbReady) return const SetupFailedScreen();
 
-  final hasStoredToken = await authService.primeAuthHeaderFromStoredToken()
+  final hasStoredToken = await authService
+      .primeAuthHeaderFromStoredToken()
       .timeout(const Duration(seconds: 1), onTimeout: () => false);
   if (hasStoredToken && authService.currentUser != null) {
     final localUser = authService.currentUser;
@@ -3184,8 +4429,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   bool _offlinePurchaseProbeBusy = false;
   Timer? _appUpdateProbeTimer;
   bool _appUpdateProbeBusy = false;
-  bool _appUpdateDialogOpen = false;
-  String? _dismissedUpdateToken;
 
   void _showAuthScreen() {
     if (!mounted) return;
@@ -3254,12 +4497,13 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   }
 
   Future<void> _showAppUpdateDialog(_AppUpdateInfo info) async {
-    if (!mounted || _appUpdateDialogOpen) return;
+    if (!mounted || _appUpdateDialogVisible) return;
     final context = navigatorKey.currentContext ?? this.context;
     if (!context.mounted) return;
 
     final updateToken = '${info.platform}:${info.latest.token}';
-    _appUpdateDialogOpen = true;
+    _appUpdateDialogVisible = true;
+    _lastForegroundUpdateToken = updateToken;
     try {
       final decision = await showDialog<String>(
         context: context,
@@ -3280,8 +4524,19 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           final minSupportedLabel = info.minSupported == null
               ? null
               : '${info.minSupported!.version}+${info.minSupported!.build}';
+          final actionAvailable = info.platform == 'android'
+              ? info.hasAndroidManagedManifest
+              : (info.downloadUrl ?? '').trim().isNotEmpty;
+          final changelogLines = (info.changelog ?? '')
+              .split('\n')
+              .map((line) => line.trim())
+              .where((line) => line.isNotEmpty)
+              .toList(growable: false);
           return Dialog(
-            insetPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 24),
+            insetPadding: const EdgeInsets.symmetric(
+              horizontal: 18,
+              vertical: 24,
+            ),
             backgroundColor: Colors.transparent,
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 520),
@@ -3366,10 +4621,34 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
                           ),
                         ),
                       ],
-                      if ((info.downloadUrl ?? '').trim().isEmpty) ...[
+                      if (changelogLines.isNotEmpty) ...[
                         const SizedBox(height: 12),
                         Text(
-                          'Ссылка на обновление не настроена на сервере. Обратитесь к администратору.',
+                          'Что нового',
+                          style: theme.textTheme.titleSmall?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        ...changelogLines.map(
+                          (line) => Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Text(
+                              '• $line',
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                      if (!actionAvailable) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          info.platform == 'android'
+                              ? 'Manifest обновления пока не настроен на сервере. Обратитесь к администратору.'
+                              : 'Ссылка на обновление не настроена на сервере. Обратитесь к администратору.',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: Colors.white,
                             fontWeight: FontWeight.w700,
@@ -3392,8 +4671,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
                       SizedBox(
                         width: double.infinity,
                         child: FilledButton.icon(
-                          onPressed: () =>
-                              Navigator.of(dialogContext).pop('update'),
+                          onPressed: actionAvailable
+                              ? () => Navigator.of(dialogContext).pop('update')
+                              : null,
                           style: FilledButton.styleFrom(
                             backgroundColor: Colors.white,
                             foregroundColor: const Color(0xFF0F6667),
@@ -3416,27 +4696,28 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       );
 
       if (decision == 'update') {
-        final url = (info.downloadUrl ?? '').trim();
-        if (url.isEmpty) {
+        final actionAvailable = info.platform == 'android'
+            ? info.hasAndroidManagedManifest
+            : (info.downloadUrl ?? '').trim().isNotEmpty;
+        if (!actionAvailable) {
           showGlobalAppNotice(
-            'Ссылка на обновление не настроена на сервере.',
+            info.platform == 'android'
+                ? 'Manifest обновления не настроен на сервере.'
+                : 'Ссылка на обновление не настроена на сервере.',
             title: 'Обновление Феникс',
             tone: AppNoticeTone.error,
           );
           return;
         }
-        final opened = await _openUpdateUrl(
-          url,
-          platform: info.platform,
-          latest: info.latest,
-        );
+        final opened = await _openUpdateUrl(info);
         if (opened) {
-          _dismissedUpdateToken = updateToken;
+          _dismissedForegroundUpdateToken = updateToken;
+          if (info.platform == 'android') {
+            return;
+          }
           final successMessage =
               info.platform == 'windows' || info.platform == 'macos'
               ? 'Обновление скачивается в фоне. После загрузки запустится установщик, и приложение закроется автоматически.'
-              : info.platform == 'android'
-              ? 'APK скачан. Если Android спросит разрешение, разрешите установку неизвестных приложений для Феникс.'
               : 'Открыта ссылка на обновление Феникс.';
           showGlobalAppNotice(
             successMessage,
@@ -3455,21 +4736,21 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           );
         }
       } else if (decision == 'later' && !info.required) {
-        _dismissedUpdateToken = updateToken;
+        _dismissedForegroundUpdateToken = updateToken;
       }
     } finally {
-      _appUpdateDialogOpen = false;
+      _appUpdateDialogVisible = false;
     }
   }
 
   Future<void> _probeAppUpdate() async {
-    if (!mounted || _appUpdateProbeBusy || _appUpdateDialogOpen) return;
+    if (!mounted || _appUpdateProbeBusy || _appUpdateDialogVisible) return;
     _appUpdateProbeBusy = true;
     try {
       final info = await _fetchAppUpdateInfo();
       if (!mounted || info == null) return;
       final updateToken = '${info.platform}:${info.latest.token}';
-      if (!info.required && _dismissedUpdateToken == updateToken) {
+      if (!info.required && _dismissedForegroundUpdateToken == updateToken) {
         return;
       }
       await _showAppUpdateDialog(info);
@@ -3585,6 +4866,18 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     try {
       authService = AuthService(dio: dio);
       _attachAuthInterceptor();
+      await NativePushService.initialize(
+        dio: dio,
+        onNotificationOpen:
+            (payload, {required fromTap, required coldStart}) async {
+              await handleNotificationPayloadEntry(
+                payload,
+                fromTap: fromTap,
+                coldStart: coldStart,
+                source: 'native',
+              );
+            },
+      );
       unawaited(inputLanguageService.initialize());
       if (kIsWeb) {
         final hasStoredToken = await authService
@@ -3624,6 +4917,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           _restartOfflinePurchaseProbe();
           await refreshUserPreferences();
           _updateSubscriptionUiState();
+          unawaited(NativePushService.consumePendingTapPayload());
         }
       });
       _restartSubscriptionProbe();
@@ -3652,6 +4946,11 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     if (!mounted) return;
     setState(() {
       _home = initial;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (authService.currentUser != null) {
+        unawaited(NativePushService.consumePendingTapPayload());
+      }
     });
   }
 
@@ -3763,9 +5062,9 @@ class _SetupFailedScreenState extends State<SetupFailedScreen> {
       if (ok) {
         final next = await determineInitialScreen(true);
         if (!mounted) return;
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => next),
-        );
+        Navigator.of(
+          context,
+        ).pushReplacement(MaterialPageRoute(builder: (_) => next));
         return;
       }
       if (!silent) {
@@ -3845,7 +5144,9 @@ class _SetupFailedScreenState extends State<SetupFailedScreen> {
                     onPressed: _retrying
                         ? null
                         : () => _retryConnection(silent: false),
-                    child: Text(_retrying ? 'Подключаемся...' : 'Повторить сейчас'),
+                    child: Text(
+                      _retrying ? 'Подключаемся...' : 'Повторить сейчас',
+                    ),
                   ),
                 ],
               ),

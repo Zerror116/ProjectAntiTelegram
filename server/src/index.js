@@ -1,12 +1,26 @@
 // server/src/index.js
 // Главный файл Express приложения с Socket.io
 
-require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
+
+const serverRoot = path.resolve(__dirname, "..");
+dotenv.config({ path: path.join(serverRoot, ".env") });
+
+const bootNodeEnv = String(process.env.NODE_ENV || "development")
+  .toLowerCase()
+  .trim();
+if (bootNodeEnv !== "production") {
+  const localEnvPath = path.join(serverRoot, ".env.local");
+  if (fs.existsSync(localEnvPath)) {
+    dotenv.config({ path: localEnvPath, override: true });
+  }
+}
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const fs = require("fs");
-const path = require("path");
 const cors = require("cors");
 const helmet = require("helmet");
 const bodyParser = require("body-parser");
@@ -33,6 +47,9 @@ const cartRoutes = require("./routes/cart");
 const supportRoutes = require("./routes/support");
 const appUpdateRoutes = require("./routes/appUpdate");
 const webPushRoutes = require("./routes/webPush");
+const notificationsRoutes = require("./routes/notifications");
+const adminNotificationsRoutes = require("./routes/adminNotifications");
+const { runNotificationDigestSweep } = require("./utils/notifications");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
 const {
@@ -195,6 +212,15 @@ function isAndroidUserAgent(req) {
     .trim();
   if (!userAgent) return false;
   return userAgent.includes("android");
+}
+
+function extractBearerToken(rawValue) {
+  const auth = String(rawValue || "").trim();
+  if (!auth) return "";
+  if (/^bearer\s+/i.test(auth)) {
+    return auth.replace(/^bearer\s+/i, "").trim();
+  }
+  return auth;
 }
 
 function sanitizeRequestPathForLog(req) {
@@ -475,7 +501,16 @@ app.use("/api/worker", workerRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/app/update", appUpdateRoutes);
+app.get("/download/android", (req, res) => {
+  const query = req.originalUrl.includes('?')
+    ? req.originalUrl.slice(req.originalUrl.indexOf('?'))
+    : '';
+  return res.redirect(302, `/api/app/update/download/android${query}`);
+});
 app.use("/api/web-push", webPushRoutes);
+app.use("/api/notifications", notificationsRoutes);
+app.use("/api/admin/notifications", adminNotificationsRoutes);
+app.use("/api/creator/notifications", adminNotificationsRoutes);
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim();
@@ -743,6 +778,7 @@ async function canUserAccessChat(user, chatId) {
 
     // Делаем io доступным в express
     app.set("io", io);
+    global.__projectPhoenixSocketIo = io;
     patchSocketEmittersWithSignedUploads(io);
     console.log("✅ Socket.io initialized");
     if (typeof deliveryRoutes.startBackgroundTasks === "function") {
@@ -759,7 +795,12 @@ async function canUserAccessChat(user, chatId) {
     io.use(async (socket, next) => {
       try {
         const token =
-          socket.handshake.auth?.token || socket.handshake.query?.token;
+          String(socket.handshake.auth?.token || "").trim() ||
+          String(socket.handshake.query?.token || "").trim() ||
+          extractBearerToken(
+            socket.handshake.headers?.authorization ||
+              socket.handshake.headers?.Authorization,
+          );
         if (!token) return next(new Error("Unauthorized"));
 
         const context = await resolveAuthContextFromToken(
@@ -937,6 +978,14 @@ async function canUserAccessChat(user, chatId) {
       );
       void runMessageEncryptionBackfill({ logger: console }).catch((err) => {
         console.error("message encryption backfill startup error:", err);
+      });
+      setInterval(() => {
+        void runNotificationDigestSweep().catch((err) => {
+          console.error("notification digest sweep error:", err);
+        });
+      }, 5 * 60 * 1000);
+      void runNotificationDigestSweep().catch((err) => {
+        console.error("notification digest startup sweep error:", err);
       });
       console.log("\n");
     });

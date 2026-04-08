@@ -10,6 +10,8 @@ import '../main.dart';
 import '../services/web_notification_service.dart';
 import '../widgets/web_notification_prompt.dart';
 import 'bug_report_screen.dart';
+import 'notification_preferences_screen.dart';
+import 'notifications_screen.dart';
 import 'printer_test_screen.dart';
 import 'support_screen.dart';
 
@@ -54,6 +56,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool get _isAndroidWeb =>
       kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  bool get _canOpenNotificationCenter {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    return role == 'creator';
+  }
 
   @override
   void initState() {
@@ -129,30 +136,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Future<void> _openSystemNotificationSettings() async {
-    if (kIsWeb) {
-      await showWebNotificationHelpSheet(
-        context,
-        permissionState: _webNotificationPermissionState,
-        isIosWeb: defaultTargetPlatform == TargetPlatform.iOS,
-        isAndroidWeb: defaultTargetPlatform == TargetPlatform.android,
-        isStandalone: WebNotificationService.isStandaloneDisplayMode,
-      );
-      return;
-    }
-    final opened = await launchUrl(
-      Uri.parse('app-settings:'),
-      mode: LaunchMode.externalApplication,
-    );
-    if (opened) return;
-    if (!mounted) return;
-    showAppNotice(
-      context,
-      'Не удалось открыть настройки устройства',
-      tone: AppNoticeTone.warning,
-    );
-  }
-
   Future<void> _showNotificationGuide() async {
     if (kIsWeb) {
       await showWebNotificationHelpSheet(
@@ -166,15 +149,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
 
     final isAndroid = defaultTargetPlatform == TargetPlatform.android;
+    final isMacOs = defaultTargetPlatform == TargetPlatform.macOS;
     final steps = isAndroid
         ? const <String>[
-            '1. Нажмите «Открыть системные настройки».',
-            '2. Для Android 13 и новее разрешите приложению уведомления.',
-            '3. Внутри настроек Феникс включите звук, показ на экране блокировки и всплывающие уведомления.',
+            '1. Откройте системные настройки телефона.',
+            '2. Найдите Феникс -> Уведомления.',
+            '3. Для Android 13 и новее разрешите приложению уведомления, звук, показ на экране блокировки и всплывающие уведомления.',
             '4. Если телефон экономит батарею слишком агрессивно, разрешите Феникс работу в фоне, чтобы важные уведомления не задерживались.',
           ]
+        : isMacOs
+        ? const <String>[
+            '1. Откройте System Settings -> Notifications.',
+            '2. Найдите Феникс в списке приложений.',
+            '3. Включите показ в Notification Center, баннеры и звук.',
+            '4. Если уведомления были запрещены раньше, включите их вручную в системных настройках macOS.',
+          ]
         : const <String>[
-            '1. Нажмите «Открыть системные настройки».',
+            '1. Откройте Настройки iPhone.',
             '2. Найдите Феникс -> Уведомления.',
             '3. Включите «Допуск уведомлений», баннеры, звук и показ в центре уведомлений.',
             '4. Если уведомления уже были запрещены раньше, включите их вручную в настройках системы.',
@@ -201,7 +192,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(height: 10),
                 Text(
                   isAndroid
-                      ? 'Android показывает системные уведомления только после явного разрешения пользователя. Лучше включать их прямо в настройках приложения и системы.'
+                      ? 'Android показывает системные уведомления только после явного разрешения пользователя. Их нужно включить в системных настройках телефона.'
+                      : isMacOs
+                      ? 'На macOS уведомления включаются в системном разделе Notifications. Там же настраиваются баннеры, звук и показ в центре уведомлений.'
                       : 'На iPhone уведомления начинают работать только после системного разрешения. Баннеры, звук и центр уведомлений настраиваются отдельно.',
                   style: theme.textTheme.bodyMedium,
                 ),
@@ -211,15 +204,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     padding: const EdgeInsets.only(bottom: 6),
                     child: Text(step, style: theme.textTheme.bodyMedium),
                   ),
-                ),
-                const SizedBox(height: 14),
-                FilledButton.icon(
-                  onPressed: () {
-                    Navigator.of(sheetContext).pop();
-                    unawaited(_openSystemNotificationSettings());
-                  },
-                  icon: const Icon(Icons.open_in_new_rounded),
-                  label: const Text('Открыть системные настройки'),
                 ),
               ],
             ),
@@ -246,8 +230,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   bool _isTwoFactorEligibleRole() {
-    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    final role = authService.effectiveRole.toLowerCase().trim();
     return role == 'admin' || role == 'tenant' || role == 'creator';
+  }
+
+  bool get _isClientBaseRole {
+    return authService.effectiveRole.toLowerCase().trim() == 'client';
   }
 
   String _extractDioMessage(
@@ -289,7 +277,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (data is Map) {
           final android = data['android'];
           if (android is Map) {
-            final raw = (android['download_url'] ?? '').toString().trim();
+            final raw =
+                ((android['landing_url'] ?? android['download_url']) ?? '')
+                    .toString()
+                    .trim();
             if (raw.isNotEmpty) {
               nextUrl = raw;
             }
@@ -1014,6 +1005,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  void _openNotificationCenter() {
+    if (!_canOpenNotificationCenter) {
+      showAppNotice(
+        context,
+        'Раздел событий доступен только создателю.',
+        tone: AppNoticeTone.info,
+      );
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const NotificationsScreen()),
+    );
+  }
+
+  void _openNotificationPreferences() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const NotificationPreferencesScreen()),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1034,20 +1047,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             ListTile(
-              leading: const Icon(Icons.notifications_active_outlined),
-              title: const Text('Системные настройки уведомлений'),
-              subtitle: const Text(
-                'Открыть настройки уведомлений устройства/браузера',
-              ),
-              onTap: _openSystemNotificationSettings,
-            ),
-            ListTile(
               leading: const Icon(Icons.help_outline_rounded),
               title: const Text('Как включить уведомления'),
               subtitle: const Text(
                 'Короткая инструкция для телефона и браузера',
               ),
               onTap: _showNotificationGuide,
+            ),
+            if (_canOpenNotificationCenter)
+              ListTile(
+                leading: const Icon(Icons.notifications_none_rounded),
+                title: const Text('Центр уведомлений'),
+                subtitle: const Text(
+                  'История событий, счётчик уведомлений и быстрые переходы',
+                ),
+                onTap: _openNotificationCenter,
+              ),
+            ListTile(
+              leading: const Icon(Icons.tune_rounded),
+              title: Text(
+                _isClientBaseRole
+                    ? 'Уведомления Феникс'
+                    : 'Настройки уведомлений Феникс',
+              ),
+              subtitle: Text(
+                _isClientBaseRole
+                    ? 'Просто включить или выключить серверные уведомления Феникс'
+                    : 'Категории уведомлений, каналы доставки и расширенные настройки создателя',
+              ),
+              onTap: _openNotificationPreferences,
             ),
             if (_canOpenThermalPrinter)
               ListTile(

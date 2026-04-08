@@ -14,8 +14,8 @@ class StickerPreviewCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final phone = job.phone.trim().isEmpty ? '89277613521' : job.phone.trim();
-    final name = job.name.trim().isEmpty ? 'Василя' : job.name.trim();
+    final phone = job.phone.trim().isEmpty ? '89999999999' : job.phone.trim();
+    final name = job.name.trim().isEmpty ? 'Имя' : job.name.trim();
     final title = (job.productTitle ?? '').trim();
     final price = (job.priceLabel ?? '').trim();
     final footer = (job.footerText ?? 'Феникс').trim();

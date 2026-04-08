@@ -17,6 +17,10 @@ const { guardAction } = require("../utils/antifraud");
 const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
 const {
+  markChatInboxItemsRead,
+  computeNotificationBadgeCount,
+} = require("../utils/notifications");
+const {
   encryptMessageText,
   decryptMessageText,
   decryptMessageRow,
@@ -328,6 +332,20 @@ function isAdminOnlyChannel(chat, settings) {
   );
 }
 
+function isBugReportsChannel(chat, settings) {
+  const kind = String(settings?.kind || "")
+    .toLowerCase()
+    .trim();
+  return kind === "bug_reports" || isBugReportsTitle(chat?.title);
+}
+
+function canAccessBugReportsChannel(role) {
+  const raw = String(role || "")
+    .toLowerCase()
+    .trim();
+  return raw === "admin" || raw === "creator";
+}
+
 function isReservedOrdersChannel(chat, settings) {
   const kind = String(settings?.kind || "")
     .toLowerCase()
@@ -439,6 +457,9 @@ function canReadChat(context, userRole, permissions = {}) {
 
     const adminOnly = isAdminOnlyChannel(context.chat, context.settings);
     if (adminOnly) {
+      if (isBugReportsChannel(context.chat, context.settings)) {
+        return canAccessBugReportsChannel(userRole);
+      }
       return isAdminOrCreator(role);
     }
     if (context.visibility === "public") return true;
@@ -492,6 +513,9 @@ function canPostChat(context, userRole, permissions = {}) {
 
     const adminOnly = isAdminOnlyChannel(context.chat, context.settings);
     if (adminOnly) {
+      if (isBugReportsChannel(context.chat, context.settings)) {
+        return canAccessBugReportsChannel(userRole);
+      }
       return (
         isAdminOrCreator(role) ||
         hasPermission(permissions, "chat.write.public")
@@ -1081,6 +1105,23 @@ function removeChatMediaByUrl(raw) {
   }
 }
 
+async function loadMessageReactionsByUser(messageId) {
+  const result = await db.query(
+    `SELECT user_id::text AS user_id, emoji
+     FROM message_reactions
+     WHERE message_id = $1`,
+    [messageId],
+  );
+  const reactions = {};
+  for (const row of result.rows) {
+    const userId = String(row.user_id || "").trim();
+    const emoji = normalizeReactionEmoji(row.emoji);
+    if (!userId || !emoji) continue;
+    reactions[userId] = emoji;
+  }
+  return reactions;
+}
+
 async function getHydratedMessageById(messageId, currentUserId) {
   const result = await db.query(
     `SELECT m.id,
@@ -1121,7 +1162,63 @@ async function getHydratedMessageById(messageId, currentUserId) {
      LIMIT 1`,
       [messageId, currentUserId ? String(currentUserId) : null],
   );
-  return decryptMessageRow(result.rows[0] || null);
+  const hydrated = decryptMessageRow(result.rows[0] || null);
+  if (!hydrated) return null;
+  const meta = parseMeta(hydrated.meta);
+  const reactionMap = await loadMessageReactionsByUser(hydrated.id);
+  if (Object.keys(reactionMap).length > 0) {
+    hydrated.meta = {
+      ...meta,
+      reactions_by_user: reactionMap,
+    };
+  } else {
+    hydrated.meta = meta;
+  }
+  return hydrated;
+}
+
+async function attachReactionMapsToMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const ids = messages
+    .map((message) => String(message?.id || "").trim())
+    .filter(Boolean);
+  if (ids.length === 0) return messages;
+  const reactionsQ = await db.query(
+    `SELECT message_id::text AS message_id,
+            user_id::text AS user_id,
+            emoji
+     FROM message_reactions
+     WHERE message_id = ANY($1::uuid[])`,
+    [ids],
+  );
+  const byMessageId = new Map();
+  for (const row of reactionsQ.rows) {
+    const messageId = String(row.message_id || "").trim();
+    const userId = String(row.user_id || "").trim();
+    const emoji = normalizeReactionEmoji(row.emoji);
+    if (!messageId || !userId || !emoji) continue;
+    const current = byMessageId.get(messageId) || {};
+    current[userId] = emoji;
+    byMessageId.set(messageId, current);
+  }
+  return messages.map((message) => {
+    const messageId = String(message?.id || "").trim();
+    const meta = parseMeta(message?.meta);
+    const reactionsByUser = byMessageId.get(messageId);
+    if (!reactionsByUser || Object.keys(reactionsByUser).length === 0) {
+      return {
+        ...message,
+        meta,
+      };
+    }
+    return {
+      ...message,
+      meta: {
+        ...meta,
+        reactions_by_user: reactionsByUser,
+      },
+    };
+  });
 }
 
 async function unhideChatInListForIncomingMessage(chatId, senderUserId = null) {
@@ -1458,7 +1555,144 @@ async function insertMessageWithDedup({
   return db.query(insertDirectSql, insertDirectParams);
 }
 
-async function markChatMessagesRead(chatId, userId) {
+function parseCursorTimestamp(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+function parseCursorLimit(raw, fallback = 40) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(Math.trunc(value), 100));
+}
+
+function trimOptionalUuid(raw) {
+  const value = String(raw || "").trim();
+  return value || null;
+}
+
+function trimOptionalText(raw, maxLength = 4000) {
+  const value = String(raw || "");
+  return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
+function parseOptionalNumber(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  return value;
+}
+
+async function getUserChatState(userId, chatId) {
+  const stateQ = await db.query(
+    `SELECT user_id,
+            chat_id,
+            last_read_message_id,
+            last_seen_message_id,
+            draft_text,
+            draft_updated_at,
+            scroll_anchor_message_id,
+            scroll_anchor_offset,
+            created_at,
+            updated_at
+     FROM user_chat_state
+     WHERE user_id = $1
+       AND chat_id = $2
+     LIMIT 1`,
+    [userId, chatId],
+  );
+  return stateQ.rowCount > 0 ? stateQ.rows[0] : null;
+}
+
+async function upsertUserChatState(userId, chatId, patch = {}) {
+  const columns = [];
+  const values = [];
+  const updates = [];
+  let index = 3;
+
+  const assign = (column, value) => {
+    columns.push(column);
+    values.push(value);
+    updates.push(`${column} = EXCLUDED.${column}`);
+    index += 1;
+    return `$${index - 1}`;
+  };
+
+  if (Object.prototype.hasOwnProperty.call(patch, "last_read_message_id")) {
+    assign("last_read_message_id", trimOptionalUuid(patch.last_read_message_id));
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "last_seen_message_id")) {
+    assign("last_seen_message_id", trimOptionalUuid(patch.last_seen_message_id));
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "draft_text")) {
+    assign("draft_text", trimOptionalText(patch.draft_text || "", 8000));
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "draft_updated_at")) {
+    assign("draft_updated_at", patch.draft_updated_at || null);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "scroll_anchor_message_id")) {
+    assign(
+      "scroll_anchor_message_id",
+      trimOptionalUuid(patch.scroll_anchor_message_id),
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "scroll_anchor_offset")) {
+    assign("scroll_anchor_offset", parseOptionalNumber(patch.scroll_anchor_offset));
+  }
+
+  if (columns.length === 0) {
+    return getUserChatState(userId, chatId);
+  }
+
+  const insertColumns = ["user_id", "chat_id", ...columns, "created_at", "updated_at"];
+  const insertValues = ["$1", "$2", ...columns.map((_, i) => `$${i + 3}`), "now()", "now()"];
+  const result = await db.query(
+    `INSERT INTO user_chat_state (${insertColumns.join(", ")})
+     VALUES (${insertValues.join(", ")})
+     ON CONFLICT (user_id, chat_id)
+     DO UPDATE
+       SET ${updates.join(", ")},
+           updated_at = now()
+     RETURNING user_id,
+               chat_id,
+               last_read_message_id,
+               last_seen_message_id,
+               draft_text,
+               draft_updated_at,
+               scroll_anchor_message_id,
+               scroll_anchor_offset,
+               created_at,
+               updated_at`,
+    [userId, chatId, ...values],
+  );
+  return result.rows[0] || null;
+}
+
+async function getVisibleMessageAnchor(chatId, userId, messageId) {
+  const trimmedMessageId = String(messageId || "").trim();
+  if (!trimmedMessageId) return null;
+  const anchorQ = await db.query(
+    `SELECT m.id,
+            m.created_at
+     FROM messages m
+     WHERE m.chat_id = $1
+       AND m.id = $2
+       AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+     LIMIT 1`,
+    [chatId, trimmedMessageId, String(userId || "")],
+  );
+  return anchorQ.rowCount > 0 ? anchorQ.rows[0] : null;
+}
+
+async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null) {
+  const visibleAnchor = visibleUntilMessageId
+    ? await getVisibleMessageAnchor(chatId, userId, visibleUntilMessageId)
+    : null;
+
   const result = await db.query(
     `WITH unread AS (
        SELECT m.id, m.sender_id
@@ -1473,7 +1707,12 @@ async function markChatMessagesRead(chatId, userId) {
          FROM message_reads mr
            WHERE mr.message_id = m.id
              AND mr.user_id = $2
-         )
+       )
+       AND (
+         $3::uuid IS NULL
+         OR m.created_at < $4::timestamptz
+         OR (m.created_at = $4::timestamptz AND m.id <= $3::uuid)
+       )
      ),
      inserted AS (
        INSERT INTO message_reads (message_id, user_id, chat_id, read_at)
@@ -1486,8 +1725,23 @@ async function markChatMessagesRead(chatId, userId) {
             unread.sender_id::text AS sender_id
      FROM inserted i
      JOIN unread ON unread.id = i.message_id`,
-    [chatId, userId],
+    [
+      chatId,
+      userId,
+      visibleAnchor?.id || null,
+      visibleAnchor?.created_at || null,
+    ],
   );
+  const lastReadMessageId =
+    visibleAnchor?.id ||
+    result.rows[result.rows.length - 1]?.message_id ||
+    null;
+  if (lastReadMessageId) {
+    await upsertUserChatState(userId, chatId, {
+      last_read_message_id: lastReadMessageId,
+      last_seen_message_id: lastReadMessageId,
+    });
+  }
   return result.rows;
 }
 
@@ -1539,7 +1793,219 @@ async function getActivePinForUser(req, chatId, userId) {
   };
 }
 
-router.get("/", requireAuth, async (req, res) => {
+async function getFirstUnreadMessageId(chatId, userId) {
+  const result = await db.query(
+    `SELECT m.id::text AS id
+     FROM messages m
+     WHERE m.chat_id = $1
+       AND m.sender_id IS NOT NULL
+       AND m.sender_id <> $2
+       AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND NOT EXISTS (
+         SELECT 1
+         FROM message_reads mr
+         WHERE mr.message_id = m.id
+           AND mr.user_id = $2
+       )
+     ORDER BY m.created_at ASC, m.id ASC
+     LIMIT 1`,
+    [chatId, String(userId || "")],
+  );
+  return result.rows[0]?.id || null;
+}
+
+async function getChatUnreadCount(chatId, userId) {
+  const result = await db.query(
+    `SELECT COUNT(*)::int AS unread_count
+     FROM messages m
+     WHERE m.chat_id = $1
+       AND m.sender_id IS NOT NULL
+       AND m.sender_id <> $2
+       AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND NOT EXISTS (
+         SELECT 1
+         FROM message_reads mr
+         WHERE mr.message_id = m.id
+           AND mr.user_id = $2
+       )`,
+    [chatId, String(userId || "")],
+  );
+  return Number(result.rows[0]?.unread_count || 0);
+}
+
+async function loadPagedMessages(req, {
+  chatId,
+  userId,
+  beforeCreatedAt = null,
+  beforeId = null,
+  afterCreatedAt = null,
+  afterId = null,
+  limit = 40,
+}) {
+  const safeLimit = parseCursorLimit(limit, 40);
+  const userIdText = String(userId || "");
+  const beforeTs = parseCursorTimestamp(beforeCreatedAt);
+  const afterTs = parseCursorTimestamp(afterCreatedAt);
+  const safeBeforeId = trimOptionalUuid(beforeId);
+  const safeAfterId = trimOptionalUuid(afterId);
+
+  let mode = "latest";
+  let rowsQ;
+
+  if (afterTs && safeAfterId) {
+    mode = "after";
+    rowsQ = await db.query(
+      `SELECT m.id,
+              m.sender_id,
+              m.client_msg_id,
+              m.text,
+              m.meta,
+              m.created_at,
+              (m.sender_id::text = $3::text) AS from_me,
+              EXISTS(
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id = $3::uuid
+              ) AS is_read_by_me,
+              EXISTS(
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              ) AS read_by_others,
+              (
+                SELECT COUNT(*)
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              )::int AS read_count,
+              COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+              u.email AS sender_email,
+              u.avatar_url AS sender_avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.chat_id = $1
+         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         AND (
+           m.created_at > $4::timestamptz
+           OR (m.created_at = $4::timestamptz AND m.id > $5::uuid)
+         )
+       ORDER BY m.created_at ASC, m.id ASC
+       LIMIT $2`,
+      [chatId, safeLimit + 1, userIdText, afterTs, safeAfterId],
+    );
+  } else if (beforeTs && safeBeforeId) {
+    mode = "before";
+    rowsQ = await db.query(
+      `SELECT m.id,
+              m.sender_id,
+              m.client_msg_id,
+              m.text,
+              m.meta,
+              m.created_at,
+              (m.sender_id::text = $3::text) AS from_me,
+              EXISTS(
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id = $3::uuid
+              ) AS is_read_by_me,
+              EXISTS(
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              ) AS read_by_others,
+              (
+                SELECT COUNT(*)
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              )::int AS read_count,
+              COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+              u.email AS sender_email,
+              u.avatar_url AS sender_avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.chat_id = $1
+         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         AND (
+           m.created_at < $4::timestamptz
+           OR (m.created_at = $4::timestamptz AND m.id < $5::uuid)
+         )
+       ORDER BY m.created_at DESC, m.id DESC
+       LIMIT $2`,
+      [chatId, safeLimit + 1, userIdText, beforeTs, safeBeforeId],
+    );
+  } else {
+    rowsQ = await db.query(
+      `SELECT m.id,
+              m.sender_id,
+              m.client_msg_id,
+              m.text,
+              m.meta,
+              m.created_at,
+              (m.sender_id::text = $3::text) AS from_me,
+              EXISTS(
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id = $3::uuid
+              ) AS is_read_by_me,
+              EXISTS(
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              ) AS read_by_others,
+              (
+                SELECT COUNT(*)
+                FROM message_reads mr
+                WHERE mr.message_id = m.id
+                  AND mr.user_id <> m.sender_id
+              )::int AS read_count,
+              COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+              u.email AS sender_email,
+              u.avatar_url AS sender_avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.chat_id = $1
+         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       ORDER BY m.created_at DESC, m.id DESC
+       LIMIT $2`,
+      [chatId, safeLimit + 1, userIdText],
+    );
+  }
+
+  let rows = rowsQ.rows || [];
+  let hasMore = rows.length > safeLimit;
+  if (hasMore) {
+    rows = rows.slice(0, safeLimit);
+  }
+  if (mode !== "after") {
+    rows = rows.reverse();
+  }
+  const decryptedRows = await attachReactionMapsToMessages(
+    rows.map((row) => decorateMessageMediaUrls(req, decryptMessageRow(row))),
+  );
+  return {
+    data: decryptedRows,
+    has_more_before: mode === "before" ? hasMore : mode === "latest" ? hasMore : false,
+    has_more_after: mode === "after" ? hasMore : false,
+    mode,
+  };
+}
+
+async function listChatsHandler(req, res) {
   try {
     const userId = req.user.id;
     const tenantId = req.user.tenant_id || null;
@@ -1549,6 +2015,7 @@ router.get("/", requireAuth, async (req, res) => {
       role === "worker" || role === "admin" || role === "tenant" || role === "creator";
     const adminOrCreator =
       role === "admin" || role === "tenant" || role === "creator";
+    const bugReportViewer = canAccessBugReportsChannel(req.user.role);
 
     const publicAndChannelQ = await db.query(
       `SELECT c.id,
@@ -1577,6 +2044,8 @@ router.get("/", requireAuth, async (req, res) => {
               last_msg.text AS last_message,
               last_msg.created_at AS updated_at,
               COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
+              st.status AS support_ticket_status,
+              COALESCE(NULLIF(BTRIM(support_assignee.name), ''), NULLIF(BTRIM(support_assignee.email), ''), '') AS support_assignee_name,
               last_msg.sender_id AS last_message_sender_id,
               COALESCE(NULLIF(BTRIM(last_user.name), ''), NULLIF(BTRIM(last_user.email), ''), 'Система') AS last_message_sender_name,
               last_user.avatar_url AS last_message_sender_avatar_url,
@@ -1584,6 +2053,10 @@ router.get("/", requireAuth, async (req, res) => {
               COALESCE(last_user.avatar_focus_y, 0) AS last_message_sender_avatar_focus_y,
               COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
        FROM chats c
+       LEFT JOIN support_tickets st
+         ON st.chat_id = c.id
+       LEFT JOIN users support_assignee
+         ON support_assignee.id = st.assignee_id
        LEFT JOIN user_chat_preferences pref
          ON pref.chat_id = c.id
         AND pref.user_id = $1
@@ -1653,7 +2126,7 @@ router.get("/", requireAuth, async (req, res) => {
                  OR COALESCE(c.settings->>'kind', '') = 'bug_reports'
                  OR LOWER(TRIM(c.title)) = 'баг-репорты'
                )
-               AND $3::boolean = true
+               AND $7::boolean = true
              )
              OR
              (
@@ -1705,6 +2178,7 @@ router.get("/", requireAuth, async (req, res) => {
         userIdText,
         userIdText,
         tenantId,
+        bugReportViewer,
       ],
     );
 
@@ -1747,6 +2221,8 @@ router.get("/", requireAuth, async (req, res) => {
         AND cm.user_id = $1
        LEFT JOIN support_tickets st
          ON st.chat_id = c.id
+       LEFT JOIN users support_assignee
+         ON support_assignee.id = st.assignee_id
        LEFT JOIN user_chat_preferences pref
          ON pref.chat_id = c.id
         AND pref.user_id = $1
@@ -1840,6 +2316,18 @@ router.get("/", requireAuth, async (req, res) => {
     }
     const chats = Array.from(byId.values());
     for (const chat of chats) {
+      const settings = normalizeSettings(chat.settings);
+      const supportStatus = String(chat.support_ticket_status || "").trim();
+      const supportAssigneeName = String(chat.support_assignee_name || "").trim();
+      if (supportStatus) {
+        settings.support_ticket = true;
+        settings.support_ticket_status = supportStatus;
+        settings.support_waiting_customer = supportStatus === "waiting_customer";
+        if (supportAssigneeName) {
+          settings.support_assignee_name = supportAssigneeName;
+        }
+      }
+      chat.settings = settings;
       chat.last_message = decryptMessageText(chat.last_message);
     }
 
@@ -1848,7 +2336,10 @@ router.get("/", requireAuth, async (req, res) => {
     console.error("chats.list error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
-});
+}
+
+router.get("/list", requireAuth, listChatsHandler);
+router.get("/", requireAuth, listChatsHandler);
 
 /**
  * POST /api/chats
@@ -1918,6 +2409,89 @@ router.post(
   },
 );
 
+router.get("/:chatId/state", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const [state, firstUnreadMessageId, unreadCount] = await Promise.all([
+      getUserChatState(userId, chatId),
+      getFirstUnreadMessageId(chatId, userId),
+      getChatUnreadCount(chatId, userId),
+    ]);
+
+    return res.json({
+      ok: true,
+      data: {
+        chat_id: chatId,
+        last_read_message_id: state?.last_read_message_id || null,
+        last_seen_message_id: state?.last_seen_message_id || null,
+        draft_text: state?.draft_text || "",
+        draft_updated_at: state?.draft_updated_at || null,
+        scroll_anchor_message_id: state?.scroll_anchor_message_id || null,
+        scroll_anchor_offset: state?.scroll_anchor_offset ?? null,
+        first_unread_message_id: firstUnreadMessageId,
+        unread_count: unreadCount,
+        updated_at: state?.updated_at || null,
+      },
+    });
+  } catch (err) {
+    console.error("chats.state.get error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.patch("/:chatId/state", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const patch = {};
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "last_read_message_id")) {
+      patch.last_read_message_id = req.body.last_read_message_id;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "last_seen_message_id")) {
+      patch.last_seen_message_id = req.body.last_seen_message_id;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "draft_text")) {
+      patch.draft_text = req.body.draft_text;
+      patch.draft_updated_at = new Date().toISOString();
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "scroll_anchor_message_id")) {
+      patch.scroll_anchor_message_id = req.body.scroll_anchor_message_id;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "scroll_anchor_offset")) {
+      patch.scroll_anchor_offset = req.body.scroll_anchor_offset;
+    }
+
+    const state = await upsertUserChatState(userId, chatId, patch);
+    return res.json({ ok: true, data: state });
+  } catch (err) {
+    console.error("chats.state.patch error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 /**
  * GET /api/chats/:chatId/messages
  */
@@ -1935,51 +2509,35 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
-    const { rows } = await db.query(
-      `SELECT m.id,
-              m.sender_id,
-              m.client_msg_id,
-              m.text,
-              m.meta,
-              m.created_at,
-              (m.sender_id::text = $2::text) AS from_me,
-              EXISTS(
-                SELECT 1
-                FROM message_reads mr
-                WHERE mr.message_id = m.id
-                  AND mr.user_id = $2::uuid
-              ) AS is_read_by_me,
-              EXISTS(
-                SELECT 1
-                FROM message_reads mr
-                WHERE mr.message_id = m.id
-                  AND mr.user_id <> m.sender_id
-              ) AS read_by_others,
-              (
-                SELECT COUNT(*)
-                FROM message_reads mr
-                WHERE mr.message_id = m.id
-                  AND mr.user_id <> m.sender_id
-              )::int AS read_count,
-              COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
-              u.email AS sender_email,
-              u.avatar_url AS sender_avatar_url,
-              COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
-              COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
-              COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
-       FROM messages m
-       LEFT JOIN users u ON u.id = m.sender_id
-       WHERE m.chat_id = $1
-         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
-         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-       ORDER BY m.created_at ASC, m.id ASC
-       LIMIT 1000`,
-      [chatId, String(userId)],
-    );
-    const safeRows = rows.map((row) =>
-      decorateMessageMediaUrls(req, decryptMessageRow(row)),
-    );
-    return res.json({ ok: true, data: safeRows });
+    const page = await loadPagedMessages(req, {
+      chatId,
+      userId,
+      beforeCreatedAt: req.query.before_created_at,
+      beforeId: req.query.before_id,
+      afterCreatedAt: req.query.after_created_at,
+      afterId: req.query.after_id,
+      limit: req.query.limit,
+    });
+    const [state, firstUnreadMessageId, unreadCount] = await Promise.all([
+      getUserChatState(userId, chatId),
+      getFirstUnreadMessageId(chatId, userId),
+      getChatUnreadCount(chatId, userId),
+    ]);
+    return res.json({
+      ok: true,
+      data: page.data,
+      paging: {
+        mode: page.mode,
+        has_more_before: page.has_more_before,
+        has_more_after: page.has_more_after,
+      },
+      state: {
+        last_read_message_id: state?.last_read_message_id || null,
+        last_seen_message_id: state?.last_seen_message_id || null,
+        first_unread_message_id: firstUnreadMessageId,
+        unread_count: unreadCount,
+      },
+    });
   } catch (err) {
     console.error("chats.messages error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
@@ -2157,6 +2715,146 @@ router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
   }
 });
 
+router.get("/:chatId/search", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+    const query = String(req.query.q || "").trim();
+    const safeLimit = parseCursorLimit(req.query.limit, 30);
+
+    if (!query) {
+      return res.status(400).json({ ok: false, error: "q required" });
+    }
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    const isReserved = isReservedOrdersChannel(context.chat, context.settings);
+    const digitsOnly = /^[0-9]+$/.test(query);
+    let messages = [];
+
+    if (isReserved && digitsOnly) {
+      const rowsQ = await db.query(
+        `SELECT m.id,
+                m.sender_id,
+                m.client_msg_id,
+                m.text,
+                m.meta,
+                m.created_at,
+                (m.sender_id::text = $3::text) AS from_me,
+                false AS is_read_by_me,
+                false AS read_by_others,
+                0::int AS read_count,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+                u.email AS sender_email,
+                u.avatar_url AS sender_avatar_url,
+                COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+                COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+                COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+         FROM messages m
+         LEFT JOIN users u ON u.id = m.sender_id
+         WHERE m.chat_id = $1
+           AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+           AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+           AND COALESCE(m.meta->>'product_code', '') = $2
+         ORDER BY m.created_at DESC, m.id DESC
+         LIMIT $4`,
+        [chatId, query, String(userId), safeLimit],
+      );
+      messages = rowsQ.rows.map((row) =>
+        decorateMessageMediaUrls(req, decryptMessageRow(row)),
+      );
+    } else if (isReserved) {
+      const like = `%${escapeLikePattern(query.toLowerCase())}%`;
+      const rowsQ = await db.query(
+        `SELECT m.id,
+                m.sender_id,
+                m.client_msg_id,
+                m.text,
+                m.meta,
+                m.created_at,
+                (m.sender_id::text = $3::text) AS from_me,
+                false AS is_read_by_me,
+                false AS read_by_others,
+                0::int AS read_count,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+                u.email AS sender_email,
+                u.avatar_url AS sender_avatar_url,
+                COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+                COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+                COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+         FROM messages m
+         LEFT JOIN users u ON u.id = m.sender_id
+         WHERE m.chat_id = $1
+           AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
+           AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+           AND (
+             LOWER(COALESCE(m.meta->>'title', '')) LIKE $2 ESCAPE '\\'
+             OR LOWER(COALESCE(m.meta->>'description', '')) LIKE $2 ESCAPE '\\'
+           )
+         ORDER BY m.created_at DESC, m.id DESC
+         LIMIT $4`,
+        [chatId, like, String(userId), safeLimit],
+      );
+      messages = rowsQ.rows.map((row) =>
+        decorateMessageMediaUrls(req, decryptMessageRow(row)),
+      );
+    } else {
+      const rowsQ = await db.query(
+        `SELECT m.id,
+                m.sender_id,
+                m.client_msg_id,
+                m.text,
+                m.meta,
+                m.created_at,
+                (m.sender_id::text = $2::text) AS from_me,
+                false AS is_read_by_me,
+                false AS read_by_others,
+                0::int AS read_count,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
+                u.email AS sender_email,
+                u.avatar_url AS sender_avatar_url,
+                COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
+                COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
+                COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
+         FROM messages m
+         LEFT JOIN users u ON u.id = m.sender_id
+         WHERE m.chat_id = $1
+           AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+           AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         ORDER BY m.created_at DESC, m.id DESC
+         LIMIT 2000`,
+        [chatId, String(userId)],
+      );
+      const q = query.toLowerCase();
+      messages = rowsQ.rows
+        .map((row) => decorateMessageMediaUrls(req, decryptMessageRow(row)))
+        .filter((row) => {
+          const meta = parseMeta(row?.meta);
+          const haystacks = [
+            String(row?.text || "").toLowerCase(),
+            String(meta.title || "").toLowerCase(),
+            String(meta.description || "").toLowerCase(),
+          ];
+          return haystacks.some((item) => item.includes(q));
+        })
+        .slice(0, safeLimit);
+    }
+
+    return res.json({ ok: true, data: await attachReactionMapsToMessages(messages) });
+  } catch (err) {
+    console.error("chats.search error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 router.get("/:chatId/pin", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -2314,6 +3012,9 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
     const userId = req.user.id;
     const role = req.user.role;
     const { chatId } = req.params;
+    const visibleUntilMessageId = trimOptionalUuid(
+      req.body?.visible_until_message_id,
+    );
 
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
@@ -2323,7 +3024,12 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
       return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
     }
 
-    const readRows = await markChatMessagesRead(chatId, userId);
+    const readRows = await markChatMessagesRead(
+      chatId,
+      userId,
+      visibleUntilMessageId,
+    );
+    await markChatInboxItemsRead({ userId, chatId });
     const messageIds = readRows
       .map((row) => row.message_id)
       .filter(Boolean);
@@ -2347,6 +3053,10 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
           messageIds: senderMessageIds,
         });
       }
+      const unreadCount = await computeNotificationBadgeCount(userId);
+      io.to(`user:${userId}`).emit("notification:badge", {
+        unread_count: unreadCount,
+      });
     }
 
     return res.json({
@@ -2354,6 +3064,7 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
       data: {
         chat_id: chatId,
         message_ids: messageIds,
+        visible_until_message_id: visibleUntilMessageId,
       },
     });
   } catch (err) {
@@ -2371,7 +3082,16 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     const userId = req.user.id;
     const role = req.user.role;
     const { chatId } = req.params;
-    const { text, client_msg_id } = req.body || {};
+    const {
+      text,
+      client_msg_id,
+      reply_to_message_id,
+      reply_preview_text,
+      reply_preview_sender_name,
+      forwarded_from_message_id,
+      forwarded_from_chat_id,
+      forwarded_from_sender_name,
+    } = req.body || {};
 
     const antifraud = await guardAction({
       queryable: db,
@@ -2408,11 +3128,40 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
         });
     }
 
+    const messageMeta = {};
+    if (trimOptionalUuid(reply_to_message_id)) {
+      messageMeta.reply_to_message_id = trimOptionalUuid(reply_to_message_id);
+      const replyPreviewText = trimOptionalText(reply_preview_text || "", 280);
+      const replyPreviewSenderName = trimOptionalText(
+        reply_preview_sender_name || "",
+        180,
+      );
+      if (replyPreviewText) {
+        messageMeta.reply_preview_text = replyPreviewText;
+      }
+      if (replyPreviewSenderName) {
+        messageMeta.reply_preview_sender_name = replyPreviewSenderName;
+      }
+    }
+    if (trimOptionalUuid(forwarded_from_message_id)) {
+      messageMeta.forwarded_from_message_id = trimOptionalUuid(
+        forwarded_from_message_id,
+      );
+      messageMeta.forwarded_from_chat_id =
+        trimOptionalUuid(forwarded_from_chat_id);
+      messageMeta.forwarded_from_sender_name = trimOptionalText(
+        forwarded_from_sender_name || "",
+        180,
+      ).trim();
+    }
+
     const insert = await insertMessageWithDedup({
       clientMsgId: String(client_msg_id || "").trim() || null,
       chatId,
       senderId: userId,
       text: String(text),
+      metaJson:
+        Object.keys(messageMeta).length > 0 ? JSON.stringify(messageMeta) : null,
     });
 
     const messageId = insert.rows[0]?.id;
@@ -2444,6 +3193,11 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
       messageId,
       userId,
     );
+    await upsertUserChatState(userId, chatId, {
+      last_seen_message_id: messageId,
+      draft_text: "",
+      draft_updated_at: new Date().toISOString(),
+    });
     if (promptMessageId) {
       await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
     }
@@ -2473,6 +3227,25 @@ router.post(
       const { chatId } = req.params;
       const caption = String(req.body?.text || "").trim();
       const clientMsgId = String(req.body?.client_msg_id || "").trim();
+      const replyToMessageId = trimOptionalUuid(req.body?.reply_to_message_id);
+      const replyPreviewText = trimOptionalText(
+        req.body?.reply_preview_text || "",
+        280,
+      );
+      const replyPreviewSenderName = trimOptionalText(
+        req.body?.reply_preview_sender_name || "",
+        180,
+      );
+      const forwardedFromMessageId = trimOptionalUuid(
+        req.body?.forwarded_from_message_id,
+      );
+      const forwardedFromChatId = trimOptionalUuid(
+        req.body?.forwarded_from_chat_id,
+      );
+      const forwardedFromSenderName = trimOptionalText(
+        req.body?.forwarded_from_sender_name || "",
+        180,
+      ).trim();
       const durationMsRaw = Math.floor(Number(req.body?.duration_ms || 0));
       const imageFile = req.files?.image?.[0] || null;
       const voiceFile = req.files?.voice?.[0] || null;
@@ -2560,6 +3333,18 @@ router.post(
       const meta = {
         attachment_type: attachmentType,
         ...(hasCaption ? { caption } : {}),
+        ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
+        ...(replyPreviewText ? { reply_preview_text: replyPreviewText } : {}),
+        ...(replyPreviewSenderName
+          ? { reply_preview_sender_name: replyPreviewSenderName }
+          : {}),
+        ...(forwardedFromMessageId
+          ? {
+              forwarded_from_message_id: forwardedFromMessageId,
+              forwarded_from_chat_id: forwardedFromChatId,
+              forwarded_from_sender_name: forwardedFromSenderName,
+            }
+          : {}),
         ...(attachmentType === "image"
           ? {
               image_url: mediaUrl,
@@ -2648,6 +3433,11 @@ router.post(
         messageId,
         userId,
       );
+      await upsertUserChatState(userId, chatId, {
+        last_seen_message_id: messageId,
+        draft_text: "",
+        draft_updated_at: new Date().toISOString(),
+      });
       if (promptMessageId) {
         await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
       }
@@ -2665,7 +3455,7 @@ router.post(
 
 /**
  * PATCH /api/chats/:chatId/messages/:messageId
- * Редактирование обычного сообщения пользователем-автором
+ * Редактирование сообщения автором или admin/creator
  */
 router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
   try {
@@ -2705,25 +3495,64 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       });
     }
 
-    if (String(message.sender_id || "") !== String(userId)) {
+    const ownMessage = String(message.sender_id || "") === String(userId);
+    const adminOrCreator = isAdminOrCreator(role);
+    if (!ownMessage && !adminOrCreator) {
       return res.status(403).json({
         ok: false,
         error: "Редактировать можно только свои сообщения",
       });
     }
 
+    const previousText = decryptMessageText(message.text);
+    await db.query(
+      `INSERT INTO message_edits (
+         id,
+         message_id,
+         edited_by,
+         editor_role,
+         previous_text,
+         edited_at
+       )
+       VALUES ($1, $2, $3, $4, $5, now())`,
+      [
+        uuidv4(),
+        messageId,
+        userId,
+        String(req.user.role || "").trim(),
+        previousText,
+      ],
+    );
+
     const upd = await db.query(
       `UPDATE messages
        SET text = $1,
-           meta = jsonb_set(
-             jsonb_set(COALESCE(meta, '{}'::jsonb), '{edited}', 'true'::jsonb, true),
-             '{edited_at}',
-             to_jsonb(now()),
-             true
+           meta = (
+             jsonb_set(
+               jsonb_set(
+                 jsonb_set(
+                   jsonb_set(COALESCE(meta, '{}'::jsonb), '{edited}', 'true'::jsonb, true),
+                   '{edited_at}',
+                   to_jsonb(now()),
+                   true
+                 ),
+                 '{edited_by_role}',
+                 to_jsonb($3::text),
+                 true
+               ),
+               '{edited_by_name}',
+               to_jsonb($4::text),
+               true
+             )
            )
        WHERE id = $2
        RETURNING id`,
-      [encryptMessageText(nextText), messageId],
+      [
+        encryptMessageText(nextText),
+        messageId,
+        String(req.user.role || "").trim(),
+        String(req.user.name || req.user.email || "").trim(),
+      ],
     );
     const updatedRaw = await getHydratedMessageById(upd.rows[0]?.id, userId);
     const updated = decorateMessageMediaUrls(req, updatedRaw);
@@ -2743,6 +3572,46 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
+
+router.get(
+  "/:chatId/messages/:messageId/edit-history",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const role = req.user.role;
+      const { chatId, messageId } = req.params;
+
+      const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+      if (!context) {
+        return res.status(404).json({ ok: false, error: "Chat not found" });
+      }
+      const permissionSet = await resolvePermissionSet(req.user, db);
+      if (!canReadChat(context, role, permissionSet.permissions)) {
+        return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+      }
+
+      const rowsQ = await db.query(
+        `SELECT me.id,
+                me.message_id,
+                me.edited_by,
+                me.editor_role,
+                me.previous_text,
+                me.edited_at,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS edited_by_name
+         FROM message_edits me
+         LEFT JOIN users u ON u.id = me.edited_by
+         WHERE me.message_id = $1
+         ORDER BY me.edited_at DESC, me.id DESC`,
+        [messageId],
+      );
+      return res.json({ ok: true, data: rowsQ.rows });
+    } catch (err) {
+      console.error("chats.editHistory error", err);
+      return res.status(500).json({ ok: false, error: "Server error" });
+    }
+  },
+);
 
 router.post(
   "/:chatId/messages/:messageId/reactions",
@@ -2796,9 +3665,31 @@ router.post(
 
       const userIdText = String(userId || "").trim();
       const byUser = normalizeReactionsByUser(meta.reactions_by_user);
-      if (byUser[userIdText] === emoji) {
+      const currentEmoji = byUser[userIdText] || "";
+      if (currentEmoji === emoji) {
+        await db.query(
+          `DELETE FROM message_reactions
+           WHERE message_id = $1
+             AND user_id = $2`,
+          [messageId, userId],
+        );
         delete byUser[userIdText];
       } else {
+        await db.query(
+          `INSERT INTO message_reactions (
+             message_id,
+             user_id,
+             emoji,
+             created_at,
+             updated_at
+           )
+           VALUES ($1, $2, $3, now(), now())
+           ON CONFLICT (message_id, user_id)
+           DO UPDATE
+             SET emoji = EXCLUDED.emoji,
+                 updated_at = now()`,
+          [messageId, userId, emoji],
+        );
         byUser[userIdText] = emoji;
       }
 
@@ -2830,6 +3721,74 @@ router.post(
       return res.json({ ok: true, data: updated });
     } catch (err) {
       console.error("chats.reaction.toggle error", err);
+      return res.status(500).json({ ok: false, error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/:chatId/messages/:messageId/reactions",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const role = req.user.role;
+      const { chatId, messageId } = req.params;
+
+      const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+      if (!context) {
+        return res.status(404).json({ ok: false, error: "Chat not found" });
+      }
+      const permissionSet = await resolvePermissionSet(req.user, db);
+      if (!canReadChat(context, role, permissionSet.permissions)) {
+        return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+      }
+
+      const messageQ = await db.query(
+        `SELECT id, meta
+         FROM messages
+         WHERE id = $1
+           AND chat_id = $2
+         LIMIT 1`,
+        [messageId, chatId],
+      );
+      if (messageQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Сообщение не найдено" });
+      }
+
+      await db.query(
+        `DELETE FROM message_reactions
+         WHERE message_id = $1
+           AND user_id = $2`,
+        [messageId, userId],
+      );
+
+      const meta = parseMeta(messageQ.rows[0].meta);
+      const byUser = normalizeReactionsByUser(meta.reactions_by_user);
+      delete byUser[String(userId || "").trim()];
+      const nextMeta = { ...meta };
+      if (Object.keys(byUser).length > 0) {
+        nextMeta.reactions_by_user = byUser;
+      } else {
+        delete nextMeta.reactions_by_user;
+      }
+      await db.query(
+        `UPDATE messages
+         SET meta = $1::jsonb
+         WHERE id = $2`,
+        [JSON.stringify(nextMeta), messageId],
+      );
+
+      const updatedRaw = await getHydratedMessageById(messageId, userId);
+      const updated = decorateMessageMediaUrls(req, updatedRaw);
+      const io = req.app.get("io");
+      if (io && updated) {
+        io.to(`chat:${chatId}`).emit("chat:message", { chatId, message: updated });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      }
+      return res.json({ ok: true, data: updated });
+    } catch (err) {
+      console.error("chats.reaction.delete error", err);
       return res.status(500).json({ ok: false, error: "Server error" });
     }
   },

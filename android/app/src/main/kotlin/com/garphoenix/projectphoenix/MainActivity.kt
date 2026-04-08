@@ -1,28 +1,30 @@
 package com.garphoenix.projectphoenix
 
 import android.Manifest
-import android.app.DownloadManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
-import android.os.Environment
+import android.os.Bundle
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import java.io.File
 
 class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL_NAME =
             "com.garphoenix.projectphoenix/native_update_installer"
-        private const val APK_MIME = "application/vnd.android.package-archive"
         private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 6104
     }
 
     private var pendingNotificationPermissionResult: MethodChannel.Result? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        ensureNotificationChannels()
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -32,133 +34,67 @@ class MainActivity : FlutterActivity() {
             CHANNEL_NAME,
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "enqueueDownload" -> {
-                    val rawUrl = call.argument<String>("url")?.trim().orEmpty()
-                    val fileName = call.argument<String>("fileName")?.trim().orEmpty()
-                    if (rawUrl.isEmpty() || fileName.isEmpty()) {
+                "startManagedUpdateDownload" -> {
+                    val payloadJson = call.argument<String>("payloadJson")?.trim().orEmpty()
+                    if (payloadJson.isEmpty()) {
                         result.error(
                             "invalid_args",
-                            "url and fileName are required",
+                            "payloadJson is required",
                             null,
                         )
                         return@setMethodCallHandler
                     }
-
                     try {
-                        val request = DownloadManager.Request(Uri.parse(rawUrl)).apply {
-                            setTitle("Обновление Феникс")
-                            setDescription("Скачиваем обновление приложения")
-                            setMimeType(APK_MIME)
-                            setNotificationVisibility(
-                                DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
-                            )
-                            setVisibleInDownloadsUi(true)
-                            setAllowedOverMetered(true)
-                            setAllowedOverRoaming(true)
-                            val headers = call.argument<Map<String, Any?>>("headers")
-                            headers?.forEach { (key, value) ->
-                                val safeKey = key.trim()
-                                val safeValue = value?.toString()?.trim().orEmpty()
-                                if (safeKey.isNotEmpty() && safeValue.isNotEmpty()) {
-                                    addRequestHeader(safeKey, safeValue)
-                                }
-                            }
-                            deleteExistingDownloadTarget(fileName)
-                            setDestinationInExternalPublicDir(
-                                Environment.DIRECTORY_DOWNLOADS,
-                                fileName,
-                            )
-                        }
-
-                        val downloadId = downloadManager().enqueue(request)
-                        result.success(downloadId.toString())
-                    } catch (t: Throwable) {
-                        result.error("enqueue_failed", t.message, null)
-                    }
-                }
-
-                "queryDownloadStatus" -> {
-                    val downloadId = call.argument<String>("downloadId")
-                        ?.trim()
-                        ?.toLongOrNull()
-                    if (downloadId == null) {
-                        result.success(mapOf("status" to "missing"))
-                        return@setMethodCallHandler
-                    }
-
-                    try {
-                        val query = DownloadManager.Query().setFilterById(downloadId)
-                        downloadManager().query(query).use { cursor ->
-                            if (cursor == null || !cursor.moveToFirst()) {
-                                result.success(mapOf("status" to "missing"))
-                                return@use
-                            }
-
-                            val status = cursor.getInt(
-                                cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS),
-                            )
-                            val downloadedBytes = cursor.getLong(
-                                cursor.getColumnIndexOrThrow(
-                                    DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR,
-                                ),
-                            )
-                            val totalBytes = cursor.getLong(
-                                cursor.getColumnIndexOrThrow(
-                                    DownloadManager.COLUMN_TOTAL_SIZE_BYTES,
-                                ),
-                            )
-                            val reason = cursor.getInt(
-                                cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON),
-                            )
-                            val localUri = cursor.getString(
-                                cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI),
-                            )
-                            val downloadedUri =
-                                downloadManager().getUriForDownloadedFile(downloadId)?.toString()
-                            result.success(
-                                mapOf(
-                                    "status" to mapDownloadStatus(status),
-                                    "downloadedBytes" to downloadedBytes,
-                                    "totalBytes" to totalBytes,
-                                    "reason" to reason.toString(),
-                                    "uri" to (downloadedUri ?: localUri.orEmpty()),
-                                ),
-                            )
-                        }
-                    } catch (t: Throwable) {
-                        result.error("query_failed", t.message, null)
-                    }
-                }
-
-                "openDownloadedUri" -> {
-                    val rawUri = call.argument<String>("uri")?.trim().orEmpty()
-                    if (rawUri.isEmpty()) {
-                        result.success(false)
-                        return@setMethodCallHandler
-                    }
-
-                    try {
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(Uri.parse(rawUri), APK_MIME)
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        startActivity(intent)
+                        PhoenixManagedUpdateEngine.startOrResume(applicationContext, payloadJson)
                         result.success(true)
-                    } catch (_: Throwable) {
-                        result.success(false)
+                    } catch (t: Throwable) {
+                        result.error("managed_update_start_failed", t.message, null)
                     }
                 }
 
-                "openDownloadsUi" -> {
+                "getManagedUpdateStatus" -> {
                     try {
-                        val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        startActivity(intent)
+                        result.success(PhoenixManagedUpdateEngine.currentStatus(applicationContext))
+                    } catch (t: Throwable) {
+                        result.error("managed_update_status_failed", t.message, null)
+                    }
+                }
+
+                "installManagedUpdate" -> {
+                    try {
+                        result.success(
+                            PhoenixManagedUpdateEngine.installPreparedUpdate(applicationContext),
+                        )
+                    } catch (t: Throwable) {
+                        result.error("managed_update_install_failed", t.message, null)
+                    }
+                }
+
+                "clearManagedUpdateState" -> {
+                    try {
+                        PhoenixManagedUpdateEngine.clearState(applicationContext)
                         result.success(true)
-                    } catch (_: Throwable) {
-                        result.success(false)
+                    } catch (t: Throwable) {
+                        result.error("managed_update_clear_failed", t.message, null)
+                    }
+                }
+
+                "canRequestPackageInstalls" -> {
+                    try {
+                        result.success(
+                            PhoenixManagedUpdateEngine.canRequestPackageInstalls(applicationContext),
+                        )
+                    } catch (t: Throwable) {
+                        result.error("install_permission_check_failed", t.message, null)
+                    }
+                }
+
+                "openUnknownAppSourcesSettings" -> {
+                    try {
+                        PhoenixManagedUpdateEngine.openUnknownAppSourcesSettings(this)
+                        result.success(true)
+                    } catch (t: Throwable) {
+                        result.error("install_settings_open_failed", t.message, null)
                     }
                 }
 
@@ -195,32 +131,6 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun downloadManager(): DownloadManager {
-        return getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    }
-
-    private fun deleteExistingDownloadTarget(fileName: String) {
-        runCatching {
-            val downloadsDir =
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val target = File(downloadsDir, fileName)
-            if (target.exists()) {
-                target.delete()
-            }
-        }
-    }
-
-    private fun mapDownloadStatus(status: Int): String {
-        return when (status) {
-            DownloadManager.STATUS_PENDING -> "pending"
-            DownloadManager.STATUS_RUNNING -> "running"
-            DownloadManager.STATUS_PAUSED -> "paused"
-            DownloadManager.STATUS_SUCCESSFUL -> "successful"
-            DownloadManager.STATUS_FAILED -> "failed"
-            else -> "unknown"
-        }
-    }
-
     private fun canPostNotifications(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             return true
@@ -245,5 +155,65 @@ class MainActivity : FlutterActivity() {
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
         pendingNotificationPermissionResult?.success(granted)
         pendingNotificationPermissionResult = null
+    }
+
+    private fun ensureNotificationChannels() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return
+        }
+        val manager =
+            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channels = listOf(
+            NotificationChannel(
+                "phoenix_messages",
+                "Личные сообщения",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Личные сообщения и каналы"
+            },
+            NotificationChannel(
+                "phoenix_support",
+                "Поддержка",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Поддержка и служебные ответы"
+            },
+            NotificationChannel(
+                "phoenix_reserved",
+                "Забронированный товар",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Забронированные товары и складские действия"
+            },
+            NotificationChannel(
+                "phoenix_delivery",
+                "Доставка",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Доставка и логистика"
+            },
+            NotificationChannel(
+                "phoenix_promo",
+                "Акции и промо",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Акции и маркетинговые уведомления"
+            },
+            NotificationChannel(
+                "phoenix_updates",
+                "Обновления",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Обновления приложения"
+            },
+            NotificationChannel(
+                "phoenix_security",
+                "Безопасность",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Входы, сбросы пароля и другие security-события"
+            },
+        )
+        manager.createNotificationChannels(channels)
     }
 }
