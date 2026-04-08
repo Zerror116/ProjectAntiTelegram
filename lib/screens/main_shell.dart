@@ -7,13 +7,16 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
+import '../services/notification_device_service.dart';
 import '../services/web_notification_service.dart';
 import '../services/web_push_client_service.dart';
+import '../src/utils/notification_navigation.dart';
 import '../widgets/web_notification_prompt.dart';
 import 'admin_panel.dart';
 import 'auth_screen.dart';
 import 'cart_screen.dart';
 import 'chats_screen.dart';
+import 'notifications_screen.dart';
 import 'profile_screen.dart';
 import 'pwa_guide_screen.dart';
 import 'settings_screen.dart';
@@ -59,26 +62,34 @@ class _MainShellState extends State<MainShell> {
   bool _webNotificationBannerDismissed = false;
   bool _webNotificationRequestInProgress = false;
   Timer? _supportQueueRefreshTimer;
+  VoidCallback? _activeSectionListener;
+  bool _initialNotificationDeepLinkHandled = false;
 
   @override
   void initState() {
     super.initState();
     if (_isAndroidWeb()) return;
+    _activeSectionListener = _handleExternalShellSectionRequest;
+    activeShellSectionNotifier.addListener(_activeSectionListener!);
     _lastEffectiveRole = authService.effectiveRole;
     final initialIds = _destinationIdsForRole(_lastEffectiveRole);
     if (initialIds.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        activeShellSectionNotifier.value = initialIds[_index.clamp(
-          0,
-          initialIds.length - 1,
-        )];
+        activeShellSectionNotifier.value =
+            initialIds[_index.clamp(0, initialIds.length - 1)];
       });
     }
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;
       final currentUser = authService.currentUser;
       unawaited(refreshSupportQueueNotices());
+      if (currentUser == null) {
+        notificationBadgeCountNotifier.value = 0;
+      } else {
+        unawaited(_syncNotificationRuntime());
+        unawaited(_maybeHandleInitialNotificationDeepLink());
+      }
       if (kIsWeb &&
           currentUser != null &&
           _webNotificationPermissionState ==
@@ -94,10 +105,8 @@ class _MainShellState extends State<MainShell> {
           _activatedDestinations.clear();
           final nextIds = _destinationIdsForRole(nextRole);
           if (nextIds.isNotEmpty) {
-            activeShellSectionNotifier.value = nextIds[_index.clamp(
-              0,
-              nextIds.length - 1,
-            )];
+            activeShellSectionNotifier.value =
+                nextIds[_index.clamp(0, nextIds.length - 1)];
           }
         }
       });
@@ -106,9 +115,11 @@ class _MainShellState extends State<MainShell> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _maybeShowIosAddToHomeHint();
+      unawaited(_maybeHandleInitialNotificationDeepLink());
     });
     unawaited(_loadWebNotificationPromptState());
     unawaited(refreshSupportQueueNotices());
+    unawaited(_syncNotificationRuntime());
     _supportQueueRefreshTimer = Timer.periodic(
       const Duration(seconds: 12),
       (_) => unawaited(refreshSupportQueueNotices()),
@@ -119,7 +130,10 @@ class _MainShellState extends State<MainShell> {
   void dispose() {
     _authSub?.cancel();
     _supportQueueRefreshTimer?.cancel();
-    activeShellSectionNotifier.value = '';
+    final listener = _activeSectionListener;
+    if (listener != null) {
+      activeShellSectionNotifier.removeListener(listener);
+    }
     super.dispose();
   }
 
@@ -142,6 +156,7 @@ class _MainShellState extends State<MainShell> {
         normalized == 'worker' ||
         normalized == 'tenant' ||
         normalized == 'creator';
+    final showNotifications = normalized == 'creator';
     final showTests = _isCreatorNativeView();
     return <String>[
       'chats',
@@ -149,6 +164,7 @@ class _MainShellState extends State<MainShell> {
       if (showAdmin) 'admin',
       if (showStats) 'stats',
       if (showWorker) 'worker',
+      if (showNotifications) 'notifications',
       'profile',
       'settings',
       if (showTests) 'tests',
@@ -221,6 +237,12 @@ class _MainShellState extends State<MainShell> {
     return _isCreatorNativeView();
   }
 
+  bool _hasNotificationsTab() {
+    const roles = {'creator'};
+    final role = _effectiveRole();
+    return roles.contains(role);
+  }
+
   bool _hasAnyPermission(List<String> keys) {
     for (final key in keys) {
       if (authService.hasPermission(key)) return true;
@@ -245,6 +267,52 @@ class _MainShellState extends State<MainShell> {
     return kIsWeb && defaultTargetPlatform == TargetPlatform.android;
   }
 
+  Future<void> _syncNotificationRuntime() async {
+    if (authService.currentUser == null) return;
+    await NotificationDeviceService.syncCurrentEndpoint(dio);
+    await refreshNotificationBadgeCount();
+  }
+
+  void _handleExternalShellSectionRequest() {
+    if (!mounted || _isAndroidWeb()) return;
+    final requestedId = activeShellSectionNotifier.value.trim();
+    if (requestedId.isEmpty) return;
+    final destinations = _buildDestinations(
+      showAdmin: _hasAdminTab(),
+      showStats: _hasStatsTab(),
+      showWorker: _hasWorkerTab(),
+      showTests: _hasTestsTab(),
+    );
+    final nextIndex = destinations.indexWhere(
+      (destination) => destination.id == requestedId,
+    );
+    if (nextIndex < 0 || nextIndex == _index) return;
+    setState(() {
+      _index = nextIndex;
+      _activatedDestinations.add(destinations[nextIndex].id);
+    });
+  }
+
+  Future<void> _maybeHandleInitialNotificationDeepLink() async {
+    if (_initialNotificationDeepLinkHandled) return;
+    if (authService.currentUser == null) return;
+    final initialPayload = consumeInitialNotificationTapPayload();
+    if (initialPayload != null) {
+      _initialNotificationDeepLinkHandled = true;
+      await handleNotificationPayloadEntry(
+        initialPayload,
+        fromTap: true,
+        coldStart: true,
+        source: 'webpush',
+      );
+      return;
+    }
+    final raw = consumeInitialNotificationDeepLink();
+    if (raw == null || raw.trim().isEmpty) return;
+    _initialNotificationDeepLinkHandled = true;
+    await openNotificationDeepLink(context, raw);
+  }
+
   Future<void> _loadWebNotificationPromptState() async {
     if (!kIsWeb) return;
     try {
@@ -263,6 +331,7 @@ class _MainShellState extends State<MainShell> {
           authService.currentUser != null) {
         unawaited(WebPushClientService.ensureSubscribed(dio));
         unawaited(WebPushClientService.syncUnreadBadge(dio));
+        unawaited(NotificationDeviceService.syncCurrentEndpoint(dio));
       }
     } catch (_) {
       if (!mounted) return;
@@ -369,6 +438,7 @@ class _MainShellState extends State<MainShell> {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_webNotificationsBannerDismissedKey, true);
         await WebPushClientService.syncUnreadBadge(dio);
+        await NotificationDeviceService.syncCurrentEndpoint(dio);
       }
     } finally {
       if (mounted) {
@@ -490,6 +560,14 @@ class _MainShellState extends State<MainShell> {
           builder: _buildWorkerScreen,
           priority: 70,
         ),
+      if (_hasNotificationsTab())
+        const _ShellDestination(
+          id: 'notifications',
+          label: 'События',
+          icon: Icons.notifications_outlined,
+          builder: _buildNotificationsScreen,
+          priority: 92,
+        ),
       const _ShellDestination(
         id: 'profile',
         label: 'Профиль',
@@ -521,6 +599,8 @@ class _MainShellState extends State<MainShell> {
   static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
   static Widget _buildStatsScreen(BuildContext context) =>
       const StatsDashboardScreen();
+  static Widget _buildNotificationsScreen(BuildContext context) =>
+      const NotificationsScreen();
   static Widget _buildProfileScreen(BuildContext context) =>
       const ProfileScreen();
   static Widget _buildSettingsScreen(BuildContext context) =>
@@ -529,6 +609,46 @@ class _MainShellState extends State<MainShell> {
       const SystemTestsScreen();
   static Widget _buildEmptyScreen(BuildContext context) =>
       const SizedBox.shrink();
+
+  Widget _buildNavIcon(BuildContext context, _ShellDestination destination) {
+    if (destination.id != 'notifications') {
+      return Icon(destination.icon);
+    }
+    return ValueListenableBuilder<int>(
+      valueListenable: notificationBadgeCountNotifier,
+      builder: (context, badgeCount, _) {
+        if (badgeCount <= 0) {
+          return Icon(destination.icon);
+        }
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Icon(destination.icon),
+            Positioned(
+              right: -8,
+              top: -6,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.error,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+                alignment: Alignment.center,
+                child: Text(
+                  badgeCount > 99 ? '99+' : '$badgeCount',
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onError,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
 
   Future<void> _openMoreSheet(
     BuildContext context,
@@ -827,7 +947,7 @@ class _MainShellState extends State<MainShell> {
             items: visibleDestinations
                 .map(
                   (destination) => BottomNavigationBarItem(
-                    icon: Icon(destination.icon),
+                    icon: _buildNavIcon(context, destination),
                     label: destination.label,
                   ),
                 )

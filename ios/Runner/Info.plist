@@ -32,6 +32,10 @@
 		<string>Приложению нужен доступ к микрофону, чтобы отправлять голосовые сообщения в чатах.</string>
 		<key>NSPhotoLibraryUsageDescription</key>
 		<string>Приложению нужен доступ к галерее, чтобы выбирать фото товаров.</string>
+		<key>UIBackgroundModes</key>
+		<array>
+			<string>remote-notification</string>
+		</array>
 		<key>UIApplicationSceneManifest</key>
 		<dict>
 			<key>UIApplicationSupportsMultipleScenes</key>

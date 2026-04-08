@@ -15,16 +15,16 @@ class PrinterTestScreen extends StatefulWidget {
 
 class _PrinterTestScreenState extends State<PrinterTestScreen> {
   final TextEditingController _regularPhoneController = TextEditingController(
-    text: '89277613521',
+    text: '89999999999',
   );
   final TextEditingController _regularNameController = TextEditingController(
-    text: 'Василя',
+    text: 'Имя',
   );
   final TextEditingController _oversizePhoneController = TextEditingController(
-    text: '89277613521',
+    text: '89999999999',
   );
   final TextEditingController _oversizeNameController = TextEditingController(
-    text: 'Василя',
+    text: 'Имя',
   );
   final TextEditingController _oversizeTitleController = TextEditingController(
     text: 'Комод белый',

@@ -17,6 +17,14 @@ const {
   encryptMessageText,
   decryptMessageRow,
 } = require("../utils/messageCrypto");
+const {
+  suggestAddresses,
+  geocodeAddressText: providerGeocodeAddressText,
+  reverseGeocodePoint,
+  validateAddressSelection,
+  normalizeDeliveryZones,
+  isAddressProviderError,
+} = require("../utils/deliveryAddressing");
 
 const requireDeliveryManagePermission = requirePermission("delivery.manage");
 
@@ -159,6 +167,7 @@ async function getDeliverySettings(queryable = db, tenantId = null) {
       value.route_origin_lng == null || value.route_origin_lng === ""
         ? null
         : Number(value.route_origin_lng),
+    delivery_zones: normalizeDeliveryZones(value.delivery_zones),
   };
 }
 
@@ -356,6 +365,256 @@ function buildAddressEncryption(addressText) {
   return writeEncryptedTextParams(addressText);
 }
 
+function sanitizeJsonObject(raw) {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
+function normalizeValidationStatus(raw) {
+  const value = String(raw || "").toLowerCase().trim();
+  if (value === "accept" || value === "accepted") return "accepted";
+  if (value === "confirm" || value === "confirm_required") {
+    return "confirm_required";
+  }
+  if (value === "fix" || value === "fix_required") return "fix_required";
+  return "unverified";
+}
+
+function normalizeValidationConfidence(raw) {
+  const value = String(raw || "").toLowerCase().trim();
+  if (["high", "medium", "low"].includes(value)) return value;
+  return null;
+}
+
+function normalizePointSource(raw) {
+  const value = String(raw || "").toLowerCase().trim();
+  if (["map", "suggest", "saved", "text"].includes(value)) return value;
+  return "text";
+}
+
+function normalizeZoneStatus(raw) {
+  const value = String(raw || "").toLowerCase().trim();
+  if (["inside", "outside", "unconfigured", "unchecked"].includes(value)) {
+    return value;
+  }
+  return "unchecked";
+}
+
+function normalizeAddressStructured(raw, addressText = "") {
+  const structured = sanitizeJsonObject(raw);
+  const next = { ...structured };
+  if (!next.full_text && addressText) {
+    next.full_text = normalizeWhitespace(addressText);
+  }
+  return next;
+}
+
+function respondAddressProviderError(res, err, fallbackMessage) {
+  if (!isAddressProviderError(err)) return false;
+  return res.status(Number(err.status) || 503).json({
+    ok: false,
+    error: String(err.message || fallbackMessage || "Сервис адресов временно недоступен."),
+    code: String(err.code || "address_provider_unavailable"),
+    provider: err.provider || null,
+    provider_unavailable: true,
+  });
+}
+
+function mapStoredDeliveryAddressRow(row) {
+  const addressText = decodeAddressFromRow(row);
+  return {
+    id: row.id,
+    user_id: row.user_id || null,
+    label: String(row.label || "Адрес").trim() || "Адрес",
+    address_text: addressText,
+    lat: row.lat == null ? null : Number(row.lat),
+    lng: row.lng == null ? null : Number(row.lng),
+    entrance: String(row.entrance || "").trim(),
+    comment: String(row.comment || "").trim(),
+    is_default: row.is_default === true,
+    provider: String(row.provider || "").trim() || null,
+    provider_address_id: String(row.provider_address_id || "").trim() || null,
+    validation_status: normalizeValidationStatus(row.validation_status),
+    validation_confidence: normalizeValidationConfidence(row.validation_confidence),
+    point_source: normalizePointSource(row.point_source),
+    mismatch_distance_meters:
+      row.mismatch_distance_meters == null
+        ? null
+        : Math.max(0, Math.round(Number(row.mismatch_distance_meters) || 0)),
+    delivery_zone_id: String(row.delivery_zone_id || "").trim() || null,
+    delivery_zone_label: String(row.delivery_zone_label || "").trim() || null,
+    delivery_zone_status: normalizeZoneStatus(row.delivery_zone_status),
+    address_structured: normalizeAddressStructured(row.address_structured, addressText),
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function extractIncomingAddressSelection(body = {}) {
+  const safe = sanitizeJsonObject(body);
+  const addressText = normalizeWhitespace(
+    safe.address_text || safe.resolved_address_text || safe.address || "",
+  );
+  const lat =
+    safe.lat == null || safe.lat === "" ? null : Number(safe.lat);
+  const lng =
+    safe.lng == null || safe.lng === "" ? null : Number(safe.lng);
+  const mismatchDistance =
+    safe.mismatch_distance_meters == null || safe.mismatch_distance_meters === ""
+      ? null
+      : Math.max(0, Math.round(Number(safe.mismatch_distance_meters) || 0));
+  return {
+    label: String(safe.label || "").trim() || "Адрес",
+    address_text: addressText,
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+    entrance: String(safe.entrance || safe.entrance_or_hint || "").trim(),
+    comment: String(safe.comment || "").trim(),
+    provider: String(safe.provider || "").trim() || null,
+    provider_address_id: String(
+      safe.provider_address_id || safe.provider_place_id || "",
+    ).trim() || null,
+    validation_status: normalizeValidationStatus(safe.validation_status),
+    validation_confidence: normalizeValidationConfidence(
+      safe.validation_confidence,
+    ),
+    point_source: normalizePointSource(safe.point_source),
+    mismatch_distance_meters: mismatchDistance,
+    delivery_zone_id: String(safe.delivery_zone_id || "").trim() || null,
+    delivery_zone_label: String(safe.delivery_zone_label || "").trim() || null,
+    delivery_zone_status: normalizeZoneStatus(safe.delivery_zone_status),
+    address_structured: normalizeAddressStructured(
+      safe.address_structured || safe.structured_address,
+      addressText,
+    ),
+  };
+}
+
+function buildAddressDbPayload(selection) {
+  const addressText = normalizeWhitespace(selection?.address_text || "");
+  const structured = normalizeAddressStructured(
+    selection?.address_structured,
+    addressText,
+  );
+  return {
+    label: String(selection?.label || "Адрес").trim() || "Адрес",
+    address_text: addressText,
+    encrypted: buildAddressEncryption(addressText),
+    lat:
+      selection?.lat == null || !Number.isFinite(Number(selection.lat))
+        ? null
+        : Number(selection.lat),
+    lng:
+      selection?.lng == null || !Number.isFinite(Number(selection.lng))
+        ? null
+        : Number(selection.lng),
+    entrance: String(selection?.entrance || "").trim() || null,
+    comment: String(selection?.comment || "").trim() || null,
+    provider: String(selection?.provider || "").trim() || null,
+    provider_address_id:
+      String(selection?.provider_address_id || "").trim() || null,
+    validation_status: normalizeValidationStatus(selection?.validation_status),
+    validation_confidence: normalizeValidationConfidence(
+      selection?.validation_confidence,
+    ),
+    point_source: normalizePointSource(selection?.point_source),
+    mismatch_distance_meters:
+      selection?.mismatch_distance_meters == null
+        ? null
+        : Math.max(
+            0,
+            Math.round(Number(selection.mismatch_distance_meters) || 0),
+          ),
+    delivery_zone_id: String(selection?.delivery_zone_id || "").trim() || null,
+    delivery_zone_label:
+      String(selection?.delivery_zone_label || "").trim() || null,
+    delivery_zone_status: normalizeZoneStatus(selection?.delivery_zone_status),
+    address_structured: structured,
+  };
+}
+
+async function resolveValidatedAddressSelection({
+  rawSelection,
+  settings,
+  requirePoint = false,
+  allowConfirm = false,
+}) {
+  const baseSelection = extractIncomingAddressSelection(rawSelection);
+  const hasAddress =
+    baseSelection.address_text ||
+    (Number.isFinite(baseSelection.lat) && Number.isFinite(baseSelection.lng));
+  if (!hasAddress) {
+    return {
+      ok: false,
+      error: "Нужно указать адрес доставки",
+    };
+  }
+
+  const validation = await validateAddressSelection({
+    addressText: baseSelection.address_text,
+    lat: baseSelection.lat,
+    lng: baseSelection.lng,
+    zones: settings?.delivery_zones,
+    structuredAddress: baseSelection.address_structured,
+    provider: baseSelection.provider,
+    providerAddressId: baseSelection.provider_address_id,
+  });
+
+  if (requirePoint && (!Number.isFinite(validation.lat) || !Number.isFinite(validation.lng))) {
+    return {
+      ok: false,
+      error: "Выберите точку на карте или адрес из подсказок",
+    };
+  }
+  if (validation.action === "fix") {
+    return {
+      ok: false,
+      error: validation.summary,
+      validation,
+    };
+  }
+  if (validation.action === "confirm" && !allowConfirm) {
+    return {
+      ok: false,
+      error: validation.summary,
+      needs_confirmation: true,
+      validation,
+    };
+  }
+
+  return {
+    ok: true,
+    selection: {
+      ...baseSelection,
+      address_text: validation.resolved_address_text || baseSelection.address_text,
+      lat: validation.lat,
+      lng: validation.lng,
+      provider: validation.provider || baseSelection.provider,
+      provider_address_id:
+        validation.provider_address_id || baseSelection.provider_address_id,
+      validation_status:
+        validation.action === "accept"
+          ? "accepted"
+          : validation.action === "confirm"
+          ? "confirm_required"
+          : "fix_required",
+      validation_confidence:
+        validation.validation_confidence || baseSelection.validation_confidence,
+      point_source: validation.point_source || baseSelection.point_source,
+      mismatch_distance_meters: validation.mismatch_distance_meters,
+      delivery_zone_id: validation.delivery_zone_id || baseSelection.delivery_zone_id,
+      delivery_zone_label:
+        validation.delivery_zone_label || baseSelection.delivery_zone_label,
+      delivery_zone_status:
+        validation.zone_status || baseSelection.delivery_zone_status,
+      address_structured: normalizeAddressStructured(
+        validation.structured_address || baseSelection.address_structured,
+        validation.resolved_address_text || baseSelection.address_text,
+      ),
+    },
+    validation,
+  };
+}
+
 function mapDeliverySlotRow(row) {
   return {
     id: row.id,
@@ -456,73 +715,25 @@ function extractGeocodeLocality(item) {
 
 async function geocodeDeliveryAddress(addressText) {
   const originalNormalized = normalizeWhitespace(addressText);
+  if (!originalNormalized) return null;
   const cleaned = stripAddressServiceParts(originalNormalized);
-  const { locality, query } = buildGeocodeQuery(cleaned);
-  const queryVariants = [
-    query,
-    `${cleaned}, ${locality}, Самарская область, Россия`,
-    `${cleaned}, ${locality}, Россия`,
-  ].filter(Boolean);
-
-  let chosen = null;
-  for (const variant of queryVariants) {
-    const params = new URLSearchParams({
-      q: variant,
-      format: "jsonv2",
-      addressdetails: "1",
-      limit: "5",
-      countrycodes: "ru",
-      "accept-language": "ru",
-    });
-    if (GEOCODER_API_KEY) {
-      params.set("apikey", GEOCODER_API_KEY);
-    }
-    const headers = {
-      Accept: "application/json",
-    };
-    if (GEOCODER_USER_AGENT) {
-      headers["User-Agent"] = GEOCODER_USER_AGENT;
-    }
-    if (GEOCODER_AUTH_HEADER) {
-      headers.Authorization = GEOCODER_AUTH_HEADER;
-    }
-    const response = await fetch(
-      `${GEOCODER_SEARCH_URL}?${params.toString()}`,
-      { headers },
-    );
-    if (!response.ok) {
-      throw new Error(`Геокодер недоступен: ${response.status}`);
-    }
-    const payload = await response.json();
-    if (!Array.isArray(payload) || payload.length === 0) {
-      continue;
-    }
-    const exactCity = payload.find((item) => {
-      const foundLocality = extractGeocodeLocality(item);
-      return foundLocality.toLowerCase() === locality.toLowerCase();
-    });
-    chosen = exactCity || payload[0];
-    if (chosen) break;
-  }
-
-  if (!chosen) {
-    return null;
-  }
-  const lat = Number(chosen.lat);
-  const lng = Number(chosen.lon);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return null;
-  }
-  const foundLocality = extractGeocodeLocality(chosen);
-  if (locality && foundLocality && foundLocality.toLowerCase() !== locality.toLowerCase()) {
-    return null;
-  }
+  const chosen = await providerGeocodeAddressText(cleaned || originalNormalized, {
+    limit: 1,
+  });
+  if (!chosen) return null;
   return {
     address_text: originalNormalized,
-    locality,
-    lat,
-    lng,
-    resolved_label: chosen.display_name || "",
+    locality: normalizeWhitespace(
+      chosen?.structured_address?.city ||
+        chosen?.structured_address?.area ||
+        "",
+    ),
+    lat: Number(chosen.lat),
+    lng: Number(chosen.lng),
+    resolved_label: chosen.label || chosen.address_text || "",
+    structured_address: chosen.structured_address || {},
+    provider: chosen.provider || null,
+    provider_address_id: chosen.provider_address_id || null,
   };
 }
 
@@ -1649,8 +1860,13 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
      LEFT JOIN phones ph ON ph.user_id = c.user_id
      LEFT JOIN user_shelves us ON us.user_id = c.user_id
      LEFT JOIN LATERAL (
-       SELECT a.id, a.address_text, a.lat, a.lng
-              ,a.address_ciphertext, a.address_iv, a.address_tag
+       SELECT a.id, a.address_text, a.lat, a.lng,
+              a.address_ciphertext, a.address_iv, a.address_tag,
+              a.entrance, a.comment, a.address_structured,
+              a.provider, a.provider_address_id,
+              a.validation_status, a.validation_confidence, a.point_source,
+              a.mismatch_distance_meters,
+              a.delivery_zone_id, a.delivery_zone_label, a.delivery_zone_status
        FROM user_delivery_addresses a
        WHERE a.user_id = c.user_id
        ORDER BY a.is_default DESC, a.updated_at DESC
@@ -1704,6 +1920,26 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
         address_text: decodeAddressFromRow(row) || "",
         lat: row.lat == null ? null : Number(row.lat),
         lng: row.lng == null ? null : Number(row.lng),
+        entrance: String(row.entrance || "").trim(),
+        comment: String(row.comment || "").trim(),
+        address_structured: normalizeAddressStructured(
+          row.address_structured,
+          decodeAddressFromRow(row) || "",
+        ),
+        provider: String(row.provider || "").trim() || null,
+        provider_address_id: String(row.provider_address_id || "").trim() || null,
+        validation_status: normalizeValidationStatus(row.validation_status),
+        validation_confidence: normalizeValidationConfidence(
+          row.validation_confidence,
+        ),
+        point_source: normalizePointSource(row.point_source),
+        mismatch_distance_meters:
+          row.mismatch_distance_meters == null
+            ? null
+            : Math.max(0, Math.round(Number(row.mismatch_distance_meters) || 0)),
+        delivery_zone_id: String(row.delivery_zone_id || "").trim() || null,
+        delivery_zone_label: String(row.delivery_zone_label || "").trim() || null,
+        delivery_zone_status: normalizeZoneStatus(row.delivery_zone_status),
         bulky_places: 0,
         bulky_titles: [],
         processed_sum: 0,
@@ -1836,13 +2072,15 @@ async function createDeliveryBatch(
 
   for (const candidate of candidates) {
     const batchCustomerId = uuidv4();
-    const encryptedAddress = buildAddressEncryption(candidate.address_text || "");
+    const addressPayload = buildAddressDbPayload(candidate);
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
          id, batch_id, user_id, customer_name, customer_phone,
          processed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
          address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
-         lat, lng,
+         lat, lng, entrance, comment, address_structured, provider, provider_address_id,
+         validation_status, validation_confidence, point_source, mismatch_distance_meters,
+         delivery_zone_id, delivery_zone_label, delivery_zone_status,
          bulky_places, bulky_note,
          call_status, delivery_status, created_at, updated_at
        )
@@ -1850,8 +2088,10 @@ async function createDeliveryBatch(
          $1, $2, $3, $4, $5,
          $6, $7, $8, $9, $10, $11,
          $12, NULL, $13, $14, $15, $16, $17,
-         $18, $19,
-         $20, $21,
+         $18, $19, $20, $21, $22::jsonb, $23, $24,
+         $25, $26, $27, $28,
+         $29, $30, $31,
+         $32, $33,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -1867,13 +2107,25 @@ async function createDeliveryBatch(
         candidate.processed_items_count,
         candidate.shelf_number,
         candidate.address_id,
-        encryptedAddress.ciphertext,
-        encryptedAddress.iv,
-        encryptedAddress.tag,
-        encryptedAddress.version,
-        encryptedAddress.encryptedAt,
-        candidate.lat,
-        candidate.lng,
+        addressPayload.encrypted.ciphertext,
+        addressPayload.encrypted.iv,
+        addressPayload.encrypted.tag,
+        addressPayload.encrypted.version,
+        addressPayload.encrypted.encryptedAt,
+        addressPayload.lat,
+        addressPayload.lng,
+        addressPayload.entrance,
+        addressPayload.comment,
+        JSON.stringify(addressPayload.address_structured),
+        addressPayload.provider,
+        addressPayload.provider_address_id,
+        addressPayload.validation_status,
+        addressPayload.validation_confidence,
+        addressPayload.point_source,
+        addressPayload.mismatch_distance_meters,
+        addressPayload.delivery_zone_id,
+        addressPayload.delivery_zone_label,
+        addressPayload.delivery_zone_status,
         candidate.bulky_places || 0,
         candidate.bulky_note || null,
       ],
@@ -1936,7 +2188,7 @@ async function addEligibleCustomersToBatch(
     if (hasBlockingRow && !reusableRow) continue;
 
     if (reusableRow) {
-      const encryptedAddress = buildAddressEncryption(candidate.address_text || "");
+      const addressPayload = buildAddressDbPayload(candidate);
       await queryable.query(
         `UPDATE delivery_batch_customers
          SET customer_name = $2,
@@ -1956,6 +2208,18 @@ async function addEligibleCustomersToBatch(
              address_encrypted_at = $15,
              lat = $16,
              lng = $17,
+             entrance = $18,
+             comment = $19,
+             address_structured = $20::jsonb,
+             provider = $21,
+             provider_address_id = $22,
+             validation_status = $23,
+             validation_confidence = $24,
+             point_source = $25,
+             mismatch_distance_meters = $26,
+             delivery_zone_id = $27,
+             delivery_zone_label = $28,
+             delivery_zone_status = $29,
              call_status = 'pending',
              delivery_status = 'awaiting_call',
              courier_slot = NULL,
@@ -1966,8 +2230,8 @@ async function addEligibleCustomersToBatch(
              eta_to = NULL,
              preferred_time_from = NULL,
              preferred_time_to = NULL,
-             bulky_places = $18,
-             bulky_note = $19,
+             bulky_places = $30,
+             bulky_note = $31,
              locked_courier_slot = NULL,
              locked_courier_name = NULL,
              locked_courier_code = NULL,
@@ -1984,13 +2248,25 @@ async function addEligibleCustomersToBatch(
           candidate.processed_items_count,
           candidate.shelf_number,
           candidate.address_id,
-          encryptedAddress.ciphertext,
-          encryptedAddress.iv,
-          encryptedAddress.tag,
-          encryptedAddress.version,
-          encryptedAddress.encryptedAt,
-          candidate.lat,
-          candidate.lng,
+          addressPayload.encrypted.ciphertext,
+          addressPayload.encrypted.iv,
+          addressPayload.encrypted.tag,
+          addressPayload.encrypted.version,
+          addressPayload.encrypted.encryptedAt,
+          addressPayload.lat,
+          addressPayload.lng,
+          addressPayload.entrance,
+          addressPayload.comment,
+          JSON.stringify(addressPayload.address_structured),
+          addressPayload.provider,
+          addressPayload.provider_address_id,
+          addressPayload.validation_status,
+          addressPayload.validation_confidence,
+          addressPayload.point_source,
+          addressPayload.mismatch_distance_meters,
+          addressPayload.delivery_zone_id,
+          addressPayload.delivery_zone_label,
+          addressPayload.delivery_zone_status,
           candidate.bulky_places || 0,
           candidate.bulky_note || null,
         ],
@@ -2007,13 +2283,15 @@ async function addEligibleCustomersToBatch(
     }
 
     const batchCustomerId = uuidv4();
-    const encryptedAddress = buildAddressEncryption(candidate.address_text || "");
+    const addressPayload = buildAddressDbPayload(candidate);
     await queryable.query(
       `INSERT INTO delivery_batch_customers (
          id, batch_id, user_id, customer_name, customer_phone,
          processed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
          address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
-         lat, lng,
+         lat, lng, entrance, comment, address_structured, provider, provider_address_id,
+         validation_status, validation_confidence, point_source, mismatch_distance_meters,
+         delivery_zone_id, delivery_zone_label, delivery_zone_status,
          bulky_places, bulky_note,
          call_status, delivery_status, created_at, updated_at
        )
@@ -2021,8 +2299,10 @@ async function addEligibleCustomersToBatch(
          $1, $2, $3, $4, $5,
          $6, $7, $8, $9, $10, $11,
          $12, NULL, $13, $14, $15, $16, $17,
-         $18, $19,
-         $20, $21,
+         $18, $19, $20, $21, $22::jsonb, $23, $24,
+         $25, $26, $27, $28,
+         $29, $30, $31,
+         $32, $33,
          'pending', 'awaiting_call', now(), now()
        )`,
       [
@@ -2038,13 +2318,25 @@ async function addEligibleCustomersToBatch(
         candidate.processed_items_count,
         candidate.shelf_number,
         candidate.address_id,
-        encryptedAddress.ciphertext,
-        encryptedAddress.iv,
-        encryptedAddress.tag,
-        encryptedAddress.version,
-        encryptedAddress.encryptedAt,
-        candidate.lat,
-        candidate.lng,
+        addressPayload.encrypted.ciphertext,
+        addressPayload.encrypted.iv,
+        addressPayload.encrypted.tag,
+        addressPayload.encrypted.version,
+        addressPayload.encrypted.encryptedAt,
+        addressPayload.lat,
+        addressPayload.lng,
+        addressPayload.entrance,
+        addressPayload.comment,
+        JSON.stringify(addressPayload.address_structured),
+        addressPayload.provider,
+        addressPayload.provider_address_id,
+        addressPayload.validation_status,
+        addressPayload.validation_confidence,
+        addressPayload.point_source,
+        addressPayload.mismatch_distance_meters,
+        addressPayload.delivery_zone_id,
+        addressPayload.delivery_zone_label,
+        addressPayload.delivery_zone_status,
         candidate.bulky_places || 0,
         candidate.bulky_note || null,
       ],
@@ -2641,6 +2933,12 @@ router.patch(
       String(req.body?.route_origin_label || "Точка отправки").trim() ||
       "Точка отправки";
     const routeOriginAddress = String(req.body?.route_origin_address || "").trim();
+    const deliveryZones = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      "delivery_zones",
+    )
+      ? normalizeDeliveryZones(req.body?.delivery_zones)
+      : null;
     let routeOriginLat =
       req.body?.route_origin_lat == null || req.body?.route_origin_lat === ""
         ? null
@@ -2659,7 +2957,7 @@ router.patch(
         if (!geocoded) {
           return res.status(400).json({
             ok: false,
-            error: "Не удалось найти точку отправки в Самарской области",
+            error: "Не удалось найти точку отправки",
           });
         }
         routeOriginLat = geocoded.lat;
@@ -2681,6 +2979,8 @@ router.patch(
         route_origin_address: routeOriginAddress,
         route_origin_lat: Number.isFinite(routeOriginLat) ? routeOriginLat : null,
         route_origin_lng: Number.isFinite(routeOriginLng) ? routeOriginLng : null,
+        delivery_zones:
+          deliveryZones == null ? settings.delivery_zones : deliveryZones,
       };
       await saveDeliverySettings(
         client,
@@ -2750,6 +3050,433 @@ router.patch(
     }
   },
 );
+
+router.get("/zones", requireAuth, async (req, res) => {
+  try {
+    const settings = await getDeliverySettings(db, req.user?.tenant_id || null);
+    return res.json({
+      ok: true,
+      data: settings.delivery_zones || [],
+    });
+  } catch (err) {
+    console.error("delivery.zones.list error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.get("/address/suggest", requireAuth, async (req, res) => {
+  const query = normalizeWhitespace(req.query?.q || "");
+  if (query.length < 3) {
+    return res.json({ ok: true, data: [] });
+  }
+  try {
+    const limit = Math.max(1, Math.min(10, Number(req.query?.limit) || 6));
+    const lat =
+      req.query?.lat == null || req.query?.lat === ""
+        ? null
+        : Number(req.query.lat);
+    const lng =
+      req.query?.lng == null || req.query?.lng === ""
+        ? null
+        : Number(req.query.lng);
+    const suggestions = await suggestAddresses(query, {
+      limit,
+      lat: Number.isFinite(lat) ? lat : null,
+      lng: Number.isFinite(lng) ? lng : null,
+    });
+    return res.json({
+      ok: true,
+      data: suggestions.map((item) => ({
+        provider: item.provider,
+        provider_address_id: item.provider_address_id,
+        address_text: item.address_text,
+        label: item.label,
+        lat: item.lat,
+        lng: item.lng,
+        address_structured: item.structured_address || {},
+      })),
+    });
+  } catch (err) {
+    console.error("delivery.address.suggest error", err);
+    if (
+      respondAddressProviderError(
+        res,
+        err,
+        "Подсказки адреса временно недоступны. Попробуйте позже или отметьте точку на карте.",
+      )
+    ) {
+      return;
+    }
+    return res.status(500).json({ ok: false, error: "Не удалось получить подсказки адреса" });
+  }
+});
+
+router.post("/address/reverse", requireAuth, async (req, res) => {
+  const lat =
+    req.body?.lat == null || req.body?.lat === "" ? null : Number(req.body.lat);
+  const lng =
+    req.body?.lng == null || req.body?.lng === "" ? null : Number(req.body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ ok: false, error: "Нужно передать lat и lng" });
+  }
+  try {
+    const result = await reverseGeocodePoint(lat, lng);
+    if (!result) {
+      return res.status(404).json({ ok: false, error: "Не удалось распознать адрес точки" });
+    }
+    return res.json({
+      ok: true,
+      data: {
+        provider: result.provider,
+        provider_address_id: result.provider_address_id,
+        address_text: result.address_text,
+        label: result.label,
+        lat: result.lat,
+        lng: result.lng,
+        address_structured: result.structured_address || {},
+      },
+    });
+  } catch (err) {
+    console.error("delivery.address.reverse error", err);
+    if (
+      respondAddressProviderError(
+        res,
+        err,
+        "Не удалось распознать точку. Попробуйте позже или введите адрес вручную.",
+      )
+    ) {
+      return;
+    }
+    return res.status(500).json({ ok: false, error: "Не удалось распознать адрес точки" });
+  }
+});
+
+router.post("/address/validate", requireAuth, async (req, res) => {
+  try {
+    const settings = await getDeliverySettings(db, req.user?.tenant_id || null);
+    const validationResult = await resolveValidatedAddressSelection({
+      rawSelection: req.body,
+      settings,
+      requirePoint: false,
+      allowConfirm: req.body?.confirm_selection === true,
+    });
+    if (!validationResult.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: validationResult.error,
+        data: validationResult.validation || null,
+      });
+    }
+    return res.json({
+      ok: true,
+      data: {
+        ...validationResult.selection,
+        summary: validationResult.validation?.summary || "Адрес подтвержден",
+        next_action: validationResult.validation?.action || "accept",
+      },
+    });
+  } catch (err) {
+    console.error("delivery.address.validate error", err);
+    if (
+      respondAddressProviderError(
+        res,
+        err,
+        "Сервис проверки адресов временно недоступен. Попробуйте чуть позже.",
+      )
+    ) {
+      return;
+    }
+    return res.status(500).json({ ok: false, error: "Не удалось проверить адрес" });
+  }
+});
+
+router.get("/addresses", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT *
+       FROM user_delivery_addresses
+       WHERE user_id = $1
+       ORDER BY is_default DESC, updated_at DESC, created_at DESC`,
+      [req.user.id],
+    );
+    return res.json({
+      ok: true,
+      data: result.rows.map(mapStoredDeliveryAddressRow),
+    });
+  } catch (err) {
+    console.error("delivery.addresses.list error", err);
+    return res.status(500).json({ ok: false, error: "Не удалось загрузить адреса" });
+  }
+});
+
+router.post("/addresses", requireAuth, async (req, res) => {
+  try {
+    const settings = await getDeliverySettings(db, req.user?.tenant_id || null);
+    const validated = await resolveValidatedAddressSelection({
+      rawSelection: req.body,
+      settings,
+      requirePoint: true,
+      allowConfirm: req.body?.confirm_selection === true,
+    });
+    if (!validated.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: validated.error,
+        data: validated.validation || null,
+      });
+    }
+    const payload = buildAddressDbPayload(validated.selection);
+    const isDefault = req.body?.is_default !== false;
+    const label = normalizeWhitespace(req.body?.label || payload.label) || "Адрес";
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      if (isDefault) {
+        await client.query(
+          `UPDATE user_delivery_addresses
+           SET is_default = false,
+               updated_at = now()
+           WHERE user_id = $1`,
+          [req.user.id],
+        );
+      }
+      const insertQ = await client.query(
+        `INSERT INTO user_delivery_addresses (
+           id, user_id, label, address_text,
+           address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+           lat, lng, entrance, comment, is_default,
+           address_structured, provider, provider_address_id,
+           validation_status, validation_confidence, point_source,
+           mismatch_distance_meters, delivery_zone_id, delivery_zone_label, delivery_zone_status,
+           created_at, updated_at
+         )
+         VALUES (
+           $1, $2, $3, NULL,
+           $4, $5, $6, $7, $8,
+           $9, $10, $11, $12, $13,
+           $14::jsonb, $15, $16,
+           $17, $18, $19,
+           $20, $21, $22, $23,
+           now(), now()
+         )
+         RETURNING *`,
+        [
+          uuidv4(),
+          req.user.id,
+          label,
+          payload.encrypted.ciphertext,
+          payload.encrypted.iv,
+          payload.encrypted.tag,
+          payload.encrypted.version,
+          payload.encrypted.encryptedAt,
+          payload.lat,
+          payload.lng,
+          payload.entrance,
+          payload.comment,
+          isDefault,
+          JSON.stringify(payload.address_structured),
+          payload.provider,
+          payload.provider_address_id,
+          payload.validation_status,
+          payload.validation_confidence,
+          payload.point_source,
+          payload.mismatch_distance_meters,
+          payload.delivery_zone_id,
+          payload.delivery_zone_label,
+          payload.delivery_zone_status,
+        ],
+      );
+      await client.query("COMMIT");
+      return res.status(201).json({
+        ok: true,
+        data: mapStoredDeliveryAddressRow(insertQ.rows[0]),
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("delivery.addresses.create error", err);
+    if (
+      respondAddressProviderError(
+        res,
+        err,
+        "Не удалось проверить адрес перед сохранением. Попробуйте чуть позже.",
+      )
+    ) {
+      return;
+    }
+    return res.status(500).json({ ok: false, error: "Не удалось сохранить адрес" });
+  }
+});
+
+router.patch("/addresses/:addressId", requireAuth, async (req, res) => {
+  const addressId = String(req.params?.addressId || "").trim();
+  if (!addressId) {
+    return res.status(400).json({ ok: false, error: "addressId обязателен" });
+  }
+  try {
+    const existingQ = await db.query(
+      `SELECT *
+       FROM user_delivery_addresses
+       WHERE id = $1
+         AND user_id = $2
+       LIMIT 1`,
+      [addressId, req.user.id],
+    );
+    if (existingQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Адрес не найден" });
+    }
+    const current = mapStoredDeliveryAddressRow(existingQ.rows[0]);
+    const settings = await getDeliverySettings(db, req.user?.tenant_id || null);
+    const rawSelection = {
+      ...current,
+      ...sanitizeJsonObject(req.body),
+      address_text: normalizeWhitespace(
+        req.body?.address_text || current.address_text || "",
+      ),
+      lat: req.body?.lat ?? current.lat,
+      lng: req.body?.lng ?? current.lng,
+      address_structured:
+        req.body?.address_structured ||
+        req.body?.structured_address ||
+        current.address_structured,
+    };
+    const validated = await resolveValidatedAddressSelection({
+      rawSelection,
+      settings,
+      requirePoint: true,
+      allowConfirm: req.body?.confirm_selection === true,
+    });
+    if (!validated.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: validated.error,
+        data: validated.validation || null,
+      });
+    }
+    const payload = buildAddressDbPayload(validated.selection);
+    const isDefault = Object.prototype.hasOwnProperty.call(req.body || {}, "is_default")
+      ? req.body?.is_default === true
+      : current.is_default === true;
+    const label = normalizeWhitespace(req.body?.label || current.label || payload.label) || "Адрес";
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      if (isDefault) {
+        await client.query(
+          `UPDATE user_delivery_addresses
+           SET is_default = false,
+               updated_at = now()
+           WHERE user_id = $1
+             AND id <> $2`,
+          [req.user.id, addressId],
+        );
+      }
+      const updateQ = await client.query(
+        `UPDATE user_delivery_addresses
+         SET label = $1,
+             address_text = NULL,
+             address_ciphertext = $2,
+             address_iv = $3,
+             address_tag = $4,
+             address_encryption_version = $5,
+             address_encrypted_at = $6,
+             lat = $7,
+             lng = $8,
+             entrance = $9,
+             comment = $10,
+             is_default = $11,
+             address_structured = $12::jsonb,
+             provider = $13,
+             provider_address_id = $14,
+             validation_status = $15,
+             validation_confidence = $16,
+             point_source = $17,
+             mismatch_distance_meters = $18,
+             delivery_zone_id = $19,
+             delivery_zone_label = $20,
+             delivery_zone_status = $21,
+             updated_at = now()
+         WHERE id = $22
+           AND user_id = $23
+         RETURNING *`,
+        [
+          label,
+          payload.encrypted.ciphertext,
+          payload.encrypted.iv,
+          payload.encrypted.tag,
+          payload.encrypted.version,
+          payload.encrypted.encryptedAt,
+          payload.lat,
+          payload.lng,
+          payload.entrance,
+          payload.comment,
+          isDefault,
+          JSON.stringify(payload.address_structured),
+          payload.provider,
+          payload.provider_address_id,
+          payload.validation_status,
+          payload.validation_confidence,
+          payload.point_source,
+          payload.mismatch_distance_meters,
+          payload.delivery_zone_id,
+          payload.delivery_zone_label,
+          payload.delivery_zone_status,
+          addressId,
+          req.user.id,
+        ],
+      );
+      await client.query("COMMIT");
+      return res.json({
+        ok: true,
+        data: mapStoredDeliveryAddressRow(updateQ.rows[0]),
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("delivery.addresses.patch error", err);
+    if (
+      respondAddressProviderError(
+        res,
+        err,
+        "Не удалось перепроверить адрес. Попробуйте чуть позже.",
+      )
+    ) {
+      return;
+    }
+    return res.status(500).json({ ok: false, error: "Не удалось обновить адрес" });
+  }
+});
+
+router.delete("/addresses/:addressId", requireAuth, async (req, res) => {
+  const addressId = String(req.params?.addressId || "").trim();
+  if (!addressId) {
+    return res.status(400).json({ ok: false, error: "addressId обязателен" });
+  }
+  try {
+    const deleted = await db.query(
+      `DELETE FROM user_delivery_addresses
+       WHERE id = $1
+         AND user_id = $2
+       RETURNING id`,
+      [addressId, req.user.id],
+    );
+    if (deleted.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Адрес не найден" });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("delivery.addresses.delete error", err);
+    return res.status(500).json({ ok: false, error: "Не удалось удалить адрес" });
+  }
+});
 
 router.get("/slots", requireAuth, async (req, res) => {
   try {
@@ -3538,6 +4265,10 @@ router.post(
       req.body?.lng == null || req.body?.lng === ""
         ? null
         : Number(req.body.lng);
+    const entrance = String(req.body?.entrance || req.body?.entrance_or_hint || "").trim();
+    const comment = String(req.body?.comment || "").trim();
+    const saveAsDefault = req.body?.save_as_default !== false;
+    const confirmSelection = req.body?.confirm_selection === true;
     let preferredWindow;
     try {
       preferredWindow = sanitizePreferredWindow(
@@ -3605,26 +4336,45 @@ router.post(
       );
       const chat = ensured.chat;
       let addressId = customer.address_id ? String(customer.address_id) : null;
-      let nextAddressText =
-        addressText || decodeAddressFromRow(customer);
-      let nextLat = Number.isFinite(lat) ? lat : customer.lat;
-      let nextLng = Number.isFinite(lng) ? lng : customer.lng;
+      let nextSelection = {
+        ...mapStoredDeliveryAddressRow(customer),
+        address_text: addressText || decodeAddressFromRow(customer),
+        lat: Number.isFinite(lat) ? lat : customer.lat,
+        lng: Number.isFinite(lng) ? lng : customer.lng,
+        entrance: entrance || String(customer.entrance || "").trim(),
+        comment: comment || String(customer.comment || "").trim(),
+      };
 
-      if (accepted && addressText.length > 0 && (!Number.isFinite(lat) || !Number.isFinite(lng))) {
-        const geocoded = await geocodeDeliveryAddress(addressText);
-        if (!geocoded) {
+      if (accepted) {
+        const settings = await getDeliverySettings(client, req.user?.tenant_id || null);
+        const validated = await resolveValidatedAddressSelection({
+          rawSelection: {
+            ...req.body,
+            address_text: addressText,
+            lat,
+            lng,
+            entrance,
+            comment,
+          },
+          settings,
+          requirePoint: true,
+          allowConfirm: confirmSelection,
+        });
+        if (!validated.ok) {
           await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
-            error: "Не удалось найти этот адрес в указанном городе",
+            error: validated.error,
+            data: validated.validation || null,
           });
         }
-        nextAddressText = geocoded.address_text;
-        nextLat = geocoded.lat;
-        nextLng = geocoded.lng;
+        nextSelection = {
+          ...nextSelection,
+          ...validated.selection,
+        };
       }
 
-      if (accepted && nextAddressText) {
+      if (accepted && saveAsDefault && nextSelection.address_text) {
         await client.query(
           `UPDATE user_delivery_addresses
            SET is_default = false,
@@ -3632,35 +4382,55 @@ router.post(
            WHERE user_id = $1`,
           [customer.user_id],
         );
-        const encryptedAddress = buildAddressEncryption(nextAddressText);
+        const addressPayload = buildAddressDbPayload(nextSelection);
         const addressInsert = await client.query(
           `INSERT INTO user_delivery_addresses (
              id, user_id, label, address_text,
              address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
-             lat, lng, is_default, created_at, updated_at
+             lat, lng, entrance, comment, is_default,
+             address_structured, provider, provider_address_id,
+             validation_status, validation_confidence, point_source, mismatch_distance_meters,
+             delivery_zone_id, delivery_zone_label, delivery_zone_status,
+             created_at, updated_at
            )
            VALUES (
              $1, $2, 'Основной адрес', NULL,
              $3, $4, $5, $6, $7,
-             $8, $9, true, now(), now()
+             $8, $9, $10, $11, true,
+             $12::jsonb, $13, $14,
+             $15, $16, $17, $18,
+             $19, $20, $21,
+             now(), now()
            )
            RETURNING id`,
           [
             uuidv4(),
             customer.user_id,
-            encryptedAddress.ciphertext,
-            encryptedAddress.iv,
-            encryptedAddress.tag,
-            encryptedAddress.version,
-            encryptedAddress.encryptedAt,
-            nextLat,
-            nextLng,
+            addressPayload.encrypted.ciphertext,
+            addressPayload.encrypted.iv,
+            addressPayload.encrypted.tag,
+            addressPayload.encrypted.version,
+            addressPayload.encrypted.encryptedAt,
+            addressPayload.lat,
+            addressPayload.lng,
+            addressPayload.entrance,
+            addressPayload.comment,
+            JSON.stringify(addressPayload.address_structured),
+            addressPayload.provider,
+            addressPayload.provider_address_id,
+            addressPayload.validation_status,
+            addressPayload.validation_confidence,
+            addressPayload.point_source,
+            addressPayload.mismatch_distance_meters,
+            addressPayload.delivery_zone_id,
+            addressPayload.delivery_zone_label,
+            addressPayload.delivery_zone_status,
           ],
         );
         addressId = String(addressInsert.rows[0].id);
       }
 
-      const customerEncryptedAddress = buildAddressEncryption(nextAddressText || "");
+      const addressPayload = buildAddressDbPayload(nextSelection);
       await client.query(
         `UPDATE delivery_batch_customers
          SET call_status = $1,
@@ -3674,23 +4444,47 @@ router.post(
              address_encrypted_at = $8,
              lat = $9,
              lng = $10,
-             preferred_time_from = $11,
-             preferred_time_to = $12,
+             entrance = $11,
+             comment = $12,
+             address_structured = $13::jsonb,
+             provider = $14,
+             provider_address_id = $15,
+             validation_status = $16,
+             validation_confidence = $17,
+             point_source = $18,
+             mismatch_distance_meters = $19,
+             delivery_zone_id = $20,
+             delivery_zone_label = $21,
+             delivery_zone_status = $22,
+             preferred_time_from = $23,
+             preferred_time_to = $24,
              accepted_at = CASE WHEN $1 = 'accepted' THEN now() ELSE accepted_at END,
              agreed_sum = CASE WHEN $1 = 'accepted' THEN processed_sum ELSE agreed_sum END,
              updated_at = now()
-         WHERE id = $13`,
+         WHERE id = $25`,
         [
           accepted ? "accepted" : "declined",
           accepted ? "preparing_delivery" : "declined",
           addressId,
-          customerEncryptedAddress.ciphertext,
-          customerEncryptedAddress.iv,
-          customerEncryptedAddress.tag,
-          customerEncryptedAddress.version,
-          customerEncryptedAddress.encryptedAt,
-          nextLat,
-          nextLng,
+          addressPayload.encrypted.ciphertext,
+          addressPayload.encrypted.iv,
+          addressPayload.encrypted.tag,
+          addressPayload.encrypted.version,
+          addressPayload.encrypted.encryptedAt,
+          addressPayload.lat,
+          addressPayload.lng,
+          addressPayload.entrance,
+          addressPayload.comment,
+          JSON.stringify(addressPayload.address_structured),
+          addressPayload.provider,
+          addressPayload.provider_address_id,
+          addressPayload.validation_status,
+          addressPayload.validation_confidence,
+          addressPayload.point_source,
+          addressPayload.mismatch_distance_meters,
+          addressPayload.delivery_zone_id,
+          addressPayload.delivery_zone_label,
+          addressPayload.delivery_zone_status,
           preferredWindow.fromText,
           preferredWindow.toText,
           customerId,
@@ -3760,10 +4554,10 @@ router.post(
          WHERE chat_id = $5
            AND COALESCE(meta->>'kind', '') = 'delivery_offer'
            AND COALESCE(meta->>'delivery_customer_id', '') = $6
-         RETURNING id`,
+        RETURNING id`,
           [
             accepted ? "accepted" : "declined",
-            nextAddressText || "",
+            nextSelection.address_text || "",
             preferredWindow.fromText || "",
             preferredWindow.toText || "",
             chat.id,
@@ -3783,7 +4577,7 @@ router.post(
               ? buildDeliveryAutoDismantledText(autoDismantleResult)
               : accepted
               ? buildDeliveryAcceptedText(
-                  nextAddressText,
+                  nextSelection.address_text,
                   preferredWindow.fromText,
                   preferredWindow.toText,
                 )
@@ -3798,7 +4592,9 @@ router.post(
               : autoDismantleResult.applied
               ? "declined_auto_dismantled"
               : "declined",
-            address_text: nextAddressText || "",
+            address_text: nextSelection.address_text || "",
+            entrance: nextSelection.entrance || "",
+            comment: nextSelection.comment || "",
             preferred_time_from: preferredWindow.fromText || "",
             preferred_time_to: preferredWindow.toText || "",
             auto_dismantled: autoDismantleResult.applied,
@@ -3897,6 +4693,15 @@ router.post(
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("delivery.clientRespond error", err);
+      if (
+        respondAddressProviderError(
+          res,
+          err,
+          "Не удалось проверить адрес доставки. Попробуйте чуть позже.",
+        )
+      ) {
+        return;
+      }
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();
@@ -3933,7 +4738,10 @@ router.post(
       req.body?.lng == null || req.body?.lng === ""
         ? null
         : Number(req.body.lng);
+    const entrance = String(req.body?.entrance || req.body?.entrance_or_hint || "").trim();
+    const comment = String(req.body?.comment || "").trim();
     const saveAsDefault = req.body?.save_as_default !== false;
+    const confirmSelection = req.body?.confirm_selection === true;
     let preferredWindow;
     try {
       preferredWindow = sanitizePreferredWindow(
@@ -3993,9 +4801,6 @@ router.post(
         });
       }
       let addressId = customer.address_id ? String(customer.address_id) : null;
-      let nextAddressText = addressText || decodeAddressFromRow(customer);
-      let nextLat = Number.isFinite(lat) ? lat : customer.lat;
-      let nextLng = Number.isFinite(lng) ? lng : customer.lng;
       const ensured = await ensureDeliveryChat(
         client,
         customer.user_id,
@@ -4003,60 +4808,101 @@ router.post(
         req.user.tenant_id || null,
       );
       const chat = ensured.chat;
+      let nextSelection = {
+        ...mapStoredDeliveryAddressRow(customer),
+        address_text: addressText || decodeAddressFromRow(customer),
+        lat: Number.isFinite(lat) ? lat : customer.lat,
+        lng: Number.isFinite(lng) ? lng : customer.lng,
+        entrance: entrance || String(customer.entrance || "").trim(),
+        comment: comment || String(customer.comment || "").trim(),
+      };
 
-      if (accepted && addressText.length > 0 && (!Number.isFinite(lat) || !Number.isFinite(lng))) {
-        const geocoded = await geocodeDeliveryAddress(addressText);
-        if (!geocoded) {
+      if (accepted) {
+        const settings = await getDeliverySettings(client, req.user?.tenant_id || null);
+        const validated = await resolveValidatedAddressSelection({
+          rawSelection: {
+            ...req.body,
+            address_text: addressText,
+            lat,
+            lng,
+            entrance,
+            comment,
+          },
+          settings,
+          requirePoint: true,
+          allowConfirm: confirmSelection,
+        });
+        if (!validated.ok) {
           await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
-            error: "Не удалось найти этот адрес в указанном городе",
+            error: validated.error,
+            data: validated.validation || null,
           });
         }
-        nextAddressText = geocoded.address_text;
-        nextLat = geocoded.lat;
-        nextLng = geocoded.lng;
+        nextSelection = {
+          ...nextSelection,
+          ...validated.selection,
+        };
       }
 
-      if (accepted && saveAsDefault && (nextAddressText || (Number.isFinite(nextLat) && Number.isFinite(nextLng)))) {
-        if (nextAddressText) {
-          await client.query(
-            `UPDATE user_delivery_addresses
-             SET is_default = false,
-                 updated_at = now()
-             WHERE user_id = $1`,
-            [customer.user_id],
-          );
-          const encryptedAddress = buildAddressEncryption(nextAddressText);
-          const addressInsert = await client.query(
-            `INSERT INTO user_delivery_addresses (
-               id, user_id, label, address_text,
-               address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
-               lat, lng, is_default, created_at, updated_at
-             )
-             VALUES (
-               $1, $2, 'Основной адрес', NULL,
-               $3, $4, $5, $6, $7,
-               $8, $9, true, now(), now()
-             )
-             RETURNING id`,
-            [
-              uuidv4(),
-              customer.user_id,
-              encryptedAddress.ciphertext,
-              encryptedAddress.iv,
-              encryptedAddress.tag,
-              encryptedAddress.version,
-              encryptedAddress.encryptedAt,
-              nextLat,
-              nextLng,
-            ],
-          );
-          addressId = String(addressInsert.rows[0].id);
-        }
+      if (accepted && saveAsDefault && nextSelection.address_text) {
+        await client.query(
+          `UPDATE user_delivery_addresses
+           SET is_default = false,
+               updated_at = now()
+           WHERE user_id = $1`,
+          [customer.user_id],
+        );
+        const addressPayload = buildAddressDbPayload(nextSelection);
+        const addressInsert = await client.query(
+          `INSERT INTO user_delivery_addresses (
+             id, user_id, label, address_text,
+             address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
+             lat, lng, entrance, comment, is_default,
+             address_structured, provider, provider_address_id,
+             validation_status, validation_confidence, point_source, mismatch_distance_meters,
+             delivery_zone_id, delivery_zone_label, delivery_zone_status,
+             created_at, updated_at
+           )
+           VALUES (
+             $1, $2, 'Основной адрес', NULL,
+             $3, $4, $5, $6, $7,
+             $8, $9, $10, $11, true,
+             $12::jsonb, $13, $14,
+             $15, $16, $17, $18,
+             $19, $20, $21,
+             now(), now()
+           )
+           RETURNING id`,
+          [
+            uuidv4(),
+            customer.user_id,
+            addressPayload.encrypted.ciphertext,
+            addressPayload.encrypted.iv,
+            addressPayload.encrypted.tag,
+            addressPayload.encrypted.version,
+            addressPayload.encrypted.encryptedAt,
+            addressPayload.lat,
+            addressPayload.lng,
+            addressPayload.entrance,
+            addressPayload.comment,
+            JSON.stringify(addressPayload.address_structured),
+            addressPayload.provider,
+            addressPayload.provider_address_id,
+            addressPayload.validation_status,
+            addressPayload.validation_confidence,
+            addressPayload.point_source,
+            addressPayload.mismatch_distance_meters,
+            addressPayload.delivery_zone_id,
+            addressPayload.delivery_zone_label,
+            addressPayload.delivery_zone_status,
+          ],
+        );
+        addressId = String(addressInsert.rows[0].id);
       }
 
-      const customerEncryptedAddress = buildAddressEncryption(nextAddressText || "");
+      const addressPayload = buildAddressDbPayload(nextSelection);
       await client.query(
         `UPDATE delivery_batch_customers
          SET call_status = $1,
@@ -4070,23 +4916,47 @@ router.post(
              address_encrypted_at = $8,
              lat = $9,
              lng = $10,
-             preferred_time_from = $11,
-             preferred_time_to = $12,
+             entrance = $11,
+             comment = $12,
+             address_structured = $13::jsonb,
+             provider = $14,
+             provider_address_id = $15,
+             validation_status = $16,
+             validation_confidence = $17,
+             point_source = $18,
+             mismatch_distance_meters = $19,
+             delivery_zone_id = $20,
+             delivery_zone_label = $21,
+             delivery_zone_status = $22,
+             preferred_time_from = $23,
+             preferred_time_to = $24,
              accepted_at = CASE WHEN $1 = 'accepted' THEN now() ELSE accepted_at END,
              agreed_sum = CASE WHEN $1 = 'accepted' THEN processed_sum ELSE agreed_sum END,
              updated_at = now()
-         WHERE id = $13`,
+         WHERE id = $25`,
         [
           accepted ? "accepted" : "declined",
           accepted ? "preparing_delivery" : "declined",
           addressId,
-          customerEncryptedAddress.ciphertext,
-          customerEncryptedAddress.iv,
-          customerEncryptedAddress.tag,
-          customerEncryptedAddress.version,
-          customerEncryptedAddress.encryptedAt,
-          nextLat,
-          nextLng,
+          addressPayload.encrypted.ciphertext,
+          addressPayload.encrypted.iv,
+          addressPayload.encrypted.tag,
+          addressPayload.encrypted.version,
+          addressPayload.encrypted.encryptedAt,
+          addressPayload.lat,
+          addressPayload.lng,
+          addressPayload.entrance,
+          addressPayload.comment,
+          JSON.stringify(addressPayload.address_structured),
+          addressPayload.provider,
+          addressPayload.provider_address_id,
+          addressPayload.validation_status,
+          addressPayload.validation_confidence,
+          addressPayload.point_source,
+          addressPayload.mismatch_distance_meters,
+          addressPayload.delivery_zone_id,
+          addressPayload.delivery_zone_label,
+          addressPayload.delivery_zone_status,
           preferredWindow.fromText,
           preferredWindow.toText,
           customerId,
@@ -4156,10 +5026,10 @@ router.post(
          WHERE chat_id = $5
            AND COALESCE(meta->>'kind', '') = 'delivery_offer'
            AND COALESCE(meta->>'delivery_customer_id', '') = $6
-         RETURNING id`,
+        RETURNING id`,
         [
           accepted ? "accepted" : "declined",
-          nextAddressText || "",
+          nextSelection.address_text || "",
           preferredWindow.fromText || "",
           preferredWindow.toText || "",
           chat.id,
@@ -4179,7 +5049,7 @@ router.post(
               ? buildDeliveryAutoDismantledText(autoDismantleResult)
               : accepted
               ? buildDeliveryAcceptedText(
-                  nextAddressText,
+                  nextSelection.address_text,
                   preferredWindow.fromText,
                   preferredWindow.toText,
                 )
@@ -4194,7 +5064,9 @@ router.post(
               : autoDismantleResult.applied
               ? "declined_auto_dismantled"
               : "declined",
-            address_text: nextAddressText || "",
+            address_text: nextSelection.address_text || "",
+            entrance: nextSelection.entrance || "",
+            comment: nextSelection.comment || "",
             preferred_time_from: preferredWindow.fromText || "",
             preferred_time_to: preferredWindow.toText || "",
             responded_by: "admin",
@@ -4339,6 +5211,15 @@ router.post(
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("delivery.customer.decision error", err);
+      if (
+        respondAddressProviderError(
+          res,
+          err,
+          "Не удалось проверить адрес клиента. Попробуйте чуть позже.",
+        )
+      ) {
+        return;
+      }
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();
@@ -4709,9 +5590,20 @@ router.post(
     const { batchId } = req.params;
     const phone = String(req.body?.phone || "").trim();
     const addressText = String(req.body?.address_text || "").trim();
+    const lat =
+      req.body?.lat == null || req.body?.lat === ""
+        ? null
+        : Number(req.body.lat);
+    const lng =
+      req.body?.lng == null || req.body?.lng === ""
+        ? null
+        : Number(req.body.lng);
+    const entrance = String(req.body?.entrance || req.body?.entrance_or_hint || "").trim();
+    const comment = String(req.body?.comment || "").trim();
     const bulkyNote = String(req.body?.bulky_note || "").trim();
     const packagePlaces = Number(req.body?.package_places ?? 1);
     const bulkyPlaces = Number(req.body?.bulky_places ?? 0);
+    const confirmSelection = req.body?.confirm_selection === true;
     let preferredWindow;
     try {
       preferredWindow = sanitizePreferredWindow(
@@ -4825,14 +5717,30 @@ router.post(
         });
       }
 
-      const geocoded = await geocodeDeliveryAddress(addressText);
-      if (!geocoded) {
+      const settings = await getDeliverySettings(client, req.user?.tenant_id || null);
+      const validated = await resolveValidatedAddressSelection({
+        rawSelection: {
+          ...req.body,
+          address_text: addressText,
+          lat,
+          lng,
+          entrance,
+          comment,
+        },
+        settings,
+        requirePoint: true,
+        allowConfirm: confirmSelection,
+      });
+      if (!validated.ok) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
-          error: "Не удалось найти этот адрес в указанном городе",
+          error: validated.error,
+          data: validated.validation || null,
         });
       }
+      const selectedAddress = validated.selection;
+      const addressPayload = buildAddressDbPayload(selectedAddress);
 
       await client.query(
         `UPDATE user_delivery_addresses
@@ -4841,40 +5749,61 @@ router.post(
          WHERE user_id = $1`,
         [user.user_id],
       );
-      const encryptedAddress = buildAddressEncryption(geocoded.address_text);
       const addressInsert = await client.query(
         `INSERT INTO user_delivery_addresses (
            id, user_id, label, address_text,
            address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at,
-           lat, lng, is_default, created_at, updated_at
+           lat, lng, entrance, comment, is_default,
+           address_structured, provider, provider_address_id,
+           validation_status, validation_confidence, point_source, mismatch_distance_meters,
+           delivery_zone_id, delivery_zone_label, delivery_zone_status,
+           created_at, updated_at
          )
          VALUES (
            $1, $2, 'Основной адрес', NULL,
            $3, $4, $5, $6, $7,
-           $8, $9, true, now(), now()
+           $8, $9, $10, $11, true,
+           $12::jsonb, $13, $14,
+           $15, $16, $17, $18,
+           $19, $20, $21,
+           now(), now()
          )
          RETURNING id`,
         [
           uuidv4(),
           user.user_id,
-          encryptedAddress.ciphertext,
-          encryptedAddress.iv,
-          encryptedAddress.tag,
-          encryptedAddress.version,
-          encryptedAddress.encryptedAt,
-          geocoded.lat,
-          geocoded.lng,
+          addressPayload.encrypted.ciphertext,
+          addressPayload.encrypted.iv,
+          addressPayload.encrypted.tag,
+          addressPayload.encrypted.version,
+          addressPayload.encrypted.encryptedAt,
+          addressPayload.lat,
+          addressPayload.lng,
+          addressPayload.entrance,
+          addressPayload.comment,
+          JSON.stringify(addressPayload.address_structured),
+          addressPayload.provider,
+          addressPayload.provider_address_id,
+          addressPayload.validation_status,
+          addressPayload.validation_confidence,
+          addressPayload.point_source,
+          addressPayload.mismatch_distance_meters,
+          addressPayload.delivery_zone_id,
+          addressPayload.delivery_zone_label,
+          addressPayload.delivery_zone_status,
         ],
       );
       const addressId = String(addressInsert.rows[0].id);
       const batchCustomerId = uuidv4();
 
-      const batchEncryptedAddress = buildAddressEncryption(geocoded.address_text);
       await client.query(
         `INSERT INTO delivery_batch_customers (
            id, batch_id, user_id, customer_name, customer_phone,
            processed_sum, agreed_sum, claim_return_sum, claim_discount_sum, claims_total, processed_items_count, shelf_number,
            address_id, address_text, address_ciphertext, address_iv, address_tag, address_encryption_version, address_encrypted_at, lat, lng,
+           entrance, comment, address_structured, provider, provider_address_id,
+           validation_status, validation_confidence, point_source, mismatch_distance_meters,
+           delivery_zone_id, delivery_zone_label, delivery_zone_status,
            call_status, delivery_status, preferred_time_from, preferred_time_to,
            package_places, bulky_places, bulky_note, accepted_at, created_at, updated_at
          )
@@ -4882,8 +5811,11 @@ router.post(
            $1, $2, $3, $4, $5,
            $6, $6, $7, $8, $9, $10, $11,
            $12, NULL, $13, $14, $15, $16, $17, $18, $19,
-           'accepted', 'preparing_delivery', $20, $21,
-           $22, $23, $24, now(), now(), now()
+           $20, $21, $22::jsonb, $23, $24,
+           $25, $26, $27, $28,
+           $29, $30, $31,
+           'accepted', 'preparing_delivery', $32, $33,
+           $34, $35, $36, now(), now(), now()
          )`,
         [
           batchCustomerId,
@@ -4898,13 +5830,25 @@ router.post(
           eligible.processed_items_count,
           eligible.shelf_number,
           addressId,
-          batchEncryptedAddress.ciphertext,
-          batchEncryptedAddress.iv,
-          batchEncryptedAddress.tag,
-          batchEncryptedAddress.version,
-          batchEncryptedAddress.encryptedAt,
-          geocoded.lat,
-          geocoded.lng,
+          addressPayload.encrypted.ciphertext,
+          addressPayload.encrypted.iv,
+          addressPayload.encrypted.tag,
+          addressPayload.encrypted.version,
+          addressPayload.encrypted.encryptedAt,
+          addressPayload.lat,
+          addressPayload.lng,
+          addressPayload.entrance,
+          addressPayload.comment,
+          JSON.stringify(addressPayload.address_structured),
+          addressPayload.provider,
+          addressPayload.provider_address_id,
+          addressPayload.validation_status,
+          addressPayload.validation_confidence,
+          addressPayload.point_source,
+          addressPayload.mismatch_distance_meters,
+          addressPayload.delivery_zone_id,
+          addressPayload.delivery_zone_label,
+          addressPayload.delivery_zone_status,
           preferredWindow.fromText,
           preferredWindow.toText,
           packagePlaces,
@@ -4971,7 +5915,7 @@ router.post(
           chat.id,
           encryptMessageText(
             buildDeliveryAcceptedText(
-              geocoded.address_text,
+              selectedAddress.address_text,
               preferredWindow.fromText,
               preferredWindow.toText,
             ),
@@ -4981,7 +5925,9 @@ router.post(
             delivery_batch_id: batchId,
             delivery_customer_id: batchCustomerId,
             offer_status: "accepted",
-            address_text: geocoded.address_text,
+            address_text: selectedAddress.address_text,
+            entrance: selectedAddress.entrance || "",
+            comment: selectedAddress.comment || "",
             preferred_time_from: preferredWindow.fromText || "",
             preferred_time_to: preferredWindow.toText || "",
             responded_by: "admin_manual_add",
@@ -5030,6 +5976,15 @@ router.post(
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("delivery.customer.manualAdd error", err);
+      if (
+        respondAddressProviderError(
+          res,
+          err,
+          "Не удалось проверить адрес перед добавлением в лист доставки. Попробуйте чуть позже.",
+        )
+      ) {
+        return;
+      }
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();

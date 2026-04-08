@@ -6,9 +6,9 @@ const {
   getWebPushPublicKey,
   upsertWebPushSubscription,
   removeWebPushSubscription,
-  computeUnreadBadgeCount,
   sendTestWebPushToUser,
 } = require("../utils/webPush");
+const { computeNotificationBadgeCount } = require("../utils/notifications");
 
 const router = express.Router();
 
@@ -22,7 +22,7 @@ router.get("/config", authMiddleware, async (req, res) => {
 
 router.get("/badge-count", authMiddleware, async (req, res) => {
   try {
-    const count = await computeUnreadBadgeCount(req.user.id);
+    const count = await computeNotificationBadgeCount(req.user.id);
     return res.json({ ok: true, unread_count: count });
   } catch (err) {
     console.error("webPush.badgeCount error", err);
@@ -37,6 +37,7 @@ router.post("/subscriptions", authMiddleware, async (req, res) => {
   try {
     const normalized = await upsertWebPushSubscription({
       userId: req.user.id,
+      tenantId: req.user?.tenant_id || null,
       subscription: req.body?.subscription || req.body,
       userAgent: req.headers["user-agent"] || "",
     });

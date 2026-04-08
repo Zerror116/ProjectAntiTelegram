@@ -9,6 +9,7 @@ const { emitToTenant } = require("../utils/socket");
 const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
+const { createNotificationInboxItem } = require("../utils/notifications");
 const {
   encryptMessageText,
   decryptMessageRow,
@@ -275,7 +276,141 @@ async function emitSupportQueueTicketEvent(req, tenantId, eventName, ticketId) {
   if (!io || !eventName || !ticketId) return;
   const payload = await hydrateSupportQueueTicket(db, ticketId);
   if (!payload) return;
+  await createSupportInboxNotifications({
+    tenantId: tenantId || null,
+    ticket: payload,
+    eventName,
+  });
   emitToTenant(io, tenantId || null, eventName, payload);
+}
+
+async function listSupportNotificationRecipients(tenantId, { bugReportsOnly = false } = {}) {
+  const usersQ = await db.query(
+    `SELECT id, email, name, role, tenant_id
+       FROM users
+      WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid)
+        AND role IN ('worker', 'admin', 'tenant', 'creator')`,
+    [tenantId || null],
+  );
+
+  const recipients = [];
+  for (const row of usersQ.rows) {
+    const role = normalizeRole(row.role);
+    if (bugReportsOnly) {
+      if (role === "admin" || role === "creator") {
+        recipients.push(row);
+      }
+      continue;
+    }
+    if (role === "admin" || role === "tenant" || role === "creator") {
+      recipients.push(row);
+      continue;
+    }
+    const permissionSet = await resolvePermissionSet(row, db);
+    if (hasPermission(permissionSet.permissions, "chat.write.support")) {
+      recipients.push(row);
+    }
+  }
+  return recipients;
+}
+
+async function createSupportInboxNotifications({ tenantId, ticket, eventName }) {
+  if (!ticket?.id || !ticket?.chat_id) return;
+  const recipients = await listSupportNotificationRecipients(tenantId);
+  const status = String(ticket.status || "open").trim().toLowerCase();
+  const productTitle = String(ticket.product_title || "").trim();
+  const customerName = String(ticket.customer_name || "Клиент").trim() || "Клиент";
+  const subject = String(ticket.subject || "Новый вопрос в поддержку").trim() ||
+    "Новый вопрос в поддержку";
+  const title = eventName === "support:ticket:queued"
+    ? "Новый тикет поддержки"
+    : "Обновление тикета поддержки";
+  const bodyParts = [
+    subject,
+    `Клиент: ${customerName}`,
+  ];
+  if (productTitle) {
+    bodyParts.push(`Товар: ${productTitle}`);
+  }
+  bodyParts.push(`Статус: ${status}`);
+  const body = bodyParts.join(" • ");
+
+  for (const recipient of recipients) {
+    await createNotificationInboxItem({
+      user: recipient,
+      category: "support",
+      priority: eventName === "support:ticket:queued" ? "high" : "normal",
+      channel: "mixed",
+      title,
+      body,
+      deepLink: `/chat?chatId=${ticket.chat_id}`,
+      payload: {
+        ticket_id: ticket.id,
+        chat_id: ticket.chat_id,
+        customer_name: customerName,
+        category: ticket.category,
+        product_title: productTitle,
+        status,
+        source_event: eventName,
+      },
+      dedupeKey: `support:${eventName}:${ticket.id}:${recipient.id}`,
+      collapseKey: `support:${ticket.id}`,
+      ttlSeconds: 60 * 60 * 8,
+      sourceType: "support_ticket",
+      sourceId: ticket.id,
+      forceShow: eventName === "support:ticket:queued",
+      isActionable: true,
+      emit: true,
+      attemptPush: true,
+    });
+  }
+}
+
+async function createBugReportInboxNotifications({
+  tenantId,
+  channelId,
+  reporter,
+  messageId,
+  messageText,
+}) {
+  if (!channelId || !reporter?.id) return;
+  const recipients = await listSupportNotificationRecipients(
+    tenantId,
+    { bugReportsOnly: true },
+  );
+  const reporterLabel = String(
+    reporter.name || reporter.email || reporter.id || "Пользователь",
+  ).trim();
+  const preview = String(messageText || "").trim().replace(/\s+/g, " ").slice(0, 180);
+
+  for (const recipient of recipients) {
+    await createNotificationInboxItem({
+      user: recipient,
+      category: "support",
+      priority: "high",
+      channel: "mixed",
+      title: "Новый bug-report",
+      body: preview.isEmpty ? `Отправитель: ${reporterLabel}` : `${reporterLabel}: ${preview}`,
+      deepLink: `/chat?chatId=${channelId}`,
+      payload: {
+        kind: "bug_report",
+        chat_id: channelId,
+        message_id: messageId,
+        reporter_id: reporter.id,
+        reporter_role: reporter.role,
+        reporter_email: reporter.email,
+      },
+      dedupeKey: `bug-report:${messageId}:${recipient.id}`,
+      collapseKey: `bug-report:${channelId}`,
+      ttlSeconds: 60 * 60 * 24 * 3,
+      sourceType: "bug_report",
+      sourceId: messageId,
+      forceShow: true,
+      isActionable: true,
+      emit: true,
+      attemptPush: true,
+    });
+  }
 }
 
 function emitSupportQueueClaimedEvent(req, tenantId, payload) {
@@ -1565,6 +1700,14 @@ router.post("/bug-report", authMiddleware, supportBugRateGuard, async (req, res)
     ]);
 
     await client.query("COMMIT");
+
+    await createBugReportInboxNotifications({
+      tenantId: reporter.tenant_id || null,
+      channelId: channel.id,
+      reporter,
+      messageId: messageInsert.rows[0]?.id || null,
+      messageText: message,
+    });
 
     const io = req.app.get("io");
     if (io) {

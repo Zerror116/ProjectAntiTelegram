@@ -6,10 +6,10 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
+import '../src/utils/messenger_ui_helpers.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
-import '../widgets/phoenix_loader.dart';
 import 'chat_screen.dart';
 
 class ChatsScreen extends StatefulWidget {
@@ -140,15 +140,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
-  void _markChatReadLocally(String chatId) {
-    if (chatId.isEmpty) return;
-    setState(() {
-      final index = _chats.indexWhere((c) => _chatIdOf(c) == chatId);
-      if (index < 0) return;
-      _chats[index] = {..._chats[index], 'unread_count': 0};
-    });
-  }
-
   void _scheduleChatsRefresh({Duration delay = const Duration(seconds: 1)}) {
     _refreshDebounceTimer?.cancel();
     _refreshDebounceTimer = Timer(delay, () {
@@ -185,16 +176,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   String _formatTime(dynamic raw) {
     return formatDateTimeValue(raw);
-  }
-
-  String _compactMessage(String text) {
-    final normalized = text
-        .split('\n')
-        .map((line) => line.trim())
-        .where((line) => line.isNotEmpty)
-        .join(' ');
-    if (normalized.isEmpty) return 'Пока без сообщений';
-    return normalized;
   }
 
   String _chatDisplayTitle(Map<String, dynamic> chat) {
@@ -244,7 +225,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   Future<Map<String, dynamic>?> _resolveMainChannelFallback() async {
     try {
-      final resp = await authService.dio.get('/api/chats');
+      final resp = await authService.dio.get('/api/chats/list');
       final data = resp.data;
       if (data is! Map || data['ok'] != true || data['data'] is! List) {
         return null;
@@ -316,7 +297,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ? Map<String, dynamic>.from(selectedChat['settings'])
         : null;
 
-    _markChatReadLocally(chatId);
     try {
       if (!mounted) return;
       await Navigator.push(
@@ -472,22 +452,268 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   String _lastMessagePreview(Map<String, dynamic> chat) {
-    final rawText = (chat['last_message'] ?? chat['last'] ?? '').toString();
-    final text = _compactMessage(rawText);
-    if (text == 'Пока без сообщений') return text;
+    return messengerBuildLastMessagePreview(
+      rawText: (chat['last_message'] ?? chat['last'] ?? '').toString(),
+      senderId: (chat['last_message_sender_id'] ?? '').toString(),
+      senderName: (chat['last_message_sender_name'] ?? '').toString(),
+      currentUserId: authService.currentUser?.id ?? '',
+    );
+  }
 
-    final senderId = (chat['last_message_sender_id'] ?? '').toString().trim();
-    final senderName = (chat['last_message_sender_name'] ?? '')
-        .toString()
-        .trim();
-    if (senderId.isEmpty || senderName == 'Система') {
-      return text;
+  bool _isSupportChat(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    return kind == 'support_ticket' || _toBool(settings['support_ticket']);
+  }
+
+  ({
+    Color background,
+    Color foreground,
+    Color border,
+  }) _supportToneColors(
+    ThemeData theme,
+    MessengerSupportStatusTone tone,
+  ) {
+    return switch (tone) {
+      MessengerSupportStatusTone.primary => (
+        background: theme.colorScheme.primaryContainer,
+        foreground: theme.colorScheme.onPrimaryContainer,
+        border: theme.colorScheme.primary.withValues(alpha: 0.28),
+      ),
+      MessengerSupportStatusTone.secondary => (
+        background: theme.colorScheme.secondaryContainer,
+        foreground: theme.colorScheme.onSecondaryContainer,
+        border: theme.colorScheme.secondary.withValues(alpha: 0.28),
+      ),
+      MessengerSupportStatusTone.success => (
+        background: theme.colorScheme.tertiaryContainer,
+        foreground: theme.colorScheme.onTertiaryContainer,
+        border: theme.colorScheme.tertiary.withValues(alpha: 0.28),
+      ),
+      MessengerSupportStatusTone.neutral => (
+        background: theme.colorScheme.surfaceContainerHigh,
+        foreground: theme.colorScheme.onSurfaceVariant,
+        border: theme.colorScheme.outlineVariant,
+      ),
+    };
+  }
+
+  Widget _buildMetaChip(
+    ThemeData theme, {
+    required IconData icon,
+    required String label,
+    required Color background,
+    required Color foreground,
+    required Color border,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: foreground),
+          const SizedBox(width: 5),
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: foreground,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _buildChatMetaChips(Map<String, dynamic> chat, ThemeData theme) {
+    final chips = <Widget>[];
+    if (_isChatPinned(chat)) {
+      chips.add(
+        _buildMetaChip(
+          theme,
+          icon: Icons.push_pin_rounded,
+          label: 'Закреплён',
+          background: theme.colorScheme.primaryContainer.withValues(alpha: 0.72),
+          foreground: theme.colorScheme.onPrimaryContainer,
+          border: theme.colorScheme.primary.withValues(alpha: 0.26),
+        ),
+      );
     }
-    final currentUserId = authService.currentUser?.id ?? '';
-    final prefix = senderId.isNotEmpty && senderId == currentUserId
-        ? 'Вы'
-        : senderName;
-    return '$prefix: $text';
+
+    if (_isSupportChat(chat)) {
+      final settings = _settingsOf(chat);
+      final statusRaw = (chat['support_ticket_status'] ??
+              settings['support_ticket_status'] ??
+              '')
+          .toString();
+      final statusLabel = messengerSupportStatusLabel(statusRaw);
+      if (statusLabel.isNotEmpty) {
+        final colors = _supportToneColors(
+          theme,
+          messengerSupportStatusTone(statusRaw),
+        );
+        chips.add(
+          _buildMetaChip(
+            theme,
+            icon: Icons.support_agent_rounded,
+            label: statusLabel,
+            background: colors.background,
+            foreground: colors.foreground,
+            border: colors.border,
+          ),
+        );
+      }
+
+      if (statusRaw.trim().toLowerCase() == 'open') {
+        chips.add(
+          _buildMetaChip(
+            theme,
+            icon: Icons.schedule_rounded,
+            label: messengerSupportWaitingLabel(waitingCustomer: false),
+            background: theme.colorScheme.surfaceContainerHighest,
+            foreground: theme.colorScheme.onSurfaceVariant,
+            border: theme.colorScheme.outlineVariant,
+          ),
+        );
+      }
+
+      final assignee = (chat['support_assignee_name'] ??
+              settings['support_assignee_name'] ??
+              '')
+          .toString()
+          .trim();
+      if (assignee.isNotEmpty) {
+        chips.add(
+          _buildMetaChip(
+            theme,
+            icon: Icons.person_outline_rounded,
+            label: assignee,
+            background: theme.colorScheme.surfaceContainerHigh,
+            foreground: theme.colorScheme.onSurfaceVariant,
+            border: theme.colorScheme.outlineVariant,
+          ),
+        );
+      }
+    }
+
+    return chips;
+  }
+
+  _ChatListBadgeSpec _chatBadgeSpec(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    final title = _chatDisplayTitle(chat).toLowerCase().trim();
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    final systemKey = (settings['system_key'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final type = (chat['type'] ?? '').toString().trim().toLowerCase();
+    final supportTicket =
+        kind == 'support_ticket' || _toBool(settings['support_ticket']);
+
+    if (_isMainChannel(chat)) {
+      return const _ChatListBadgeSpec(
+        label: 'Основной',
+        icon: Icons.campaign_outlined,
+        tone: _ChatListBadgeTone.primary,
+      );
+    }
+    if (kind == 'reserved_orders' ||
+        systemKey == 'reserved_orders' ||
+        title == 'забронированный товар') {
+      return const _ChatListBadgeSpec(
+        label: 'Reserved',
+        icon: Icons.inventory_2_outlined,
+        tone: _ChatListBadgeTone.tertiary,
+      );
+    }
+    if (kind == 'bug_reports' || title == 'баг-репорты') {
+      return const _ChatListBadgeSpec(
+        label: 'Bug',
+        icon: Icons.bug_report_outlined,
+        tone: _ChatListBadgeTone.error,
+      );
+    }
+    if (supportTicket) {
+      return const _ChatListBadgeSpec(
+        label: 'Support',
+        icon: Icons.support_agent_outlined,
+        tone: _ChatListBadgeTone.secondary,
+      );
+    }
+    if (title.contains('архив')) {
+      return const _ChatListBadgeSpec(
+        label: 'Архив',
+        icon: Icons.archive_outlined,
+        tone: _ChatListBadgeTone.neutral,
+      );
+    }
+    if (type == 'private') {
+      return const _ChatListBadgeSpec(
+        label: 'ЛС',
+        icon: Icons.person_outline,
+        tone: _ChatListBadgeTone.neutral,
+      );
+    }
+    if (type == 'channel') {
+      return const _ChatListBadgeSpec(
+        label: 'Канал',
+        icon: Icons.forum_outlined,
+        tone: _ChatListBadgeTone.neutral,
+      );
+    }
+    return const _ChatListBadgeSpec(
+      label: 'Чат',
+      icon: Icons.chat_bubble_outline,
+      tone: _ChatListBadgeTone.neutral,
+    );
+  }
+
+  Widget _buildChatBadge(Map<String, dynamic> chat, ThemeData theme) {
+    final spec = _chatBadgeSpec(chat);
+    final colors = spec.resolve(theme);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: colors.background,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: colors.border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(spec.icon, size: 13, color: colors.foreground),
+          const SizedBox(width: 5),
+          Text(
+            spec.label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: colors.foreground,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatsLoadingSkeleton(ThemeData theme) {
+    return ListView.builder(
+      physics: const BouncingScrollPhysics(
+        parent: AlwaysScrollableScrollPhysics(),
+      ),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
+      itemCount: 7,
+      itemBuilder: (context, index) => _ChatsSkeletonCard(
+        index: index,
+        theme: theme,
+      ),
+    );
   }
 
   String _extractDioError(Object error) {
@@ -540,7 +766,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
     );
     if (!mounted || result == null) return;
 
-    _markChatReadLocally(result.chatId);
     await Navigator.push(
       context,
       MaterialPageRoute(
@@ -753,6 +978,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
       if (type == 'chat:message:deleted') {
         _scheduleChatsRefresh();
+        return;
+      }
+
+      if (type == 'socket:connected') {
+        _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
       }
     });
   }
@@ -827,7 +1057,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
 
     try {
-      final resp = await authService.dio.get('/api/chats');
+      final resp = await authService.dio.get('/api/chats/list');
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         final nextChats = List<Map<String, dynamic>>.from(data['data'])
@@ -889,12 +1119,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
         : _toAvatarZoom(settings['avatar_zoom']);
     final preview = _lastMessagePreview(chat);
     final unreadCount = int.tryParse('${chat['unread_count'] ?? 0}') ?? 0;
-    final isPinned = _isChatPinned(chat);
+    final badge = _buildChatBadge(chat, theme);
+    final metaChips = _buildChatMetaChips(chat, theme);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
       child: Material(
-        color: theme.colorScheme.surface,
+        color: Colors.transparent,
         borderRadius: BorderRadius.circular(22),
         child: InkWell(
           borderRadius: BorderRadius.circular(22),
@@ -907,8 +1138,23 @@ class _ChatsScreenState extends State<ChatsScreen> {
           child: Ink(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
             decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  theme.colorScheme.surface,
+                  theme.colorScheme.surfaceContainerLowest,
+                ],
+              ),
               borderRadius: BorderRadius.circular(22),
               border: Border.all(color: theme.colorScheme.outlineVariant),
+              boxShadow: [
+                BoxShadow(
+                  color: theme.colorScheme.shadow.withValues(alpha: 0.04),
+                  blurRadius: 18,
+                  offset: const Offset(0, 8),
+                ),
+              ],
             ),
             child: Row(
               children: [
@@ -927,34 +1173,67 @@ class _ChatsScreenState extends State<ChatsScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                badge,
+                                const SizedBox(height: 8),
+                                Text(
+                                  title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              if (time.isNotEmpty)
+                                Text(
+                                  time,
+                                  style: theme.textTheme.labelMedium?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                    fontWeight: unreadCount > 0
+                                        ? FontWeight.w700
+                                        : FontWeight.w500,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                      if (metaChips.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: metaChips,
+                        ),
+                      ],
+                      const SizedBox(height: 10),
+                      Row(
                         children: [
                           Expanded(
                             child: Text(
-                              title,
-                              maxLines: 1,
+                              preview,
+                              maxLines: 2,
                               overflow: TextOverflow.ellipsis,
-                              style: theme.textTheme.titleMedium?.copyWith(
-                                fontWeight: FontWeight.w700,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                height: 1.25,
+                                color: unreadCount > 0
+                                    ? theme.colorScheme.onSurface
+                                    : theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ),
-                          if (isPinned) ...[
-                            const SizedBox(width: 8),
-                            Icon(
-                              Icons.push_pin,
-                              size: 16,
-                              color: theme.colorScheme.primary,
-                            ),
-                          ],
-                          if (time.isNotEmpty) ...[
-                            const SizedBox(width: 10),
-                            Text(
-                              time,
-                              style: theme.textTheme.labelMedium?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ],
                           if (unreadCount > 0) ...[
                             const SizedBox(width: 10),
                             Container(
@@ -981,16 +1260,6 @@ class _ChatsScreenState extends State<ChatsScreen> {
                             ),
                           ],
                         ],
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        preview,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          height: 1.25,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
                       ),
                     ],
                   ),
@@ -1023,11 +1292,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
               ),
         child: _loading
-            ? const PhoenixLoadingView(
-                title: 'Загружаем чаты',
-                subtitle: 'Получаем каналы и личные переписки',
-                size: 52,
-              )
+            ? _buildChatsLoadingSkeleton(theme)
             : _error.isNotEmpty
             ? ListView(
                 physics: const BouncingScrollPhysics(
@@ -1057,18 +1322,49 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
                 padding: const EdgeInsets.all(24),
                 children: [
-                  const SizedBox(height: 80),
+                  const SizedBox(height: 72),
                   Icon(
                     Icons.chat_bubble_outline,
-                    size: 52,
-                    color: theme.colorScheme.onSurfaceVariant,
+                    size: 58,
+                    color: theme.colorScheme.primary,
                   ),
                   const SizedBox(height: 16),
                   Center(
                     child: Text(
                       'Пока нет доступных чатов',
-                      style: theme.textTheme.titleMedium,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                  Center(
+                    child: Text(
+                      'Когда появятся личные сообщения, support или системные каналы, они появятся здесь.',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: _openDirectChatDialog,
+                        icon: const Icon(Icons.person_outline),
+                        label: const Text('Личные сообщения'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: _loadChats,
+                        icon: const Icon(Icons.refresh_rounded),
+                        label: const Text('Обновить'),
+                      ),
+                    ],
                   ),
                 ],
               )
@@ -2080,6 +2376,191 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
           child: const Text('Отмена'),
         ),
       ],
+    );
+  }
+}
+
+enum _ChatListBadgeTone { primary, secondary, tertiary, error, neutral }
+
+class _ChatListBadgeSpec {
+  const _ChatListBadgeSpec({
+    required this.label,
+    required this.icon,
+    required this.tone,
+  });
+
+  final String label;
+  final IconData icon;
+  final _ChatListBadgeTone tone;
+
+  _ChatListBadgeColors resolve(ThemeData theme) {
+    switch (tone) {
+      case _ChatListBadgeTone.primary:
+        return _ChatListBadgeColors(
+          background: theme.colorScheme.primaryContainer,
+          foreground: theme.colorScheme.onPrimaryContainer,
+          border: theme.colorScheme.primary.withValues(alpha: 0.18),
+        );
+      case _ChatListBadgeTone.secondary:
+        return _ChatListBadgeColors(
+          background: theme.colorScheme.secondaryContainer,
+          foreground: theme.colorScheme.onSecondaryContainer,
+          border: theme.colorScheme.secondary.withValues(alpha: 0.18),
+        );
+      case _ChatListBadgeTone.tertiary:
+        return _ChatListBadgeColors(
+          background: theme.colorScheme.tertiaryContainer,
+          foreground: theme.colorScheme.onTertiaryContainer,
+          border: theme.colorScheme.tertiary.withValues(alpha: 0.18),
+        );
+      case _ChatListBadgeTone.error:
+        return _ChatListBadgeColors(
+          background: theme.colorScheme.errorContainer,
+          foreground: theme.colorScheme.onErrorContainer,
+          border: theme.colorScheme.error.withValues(alpha: 0.18),
+        );
+      case _ChatListBadgeTone.neutral:
+        return _ChatListBadgeColors(
+          background: theme.colorScheme.surfaceContainerHigh,
+          foreground: theme.colorScheme.onSurfaceVariant,
+          border: theme.colorScheme.outlineVariant,
+        );
+    }
+  }
+}
+
+class _ChatListBadgeColors {
+  const _ChatListBadgeColors({
+    required this.background,
+    required this.foreground,
+    required this.border,
+  });
+
+  final Color background;
+  final Color foreground;
+  final Color border;
+}
+
+class _ChatsSkeletonCard extends StatelessWidget {
+  const _ChatsSkeletonCard({
+    required this.index,
+    required this.theme,
+  });
+
+  final int index;
+  final ThemeData theme;
+
+  @override
+  Widget build(BuildContext context) {
+    final widths = <double>[0.72, 0.58, 0.66, 0.49, 0.61, 0.54, 0.69];
+    final subtitleWidths = <double>[0.86, 0.76, 0.82, 0.68, 0.73, 0.78, 0.84];
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              theme.colorScheme.surface,
+              theme.colorScheme.surfaceContainerLowest,
+            ],
+          ),
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          child: Row(
+            children: [
+              _SkeletonBlock(
+                width: 52,
+                height: 52,
+                radius: 26,
+                theme: theme,
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        _SkeletonBlock(
+                          width: 78,
+                          height: 24,
+                          radius: 999,
+                          theme: theme,
+                        ),
+                        const Spacer(),
+                        _SkeletonBlock(
+                          width: 42,
+                          height: 14,
+                          radius: 8,
+                          theme: theme,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    FractionallySizedBox(
+                      widthFactor: widths[index % widths.length],
+                      child: _SkeletonBlock(
+                        width: double.infinity,
+                        height: 18,
+                        radius: 9,
+                        theme: theme,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    FractionallySizedBox(
+                      widthFactor: subtitleWidths[index % subtitleWidths.length],
+                      child: _SkeletonBlock(
+                        width: double.infinity,
+                        height: 14,
+                        radius: 8,
+                        theme: theme,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SkeletonBlock extends StatelessWidget {
+  const _SkeletonBlock({
+    required this.width,
+    required this.height,
+    required this.radius,
+    required this.theme,
+  });
+
+  final double width;
+  final double height;
+  final double radius;
+  final ThemeData theme;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(radius),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            theme.colorScheme.surfaceContainerHighest,
+            theme.colorScheme.surfaceContainerHigh,
+          ],
+        ),
+      ),
     );
   }
 }

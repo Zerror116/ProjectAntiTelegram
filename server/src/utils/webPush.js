@@ -1,8 +1,23 @@
-const webPush = require("web-push");
-
 const db = require("../db");
 
 let vapidConfigured = false;
+let cachedWebPushModule = undefined;
+
+function getWebPushModule() {
+  if (cachedWebPushModule !== undefined) {
+    return cachedWebPushModule;
+  }
+  try {
+    cachedWebPushModule = require("web-push");
+  } catch (error) {
+    if (error && error.code === "MODULE_NOT_FOUND") {
+      cachedWebPushModule = null;
+      return null;
+    }
+    throw error;
+  }
+  return cachedWebPushModule;
+}
 
 function getWebPushConfig() {
   const publicKey = String(process.env.WEB_PUSH_PUBLIC_KEY || "").trim();
@@ -22,6 +37,13 @@ function ensureWebPushConfigured() {
   if (vapidConfigured) return true;
   const { publicKey, privateKey, subject } = getWebPushConfig();
   if (!publicKey || !privateKey) return false;
+  const webPush = getWebPushModule();
+  if (!webPush) {
+    console.warn(
+      "[web-push] package not installed; web push is disabled until dependencies are refreshed",
+    );
+    return false;
+  }
   webPush.setVapidDetails(subject, publicKey, privateKey);
   vapidConfigured = true;
   return true;
@@ -60,6 +82,7 @@ async function upsertWebPushSubscription({
   userId,
   subscription,
   userAgent = "",
+  tenantId = null,
 }) {
   const normalized = normalizeWebPushSubscription(subscription);
   if (!normalized) {
@@ -86,6 +109,18 @@ async function upsertWebPushSubscription({
         last_seen_at = now()`,
     [userId, normalized.endpoint, JSON.stringify(normalized), userAgent],
   );
+  try {
+    const { syncLegacyWebPushEndpoint } = require("./notifications");
+    await syncLegacyWebPushEndpoint({
+      userId,
+      tenantId,
+      endpoint: normalized.endpoint,
+      subscription: normalized,
+      userAgent,
+    });
+  } catch (err) {
+    console.warn("webPush.syncLegacyWebPushEndpoint warning", err?.message || err);
+  }
   return normalized;
 }
 
@@ -98,6 +133,18 @@ async function removeWebPushSubscription({ userId, endpoint }) {
         AND endpoint = $2`,
     [userId, normalizedEndpoint],
   );
+  try {
+    const { deactivateLegacyWebPushEndpoint } = require("./notifications");
+    await deactivateLegacyWebPushEndpoint({
+      userId,
+      endpoint: normalizedEndpoint,
+    });
+  } catch (err) {
+    console.warn(
+      "webPush.deactivateLegacyWebPushEndpoint warning",
+      err?.message || err,
+    );
+  }
   return result.rowCount > 0;
 }
 
@@ -181,11 +228,24 @@ async function resolveChatPushRecipients({ chatId, senderId, explicitUserIds = [
 
 async function sendPayloadToUserSubscriptions(userId, payload) {
   if (!ensureWebPushConfigured()) return 0;
+  const webPush = getWebPushModule();
+  if (!webPush) return 0;
   const subscriptionsQ = await db.query(
     `SELECT endpoint, subscription
-       FROM web_push_subscriptions
-      WHERE user_id = $1
-        AND is_active = true`,
+       FROM (
+         SELECT endpoint, subscription
+           FROM web_push_subscriptions
+          WHERE user_id = $1
+            AND is_active = true
+         UNION
+         SELECT endpoint, subscription
+           FROM notification_endpoints
+          WHERE user_id = $1
+            AND is_active = true
+            AND transport = 'webpush'
+            AND endpoint IS NOT NULL
+            AND btrim(endpoint) <> ''
+       ) targets`,
     [userId],
   );
   if (subscriptionsQ.rowCount === 0) return 0;
@@ -236,8 +296,18 @@ async function sendTestWebPushToUser(userId) {
   });
 }
 
+async function loadUserSummary(userId) {
+  const q = await db.query(
+    `SELECT id, email, name, role, tenant_id
+       FROM users
+      WHERE id = $1
+      LIMIT 1`,
+    [userId],
+  );
+  return q.rows[0] || null;
+}
+
 async function queueChatMessageWebPushForRooms({ rooms = [], payload = {} }) {
-  if (!ensureWebPushConfigured()) return;
   const normalizedRooms = Array.isArray(rooms) ? rooms : [];
   if (!normalizedRooms.length) return;
 
@@ -267,19 +337,37 @@ async function queueChatMessageWebPushForRooms({ rooms = [], payload = {} }) {
   const preview = buildMessagePreview(message);
 
   for (const recipientUserId of recipientIds) {
-    const unreadCount = await computeUnreadBadgeCount(recipientUserId);
-    await sendPayloadToUserSubscriptions(recipientUserId, {
-      type: "chat-message",
-      title: senderName,
-      body: preview,
-      tag: chatId ? `chat:${chatId}` : "chat-message",
-      url: "/",
-      badgeCount: unreadCount,
-      data: {
-        chatId: chatId || null,
-        messageId: String(message.id || "").trim() || null,
-      },
-    });
+    const recipient = await loadUserSummary(recipientUserId);
+    if (!recipient) continue;
+    try {
+      const { createNotificationInboxItem } = require("./notifications");
+      await createNotificationInboxItem({
+        user: recipient,
+        category: "chat",
+        priority: "normal",
+        channel: "mixed",
+        title: senderName,
+        body: preview,
+        deepLink: chatId ? `/chat?chatId=${encodeURIComponent(chatId)}` : "/",
+        payload: {
+          chat_id: chatId || null,
+          message_id: String(message.id || "").trim() || null,
+        },
+        dedupeKey: chatId
+          ? `chat:${chatId}:${recipientUserId}`
+          : `chat-message:${recipientUserId}`,
+        collapseKey: chatId ? `chat:${chatId}` : "chat-message",
+        ttlSeconds: 60 * 60 * 24,
+        sourceType: "chat_message",
+        sourceId: String(message.id || "").trim(),
+        forceShow: false,
+        isActionable: true,
+        emit: true,
+        attemptPush: true,
+      });
+    } catch (err) {
+      console.error("queueChatMessageWebPushForRooms.createNotificationInboxItem error:", err);
+    }
   }
 }
 

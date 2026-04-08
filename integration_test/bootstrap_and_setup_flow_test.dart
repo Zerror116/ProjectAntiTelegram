@@ -120,16 +120,20 @@ void main() {
     await tester.pumpWidget(const MaterialApp(home: app.SetupFailedScreen()));
     await tester.pumpAndSettle();
     expect(
-      find.text('Не удалось инициализировать базу данных на сервере.'),
+      find.text(
+        'Похоже, сервер Феникса был временно недоступен или перезапускался.',
+      ),
       findsOneWidget,
     );
 
     apiState.healthStatus = 200;
-    await tester.tap(find.text('Повторить'));
+    await tester.tap(find.text('Повторить сейчас'));
     await tester.pumpAndSettle(const Duration(seconds: 1));
 
     expect(
-      find.text('Не удалось инициализировать базу данных на сервере.'),
+      find.text(
+        'Похоже, сервер Феникса был временно недоступен или перезапускался.',
+      ),
       findsNothing,
     );
   });
