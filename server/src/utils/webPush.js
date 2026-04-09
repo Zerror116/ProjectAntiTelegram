@@ -1,4 +1,5 @@
 const db = require("../db");
+const { computeNotificationInboxBadgeCount } = require("./notifications");
 
 let vapidConfigured = false;
 let cachedWebPushModule = undefined;
@@ -280,7 +281,7 @@ async function sendWebPushPayloadToUser(userId, payload) {
 }
 
 async function sendTestWebPushToUser(userId) {
-  const unreadCount = await computeUnreadBadgeCount(userId);
+  const unreadCount = await computeNotificationInboxBadgeCount(userId);
   return sendPayloadToUserSubscriptions(userId, {
     type: "test",
     title: "Проект Феникс",

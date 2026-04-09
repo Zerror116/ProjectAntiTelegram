@@ -907,7 +907,7 @@ ThemeData _buildDarkTheme() {
 
 Widget _wrapAppRoot(BuildContext context, Widget child) {
   final reduced = performanceModeNotifier.value;
-  final host = _GlobalNoticeHost(child: child);
+  final host = _maybeWrapWithDesktopSelection(_GlobalNoticeHost(child: child));
   if (!reduced) {
     return ScaffoldMessenger(child: host);
   }
@@ -920,6 +920,27 @@ Widget _wrapAppRoot(BuildContext context, Widget child) {
       data: media.copyWith(disableAnimations: true),
       child: host,
     ),
+  );
+}
+
+bool _supportsGlobalDesktopSelection() {
+  if (kIsWeb) {
+    return defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS;
+  }
+  return defaultTargetPlatform == TargetPlatform.macOS ||
+      defaultTargetPlatform == TargetPlatform.windows ||
+      defaultTargetPlatform == TargetPlatform.linux;
+}
+
+Widget _maybeWrapWithDesktopSelection(Widget child) {
+  if (!_supportsGlobalDesktopSelection()) return child;
+  return Overlay(
+    initialEntries: [
+      OverlayEntry(
+        builder: (context) => SelectionArea(child: child),
+      ),
+    ],
   );
 }
 
@@ -3155,7 +3176,7 @@ void _setNotificationInboxBadgeCount(int count) {
 
 Future<void> refreshNotificationBadgeCount() async {
   if (authService.currentUser == null) {
-    _setNotificationBadgeCount(0, syncWebBadge: false);
+    _setNotificationBadgeCount(0);
     _setNotificationInboxBadgeCount(0);
     return;
   }

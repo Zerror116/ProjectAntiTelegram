@@ -1079,7 +1079,8 @@ async function maybeSendWebPushForItem(user, item, preferences) {
   const payload = buildSocketPayload(item, badgeCount, inboxUnreadCount);
   payload.type = category;
   payload.url = payload.deep_link || "/";
-  payload.badgeCount = badgeCount;
+  // Web/PWA app badges should mirror the inbox/events counter, not chat unread totals.
+  payload.badgeCount = inboxUnreadCount;
   payload.tag = String(item.collapse_key || `${category}:${item.id}`);
   payload.data = {
     ...(payload.payload || {}),
