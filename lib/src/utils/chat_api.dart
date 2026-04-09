@@ -7,15 +7,15 @@ List<Map<String, dynamic>> _parseChatRows(dynamic raw) {
     return raw
         .whereType<Map>()
         .map((row) => Map<String, dynamic>.from(row))
-        .toList(growable: false);
+        .toList(growable: true);
   }
   if (raw is Map && raw['ok'] == true && raw['data'] is List) {
     return (raw['data'] as List)
         .whereType<Map>()
         .map((row) => Map<String, dynamic>.from(row))
-        .toList(growable: false);
+        .toList(growable: true);
   }
-  return const <Map<String, dynamic>>[];
+  return <Map<String, dynamic>>[];
 }
 
 Future<List<Map<String, dynamic>>> loadChatsCollection() async {
