@@ -84,6 +84,12 @@ function isSubscriptionRestrictionReason(reason) {
 
 function isProfileProbeRequest(req) {
   const method = String(req?.method || '').toUpperCase().trim();
+  const fullPath = `${String(req?.baseUrl || '').trim()}${String(
+    req?.path || '',
+  ).trim()}`.toLowerCase();
+  if (method === 'POST' && fullPath === '/api/auth/refresh/bootstrap') {
+    return true;
+  }
   if (method !== 'GET') return false;
   const baseUrl = String(req?.baseUrl || '').toLowerCase().trim();
   const path = String(req?.path || '').toLowerCase().trim();

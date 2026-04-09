@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../main.dart';
 import '../../screens/chat_screen.dart';
+import 'chat_api.dart';
 
 bool _initialNotificationDeepLinkConsumed = false;
 
@@ -83,15 +84,10 @@ String? _chatIdFrom(Uri? uri, Map<String, dynamic>? payload) {
 
 Future<Map<String, dynamic>?> _loadChatMeta(String chatId) async {
   try {
-    final response = await authService.dio.get('/api/chats/list');
-    final root = response.data;
-    if (root is Map && root['ok'] == true && root['data'] is List) {
-      for (final raw in root['data']) {
-        if (raw is! Map) continue;
-        final row = Map<String, dynamic>.from(raw);
-        if ((row['id'] ?? '').toString().trim() == chatId) {
-          return row;
-        }
+    final rows = await loadChatsCollection();
+    for (final row in rows) {
+      if ((row['id'] ?? '').toString().trim() == chatId) {
+        return row;
       }
     }
   } on DioException {

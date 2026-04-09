@@ -19,10 +19,15 @@ const {
 } = require('../utils/tenants');
 const {
   createUserSession,
+  findUserSessionByRefreshToken,
+  generateOpaqueToken,
+  getUserSessionBySessionId,
+  hashOpaqueToken,
   listUserSessions,
   revokeOtherUserSessions,
   revokeSessionByRecordId,
   revokeUserSession,
+  updateUserSessionAuthState,
 } = require('../utils/sessions');
 const {
   normalizePhoneDigits,
@@ -79,6 +84,14 @@ const REGISTRATION_EMAIL_VERIFY_PURPOSE = 'registration_email_verification';
 const MAGIC_LINK_LOGIN_ENABLED = parseBooleanFlag(
   process.env.AUTH_MAGIC_LINK_ENABLED,
 );
+const ACCESS_TOKEN_TTL =
+  String(process.env.AUTH_ACCESS_TOKEN_TTL || '24h').trim() || '24h';
+const SESSION_TTL_DAYS = Math.max(
+  1,
+  Math.min(Number(process.env.AUTH_SESSION_TTL_DAYS || 60) || 60, 365),
+);
+const SESSION_TTL_MS = SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
+const ACCESS_TOKEN_TTL_MS = parseDurationMs(ACCESS_TOKEN_TTL, 24 * 60 * 60 * 1000);
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -91,7 +104,33 @@ if (
 }
 
 function signToken(payload) {
-  return signJwt(payload, { expiresIn: '7d' });
+  return signJwt(payload, { expiresIn: ACCESS_TOKEN_TTL });
+}
+
+function parseDurationMs(raw, fallbackMs) {
+  const normalized = String(raw || '').trim().toLowerCase();
+  if (!normalized) return fallbackMs;
+  const match = normalized.match(/^(\d+)\s*([smhd])$/i);
+  if (!match) return fallbackMs;
+  const amount = Number(match[1] || 0);
+  if (!Number.isFinite(amount) || amount <= 0) return fallbackMs;
+  const unit = match[2].toLowerCase();
+  switch (unit) {
+    case 's':
+      return amount * 1000;
+    case 'm':
+      return amount * 60 * 1000;
+    case 'h':
+      return amount * 60 * 60 * 1000;
+    case 'd':
+      return amount * 24 * 60 * 60 * 1000;
+    default:
+      return fallbackMs;
+  }
+}
+
+function buildAccessExpiry(now = Date.now()) {
+  return new Date(now + ACCESS_TOKEN_TTL_MS);
 }
 
 async function createSecurityInboxNotification({
@@ -135,7 +174,47 @@ async function createSecurityInboxNotification({
 }
 
 function buildSessionExpiry() {
-  return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  return new Date(Date.now() + SESSION_TTL_MS);
+}
+
+function resolveRefreshScopeKey({
+  user = null,
+  tenant = null,
+  tenantCode = '',
+  isPlatformCreator = false,
+} = {}) {
+  if (isPlatformCreator) return 'platform';
+  const normalizedTenantCode = db.normalizeTenantCode(
+    tenantCode || tenant?.code || user?.tenant_code || '',
+  );
+  return normalizedTenantCode || 'platform';
+}
+
+function buildRefreshToken(scopeKey) {
+  const safeScope = db.normalizeTenantCode(scopeKey) || 'platform';
+  return `${safeScope}.${generateOpaqueToken()}`;
+}
+
+function parseRefreshTokenScope(refreshToken) {
+  const normalized = String(refreshToken || '').trim();
+  if (!normalized) return '';
+  const separator = normalized.indexOf('.');
+  if (separator <= 0) return '';
+  return db.normalizeTenantCode(normalized.slice(0, separator)) || '';
+}
+
+async function runWithRefreshScope(scopeKey, fn) {
+  const normalizedScope = db.normalizeTenantCode(scopeKey);
+  if (!normalizedScope || normalizedScope === 'platform') {
+    return db.runWithPlatform(fn);
+  }
+  const tenantRow = await db.resolveTenantByCode(normalizedScope);
+  if (!tenantRow) {
+    const error = new Error('Арендатор для refresh-сессии не найден');
+    error.statusCode = 401;
+    throw error;
+  }
+  return db.runWithTenantRow(tenantRow, fn);
 }
 
 function constantTimeEquals(leftValue, rightValue) {
@@ -1130,8 +1209,10 @@ async function resolvePhoneAccessForUser({
 async function createAuthenticatedSession({
   client,
   user,
+  tenant = null,
   req,
   deviceFingerprint = null,
+  isPlatformCreator = false,
 }) {
   const normalizedFingerprint = normalizeDeviceFingerprint(deviceFingerprint);
   await assertDeviceAccountLimit(
@@ -1144,10 +1225,20 @@ async function createAuthenticatedSession({
 
   const sessionId = uuidv4();
   const sessionExpiresAt = buildSessionExpiry();
+  const refreshToken = buildRefreshToken(
+    resolveRefreshScopeKey({
+      user,
+      tenant,
+      isPlatformCreator,
+    }),
+  );
   await createUserSession({
     queryable: client,
     userId: user.id,
     sessionId,
+    sessionPublicId: sessionId,
+    refreshTokenHash: hashOpaqueToken(refreshToken),
+    refreshLastUsedAt: new Date(),
     deviceFingerprint: normalizedFingerprint,
     userAgent: req.get('user-agent') || '',
     ipAddress: getRequestIp(req),
@@ -1155,8 +1246,33 @@ async function createAuthenticatedSession({
   });
   return {
     sessionId,
+    refreshToken,
+    sessionExpiresAt,
     normalizedFingerprint,
   };
+}
+
+async function fetchAuthUserWithTenant(queryable, userId) {
+  if (!userId) return null;
+  const result = await queryable.query(
+    `SELECT u.id,
+            u.email,
+            u.name,
+            u.role,
+            u.is_active,
+            u.block_reason,
+            u.tenant_id,
+            t.code AS tenant_code,
+            t.name AS tenant_name,
+            t.status AS tenant_status,
+            t.subscription_expires_at
+     FROM users u
+     LEFT JOIN tenants t ON t.id = u.tenant_id
+     WHERE u.id = $1
+     LIMIT 1`,
+    [userId],
+  );
+  return result.rows[0] || null;
 }
 
 async function buildSuccessfulAuthResponse({
@@ -1164,6 +1280,8 @@ async function buildSuccessfulAuthResponse({
   user,
   tenant,
   sessionId,
+  refreshToken,
+  sessionExpiresAt,
   isPlatformCreator = false,
   twoFactor = null,
 }) {
@@ -1187,6 +1305,7 @@ async function buildSuccessfulAuthResponse({
     isPlatformCreator,
   });
   const effectiveTenantCode = tenant?.code || user?.tenant_code || null;
+  const accessExpiresAt = buildAccessExpiry();
   const token = signToken({
     id: user.id,
     email: user.email,
@@ -1198,6 +1317,12 @@ async function buildSuccessfulAuthResponse({
 
   return {
     token,
+    refresh_token: refreshToken,
+    access_expires_at: accessExpiresAt.toISOString(),
+    session_expires_at:
+      sessionExpiresAt instanceof Date
+        ? sessionExpiresAt.toISOString()
+        : sessionExpiresAt || null,
     session_id: sessionId,
     two_factor: twoFactor || {
       enabled: false,
@@ -1207,6 +1332,7 @@ async function buildSuccessfulAuthResponse({
     user: {
       id: user.id,
       email: user.email,
+      name: user.name || null,
       role: user.role,
       tenant_id: user.tenant_id || null,
       tenant_code: effectiveTenantCode,
@@ -1770,10 +1896,20 @@ router.post('/register', async (req, res) => {
 
         const sessionId = uuidv4();
         const sessionExpiresAt = buildSessionExpiry();
+        const refreshToken = buildRefreshToken(
+          resolveRefreshScopeKey({
+            user,
+            tenant,
+            isPlatformCreator,
+          }),
+        );
         await createUserSession({
           queryable: client,
           userId: user.id,
           sessionId,
+          sessionPublicId: sessionId,
+          refreshTokenHash: hashOpaqueToken(refreshToken),
+          refreshLastUsedAt: new Date(),
           deviceFingerprint: requiredDeviceFingerprint,
           userAgent: req.get('user-agent') || '',
           ipAddress:
@@ -1784,7 +1920,14 @@ router.post('/register', async (req, res) => {
         });
 
         await client.query('COMMIT');
-        return { ok: true, user, sessionId, phoneAccessRequest };
+        return {
+          ok: true,
+          user,
+          sessionId,
+          sessionExpiresAt,
+          refreshToken,
+          phoneAccessRequest,
+        };
       } catch (err) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         throw err;
@@ -1874,6 +2017,7 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    const accessExpiresAt = buildAccessExpiry();
     const token = signToken({
       id: registration.user.id,
       email: registration.user.email,
@@ -1885,6 +2029,12 @@ router.post('/register', async (req, res) => {
 
     return res.status(201).json({
       token,
+      refresh_token: registration.refreshToken,
+      access_expires_at: accessExpiresAt.toISOString(),
+      session_expires_at:
+        registration.sessionExpiresAt instanceof Date
+          ? registration.sessionExpiresAt.toISOString()
+          : registration.sessionExpiresAt || null,
       session_id: registration.sessionId,
       user: {
         id: registration.user.id,
@@ -2124,10 +2274,20 @@ router.post('/login', async (req, res) => {
 
         const sessionId = uuidv4();
         const sessionExpiresAt = buildSessionExpiry();
+        const refreshToken = buildRefreshToken(
+          resolveRefreshScopeKey({
+            user,
+            tenant,
+            isPlatformCreator,
+          }),
+        );
         await createUserSession({
           queryable: client,
           userId: user.id,
           sessionId,
+          sessionPublicId: sessionId,
+          refreshTokenHash: hashOpaqueToken(refreshToken),
+          refreshLastUsedAt: new Date(),
           deviceFingerprint: device_fingerprint,
           userAgent: req.get('user-agent') || '',
           ipAddress:
@@ -2142,6 +2302,8 @@ router.post('/login', async (req, res) => {
           ok: true,
           user,
           sessionId,
+          sessionExpiresAt,
+          refreshToken,
           twoFactor: {
             enabled: requiresTwoFactor,
             method: twoFactorMethod,
@@ -2179,6 +2341,8 @@ router.post('/login', async (req, res) => {
         user: result.user,
         tenant,
         sessionId: result.sessionId,
+        refreshToken: result.refreshToken,
+        sessionExpiresAt: result.sessionExpiresAt,
         isPlatformCreator,
         twoFactor: result.twoFactor,
       }),
@@ -2186,6 +2350,207 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error('auth.login error', err);
     return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+router.post('/refresh', async (req, res) => {
+  const refreshToken = String(req.body?.refresh_token || '').trim();
+  if (!refreshToken) {
+    return res.status(400).json({ error: 'refresh_token обязателен' });
+  }
+
+  const scopeKey = parseRefreshTokenScope(refreshToken);
+  if (!scopeKey) {
+    return res.status(401).json({ error: 'Сессия истекла, войдите снова' });
+  }
+
+  try {
+    return await runWithRefreshScope(scopeKey, async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const session = await findUserSessionByRefreshToken({
+          queryable: client,
+          refreshToken,
+        });
+        if (!session) {
+          await client.query('ROLLBACK');
+          return res
+              .status(401)
+              .json({ error: 'Сессия истекла, войдите снова' });
+        }
+        const sessionId = String(session.session_public_id || '').trim();
+        if (!sessionId) {
+          await client.query('ROLLBACK');
+          return res
+              .status(401)
+              .json({ error: 'Сессия устарела, войдите снова' });
+        }
+
+        const user = await fetchAuthUserWithTenant(client, session.user_id);
+        if (!user) {
+          await client.query('ROLLBACK');
+          return res.status(401).json({ error: 'Пользователь не найден' });
+        }
+        if (user.is_active === false) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error:
+              String(user.block_reason || '').trim() ||
+              'Вас заблокировали за нарушение правил',
+          });
+        }
+
+        const isPlatformCreator =
+          String(user.email || '').trim().toLowerCase() ===
+          CREATOR_EMAIL.toLowerCase();
+
+        const tenant = user.tenant_id
+          ? {
+              id: user.tenant_id,
+              code: user.tenant_code || null,
+              name: user.tenant_name || null,
+              status: user.tenant_status || null,
+              subscription_expires_at: user.subscription_expires_at || null,
+            }
+          : null;
+        const nextRefreshToken = buildRefreshToken(
+          resolveRefreshScopeKey({
+            user,
+            tenant,
+            isPlatformCreator,
+          }),
+        );
+        await updateUserSessionAuthState({
+          queryable: client,
+          sessionRecordId: session.id,
+          sessionPublicId: sessionId,
+          refreshTokenHash: hashOpaqueToken(nextRefreshToken),
+          refreshLastUsedAt: new Date(),
+        });
+        const payload = await buildSuccessfulAuthResponse({
+          req,
+          user,
+          tenant,
+          sessionId,
+          refreshToken: nextRefreshToken,
+          sessionExpiresAt: session.expires_at || buildSessionExpiry(),
+          isPlatformCreator,
+        });
+        await client.query('COMMIT');
+        return res.json(payload);
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
+  } catch (err) {
+    console.error('auth.refresh error', err);
+    return res.status(err.statusCode || 500).json({
+      error: err.message || 'Ошибка обновления сессии',
+    });
+  }
+});
+
+router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
+  const currentSessionId = String(req.user?.session_id || '').trim();
+  if (!currentSessionId) {
+    return res.status(401).json({ error: 'Текущая сессия не найдена' });
+  }
+
+  try {
+    const tenantScope = req.user?.is_platform_creator
+      ? null
+      : await db.resolveTenantByCode(req.user?.tenant_code || '');
+    return await db.runWithTenantRow(tenantScope, async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const session = await getUserSessionBySessionId({
+          queryable: client,
+          sessionId: currentSessionId,
+        });
+        if (!session || session.is_active === false) {
+          await client.query('ROLLBACK');
+          return res
+              .status(401)
+              .json({ error: 'Сессия истекла, войдите снова' });
+        }
+        const user = await fetchAuthUserWithTenant(client, req.user.id);
+        if (!user) {
+          await client.query('ROLLBACK');
+          return res.status(401).json({ error: 'Пользователь не найден' });
+        }
+        const isPlatformCreator =
+          String(user.email || '').trim().toLowerCase() ===
+          CREATOR_EMAIL.toLowerCase();
+        const tenant = user.tenant_id
+          ? {
+              id: user.tenant_id,
+              code: user.tenant_code || null,
+              name: user.tenant_name || null,
+              status: user.tenant_status || null,
+              subscription_expires_at: user.subscription_expires_at || null,
+            }
+          : null;
+        const targetExpiry = (() => {
+          const candidate = buildSessionExpiry();
+          const currentExpiry = session.expires_at
+            ? new Date(session.expires_at)
+            : null;
+          if (
+            currentExpiry instanceof Date &&
+            !Number.isNaN(currentExpiry.getTime()) &&
+            currentExpiry.getTime() > candidate.getTime()
+          ) {
+            return currentExpiry;
+          }
+          return candidate;
+        })();
+        const nextRefreshToken = buildRefreshToken(
+          resolveRefreshScopeKey({
+            user,
+            tenant,
+            isPlatformCreator,
+          }),
+        );
+        await updateUserSessionAuthState({
+          queryable: client,
+          sessionId: currentSessionId,
+          sessionPublicId: currentSessionId,
+          refreshTokenHash: hashOpaqueToken(nextRefreshToken),
+          refreshLastUsedAt: new Date(),
+          expiresAt: targetExpiry,
+        });
+        const payload = await buildSuccessfulAuthResponse({
+          req,
+          user,
+          tenant,
+          sessionId: currentSessionId,
+          refreshToken: nextRefreshToken,
+          sessionExpiresAt: targetExpiry,
+          isPlatformCreator,
+        });
+        await client.query('COMMIT');
+        return res.json(payload);
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
+  } catch (err) {
+    console.error('auth.refresh.bootstrap error', err);
+    return res.status(err.statusCode || 500).json({
+      error: err.message || 'Не удалось подготовить длительную сессию',
+    });
   }
 });
 
@@ -2357,14 +2722,18 @@ router.post('/magic-link/consume', async (req, res) => {
     const session = await createAuthenticatedSession({
       client,
       user,
+      tenant,
       req,
       deviceFingerprint,
+      isPlatformCreator,
     });
     const payload = await buildSuccessfulAuthResponse({
       req,
       user,
       tenant,
       sessionId: session.sessionId,
+      refreshToken: session.refreshToken,
+      sessionExpiresAt: session.sessionExpiresAt,
       isPlatformCreator,
       twoFactor: {
         enabled: false,

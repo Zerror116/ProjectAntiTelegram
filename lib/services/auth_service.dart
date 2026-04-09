@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../src/utils/device_utils.dart';
 import 'notification_device_service.dart';
 import 'native_push_service.dart';
@@ -110,6 +111,11 @@ class AuthService {
     defaultValue: false,
   );
   static const _tokenKey = 'auth_token';
+  static const _legacyJwtKey = 'jwt';
+  static const _refreshTokenKey = 'auth_refresh_token';
+  static const _accessExpiresAtKey = 'auth_access_expires_at';
+  static const _sessionExpiresAtKey = 'auth_session_expires_at';
+  static const _authNoticeKey = 'auth_notice_message';
   static const _viewRoleKey = 'creator_view_role';
   static const _tenantCodeKey = 'tenant_code_scope';
   static const _savedSessionsKey = 'saved_tenant_sessions_v1';
@@ -168,6 +174,8 @@ class AuthService {
   bool _isLoggingOut = false;
   String? _deviceFingerprintCache;
   String? _tenantCodeCache;
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+  Completer<bool>? _sessionRefreshCompleter;
 
   String _normalizeTenantCodeScope(String? value) {
     final normalized = (value ?? '').trim().toLowerCase();
@@ -177,11 +185,124 @@ class AuthService {
 
   AuthService({required this.dio});
 
+  Future<void> _writeSecret(String key, String value) async {
+    if (kIsWeb) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(key, value);
+      return;
+    }
+    await _secureStorage.write(key: key, value: value);
+  }
+
+  Future<String?> _readSecret(String key) async {
+    if (kIsWeb) {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(key);
+    }
+    return _secureStorage.read(key: key);
+  }
+
+  Future<void> _removeSecret(String key) async {
+    if (kIsWeb) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(key);
+      return;
+    }
+    await _secureStorage.delete(key: key);
+  }
+
+  Future<String?> _readLegacyStoredToken() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final legacy =
+          prefs.getString(_tokenKey) ?? prefs.getString(_legacyJwtKey);
+      final normalized = legacy?.trim();
+      if (normalized == null || normalized.isEmpty) return null;
+      return normalized;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _cleanupLegacyStoredTokenCopies() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_legacyJwtKey);
+      if (!kIsWeb) {
+        await prefs.remove(_tokenKey);
+      }
+    } catch (_) {}
+  }
+
+  DateTime? _parseStoredDateTime(String? raw) {
+    final normalized = (raw ?? '').trim();
+    if (normalized.isEmpty) return null;
+    return DateTime.tryParse(normalized)?.toUtc();
+  }
+
+  String? _encodeStoredDateTime(DateTime? value) {
+    if (value == null) return null;
+    return value.toUtc().toIso8601String();
+  }
+
+  Future<void> setPendingAuthNotice(String? value) async {
+    final normalized = (value ?? '').trim();
+    final prefs = await SharedPreferences.getInstance();
+    if (normalized.isEmpty) {
+      await prefs.remove(_authNoticeKey);
+      return;
+    }
+    await prefs.setString(_authNoticeKey, normalized);
+  }
+
+  Future<String?> consumePendingAuthNotice() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_authNoticeKey)?.trim() ?? '';
+      if (raw.isEmpty) return null;
+      await prefs.remove(_authNoticeKey);
+      return raw;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  DateTime? _accessExpiryFromToken(String token) {
+    try {
+      final parts = token.split('.');
+      if (parts.length < 2) return null;
+      var normalized = parts[1].replaceAll('-', '+').replaceAll('_', '/');
+      final padLength = (4 - (normalized.length % 4)) % 4;
+      normalized = normalized.padRight(normalized.length + padLength, '=');
+      final json = utf8.decode(base64Decode(normalized));
+      final decoded = jsonDecode(json);
+      if (decoded is! Map) return null;
+      final expRaw = decoded['exp'];
+      final exp = expRaw is int
+          ? expRaw
+          : int.tryParse(expRaw?.toString() ?? '');
+      if (exp == null || exp <= 0) return null;
+      return DateTime.fromMillisecondsSinceEpoch(exp * 1000, isUtc: true);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _isExpired(
+    DateTime? value, {
+    Duration skew = const Duration(seconds: 30),
+  }) {
+    if (value == null) return false;
+    return value.isBefore(DateTime.now().toUtc().add(skew));
+  }
+
   Future<void> _maybeEnsureWebPushSubscription() async {
     if (!kIsWeb) return;
     try {
       final permission = await WebNotificationService.getPermissionState();
-      print('[web-push] auth hook permission=$permission user=${_currentUser?.email ?? ''}');
+      print(
+        '[web-push] auth hook permission=$permission user=${_currentUser?.email ?? ''}',
+      );
       if (permission != WebNotificationPermissionState.granted) return;
       await WebPushClientService.ensureSubscribed(dio);
       await WebPushClientService.syncUnreadBadge(dio);
@@ -205,8 +326,7 @@ class AuthService {
 
   Future<List<Map<String, dynamic>>> listSavedTenantSessions() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_savedSessionsKey);
+      final raw = await _readSecret(_savedSessionsKey);
       if (raw == null || raw.trim().isEmpty) return const [];
       final decoded = jsonDecode(raw);
       if (decoded is! List) return const [];
@@ -236,9 +356,15 @@ class AuthService {
 
     final sessions = await listSavedTenantSessions();
     final id = _sessionIdFor(user.email, user.tenantCode);
+    final refreshToken = (await getRefreshToken())?.trim() ?? '';
+    final accessExpiresAt = _encodeStoredDateTime(await getAccessTokenExpiry());
+    final sessionExpiresAt = _encodeStoredDateTime(await getSessionExpiry());
     final next = <String, dynamic>{
       'id': id,
       'token': token,
+      'refresh_token': refreshToken,
+      'access_expires_at': accessExpiresAt,
+      'session_expires_at': sessionExpiresAt,
       'email': user.email,
       'name': user.name ?? '',
       'role': user.role,
@@ -253,8 +379,7 @@ class AuthService {
     ];
 
     try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_savedSessionsKey, jsonEncode(updated));
+      await _writeSecret(_savedSessionsKey, jsonEncode(updated));
     } catch (_) {}
   }
 
@@ -266,8 +391,7 @@ class AuthService {
         .where((row) => (row['id'] ?? '').toString() != id)
         .toList();
     try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_savedSessionsKey, jsonEncode(updated));
+      await _writeSecret(_savedSessionsKey, jsonEncode(updated));
     } catch (_) {}
   }
 
@@ -282,10 +406,30 @@ class AuthService {
     if (found.isEmpty) return false;
 
     final token = (found['token'] ?? '').toString().trim();
+    final refreshToken = (found['refresh_token'] ?? '').toString().trim();
+    final accessExpiresAt = _parseStoredDateTime(
+      (found['access_expires_at'] ?? '').toString(),
+    );
+    final sessionExpiresAt = _parseStoredDateTime(
+      (found['session_expires_at'] ?? '').toString(),
+    );
     if (token.isEmpty) return false;
 
     try {
-      await setToken(token);
+      await setSessionTokens(
+        accessToken: token,
+        refreshToken: refreshToken.isEmpty ? null : refreshToken,
+        accessExpiresAt: accessExpiresAt,
+        sessionExpiresAt: sessionExpiresAt,
+      );
+      final refreshed = await ensureFreshSession(
+        allowBootstrap: true,
+        forceRefreshIfExpired: true,
+      );
+      if (!refreshed) {
+        await removeSavedTenantSession(id);
+        return false;
+      }
       final resp = await dio.get('/api/profile');
       if (resp.statusCode == 200 &&
           resp.data is Map &&
@@ -305,7 +449,10 @@ class AuthService {
         try {
           _authController.add(_currentUser);
         } catch (_) {}
-        await _upsertSavedSession(token, _currentUser);
+        final latestToken = await getToken();
+        if (latestToken != null && latestToken.trim().isNotEmpty) {
+          await _upsertSavedSession(latestToken, _currentUser);
+        }
         return true;
       }
       await removeSavedTenantSession(id);
@@ -333,21 +480,90 @@ class AuthService {
     }
   }
 
-  /// Публичный: установить токен и (опционально) user, уведомить слушателей
-  Future<void> setToken(String token, [User? user]) async {
+  Future<void> _saveToken(String token) async {
+    try {
+      _cachedToken = token;
+      await _writeSecret(_tokenKey, token);
+      await _cleanupLegacyStoredTokenCopies();
+      debugPrint('✅ Access token stored: ${_shortToken(token)}...');
+    } catch (e) {
+      debugPrint('❌ Error saving access token: $e');
+    }
+  }
+
+  Future<void> _saveRefreshToken(String token) async {
+    try {
+      await _writeSecret(_refreshTokenKey, token);
+    } catch (e) {
+      debugPrint('❌ Error saving refresh token: $e');
+    }
+  }
+
+  Future<void> _saveExpiry(String key, DateTime? value) async {
+    final encoded = _encodeStoredDateTime(value);
+    if (encoded == null || encoded.isEmpty) {
+      await _removeSecret(key);
+      return;
+    }
+    await _writeSecret(key, encoded);
+  }
+
+  Future<DateTime?> _readExpiry(String key) async {
+    final raw = await _readSecret(key);
+    return _parseStoredDateTime(raw);
+  }
+
+  Future<String?> getRefreshToken() async {
+    try {
+      final token = await _readSecret(_refreshTokenKey);
+      final normalized = token?.trim();
+      if (normalized == null || normalized.isEmpty) return null;
+      return normalized;
+    } catch (e) {
+      debugPrint('❌ Error getting refresh token: $e');
+      return null;
+    }
+  }
+
+  Future<DateTime?> getAccessTokenExpiry() async {
+    return _readExpiry(_accessExpiresAtKey);
+  }
+
+  Future<DateTime?> getSessionExpiry() async {
+    return _readExpiry(_sessionExpiresAtKey);
+  }
+
+  Future<void> setSessionTokens({
+    required String accessToken,
+    String? refreshToken,
+    DateTime? accessExpiresAt,
+    DateTime? sessionExpiresAt,
+    User? user,
+    bool keepExistingRefreshToken = true,
+  }) async {
     debugPrint(
-      '🔐 setToken called with token: ${_shortToken(token)}..., user: ${user?.email}',
+      '🔐 setSessionTokens called with token: ${_shortToken(accessToken)}..., user: ${user?.email}',
     );
-    _cachedToken = token;
-    await _saveToken(token);
-    _setAuthHeader(token);
+    _cachedToken = accessToken;
+    await _saveToken(accessToken);
+    if (refreshToken != null && refreshToken.trim().isNotEmpty) {
+      await _saveRefreshToken(refreshToken.trim());
+    } else if (!keepExistingRefreshToken) {
+      await _removeSecret(_refreshTokenKey);
+    }
+    await _saveExpiry(
+      _accessExpiresAtKey,
+      accessExpiresAt ?? _accessExpiryFromToken(accessToken),
+    );
+    await _saveExpiry(_sessionExpiresAtKey, sessionExpiresAt);
+    _setAuthHeader(accessToken);
     if (user != null) _currentUser = user;
     await _saveUserSnapshot(_currentUser);
     final responseTenantCode = (user?.tenantCode ?? '').trim();
     if (responseTenantCode.isNotEmpty) {
       await setTenantCode(responseTenantCode);
     }
-    await _upsertSavedSession(token, _currentUser);
+    await _upsertSavedSession(accessToken, _currentUser);
     try {
       final prefs = await SharedPreferences.getInstance();
       if (_currentUser?.role.toLowerCase().trim() == 'creator') {
@@ -368,8 +584,13 @@ class AuthService {
       await NativePushService.syncCurrentEndpoint(dio);
     } catch (_) {}
     debugPrint(
-      '✅ AuthService.setToken -> token set, user=${_currentUser?.email}',
+      '✅ AuthService.setSessionTokens -> token set, user=${_currentUser?.email}',
     );
+  }
+
+  /// Публичный: установить access token и (опционально) user, уведомить слушателей
+  Future<void> setToken(String token, [User? user]) async {
+    await setSessionTokens(accessToken: token, user: user);
   }
 
   /// Публичный: очистить токен и user (logout)
@@ -393,11 +614,16 @@ class AuthService {
         }
       } catch (_) {}
       final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_tokenKey);
       await prefs.remove(_viewRoleKey);
       await prefs.remove(_userSnapshotKey);
+      await _removeSecret(_tokenKey);
+      await _removeSecret(_refreshTokenKey);
+      await _removeSecret(_accessExpiresAtKey);
+      await _removeSecret(_sessionExpiresAtKey);
+      await _cleanupLegacyStoredTokenCopies();
       _cachedToken = null;
-      debugPrint('✅ Token removed from SharedPreferences');
+      _sessionRefreshCompleter = null;
+      debugPrint('✅ Auth secrets removed');
 
       _setAuthHeader(null);
       pendingEmail = null;
@@ -413,20 +639,6 @@ class AuthService {
       debugPrint('✅ AuthService.clearToken -> logged out');
     } finally {
       _isLoggingOut = false;
-    }
-  }
-
-  /// Приватный: сохранить токен в SharedPreferences
-  Future<void> _saveToken(String token) async {
-    try {
-      _cachedToken = token;
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_tokenKey, token);
-      debugPrint(
-        '✅ Token saved to SharedPreferences: ${_shortToken(token)}...',
-      );
-    } catch (e) {
-      debugPrint('❌ Error saving token: $e');
     }
   }
 
@@ -526,8 +738,15 @@ class AuthService {
       if (_cachedToken != null && _cachedToken!.trim().isNotEmpty) {
         return _cachedToken;
       }
-      final prefs = await SharedPreferences.getInstance();
-      final token = prefs.getString(_tokenKey);
+      var token = await _readSecret(_tokenKey);
+      token = token?.trim();
+      if (token == null || token.isEmpty) {
+        final legacy = await _readLegacyStoredToken();
+        if (legacy != null && legacy.isNotEmpty) {
+          token = legacy;
+          await _saveToken(legacy);
+        }
+      }
       _cachedToken = token;
       _authVerboseLog(
         '🔑 getToken -> ${token != null ? '${_shortToken(token)}...' : 'null'}',
@@ -597,12 +816,19 @@ class AuthService {
     return _tenantCodeCache;
   }
 
-  /// Обработать ответ от /auth (вытянуть токен и user), использовать setToken
+  /// Обработать ответ от /auth (вытянуть токены и user), использовать setSessionTokens
   Future<void> _processAuthResponse(Response resp) async {
     debugPrint('📝 _processAuthResponse: status=${resp.statusCode}');
     // ✅ ИСПРАВЛЕНИЕ: Cast правильно
     final data = (resp.data as Map<dynamic, dynamic>).cast<String, dynamic>();
     final token = data['token'] ?? data['access'];
+    final refreshToken = (data['refresh_token'] ?? '').toString().trim();
+    final accessExpiresAt = _parseStoredDateTime(
+      (data['access_expires_at'] ?? '').toString(),
+    );
+    final sessionExpiresAt = _parseStoredDateTime(
+      (data['session_expires_at'] ?? '').toString(),
+    );
     Map<String, dynamic>? userMap;
     if (data['user'] is Map) {
       userMap = Map<String, dynamic>.from(data['user']);
@@ -674,8 +900,13 @@ class AuthService {
       await setTenantCode(tenantCodeFromResponse);
     }
 
-    // ✅ Сохраняем токен ПЕРЕД установкой заголовка
-    await setToken(tokenStr, _currentUser);
+    await setSessionTokens(
+      accessToken: tokenStr,
+      refreshToken: refreshToken.isEmpty ? null : refreshToken,
+      accessExpiresAt: accessExpiresAt,
+      sessionExpiresAt: sessionExpiresAt,
+      user: _currentUser,
+    );
     debugPrint('✅ _processAuthResponse complete');
   }
 
@@ -981,6 +1212,152 @@ class AuthService {
     unawaited(_saveUserSnapshot(_currentUser));
   }
 
+  Future<bool> _bootstrapLegacySession() async {
+    final token = await getToken();
+    if (token == null || token.trim().isEmpty) return false;
+    final accessExpiry =
+        await getAccessTokenExpiry() ?? _accessExpiryFromToken(token);
+    if (_isExpired(accessExpiry)) {
+      return false;
+    }
+    try {
+      final resp = await dio.post(
+        '/api/auth/refresh/bootstrap',
+        options: Options(
+          sendTimeout: const Duration(seconds: 8),
+          receiveTimeout: const Duration(seconds: 8),
+        ),
+      );
+      if (resp.statusCode == 200) {
+        await _processAuthResponse(resp);
+        return true;
+      }
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      if (status == 401 || status == 403) {
+        return false;
+      }
+      debugPrint('⚠️ bootstrap legacy session skipped: $e');
+      return false;
+    } catch (e) {
+      debugPrint('⚠️ bootstrap legacy session error: $e');
+      return false;
+    }
+    return false;
+  }
+
+  Future<bool> refreshSession({bool allowBootstrap = false}) async {
+    if (_sessionRefreshCompleter != null) {
+      return _sessionRefreshCompleter!.future;
+    }
+    final completer = Completer<bool>();
+    _sessionRefreshCompleter = completer;
+    try {
+      final sessionExpiry = await getSessionExpiry();
+      if (_isExpired(sessionExpiry, skew: Duration.zero)) {
+        await setPendingAuthNotice(
+          'Срок входа истек, пожалуйста, войдите снова',
+        );
+        await clearToken();
+        completer.complete(false);
+        return false;
+      }
+
+      final refreshToken = await getRefreshToken();
+      if (refreshToken == null || refreshToken.trim().isEmpty) {
+        if (allowBootstrap) {
+          final bootstrapped = await _bootstrapLegacySession();
+          completer.complete(bootstrapped);
+          return bootstrapped;
+        }
+        completer.complete(false);
+        return false;
+      }
+
+      try {
+        final resp = await dio.post(
+          '/api/auth/refresh',
+          data: {'refresh_token': refreshToken},
+          options: Options(
+            sendTimeout: const Duration(seconds: 8),
+            receiveTimeout: const Duration(seconds: 8),
+          ),
+        );
+        if (resp.statusCode == 200) {
+          await _processAuthResponse(resp);
+          completer.complete(true);
+          return true;
+        }
+      } on DioException catch (e) {
+        final status = e.response?.statusCode;
+        if (allowBootstrap && (status == 400 || status == 401)) {
+          final bootstrapped = await _bootstrapLegacySession();
+          if (bootstrapped) {
+            completer.complete(true);
+            return true;
+          }
+        }
+        if (status == 401) {
+          await setPendingAuthNotice(
+            'Срок входа истек, пожалуйста, войдите снова',
+          );
+          await clearToken();
+          completer.complete(false);
+          return false;
+        }
+        debugPrint('⚠️ refreshSession warning: $e');
+        completer.complete(false);
+        return false;
+      }
+
+      completer.complete(false);
+      return false;
+    } catch (e) {
+      debugPrint('⚠️ refreshSession error: $e');
+      completer.complete(false);
+      return false;
+    } finally {
+      if (identical(_sessionRefreshCompleter, completer)) {
+        _sessionRefreshCompleter = null;
+      }
+    }
+  }
+
+  Future<bool> ensureFreshSession({
+    bool allowBootstrap = true,
+    bool forceRefreshIfExpired = false,
+  }) async {
+    final token = await getToken();
+    if (token == null || token.trim().isEmpty) return false;
+
+    final sessionExpiry = await getSessionExpiry();
+    if (_isExpired(sessionExpiry, skew: Duration.zero)) {
+      await setPendingAuthNotice('Срок входа истек, пожалуйста, войдите снова');
+      await clearToken();
+      return false;
+    }
+
+    final accessExpiry =
+        await getAccessTokenExpiry() ?? _accessExpiryFromToken(token);
+    if (accessExpiry != null) {
+      await _saveExpiry(_accessExpiresAtKey, accessExpiry);
+    }
+    final needsRefresh =
+        _isExpired(accessExpiry, skew: const Duration(minutes: 2)) ||
+        (forceRefreshIfExpired && _isExpired(accessExpiry));
+
+    if (!needsRefresh) {
+      final refreshToken = await getRefreshToken();
+      if ((refreshToken == null || refreshToken.trim().isEmpty) &&
+          allowBootstrap) {
+        unawaited(_bootstrapLegacySession());
+      }
+      return true;
+    }
+
+    return refreshSession(allowBootstrap: allowBootstrap);
+  }
+
   /// Попытка обновить токен при старте (восстановить сессию)
   Future<bool> tryRefreshOnStartup() async {
     String? token;
@@ -996,9 +1373,27 @@ class AuthService {
       debugPrint('✅ Token found in storage, setting auth header');
       _setAuthHeader(token);
       await _restoreLocalSessionFallback(token: token);
+      final sessionReady = await ensureFreshSession(
+        allowBootstrap: true,
+        forceRefreshIfExpired: true,
+      );
+      if (!sessionReady) {
+        final latestToken = await getToken();
+        if (latestToken == null || latestToken.trim().isEmpty) {
+          _lastStartupRefreshUsedFallback = false;
+          return false;
+        }
+        final restored = await _restoreLocalSessionFallback(token: latestToken);
+        _lastStartupRefreshUsedFallback = restored;
+        return restored;
+      }
+      token = await getToken();
+      if (token != null && token.trim().isNotEmpty) {
+        _setAuthHeader(token);
+      }
 
       // Проверяем, валиден ли токен, запрашивая профиль
-      final resp = await dio.get(
+      Response<dynamic> resp = await dio.get(
         '/api/profile',
         options: Options(
           sendTimeout: const Duration(seconds: 8),
@@ -1006,6 +1401,21 @@ class AuthService {
         ),
       );
       debugPrint('📡 Profile check: status=${resp.statusCode}');
+
+      if (resp.statusCode == 401) {
+        final refreshed = await refreshSession(allowBootstrap: true);
+        if (!refreshed) {
+          await clearToken();
+          return false;
+        }
+        resp = await dio.get(
+          '/api/profile',
+          options: Options(
+            sendTimeout: const Duration(seconds: 8),
+            receiveTimeout: const Duration(seconds: 8),
+          ),
+        );
+      }
 
       if (resp.statusCode == 200 && resp.data is Map) {
         final user = resp.data['user'];
@@ -1038,7 +1448,7 @@ class AuthService {
       final status = e.response?.statusCode;
       // Временная недоступность сервера не должна выбрасывать пользователя из сессии.
       // Очищаем токен только если сервер явно вернул auth-ошибку.
-      if (status == 401 || status == 403) {
+      if (status == 401) {
         debugPrint('❌ tryRefreshOnStartup auth error: $e');
         _lastStartupRefreshUsedFallback = false;
         await clearToken();

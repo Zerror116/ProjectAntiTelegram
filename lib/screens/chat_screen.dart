@@ -21,6 +21,7 @@ import '../main.dart';
 import '../services/sticker_print_service.dart';
 import '../services/web_image_cache_service.dart';
 import '../services/web_media_capture_permission_service.dart';
+import '../src/utils/chat_api.dart';
 import '../src/utils/chat_image_preprocessor.dart';
 import '../src/utils/media_url.dart';
 import '../src/utils/messenger_ui_helpers.dart';
@@ -123,13 +124,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
   bool _showScrollToBottomButton = false;
-  bool _keepBottomAnchor = true;
   bool _initialViewportApplied = false;
   bool _initialViewportReady = false;
   bool _loadingOlderMessages = false;
   bool _loadingNewerMessages = false;
   bool _draftSyncInFlight = false;
   bool _hasMoreBefore = false;
+  bool _stickToBottom = true;
   int _offlineQueuedCount = 0;
   int _unreadCount = 0;
 
@@ -165,6 +166,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _serverChatStateSyncTimer;
   Timer? _reconnectReplayTimer;
   Timer? _searchDebounceTimer;
+  int _bottomSettlePassesRemaining = 0;
+  VoidCallback? _bottomSettleOnComplete;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -403,7 +406,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _inputFocusNode.addListener(() {
       if (_inputFocusNode.hasFocus) {
-        _keepBottomAnchor = true;
         _scrollToBottom(animated: true);
       }
     });
@@ -952,9 +954,7 @@ class _ChatScreenState extends State<ChatScreen> {
       unawaited(_loadOlderMessages());
     }
     final nearBottom = _isNearBottom();
-    if (!nearBottom) {
-      _keepBottomAnchor = false;
-    }
+    _stickToBottom = nearBottom;
     if (nearBottom && _unreadCount > 0) {
       _scheduleReadSync();
     }
@@ -963,16 +963,120 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() => _showScrollToBottomButton = shouldShow);
   }
 
-  void _scrollToBottom({bool animated = true}) {
+  void _clearBottomSettle({bool clearCallback = true}) {
+    _bottomAnchorTimer?.cancel();
+    _bottomAnchorTimer = null;
+    _bottomSettlePassesRemaining = 0;
+    if (clearCallback) {
+      _bottomSettleOnComplete = null;
+    }
+  }
+
+  void _completeBottomSettleIfNeeded() {
+    if (_bottomSettlePassesRemaining > 0) return;
+    final onComplete = _bottomSettleOnComplete;
+    _bottomSettleOnComplete = null;
+    onComplete?.call();
+  }
+
+  void _runBottomSettlePass({
+    Duration interval = const Duration(milliseconds: 120),
+  }) {
+    if (!mounted || !_scrollController.hasClients) {
+      _completeBottomSettleIfNeeded();
+      return;
+    }
+    if (_bottomSettlePassesRemaining <= 0) {
+      _completeBottomSettleIfNeeded();
+      return;
+    }
+
+    final target = _scrollController.position.maxScrollExtent.toDouble();
+    final delta = (target - _scrollController.position.pixels).abs();
+    if (delta > 0.5) {
+      _scrollController.jumpTo(target);
+    }
+    _bottomSettlePassesRemaining = max(0, _bottomSettlePassesRemaining - 1);
+    _handleScroll();
+    if (_bottomSettlePassesRemaining > 0) {
+      _bottomAnchorTimer?.cancel();
+      _bottomAnchorTimer = Timer(
+        interval,
+        () => _runBottomSettlePass(interval: interval),
+      );
+      return;
+    }
+    _completeBottomSettleIfNeeded();
+  }
+
+  void _armBottomSettle({
+    int passes = 3,
+    Duration delay = const Duration(milliseconds: 180),
+    Duration interval = const Duration(milliseconds: 120),
+    VoidCallback? onComplete,
+  }) {
+    if (passes <= 0) {
+      onComplete?.call();
+      return;
+    }
+    _bottomSettlePassesRemaining = max(_bottomSettlePassesRemaining, passes);
+    if (onComplete != null) {
+      _bottomSettleOnComplete = onComplete;
+    }
+    _bottomAnchorTimer?.cancel();
+    _bottomAnchorTimer = Timer(
+      delay,
+      () => _runBottomSettlePass(interval: interval),
+    );
+  }
+
+  void _pingBottomSettle({
+    Duration delay = const Duration(milliseconds: 40),
+    Duration interval = const Duration(milliseconds: 120),
+  }) {
+    if (_bottomSettlePassesRemaining <= 0) return;
+    _bottomAnchorTimer?.cancel();
+    _bottomAnchorTimer = Timer(
+      delay,
+      () => _runBottomSettlePass(interval: interval),
+    );
+  }
+
+  void _scrollToBottom({
+    bool animated = true,
+    int settlePasses = 5,
+    Duration settleInterval = const Duration(milliseconds: 120),
+  }) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
+      _stickToBottom = true;
       final target = _scrollController.position.maxScrollExtent;
-      _keepBottomAnchor = true;
+      if (settlePasses > 0) {
+        _armBottomSettle(
+          passes: settlePasses,
+          delay: animated
+              ? const Duration(milliseconds: 220)
+              : Duration.zero,
+          interval: settleInterval,
+        );
+      } else {
+        _clearBottomSettle(clearCallback: false);
+      }
       if (animated) {
-        _scrollController.animateTo(
-          target,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
+        unawaited(
+          _scrollController
+              .animateTo(
+                target,
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOut,
+              )
+              .whenComplete(() {
+                if (!mounted || !_scrollController.hasClients) return;
+                _pingBottomSettle(
+                  delay: Duration.zero,
+                  interval: settleInterval,
+                );
+              }),
         );
       } else {
         _scrollController.jumpTo(target);
@@ -1038,7 +1142,6 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    _keepBottomAnchor = true;
     _stabilizeBottomAnchor(passes: 7, onComplete: _markInitialViewportReady);
   }
 
@@ -1108,7 +1211,6 @@ class _ChatScreenState extends State<ChatScreen> {
         .clamp(0.0, maxExtent)
         .toDouble();
     _scrollController.jumpTo(nextOffset);
-    _keepBottomAnchor = false;
     _handleScroll();
 
     if (passes == 1) {
@@ -1141,7 +1243,6 @@ class _ChatScreenState extends State<ChatScreen> {
     final target = hasSavedFraction
         ? (maxExtent * normalizedFraction).clamp(0.0, maxExtent).toDouble()
         : (savedOffset ?? 0.0).clamp(0.0, maxExtent).toDouble();
-    _keepBottomAnchor = (maxExtent - target) <= 120;
     _scrollController.jumpTo(target);
     _handleScroll();
     if (passes == 1) {
@@ -1164,21 +1265,18 @@ class _ChatScreenState extends State<ChatScreen> {
     Duration interval = const Duration(milliseconds: 180),
     VoidCallback? onComplete,
   }) {
-    if (passes <= 0) return;
-    _bottomAnchorTimer?.cancel();
-    _scrollToBottom(animated: false);
-    if (passes == 1) {
+    if (passes <= 0) {
       onComplete?.call();
       return;
     }
-    _bottomAnchorTimer = Timer(interval, () {
-      if (!mounted || !_keepBottomAnchor) return;
-      _stabilizeBottomAnchor(
-        passes: passes - 1,
-        interval: interval,
-        onComplete: onComplete,
-      );
-    });
+    _scrollToBottom(
+      animated: false,
+      settlePasses: passes,
+      settleInterval: interval,
+    );
+    if (onComplete != null) {
+      _bottomSettleOnComplete = onComplete;
+    }
   }
 
   void _markInitialViewportReady() {
@@ -1235,10 +1333,15 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       return;
     }
-    if (!_keepBottomAnchor && !_isNearBottom()) return;
-    _stabilizeBottomAnchor(
+    if (_bottomSettlePassesRemaining > 0) {
+      _pingBottomSettle();
+      return;
+    }
+    if (!_stickToBottom) return;
+    _armBottomSettle(
       passes: 2,
-      interval: const Duration(milliseconds: 120),
+      delay: Duration.zero,
+      interval: const Duration(milliseconds: 80),
     );
   }
 
@@ -1472,7 +1575,6 @@ class _ChatScreenState extends State<ChatScreen> {
     _recomputeSearchResults();
 
     if (autoScroll) {
-      _keepBottomAnchor = true;
       _scrollToBottom(animated: true);
     }
   }
@@ -1486,30 +1588,51 @@ class _ChatScreenState extends State<ChatScreen> {
     String? imageUrl,
   }) {
     if (productId.trim().isEmpty) return;
+    final nextMessages = List<Map<String, dynamic>>.from(_messages);
+    var changed = false;
+    for (var index = 0; index < nextMessages.length; index++) {
+      final message = nextMessages[index];
+      final meta = _metaMapOf(message['meta']);
+      final kind = meta['kind']?.toString() ?? '';
+      final currentProductId = meta['product_id']?.toString() ?? '';
+      if (kind != 'catalog_product' || currentProductId != productId) {
+        continue;
+      }
+
+      final nextMeta = Map<String, dynamic>.from(meta);
+      var itemChanged = false;
+      if ((nextMeta['quantity'] as Object?) != quantity) {
+        nextMeta['quantity'] = quantity;
+        changed = true;
+        itemChanged = true;
+      }
+      if (price != null &&
+          price.trim().isNotEmpty &&
+          (nextMeta['price']?.toString() ?? '') != price) {
+        nextMeta['price'] = price;
+        changed = true;
+        itemChanged = true;
+      }
+      if (imageUrl != null &&
+          imageUrl.trim().isNotEmpty &&
+          (nextMeta['image_url']?.toString() ?? '') != imageUrl) {
+        nextMeta['image_url'] = imageUrl;
+        changed = true;
+        itemChanged = true;
+      }
+      if (!itemChanged) continue;
+      nextMessages[index] = {
+        ...message,
+        'meta': nextMeta,
+      };
+    }
+    if (!changed) return;
+    if (!mounted) {
+      _messages = nextMessages;
+      return;
+    }
     setState(() {
-      _messages = _messages.map((message) {
-        final meta = _metaMapOf(message['meta']);
-        final kind = meta['kind']?.toString() ?? '';
-        final currentProductId = meta['product_id']?.toString() ?? '';
-        if (kind != 'catalog_product' || currentProductId != productId) {
-          return message;
-        }
-
-        final nextMeta = Map<String, dynamic>.from(meta)
-          ..['quantity'] = quantity;
-        if (price != null && price.trim().isNotEmpty) {
-          nextMeta['price'] = price;
-        }
-        if (imageUrl != null && imageUrl.trim().isNotEmpty) {
-          nextMeta['image_url'] = imageUrl;
-        }
-
-        return {
-          ...message,
-          if (title != null && title.trim().isNotEmpty) 'text': message['text'],
-          'meta': nextMeta,
-        };
-      }).toList();
+      _messages = nextMessages;
     });
   }
 
@@ -1811,66 +1934,102 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final visibleMessages = _visibleMessages();
     if (visibleMessages.isEmpty) return null;
-    final timeline = _buildTimeline(visibleMessages);
-    final messageRowIndex = timeline.indexWhere((row) {
-      if (row['type'] != 'message') return false;
-      final rowMessage = row['data'];
-      if (rowMessage is! Map) return false;
-      return (rowMessage['id'] ?? '').toString() == messageId;
-    });
-    if (messageRowIndex < 0) return null;
+    final targetIndex = visibleMessages.indexWhere(
+      (message) => (message['id'] ?? '').toString().trim() == messageId,
+    );
+    if (targetIndex < 0) return null;
 
     final maxExtent = _scrollController.position.maxScrollExtent;
     if (maxExtent <= 0) {
       return _messageItemKeys[messageId]?.currentContext;
     }
 
-    final targetFraction = timeline.length <= 1
-        ? 0.0
-        : (messageRowIndex / (timeline.length - 1)).clamp(0.0, 1.0);
-    final estimatedOffset = maxExtent * targetFraction;
-    final deltas = <double>[0, -0.06, 0.06, -0.14, 0.14, -0.25, 0.25];
+    final indexById = <String, int>{};
+    for (var index = 0; index < visibleMessages.length; index++) {
+      final id = (visibleMessages[index]['id'] ?? '').toString().trim();
+      if (id.isEmpty) continue;
+      indexById[id] = index;
+    }
 
-    final offsets = <double>[];
-    for (final delta in deltas) {
-      final candidate = (estimatedOffset + maxExtent * delta)
+    final viewportContext = _messagesViewportKey.currentContext;
+    final viewportObject = viewportContext?.findRenderObject();
+    final builtAnchors = <({int index, double top})>[];
+    if (viewportObject is RenderBox) {
+      for (final entry in _messageItemKeys.entries) {
+        final builtIndex = indexById[entry.key.trim()];
+        if (builtIndex == null) continue;
+        final itemContext = entry.value.currentContext;
+        final itemObject = itemContext?.findRenderObject();
+        if (itemObject is! RenderBox || !itemObject.hasSize) continue;
+        final topLeft = itemObject.localToGlobal(
+          Offset.zero,
+          ancestor: viewportObject,
+        );
+        builtAnchors.add((index: builtIndex, top: topLeft.dy));
+      }
+    }
+
+    double ratioOffset() {
+      if (visibleMessages.length <= 1) return 0.0;
+      return (maxExtent * (targetIndex / (visibleMessages.length - 1)))
           .clamp(0.0, maxExtent)
           .toDouble();
-      if (!offsets.any((x) => (x - candidate).abs() < 2)) {
-        offsets.add(candidate);
-      }
-    }
-    for (final fallback in <double>[0.0, maxExtent, maxExtent * 0.5]) {
-      final candidate = fallback.clamp(0.0, maxExtent).toDouble();
-      if (!offsets.any((x) => (x - candidate).abs() < 2)) {
-        offsets.add(candidate);
-      }
     }
 
-    for (final offset in offsets) {
-      if (!_scrollController.hasClients) break;
-      _scrollController.jumpTo(offset);
+    double estimatedOffsetFromAnchors() {
+      if (builtAnchors.isEmpty || viewportObject is! RenderBox) {
+        return ratioOffset();
+      }
+      builtAnchors.sort((a, b) => a.index.compareTo(b.index));
+      var pixelsPerMessage = 92.0;
+      final first = builtAnchors.first;
+      final last = builtAnchors.last;
+      final indexDelta = last.index - first.index;
+      final topDelta = last.top - first.top;
+      if (indexDelta.abs() >= 1 && topDelta.abs() > 1) {
+        pixelsPerMessage = (topDelta / indexDelta)
+            .abs()
+            .clamp(58.0, 260.0)
+            .toDouble();
+      }
+      final nearest = builtAnchors.reduce((best, candidate) {
+        final bestDistance = (best.index - targetIndex).abs();
+        final nextDistance = (candidate.index - targetIndex).abs();
+        if (nextDistance < bestDistance) return candidate;
+        return best;
+      });
+      final desiredTop = viewportObject.size.height * 0.18;
+      final estimatedTop =
+          nearest.top + (targetIndex - nearest.index) * pixelsPerMessage;
+      return (_scrollController.offset + estimatedTop - desiredTop)
+          .clamp(0.0, maxExtent)
+          .toDouble();
+    }
+
+    final attemptedOffsets = <double>[];
+
+    Future<BuildContext?> attemptOffset(double offset) async {
+      final clamped = offset.clamp(0.0, maxExtent).toDouble();
+      if (attemptedOffsets.any((value) => (value - clamped).abs() < 2)) {
+        return null;
+      }
+      attemptedOffsets.add(clamped);
+      if (!_scrollController.hasClients) return null;
+      _scrollController.jumpTo(clamped);
       await Future<void>.delayed(const Duration(milliseconds: 34));
       if (!mounted) return null;
-      context = _messageItemKeys[messageId]?.currentContext;
-      if (context != null && context.mounted) {
-        return context;
+      final resolved = _messageItemKeys[messageId]?.currentContext;
+      if (resolved != null && resolved.mounted) {
+        return resolved;
       }
+      return null;
     }
 
-    // Fallback sweep for long chats where message tile heights vary a lot.
-    for (var i = 0; i <= 16; i++) {
-      if (!_scrollController.hasClients) break;
-      final fraction = i / 16;
-      final offset = (maxExtent * fraction).clamp(0.0, maxExtent).toDouble();
-      _scrollController.jumpTo(offset);
-      await Future<void>.delayed(const Duration(milliseconds: 28));
-      if (!mounted) return null;
-      context = _messageItemKeys[messageId]?.currentContext;
-      if (context != null && context.mounted) {
-        return context;
-      }
-    }
+    context = await attemptOffset(estimatedOffsetFromAnchors());
+    if (context != null) return context;
+
+    context = await attemptOffset(ratioOffset());
+    if (context != null) return context;
 
     return _messageItemKeys[messageId]?.currentContext;
   }
@@ -1893,6 +2052,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _jumpToMessageById(String messageId) async {
     final trimmedMessageId = messageId.trim();
     if (trimmedMessageId.isEmpty) return;
+    _stickToBottom = false;
+    _clearBottomSettle();
 
     if (_searchMode || _searchQuery.isNotEmpty) {
       setState(() {
@@ -1941,6 +2102,7 @@ class _ChatScreenState extends State<ChatScreen> {
       alignment: 0.12,
       curve: Curves.easeOutCubic,
     );
+    _handleScroll();
   }
 
   Future<void> _markChatAsRead() async {
@@ -6055,6 +6217,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _jumpToSearchResult(int index) async {
     if (index < 0 || index >= _searchResultIds.length) return;
     final messageId = _searchResultIds[index];
+    _stickToBottom = false;
+    _clearBottomSettle();
     final targetContext = await _resolveMessageContextWithScroll(messageId);
     if (targetContext == null || !targetContext.mounted) return;
     await Scrollable.ensureVisible(
@@ -6063,6 +6227,7 @@ class _ChatScreenState extends State<ChatScreen> {
       alignment: 0.18,
       curve: Curves.easeOutCubic,
     );
+    _handleScroll();
   }
 
   void _moveSearchResult(int delta) {
@@ -7115,12 +7280,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<Map<String, dynamic>?> _pickForwardTargetChat() async {
     try {
-      final resp = await authService.dio.get('/api/chats/list');
-      final data = resp.data;
-      if (data is! Map || data['ok'] != true || data['data'] is! List) {
-        return null;
-      }
-      final chats = List<Map<String, dynamic>>.from(data['data'])
+      final chats = (await loadChatsCollection())
           .where((chat) {
             final kind = (_chatStateMapOf(chat['settings'])['kind'] ?? '')
                 .toString()
@@ -9701,13 +9861,15 @@ class _ChatScreenState extends State<ChatScreen> {
                                 opacity: _initialViewportReady ? 1 : 0,
                                 child: ListView.builder(
                                   controller: _scrollController,
-                                  physics: const BouncingScrollPhysics(
-                                    parent: AlwaysScrollableScrollPhysics(),
-                                  ),
+                                  physics: kIsWeb
+                                      ? const ClampingScrollPhysics()
+                                      : const BouncingScrollPhysics(
+                                          parent: AlwaysScrollableScrollPhysics(),
+                                        ),
                                   keyboardDismissBehavior:
                                       ScrollViewKeyboardDismissBehavior.onDrag,
-                                  cacheExtent: media.size.height *
-                                      (_isPublicChannel() ? 0.7 : 1.0),
+                                  cacheExtent:
+                                      media.size.height * (kIsWeb ? 3.6 : 2.2),
                                   itemCount: timeline.length,
                                   itemBuilder: (context, i) {
                                     final row = timeline[i];
@@ -10107,10 +10269,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       child: FloatingActionButton.small(
                         heroTag: 'chat-scroll-bottom',
                         tooltip: 'В конец чата',
-                        onPressed: () {
-                          _keepBottomAnchor = true;
-                          _scrollToBottom(animated: true);
-                        },
+                        onPressed: () => _scrollToBottom(animated: true),
                         child: const Icon(Icons.keyboard_double_arrow_down_rounded),
                       ),
                     ),
