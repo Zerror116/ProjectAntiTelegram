@@ -2,7 +2,7 @@ name: projectphoenix
 description: "A new Flutter project."
 publish_to: 'none'
 
-version: 1.0.24+25
+version: 1.0.25+26
 
 environment:
   sdk: ^3.11.0

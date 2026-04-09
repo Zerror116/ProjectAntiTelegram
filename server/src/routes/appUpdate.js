@@ -272,16 +272,47 @@ function resolveAndroidPackageName() {
 function resolveAndroidManagedManifestMinBuild() {
   return safePositiveInt(
     process.env.APP_UPDATE_ANDROID_MANIFEST_MIN_BUILD,
-    22,
+    21,
   );
 }
 
-function supportsManagedAndroidManifest(req) {
+function getAndroidManagedManifestSupport(req) {
   const minBuild = resolveAndroidManagedManifestMinBuild();
-  if (minBuild <= 0) return true;
+  if (minBuild <= 0) {
+    return {
+      supported: true,
+      reason: 'managed_manifest_enabled',
+      currentBuild: safePositiveInt(req?.query?.current_build, 0),
+      minBuild,
+    };
+  }
   const currentBuild = safePositiveInt(req?.query?.current_build, 0);
-  if (currentBuild <= 0) return true;
-  return currentBuild >= minBuild;
+  if (currentBuild <= 0) {
+    return {
+      supported: true,
+      reason: 'managed_manifest_enabled_unknown_build',
+      currentBuild,
+      minBuild,
+    };
+  }
+  if (currentBuild >= minBuild) {
+    return {
+      supported: true,
+      reason: 'managed_manifest_enabled',
+      currentBuild,
+      minBuild,
+    };
+  }
+  return {
+    supported: false,
+    reason: 'unsupported_legacy_build',
+    currentBuild,
+    minBuild,
+  };
+}
+
+function supportsManagedAndroidManifest(req) {
+  return getAndroidManagedManifestSupport(req).supported;
 }
 
 function resolveAllowedUpdateHosts(req) {
@@ -833,9 +864,15 @@ router.get('/android/apk', async (req, res) => {
 
 router.get('/android/manifest', async (req, res) => {
   try {
-    if (!supportsManagedAndroidManifest(req)) {
+    const support = getAndroidManagedManifestSupport(req);
+    if (!support.supported) {
+      console.info('app.update.android.manifest unsupported_legacy_build', {
+        currentBuild: support.currentBuild,
+        minBuild: support.minBuild,
+      });
       return res.status(404).json({
         ok: false,
+        code: support.reason,
         error:
           'Для этой версии Феникс встроенный manifest не используется. Скачивание продолжится через сайт.',
       });
@@ -849,13 +886,25 @@ router.get('/android/manifest', async (req, res) => {
         cleanString(android.error_code) === 'broken_release_apk'
           ? 503
           : 404;
+      const reason =
+        cleanString(android.error_code) || 'manifest_unavailable';
+      console.warn('app.update.android.manifest manifest_unavailable', {
+        reason,
+        statusCode,
+      });
       return res.status(statusCode).json({
         ok: false,
+        code: reason,
         error:
           cleanString(android.error_message) ||
           'Android update manifest is not configured on server',
       });
     }
+    console.info('app.update.android.manifest manifest_verify_ok', {
+      currentBuild: support.currentBuild,
+      minBuild: support.minBuild,
+      keyId: cleanString(envelope.key_id),
+    });
     const android = await buildAndroidPublicConfig(req);
     void maybeCreateUpdateNotification(req, android, 'android');
     return res.json({ ok: true, data: envelope });

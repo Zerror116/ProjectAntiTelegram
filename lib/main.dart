@@ -1485,6 +1485,9 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   final fallbackUri = _resolveAndroidFallbackUpdateUri(info);
   final envelope = info.androidManifestEnvelope;
   if (envelope == null) {
+    debugPrint(
+      'appUpdate: android manifest_unavailable at launch build=${info.current.build}',
+    );
     if (fallbackUri != null) {
       return _openAndroidFallbackUpdateUri(fallbackUri);
     }
@@ -1549,6 +1552,9 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       envelope,
     );
     if (!started) {
+      debugPrint(
+        'appUpdate: android managed update did not start fallback=${fallbackUri != null}',
+      );
       if (fallbackUri != null) {
         return _openAndroidFallbackUpdateUri(fallbackUri);
       }
@@ -1567,6 +1573,9 @@ Future<bool> _downloadAndInstallAndroidUpdate({
             state.isFailed &&
             (failureCode == 'manifest_signature_invalid' ||
                 failureCode == 'manifest_invalid');
+        if (state.isFailed && failureCode.isNotEmpty) {
+          debugPrint('appUpdate: android managed update failure=$failureCode');
+        }
         if (shouldUseBrowserFallback) {
           browserFallbackTriggeredByManagedFailure = true;
           final opened = await _openAndroidFallbackUpdateUri(fallbackUri);
@@ -2285,6 +2294,9 @@ Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
       if (manifestRoot is Map && manifestRoot['ok'] == true) {
         final data = manifestRoot['data'];
         if (data is Map) {
+          debugPrint(
+            'appUpdate: android manifest_verify_ok build=${current.build} -> ${latest.token}',
+          );
           androidManifestEnvelope = Map<String, dynamic>.from(data);
           final manifestRaw = data['manifest'];
           if (manifestRaw is Map) {
@@ -2341,7 +2353,23 @@ Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
           }
         }
       }
-    } catch (_) {
+    } on DioException catch (e) {
+      final status = e.response?.statusCode ?? 0;
+      final root = e.response?.data;
+      final code = root is Map ? (root['code'] ?? '').toString().trim() : '';
+      if (status == 404 && code == 'unsupported_legacy_build') {
+        debugPrint(
+          'appUpdate: android unsupported_legacy_build build=${current.build}',
+        );
+      } else {
+        debugPrint(
+          'appUpdate: android manifest_unavailable '
+          'status=$status code=${code.isEmpty ? 'n/a' : code} build=${current.build}',
+        );
+      }
+      // ignore: base update info remains available even if manifest endpoint is temporarily unavailable
+    } catch (e) {
+      debugPrint('appUpdate: android manifest_unavailable error=$e');
       // ignore: base update info remains available even if manifest endpoint is temporarily unavailable
     }
   }
