@@ -2715,11 +2715,14 @@ router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
   }
 });
 
-router.get("/:chatId/search", requireAuth, async (req, res) => {
+router.get("/:chatId/search", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.id;
     const role = req.user.role;
     const { chatId } = req.params;
+    if (chatId === "direct") {
+      return next();
+    }
     const query = String(req.query.q || "").trim();
     const safeLimit = parseCursorLimit(req.query.limit, 30);
 

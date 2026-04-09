@@ -1724,7 +1724,7 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
     try {
       final resp = await authService.dio.get(
         '/api/chats/direct/search',
-        queryParameters: {'query': query, 'limit': 10},
+        queryParameters: {'q': query, 'limit': 10},
         options: Options(
           validateStatus: (code) {
             if (code == null) return false;
@@ -1796,7 +1796,10 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
       if (!mounted || requestSeq != _lookupRequestSeq) return;
       setState(() {
         _lookupLoading = false;
-        _lookupMessage = 'Ошибка поиска: ${widget.extractDioError(e)}';
+        final errorText = widget.extractDioError(e).trim();
+        _lookupMessage = errorText == 'q required'
+            ? 'Введите минимум 3 символа или полный email/номер'
+            : 'Ошибка поиска: $errorText';
         _exactCandidate = null;
         _searchCandidates.clear();
         _selectedCandidateId = '';
