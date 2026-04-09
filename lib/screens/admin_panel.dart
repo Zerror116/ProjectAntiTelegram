@@ -353,6 +353,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return baseRole == 'admin';
   }
 
+  bool _isAdminViewRole() {
+    return authService.effectiveRole.toLowerCase().trim() == 'admin';
+  }
+
   bool _hasPermission(String key) {
     return authService.hasPermission(key);
   }
@@ -436,7 +440,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   }
 
   bool _canViewPromotionsTab() {
-    return _isAdminBase();
+    return _isAdminViewRole();
   }
 
   List<_AdminTabSpec> _buildVisibleTabs() {
@@ -462,7 +466,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (_canViewChannelsTab())
         _AdminTabSpec(
           id: 'channels',
-          label: _isAdminBase() ? 'Каналы и промо' : 'Каналы',
+          label: _isAdminViewRole() ? 'Каналы и промо' : 'Каналы',
           builder: _buildSettingsTab,
         ),
       if (_canViewPromotionsTab())
@@ -7276,7 +7280,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       child: ListView(
         padding: EdgeInsets.all(compact ? 10 : 16),
         children: [
-          if (_isAdminBase()) ...[
+          if (_isAdminViewRole()) ...[
             Card(
               child: ListTile(
                 leading: const Icon(Icons.campaign_outlined),

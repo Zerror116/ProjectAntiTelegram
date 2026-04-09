@@ -26,7 +26,7 @@ class _AdminPromotionCenterScreenState
   List<Map<String, dynamic>> _campaigns = const [];
 
   bool get _isAdminBaseRole {
-    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    final role = authService.effectiveRole.toLowerCase().trim();
     return role == 'admin';
   }
 
