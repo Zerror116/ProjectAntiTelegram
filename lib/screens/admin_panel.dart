@@ -435,6 +435,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return _hasAnyPermission(const ['delivery.manage', 'tenant.users.manage']);
   }
 
+  bool _canViewPromotionsTab() {
+    return _isAdminBase();
+  }
+
   List<_AdminTabSpec> _buildVisibleTabs() {
     final tabs = <_AdminTabSpec>[
       if (_canViewClientCartsTab())
@@ -458,8 +462,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (_canViewChannelsTab())
         _AdminTabSpec(
           id: 'channels',
-          label: 'Каналы',
+          label: _isAdminBase() ? 'Каналы и промо' : 'Каналы',
           builder: _buildSettingsTab,
+        ),
+      if (_canViewPromotionsTab())
+        _AdminTabSpec(
+          id: 'promotions',
+          label: 'Промо',
+          builder: _buildPromotionsTab,
         ),
       if (_canViewDeliveryTab())
         _AdminTabSpec(
@@ -7300,6 +7310,76 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 child: _buildChannelCard(channel),
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPromotionsTab() {
+    final compact = MediaQuery.of(context).size.width < 640;
+    return RefreshIndicator(
+      onRefresh: _reloadAll,
+      child: ListView(
+        padding: EdgeInsets.all(compact ? 10 : 16),
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Промо-рассылки',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Здесь администратор создаёт акции и промо-уведомления для клиентов. '
+                    'Рассылка уходит только клиентам вашего tenant, у которых включены акции и промо.',
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => const AdminPromotionCenterScreen(),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.campaign_outlined),
+                    label: const Text('Открыть центр промо'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Что заполнять',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    '1. Заголовок акции.\n'
+                    '2. Короткий текст предложения.\n'
+                    '3. Deep link внутри приложения, если нужно открыть конкретный экран.\n'
+                    '4. Ссылку на картинку, если акция должна прийти с баннером.',
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
