@@ -107,6 +107,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final _supportTemplateTriggerCtrl = TextEditingController();
   final _supportTemplateTriggerProbeCtrl = TextEditingController();
   final _supportTemplatePriorityCtrl = TextEditingController(text: '100');
+  final _supportFaqQuestionCtrl = TextEditingController();
+  final _supportFaqAnswerCtrl = TextEditingController();
+  final _supportFaqKeywordsCtrl = TextEditingController();
+  final _supportFaqSortOrderCtrl = TextEditingController(text: '100');
   final _roleTemplateTitleCtrl = TextEditingController();
   final _roleTemplateCodeCtrl = TextEditingController();
   final _roleTemplateDescriptionCtrl = TextEditingController();
@@ -124,9 +128,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _supportArchiveBusy = false;
   bool _supportTemplatesLoading = false;
   bool _supportTemplateSaving = false;
+  bool _supportFaqLoading = false;
+  bool _supportFaqSaving = false;
   bool _supportQuickReplyBusy = false;
   bool _supportTemplateAutoReply = true;
   bool _supportTemplateElseFallback = false;
+  bool _supportFaqIsActive = true;
   bool _supportNotificationsLoading = false;
   bool _returnsAnalyticsLoading = false;
   bool _supportDraftRestoreInProgress = false;
@@ -156,6 +163,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   String _financePeriod = 'month';
   String _smartNotifyType = 'order';
   String _smartNotifyPriority = 'high';
+  String _supportTemplateCategory = 'general';
+  String _supportFaqCategory = 'general';
   double? _deliveryOriginLat;
   double? _deliveryOriginLng;
 
@@ -169,6 +178,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   List<Map<String, dynamic>> _supportActiveTickets = [];
   List<Map<String, dynamic>> _supportArchivedTickets = [];
   List<Map<String, dynamic>> _supportTemplates = [];
+  List<Map<String, dynamic>> _supportFaqEntries = [];
   List<Map<String, dynamic>> _supportNotificationItems = [];
   List<Map<String, dynamic>> _clientCartUsers = [];
   List<Map<String, dynamic>> _selectedClientCartItems = [];
@@ -196,6 +206,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   String _inviteRole = 'client';
   String _lastInviteCode = '';
   String _lastInviteLink = '';
+  String _editingSupportTemplateId = '';
+  String _editingSupportFaqId = '';
   final Map<String, String> _ticketTemplateById = {};
   final Map<String, String> _roleSelectionByUserId = {};
   final Set<String> _supportClaimBusyTicketIds = <String>{};
@@ -289,6 +301,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _supportTemplateTriggerCtrl.dispose();
     _supportTemplateTriggerProbeCtrl.dispose();
     _supportTemplatePriorityCtrl.dispose();
+    _supportFaqQuestionCtrl.dispose();
+    _supportFaqAnswerCtrl.dispose();
+    _supportFaqKeywordsCtrl.dispose();
+    _supportFaqSortOrderCtrl.dispose();
     _roleTemplateTitleCtrl.dispose();
     _roleTemplateCodeCtrl.dispose();
     _roleTemplateDescriptionCtrl.dispose();
@@ -423,6 +439,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final role = authService.effectiveRole;
     if (role == 'admin' || role == 'tenant') return true;
     return _hasPermission('chat.write.support');
+  }
+
+  bool _canManageSupportKnowledgeBase() {
+    if (_isCreatorBase()) return true;
+    return authService.effectiveRole.toLowerCase().trim() == 'admin';
   }
 
   bool _canForceCloseSupportTicket() {
@@ -832,6 +853,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     if (_canViewSupportTab()) {
       await _loadSupportTickets();
       await _loadSupportTemplates(silent: true);
+      await _loadSupportFaqEntries(silent: true);
       await _loadReturnsWorkflow(silent: true);
       await _loadSupportNotificationCenter(silent: true);
       await _loadReturnsAnalytics(silent: true);
@@ -1366,6 +1388,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     try {
       final resp = await authService.dio.get(
         '/api/admin/ops/support/templates',
+        queryParameters: {
+          if (_canManageSupportKnowledgeBase()) 'include_inactive': 1,
+        },
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
@@ -1391,7 +1416,106 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _createSupportTemplate() async {
+  Future<void> _loadSupportFaqEntries({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _supportFaqLoading = true);
+    } else {
+      _supportFaqLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/ops/support/faq',
+        queryParameters: {
+          if (_canManageSupportKnowledgeBase()) 'include_inactive': 1,
+        },
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is List) {
+        if (!mounted) return;
+        setState(() {
+          _supportFaqEntries = List<Map<String, dynamic>>.from(data['data']);
+        });
+      } else if (!silent && mounted) {
+        setState(() => _message = 'Не удалось загрузить FAQ поддержки');
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(() => _message = 'Ошибка FAQ поддержки: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _supportFaqLoading = false);
+      } else {
+        _supportFaqLoading = false;
+      }
+    }
+  }
+
+  List<DropdownMenuItem<String>> _supportCategoryDropdownItems() {
+    return const <String>['general', 'product', 'delivery', 'cart']
+        .map(
+          (value) => DropdownMenuItem<String>(
+            value: value,
+            child: Text(_supportCategoryLabel(value)),
+          ),
+        )
+        .toList();
+  }
+
+  String _supportTemplatePreview(Map<String, dynamic> template) {
+    final body = (template['body'] ?? '').toString().trim().replaceAll(
+      RegExp(r'\s+'),
+      ' ',
+    );
+    if (body.isEmpty) return 'Без текста';
+    if (body.length <= 90) return body;
+    return '${body.substring(0, 87)}...';
+  }
+
+  void _resetSupportTemplateEditor({bool clearMessage = false}) {
+    _supportTemplateTitleCtrl.clear();
+    _supportTemplateBodyCtrl.clear();
+    _supportTemplateTriggerCtrl.clear();
+    _supportTemplateTriggerProbeCtrl.clear();
+    _supportTemplatePriorityCtrl.text = '100';
+    _supportDraftSaveTimer?.cancel();
+    unawaited(_clearSupportTemplateDraft());
+    void apply() {
+      _editingSupportTemplateId = '';
+      _supportTemplateCategory = 'general';
+      _supportTemplateAutoReply = true;
+      _supportTemplateElseFallback = false;
+      if (clearMessage) {
+        _message = '';
+      }
+    }
+    if (mounted) {
+      setState(apply);
+    } else {
+      apply();
+    }
+  }
+
+  void _editSupportTemplate(Map<String, dynamic> template) {
+    final triggerRule = (template['trigger_rule'] ?? '').toString().trim();
+    _supportTemplateTitleCtrl.text = (template['title'] ?? '').toString();
+    _supportTemplateBodyCtrl.text = (template['body'] ?? '').toString();
+    _supportTemplateTriggerCtrl.text = triggerRule == '*' ? '*' : triggerRule;
+    _supportTemplateTriggerProbeCtrl.clear();
+    _supportTemplatePriorityCtrl.text = (template['priority'] ?? 100).toString();
+    setState(() {
+      _editingSupportTemplateId = (template['id'] ?? '').toString().trim();
+      _supportTemplateCategory = (template['category'] ?? 'general')
+          .toString()
+          .trim()
+          .toLowerCase();
+      _supportTemplateAutoReply = template['auto_reply_enabled'] == true;
+      _supportTemplateElseFallback = triggerRule == '*';
+      _message = 'Редактируем шаблон "${(template['title'] ?? 'Шаблон').toString()}"';
+    });
+  }
+
+  Future<void> _saveSupportTemplate() async {
     final title = _supportTemplateTitleCtrl.text.trim();
     final body = _supportTemplateBodyCtrl.text.trim();
     final rawTriggerRule = _supportTemplateTriggerCtrl.text.trim();
@@ -1411,35 +1535,38 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       );
       return;
     }
+    final editingId = _editingSupportTemplateId.trim();
     setState(() {
       _supportTemplateSaving = true;
       _message = '';
     });
     try {
-      await authService.dio.post(
-        '/api/admin/ops/support/templates',
-        data: {
-          'title': title,
-          'body': body,
-          'category': 'general',
-          'trigger_rule': triggerRule,
-          'auto_reply_enabled': _supportTemplateAutoReply,
-          'priority': priority,
-        },
-      );
-      _supportTemplateTitleCtrl.clear();
-      _supportTemplateBodyCtrl.clear();
-      _supportTemplateTriggerCtrl.clear();
-      _supportTemplateTriggerProbeCtrl.clear();
-      _supportTemplatePriorityCtrl.text = '100';
-      _supportDraftSaveTimer?.cancel();
-      await _clearSupportTemplateDraft();
+      final payload = {
+        'title': title,
+        'body': body,
+        'category': _supportTemplateCategory,
+        'trigger_rule': triggerRule,
+        'auto_reply_enabled': _supportTemplateAutoReply,
+        'priority': priority,
+      };
+      if (editingId.isEmpty) {
+        await authService.dio.post(
+          '/api/admin/ops/support/templates',
+          data: payload,
+        );
+      } else {
+        await authService.dio.patch(
+          '/api/admin/ops/support/templates/$editingId',
+          data: payload,
+        );
+      }
+      _resetSupportTemplateEditor();
       await _loadSupportTemplates(silent: true);
       if (mounted) {
         setState(() {
-          _supportTemplateAutoReply = true;
-          _supportTemplateElseFallback = false;
-          _message = 'Шаблон поддержки сохранен';
+          _message = editingId.isEmpty
+              ? 'Шаблон поддержки сохранён'
+              : 'Шаблон поддержки обновлён';
         });
       }
     } catch (e) {
@@ -1451,6 +1578,194 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     } finally {
       if (mounted) {
         setState(() => _supportTemplateSaving = false);
+      }
+    }
+  }
+
+  Future<void> _toggleSupportTemplateActive(Map<String, dynamic> template) async {
+    final templateId = (template['id'] ?? '').toString().trim();
+    if (templateId.isEmpty) return;
+    final nextActive = !(template['is_active'] == true);
+    setState(() {
+      _supportTemplateSaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/ops/support/templates/$templateId',
+        data: {'is_active': nextActive},
+      );
+      await _loadSupportTemplates(silent: true);
+      if (!mounted) return;
+      setState(() {
+        _message = nextActive
+            ? 'Шаблон снова активен'
+            : 'Шаблон скрыт из быстрых ответов';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка шаблона: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _supportTemplateSaving = false);
+      } else {
+        _supportTemplateSaving = false;
+      }
+    }
+  }
+
+  void _resetSupportFaqEditor({bool clearMessage = false}) {
+    _supportFaqQuestionCtrl.clear();
+    _supportFaqAnswerCtrl.clear();
+    _supportFaqKeywordsCtrl.clear();
+    _supportFaqSortOrderCtrl.text = '100';
+    void apply() {
+      _editingSupportFaqId = '';
+      _supportFaqCategory = 'general';
+      _supportFaqIsActive = true;
+      if (clearMessage) {
+        _message = '';
+      }
+    }
+    if (mounted) {
+      setState(apply);
+    } else {
+      apply();
+    }
+  }
+
+  void _editSupportFaq(Map<String, dynamic> entry) {
+    _supportFaqQuestionCtrl.text = (entry['question'] ?? '').toString();
+    _supportFaqAnswerCtrl.text = (entry['answer'] ?? '').toString();
+    final keywords = entry['keywords'];
+    _supportFaqKeywordsCtrl.text = keywords is List
+        ? keywords.join(', ')
+        : (keywords ?? '').toString();
+    _supportFaqSortOrderCtrl.text = (entry['sort_order'] ?? 100).toString();
+    setState(() {
+      _editingSupportFaqId = (entry['id'] ?? '').toString().trim();
+      _supportFaqCategory = (entry['category'] ?? 'general')
+          .toString()
+          .trim()
+          .toLowerCase();
+      _supportFaqIsActive = entry['is_active'] != false;
+      _message = 'Редактируем карточку FAQ';
+    });
+  }
+
+  Future<void> _saveSupportFaqEntry() async {
+    final question = _supportFaqQuestionCtrl.text.trim();
+    final answer = _supportFaqAnswerCtrl.text.trim();
+    final sortOrder = int.tryParse(_supportFaqSortOrderCtrl.text.trim()) ?? 100;
+    if (question.isEmpty || answer.isEmpty) {
+      setState(() => _message = 'Заполни вопрос и ответ для FAQ');
+      return;
+    }
+    final editingId = _editingSupportFaqId.trim();
+    setState(() {
+      _supportFaqSaving = true;
+      _message = '';
+    });
+    try {
+      final payload = {
+        'question': question,
+        'answer': answer,
+        'category': _supportFaqCategory,
+        'keywords': _supportFaqKeywordsCtrl.text.trim(),
+        'sort_order': sortOrder,
+        'is_active': _supportFaqIsActive,
+      };
+      if (editingId.isEmpty) {
+        await authService.dio.post('/api/admin/ops/support/faq', data: payload);
+      } else {
+        await authService.dio.patch(
+          '/api/admin/ops/support/faq/$editingId',
+          data: payload,
+        );
+      }
+      _resetSupportFaqEditor();
+      await _loadSupportFaqEntries(silent: true);
+      if (!mounted) return;
+      setState(() {
+        _message = editingId.isEmpty
+            ? 'FAQ сохранён'
+            : 'FAQ обновлён';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка FAQ: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _supportFaqSaving = false);
+      } else {
+        _supportFaqSaving = false;
+      }
+    }
+  }
+
+  Future<void> _toggleSupportFaqActive(Map<String, dynamic> entry) async {
+    final faqId = (entry['id'] ?? '').toString().trim();
+    if (faqId.isEmpty) return;
+    final nextActive = !(entry['is_active'] == true);
+    setState(() {
+      _supportFaqSaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/ops/support/faq/$faqId',
+        data: {'is_active': nextActive},
+      );
+      await _loadSupportFaqEntries(silent: true);
+      if (!mounted) return;
+      setState(() {
+        _message = nextActive
+            ? 'FAQ снова показывается клиентам'
+            : 'FAQ скрыт из подсказок';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка FAQ: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _supportFaqSaving = false);
+      } else {
+        _supportFaqSaving = false;
+      }
+    }
+  }
+
+  Future<void> _deleteSupportFaqEntry(Map<String, dynamic> entry) async {
+    final faqId = (entry['id'] ?? '').toString().trim();
+    if (faqId.isEmpty) return;
+    setState(() {
+      _supportFaqSaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.delete('/api/admin/ops/support/faq/$faqId');
+      if (_editingSupportFaqId == faqId) {
+        _resetSupportFaqEditor();
+      }
+      await _loadSupportFaqEntries(silent: true);
+      if (!mounted) return;
+      setState(() => _message = 'FAQ удалён');
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка удаления FAQ: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _supportFaqSaving = false);
+      } else {
+        _supportFaqSaving = false;
       }
     }
   }
@@ -3526,20 +3841,20 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       case 'cart':
         return 'Корзина';
       default:
-        return 'Общий';
+        return 'Общий вопрос';
     }
   }
 
-  String _supportStatusLabel(String raw) {
+  String _supportStatusLabel(String raw, {bool hasAssignee = false}) {
     switch (raw.trim().toLowerCase()) {
-      case 'open':
-        return 'Открыт';
       case 'waiting_customer':
-        return 'Ждём клиента';
+        return 'Ждём ваш ответ';
       case 'resolved':
-        return 'Решён';
+        return 'Решено';
       case 'archived':
-        return 'В архиве';
+        return 'Закрыто';
+      case 'open':
+        return hasAssignee ? 'В работе' : 'Новая заявка';
       default:
         return 'Неизвестно';
     }
@@ -3745,6 +4060,35 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         setState(() => _supportClaimBusyTicketIds.remove(ticketId));
       } else {
         _supportClaimBusyTicketIds.remove(ticketId);
+      }
+    }
+  }
+
+  Future<void> _resolveSupportTicket(Map<String, dynamic> ticket) async {
+    final ticketId = (ticket['id'] ?? '').toString().trim();
+    if (ticketId.isEmpty) return;
+    if (_supportFinishBusyTicketIds.contains(ticketId)) return;
+    setState(() {
+      _supportFinishBusyTicketIds.add(ticketId);
+      _message = '';
+    });
+    try {
+      await authService.dio.post('/api/support/tickets/$ticketId/resolve');
+      await _loadSupportTickets(silent: true);
+      await _loadSupportNotificationCenter(silent: true);
+      unawaited(refreshSupportQueueNotices());
+      if (!mounted) return;
+      setState(() => _message = 'Обращение отмечено как решённое');
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка завершения: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _supportFinishBusyTicketIds.remove(ticketId));
+      } else {
+        _supportFinishBusyTicketIds.remove(ticketId);
       }
     }
   }
@@ -7712,18 +8056,39 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final ticketId = (ticket['id'] ?? '').toString().trim();
     final customer = (ticket['customer_name'] ?? 'Клиент').toString();
     final assignee = (ticket['assignee_name'] ?? '—').toString();
+    final hasAssignee =
+        !pending && assignee.trim().isNotEmpty && assignee.trim() != '—';
     final category = _supportCategoryLabel(
       (ticket['category'] ?? '').toString(),
     );
-    final status = _supportStatusLabel((ticket['status'] ?? '').toString());
+    final statusRaw = (ticket['status'] ?? '').toString().trim().toLowerCase();
+    final status = (ticket['status_display'] ?? '').toString().trim().isNotEmpty
+        ? (ticket['status_display'] ?? '').toString().trim()
+        : _supportStatusLabel(statusRaw, hasAssignee: hasAssignee);
+    final statusHint = (ticket['status_hint'] ?? '').toString().trim();
     final subject = (ticket['subject'] ?? '').toString().trim();
     final updatedAt = _formatDateTimeLabel(ticket['updated_at']);
     final archiveReason = (ticket['archive_reason'] ?? '').toString().trim();
     final productTitle = (ticket['product_title'] ?? '').toString().trim();
     final claimBusy = _supportClaimBusyTicketIds.contains(ticketId);
     final finishBusy = _supportFinishBusyTicketIds.contains(ticketId);
+    final quickReplyTemplates = _supportTemplates
+        .where((template) => template['is_active'] != false)
+        .toList()
+      ..sort((a, b) {
+        final categoryCompare = _supportCategoryLabel(
+          (a['category'] ?? '').toString(),
+        ).compareTo(
+          _supportCategoryLabel((b['category'] ?? '').toString()),
+        );
+        if (categoryCompare != 0) return categoryCompare;
+        return (a['title'] ?? '').toString().compareTo(
+          (b['title'] ?? '').toString(),
+        );
+      });
     final isTemplateEnabled =
-        !archived && !pending && _supportTemplates.isNotEmpty;
+        !archived && !pending && quickReplyTemplates.isNotEmpty;
+    final canResolve = !archived && !pending && statusRaw != 'resolved';
 
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
@@ -7752,6 +8117,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             Text('Ответственный: ${pending ? 'Свободный' : assignee}'),
             if (productTitle.isNotEmpty) Text('Товар: $productTitle'),
             if (updatedAt.isNotEmpty) Text('Обновлён: $updatedAt'),
+            if (statusHint.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  statusHint,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
             if (archiveReason.isNotEmpty)
               Text('Причина архива: $archiveReason'),
             const SizedBox(height: 10),
@@ -7775,16 +8151,26 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     icon: const Icon(Icons.forum_outlined),
                     label: const Text('Открыть чат'),
                   ),
-                if (!archived && !pending)
+                if (canResolve)
+                  OutlinedButton.icon(
+                    onPressed: finishBusy
+                        ? null
+                        : () => _resolveSupportTicket(ticket),
+                    icon: const Icon(Icons.verified_outlined),
+                    label: Text(
+                      finishBusy ? 'Отмечаем...' : 'Отметить решённой',
+                    ),
+                  ),
+                if (!archived && !pending && _canForceCloseSupportTicket())
                   OutlinedButton.icon(
                     onPressed: finishBusy || _supportArchiveBusy
                         ? null
-                        : () => _archiveSupportTicket(ticket),
+                        : () => _archiveSupportTicket(ticket, force: true),
                     icon: const Icon(Icons.archive_outlined),
                     label: Text(
                       finishBusy || _supportArchiveBusy
-                          ? 'Завершаем...'
-                          : 'Закончить чат',
+                          ? 'Закрываем...'
+                          : 'Закрыть сразу',
                     ),
                   ),
                 if (ticketId.isNotEmpty)
@@ -7799,12 +8185,30 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     ? null
                     : _ticketTemplateById[ticketId],
                 isExpanded: true,
-                items: _supportTemplates.map((template) {
+                items: quickReplyTemplates.map((template) {
                   final id = (template['id'] ?? '').toString();
                   final title = (template['title'] ?? 'Шаблон').toString();
+                  final categoryLabel = _supportCategoryLabel(
+                    (template['category'] ?? '').toString(),
+                  );
+                  final preview = _supportTemplatePreview(template);
                   return DropdownMenuItem<String>(
                     value: id,
-                    child: Text(title),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text('$categoryLabel • $title'),
+                        Text(
+                          preview,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
                   );
                 }).toList(),
                 onChanged: (value) {
@@ -7854,11 +8258,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final returnsSummary = _asMap(_returnsAnalytics?['summary']);
     final returnsTopProducts = _asMapList(_returnsAnalytics?['top_products']);
     final canForceCloseSupport = _canForceCloseSupportTicket();
+    final canManageSupportKnowledgeBase = _canManageSupportKnowledgeBase();
 
     return RefreshIndicator(
       onRefresh: () async {
         await _loadSupportTickets(silent: true);
         await _loadSupportTemplates(silent: true);
+        await _loadSupportFaqEntries(silent: true);
         await _loadReturnsWorkflow(silent: true);
         await _loadSupportNotificationCenter(silent: true);
         await _loadReturnsAnalytics(silent: true);
@@ -7881,6 +8287,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     ? null
                     : () async {
                         await _loadSupportTickets(silent: true);
+                        await _loadSupportTemplates(silent: true);
+                        await _loadSupportFaqEntries(silent: true);
                         await _loadReturnsWorkflow(silent: true);
                         await _loadSupportNotificationCenter(silent: true);
                         await _loadReturnsAnalytics(silent: true);
@@ -8017,6 +8425,25 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                         icon: const Icon(Icons.forum_outlined),
                                         label: const Text('Открыть чат'),
                                       ),
+                                    if (supportStatus != 'resolved')
+                                      OutlinedButton.icon(
+                                        onPressed: supportFinishBusy
+                                            ? null
+                                            : () => _resolveSupportTicket(
+                                                {
+                                                  'id': supportTicketId,
+                                                  'chat_id': event['chat_id'],
+                                                },
+                                              ),
+                                        icon: const Icon(
+                                          Icons.verified_outlined,
+                                        ),
+                                        label: Text(
+                                          supportFinishBusy
+                                              ? 'Отмечаем...'
+                                              : 'Отметить решённой',
+                                        ),
+                                      ),
                                     if (canForceCloseSupport)
                                       OutlinedButton.icon(
                                         onPressed:
@@ -8053,7 +8480,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                           supportFinishBusy ||
                                                   _supportArchiveBusy
                                               ? 'Закрываем...'
-                                              : 'Закрыть заявку',
+                                              : 'Закрыть сразу',
                                         ),
                                       ),
                                   ],
@@ -8142,10 +8569,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 children: [
                   Row(
                     children: [
-                      const Expanded(
+                      Expanded(
                         child: Text(
-                          'Шаблоны ответов',
-                          style: TextStyle(fontWeight: FontWeight.w700),
+                          canManageSupportKnowledgeBase
+                              ? 'Шаблоны ответов'
+                              : 'Быстрые ответы поддержки',
+                          style: const TextStyle(fontWeight: FontWeight.w700),
                         ),
                       ),
                       IconButton(
@@ -8160,258 +8589,689 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   if (_supportTemplatesLoading)
                     const LinearProgressIndicator(minHeight: 2),
                   const SizedBox(height: 8),
-                  TextField(
-                    controller: _supportTemplateTitleCtrl,
-                    decoration: withInputLanguageBadge(
-                      const InputDecoration(
-                        labelText: 'Название шаблона',
-                        border: OutlineInputBorder(),
-                      ),
+                  if (canManageSupportKnowledgeBase) ...[
+                    TextField(
                       controller: _supportTemplateTitleCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Название шаблона',
+                          hintText: 'Например: Статус доставки',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _supportTemplateTitleCtrl,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _supportTemplateBodyCtrl,
-                    minLines: 2,
-                    maxLines: 4,
-                    decoration: withInputLanguageBadge(
-                      const InputDecoration(
-                        labelText: 'Текст шаблона',
-                        hintText: 'Можно использовать команды из списка ниже',
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _supportTemplateBodyCtrl,
+                      minLines: 2,
+                      maxLines: 4,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Текст ответа',
+                          hintText: 'Напишите понятный готовый ответ для клиента',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _supportTemplateBodyCtrl,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      key: ValueKey<String>(
+                        'support-template-category-$_supportTemplateCategory',
+                      ),
+                      initialValue: _supportTemplateCategory,
+                      items: _supportCategoryDropdownItems(),
+                      onChanged: _supportTemplateSaving
+                          ? null
+                          : (value) {
+                              if (value == null) return;
+                              setState(() => _supportTemplateCategory = value);
+                            },
+                      decoration: const InputDecoration(
+                        labelText: 'Категория',
                         border: OutlineInputBorder(),
                       ),
-                      controller: _supportTemplateBodyCtrl,
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  SwitchListTile.adaptive(
-                    value: _supportTemplateElseFallback,
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text('Шаблон по умолчанию (ELSE)'),
-                    subtitle: const Text(
-                      'Сработает, если другие триггеры не совпали',
-                    ),
-                    onChanged: _supportTemplateSaving
-                        ? null
-                        : _setSupportTemplateFallback,
-                  ),
-                  TextField(
-                    controller: _supportTemplateTriggerCtrl,
-                    enabled: !_supportTemplateElseFallback,
-                    onChanged: (_) {
-                      if (!_supportTemplateElseFallback &&
-                          _isFallbackTriggerRule(
-                            _supportTemplateTriggerCtrl.text,
-                          )) {
-                        _setSupportTemplateFallback(true);
-                        return;
-                      }
-                      setState(() {});
-                    },
-                    decoration: withInputLanguageBadge(
-                      InputDecoration(
-                        labelText: 'Триггер (if)',
-                        hintText: 'Пример: время+доставки|когда+доставка',
-                        helperText: _supportTemplateElseFallback
-                            ? 'Режим ELSE включен: этот шаблон ответит, если другие правила не подошли.'
-                            : 'Формат: слово+слово|другая+группа',
-                        border: const OutlineInputBorder(),
+                    const SizedBox(height: 8),
+                    ExpansionTile(
+                      tilePadding: EdgeInsets.zero,
+                      childrenPadding: const EdgeInsets.only(bottom: 8),
+                      title: const Text('Дополнительно'),
+                      subtitle: const Text(
+                        'Триггеры, автоответ и служебные настройки',
                       ),
-                      controller: _supportTemplateTriggerCtrl,
-                    ),
-                  ),
-                  if (!_supportTemplateElseFallback) ...[
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: _supportTriggerExamples
-                          .map(
-                            (example) => ActionChip(
+                      children: [
+                        SwitchListTile.adaptive(
+                          value: _supportTemplateElseFallback,
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Шаблон по умолчанию'),
+                          subtitle: const Text(
+                            'Сработает, если другие правила не подошли',
+                          ),
+                          onChanged: _supportTemplateSaving
+                              ? null
+                              : _setSupportTemplateFallback,
+                        ),
+                        TextField(
+                          controller: _supportTemplateTriggerCtrl,
+                          enabled: !_supportTemplateElseFallback,
+                          onChanged: (_) {
+                            if (!_supportTemplateElseFallback &&
+                                _isFallbackTriggerRule(
+                                  _supportTemplateTriggerCtrl.text,
+                                )) {
+                              _setSupportTemplateFallback(true);
+                              return;
+                            }
+                            setState(() {});
+                          },
+                          decoration: withInputLanguageBadge(
+                            InputDecoration(
+                              labelText: 'Ключевые слова',
+                              hintText:
+                                  'Например: время+доставки|когда+доставка',
+                              helperText: _supportTemplateElseFallback
+                                  ? 'Сейчас включён fallback-режим.'
+                                  : 'Формат: слово+слово|другая+группа',
+                              border: const OutlineInputBorder(),
+                            ),
+                            controller: _supportTemplateTriggerCtrl,
+                          ),
+                        ),
+                        if (!_supportTemplateElseFallback) ...[
+                          const SizedBox(height: 6),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: _supportTriggerExamples
+                                .map(
+                                  (example) => ActionChip(
+                                    onPressed: _supportTemplateSaving
+                                        ? null
+                                        : () => _appendSupportTriggerExample(
+                                            example,
+                                          ),
+                                    avatar: const Icon(Icons.rule, size: 16),
+                                    label: Text(example),
+                                  ),
+                                )
+                                .toList(),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Логика: "+" = и, "|" = или. Пример: время+доставки|когда+доставка',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
+                                ),
+                          ),
+                          if (parsedTriggerGroups.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: parsedTriggerGroups
+                                  .asMap()
+                                  .entries
+                                  .map(
+                                    (entry) => Chip(
+                                      avatar: const Icon(
+                                        Icons.account_tree,
+                                        size: 16,
+                                      ),
+                                      label: Text(
+                                        'IF ${entry.key + 1}: ${entry.value.join(' + ')}',
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                          ],
+                        ],
+                        const SizedBox(height: 8),
+                        TextField(
+                          controller: _supportTemplateTriggerProbeCtrl,
+                          onChanged: (_) => setState(() {}),
+                          decoration: withInputLanguageBadge(
+                            const InputDecoration(
+                              labelText: 'Проверка правила',
+                              hintText: 'Введите пример сообщения клиента',
+                              border: OutlineInputBorder(),
+                            ),
+                            controller: _supportTemplateTriggerProbeCtrl,
+                          ),
+                        ),
+                        if (triggerProbeText.isNotEmpty) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            showTriggerProbeResult
+                                ? (triggerProbeMatches
+                                      ? (_supportTemplateElseFallback
+                                            ? 'Результат: сработает как шаблон по умолчанию.'
+                                            : 'Результат: правило совпало, шаблон сработает.')
+                                      : 'Результат: правило не совпало.')
+                                : 'Результат: добавьте правило или включите шаблон по умолчанию.',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: showTriggerProbeResult
+                                      ? (triggerProbeMatches
+                                            ? Theme.of(
+                                                context,
+                                              ).colorScheme.primary
+                                            : Theme.of(
+                                                context,
+                                              ).colorScheme.error)
+                                      : Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: SwitchListTile.adaptive(
+                                value: _supportTemplateAutoReply,
+                                contentPadding: EdgeInsets.zero,
+                                title: const Text('Автоответ по правилу'),
+                                onChanged: _supportTemplateSaving
+                                    ? null
+                                    : (value) {
+                                        setState(
+                                          () =>
+                                              _supportTemplateAutoReply = value,
+                                        );
+                                        _scheduleSupportTemplateDraftSave();
+                                      },
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            SizedBox(
+                              width: 140,
+                              child: TextField(
+                                controller: _supportTemplatePriorityCtrl,
+                                keyboardType: TextInputType.number,
+                                decoration: withInputLanguageBadge(
+                                  const InputDecoration(
+                                    labelText: 'Порядок',
+                                    hintText: '100',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                  controller: _supportTemplatePriorityCtrl,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Text(
+                          'Команды для вставки',
+                          style: Theme.of(context).textTheme.labelLarge
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: _supportTemplateTokens.map((item) {
+                            final token = (item['token'] ?? '').trim();
+                            final title = (item['title'] ?? token).trim();
+                            return ActionChip(
                               onPressed: _supportTemplateSaving
                                   ? null
-                                  : () => _appendSupportTriggerExample(example),
-                              avatar: const Icon(Icons.rule, size: 16),
-                              label: Text(example),
+                                  : () => _insertSupportTemplateToken(token),
+                              avatar: const Icon(Icons.functions, size: 16),
+                              label: Text(token),
+                              tooltip: title,
+                            );
+                          }).toList(),
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                'Нажмите на команду, чтобы вставить её в текст по курсору',
+                                style: Theme.of(context).textTheme.bodySmall
+                                    ?.copyWith(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
+                              ),
                             ),
-                          )
-                          .toList(),
+                            PopupMenuButton<String>(
+                              tooltip: 'Вставить в название',
+                              onSelected: (token) {
+                                if (_supportTemplateSaving) return;
+                                _insertSupportTemplateToken(
+                                  token,
+                                  toTitle: true,
+                                );
+                              },
+                              itemBuilder: (context) =>
+                                  _supportTemplateTokens.map((item) {
+                                    final token =
+                                        (item['token'] ?? '').trim();
+                                    final title =
+                                        (item['title'] ?? token).trim();
+                                    return PopupMenuItem<String>(
+                                      value: token,
+                                      child: Text('$title: $token'),
+                                    );
+                                  }).toList(),
+                              child: const Chip(
+                                avatar: Icon(Icons.title, size: 16),
+                                label: Text('Вставить в название'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        if (_editingSupportTemplateId.isNotEmpty)
+                          OutlinedButton.icon(
+                            onPressed: _supportTemplateSaving
+                                ? null
+                                : () => _resetSupportTemplateEditor(
+                                    clearMessage: true,
+                                  ),
+                            icon: const Icon(Icons.close),
+                            label: const Text('Сбросить'),
+                          ),
+                        const Spacer(),
+                        FilledButton.icon(
+                          onPressed: _supportTemplateSaving
+                              ? null
+                              : _saveSupportTemplate,
+                          icon: Icon(
+                            _editingSupportTemplateId.isEmpty
+                                ? Icons.add_comment_outlined
+                                : Icons.save_outlined,
+                          ),
+                          label: Text(
+                            _supportTemplateSaving
+                                ? 'Сохранение...'
+                                : _editingSupportTemplateId.isEmpty
+                                ? 'Сохранить шаблон'
+                                : 'Обновить шаблон',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ] else
                     Text(
-                      'Логика: "+" = и, "|" = или. Пример: время+доставки|когда+доставка',
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      'Здесь видны готовые ответы, которыми сотрудники пользуются в очереди поддержки.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
-                    if (parsedTriggerGroups.isNotEmpty) ...[
-                      const SizedBox(height: 6),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: parsedTriggerGroups
-                            .asMap()
-                            .entries
-                            .map(
-                              (entry) => Chip(
-                                avatar: const Icon(
-                                  Icons.account_tree,
-                                  size: 16,
-                                ),
-                                label: Text(
-                                  'IF ${entry.key + 1}: ${entry.value.join(' + ')}',
-                                ),
-                              ),
-                            )
-                            .toList(),
-                      ),
-                    ],
-                  ],
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _supportTemplateTriggerProbeCtrl,
-                    onChanged: (_) => setState(() {}),
-                    decoration: withInputLanguageBadge(
-                      const InputDecoration(
-                        labelText: 'Проверка триггера',
-                        hintText: 'Введите пример сообщения клиента',
-                        border: OutlineInputBorder(),
-                      ),
-                      controller: _supportTemplateTriggerProbeCtrl,
+                  const SizedBox(height: 12),
+                  Text(
+                    'Готовые шаблоны',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
                     ),
                   ),
-                  if (triggerProbeText.isNotEmpty) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      showTriggerProbeResult
-                          ? (triggerProbeMatches
-                                ? (_supportTemplateElseFallback
-                                      ? 'Результат: сработает как ELSE (fallback).'
-                                      : 'Результат: триггер совпал, шаблон сработает.')
-                                : 'Результат: триггер не совпал.')
-                          : 'Результат: добавьте триггер или включите режим ELSE.',
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: showTriggerProbeResult
-                            ? (triggerProbeMatches
-                                  ? Theme.of(context).colorScheme.primary
-                                  : Theme.of(context).colorScheme.error)
-                            : Theme.of(context).colorScheme.onSurfaceVariant,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
                   const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: SwitchListTile.adaptive(
-                          value: _supportTemplateAutoReply,
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('Автоответ по триггеру'),
-                          onChanged: _supportTemplateSaving
-                              ? null
-                              : (value) {
-                                  setState(
-                                    () => _supportTemplateAutoReply = value,
-                                  );
-                                  _scheduleSupportTemplateDraftSave();
-                                },
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      SizedBox(
-                        width: 140,
-                        child: TextField(
-                          controller: _supportTemplatePriorityCtrl,
-                          keyboardType: TextInputType.number,
-                          decoration: withInputLanguageBadge(
-                            const InputDecoration(
-                              labelText: 'Приоритет',
-                              hintText: '100',
-                              border: OutlineInputBorder(),
-                            ),
-                            controller: _supportTemplatePriorityCtrl,
+                  if (_supportTemplates.isEmpty)
+                    const Text('Шаблоны пока не созданы')
+                  else
+                    ..._supportTemplates.map((template) {
+                      final title = (template['title'] ?? 'Шаблон').toString();
+                      final category = _supportCategoryLabel(
+                        (template['category'] ?? '').toString(),
+                      );
+                      final preview = _supportTemplatePreview(template);
+                      final isActive = template['is_active'] != false;
+                      final isAutoReply =
+                          template['auto_reply_enabled'] == true;
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      '$category • $title',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                  _buildModerationChip(
+                                    isActive ? 'Активен' : 'Скрыт',
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                preview,
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                              const SizedBox(height: 6),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _buildModerationChip(
+                                    isAutoReply
+                                        ? 'Автоответ'
+                                        : 'Только вручную',
+                                  ),
+                                  _buildModerationChip(
+                                    'Порядок ${(template['priority'] ?? 100).toString()}',
+                                  ),
+                                ],
+                              ),
+                              if (canManageSupportKnowledgeBase) ...[
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    FilledButton.tonalIcon(
+                                      onPressed: _supportTemplateSaving
+                                          ? null
+                                          : () => _editSupportTemplate(template),
+                                      icon: const Icon(Icons.edit_outlined),
+                                      label: const Text('Редактировать'),
+                                    ),
+                                    OutlinedButton.icon(
+                                      onPressed: _supportTemplateSaving
+                                          ? null
+                                          : () =>
+                                              _toggleSupportTemplateActive(
+                                                template,
+                                              ),
+                                      icon: Icon(
+                                        isActive
+                                            ? Icons.visibility_off_outlined
+                                            : Icons.visibility_outlined,
+                                      ),
+                                      label: Text(
+                                        isActive ? 'Скрыть' : 'Показать',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ],
                           ),
                         ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    'Команды для вставки',
-                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: _supportTemplateTokens.map((item) {
-                      final token = (item['token'] ?? '').trim();
-                      final title = (item['title'] ?? token).trim();
-                      return ActionChip(
-                        onPressed: _supportTemplateSaving
-                            ? null
-                            : () => _insertSupportTemplateToken(token),
-                        avatar: const Icon(Icons.functions, size: 16),
-                        label: Text(token),
-                        tooltip: title,
                       );
-                    }).toList(),
-                  ),
-                  const SizedBox(height: 8),
+                    }),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Row(
                     children: [
-                      Expanded(
+                      const Expanded(
                         child: Text(
-                          'Нажмите на команду, чтобы вставить её в текст по курсору',
-                          style: Theme.of(context).textTheme.bodySmall
-                              ?.copyWith(
-                                color: Theme.of(
-                                  context,
-                                ).colorScheme.onSurfaceVariant,
-                              ),
+                          'Частые вопросы',
+                          style: TextStyle(fontWeight: FontWeight.w700),
                         ),
                       ),
-                      PopupMenuButton<String>(
-                        tooltip: 'Вставить в название',
-                        onSelected: (token) {
-                          if (_supportTemplateSaving) return;
-                          _insertSupportTemplateToken(token, toTitle: true);
-                        },
-                        itemBuilder: (context) =>
-                            _supportTemplateTokens.map((item) {
-                              final token = (item['token'] ?? '').trim();
-                              final title = (item['title'] ?? token).trim();
-                              return PopupMenuItem<String>(
-                                value: token,
-                                child: Text('$title: $token'),
-                              );
-                            }).toList(),
-                        child: const Chip(
-                          avatar: Icon(Icons.title, size: 16),
-                          label: Text('Вставить в название'),
-                        ),
+                      IconButton(
+                        onPressed: _supportFaqLoading
+                            ? null
+                            : () => _loadSupportFaqEntries(),
+                        icon: const Icon(Icons.refresh),
+                        tooltip: 'Обновить FAQ',
                       ),
                     ],
                   ),
+                  if (_supportFaqLoading)
+                    const LinearProgressIndicator(minHeight: 2),
                   const SizedBox(height: 8),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: FilledButton.icon(
-                      onPressed: _supportTemplateSaving
-                          ? null
-                          : _createSupportTemplate,
-                      icon: const Icon(Icons.add_comment_outlined),
-                      label: Text(
-                        _supportTemplateSaving
-                            ? 'Сохранение...'
-                            : 'Сохранить шаблон',
+                  if (canManageSupportKnowledgeBase) ...[
+                    TextField(
+                      controller: _supportFaqQuestionCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Вопрос',
+                          hintText: 'Например: Как узнать статус доставки?',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _supportFaqQuestionCtrl,
                       ),
                     ),
-                  ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _supportFaqAnswerCtrl,
+                      minLines: 2,
+                      maxLines: 4,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Ответ',
+                          hintText:
+                              'Напишите короткий и понятный ответ для клиента',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _supportFaqAnswerCtrl,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      key: ValueKey<String>(
+                        'support-faq-category-$_supportFaqCategory',
+                      ),
+                      initialValue: _supportFaqCategory,
+                      items: _supportCategoryDropdownItems(),
+                      onChanged: _supportFaqSaving
+                          ? null
+                          : (value) {
+                              if (value == null) return;
+                              setState(() => _supportFaqCategory = value);
+                            },
+                      decoration: const InputDecoration(
+                        labelText: 'Категория',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _supportFaqKeywordsCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Ключевые слова',
+                          hintText:
+                              'Например: доставка, курьер, адрес, когда привезут',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _supportFaqKeywordsCtrl,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: SwitchListTile.adaptive(
+                            value: _supportFaqIsActive,
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text('Показывать клиентам'),
+                            onChanged: _supportFaqSaving
+                                ? null
+                                : (value) {
+                                    setState(() => _supportFaqIsActive = value);
+                                  },
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        SizedBox(
+                          width: 140,
+                          child: TextField(
+                            controller: _supportFaqSortOrderCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: withInputLanguageBadge(
+                              const InputDecoration(
+                                labelText: 'Порядок',
+                                hintText: '100',
+                                border: OutlineInputBorder(),
+                              ),
+                              controller: _supportFaqSortOrderCtrl,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        if (_editingSupportFaqId.isNotEmpty)
+                          OutlinedButton.icon(
+                            onPressed: _supportFaqSaving
+                                ? null
+                                : () =>
+                                    _resetSupportFaqEditor(clearMessage: true),
+                            icon: const Icon(Icons.close),
+                            label: const Text('Сбросить'),
+                          ),
+                        const Spacer(),
+                        FilledButton.icon(
+                          onPressed: _supportFaqSaving
+                              ? null
+                              : _saveSupportFaqEntry,
+                          icon: Icon(
+                            _editingSupportFaqId.isEmpty
+                                ? Icons.help_center_outlined
+                                : Icons.save_outlined,
+                          ),
+                          label: Text(
+                            _supportFaqSaving
+                                ? 'Сохранение...'
+                                : _editingSupportFaqId.isEmpty
+                                ? 'Сохранить FAQ'
+                                : 'Обновить FAQ',
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                  ] else
+                    Text(
+                      'Эти карточки видят клиенты до создания обращения. Редактирование доступно администратору и создателю.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  if (_supportFaqEntries.isEmpty)
+                    const Text('FAQ пока пуст')
+                  else
+                    ..._supportFaqEntries.map((entry) {
+                      final question = (entry['question'] ?? 'Вопрос')
+                          .toString()
+                          .trim();
+                      final answer = (entry['answer'] ?? '').toString().trim();
+                      final category = _supportCategoryLabel(
+                        (entry['category'] ?? '').toString(),
+                      );
+                      final isActive = entry['is_active'] != false;
+                      final keywords = entry['keywords'];
+                      final keywordsText = keywords is List
+                          ? keywords.join(', ')
+                          : (keywords ?? '').toString();
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      question,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                  _buildModerationChip(
+                                    isActive ? 'Активен' : 'Скрыт',
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(category),
+                              if (answer.isNotEmpty) ...[
+                                const SizedBox(height: 6),
+                                Text(answer),
+                              ],
+                              if (keywordsText.trim().isNotEmpty) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                  'Ключевые слова: $keywordsText',
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
+                                      ),
+                                ),
+                              ],
+                              if (canManageSupportKnowledgeBase) ...[
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    FilledButton.tonalIcon(
+                                      onPressed: _supportFaqSaving
+                                          ? null
+                                          : () => _editSupportFaq(entry),
+                                      icon: const Icon(Icons.edit_outlined),
+                                      label: const Text('Редактировать'),
+                                    ),
+                                    OutlinedButton.icon(
+                                      onPressed: _supportFaqSaving
+                                          ? null
+                                          : () => _toggleSupportFaqActive(entry),
+                                      icon: Icon(
+                                        isActive
+                                            ? Icons.visibility_off_outlined
+                                            : Icons.visibility_outlined,
+                                      ),
+                                      label: Text(
+                                        isActive ? 'Скрыть' : 'Показать',
+                                      ),
+                                    ),
+                                    OutlinedButton.icon(
+                                      onPressed: _supportFaqSaving
+                                          ? null
+                                          : () => _deleteSupportFaqEntry(entry),
+                                      icon: const Icon(Icons.delete_outline),
+                                      label: const Text('Удалить'),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
                 ],
               ),
             ),

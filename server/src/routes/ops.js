@@ -23,6 +23,10 @@ const {
   decryptMessageText,
   decryptMessageRow,
 } = require('../utils/messageCrypto');
+const {
+  buildSupportTicketStatusLabel,
+  decorateSupportTicketRow,
+} = require('../utils/supportTicketPresentation');
 
 const router = express.Router();
 const requireSupportWritePermission = requirePermission('chat.write.support');
@@ -371,6 +375,20 @@ function normalizeTemplateCategory(value) {
   return 'general';
 }
 
+function normalizeFaqKeywords(raw) {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .join(', ');
+  }
+  return String(raw || '')
+    .split(/[,;\n]/)
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .join(', ');
+}
+
 function mapClaimWorkflowStatus(status, customerDiscountStatus = '') {
   const decision = String(customerDiscountStatus || '').trim();
   switch (String(status || '').trim()) {
@@ -409,18 +427,7 @@ function allowedClaimActions(status, customerDiscountStatus = '') {
 }
 
 function mapSupportTicketStatusLabel(status) {
-  switch (String(status || '').trim()) {
-    case 'open':
-      return 'Открыт';
-    case 'waiting_customer':
-      return 'Ждем клиента';
-    case 'resolved':
-      return 'Решен';
-    case 'archived':
-      return 'В архиве';
-    default:
-      return 'Неизвестно';
-  }
+  return buildSupportTicketStatusLabel(status);
 }
 
 function mapClaimTypeLabel(claimType) {
@@ -1558,6 +1565,8 @@ router.get('/support/templates', requireAuth, requireRole('admin', 'creator', 'w
   try {
     const rawCategory = String(req.query?.category || '').trim().toLowerCase();
     const category = rawCategory ? normalizeTemplateCategory(rawCategory) : '';
+    const includeInactive =
+      req.query?.include_inactive === '1' || req.query?.include_inactive === 1;
     const rows = await db.query(
       `SELECT id,
               tenant_id,
@@ -1575,13 +1584,217 @@ router.get('/support/templates', requireAuth, requireRole('admin', 'creator', 'w
        FROM support_reply_templates
        WHERE (tenant_id = $1::uuid OR tenant_id IS NULL)
          AND category = COALESCE(NULLIF($2, ''), category)
-         AND is_active = true
+         AND ($3::boolean = true OR is_active = true)
        ORDER BY is_system DESC, updated_at DESC, created_at DESC`,
-      [req.user?.tenant_id || null, category || ''],
+      [req.user?.tenant_id || null, category || '', includeInactive],
     );
     return res.json({ ok: true, data: rows.rows });
   } catch (err) {
     console.error('ops.support.templates.list error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/support/faq', requireAuth, requireRole('admin', 'creator', 'worker'), async (req, res) => {
+  try {
+    const rawCategory = String(req.query?.category || '').trim().toLowerCase();
+    const category = rawCategory ? normalizeTemplateCategory(rawCategory) : '';
+    const includeInactive =
+      req.query?.include_inactive === '1' || req.query?.include_inactive === 1;
+    const rows = await db.query(
+      `SELECT id,
+              tenant_id,
+              category,
+              question,
+              answer,
+              keywords,
+              sort_order,
+              is_active,
+              created_by,
+              created_at,
+              updated_at
+       FROM support_faq_entries
+       WHERE (tenant_id = $1::uuid OR tenant_id IS NULL)
+         AND category = COALESCE(NULLIF($2, ''), category)
+         AND ($3::boolean = true OR is_active = true)
+       ORDER BY sort_order ASC, updated_at DESC, created_at DESC`,
+      [req.user?.tenant_id || null, category || '', includeInactive],
+    );
+    return res.json({
+      ok: true,
+      data: rows.rows.map((row) => ({
+        ...row,
+        category: normalizeTemplateCategory(row.category),
+        keywords: normalizeFaqKeywords(row.keywords),
+      })),
+    });
+  } catch (err) {
+    console.error('ops.support.faq.list error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/support/faq', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
+  try {
+    const question = String(req.body?.question || '').trim();
+    const answer = String(req.body?.answer || '').trim();
+    const category = normalizeTemplateCategory(req.body?.category);
+    const keywords = normalizeFaqKeywords(req.body?.keywords);
+    const sortOrder = parsePositiveInt(req.body?.sort_order, 100, 0, 10000);
+    const isActive =
+      Object.prototype.hasOwnProperty.call(req.body || {}, 'is_active')
+        ? req.body?.is_active === true
+        : true;
+
+    if (!question || !answer) {
+      return res.status(400).json({ ok: false, error: 'question и answer обязательны' });
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO support_faq_entries (
+         tenant_id,
+         category,
+         question,
+         answer,
+         keywords,
+         sort_order,
+         is_active,
+         created_by,
+         created_at,
+         updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+       RETURNING *`,
+      [
+        req.user?.tenant_id || null,
+        category,
+        question,
+        answer,
+        keywords,
+        sortOrder,
+        isActive,
+        req.user?.id || null,
+      ],
+    );
+
+    await insertAuditFromReq(req, {
+      action: 'support.faq.create',
+      entityType: 'support_faq',
+      entityId: inserted.rows[0]?.id,
+      after: inserted.rows[0],
+    });
+
+    return res.status(201).json({ ok: true, data: inserted.rows[0] });
+  } catch (err) {
+    console.error('ops.support.faq.create error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.patch('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
+  try {
+    const id = String(req.params?.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'id FAQ обязателен' });
+    }
+
+    const beforeQ = await db.query(
+      `SELECT *
+       FROM support_faq_entries
+       WHERE id = $1
+         AND (tenant_id = $2::uuid OR tenant_id IS NULL)
+       LIMIT 1`,
+      [id, req.user?.tenant_id || null],
+    );
+    if (beforeQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'FAQ не найден' });
+    }
+
+    const hasQuestion = Object.prototype.hasOwnProperty.call(req.body || {}, 'question');
+    const hasAnswer = Object.prototype.hasOwnProperty.call(req.body || {}, 'answer');
+    const hasCategory = Object.prototype.hasOwnProperty.call(req.body || {}, 'category');
+    const hasKeywords = Object.prototype.hasOwnProperty.call(req.body || {}, 'keywords');
+    const hasSortOrder = Object.prototype.hasOwnProperty.call(req.body || {}, 'sort_order');
+    const hasActive = Object.prototype.hasOwnProperty.call(req.body || {}, 'is_active');
+
+    const updated = await db.query(
+      `UPDATE support_faq_entries
+       SET question = CASE WHEN $1::boolean THEN COALESCE(NULLIF($2, ''), question) ELSE question END,
+           answer = CASE WHEN $3::boolean THEN COALESCE(NULLIF($4, ''), answer) ELSE answer END,
+           category = CASE WHEN $5::boolean THEN $6 ELSE category END,
+           keywords = CASE WHEN $7::boolean THEN $8 ELSE keywords END,
+           sort_order = CASE WHEN $9::boolean THEN $10 ELSE sort_order END,
+           is_active = CASE WHEN $11::boolean THEN $12 ELSE is_active END,
+           updated_at = now()
+       WHERE id = $13
+       RETURNING *`,
+      [
+        hasQuestion,
+        String(req.body?.question || '').trim(),
+        hasAnswer,
+        String(req.body?.answer || '').trim(),
+        hasCategory,
+        normalizeTemplateCategory(req.body?.category),
+        hasKeywords,
+        normalizeFaqKeywords(req.body?.keywords),
+        hasSortOrder,
+        parsePositiveInt(req.body?.sort_order, 100, 0, 10000),
+        hasActive,
+        req.body?.is_active === true,
+        id,
+      ],
+    );
+
+    await insertAuditFromReq(req, {
+      action: 'support.faq.update',
+      entityType: 'support_faq',
+      entityId: id,
+      before: beforeQ.rows[0],
+      after: updated.rows[0],
+    });
+
+    return res.json({ ok: true, data: updated.rows[0] });
+  } catch (err) {
+    console.error('ops.support.faq.patch error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.delete('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
+  try {
+    const id = String(req.params?.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'id FAQ обязателен' });
+    }
+
+    const beforeQ = await db.query(
+      `SELECT *
+       FROM support_faq_entries
+       WHERE id = $1
+         AND (tenant_id = $2::uuid OR tenant_id IS NULL)
+       LIMIT 1`,
+      [id, req.user?.tenant_id || null],
+    );
+    if (beforeQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'FAQ не найден' });
+    }
+
+    await db.query(
+      `DELETE FROM support_faq_entries
+       WHERE id = $1`,
+      [id],
+    );
+
+    await insertAuditFromReq(req, {
+      action: 'support.faq.delete',
+      entityType: 'support_faq',
+      entityId: id,
+      before: beforeQ.rows[0],
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('ops.support.faq.delete error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });
@@ -2018,6 +2231,7 @@ router.get(
            SELECT st.id::text AS source_id,
                   'support_ticket'::text AS event_type,
                   st.chat_id::text AS chat_id,
+                  st.assignee_id::text AS assignee_id,
                   ch.type::text AS chat_type,
                   ch.settings AS chat_settings,
                   st.status::text AS status,
@@ -2041,6 +2255,7 @@ router.get(
            SELECT cc.id::text AS source_id,
                   'claim'::text AS event_type,
                   NULL::text AS chat_id,
+                  NULL::text AS assignee_id,
                   NULL::text AS chat_type,
                   NULL::jsonb AS chat_settings,
                   cc.status::text AS status,
@@ -2122,8 +2337,14 @@ router.get(
       const customerDiscountStatus = String(
         row.customer_discount_status || '',
       ).trim();
+      const supportTicketView = eventType === 'support_ticket'
+        ? decorateSupportTicketRow({
+            status,
+            assignee_id: row.assignee_id || null,
+          })
+        : null;
       const statusLabel = eventType === 'support_ticket'
-        ? mapSupportTicketStatusLabel(status)
+        ? String(supportTicketView?.status_display || mapSupportTicketStatusLabel(status))
         : mapClaimWorkflowStatus(status, customerDiscountStatus);
       const claimType = String(row.claim_type || '').trim();
       const claimTypeLabel = claimType ? mapClaimTypeLabel(claimType) : '';

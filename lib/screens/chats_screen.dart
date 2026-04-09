@@ -564,11 +564,22 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
     if (_isSupportChat(chat)) {
       final settings = _settingsOf(chat);
+      final assignee = (chat['support_assignee_name'] ??
+              settings['support_assignee_name'] ??
+              '')
+          .toString()
+          .trim();
+      final waitingCustomer = _toBool(
+        chat['support_waiting_customer'] ?? settings['support_waiting_customer'],
+      );
       final statusRaw = (chat['support_ticket_status'] ??
               settings['support_ticket_status'] ??
               '')
           .toString();
-      final statusLabel = messengerSupportStatusLabel(statusRaw);
+      final statusLabel = messengerSupportStatusLabel(
+        statusRaw,
+        hasAssignee: assignee.isNotEmpty,
+      );
       if (statusLabel.isNotEmpty) {
         final colors = _supportToneColors(
           theme,
@@ -591,19 +602,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
           _buildMetaChip(
             theme,
             icon: Icons.schedule_rounded,
-            label: messengerSupportWaitingLabel(waitingCustomer: false),
+            label: messengerSupportWaitingLabel(
+              waitingCustomer: waitingCustomer,
+            ),
             background: theme.colorScheme.surfaceContainerHighest,
             foreground: theme.colorScheme.onSurfaceVariant,
             border: theme.colorScheme.outlineVariant,
           ),
         );
       }
-
-      final assignee = (chat['support_assignee_name'] ??
-              settings['support_assignee_name'] ??
-              '')
-          .toString()
-          .trim();
       if (assignee.isNotEmpty) {
         chips.add(
           _buildMetaChip(
