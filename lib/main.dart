@@ -24,6 +24,7 @@ import 'services/offline_purchase_queue_service.dart';
 import 'services/web_notification_service.dart';
 import 'services/web_push_client_service.dart';
 import 'src/utils/media_url.dart';
+import 'src/utils/messenger_ui_helpers.dart';
 import 'src/utils/notification_navigation.dart';
 import 'theme/app_theme.dart';
 import 'widgets/phoenix_loader.dart';
@@ -504,6 +505,8 @@ class _SupportQueueNoticePayload {
   final String customerName;
   final String? productTitle;
   final String status;
+  final String statusDisplay;
+  final String statusHint;
   final bool claimable;
   final bool closable;
 
@@ -515,6 +518,8 @@ class _SupportQueueNoticePayload {
     required this.customerName,
     required this.productTitle,
     required this.status,
+    required this.statusDisplay,
+    required this.statusHint,
     required this.claimable,
     required this.closable,
   });
@@ -575,6 +580,8 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
   final category = (map['category'] ?? 'general').toString().trim();
   final productTitle = (map['product_title'] ?? '').toString().trim();
   final status = (map['status'] ?? 'open').toString().trim().toLowerCase();
+  final statusDisplay = (map['status_display'] ?? '').toString().trim();
+  final statusHint = (map['status_hint'] ?? '').toString().trim();
   final claimable = (map['claimable'] ?? map['assignee_id'] == null) == true;
   return _SupportQueueNoticePayload(
     ticketId: ticketId,
@@ -584,6 +591,8 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
     customerName: customerName.isEmpty ? 'Клиент' : customerName,
     productTitle: productTitle.isEmpty ? null : productTitle,
     status: status.isEmpty ? 'open' : status,
+    statusDisplay: statusDisplay,
+    statusHint: statusHint,
     claimable: claimable,
     closable: false,
   );
@@ -601,6 +610,8 @@ _SupportQueueNoticePayload? _parseAssignedSupportNotice(dynamic raw) {
   final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
   final productTitle = (map['product_title'] ?? '').toString().trim();
   final chatId = (map['chat_id'] ?? '').toString().trim();
+  final statusDisplay = (map['status_display'] ?? '').toString().trim();
+  final statusHint = (map['status_hint'] ?? '').toString().trim();
   return _SupportQueueNoticePayload(
     ticketId: ticketId,
     chatId: chatId.isEmpty ? null : chatId,
@@ -609,6 +620,8 @@ _SupportQueueNoticePayload? _parseAssignedSupportNotice(dynamic raw) {
     customerName: customerName.isEmpty ? 'Клиент' : customerName,
     productTitle: productTitle.isEmpty ? null : productTitle,
     status: status,
+    statusDisplay: statusDisplay,
+    statusHint: statusHint,
     claimable: false,
     closable: true,
   );
@@ -770,30 +783,27 @@ Future<void> _closeSupportQueueNotice(String ticketId) async {
   busy.add(id);
   _supportQueueClaimBusyNotifier.value = busy;
   try {
-    await dio.post(
-      '/api/support/tickets/$id/archive',
-      data: {'force': true, 'reason': 'forced_admin_archive'},
-    );
+    await dio.post('/api/support/tickets/$id/resolve');
     _removeSupportQueueNotice(id);
     showGlobalAppNotice(
-      'Диалог закончен',
+      'Обращение отмечено как решённое',
       title: 'Поддержка',
       tone: AppNoticeTone.success,
     );
     chatEventsController.add({
       'type': 'support:queue:changed',
-      'data': {'ticket_id': id, 'action': 'archived'},
+      'data': {'ticket_id': id, 'action': 'resolved'},
     });
   } on DioException catch (e) {
     final message = _extractApiErrorMessage(e);
     showGlobalAppNotice(
-      message.isNotEmpty ? message : 'Не удалось завершить заявку',
+      message.isNotEmpty ? message : 'Не удалось отметить обращение как решённое',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
   } catch (_) {
     showGlobalAppNotice(
-      'Не удалось завершить заявку',
+      'Не удалось отметить обращение как решённое',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
@@ -2429,15 +2439,7 @@ class _GlobalNoticeHost extends StatelessWidget {
   }
 
   String _supportStatusLabel(String raw) {
-    switch (raw.toLowerCase().trim()) {
-      case 'waiting_customer':
-        return 'Ждёт клиента';
-      case 'resolved':
-        return 'Ожидает закрытия';
-      case 'open':
-      default:
-        return 'Открыт';
-    }
+    return messengerSupportStatusLabel(raw);
   }
 
   @override
@@ -2710,9 +2712,14 @@ class _GlobalNoticeHost extends StatelessWidget {
                                               runSpacing: 8,
                                               children: [
                                                 _SupportQueueChip(
-                                                  label: _supportStatusLabel(
-                                                    notice.status,
-                                                  ),
+                                                  label:
+                                                      notice.statusDisplay
+                                                              .trim()
+                                                              .isNotEmpty
+                                                          ? notice.statusDisplay
+                                                          : _supportStatusLabel(
+                                                              notice.status,
+                                                            ),
                                                 ),
                                                 _SupportQueueChip(
                                                   label: _supportCategoryLabel(
@@ -2730,6 +2737,22 @@ class _GlobalNoticeHost extends StatelessWidget {
                                               ],
                                             ),
                                             const SizedBox(height: 10),
+                                            if (notice.statusHint
+                                                .trim()
+                                                .isNotEmpty) ...[
+                                              Text(
+                                                notice.statusHint.trim(),
+                                                maxLines: compact ? 2 : 3,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: theme.textTheme.bodySmall
+                                                    ?.copyWith(
+                                                      color: theme
+                                                          .colorScheme
+                                                          .onSurfaceVariant,
+                                                    ),
+                                              ),
+                                              const SizedBox(height: 10),
+                                            ],
                                             if ((canClaim &&
                                                     notice.claimable) ||
                                                 notice.closable ||
@@ -2794,8 +2817,8 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                               ),
                                                         label: Text(
                                                           actionBusy
-                                                              ? 'Закрываем...'
-                                                              : 'Закрыть заявку',
+                                                              ? 'Отмечаем...'
+                                                              : 'Отметить решённой',
                                                         ),
                                                       ),
                                                   ],

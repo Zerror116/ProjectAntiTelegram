@@ -2209,6 +2209,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final settings = widget.chatSettings ?? const <String, dynamic>{};
     return messengerSupportStatusLabel(
       (settings['support_ticket_status'] ?? '').toString(),
+      hasAssignee: _supportTicketAssigneeName().isNotEmpty,
     );
   }
 
@@ -9229,7 +9230,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                       icon: const Icon(Icons.check_circle_outline),
                       label: Text(
-                        supportFeedbackBusy ? 'Сохранение...' : 'Да, решили',
+                        supportFeedbackBusy
+                            ? 'Сохранение...'
+                            : 'Да, вопрос решён',
                       ),
                     ),
                     OutlinedButton.icon(
@@ -9240,7 +9243,7 @@ class _ChatScreenState extends State<ChatScreen> {
                               resolved: false,
                             ),
                       icon: const Icon(Icons.refresh_outlined),
-                      label: const Text('Нет, ещё вопрос'),
+                      label: const Text('Нет, нужна помощь'),
                     ),
                   ],
                 ),
@@ -9249,10 +9252,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   theme,
                   'Статус',
                   supportFeedbackStatus == 'resolved'
-                      ? 'Закрыт'
+                      ? 'Закрыто'
                       : supportFeedbackStatus == 'reopened'
-                      ? 'Открыт повторно'
-                      : 'Ожидаем ответ клиента',
+                      ? 'Снова в работе'
+                      : 'Ждём ваш ответ',
                 ),
               ],
             ] else if (hasBuy) ...[

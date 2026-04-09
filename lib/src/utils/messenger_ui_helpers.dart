@@ -8,16 +8,19 @@ enum MessengerReservedQuickFilter {
   shelfless,
 }
 
-String messengerSupportStatusLabel(String raw) {
+String messengerSupportStatusLabel(
+  String raw, {
+  bool hasAssignee = false,
+}) {
   switch (raw.trim().toLowerCase()) {
     case 'waiting_customer':
-      return 'Ждём клиента';
+      return 'Ждём ваш ответ';
     case 'resolved':
-      return 'Решён';
+      return 'Решено';
     case 'archived':
-      return 'Архив';
+      return 'Закрыто';
     case 'open':
-      return 'Открыт';
+      return hasAssignee ? 'В работе' : 'Новая заявка';
     default:
       return '';
   }
@@ -38,7 +41,9 @@ MessengerSupportStatusTone messengerSupportStatusTone(String raw) {
 }
 
 String messengerSupportWaitingLabel({required bool waitingCustomer}) {
-  return waitingCustomer ? 'Ждём клиента' : 'Ждём сотрудника';
+  return waitingCustomer
+      ? 'Сейчас ждём ваш ответ'
+      : 'Сейчас ход за поддержкой';
 }
 
 String messengerBuildLastMessagePreview({

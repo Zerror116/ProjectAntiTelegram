@@ -11,6 +11,11 @@ const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 const { createNotificationInboxItem } = require("../utils/notifications");
 const {
+  buildSupportTicketStatusLabel,
+  buildSupportTicketStatusHint,
+  decorateSupportTicketRow,
+} = require("../utils/supportTicketPresentation");
+const {
   encryptMessageText,
   decryptMessageRow,
 } = require("../utils/messageCrypto");
@@ -114,6 +119,42 @@ function normalizeSupportCategory(raw, fallback = "general") {
     .trim();
   if (SUPPORT_CATEGORIES.has(normalized)) return normalized;
   return fallback;
+}
+
+function normalizeFaqKeywords(raw) {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => normalizeText(item))
+      .filter(Boolean)
+      .join(", ");
+  }
+  return String(raw || "")
+    .split(/[,;\n]/)
+    .map((item) => normalizeText(item))
+    .filter(Boolean)
+    .join(", ");
+}
+
+function decorateFaqRow(row) {
+  if (!row || typeof row !== "object") return row;
+  const category = normalizeSupportCategory(row.category);
+  const keywords = normalizeFaqKeywords(row.keywords);
+  return {
+    ...row,
+    category,
+    category_display:
+      category === "product"
+        ? "Товар"
+        : category === "delivery"
+          ? "Доставка"
+          : category === "cart"
+            ? "Корзина"
+            : "Общий вопрос",
+    keywords,
+    keywords_list: keywords
+      ? keywords.split(",").map((item) => normalizeText(item)).filter(Boolean)
+      : [],
+  };
 }
 
 function buildSupportSubject(category, productTitle = "") {
@@ -268,7 +309,7 @@ async function hydrateSupportQueueTicket(queryable, ticketId) {
      LIMIT 1`,
     [ticketId],
   );
-  return result.rows[0] || null;
+  return result.rowCount > 0 ? decorateSupportTicketRow(result.rows[0]) : null;
 }
 
 async function emitSupportQueueTicketEvent(req, tenantId, eventName, ticketId) {
@@ -318,6 +359,9 @@ async function createSupportInboxNotifications({ tenantId, ticket, eventName }) 
   if (!ticket?.id || !ticket?.chat_id) return;
   const recipients = await listSupportNotificationRecipients(tenantId);
   const status = String(ticket.status || "open").trim().toLowerCase();
+  const statusLabel = buildSupportTicketStatusLabel(status, {
+    assigneeId: ticket.assignee_id || null,
+  });
   const productTitle = String(ticket.product_title || "").trim();
   const customerName = String(ticket.customer_name || "Клиент").trim() || "Клиент";
   const subject = String(ticket.subject || "Новый вопрос в поддержку").trim() ||
@@ -332,7 +376,7 @@ async function createSupportInboxNotifications({ tenantId, ticket, eventName }) 
   if (productTitle) {
     bodyParts.push(`Товар: ${productTitle}`);
   }
-  bodyParts.push(`Статус: ${status}`);
+  bodyParts.push(`Статус: ${statusLabel}`);
   const body = bodyParts.join(" • ");
 
   for (const recipient of recipients) {
@@ -784,7 +828,8 @@ async function openOrReuseSupportTicket(
   );
 
   return {
-    ticket: ticketRes.rowCount > 0 ? ticketRes.rows[0] : null,
+    ticket:
+      ticketRes.rowCount > 0 ? decorateSupportTicketRow(ticketRes.rows[0]) : null,
     chat: chatRecord,
     category,
     createdChat,
@@ -939,6 +984,39 @@ async function ensureAdminCreatorMembers(client, chatId, tenantId = null) {
     );
   }
 }
+
+router.get("/faq", authMiddleware, async (req, res) => {
+  try {
+    const category = normalizeSupportCategory(req.query?.category, "");
+    const rows = await db.query(
+      `SELECT id,
+              tenant_id,
+              category,
+              question,
+              answer,
+              keywords,
+              sort_order,
+              is_active,
+              created_at,
+              updated_at
+       FROM support_faq_entries
+       WHERE is_active = true
+         AND (tenant_id = $1::uuid OR tenant_id IS NULL)
+         AND category = COALESCE(NULLIF($2, ''), category)
+       ORDER BY sort_order ASC, updated_at DESC, created_at DESC
+       LIMIT 120`,
+      [req.user?.tenant_id || null, category || ""],
+    );
+
+    return res.json({
+      ok: true,
+      data: rows.rows.map((row) => decorateFaqRow(row)),
+    });
+  } catch (err) {
+    console.error("support.faq.list error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
 
 router.post("/ask", authMiddleware, supportAskRateGuard, async (req, res) => {
   const message = normalizeText(req.body?.message);
@@ -1185,7 +1263,10 @@ router.get("/tickets", authMiddleware, async (req, res) => {
       params,
     );
 
-    return res.json({ ok: true, data: list.rows });
+    return res.json({
+      ok: true,
+      data: list.rows.map((row) => decorateSupportTicketRow(row)),
+    });
   } catch (err) {
     console.error("support.tickets.list error", err);
     return res.status(500).json({ ok: false, error: "Ошибка сервера" });
@@ -1235,7 +1316,10 @@ router.get("/tickets/queue", authMiddleware, async (req, res) => {
       [req.user.tenant_id || null],
     );
 
-    return res.json({ ok: true, data: list.rows });
+    return res.json({
+      ok: true,
+      data: list.rows.map((row) => decorateSupportTicketRow(row)),
+    });
   } catch (err) {
     console.error("support.tickets.queue error", err);
     return res.status(500).json({ ok: false, error: "Ошибка сервера" });
@@ -1382,6 +1466,104 @@ router.post("/tickets/:ticketId/claim", authMiddleware, ensureSupportStaffAccess
   }
 });
 
+router.post(
+  "/tickets/:ticketId/resolve",
+  authMiddleware,
+  ensureSupportStaffAccess,
+  async (req, res) => {
+    const ticketId = normalizeText(req.params.ticketId);
+    if (!ticketId) {
+      return res.status(400).json({ ok: false, error: "ticketId обязателен" });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const ticketRes = await client.query(
+        `SELECT st.*,
+                c.settings AS chat_settings
+         FROM support_tickets st
+         JOIN chats c ON c.id = st.chat_id
+         WHERE st.id = $1
+           AND ($2::uuid IS NULL OR st.tenant_id = $2::uuid)
+         LIMIT 1
+         FOR UPDATE`,
+        [ticketId, req.user.tenant_id || null],
+      );
+
+      if (ticketRes.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Тикет не найден" });
+      }
+
+      const ticket = ticketRes.rows[0];
+      const requesterId = String(req.user.id || "").trim();
+      const isAssignee = String(ticket.assignee_id || "").trim() === requesterId;
+
+      if (!isAssignee) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          error: "Отметить вопрос как решённый может только назначенный сотрудник поддержки",
+        });
+      }
+
+      await client.query(
+        `UPDATE support_tickets
+         SET status = 'resolved',
+             resolved_by = $1::uuid,
+             resolved_at = now(),
+             archived_at = NULL,
+             archive_reason = NULL,
+             updated_at = now()
+         WHERE id = $2`,
+        [req.user.id || null, ticket.id],
+      );
+
+      const promptMessage = await insertSupportMessage(client, {
+        chatId: ticket.chat_id,
+        senderId: null,
+        text:
+          "Мы отметили обращение как решённое. Подтвердите, пожалуйста: вопрос решён или нужна ещё помощь?",
+        meta: {
+          kind: "support_feedback_prompt",
+          support_ticket_id: ticket.id,
+          feedback_status: "pending",
+        },
+      });
+
+      await client.query("COMMIT");
+
+      if (promptMessage?.id) {
+        await emitChatMessage(
+          req,
+          req.user.tenant_id || null,
+          promptMessage.chat_id,
+          promptMessage.id,
+        );
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          ticket_id: ticket.id,
+          status: "resolved",
+          status_display: buildSupportTicketStatusLabel("resolved"),
+          status_hint: buildSupportTicketStatusHint("resolved"),
+          can_customer_confirm_resolution: true,
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("support.ticket.resolve error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
 router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
   const ticketId = normalizeText(req.params.ticketId);
   const resolved = req.body?.resolved;
@@ -1461,18 +1643,18 @@ router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
     );
 
     const statusText = resolved
-      ? "Отлично, вопрос закрыт и отправлен в архив поддержки."
-      : "Поняли, вопрос снова открыт. Поддержка ответит в этом чате.";
+      ? "Спасибо. Закрываем обращение."
+      : "Поняли. Возвращаем обращение в работу, поддержка ответит в этом чате.";
 
-      const statusMessage = await insertSupportMessage(client, {
-        chatId: ticket.chat_id,
-        senderId: null,
-        text: resolved ? "Диалог закончен" : statusText,
-        meta: {
-          kind: "support_feedback_result",
-          support_ticket_id: ticket.id,
-          feedback_status: resolved ? "resolved" : "reopened",
-        },
+    const statusMessage = await insertSupportMessage(client, {
+      chatId: ticket.chat_id,
+      senderId: null,
+      text: statusText,
+      meta: {
+        kind: "support_feedback_result",
+        support_ticket_id: ticket.id,
+        feedback_status: resolved ? "resolved" : "reopened",
+      },
     });
 
     await client.query("COMMIT");
@@ -1503,6 +1685,12 @@ router.post("/tickets/:ticketId/feedback", authMiddleware, async (req, res) => {
       data: {
         ticket_id: ticket.id,
         status: nextStatus,
+        status_display: buildSupportTicketStatusLabel(nextStatus, {
+          assigneeId: resolved ? ticket.assignee_id || req.user.id : ticket.assignee_id,
+        }),
+        status_hint: buildSupportTicketStatusHint(nextStatus, {
+          assigneeId: resolved ? ticket.assignee_id || req.user.id : ticket.assignee_id,
+        }),
       },
     });
   } catch (err) {
@@ -1610,6 +1798,8 @@ router.post(
         data: {
           ticket_id: ticket.id,
           status: "archived",
+          status_display: buildSupportTicketStatusLabel("archived"),
+          status_hint: buildSupportTicketStatusHint("archived"),
         },
       });
     } catch (err) {
