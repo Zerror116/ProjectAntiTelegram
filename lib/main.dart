@@ -129,6 +129,7 @@ class _AppUpdateInfo {
   final String title;
   final String? message;
   final String? downloadUrl;
+  final String? landingUrl;
   final String? changelog;
   final String? channel;
   final String? publishedAt;
@@ -145,6 +146,7 @@ class _AppUpdateInfo {
     required this.title,
     required this.message,
     required this.downloadUrl,
+    required this.landingUrl,
     required this.changelog,
     required this.channel,
     required this.publishedAt,
@@ -1437,8 +1439,12 @@ String _fallbackInstallerNameForPlatform(
 Future<bool> _downloadAndInstallAndroidUpdate({
   required _AppUpdateInfo info,
 }) async {
+  final fallbackUri = _resolveAndroidFallbackUpdateUri(info);
   final envelope = info.androidManifestEnvelope;
   if (envelope == null) {
+    if (fallbackUri != null) {
+      return _openAndroidFallbackUpdateUri(fallbackUri);
+    }
     showGlobalAppNotice(
       'Manifest обновления не настроен на сервере. Попробуйте позже.',
       title: 'Обновление Феникс',
@@ -1499,6 +1505,9 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       envelope,
     );
     if (!started) {
+      if (fallbackUri != null) {
+        return _openAndroidFallbackUpdateUri(fallbackUri);
+      }
       return false;
     }
 
@@ -1613,6 +1622,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                           state.isDownloading ||
                           state.isVerifying ||
                           state.isInstalling;
+                      final canUseBrowserFallback =
+                          state.isFailed && fallbackUri != null;
 
                       return Column(
                         mainAxisSize: MainAxisSize.min,
@@ -1853,6 +1864,28 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                                   icon: const Icon(Icons.refresh_rounded),
                                   label: const Text('Продолжить загрузку'),
                                 )
+                              else if (canUseBrowserFallback)
+                                FilledButton.icon(
+                                  onPressed: () async {
+                                    final opened =
+                                        await _openAndroidFallbackUpdateUri(
+                                          fallbackUri,
+                                        );
+                                    if (!opened) {
+                                      showGlobalAppNotice(
+                                        'Не удалось открыть страницу загрузки. Попробуйте ещё раз.',
+                                        title: 'Обновление Феникс',
+                                        tone: AppNoticeTone.error,
+                                      );
+                                    }
+                                  },
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: Colors.white,
+                                    foregroundColor: const Color(0xFF0F6667),
+                                  ),
+                                  icon: const Icon(Icons.open_in_browser),
+                                  label: const Text('Скачать через сайт'),
+                                )
                               else if (state.readyToInstall)
                                 FilledButton.icon(
                                   onPressed: handleInstallRequest,
@@ -1907,6 +1940,21 @@ Future<bool> _downloadAndInstallAndroidUpdate({
     poller?.cancel();
     statusNotifier.dispose();
     _nativeAndroidUpdateBusy = false;
+  }
+}
+
+Uri? _resolveAndroidFallbackUpdateUri(_AppUpdateInfo info) {
+  final landingRaw = (info.landingUrl ?? '').trim();
+  final downloadRaw = (info.downloadUrl ?? '').trim();
+  return _resolveUpdateUri(landingRaw.isNotEmpty ? landingRaw : downloadRaw);
+}
+
+Future<bool> _openAndroidFallbackUpdateUri(Uri? uri) async {
+  if (uri == null) return false;
+  try {
+    return await launchUrl(uri, mode: LaunchMode.externalApplication);
+  } catch (_) {
+    return false;
   }
 }
 
@@ -2085,6 +2133,7 @@ Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
   final title = (platformConfig['title'] ?? '').toString().trim();
   final message = (platformConfig['message'] ?? '').toString().trim();
   final downloadUrl = (platformConfig['download_url'] ?? '').toString().trim();
+  final landingUrl = (platformConfig['landing_url'] ?? '').toString().trim();
   final changelog = (platformConfig['changelog'] ?? '').toString().trim();
   final channel = (platformConfig['channel'] ?? '').toString().trim();
   final publishedAt = (platformConfig['published_at'] ?? '').toString().trim();
@@ -2186,6 +2235,7 @@ Future<_AppUpdateInfo?> _fetchAppUpdateInfo() async {
     title: resolvedTitle,
     message: resolvedMessage,
     downloadUrl: resolvedDownloadUrl,
+    landingUrl: landingUrl.isNotEmpty ? landingUrl : null,
     changelog: resolvedChangelog,
     channel: resolvedChannel,
     publishedAt: resolvedPublishedAt,
