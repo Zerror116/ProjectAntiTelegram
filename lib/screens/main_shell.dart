@@ -21,7 +21,6 @@ import 'profile_screen.dart';
 import 'pwa_guide_screen.dart';
 import 'settings_screen.dart';
 import 'stats_dashboard_screen.dart';
-import 'system_tests_screen.dart';
 import 'worker_panel.dart';
 
 class _ShellDestination {
@@ -157,7 +156,6 @@ class _MainShellState extends State<MainShell> {
         normalized == 'tenant' ||
         normalized == 'creator';
     final showNotifications = normalized == 'creator';
-    final showTests = _isCreatorNativeView();
     return <String>[
       'chats',
       'cart',
@@ -167,7 +165,6 @@ class _MainShellState extends State<MainShell> {
       if (showNotifications) 'notifications',
       'profile',
       'settings',
-      if (showTests) 'tests',
     ];
   }
 
@@ -233,10 +230,6 @@ class _MainShellState extends State<MainShell> {
     ]);
   }
 
-  bool _hasTestsTab() {
-    return _isCreatorNativeView();
-  }
-
   bool _hasNotificationsTab() {
     const roles = {'creator'};
     final role = _effectiveRole();
@@ -281,7 +274,6 @@ class _MainShellState extends State<MainShell> {
       showAdmin: _hasAdminTab(),
       showStats: _hasStatsTab(),
       showWorker: _hasWorkerTab(),
-      showTests: _hasTestsTab(),
     );
     final nextIndex = destinations.indexWhere(
       (destination) => destination.id == requestedId,
@@ -519,7 +511,6 @@ class _MainShellState extends State<MainShell> {
     required bool showAdmin,
     required bool showStats,
     required bool showWorker,
-    required bool showTests,
   }) {
     return <_ShellDestination>[
       const _ShellDestination(
@@ -582,14 +573,6 @@ class _MainShellState extends State<MainShell> {
         builder: _buildSettingsScreen,
         priority: 40,
       ),
-      if (showTests)
-        const _ShellDestination(
-          id: 'tests',
-          label: 'Тесты',
-          icon: Icons.science_outlined,
-          builder: _buildTestsScreen,
-          priority: 20,
-        ),
     ];
   }
 
@@ -605,8 +588,6 @@ class _MainShellState extends State<MainShell> {
       const ProfileScreen();
   static Widget _buildSettingsScreen(BuildContext context) =>
       const SettingsScreen();
-  static Widget _buildTestsScreen(BuildContext context) =>
-      const SystemTestsScreen();
   static Widget _buildEmptyScreen(BuildContext context) =>
       const SizedBox.shrink();
 
@@ -841,14 +822,12 @@ class _MainShellState extends State<MainShell> {
         final showAdmin = _hasAdminTab();
         final showStats = _hasStatsTab();
         final showWorker = _hasWorkerTab();
-        final showTests = _hasTestsTab();
         final effectiveRole = _effectiveRole();
 
         final destinations = _buildDestinations(
           showAdmin: showAdmin,
           showStats: showStats,
           showWorker: showWorker,
-          showTests: showTests,
         );
         if (_index >= destinations.length) _index = destinations.length - 1;
         if (destinations.isNotEmpty) {

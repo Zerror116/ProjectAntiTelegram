@@ -47,6 +47,7 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _magicLinkEnabled = false;
   bool _emailRecoveryStatusLoaded = false;
   bool _registrationEmailCodeEnabled = false;
+  bool _showPassword = false;
 
   late final AuthService _authService;
 
@@ -588,25 +589,57 @@ class _AuthScreenState extends State<AuthScreen> {
         context: context,
         barrierDismissible: false,
         builder: (dialogContext) {
+          var showNewPassword = false;
+          var showConfirmPassword = false;
           return AlertDialog(
             title: const Text('Новый пароль'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: newPasswordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: 'Новый пароль'),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: confirmPasswordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Повторите пароль',
+            content: StatefulBuilder(
+              builder: (context, setDialogState) => Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: newPasswordController,
+                    obscureText: !showNewPassword,
+                    decoration: InputDecoration(
+                      labelText: 'Новый пароль',
+                      suffixIcon: IconButton(
+                        tooltip:
+                            showNewPassword ? 'Скрыть пароль' : 'Показать пароль',
+                        onPressed: () => setDialogState(
+                          () => showNewPassword = !showNewPassword,
+                        ),
+                        icon: Icon(
+                          showNewPassword
+                              ? Icons.visibility_off_outlined
+                              : Icons.visibility_outlined,
+                        ),
+                      ),
+                    ),
                   ),
-                ),
-              ],
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: confirmPasswordController,
+                    obscureText: !showConfirmPassword,
+                    decoration: InputDecoration(
+                      labelText: 'Повторите пароль',
+                      suffixIcon: IconButton(
+                        tooltip: showConfirmPassword
+                            ? 'Скрыть пароль'
+                            : 'Показать пароль',
+                        onPressed: () => setDialogState(
+                          () =>
+                              showConfirmPassword = !showConfirmPassword,
+                        ),
+                        icon: Icon(
+                          showConfirmPassword
+                              ? Icons.visibility_off_outlined
+                              : Icons.visibility_outlined,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
             actions: [
               TextButton(
@@ -1295,10 +1328,25 @@ class _AuthScreenState extends State<AuthScreen> {
                     TextFormField(
                       controller: _passwordController,
                       decoration: withInputLanguageBadge(
-                        const InputDecoration(labelText: 'Пароль'),
+                        InputDecoration(
+                          labelText: 'Пароль',
+                          suffixIcon: IconButton(
+                            tooltip: _showPassword
+                                ? 'Скрыть пароль'
+                                : 'Показать пароль',
+                            onPressed: () {
+                              setState(() => _showPassword = !_showPassword);
+                            },
+                            icon: Icon(
+                              _showPassword
+                                  ? Icons.visibility_off_outlined
+                                  : Icons.visibility_outlined,
+                            ),
+                          ),
+                        ),
                         controller: _passwordController,
                       ),
-                      obscureText: true,
+                      obscureText: !_showPassword,
                       validator: (v) {
                         if (v == null || v.isEmpty) return 'Введите пароль';
                         if (v.length < 8) {
