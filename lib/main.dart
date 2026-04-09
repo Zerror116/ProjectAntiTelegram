@@ -3722,6 +3722,9 @@ Future<void> _handleIncomingNotificationPayload(
   }
 
   final category = (map['category'] ?? '').toString().trim().toLowerCase();
+  if (kIsWeb && category == 'updates') {
+    return;
+  }
   final context = navigatorKey.currentContext;
   final deepLink = _notificationDeepLink(map);
   final nestedPayload = _notificationMetaPayload(map);

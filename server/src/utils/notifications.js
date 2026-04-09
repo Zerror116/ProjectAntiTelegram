@@ -1047,6 +1047,12 @@ async function maybeSendWebPushForItem(user, item, preferences) {
   const payloadMeta = normalizeJsonMap(item.payload);
   const isTestPromo = category === "promo" && payloadMeta.test_only === true;
 
+  // Web/PWA should not receive app-update notifications. Android APK update
+  // prompts are handled on native builds; web users should not be spammed.
+  if (category === "updates") {
+    return { sent: 0, state: "skipped", reason: "web_updates_disabled" };
+  }
+
   if (!isDigestSummary && category === "promo") {
     const todayCount = await countNonUrgentEventsForToday(user.id, "promo");
     if (todayCount > preferences.frequency_caps.promo_per_day) {
