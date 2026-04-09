@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../src/utils/device_utils.dart';
+import '../src/utils/local_time_zone.dart';
 import 'native_update_installer.dart';
 import 'web_notification_service.dart';
 import 'web_push_client_service.dart';
@@ -78,7 +79,7 @@ class NotificationDeviceService {
           'capabilities': _capabilities(),
           'app_version': '${packageInfo.version}+${packageInfo.buildNumber}',
           'locale': locale,
-          'timezone': DateTime.now().timeZoneName,
+          'timezone': await resolveLocalTimeZoneId(),
         },
       );
     } catch (e) {

@@ -10,6 +10,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../src/utils/device_utils.dart';
+import '../src/utils/local_time_zone.dart';
 import 'firebase_runtime_options.dart';
 import 'native_update_installer.dart';
 
@@ -276,7 +277,7 @@ class NativePushService {
           'capabilities': _capabilities(),
           'app_version': '${packageInfo.version}+${packageInfo.buildNumber}',
           'locale': PlatformDispatcher.instance.locale.toLanguageTag(),
-          'timezone': DateTime.now().timeZoneName,
+          'timezone': await resolveLocalTimeZoneId(),
         },
       );
     } catch (e) {

@@ -27,10 +27,10 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     text: 'Имя',
   );
   final TextEditingController _oversizeTitleController = TextEditingController(
-    text: 'Комод белый',
+    text: 'Габарит',
   );
   final TextEditingController _oversizePriceController = TextEditingController(
-    text: '3 500 ₽',
+    text: '0 ₽',
   );
 
   bool _printingRegular = false;
