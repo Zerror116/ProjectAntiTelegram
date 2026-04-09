@@ -141,6 +141,75 @@ function normalizeClock(raw) {
   return normalized;
 }
 
+const TIMEZONE_ALIAS_MAP = new Map([
+  ["самара, стандартное время", "Europe/Samara"],
+  ["samara standard time", "Europe/Samara"],
+  ["азербайджан, стандартное время", "Asia/Baku"],
+  ["azerbaijan standard time", "Asia/Baku"],
+]);
+
+function isValidTimeZone(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return false;
+  try {
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: value,
+      year: "numeric",
+    }).format(new Date());
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function timeZoneFromOffsetString(raw) {
+  const normalized = String(raw || "")
+    .trim()
+    .replace(/\s+/g, "")
+    .toUpperCase();
+  if (!normalized) return null;
+  if (normalized === "UTC" || normalized === "GMT") {
+    return "UTC";
+  }
+  const match = normalized.match(/^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$/i);
+  if (!match) return null;
+  const sign = match[1] === "+" ? 1 : -1;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3] || "0");
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) {
+    return null;
+  }
+  if (hours > 14 || minutes > 59 || minutes !== 0) {
+    return null;
+  }
+  if (hours === 0) {
+    return "UTC";
+  }
+  const etcSign = sign > 0 ? "-" : "+";
+  return `Etc/GMT${etcSign}${hours}`;
+}
+
+function canonicalizeNotificationTimeZone(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return null;
+  if (isValidTimeZone(trimmed)) {
+    return trimmed;
+  }
+  const alias = TIMEZONE_ALIAS_MAP.get(trimmed.toLowerCase());
+  if (alias && isValidTimeZone(alias)) {
+    return alias;
+  }
+  const offsetZone = timeZoneFromOffsetString(trimmed);
+  if (offsetZone && isValidTimeZone(offsetZone)) {
+    return offsetZone;
+  }
+  return null;
+}
+
+function normalizeNotificationTimeZone(raw, fallback = "UTC") {
+  return canonicalizeNotificationTimeZone(raw) || fallback;
+}
+
 function withinQuietHours({ enabled, from, to, now = new Date() }) {
   if (!enabled || !from || !to) return false;
   const [fromH, fromM] = from.split(":").map((x) => Number(x));
@@ -645,7 +714,7 @@ async function upsertNotificationEndpoint({
   const normalizedCapabilities = normalizeJsonMap(capabilities);
   const normalizedAppVersion = String(appVersion || "").trim() || null;
   const normalizedLocale = String(locale || "").trim() || null;
-  const normalizedTimezone = String(timezone || "").trim() || null;
+  const normalizedTimezone = canonicalizeNotificationTimeZone(timezone);
   const normalizedUserAgent = String(userAgent || "").trim() || null;
 
   let existing = null;
@@ -1744,8 +1813,9 @@ async function dispatchPromotionCampaign({ actor, title, body, deepLink, media =
 }
 
 function getLocalTimeParts(timeZone, now = new Date()) {
+  const safeTimeZone = normalizeNotificationTimeZone(timeZone);
   const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
+    timeZone: safeTimeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -1793,7 +1863,7 @@ function clockToMinutes(rawClock, fallbackMinutes) {
 
 async function resolveNotificationTimezone(userId) {
   const endpointQ = await db.query(
-    `SELECT timezone
+    `SELECT id, timezone
        FROM notification_endpoints
       WHERE user_id = $1
         AND is_active = true
@@ -1803,8 +1873,27 @@ async function resolveNotificationTimezone(userId) {
       LIMIT 1`,
     [userId],
   );
-  const timezone = String(endpointQ.rows?.[0]?.timezone || "").trim();
-  return timezone || "UTC";
+  const endpoint = endpointQ.rows?.[0] || null;
+  const rawTimezone = String(endpoint?.timezone || "").trim();
+  const normalizedTimezone = canonicalizeNotificationTimeZone(rawTimezone);
+  if (endpoint?.id && rawTimezone && normalizedTimezone && normalizedTimezone !== rawTimezone) {
+    await db.query(
+      `UPDATE notification_endpoints
+          SET timezone = $2,
+              updated_at = now()
+        WHERE id = $1`,
+      [endpoint.id, normalizedTimezone],
+    );
+  } else if (endpoint?.id && rawTimezone && !normalizedTimezone) {
+    await db.query(
+      `UPDATE notification_endpoints
+          SET timezone = NULL,
+              updated_at = now()
+        WHERE id = $1`,
+      [endpoint.id],
+    );
+  }
+  return normalizedTimezone || "UTC";
 }
 
 async function recordNotificationDigestRun({
