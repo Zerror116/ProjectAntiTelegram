@@ -16,6 +16,9 @@ import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -704,13 +707,46 @@ object PhoenixManagedUpdateEngine {
             return false
         }
         return try {
-            val verifier = Signature.getInstance("Ed25519")
-            verifier.initVerify(loadPublicKey())
-            verifier.update(canonicalJson(envelope.manifest).toByteArray(Charsets.UTF_8))
-            verifier.verify(Base64.decode(envelope.signature, Base64.DEFAULT))
+            val canonicalBytes = canonicalJson(envelope.manifest).toByteArray(Charsets.UTF_8)
+            val signatureBytes = Base64.decode(envelope.signature, Base64.DEFAULT)
+            try {
+                verifyEnvelopeWithJca(canonicalBytes, signatureBytes)
+            } catch (jcaError: Throwable) {
+                val verified = verifyEnvelopeWithBouncyCastle(canonicalBytes, signatureBytes)
+                if (verified) {
+                    Log.i(
+                        UPDATE_LOG_TAG,
+                        "manifest_verify_ok provider=bouncycastle sdk=${Build.VERSION.SDK_INT} reason=${jcaError.javaClass.simpleName}",
+                    )
+                }
+                verified
+            }
         } catch (_: Throwable) {
             false
         }
+    }
+
+    private fun verifyEnvelopeWithJca(
+        canonicalBytes: ByteArray,
+        signatureBytes: ByteArray,
+    ): Boolean {
+        val verifier = Signature.getInstance("Ed25519")
+        verifier.initVerify(loadPublicKey())
+        verifier.update(canonicalBytes)
+        return verifier.verify(signatureBytes)
+    }
+
+    private fun verifyEnvelopeWithBouncyCastle(
+        canonicalBytes: ByteArray,
+        signatureBytes: ByteArray,
+    ): Boolean {
+        val verifier = Ed25519Signer()
+        verifier.init(
+            false,
+            Ed25519PublicKeyParameters(loadEd25519PublicKeyBytes(), 0),
+        )
+        verifier.update(canonicalBytes, 0, canonicalBytes.size)
+        return verifier.verifySignature(signatureBytes)
     }
 
     private fun loadPublicKey(): java.security.PublicKey {
@@ -721,6 +757,18 @@ object PhoenixManagedUpdateEngine {
             .trim()
         val keySpec = X509EncodedKeySpec(Base64.decode(pem, Base64.DEFAULT))
         return KeyFactory.getInstance("Ed25519").generatePublic(keySpec)
+    }
+
+    private fun loadEd25519PublicKeyBytes(): ByteArray {
+        val pem = BuildConfig.UPDATE_MANIFEST_PUBLIC_KEY
+            .replace("-----BEGIN PUBLIC KEY-----", "")
+            .replace("-----END PUBLIC KEY-----", "")
+            .replace("\n", "")
+            .trim()
+        val subjectPublicKeyInfo = SubjectPublicKeyInfo.getInstance(
+            Base64.decode(pem, Base64.DEFAULT),
+        )
+        return subjectPublicKeyInfo.publicKeyData.bytes
     }
 
     private fun isAllowedDownloadUrl(rawUrl: String): Boolean {

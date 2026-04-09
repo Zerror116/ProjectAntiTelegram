@@ -137,4 +137,5 @@ flutter {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    implementation("org.bouncycastle:bcprov-jdk15to18:1.83")
 }
