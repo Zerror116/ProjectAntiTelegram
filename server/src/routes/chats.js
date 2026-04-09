@@ -4400,6 +4400,8 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
        JOIN chat_members m1 ON m1.chat_id = c.id AND m1.user_id = $1
        JOIN chat_members m2 ON m2.chat_id = c.id AND m2.user_id = $2
        WHERE c.type = 'private'
+         AND COALESCE(c.settings->>'kind', '') <> 'support_ticket'
+         AND COALESCE((c.settings->>'support_ticket')::boolean, false) = false
          AND ($3::uuid IS NULL OR c.tenant_id = $3::uuid)
          AND NOT EXISTS (
            SELECT 1
