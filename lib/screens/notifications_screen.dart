@@ -721,7 +721,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                                 ),
                                 ValueListenableBuilder<int>(
                                   valueListenable:
-                                      notificationBadgeCountNotifier,
+                                      notificationInboxBadgeCountNotifier,
                                   builder: (context, badgeCount, _) {
                                     return Chip(
                                       label: Text('Счётчик: $badgeCount'),

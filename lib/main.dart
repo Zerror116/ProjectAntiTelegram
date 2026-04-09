@@ -53,6 +53,8 @@ final StreamController<Map<String, dynamic>> notificationEventsController =
     StreamController<Map<String, dynamic>>.broadcast();
 final ValueNotifier<bool> notificationsEnabledNotifier = ValueNotifier(true);
 final ValueNotifier<int> notificationBadgeCountNotifier = ValueNotifier<int>(0);
+final ValueNotifier<int> notificationInboxBadgeCountNotifier =
+    ValueNotifier<int>(0);
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(
   ThemeMode.light,
 );
@@ -3067,9 +3069,15 @@ void _setNotificationBadgeCount(int count, {bool syncWebBadge = true}) {
   }
 }
 
+void _setNotificationInboxBadgeCount(int count) {
+  final normalized = count < 0 ? 0 : count;
+  notificationInboxBadgeCountNotifier.value = normalized;
+}
+
 Future<void> refreshNotificationBadgeCount() async {
   if (authService.currentUser == null) {
     _setNotificationBadgeCount(0, syncWebBadge: false);
+    _setNotificationInboxBadgeCount(0);
     return;
   }
   try {
@@ -3083,7 +3091,13 @@ Future<void> refreshNotificationBadgeCount() async {
             root['unread_count'] ?? data['unread_count'] ?? 0,
           )
         : 0;
+    final inboxUnreadCount = root is Map
+        ? _notificationUnreadCountFrom(
+            root['inbox_unread_count'] ?? data['inbox_unread_count'] ?? 0,
+          )
+        : 0;
     _setNotificationBadgeCount(unreadCount, syncWebBadge: false);
+    _setNotificationInboxBadgeCount(inboxUnreadCount);
     if (kIsWeb) {
       unawaited(WebPushClientService.syncUnreadBadge(dio));
     }
@@ -3462,10 +3476,16 @@ Future<void> _handleIncomingNotificationPayload(
   final unreadCount = _notificationUnreadCountFrom(
     map['badge_count'] ?? map['unread_count'] ?? 0,
   );
+  final inboxUnreadCount = _notificationUnreadCountFrom(
+    map['inbox_unread_count'] ?? 0,
+  );
   if (unreadCount > 0 ||
       map.containsKey('badge_count') ||
       map.containsKey('unread_count')) {
     _setNotificationBadgeCount(unreadCount);
+  }
+  if (inboxUnreadCount > 0 || map.containsKey('inbox_unread_count')) {
+    _setNotificationInboxBadgeCount(inboxUnreadCount);
   }
 
   notificationEventsController.add({
@@ -3570,7 +3590,13 @@ void _handleSocketNotificationBadge(dynamic data) {
   final unreadCount = _notificationUnreadCountFrom(
     map['unread_count'] ?? map['badge_count'] ?? 0,
   );
+  final inboxUnreadCount = _notificationUnreadCountFrom(
+    map['inbox_unread_count'] ?? 0,
+  );
   _setNotificationBadgeCount(unreadCount);
+  if (map.containsKey('inbox_unread_count')) {
+    _setNotificationInboxBadgeCount(inboxUnreadCount);
+  }
   notificationEventsController.add({'type': 'notification:badge', 'data': map});
 }
 
@@ -3593,8 +3619,14 @@ void _handleSocketNotificationRead(dynamic data) {
   final unreadCount = _notificationUnreadCountFrom(
     map['unread_count'] ?? map['badge_count'] ?? 0,
   );
+  final inboxUnreadCount = _notificationUnreadCountFrom(
+    map['inbox_unread_count'] ?? 0,
+  );
   if (map.containsKey('unread_count') || map.containsKey('badge_count')) {
     _setNotificationBadgeCount(unreadCount);
+  }
+  if (map.containsKey('inbox_unread_count')) {
+    _setNotificationInboxBadgeCount(inboxUnreadCount);
   }
   notificationEventsController.add({'type': 'notification:read', 'data': map});
 }

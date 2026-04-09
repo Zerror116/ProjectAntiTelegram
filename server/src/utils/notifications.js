@@ -918,6 +918,22 @@ async function computeNotificationBadgeCount(userId) {
     return 0;
   }
   const chatUnread = badgePrefs.count_chat ? await computeChatUnreadCount(userId) : 0;
+  const inboxCount = await computeNotificationInboxBadgeCount(userId, {
+    user,
+    preferences,
+  });
+  return chatUnread + inboxCount;
+}
+
+async function computeNotificationInboxBadgeCount(
+  userId,
+  { user: providedUser = null, preferences: providedPreferences = null } = {},
+) {
+  const user = providedUser || await getNotificationUser(userId);
+  if (!user) return 0;
+  const preferences =
+    providedPreferences || await getNotificationPreferencesForUser(user);
+  const badgePrefs = preferences.badge_preferences;
   const inboxQ = await db.query(
     `SELECT category, COUNT(*)::int AS count
        FROM notification_inbox_items
@@ -939,10 +955,10 @@ async function computeNotificationBadgeCount(userId) {
     if (category === "promo" && badgePrefs.count_promo) inboxCount += count;
     if (category === "updates" && badgePrefs.count_updates) inboxCount += count;
   }
-  return chatUnread + inboxCount;
+  return inboxCount;
 }
 
-function buildSocketPayload(item, badgeCount) {
+function buildSocketPayload(item, badgeCount, inboxUnreadCount = 0) {
   const media = normalizeJsonMap(item.media);
   const payload = normalizeJsonMap(item.payload);
   return {
@@ -956,6 +972,7 @@ function buildSocketPayload(item, badgeCount) {
     payload,
     inbox_item_id: String(item.id || "").trim(),
     badge_count: badgeCount,
+    inbox_unread_count: inboxUnreadCount,
     force_show: item.force_show === true,
     created_at: item.created_at || null,
     campaign_id: item.campaign_id ? String(item.campaign_id) : null,
@@ -1055,7 +1072,11 @@ async function maybeSendWebPushForItem(user, item, preferences) {
   }
 
   const badgeCount = await computeNotificationBadgeCount(user.id);
-  const payload = buildSocketPayload(item, badgeCount);
+  const inboxUnreadCount = await computeNotificationInboxBadgeCount(user.id, {
+    user,
+    preferences,
+  });
+  const payload = buildSocketPayload(item, badgeCount, inboxUnreadCount);
   payload.type = category;
   payload.url = payload.deep_link || "/";
   payload.badgeCount = badgeCount;
@@ -1423,9 +1444,19 @@ async function createNotificationInboxItem({
     const io = global.__projectPhoenixSocketIo;
     if (io) {
       const badgeCount = await computeNotificationBadgeCount(user.id);
-      emitToUser(io, user.id, "notification:new", buildSocketPayload(row, badgeCount));
+      const inboxUnreadCount = await computeNotificationInboxBadgeCount(
+        user.id,
+        { user },
+      );
+      emitToUser(
+        io,
+        user.id,
+        "notification:new",
+        buildSocketPayload(row, badgeCount, inboxUnreadCount),
+      );
       emitToUser(io, user.id, "notification:badge", {
         unread_count: badgeCount,
+        inbox_unread_count: inboxUnreadCount,
       });
     }
   }
@@ -1464,10 +1495,18 @@ async function markNotificationInboxItemRead({ userId, itemId }) {
   const row = q.rows[0] || null;
   if (row) {
     const badgeCount = await computeNotificationBadgeCount(userId);
+    const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
     const io = global.__projectPhoenixSocketIo;
     if (io) {
-      emitToUser(io, userId, "notification:read", { id: itemId, unread_count: badgeCount });
-      emitToUser(io, userId, "notification:badge", { unread_count: badgeCount });
+      emitToUser(io, userId, "notification:read", {
+        id: itemId,
+        unread_count: badgeCount,
+        inbox_unread_count: inboxUnreadCount,
+      });
+      emitToUser(io, userId, "notification:badge", {
+        unread_count: badgeCount,
+        inbox_unread_count: inboxUnreadCount,
+      });
     }
   }
   return row;
@@ -1511,10 +1550,18 @@ async function markNotificationInboxItemOpened({ userId, itemId }) {
   }
 
   const badgeCount = await computeNotificationBadgeCount(userId);
+  const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
   const io = global.__projectPhoenixSocketIo;
   if (io) {
-    emitToUser(io, userId, "notification:read", { id: itemId, unread_count: badgeCount });
-    emitToUser(io, userId, "notification:badge", { unread_count: badgeCount });
+    emitToUser(io, userId, "notification:read", {
+      id: itemId,
+      unread_count: badgeCount,
+      inbox_unread_count: inboxUnreadCount,
+    });
+    emitToUser(io, userId, "notification:badge", {
+      unread_count: badgeCount,
+      inbox_unread_count: inboxUnreadCount,
+    });
   }
   return row;
 }
@@ -1530,9 +1577,13 @@ async function markAllNotificationInboxItemsRead({ userId }) {
     [userId],
   );
   const badgeCount = await computeNotificationBadgeCount(userId);
+  const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
   const io = global.__projectPhoenixSocketIo;
   if (io) {
-    emitToUser(io, userId, "notification:badge", { unread_count: badgeCount });
+    emitToUser(io, userId, "notification:badge", {
+      unread_count: badgeCount,
+      inbox_unread_count: inboxUnreadCount,
+    });
   }
   return badgeCount;
 }
@@ -2078,6 +2129,7 @@ module.exports = {
   upsertNotificationEndpoint,
   deactivateNotificationEndpoint,
   computeNotificationBadgeCount,
+  computeNotificationInboxBadgeCount,
   createNotificationInboxItem,
   listNotificationInbox,
   markNotificationInboxItemOpened,
