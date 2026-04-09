@@ -466,7 +466,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (_canViewChannelsTab())
         _AdminTabSpec(
           id: 'channels',
-          label: _isAdminViewRole() ? 'Каналы и промо' : 'Каналы',
+          label: 'Каналы',
           builder: _buildSettingsTab,
         ),
       if (_canViewPromotionsTab())
@@ -7280,26 +7280,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       child: ListView(
         padding: EdgeInsets.all(compact ? 10 : 16),
         children: [
-          if (_isAdminViewRole()) ...[
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.campaign_outlined),
-                title: const Text('Промо-рассылки'),
-                subtitle: const Text(
-                  'Реальные промо-кампании администратора по opt-in клиентам tenant.',
-                ),
-                trailing: const Icon(Icons.chevron_right_rounded),
-                onTap: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (_) => const AdminPromotionCenterScreen(),
-                    ),
-                  );
-                },
-              ),
-            ),
-            SizedBox(height: compact ? 8 : 12),
-          ],
           if (_channels.isEmpty)
             const Center(
               child: Padding(
