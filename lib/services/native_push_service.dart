@@ -173,7 +173,8 @@ class NativePushService {
       captureBackgroundTapPayload(launchPayload, coldStart: true);
     }
 
-    await syncCurrentEndpoint(dio);
+    // Не блокируем запуск приложения сетевой синхронизацией push endpoint.
+    unawaited(syncCurrentEndpoint(dio));
   }
 
   static Future<void> ensureInitializedForBackground() async {

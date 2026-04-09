@@ -469,6 +469,22 @@ Duration _bootstrapRetryDelay(int attemptIndex) {
   return Duration(milliseconds: 900 + (clamped * 1200));
 }
 
+bool _shouldBlockStartupOnServerHealth() {
+  return _isLoopbackApiBase(_runtimeApiBaseUrl);
+}
+
+Duration _startupHealthConnectTimeoutForBase(String base) {
+  return _isLoopbackApiBase(base)
+      ? const Duration(seconds: 3)
+      : const Duration(seconds: 2);
+}
+
+Duration _startupHealthReadTimeoutForBase(String base) {
+  return _isLoopbackApiBase(base)
+      ? const Duration(seconds: 4)
+      : const Duration(seconds: 2);
+}
+
 bool _isLoopbackApiBase(String base) {
   final uri = Uri.tryParse(base);
   final host = (uri?.host ?? '').toLowerCase().trim();
@@ -3943,14 +3959,17 @@ Future<bool> ensureDatabaseExists({int attempts = 4}) async {
     for (final base in candidates) {
       _setRuntimeApiBaseUrl(base);
       try {
+        final connectTimeout = _startupHealthConnectTimeoutForBase(base);
+        final readTimeout = _startupHealthReadTimeoutForBase(base);
         debugPrint(
           'ensureDatabaseExists: attempt=${attemptIndex + 1}/$totalAttempts checking /health at $base',
         );
         final health = await dio.get(
           '/health',
           options: Options(
-            sendTimeout: const Duration(seconds: 4),
-            receiveTimeout: const Duration(seconds: 4),
+            connectTimeout: connectTimeout,
+            sendTimeout: readTimeout,
+            receiveTimeout: readTimeout,
           ),
         );
         debugPrint(
@@ -3973,6 +3992,7 @@ Future<bool> ensureDatabaseExists({int attempts = 4}) async {
           final resp = await dio.post(
             '/api/setup',
             options: Options(
+              connectTimeout: const Duration(seconds: 4),
               sendTimeout: const Duration(seconds: 6),
               receiveTimeout: const Duration(seconds: 6),
             ),
@@ -4699,6 +4719,13 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Timer? _appUpdateProbeTimer;
   bool _appUpdateProbeBusy = false;
 
+  void _setFastStartupHomeIfNeeded(Widget next) {
+    if (!mounted || _home != null) return;
+    setState(() {
+      _home = next;
+    });
+  }
+
   void _showAuthScreen() {
     if (!mounted) return;
     setState(() {
@@ -5128,9 +5155,23 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   }
 
   Future<void> _startInit() async {
+    final shouldBlockOnServerHealth = _shouldBlockStartupOnServerHealth();
     try {
       authService = AuthService(dio: dio);
       _attachAuthInterceptor();
+      final hasStoredToken = await authService
+          .primeAuthHeaderFromStoredToken()
+          .timeout(const Duration(seconds: 1), onTimeout: () => false);
+      if (!shouldBlockOnServerHealth) {
+        final restoredUser = authService.currentUser;
+        if (hasStoredToken && restoredUser != null) {
+          _setFastStartupHomeIfNeeded(
+            _buildInitialScreenFromRestoredUser(restoredUser),
+          );
+        } else {
+          _setFastStartupHomeIfNeeded(const AuthScreen());
+        }
+      }
       await NativePushService.initialize(
         dio: dio,
         onNotificationOpen:
@@ -5144,16 +5185,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
             },
       );
       unawaited(inputLanguageService.initialize());
-      if (kIsWeb) {
-        final hasStoredToken = await authService
-            .primeAuthHeaderFromStoredToken()
-            .timeout(const Duration(seconds: 1), onTimeout: () => false);
-        if (hasStoredToken && mounted && _home == null) {
-          setState(() {
-            _home = const MainShell();
-          });
-        }
-      }
 
       // ✅ ИСПРАВЛЕНИЕ: Подписка на изменения аутентификации
       // При logout (user == null) отключаем socket
@@ -5196,7 +5227,12 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       debugPrint('Error attaching interceptor: $e\n$st');
     }
 
-    final dbReady = await ensureDatabaseExists();
+    final dbReady = shouldBlockOnServerHealth
+        ? await ensureDatabaseExists()
+        : true;
+    if (!shouldBlockOnServerHealth) {
+      unawaited(ensureDatabaseExists(attempts: 1));
+    }
 
     final initial = await determineInitialScreen(
       dbReady,
