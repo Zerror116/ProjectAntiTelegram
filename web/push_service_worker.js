@@ -15,6 +15,7 @@ self.addEventListener('activate', (event) => {
         .filter((key) => key.startsWith(RUNTIME_CACHE_PREFIX) && key !== IMAGE_RUNTIME_CACHE)
         .map((key) => caches.delete(key)),
     );
+    await syncBadge(0);
     await self.clients.claim();
   })());
 });

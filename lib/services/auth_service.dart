@@ -4,9 +4,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:dio/dio.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../src/utils/device_utils.dart';
 import 'notification_device_service.dart';
 import 'native_push_service.dart';
@@ -176,6 +177,8 @@ class AuthService {
   String? _tenantCodeCache;
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   Completer<bool>? _sessionRefreshCompleter;
+  bool _preferSharedPrefsSecretStore = false;
+  bool _loggedSharedPrefsSecretFallback = false;
 
   String _normalizeTenantCodeScope(String? value) {
     final normalized = (value ?? '').trim().toLowerCase();
@@ -185,30 +188,101 @@ class AuthService {
 
   AuthService({required this.dio});
 
+  bool _isDesktopPlatform() {
+    if (kIsWeb) return false;
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+      case TargetPlatform.linux:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool _shouldFallbackToSharedPrefsSecretStore(Object error) {
+    if (!_isDesktopPlatform()) return false;
+    if (error is! PlatformException) return false;
+    final code = error.code.trim();
+    final message = (error.message ?? '').toLowerCase().trim();
+    return code == '-34018' ||
+        message.contains('required entitlement') ||
+        message.contains('security result code') ||
+        message.contains('keychain');
+  }
+
+  void _enableSharedPrefsSecretStoreFallback(Object error) {
+    _preferSharedPrefsSecretStore = true;
+    if (_loggedSharedPrefsSecretFallback) return;
+    _loggedSharedPrefsSecretFallback = true;
+    debugPrint(
+      '⚠️ Secure storage unavailable on this desktop build, '
+      'falling back to local preferences: $error',
+    );
+  }
+
+  Future<void> _writeSharedSecret(String key, String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(key, value);
+  }
+
+  Future<String?> _readSharedSecret(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(key);
+  }
+
+  Future<void> _removeSharedSecret(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(key);
+  }
+
   Future<void> _writeSecret(String key, String value) async {
-    if (kIsWeb) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(key, value);
+    if (kIsWeb || _preferSharedPrefsSecretStore) {
+      await _writeSharedSecret(key, value);
       return;
     }
-    await _secureStorage.write(key: key, value: value);
+    try {
+      await _secureStorage.write(key: key, value: value);
+    } catch (error) {
+      if (_shouldFallbackToSharedPrefsSecretStore(error)) {
+        _enableSharedPrefsSecretStoreFallback(error);
+        await _writeSharedSecret(key, value);
+        return;
+      }
+      rethrow;
+    }
   }
 
   Future<String?> _readSecret(String key) async {
-    if (kIsWeb) {
-      final prefs = await SharedPreferences.getInstance();
-      return prefs.getString(key);
+    if (kIsWeb || _preferSharedPrefsSecretStore) {
+      return _readSharedSecret(key);
     }
-    return _secureStorage.read(key: key);
+    try {
+      return await _secureStorage.read(key: key);
+    } catch (error) {
+      if (_shouldFallbackToSharedPrefsSecretStore(error)) {
+        _enableSharedPrefsSecretStoreFallback(error);
+        return _readSharedSecret(key);
+      }
+      rethrow;
+    }
   }
 
   Future<void> _removeSecret(String key) async {
-    if (kIsWeb) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(key);
+    if (kIsWeb || _preferSharedPrefsSecretStore) {
+      await _removeSharedSecret(key);
       return;
     }
-    await _secureStorage.delete(key: key);
+    try {
+      await _secureStorage.delete(key: key);
+    } catch (error) {
+      if (_shouldFallbackToSharedPrefsSecretStore(error)) {
+        _enableSharedPrefsSecretStoreFallback(error);
+        await _removeSharedSecret(key);
+        return;
+      }
+      rethrow;
+    }
   }
 
   Future<String?> _readLegacyStoredToken() async {
@@ -228,7 +302,7 @@ class AuthService {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_legacyJwtKey);
-      if (!kIsWeb) {
+      if (!kIsWeb && !_preferSharedPrefsSecretStore) {
         await prefs.remove(_tokenKey);
       }
     } catch (_) {}

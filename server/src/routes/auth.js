@@ -3074,7 +3074,7 @@ router.post('/logout', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/sessions', authMiddleware, requireTenantOrCreator, async (req, res) => {
+router.get('/sessions', authMiddleware, async (req, res) => {
   try {
     const rows = await listUserSessions({
       queryable: db,
@@ -3088,7 +3088,7 @@ router.get('/sessions', authMiddleware, requireTenantOrCreator, async (req, res)
   }
 });
 
-router.post('/sessions/revoke_others', authMiddleware, requireTenantOrCreator, async (req, res) => {
+router.post('/sessions/revoke_others', authMiddleware, async (req, res) => {
   try {
     const revoked = await revokeOtherUserSessions({
       queryable: db,
@@ -3102,7 +3102,7 @@ router.post('/sessions/revoke_others', authMiddleware, requireTenantOrCreator, a
   }
 });
 
-router.delete('/sessions/:id', authMiddleware, requireTenantOrCreator, async (req, res) => {
+router.delete('/sessions/:id', authMiddleware, async (req, res) => {
   try {
     const sessionRecordId = String(req.params?.id || '').trim();
     if (!sessionRecordId) {
