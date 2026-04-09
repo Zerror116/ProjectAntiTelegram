@@ -9,6 +9,49 @@ import 'chat_api.dart';
 
 bool _initialNotificationDeepLinkConsumed = false;
 
+String? _shellSectionFromPath(String path) {
+  switch (path) {
+    case '':
+    case '/':
+    case '/home':
+    case '/main':
+    case '/chats':
+      return 'chats';
+    case '/cart':
+    case '/basket':
+      return 'cart';
+    case '/profile':
+      return 'profile';
+    case '/settings':
+      return 'settings';
+    case '/admin':
+      return 'admin';
+    case '/worker':
+      return 'worker';
+    case '/stats':
+      return 'stats';
+    case '/notifications':
+      return 'notifications';
+    default:
+      return null;
+  }
+}
+
+bool _canOpenShellSection(String sectionId) {
+  final role = authService.effectiveRole.toLowerCase().trim();
+  switch (sectionId) {
+    case 'notifications':
+      return role == 'creator';
+    case 'admin':
+    case 'stats':
+      return role == 'admin' || role == 'tenant' || role == 'creator';
+    case 'worker':
+      return role == 'worker' || role == 'tenant' || role == 'creator';
+    default:
+      return true;
+  }
+}
+
 Uri? _parseNotificationUri(String raw) {
   final trimmed = raw.trim();
   if (trimmed.isEmpty) return null;
@@ -178,6 +221,19 @@ Future<bool> openNotificationDeepLink(
 
   if (uri == null) return false;
   final path = uri.path.toLowerCase().trim();
+  final shellSection = _shellSectionFromPath(path);
+  if (shellSection != null) {
+    if (!_canOpenShellSection(shellSection)) {
+      showGlobalAppNotice(
+        'Этот раздел сейчас недоступен для выбранной роли.',
+        title: 'Уведомления',
+        tone: AppNoticeTone.info,
+      );
+      return false;
+    }
+    activeShellSectionNotifier.value = shellSection;
+    return true;
+  }
   if (path.contains('notification')) {
     if (!_canOpenNotificationCenter()) {
       showGlobalAppNotice(
