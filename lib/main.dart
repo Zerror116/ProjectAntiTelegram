@@ -3822,6 +3822,42 @@ bool _isAuthEndpoint(RequestOptions options) {
       path.contains('/register');
 }
 
+Future<Response<dynamic>> _retryRequestWithFreshAuth(
+  RequestOptions requestOptions,
+) async {
+  final nextHeaders = Map<String, dynamic>.from(requestOptions.headers);
+  final token = await authService.getToken();
+  if (token != null && token.trim().isNotEmpty) {
+    nextHeaders['Authorization'] = 'Bearer $token';
+  } else {
+    nextHeaders.remove('Authorization');
+  }
+  final extra = Map<String, dynamic>.from(requestOptions.extra)
+    ..['auth_retry_attempted'] = true;
+  final options = Options(
+    method: requestOptions.method,
+    headers: nextHeaders,
+    responseType: requestOptions.responseType,
+    contentType: requestOptions.contentType,
+    followRedirects: requestOptions.followRedirects,
+    receiveDataWhenStatusError: requestOptions.receiveDataWhenStatusError,
+    sendTimeout: requestOptions.sendTimeout,
+    receiveTimeout: requestOptions.receiveTimeout,
+    extra: extra,
+    validateStatus: requestOptions.validateStatus,
+    listFormat: requestOptions.listFormat,
+  );
+  return dio.request<dynamic>(
+    requestOptions.path,
+    data: requestOptions.data,
+    queryParameters: requestOptions.queryParameters,
+    options: options,
+    cancelToken: requestOptions.cancelToken,
+    onReceiveProgress: requestOptions.onReceiveProgress,
+    onSendProgress: requestOptions.onSendProgress,
+  );
+}
+
 void _removeHeaderIgnoreCase(Map<String, dynamic> headers, String name) {
   final target = name.toLowerCase();
   final toDelete = <String>[];
@@ -3941,24 +3977,43 @@ void _attachAuthInterceptor() {
         }
 
         if (status == 401 && !_isAuthEndpoint(req) && hasBearerToken) {
-          if (_handlingAuthFailure) {
-            debugPrint(
-              '_attachAuthInterceptor: auth failure already handling, skipping',
+          final alreadyRetried = req.extra['auth_retry_attempted'] == true;
+          if (!alreadyRetried) {
+            final refreshed = await authService.refreshSession(
+              allowBootstrap: true,
             );
-            return handler.next(err);
+            if (refreshed) {
+              try {
+                final retryResponse = await _retryRequestWithFreshAuth(req);
+                return handler.resolve(retryResponse);
+              } catch (retryErr, retrySt) {
+                debugPrint(
+                  '_attachAuthInterceptor: retry after refresh failed: $retryErr\n$retrySt',
+                );
+              }
+            }
           }
 
-          _handlingAuthFailure = true;
-          debugPrint('_attachAuthInterceptor: got 401, forcing logout');
-          try {
-            await disconnectSocket();
-            await authService.clearToken();
-            navigatorKey.currentState?.pushNamedAndRemoveUntil(
-              '/auth',
-              (route) => false,
-            );
-          } catch (e, st) {
-            debugPrint('Error during forced logout in interceptor: $e\n$st');
+          final stillHasToken = await authService.getToken();
+          if (stillHasToken == null || stillHasToken.trim().isEmpty) {
+            if (_handlingAuthFailure) {
+              return handler.next(err);
+            }
+            _handlingAuthFailure = true;
+            debugPrint('_attachAuthInterceptor: auth expired, forcing logout');
+            try {
+              await disconnectSocket();
+              await authService.clearToken();
+              navigatorKey.currentState?.pushNamedAndRemoveUntil(
+                '/auth',
+                (route) => false,
+                arguments: const {
+                  'notice': 'Срок входа истек, пожалуйста, войдите снова',
+                },
+              );
+            } catch (e, st) {
+              debugPrint('Error during forced logout in interceptor: $e\n$st');
+            }
           }
         }
         handler.next(err);
@@ -4005,6 +4060,15 @@ Future<void> _initSocket() async {
   _socketInitInProgress = true;
   try {
     debugPrint('🚀 Initializing socket...');
+
+    final sessionReady = await authService.ensureFreshSession(
+      allowBootstrap: true,
+      forceRefreshIfExpired: true,
+    );
+    if (!sessionReady) {
+      debugPrint('⏭️ _initSocket skipped: session is not ready');
+      return;
+    }
 
     final token = await authService.getToken();
     if (token == null || token.trim().isEmpty) {

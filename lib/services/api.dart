@@ -6,6 +6,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 class ApiService {
   final Dio dio;
   final FlutterSecureStorage storage;
+  static const String _authTokenKey = 'auth_token';
 
   ApiService._(this.dio, this.storage);
 
@@ -41,12 +42,12 @@ class ApiService {
   }
 
   Future<void> setAuthToken(String token) async {
-    await storage.write(key: 'jwt', value: token);
+    await storage.write(key: _authTokenKey, value: token);
     dio.options.headers['Authorization'] = 'Bearer $token';
   }
 
   Future<String?> getAuthToken() async {
-    return await storage.read(key: 'jwt');
+    return await storage.read(key: _authTokenKey);
   }
 
   Future<Map<String, dynamic>> register(String email, String password) async {

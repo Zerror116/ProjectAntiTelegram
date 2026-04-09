@@ -9,6 +9,7 @@ import '../src/utils/media_url.dart';
 import 'adaptive_network_image.dart';
 
 final Map<String, Size> _chatMessageImageSizeCache = <String, Size>{};
+final Set<String> _chatMessageImageRenderedUrls = <String>{};
 
 String _resolvedChatImageUrl(String imageUrl) =>
     resolveMediaUrl(imageUrl, apiBaseUrl: dio.options.baseUrl) ?? imageUrl;
@@ -79,11 +80,15 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
   ImageStream? _imageStream;
   ImageStreamListener? _imageStreamListener;
   Size? _intrinsicSize;
+  bool _hasRenderedImage = false;
 
   @override
   void initState() {
     super.initState();
     _intrinsicSize = _sizeFromKnownDimensions();
+    _hasRenderedImage = _chatMessageImageRenderedUrls.contains(
+      _resolvedChatImageUrl(widget.imageUrl),
+    );
     _resolveIntrinsicSizeIfNeeded();
   }
 
@@ -96,6 +101,9 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
         widget.knownHeight != oldWidget.knownHeight) {
       _removeImageStreamListener();
       _intrinsicSize = nextKnown;
+      _hasRenderedImage = _chatMessageImageRenderedUrls.contains(
+        _resolvedChatImageUrl(widget.imageUrl),
+      );
       _resolveIntrinsicSizeIfNeeded();
     }
   }
@@ -155,6 +163,18 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
     }
     _imageStream = null;
     _imageStreamListener = null;
+  }
+
+  void _markImageRendered() {
+    final resolvedUrl = _resolvedChatImageUrl(widget.imageUrl);
+    _chatMessageImageRenderedUrls.add(resolvedUrl);
+    if (_hasRenderedImage) {
+      widget.onFramePainted?.call();
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _hasRenderedImage = true);
+    widget.onFramePainted?.call();
   }
 
   @override
@@ -253,12 +273,13 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
                       frameBuilder: (context, child, frame, sync) {
                         if (sync || frame != null) {
                           WidgetsBinding.instance.addPostFrameCallback((_) {
-                            widget.onFramePainted?.call();
+                            _markImageRendered();
                           });
                         }
                         return child;
                       },
                       loadingBuilder: (context, child, progress) {
+                        if (_hasRenderedImage) return child;
                         if (progress == null) return child;
                         return buildPlaceholder(loading: true);
                       },

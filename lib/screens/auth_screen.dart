@@ -42,6 +42,7 @@ class _AuthScreenState extends State<AuthScreen> {
   String _apkInfoMessage = '';
   String _tenantCodeFromLink = '';
   bool _handledIncomingAuthAction = false;
+  bool _routeNoticeApplied = false;
   bool _passwordResetEnabled = false;
   bool _magicLinkEnabled = false;
   bool _emailRecoveryStatusLoaded = false;
@@ -88,6 +89,32 @@ class _AuthScreenState extends State<AuthScreen> {
       unawaited(_loadEmailRecoveryAvailability());
       unawaited(_handleIncomingAuthActionIfNeeded());
     });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_routeNoticeApplied) return;
+    _routeNoticeApplied = true;
+    final args = ModalRoute.of(context)?.settings.arguments;
+    String? notice;
+    if (args is String && args.trim().isNotEmpty) {
+      notice = args.trim();
+    } else if (args is Map) {
+      final raw = (args['notice'] ?? '').toString().trim();
+      if (raw.isNotEmpty) {
+        notice = raw;
+      }
+    }
+    if (notice != null && notice.isNotEmpty) {
+      setState(() => _message = notice!);
+      return;
+    }
+    unawaited(() async {
+      final storedNotice = await _authService.consumePendingAuthNotice();
+      if (!mounted || storedNotice == null || storedNotice.isEmpty) return;
+      setState(() => _message = storedNotice);
+    }());
   }
 
   void _prepareWebExperience() {

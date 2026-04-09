@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
+import '../src/utils/chat_api.dart';
 import '../src/utils/messenger_ui_helpers.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
@@ -225,12 +226,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   Future<Map<String, dynamic>?> _resolveMainChannelFallback() async {
     try {
-      final resp = await authService.dio.get('/api/chats/list');
-      final data = resp.data;
-      if (data is! Map || data['ok'] != true || data['data'] is! List) {
-        return null;
-      }
-      final rows = List<Map<String, dynamic>>.from(data['data']);
+      final rows = await loadChatsCollection();
       final main = rows.firstWhere(
         _isMainChannel,
         orElse: () => const <String, dynamic>{},
@@ -241,6 +237,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
     } catch (_) {
       return null;
     }
+  }
+
+  String _chatLoadErrorText(Object error) {
+    if (error is DioException) {
+      final status = error.response?.statusCode;
+      if (status == 401) {
+        return 'Сессия сейчас обновляется. Попробуйте открыть чаты ещё раз через пару секунд.';
+      }
+      if (status == 404) {
+        return 'Список чатов временно недоступен. Попробуйте обновить страницу.';
+      }
+      if (status == 502 || status == 503 || status == 504) {
+        return 'Сервер чатов сейчас перегружен. Попробуйте ещё раз чуть позже.';
+      }
+      if (error.type == DioExceptionType.connectionError ||
+          error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.receiveTimeout) {
+        return 'Не удалось подключиться к чатам. Проверьте интернет и попробуйте снова.';
+      }
+    }
+    return 'Не удалось загрузить чаты. Попробуйте ещё раз.';
   }
 
   Future<void> _openChat(Map<String, dynamic> chat) async {
@@ -1057,26 +1074,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
 
     try {
-      final resp = await authService.dio.get('/api/chats/list');
-      final data = resp.data;
-      if (data is Map && data['ok'] == true && data['data'] is List) {
-        final nextChats = List<Map<String, dynamic>>.from(data['data'])
-          ..sort(_compareChats);
-        if (!mounted) return;
-        setState(() {
-          _chats = nextChats;
-          _loadedOnce = true;
-        });
-      } else {
-        if (!mounted) return;
-        if (_chats.isEmpty) {
-          setState(() => _error = 'Неверный ответ сервера');
-        }
-      }
+      final nextChats = await loadChatsCollection()..sort(_compareChats);
+      if (!mounted) return;
+      setState(() {
+        _chats = nextChats;
+        _loadedOnce = true;
+      });
     } catch (e) {
       if (!mounted) return;
       if (_chats.isEmpty) {
-        setState(() => _error = 'Ошибка загрузки чатов: $e');
+        setState(() => _error = _chatLoadErrorText(e));
       }
     } finally {
       _refreshInFlight = false;
