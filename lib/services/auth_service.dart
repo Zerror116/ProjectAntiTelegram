@@ -179,6 +179,7 @@ class AuthService {
   Completer<bool>? _sessionRefreshCompleter;
   bool _preferSharedPrefsSecretStore = false;
   bool _loggedSharedPrefsSecretFallback = false;
+  bool _postAuthSyncInProgress = false;
 
   String _normalizeTenantCodeScope(String? value) {
     final normalized = (value ?? '').trim().toLowerCase();
@@ -384,6 +385,24 @@ class AuthService {
       print('[web-push] auth hook error: $e');
       _authVerboseLog('⚠️ Web push sync skipped: $e');
     }
+  }
+
+  void _schedulePostAuthSync() {
+    if (_postAuthSyncInProgress) return;
+    _postAuthSyncInProgress = true;
+    unawaited(() async {
+      try {
+        await _maybeEnsureWebPushSubscription();
+        try {
+          await NotificationDeviceService.syncCurrentEndpoint(dio);
+        } catch (_) {}
+        try {
+          await NativePushService.syncCurrentEndpoint(dio);
+        } catch (_) {}
+      } finally {
+        _postAuthSyncInProgress = false;
+      }
+    }());
   }
 
   void _authVerboseLog(String message) {
@@ -650,13 +669,7 @@ class AuthService {
     try {
       _authController.add(_currentUser);
     } catch (_) {}
-    await _maybeEnsureWebPushSubscription();
-    try {
-      await NotificationDeviceService.syncCurrentEndpoint(dio);
-    } catch (_) {}
-    try {
-      await NativePushService.syncCurrentEndpoint(dio);
-    } catch (_) {}
+    _schedulePostAuthSync();
     debugPrint(
       '✅ AuthService.setSessionTokens -> token set, user=${_currentUser?.email}',
     );
@@ -1503,13 +1516,7 @@ class AuthService {
           try {
             _authController.add(_currentUser);
           } catch (_) {}
-          await _maybeEnsureWebPushSubscription();
-          try {
-            await NotificationDeviceService.syncCurrentEndpoint(dio);
-          } catch (_) {}
-          try {
-            await NativePushService.syncCurrentEndpoint(dio);
-          } catch (_) {}
+          _schedulePostAuthSync();
           _lastStartupRefreshUsedFallback = false;
           debugPrint(
             '✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}',
