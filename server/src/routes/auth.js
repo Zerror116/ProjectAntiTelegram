@@ -1275,6 +1275,27 @@ async function fetchAuthUserWithTenant(queryable, userId) {
   return result.rows[0] || null;
 }
 
+async function resolveRequestedCreatorTenant(req) {
+  const tenantCode = extractTenantCodeHint(req);
+  if (!tenantCode) return null;
+  const tenantRes = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            COALESCE(is_deleted, false) AS is_deleted
+     FROM tenants
+     WHERE lower(code) = $1
+     LIMIT 1`,
+    [tenantCode],
+  );
+  if (tenantRes.rowCount === 0) return null;
+  const tenant = tenantRes.rows[0];
+  if (tenant?.is_deleted === true) return null;
+  return tenant;
+}
+
 async function buildSuccessfulAuthResponse({
   req,
   user,
@@ -1285,6 +1306,10 @@ async function buildSuccessfulAuthResponse({
   isPlatformCreator = false,
   twoFactor = null,
 }) {
+  const creatorScopedTenant = isPlatformCreator
+    ? await resolveRequestedCreatorTenant(req)
+    : null;
+  const responseTenant = creatorScopedTenant || tenant || null;
   if (!isPlatformCreator) {
     try {
       await upsertTenantUserIndex({
@@ -1301,17 +1326,17 @@ async function buildSuccessfulAuthResponse({
 
   const phoneAccess = await resolvePhoneAccessForUser({
     user,
-    tenant,
+    tenant: responseTenant,
     isPlatformCreator,
   });
-  const effectiveTenantCode = tenant?.code || user?.tenant_code || null;
+  const effectiveTenantCode = responseTenant?.code || user?.tenant_code || null;
   const accessExpiresAt = buildAccessExpiry();
   const token = signToken({
     id: user.id,
     email: user.email,
     role: user.role,
-    tenant_id: user.tenant_id || null,
-    tenant_code: effectiveTenantCode,
+    tenant_id: isPlatformCreator ? null : user.tenant_id || null,
+    tenant_code: isPlatformCreator ? null : effectiveTenantCode,
     sid: sessionId,
   });
 
@@ -1334,20 +1359,27 @@ async function buildSuccessfulAuthResponse({
       email: user.email,
       name: user.name || null,
       role: user.role,
-      tenant_id: user.tenant_id || null,
+      tenant_id: responseTenant?.id || user.tenant_id || null,
       tenant_code: effectiveTenantCode,
-      tenant_name: user.tenant_name || tenant?.name || null,
+      tenant_name: user.tenant_name || responseTenant?.name || null,
+      tenant_status: user.tenant_status || responseTenant?.status || null,
+      subscription_expires_at:
+        user.subscription_expires_at ||
+        responseTenant?.subscription_expires_at ||
+        null,
       phone_access_state: phoneAccess.state || 'none',
       phone_access: phoneAccess,
     },
-    tenant: user.tenant_id
+    tenant: responseTenant || user.tenant_id
       ? {
-          id: user.tenant_id,
+          id: responseTenant?.id || user.tenant_id,
           code: effectiveTenantCode,
-          name: user.tenant_name || tenant?.name || null,
-          status: user.tenant_status || tenant?.status || null,
+          name: user.tenant_name || responseTenant?.name || null,
+          status: user.tenant_status || responseTenant?.status || null,
           subscription_expires_at:
-            user.subscription_expires_at || tenant?.subscription_expires_at || null,
+            user.subscription_expires_at ||
+            responseTenant?.subscription_expires_at ||
+            null,
         }
       : null,
   };

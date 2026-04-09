@@ -53,6 +53,7 @@ class _MainShellState extends State<MainShell> {
   int _index = 0;
   StreamSubscription<User?>? _authSub;
   String _lastEffectiveRole = '';
+  String _lastCreatorTenantScope = '';
   final Set<String> _activatedDestinations = <String>{};
   String? _phoneAccessDecisionInFlightId;
   WebNotificationPermissionState _webNotificationPermissionState =
@@ -71,6 +72,7 @@ class _MainShellState extends State<MainShell> {
     _activeSectionListener = _handleExternalShellSectionRequest;
     activeShellSectionNotifier.addListener(_activeSectionListener!);
     _lastEffectiveRole = authService.effectiveRole;
+    _lastCreatorTenantScope = authService.creatorTenantScopeCode ?? '';
     final initialIds = _destinationIdsForRole(_lastEffectiveRole);
     if (initialIds.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -81,6 +83,7 @@ class _MainShellState extends State<MainShell> {
     }
     _authSub = authService.authStream.listen((_) {
       final nextRole = authService.effectiveRole;
+      final nextCreatorTenantScope = authService.creatorTenantScopeCode ?? '';
       final currentUser = authService.currentUser;
       unawaited(refreshSupportQueueNotices());
       if (currentUser == null) {
@@ -97,9 +100,11 @@ class _MainShellState extends State<MainShell> {
         unawaited(WebPushClientService.syncUnreadBadge(dio));
       }
       setState(() {
-        if (_lastEffectiveRole != nextRole) {
+        if (_lastEffectiveRole != nextRole ||
+            _lastCreatorTenantScope != nextCreatorTenantScope) {
           final nextIndex = _resolveNextIndexForRole(nextRole);
           _lastEffectiveRole = nextRole;
+          _lastCreatorTenantScope = nextCreatorTenantScope;
           _index = nextIndex;
           _activatedDestinations.clear();
           final nextIds = _destinationIdsForRole(nextRole);
@@ -868,6 +873,7 @@ class _MainShellState extends State<MainShell> {
             : destinations;
 
         final currentDestination = destinations[_index];
+        final creatorTenantScope = authService.creatorTenantScopeCode ?? '';
         final currentNavIndex = compactNavigation
             ? (() {
                 final visibleIndex = visibleDestinations.indexWhere(
@@ -886,14 +892,16 @@ class _MainShellState extends State<MainShell> {
                 _buildWebNotificationBanner(context),
                 Expanded(
                   child: IndexedStack(
-                    key: ValueKey('shell-$effectiveRole'),
+                    key: ValueKey('shell-$effectiveRole-$creatorTenantScope'),
                     index: _index,
                     children: destinations.map((destination) {
                       if (!_activatedDestinations.contains(destination.id)) {
                         return const SizedBox.shrink();
                       }
                       return KeyedSubtree(
-                        key: ValueKey('page-${destination.id}-$effectiveRole'),
+                        key: ValueKey(
+                          'page-${destination.id}-$effectiveRole-$creatorTenantScope',
+                        ),
                         child: destination.builder(context),
                       );
                     }).toList(),

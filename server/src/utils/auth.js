@@ -128,12 +128,40 @@ function isPhoneAccessBypassRequest(req) {
   return false;
 }
 
+async function resolveCreatorTenantScope(requestedTenantCode = '') {
+  const normalizedTenantCode = db.normalizeTenantCode(requestedTenantCode);
+  if (!normalizedTenantCode) return null;
+  const tenantRes = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            db_mode,
+            db_url,
+            db_name,
+            db_schema,
+            COALESCE(is_deleted, false) AS is_deleted
+     FROM tenants
+     WHERE lower(code) = $1
+     LIMIT 1`,
+    [normalizedTenantCode],
+  );
+  if (tenantRes.rowCount === 0) return null;
+  const tenantRow = tenantRes.rows[0];
+  if (tenantRow?.is_deleted === true) return null;
+  return tenantRow;
+}
+
 async function resolveAuthContextFromToken(
   token,
   requestedViewRole = '',
   options = {},
 ) {
   const ignoreTenantSubscription = options?.ignoreTenantSubscription === true;
+  const requestedTenantCode = db.normalizeTenantCode(
+    options?.requestedTenantCode || '',
+  );
   const unsafePayload = decodeJwtPayloadUnsafe(token) || {};
   const tenantCodeHint = db.normalizeTenantCode(
     unsafePayload.tenant_code ||
@@ -217,7 +245,9 @@ async function resolveAuthContextFromToken(
   const isPlatformCreator = baseRole === 'creator' && isPlatformCreatorEmail(row.email);
 
   let tenantRegistry = null;
-  if (!isPlatformCreator) {
+  if (isPlatformCreator) {
+    tenantRegistry = await resolveCreatorTenantScope(requestedTenantCode);
+  } else {
     const effectiveTenantCode = db.normalizeTenantCode(
       tenantCodeHint || row.tenant_code || '',
     );
@@ -290,7 +320,7 @@ async function resolveAuthContextFromToken(
     base_role: baseRole,
     effective_role: effectiveRole,
     view_role: effectiveRole !== baseRole ? effectiveRole : null,
-    tenant_id: row.tenant_id || null,
+    tenant_id: tenantRegistry?.id || row.tenant_id || null,
     tenant_code: tenantRegistry?.code || row.tenant_code || tenantCodeHint || null,
     tenant_name: tenantRegistry?.name || row.tenant_name || null,
     tenant_status: tenantRegistry?.status || row.tenant_status || null,
@@ -347,6 +377,7 @@ async function authMiddleware(req, res, next) {
     let context = await resolveAuthContextFromToken(
       token,
       req.headers['x-view-role'],
+      { requestedTenantCode: req.headers['x-tenant-code'] },
     );
     if (!context.ok &&
         isSubscriptionRestrictionReason(context.reason) &&
@@ -355,7 +386,10 @@ async function authMiddleware(req, res, next) {
       context = await resolveAuthContextFromToken(
         token,
         req.headers['x-view-role'],
-        { ignoreTenantSubscription: true },
+        {
+          ignoreTenantSubscription: true,
+          requestedTenantCode: req.headers['x-tenant-code'],
+        },
       );
       if (context.ok) {
         req.subscriptionRestricted = true;
@@ -387,7 +421,7 @@ async function authMiddleware(req, res, next) {
         phone_access: req.user?.phone_access || null,
       });
     }
-    if (context.user?.is_platform_creator === true) {
+    if (context.user?.is_platform_creator === true && !context.tenantScope) {
       return db.runWithPlatform(() => next());
     }
     if (context.tenantScope) {
