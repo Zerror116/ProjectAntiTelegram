@@ -389,7 +389,7 @@ upload_release_files() {
 
 smoke_check_remote_release() {
   local base="${PUBLIC_BASE_URL%/}"
-  local update_json manifest_json headers_html landing_html
+  local update_json manifest_json legacy_manifest_21_json headers_html landing_html legacy20_manifest_file legacy20_status
 
   note "smoke: GET $base/api/app/update"
   update_json="$(curl -fsSL "$base/api/app/update")"
@@ -407,6 +407,22 @@ smoke_check_remote_release() {
   [[ "$(printf '%s' "$manifest_json" | jq -r '.data.manifest.package_name')" == "$EXPECTED_PACKAGE_NAME" ]] || fail "Smoke failed: manifest package_name mismatch"
   [[ "$(printf '%s' "$manifest_json" | jq -r '.data.manifest.sha256')" == "$APK_SHA256" ]] || fail "Smoke failed: manifest sha256 mismatch"
   [[ "$(printf '%s' "$manifest_json" | jq -r '.data.key_id')" == "${APP_UPDATE_MANIFEST_KEY_ID}" ]] || fail "Smoke failed: manifest key_id mismatch"
+  printf '%s' "$manifest_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
+    node "$SCRIPT_DIR/check_android_manifest_parity.js" --stdin >/dev/null || fail "Smoke failed: manifest parity/signature verification failed"
+
+  note "smoke: GET $base/api/app/update/android/manifest?current_build=21"
+  legacy_manifest_21_json="$(curl -fsSL "$base/api/app/update/android/manifest?current_build=21")"
+  [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.ok')" == "true" ]] || fail "Smoke failed: legacy build 21 manifest returned ok=false"
+  [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.data.manifest.version')" == "$APP_VERSION_NAME" ]] || fail "Smoke failed: legacy build 21 manifest version mismatch"
+  [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.data.manifest.build')" == "$APP_BUILD_NUMBER" ]] || fail "Smoke failed: legacy build 21 manifest build mismatch"
+  printf '%s' "$legacy_manifest_21_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
+    node "$SCRIPT_DIR/check_android_manifest_parity.js" --stdin >/dev/null || fail "Smoke failed: legacy build 21 parity/signature verification failed"
+
+  legacy20_manifest_file="$(mktemp -t fenix-legacy20-manifest.XXXXXX.json)"
+  legacy20_status="$(curl -sS -o "$legacy20_manifest_file" -w '%{http_code}' "$base/api/app/update/android/manifest?current_build=20")"
+  [[ "$legacy20_status" == "404" ]] || fail "Smoke failed: legacy build 20 expected 404, got $legacy20_status"
+  [[ "$(jq -r '.code' < "$legacy20_manifest_file")" == "unsupported_legacy_build" ]] || fail "Smoke failed: legacy build 20 code mismatch"
+  rm -f "$legacy20_manifest_file"
 
   note "smoke: HEAD $base/api/app/update/android/apk"
   headers_html="$(curl -fsSI -H 'User-Agent: Android' -H 'X-Fenix-Platform: android' "$base/api/app/update/android/apk")"
@@ -429,6 +445,7 @@ require_command curl
 require_command shasum
 require_command rsync
 require_command ssh
+require_command node
 validate_public_base_url "$PUBLIC_BASE_URL"
 resolve_version_info
 resolve_expected_package_name

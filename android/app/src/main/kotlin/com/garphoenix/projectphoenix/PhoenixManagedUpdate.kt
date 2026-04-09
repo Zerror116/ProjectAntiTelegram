@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.util.Base64
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
@@ -35,6 +36,7 @@ import kotlin.math.max
 private const val UPDATE_PREFS = "phoenix_managed_update"
 private const val UPDATE_NOTIFICATION_ID = 64021
 private const val UPDATE_CHANNEL_ID = "phoenix_updates"
+private const val UPDATE_LOG_TAG = "PhoenixManagedUpdate"
 private const val ACTION_START_OR_RESUME_UPDATE = "com.garphoenix.projectphoenix.action.START_OR_RESUME_UPDATE"
 private const val ACTION_INSTALL_RESULT = "com.garphoenix.projectphoenix.action.INSTALL_RESULT"
 private const val EXTRA_UPDATE_PAYLOAD_JSON = "update_payload_json"
@@ -360,6 +362,7 @@ object PhoenixManagedUpdateEngine {
         val context = service.applicationContext
         val envelope = parseEnvelope(payloadJson)
         if (envelope == null) {
+            Log.w(UPDATE_LOG_TAG, "manifest_invalid: envelope parse failed")
             fail(
                 context = context,
                 current = PhoenixManagedUpdateStore.load(context),
@@ -385,6 +388,10 @@ object PhoenixManagedUpdateEngine {
         updateState(context, checking, service)
 
         if (!verifyEnvelope(envelope)) {
+            Log.w(
+                UPDATE_LOG_TAG,
+                "manifest_signature_invalid: keyId=${envelope.keyId} version=${envelope.versionToken}",
+            )
             fail(
                 context = context,
                 current = checking,
@@ -394,6 +401,10 @@ object PhoenixManagedUpdateEngine {
             )
             return
         }
+        Log.i(
+            UPDATE_LOG_TAG,
+            "manifest_verify_ok: keyId=${envelope.keyId} version=${envelope.versionToken}",
+        )
 
         if (!isAllowedDownloadUrl(envelope.downloadUrl)) {
             fail(
