@@ -716,21 +716,13 @@ function renderAndroidDownloadUnavailablePage(config) {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>${title}</title>
 <style>
-  :root {
-    color-scheme: dark;
-    --bg:#0d0816;
-    --card:#1a1128;
-    --line:rgba(255,255,255,.08);
-    --muted:#cbbfe0;
-    --text:#fff7ff;
-    --warn:#ffb347;
-  }
-  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:radial-gradient(circle at top left,#2e134b 0%,var(--bg) 45%); color:var(--text); }
+  :root { color-scheme: dark; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:radial-gradient(circle at top left,#2e134b 0%,#0d0816 45%); color:#fff7ff; }
   .wrap { max-width:720px; margin:0 auto; padding:32px 18px 48px; }
-  .card { background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02)); border:1px solid var(--line); border-radius:28px; padding:24px; box-shadow:0 16px 44px rgba(0,0,0,.24); }
+  .card { background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02)); border:1px solid rgba(255,255,255,.08); border-radius:28px; padding:24px; box-shadow:0 16px 44px rgba(0,0,0,.24); }
   .badge { display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(255,179,71,.12); color:#ffd8a0; font-weight:700; font-size:12px; }
   h1 { margin:14px 0 8px; font-size:32px; line-height:1.1; }
-  p { color:var(--muted); line-height:1.6; margin:0; }
+  p { color:#cbbfe0; line-height:1.6; margin:0; }
 </style>
 </head>
 <body>
@@ -774,30 +766,21 @@ function renderAndroidDownloadPage(config) {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Феникс для Android</title>
 <style>
-  :root {
-    color-scheme: dark;
-    --bg:#0d0816;
-    --card:#1a1128;
-    --line:rgba(255,255,255,.08);
-    --muted:#cbbfe0;
-    --text:#fff7ff;
-    --accent:#32db7c;
-    --accent2:#19c7c9;
-  }
-  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:radial-gradient(circle at top left,#2e134b 0%,var(--bg) 45%); color:var(--text); }
+  :root { color-scheme: dark; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:radial-gradient(circle at top left,#2e134b 0%,#0d0816 45%); color:#fff7ff; }
   .wrap { max-width:720px; margin:0 auto; padding:32px 18px 48px; }
-  .card { background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02)); border:1px solid var(--line); border-radius:28px; padding:24px; box-shadow:0 16px 44px rgba(0,0,0,.24); }
+  .card { background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02)); border:1px solid rgba(255,255,255,.08); border-radius:28px; padding:24px; box-shadow:0 16px 44px rgba(0,0,0,.24); }
   .eyebrow { color:#9fffd0; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.14em; }
   h1 { margin:10px 0 6px; font-size:32px; line-height:1.1; }
-  .lead { margin:0 0 22px; color:var(--muted); line-height:1.5; }
+  .lead { margin:0 0 22px; color:#cbbfe0; line-height:1.5; }
   .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:18px 0 22px; }
-  .meta { border:1px solid var(--line); border-radius:18px; padding:14px; background:rgba(255,255,255,.02); }
+  .meta { border:1px solid rgba(255,255,255,.08); border-radius:18px; padding:14px; background:rgba(255,255,255,.02); }
   .meta strong { display:block; font-size:12px; color:#aeead7; text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
-  .cta { display:inline-flex; align-items:center; justify-content:center; min-height:52px; padding:0 20px; border-radius:18px; text-decoration:none; color:#062b21; background:linear-gradient(135deg,var(--accent),var(--accent2)); font-weight:800; box-shadow:0 12px 28px rgba(25,199,201,.24); }
+  .cta { display:inline-flex; align-items:center; justify-content:center; min-height:52px; padding:0 20px; border-radius:18px; text-decoration:none; color:#062b21; background:linear-gradient(135deg,#32db7c,#19c7c9); font-weight:800; box-shadow:0 12px 28px rgba(25,199,201,.24); }
   .section { margin-top:22px; }
   .section h2 { margin:0 0 10px; font-size:18px; }
-  ul { margin:0; padding-left:20px; color:var(--muted); line-height:1.6; }
-  .muted { color:var(--muted); line-height:1.6; }
+  ul { margin:0; padding-left:20px; color:#cbbfe0; line-height:1.6; }
+  .muted { color:#cbbfe0; line-height:1.6; }
   .badge { display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(50,219,124,.14); color:#aef7cb; font-weight:700; font-size:12px; }
   code { word-break:break-all; color:#ddfef7; }
   @media (max-width:640px){ .grid{grid-template-columns:1fr;} h1{font-size:28px;} }

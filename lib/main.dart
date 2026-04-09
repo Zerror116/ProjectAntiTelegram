@@ -805,7 +805,9 @@ Future<void> _closeSupportQueueNotice(String ticketId) async {
   } on DioException catch (e) {
     final message = _extractApiErrorMessage(e);
     showGlobalAppNotice(
-      message.isNotEmpty ? message : 'Не удалось отметить обращение как решённое',
+      message.isNotEmpty
+          ? message
+          : 'Не удалось отметить обращение как решённое',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
@@ -937,9 +939,7 @@ Widget _maybeWrapWithDesktopSelection(Widget child) {
   if (!_supportsGlobalDesktopSelection()) return child;
   return Overlay(
     initialEntries: [
-      OverlayEntry(
-        builder: (context) => SelectionArea(child: child),
-      ),
+      OverlayEntry(builder: (context) => SelectionArea(child: child)),
     ],
   );
 }
@@ -1755,7 +1755,9 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                                       ),
                                     ],
                                   ),
-                                  if ((info.message ?? '').trim().isNotEmpty) ...[
+                                  if ((info.message ?? '')
+                                      .trim()
+                                      .isNotEmpty) ...[
                                     const SizedBox(height: 14),
                                     Text(
                                       info.message!.trim(),
@@ -1842,10 +1844,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                                           borderRadius: BorderRadius.circular(
                                             999,
                                           ),
-                                          backgroundColor:
-                                              Colors.white.withValues(
-                                                alpha: 0.18,
-                                              ),
+                                          backgroundColor: Colors.white
+                                              .withValues(alpha: 0.18),
                                           valueColor:
                                               const AlwaysStoppedAnimation<
                                                 Color
@@ -1876,10 +1876,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                                             'Скорость: $speedText · Осталось: $etaText',
                                             style: theme.textTheme.bodySmall
                                                 ?.copyWith(
-                                                  color:
-                                                      Colors.white.withValues(
-                                                        alpha: 0.92,
-                                                      ),
+                                                  color: Colors.white
+                                                      .withValues(alpha: 0.92),
                                                 ),
                                           ),
                                         ],
@@ -1889,24 +1887,21 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                                             'APK уже в приложении. Можно открывать установку.',
                                             style: theme.textTheme.bodySmall
                                                 ?.copyWith(
-                                                  color:
-                                                      Colors.white.withValues(
-                                                        alpha: 0.92,
-                                                      ),
+                                                  color: Colors.white
+                                                      .withValues(alpha: 0.92),
                                                   fontWeight: FontWeight.w700,
                                                 ),
                                           ),
                                         ],
-                                        if (state.isInstalledPendingRestart) ...[
+                                        if (state
+                                            .isInstalledPendingRestart) ...[
                                           const SizedBox(height: 8),
                                           Text(
                                             'Android завершил установку. Можно открыть новую версию.',
                                             style: theme.textTheme.bodySmall
                                                 ?.copyWith(
-                                                  color:
-                                                      Colors.white.withValues(
-                                                        alpha: 0.92,
-                                                      ),
+                                                  color: Colors.white
+                                                      .withValues(alpha: 0.92),
                                                   fontWeight: FontWeight.w700,
                                                 ),
                                           ),
@@ -2044,6 +2039,14 @@ Uri? _resolveAndroidFallbackUpdateUri(_AppUpdateInfo info) {
   final landingRaw = (info.landingUrl ?? '').trim();
   final downloadRaw = (info.downloadUrl ?? '').trim();
   return _resolveUpdateUri(landingRaw.isNotEmpty ? landingRaw : downloadRaw);
+}
+
+bool _hasUpdateActionAvailable(_AppUpdateInfo info) {
+  if (info.platform == 'android') {
+    return info.hasAndroidManagedManifest ||
+        _resolveAndroidFallbackUpdateUri(info) != null;
+  }
+  return (info.downloadUrl ?? '').trim().isNotEmpty;
 }
 
 Future<bool> _openAndroidFallbackUpdateUri(Uri? uri) async {
@@ -2861,12 +2864,12 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                 _SupportQueueChip(
                                                   label:
                                                       notice.statusDisplay
-                                                              .trim()
-                                                              .isNotEmpty
-                                                          ? notice.statusDisplay
-                                                          : _supportStatusLabel(
-                                                              notice.status,
-                                                            ),
+                                                          .trim()
+                                                          .isNotEmpty
+                                                      ? notice.statusDisplay
+                                                      : _supportStatusLabel(
+                                                          notice.status,
+                                                        ),
                                                 ),
                                                 _SupportQueueChip(
                                                   label: _supportCategoryLabel(
@@ -4790,9 +4793,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           final minSupportedLabel = info.minSupported == null
               ? null
               : _appUpdateDisplayVersion(info.minSupported!);
-          final actionAvailable = info.platform == 'android'
-              ? info.hasAndroidManagedManifest
-              : (info.downloadUrl ?? '').trim().isNotEmpty;
+          final actionAvailable = _hasUpdateActionAvailable(info);
           final changelogLines = (info.changelog ?? '')
               .split('\n')
               .map((line) => line.trim())
@@ -4913,7 +4914,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
                         const SizedBox(height: 12),
                         Text(
                           info.platform == 'android'
-                              ? 'Manifest обновления пока не настроен на сервере. Обратитесь к администратору.'
+                              ? 'Ссылка на обновление пока не настроена на сервере. Обратитесь к администратору.'
                               : 'Ссылка на обновление не настроена на сервере. Обратитесь к администратору.',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: Colors.white,
@@ -4962,13 +4963,11 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       );
 
       if (decision == 'update') {
-        final actionAvailable = info.platform == 'android'
-            ? info.hasAndroidManagedManifest
-            : (info.downloadUrl ?? '').trim().isNotEmpty;
+        final actionAvailable = _hasUpdateActionAvailable(info);
         if (!actionAvailable) {
           showGlobalAppNotice(
             info.platform == 'android'
-                ? 'Manifest обновления не настроен на сервере.'
+                ? 'Ссылка на обновление не настроена на сервере.'
                 : 'Ссылка на обновление не настроена на сервере.',
             title: 'Обновление Феникс',
             tone: AppNoticeTone.error,
