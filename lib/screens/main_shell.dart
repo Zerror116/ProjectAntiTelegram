@@ -615,7 +615,7 @@ class _MainShellState extends State<MainShell> {
       return Icon(destination.icon);
     }
     return ValueListenableBuilder<int>(
-      valueListenable: notificationBadgeCountNotifier,
+      valueListenable: notificationInboxBadgeCountNotifier,
       builder: (context, badgeCount, _) {
         if (badgeCount <= 0) {
           return Icon(destination.icon);
