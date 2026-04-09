@@ -124,6 +124,12 @@ class _AppUpdateVersion {
   String get token => '$version+$build';
 }
 
+String _appUpdateDisplayVersion(_AppUpdateVersion value) {
+  final normalized = value.version.trim();
+  if (normalized.isNotEmpty && normalized != '0') return normalized;
+  return value.build > 0 ? value.build.toString() : '—';
+}
+
 class _AppUpdateInfo {
   final bool required;
   final String title;
@@ -1538,8 +1544,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       barrierDismissible: !info.required,
       builder: (dialogContext) {
         final theme = Theme.of(dialogContext);
-        final currentLabel = '${info.current.version}+${info.current.build}';
-        final latestLabel = '${info.latest.version}+${info.latest.build}';
+        final currentLabel = _appUpdateDisplayVersion(info.current);
+        final latestLabel = _appUpdateDisplayVersion(info.latest);
         final publishedLabel =
             _formatRuDateTime(info.publishedAt) ?? 'Не указана';
         final changelogLines = (info.changelog ?? '')
@@ -4679,8 +4685,8 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
         barrierDismissible: !info.required,
         builder: (dialogContext) {
           final theme = Theme.of(dialogContext);
-          final currentLabel = '${info.current.version}+${info.current.build}';
-          final latestLabel = '${info.latest.version}+${info.latest.build}';
+          final currentLabel = _appUpdateDisplayVersion(info.current);
+          final latestLabel = _appUpdateDisplayVersion(info.latest);
           final platformLabel = info.platform == 'android'
               ? 'Android'
               : info.platform == 'ios'
@@ -4692,7 +4698,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
               : info.platform;
           final minSupportedLabel = info.minSupported == null
               ? null
-              : '${info.minSupported!.version}+${info.minSupported!.build}';
+              : _appUpdateDisplayVersion(info.minSupported!);
           final actionAvailable = info.platform == 'android'
               ? info.hasAndroidManagedManifest
               : (info.downloadUrl ?? '').trim().isNotEmpty;

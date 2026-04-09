@@ -255,6 +255,13 @@ function compareVersionWithBuild(left, right) {
   return 0;
 }
 
+function formatPublicVersionLabel(version, build) {
+  const cleanVersion = normalizeVersion(version);
+  if (cleanVersion && cleanVersion !== '0') return cleanVersion;
+  const safeBuild = safePositiveInt(build, 0);
+  return safeBuild > 0 ? String(safeBuild) : '—';
+}
+
 function resolveAndroidPackageName() {
   return (
     cleanString(process.env.APP_UPDATE_ANDROID_PACKAGE_NAME) ||
@@ -557,6 +564,10 @@ async function maybeCreateUpdateNotification(req, platformConfig, platform) {
     }
 
     const versionToken = `${latest.version}+${latest.build}`;
+    const publicVersionLabel = formatPublicVersionLabel(
+      latest.version,
+      latest.build,
+    );
     await createNotificationInboxItem({
       user: context.user,
       category: 'updates',
@@ -566,7 +577,7 @@ async function maybeCreateUpdateNotification(req, platformConfig, platform) {
         cleanString(platformConfig.title) || 'Доступно обновление Феникс',
       body:
         cleanString(platformConfig.message) ||
-        `Доступна версия ${versionToken}.`,
+        `Доступна версия ${publicVersionLabel}.`,
       deepLink: `/update?platform=${encodeURIComponent(platform)}&version=${encodeURIComponent(versionToken)}`,
       payload: {
         version: versionToken,
@@ -785,7 +796,7 @@ function renderAndroidDownloadPage(config) {
       <p class="lead">Это официальная страница первой установки APK. Дальнейшие обновления приложение скачивает и показывает уже внутри себя.</p>
       <span class="badge">Официальный файл Феникс</span>
       <div class="grid">
-        <div class="meta"><strong>Версия</strong>${escapeHtml(`${config.latest_version || '—'}+${config.latest_build || 0}`)}</div>
+        <div class="meta"><strong>Версия</strong>${escapeHtml(formatPublicVersionLabel(config.latest_version, config.latest_build))}</div>
         <div class="meta"><strong>Размер APK</strong>${escapeHtml(formatBytesRu(config.file_size))}</div>
         <div class="meta"><strong>Дата релиза</strong>${escapeHtml(publishedLabel)}</div>
         <div class="meta"><strong>Канал</strong>${escapeHtml(config.channel || 'stable')}</div>
