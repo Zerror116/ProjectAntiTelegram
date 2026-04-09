@@ -90,6 +90,7 @@ bool _appSoundPlayerPrepared = false;
 bool _socketInitInProgress = false;
 String? _socketBoundUserId;
 String? _socketBoundViewRole;
+String? _socketBoundTenantCode;
 String _lastConnectivityHint = '';
 bool _keyboardAssertRecoveredRecently = false;
 Timer? _webPushBadgeSyncTimer;
@@ -3975,6 +3976,7 @@ Future<void> disconnectSocket() async {
     socket = null;
     _socketBoundUserId = null;
     _socketBoundViewRole = null;
+    _socketBoundTenantCode = null;
     debugPrint('✅ Socket disconnected');
   } catch (e) {
     debugPrint('❌ Error disconnecting socket: $e');
@@ -4175,13 +4177,21 @@ void _attachAuthInterceptor() {
           }
           await authService.getTenantCode();
           _removeTenantHeaders(options.headers);
+          final currentRole =
+              authService.currentUser?.role.toLowerCase().trim() ?? '';
           final viewRole = authService.viewRole?.trim();
           _removeHeaderIgnoreCase(options.headers, 'X-View-Role');
-          if ((authService.currentUser?.role.toLowerCase().trim() ?? '') ==
-                  'creator' &&
+          if (currentRole == 'creator' &&
               viewRole != null &&
               viewRole.isNotEmpty) {
             options.headers['X-View-Role'] = viewRole;
+          }
+          if (currentRole == 'creator') {
+            final creatorTenantCode =
+                await authService.getCreatorTenantScopeCode();
+            if (creatorTenantCode != null && creatorTenantCode.isNotEmpty) {
+              options.headers['X-Tenant-Code'] = creatorTenantCode;
+            }
           }
           // На macOS/http не-ASCII заголовки вызывают FormatException.
           _dropInvalidHeaderValues(options.headers);
@@ -4296,10 +4306,14 @@ Future<void> _initSocket() async {
   final viewRole = currentRole == 'creator'
       ? authService.viewRole?.trim()
       : null;
+  final creatorTenantCode = currentRole == 'creator'
+      ? await authService.getCreatorTenantScopeCode()
+      : null;
 
   final sameBinding =
       _socketBoundUserId == userId &&
-      (_socketBoundViewRole ?? '') == (viewRole ?? '');
+      (_socketBoundViewRole ?? '') == (viewRole ?? '') &&
+      (_socketBoundTenantCode ?? '') == (creatorTenantCode ?? '');
   if (socket != null && sameBinding) {
     final alreadyActive = socket!.connected || socket!.active;
     if (alreadyActive) {
@@ -4341,6 +4355,13 @@ Future<void> _initSocket() async {
       socketHeaders['X-View-Role'] = viewRole;
       socketQuery['view_role'] = viewRole;
     }
+    if (currentRole == 'creator' &&
+        creatorTenantCode != null &&
+        creatorTenantCode.isNotEmpty) {
+      socketAuth['tenant_code'] = creatorTenantCode;
+      socketHeaders['X-Tenant-Code'] = creatorTenantCode;
+      socketQuery['tenant_code'] = creatorTenantCode;
+    }
 
     // Build options
     socket = io.io(
@@ -4355,6 +4376,7 @@ Future<void> _initSocket() async {
     );
     _socketBoundUserId = userId;
     _socketBoundViewRole = viewRole ?? '';
+    _socketBoundTenantCode = creatorTenantCode ?? '';
 
     socket?.on('connect', (_) {
       debugPrint('✅ Socket connected: ${socket?.id}');

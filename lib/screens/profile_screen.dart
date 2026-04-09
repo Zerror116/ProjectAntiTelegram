@@ -49,6 +49,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _sessionsBusy = false;
   bool _switchingSession = false;
   bool _addGroupBusy = false;
+  bool _creatorTenantsLoading = false;
+  bool _creatorTenantScopeBusy = false;
   final _addGroupCodeCtrl = TextEditingController();
   final _addGroupPasswordCtrl = TextEditingController();
   final _tenantClientSearchCtrl = TextEditingController();
@@ -58,6 +60,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   List<Map<String, dynamic>> _tenantClients = const [];
   String _tenantRoleUpdateUserId = '';
   List<Map<String, dynamic>> _savedTenantSessions = const [];
+  List<Map<String, dynamic>> _creatorTenants = const [];
+  String _creatorTenantScopeCode = '';
 
   @override
   void initState() {
@@ -205,6 +209,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } finally {
       if (mounted) setState(() => _loading = false);
       unawaited(_loadSavedSessions());
+      unawaited(_loadCreatorTenants(silent: true));
     }
   }
 
@@ -267,6 +272,136 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
+  Future<void> _loadCreatorTenants({bool silent = false}) async {
+    final actualRole = (authService.currentUser?.role ?? '')
+        .toLowerCase()
+        .trim();
+    final email = (authService.currentUser?.email ?? '').toLowerCase().trim();
+    final isPlatformCreator =
+        actualRole == 'creator' && email == _platformCreatorEmail;
+    if (!isPlatformCreator) {
+      if (!mounted) return;
+      setState(() {
+        _creatorTenants = const [];
+        _creatorTenantScopeCode = '';
+        _creatorTenantsLoading = false;
+      });
+      return;
+    }
+
+    if (mounted && !silent) {
+      setState(() => _creatorTenantsLoading = true);
+    } else {
+      _creatorTenantsLoading = true;
+    }
+
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/tenants',
+        options: Options(headers: const {'X-View-Role': 'creator'}),
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) {
+        return;
+      }
+      final rows = List<Map<String, dynamic>>.from(data['data'])
+          .where((row) => row['is_deleted'] != true)
+          .toList();
+      final currentCreatorTenantCode = _normalizeTenantCode(
+        authService.currentUser?.tenantCode,
+      );
+      final defaultTenantCode = rows
+          .map((row) => _normalizeTenantCode(row['code']))
+          .firstWhere(
+            (code) => code == 'default',
+            orElse: () => '',
+          );
+      final fallbackSelected = currentCreatorTenantCode.isNotEmpty
+          ? currentCreatorTenantCode
+          : (defaultTenantCode.isNotEmpty
+                ? defaultTenantCode
+                : (rows.isNotEmpty ? _normalizeTenantCode(rows.first['code']) : ''));
+      final selected =
+          _normalizeTenantCode(
+            (await authService.getCreatorTenantScopeCode()) ?? fallbackSelected,
+          );
+      final hasSelected = selected.isNotEmpty &&
+          rows.any(
+            (row) =>
+                _normalizeTenantCode(row['code']) == selected,
+          );
+      final effectiveSelected = hasSelected ? selected : fallbackSelected;
+      if (effectiveSelected.isNotEmpty &&
+          effectiveSelected != authService.creatorTenantScopeCode) {
+        final target = rows.firstWhere(
+          (row) => _normalizeTenantCode(row['code']) == effectiveSelected,
+          orElse: () => const <String, dynamic>{},
+        );
+        await authService.setCreatorTenantScope(
+          effectiveSelected,
+          tenantId: (target['id'] ?? '').toString().trim(),
+          tenantName: (target['name'] ?? '').toString().trim(),
+          tenantStatus: (target['status'] ?? '').toString().trim(),
+          subscriptionExpiresAt:
+              (target['subscription_expires_at'] ?? '').toString().trim(),
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _creatorTenants = rows;
+        _creatorTenantScopeCode = effectiveSelected;
+      });
+    } catch (e) {
+      if (!mounted || silent) return;
+      setState(
+        () => _message = 'Ошибка списка групп арендаторов: ${_extractDioMessage(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _creatorTenantsLoading = false);
+      } else {
+        _creatorTenantsLoading = false;
+      }
+    }
+  }
+
+  Future<void> _changeCreatorTenantScope(String? nextCode) async {
+    if (_creatorTenantScopeBusy) return;
+    final normalized = _normalizeTenantCode(nextCode);
+    if (normalized.isEmpty) return;
+    final target = _creatorTenants.firstWhere(
+      (row) => _normalizeTenantCode(row['code']) == normalized,
+      orElse: () => const <String, dynamic>{},
+    );
+    setState(() {
+      _creatorTenantScopeBusy = true;
+      _message = '';
+    });
+    try {
+      await authService.setCreatorTenantScope(
+        normalized,
+        tenantId: (target['id'] ?? '').toString().trim(),
+        tenantName: (target['name'] ?? '').toString().trim(),
+        tenantStatus: (target['status'] ?? '').toString().trim(),
+        subscriptionExpiresAt:
+            (target['subscription_expires_at'] ?? '').toString().trim(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _creatorTenantScopeCode = normalized;
+        _viewMode = authService.viewRole ?? 'creator';
+      });
+      Navigator.of(context).pushNamedAndRemoveUntil('/main', (route) => false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка переключения группы: ${_extractDioMessage(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _creatorTenantScopeBusy = false);
+    }
+  }
+
   String _sessionTenantLabel(Map<String, dynamic> row) {
     final tenantName = (row['tenant_name'] ?? '').toString().trim();
     if (tenantName.isNotEmpty) return tenantName;
@@ -274,6 +409,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (tenantCode.isNotEmpty) return tenantCode;
     return 'Неизвестная группа';
   }
+
+  String _normalizeTenantCode(Object? value) =>
+      value?.toString().trim().toLowerCase() ?? '';
 
   Map<String, String> _extractInvitePayload(String raw) {
     final source = raw.trim();
@@ -490,62 +628,38 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (picked == null || picked.files.isEmpty) return;
     final pickedFile = picked.files.single;
 
-    if (kIsWeb) {
-      final bytes = pickedFile.bytes;
-      if (bytes == null || bytes.isEmpty) {
-        if (!mounted) return;
-        setState(() => _message = 'Не удалось прочитать выбранный файл');
-        return;
-      }
-      setState(() {
-        _avatarBusy = true;
-        _message = '';
-      });
-      try {
-        final fileName = pickedFile.name.trim().isNotEmpty
-            ? pickedFile.name.trim()
-            : 'avatar.jpg';
-        final form = FormData.fromMap({
-          'avatar': MultipartFile.fromBytes(bytes, filename: fileName),
-        });
-        final resp = await authService.dio.post('/api/profile/avatar', data: form);
-        final data = resp.data;
-        if (data is Map && data['user'] is Map && mounted) {
-          setState(() {
-            _applyUser(Map<String, dynamic>.from(data['user']));
-            _message = 'Аватарка обновлена';
-          });
+    Uint8List? sourceBytes = pickedFile.bytes;
+    if (sourceBytes == null || sourceBytes.isEmpty) {
+      final path = pickedFile.path;
+      if (path != null && path.isNotEmpty) {
+        try {
+          sourceBytes = await File(path).readAsBytes();
+        } catch (_) {
+          sourceBytes = null;
         }
-      } catch (e) {
-        if (!mounted) return;
-        setState(
-          () => _message = 'Ошибка загрузки аватарки: ${_extractDioMessage(e)}',
-        );
-      } finally {
-        if (mounted) setState(() => _avatarBusy = false);
       }
-      return;
     }
-
-    final path = pickedFile.path;
-    if (path == null || path.isEmpty) {
+    if (sourceBytes == null || sourceBytes.isEmpty) {
       if (!mounted) return;
-      setState(() => _message = 'Не удалось получить путь к файлу');
+      setState(() => _message = 'Не удалось прочитать выбранный файл');
       return;
     }
 
-    final selectedName = (pickedFile.name).toLowerCase().trim();
-    final isGif = selectedName.endsWith('.gif');
-    AvatarCropResult? placement;
+    final selectedName = pickedFile.name.trim().isEmpty
+        ? 'avatar.jpg'
+        : pickedFile.name.trim();
+    final selectedNameLower = selectedName.toLowerCase().trim();
+    Uint8List uploadBytes = sourceBytes;
+    var uploadFileName = selectedName;
+    final isGif = selectedNameLower.endsWith('.gif');
+    AvatarCropResult? croppedAvatar;
     if (!isGif) {
       try {
         if (!mounted) return;
-        placement = await showAvatarCropDialog(
+        croppedAvatar = await showAvatarCropDialog(
           context: context,
-          filePath: path,
-          initialFocusX: _avatarFocusX,
-          initialFocusY: _avatarFocusY,
-          initialZoom: _avatarZoom,
+          sourceBytes: sourceBytes,
+          originalFileName: selectedName,
         );
       } catch (e) {
         if (!mounted) return;
@@ -554,7 +668,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
         );
         return;
       }
-      if (placement == null) return;
+      if (croppedAvatar == null) return;
+      uploadBytes = croppedAvatar.bytes;
+      uploadFileName = croppedAvatar.fileName;
     }
 
     setState(() {
@@ -562,10 +678,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _message = '';
     });
     try {
-      final uploadPath = placement?.croppedPath ?? path;
-      final fileName = uploadPath.split(Platform.pathSeparator).last;
       final form = FormData.fromMap({
-        'avatar': await MultipartFile.fromFile(uploadPath, filename: fileName),
+        'avatar': MultipartFile.fromBytes(uploadBytes, filename: uploadFileName),
       });
       final resp = await authService.dio.post(
         '/api/profile/avatar',
@@ -585,11 +699,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       );
     } finally {
       if (mounted) setState(() => _avatarBusy = false);
-      if (placement != null) {
-        try {
-          await File(placement.croppedPath).delete();
-        } catch (_) {}
-      }
     }
   }
 
@@ -2086,6 +2195,80 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
+                            'Группа арендатора',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Создатель всегда работает внутри одной группы арендатора. По умолчанию это Default Tenant, а здесь можно мгновенно переключиться в любую другую группу без приглашения и без пароля.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          DropdownButtonFormField<String>(
+                            key: ValueKey(
+                              'creator-scope-${_creatorTenantScopeCode.isEmpty ? 'default' : _creatorTenantScopeCode}',
+                            ),
+                            initialValue: _creatorTenantScopeCode.isEmpty
+                                ? null
+                                : _creatorTenantScopeCode,
+                            decoration: const InputDecoration(
+                              labelText: 'Работать в группе',
+                              border: OutlineInputBorder(),
+                            ),
+                            items: _creatorTenants.map((row) {
+                                final code = (row['code'] ?? '')
+                                    .toString()
+                                    .trim()
+                                    .toLowerCase();
+                                final name = (row['name'] ?? '')
+                                    .toString()
+                                    .trim();
+                                final status = (row['status'] ?? '')
+                                    .toString()
+                                    .trim()
+                                    .toLowerCase();
+                                final statusLabel = switch (status) {
+                                  'active' => 'активна',
+                                  'blocked' => 'заблокирована',
+                                  _ => status,
+                                };
+                                final title = name.isNotEmpty ? name : code;
+                                return DropdownMenuItem<String>(
+                                  value: code,
+                                  child: Text(
+                                    statusLabel.isEmpty
+                                        ? title
+                                        : '$title • $statusLabel',
+                                  ),
+                                );
+                              }).toList(),
+                            onChanged: (_creatorTenantScopeBusy ||
+                                    _creatorTenantsLoading)
+                                ? null
+                                : (value) => _changeCreatorTenantScope(value),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            'Сейчас открыта группа: $tenantLabel.',
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (isPlatformCreator) ...[
+                    const SizedBox(height: 16),
+                    _sectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
                             'Ключи арендаторов',
                             style: theme.textTheme.titleMedium?.copyWith(
                               fontWeight: FontWeight.w800,
@@ -2102,12 +2285,17 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           SizedBox(
                             width: double.infinity,
                             child: FilledButton.icon(
-                              onPressed: () => Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) => const CreatorKeysScreen(),
-                                ),
-                              ),
+                              onPressed: () async {
+                                await Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) => const CreatorKeysScreen(),
+                                  ),
+                                );
+                                if (!mounted) return;
+                                await _loadCreatorTenants();
+                                await _load();
+                              },
                               icon: const Icon(Icons.vpn_key_outlined),
                               label: const Text('Открыть ключи'),
                             ),

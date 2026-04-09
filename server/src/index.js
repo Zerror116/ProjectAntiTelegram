@@ -806,6 +806,13 @@ async function canUserAccessChat(user, chatId) {
         const context = await resolveAuthContextFromToken(
           token,
           socket.handshake.auth?.view_role || "",
+          {
+            requestedTenantCode:
+              socket.handshake.auth?.tenant_code ||
+              socket.handshake.query?.tenant_code ||
+              socket.handshake.headers?.['x-tenant-code'] ||
+              '',
+          },
         );
         if (!context.ok || !context.user?.id) {
           const authError = context.error || "Unauthorized";

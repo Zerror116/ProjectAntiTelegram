@@ -976,10 +976,23 @@ router.get("/", authMiddleware, async (req, res) => {
       });
     }
 
+    const responseUser =
+      req.user?.is_platform_creator === true &&
+      String(req.user?.tenant_code || "").trim()
+        ? {
+            ...user,
+            tenant_code: req.user?.tenant_code || null,
+            tenant_name: req.user?.tenant_name || null,
+            tenant_status: req.user?.tenant_status || null,
+            subscription_expires_at:
+              req.user?.subscription_expires_at || null,
+          }
+        : user;
+
     return res.json({
       ok: true,
       user: {
-        ...user,
+        ...responseUser,
         phone_access_state:
           String(req.user?.phone_access_state || '').trim() || 'none',
         phone_access:

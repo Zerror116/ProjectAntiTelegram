@@ -1,9 +1,9 @@
-import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:flutter/gestures.dart';
+import 'package:crop_your_image/crop_your_image.dart';
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
+
+import 'phoenix_crop_core.dart';
 
 class ProductPhotoCropResult {
   const ProductPhotoCropResult({
@@ -19,418 +19,231 @@ class ProductPhotoCropResult {
   final int height;
 }
 
-Offset _clampCropOffset({
-  required Offset offset,
-  required int sourceWidth,
-  required int sourceHeight,
-  required double viewportWidth,
-  required double viewportHeight,
-  required double zoom,
-}) {
-  final baseScale = math.max(
-    viewportWidth / sourceWidth,
-    viewportHeight / sourceHeight,
-  );
-  final renderedWidth = sourceWidth * baseScale * zoom;
-  final renderedHeight = sourceHeight * baseScale * zoom;
-
-  final maxX = math.max(0.0, (renderedWidth - viewportWidth) / 2);
-  final maxY = math.max(0.0, (renderedHeight - viewportHeight) / 2);
-
-  return Offset(
-    offset.dx.clamp(-maxX, maxX).toDouble(),
-    offset.dy.clamp(-maxY, maxY).toDouble(),
-  );
-}
-
-img.Image _cropViewport({
-  required img.Image source,
-  required double viewportWidth,
-  required double viewportHeight,
-  required Offset offset,
-  required double zoom,
-}) {
-  final baseScale = math.max(
-    viewportWidth / source.width,
-    viewportHeight / source.height,
-  );
-  final effectiveScale = baseScale * zoom;
-  final renderedWidth = source.width * effectiveScale;
-  final renderedHeight = source.height * effectiveScale;
-
-  final imageLeft = (viewportWidth - renderedWidth) / 2 + offset.dx;
-  final imageTop = (viewportHeight - renderedHeight) / 2 + offset.dy;
-
-  final srcXf = (0 - imageLeft) / effectiveScale;
-  final srcYf = (0 - imageTop) / effectiveScale;
-  final srcWf = viewportWidth / effectiveScale;
-  final srcHf = viewportHeight / effectiveScale;
-
-  final srcX = srcXf.floor().clamp(0, source.width - 1);
-  final srcY = srcYf.floor().clamp(0, source.height - 1);
-  final srcW = srcWf.ceil().clamp(1, source.width - srcX);
-  final srcH = srcHf.ceil().clamp(1, source.height - srcY);
-
-  return img.copyCrop(source, x: srcX, y: srcY, width: srcW, height: srcH);
-}
-
-img.Image _normalizeForUpload(img.Image source, {int maxLongestSide = 2600}) {
-  final longestSide = math.max(source.width, source.height);
-  if (longestSide <= maxLongestSide) return source;
-  final scale = maxLongestSide / longestSide;
-  final targetWidth = (source.width * scale).round().clamp(1, maxLongestSide);
-  final targetHeight = (source.height * scale).round().clamp(1, maxLongestSide);
-  return img.copyResize(
-    source,
-    width: targetWidth,
-    height: targetHeight,
-    interpolation: img.Interpolation.cubic,
-  );
-}
-
-Uint8List _encodeTelegramLikeJpeg(img.Image source) {
-  var working = _normalizeForUpload(source);
-  const maxUploadBytes = 7 * 1024 * 1024;
-  const qualitySteps = <int>[97, 95, 93, 90, 87, 84];
-
-  for (final quality in qualitySteps) {
-    final output = Uint8List.fromList(img.encodeJpg(working, quality: quality));
-    if (output.lengthInBytes <= maxUploadBytes ||
-        quality == qualitySteps.last) {
-      return output;
-    }
-  }
-
-  return Uint8List.fromList(img.encodeJpg(working, quality: 82));
-}
-
-String _buildCroppedFilename(String originalFileName) {
-  final normalizedPath = originalFileName.replaceAll('\\', '/').trim();
-  final lastSegment = normalizedPath.split('/').last.trim();
-  final baseWithExt = lastSegment.isEmpty ? 'product-photo' : lastSegment;
-  final dotIndex = baseWithExt.lastIndexOf('.');
-  final base = dotIndex > 0 ? baseWithExt.substring(0, dotIndex) : baseWithExt;
-  final safeBase = base
-      .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_')
-      .replaceAll(RegExp(r'_+'), '_')
-      .trim();
-  final clean = safeBase.isEmpty ? 'product-photo' : safeBase;
-  return '${clean}_crop.jpg';
-}
-
-String _buildOriginalFilename(String originalFileName) {
-  final normalizedPath = originalFileName.replaceAll('\\', '/').trim();
-  final lastSegment = normalizedPath.split('/').last.trim();
-  if (lastSegment.isEmpty) return 'product-photo.jpg';
-  final safe = lastSegment
-      .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_')
-      .replaceAll(RegExp(r'_+'), '_')
-      .trim();
-  return safe.isEmpty ? 'product-photo.jpg' : safe;
-}
-
 Future<ProductPhotoCropResult?> showProductPhotoCropDialog({
   required BuildContext context,
   required Uint8List sourceBytes,
   required String originalFileName,
-  double? cropAspectRatio,
+  PhoenixPostCropPreset initialPreset = PhoenixPostCropPreset.square,
 }) async {
-  final decoded = img.decodeImage(sourceBytes);
-  if (decoded == null) {
-    throw Exception('Не удалось прочитать выбранное изображение');
-  }
-  final source = img.bakeOrientation(decoded);
-  final fileName = _buildCroppedFilename(originalFileName);
-  final passthroughFileName = _buildOriginalFilename(originalFileName);
+  final prepared = prepareImageForEditing(sourceBytes);
   if (!context.mounted) return null;
-
   return showDialog<ProductPhotoCropResult>(
     context: context,
-    builder: (dialogContext) {
-      final media = MediaQuery.of(dialogContext);
-      final maxDialogWidth = (media.size.width - 34).clamp(300.0, 680.0);
-      final maxViewportHeight = (media.size.height - 320).clamp(220.0, 460.0);
-      final sourceAspect = source.width > 0 && source.height > 0
-          ? source.width / source.height
-          : 1.0;
-      final resolvedAspect =
-          (cropAspectRatio != null && cropAspectRatio > 0
-                  ? cropAspectRatio
-                  : sourceAspect)
-              .clamp(0.45, 2.4)
-              .toDouble();
-      var viewportWidth = maxDialogWidth;
-      var viewportHeight = viewportWidth / resolvedAspect;
-      if (viewportHeight > maxViewportHeight) {
-        viewportHeight = maxViewportHeight;
-        viewportWidth = viewportHeight * resolvedAspect;
-      }
-
-      const minZoom = 1.0;
-      const maxZoom = 5.0;
-      var zoom = 1.0;
-      var offset = Offset.zero;
-      var scaleBase = zoom;
-      var startOffset = offset;
-      var startFocal = Offset.zero;
-      var exporting = false;
-      var localError = '';
-
-      return StatefulBuilder(
-        builder: (context, setModalState) {
-          return AlertDialog(
-            title: const Text('Обрезка фото товара'),
-            content: SizedBox(
-              width: maxDialogWidth,
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text(
-                      'Перемещайте и масштабируйте фото. Рамка показывает итоговый кадр.',
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 12),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(14),
-                      child: SizedBox(
-                        width: viewportWidth,
-                        height: viewportHeight,
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            Container(color: Colors.black12),
-                            Listener(
-                              onPointerSignal: (event) {
-                                if (event is! PointerScrollEvent) return;
-                                setModalState(() {
-                                  final next =
-                                      zoom +
-                                      (event.scrollDelta.dy > 0 ? -0.08 : 0.08);
-                                  zoom = next
-                                      .clamp(minZoom, maxZoom)
-                                      .toDouble();
-                                  offset = _clampCropOffset(
-                                    offset: offset,
-                                    sourceWidth: source.width,
-                                    sourceHeight: source.height,
-                                    viewportWidth: viewportWidth,
-                                    viewportHeight: viewportHeight,
-                                    zoom: zoom,
-                                  );
-                                });
-                              },
-                              child: GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                onScaleStart: (details) {
-                                  scaleBase = zoom;
-                                  startOffset = offset;
-                                  startFocal = details.localFocalPoint;
-                                },
-                                onScaleUpdate: (details) {
-                                  setModalState(() {
-                                    zoom = (scaleBase * details.scale)
-                                        .clamp(minZoom, maxZoom)
-                                        .toDouble();
-                                    final translated =
-                                        details.localFocalPoint - startFocal;
-                                    offset = _clampCropOffset(
-                                      offset: startOffset + translated,
-                                      sourceWidth: source.width,
-                                      sourceHeight: source.height,
-                                      viewportWidth: viewportWidth,
-                                      viewportHeight: viewportHeight,
-                                      zoom: zoom,
-                                    );
-                                  });
-                                },
-                                child: Transform.translate(
-                                  offset: offset,
-                                  child: Transform.scale(
-                                    scale: zoom,
-                                    child: Image.memory(
-                                      sourceBytes,
-                                      width: viewportWidth,
-                                      height: viewportHeight,
-                                      fit: BoxFit.cover,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                            IgnorePointer(
-                              child: CustomPaint(
-                                painter: _CropViewportFramePainter(),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      'Масштаб: ${(zoom * 100).round()}%',
-                      style: TextStyle(color: Colors.grey.shade700),
-                    ),
-                    Slider(
-                      value: zoom,
-                      min: minZoom,
-                      max: maxZoom,
-                      divisions: ((maxZoom - minZoom) * 20).round().clamp(
-                        1,
-                        120,
-                      ),
-                      onChanged: (next) {
-                        setModalState(() {
-                          zoom = next;
-                          offset = _clampCropOffset(
-                            offset: offset,
-                            sourceWidth: source.width,
-                            sourceHeight: source.height,
-                            viewportWidth: viewportWidth,
-                            viewportHeight: viewportHeight,
-                            zoom: zoom,
-                          );
-                        });
-                      },
-                    ),
-                    if (localError.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 2),
-                        child: Text(
-                          localError,
-                          style: const TextStyle(color: Colors.red),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: exporting
-                    ? null
-                    : () => Navigator.of(dialogContext).pop(),
-                child: const Text('Отмена'),
-              ),
-              TextButton(
-                onPressed: exporting
-                    ? null
-                    : () {
-                        Navigator.of(dialogContext).pop(
-                          ProductPhotoCropResult(
-                            bytes: sourceBytes,
-                            fileName: passthroughFileName,
-                            width: source.width,
-                            height: source.height,
-                          ),
-                        );
-                      },
-                child: const Text('Без обрезки'),
-              ),
-              TextButton(
-                onPressed: exporting
-                    ? null
-                    : () {
-                        setModalState(() {
-                          zoom = 1.0;
-                          offset = Offset.zero;
-                          localError = '';
-                        });
-                      },
-                child: const Text('Сброс'),
-              ),
-              ElevatedButton(
-                onPressed: exporting
-                    ? null
-                    : () async {
-                        setModalState(() {
-                          exporting = true;
-                          localError = '';
-                        });
-                        try {
-                          final cropped = _cropViewport(
-                            source: source,
-                            viewportWidth: viewportWidth,
-                            viewportHeight: viewportHeight,
-                            offset: offset,
-                            zoom: zoom,
-                          );
-                          final prepared = _encodeTelegramLikeJpeg(cropped);
-                          if (!dialogContext.mounted) return;
-                          Navigator.of(dialogContext).pop(
-                            ProductPhotoCropResult(
-                              bytes: prepared,
-                              fileName: fileName,
-                              width: cropped.width,
-                              height: cropped.height,
-                            ),
-                          );
-                        } catch (_) {
-                          setModalState(() {
-                            exporting = false;
-                            localError = 'Не удалось обработать изображение';
-                          });
-                        }
-                      },
-                child: exporting
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Text('Применить обрезку'),
-              ),
-            ],
-          );
-        },
-      );
-    },
+    builder: (_) => _ProductPhotoCropDialog(
+      prepared: prepared,
+      originalFileName: originalFileName,
+      initialPreset: initialPreset,
+    ),
   );
 }
 
-class _CropViewportFramePainter extends CustomPainter {
+class _ProductPhotoCropDialog extends StatefulWidget {
+  const _ProductPhotoCropDialog({
+    required this.prepared,
+    required this.originalFileName,
+    required this.initialPreset,
+  });
+
+  final PhoenixPreparedImage prepared;
+  final String originalFileName;
+  final PhoenixPostCropPreset initialPreset;
+
   @override
-  void paint(Canvas canvas, Size size) {
-    final borderPaint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.92)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2;
-    final guidePaint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.35)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
+  State<_ProductPhotoCropDialog> createState() => _ProductPhotoCropDialogState();
+}
 
-    final rect = Rect.fromLTWH(0, 0, size.width, size.height);
-    canvas.drawRect(rect, borderPaint);
+class _ProductPhotoCropDialogState extends State<_ProductPhotoCropDialog> {
+  final CropController _controller = CropController();
+  late PhoenixPostCropPreset _preset = widget.initialPreset;
+  bool _exporting = false;
+  String _localError = '';
 
-    final oneThirdX = size.width / 3;
-    final twoThirdX = (size.width / 3) * 2;
-    final oneThirdY = size.height / 3;
-    final twoThirdY = (size.height / 3) * 2;
+  void _resetEditor() {
+    _controller.withCircleUi = false;
+    _controller.aspectRatio = _preset.aspectRatio;
+    _controller.image = widget.prepared.bytes;
+    setState(() {
+      _localError = '';
+    });
+  }
 
-    canvas.drawLine(
-      Offset(oneThirdX, 0),
-      Offset(oneThirdX, size.height),
-      guidePaint,
+  void _applyPreset(PhoenixPostCropPreset preset) {
+    setState(() {
+      _preset = preset;
+      _localError = '';
+    });
+    if (preset != PhoenixPostCropPreset.uncropped) {
+      _controller.withCircleUi = false;
+      _controller.aspectRatio = preset.aspectRatio;
+      _controller.image = widget.prepared.bytes;
+    }
+  }
+
+  void _finishWithoutCrop() {
+    final preparedUpload = buildPostUploadImage(
+      widget.prepared.bytes,
+      widget.originalFileName,
+      cropped: false,
     );
-    canvas.drawLine(
-      Offset(twoThirdX, 0),
-      Offset(twoThirdX, size.height),
-      guidePaint,
-    );
-    canvas.drawLine(
-      Offset(0, oneThirdY),
-      Offset(size.width, oneThirdY),
-      guidePaint,
-    );
-    canvas.drawLine(
-      Offset(0, twoThirdY),
-      Offset(size.width, twoThirdY),
-      guidePaint,
+    Navigator.of(context).pop(
+      ProductPhotoCropResult(
+        bytes: preparedUpload.bytes,
+        fileName: preparedUpload.fileName,
+        width: preparedUpload.width,
+        height: preparedUpload.height,
+      ),
     );
   }
 
+  void _applyCrop() {
+    if (_preset == PhoenixPostCropPreset.uncropped) {
+      _finishWithoutCrop();
+      return;
+    }
+    setState(() {
+      _exporting = true;
+      _localError = '';
+    });
+    _controller.crop();
+  }
+
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final media = MediaQuery.of(context);
+    final dialogWidth = (media.size.width - 34).clamp(300.0, 700.0);
+    final cropAspect = _preset.aspectRatio ?? 1.0;
+    final maxViewportHeight = (media.size.height - 340).clamp(220.0, 470.0);
+    var viewportWidth = dialogWidth;
+    var viewportHeight = viewportWidth / cropAspect;
+    if (viewportHeight > maxViewportHeight) {
+      viewportHeight = maxViewportHeight;
+      viewportWidth = viewportHeight * cropAspect;
+    }
+
+    return AlertDialog(
+      title: const Text('Фото товара'),
+      content: SizedBox(
+        width: dialogWidth,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Выберите кадр для поста. При желании можно сохранить фото целиком без обрезки.',
+                style: theme.textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: PhoenixPostCropPreset.values.map((preset) {
+                  return ChoiceChip(
+                    label: Text(preset.label),
+                    selected: _preset == preset,
+                    onSelected: _exporting ? null : (_) => _applyPreset(preset),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 14),
+              Center(
+                child: _preset == PhoenixPostCropPreset.uncropped
+                    ? ClipRRect(
+                        borderRadius: BorderRadius.circular(18),
+                        child: Container(
+                          width: dialogWidth,
+                          constraints: BoxConstraints(
+                            minHeight: 220,
+                            maxHeight: maxViewportHeight,
+                          ),
+                          color: theme.colorScheme.surfaceContainerHighest,
+                          alignment: Alignment.center,
+                          child: Image.memory(
+                            widget.prepared.bytes,
+                            fit: BoxFit.contain,
+                            filterQuality: FilterQuality.high,
+                          ),
+                        ),
+                      )
+                    : PhoenixCropCore(
+                        imageBytes: widget.prepared.bytes,
+                        controller: _controller,
+                        onCropped: (result) {
+                          switch (result) {
+                            case CropSuccess(:final croppedImage):
+                              final preparedUpload = buildPostUploadImage(
+                                croppedImage,
+                                widget.originalFileName,
+                                cropped: true,
+                              );
+                              if (!mounted) return;
+                              Navigator.of(context).pop(
+                                ProductPhotoCropResult(
+                                  bytes: preparedUpload.bytes,
+                                  fileName: preparedUpload.fileName,
+                                  width: preparedUpload.width,
+                                  height: preparedUpload.height,
+                                ),
+                              );
+                            case CropFailure():
+                              if (!mounted) return;
+                              setState(() {
+                                _exporting = false;
+                                _localError = 'Не удалось обработать изображение';
+                              });
+                          }
+                        },
+                        aspectRatio: _preset.aspectRatio,
+                        height: viewportHeight,
+                        width: viewportWidth,
+                        showGrid: true,
+                      ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _preset == PhoenixPostCropPreset.uncropped
+                    ? 'Фото сохранится целиком. Мы только выровняем ориентацию и подготовим размер для загрузки.'
+                    : 'Перемещайте и приближайте фото внутри рамки. Итоговый кадр будет таким же, как в редакторе.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              if (_localError.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Text(
+                  _localError,
+                  style: TextStyle(color: theme.colorScheme.error),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _exporting ? null : () => Navigator.of(context).pop(),
+          child: const Text('Отмена'),
+        ),
+        TextButton(
+          onPressed: _exporting ? null : _resetEditor,
+          child: const Text('Сбросить'),
+        ),
+        ElevatedButton(
+          onPressed: _exporting ? null : _applyCrop,
+          child: _exporting
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Text(
+                  _preset == PhoenixPostCropPreset.uncropped
+                      ? 'Сохранить без обрезки'
+                      : 'Готово',
+                ),
+        ),
+      ],
+    );
+  }
 }

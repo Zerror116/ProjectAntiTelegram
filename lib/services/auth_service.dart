@@ -119,6 +119,7 @@ class AuthService {
   static const _authNoticeKey = 'auth_notice_message';
   static const _viewRoleKey = 'creator_view_role';
   static const _tenantCodeKey = 'tenant_code_scope';
+  static const _creatorTenantScopeKey = 'creator_tenant_scope_code_v1';
   static const _savedSessionsKey = 'saved_tenant_sessions_v1';
   static const _userSnapshotKey = 'auth_user_snapshot_v1';
 
@@ -175,6 +176,7 @@ class AuthService {
   bool _isLoggingOut = false;
   String? _deviceFingerprintCache;
   String? _tenantCodeCache;
+  String? _creatorTenantScopeCache;
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   Completer<bool>? _sessionRefreshCompleter;
   bool _preferSharedPrefsSecretStore = false;
@@ -653,7 +655,11 @@ class AuthService {
     if (user != null) _currentUser = user;
     await _saveUserSnapshot(_currentUser);
     final responseTenantCode = (user?.tenantCode ?? '').trim();
-    if (responseTenantCode.isNotEmpty) {
+    if ((_currentUser?.role.toLowerCase().trim() ?? '') == 'creator') {
+      if (responseTenantCode.isNotEmpty) {
+        _creatorTenantScopeCache = _normalizeTenantCodeScope(responseTenantCode);
+      }
+    } else if (responseTenantCode.isNotEmpty) {
       await setTenantCode(responseTenantCode);
     }
     await _upsertSavedSession(accessToken, _currentUser);
@@ -661,9 +667,15 @@ class AuthService {
       final prefs = await SharedPreferences.getInstance();
       if (_currentUser?.role.toLowerCase().trim() == 'creator') {
         _viewRole = prefs.getString(_viewRoleKey);
+        await _restoreCreatorTenantScopeFromStorage(
+          prefs,
+          patchCurrentUser: true,
+        );
       } else {
         _viewRole = null;
         await prefs.remove(_viewRoleKey);
+        _creatorTenantScopeCache = null;
+        await prefs.remove(_creatorTenantScopeKey);
       }
     } catch (_) {}
     try {
@@ -703,6 +715,7 @@ class AuthService {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_viewRoleKey);
       await prefs.remove(_userSnapshotKey);
+      await prefs.remove(_creatorTenantScopeKey);
       await _removeSecret(_tokenKey);
       await _removeSecret(_refreshTokenKey);
       await _removeSecret(_accessExpiresAtKey);
@@ -719,6 +732,7 @@ class AuthService {
       pendingRegistrationEmailToken = null;
       _currentUser = null;
       _viewRole = null;
+      _creatorTenantScopeCache = null;
 
       try {
         _authController.add(null);
@@ -773,8 +787,13 @@ class AuthService {
       final prefs = await SharedPreferences.getInstance();
       if (_currentUser?.role.toLowerCase().trim() == 'creator') {
         _viewRole = prefs.getString(_viewRoleKey);
+        await _restoreCreatorTenantScopeFromStorage(
+          prefs,
+          patchCurrentUser: true,
+        );
       } else {
         _viewRole = null;
+        _creatorTenantScopeCache = null;
       }
       try {
         _authController.add(_currentUser);
@@ -860,6 +879,10 @@ class AuthService {
           final prefs = await SharedPreferences.getInstance();
           if (_currentUser?.role.toLowerCase().trim() == 'creator') {
             _viewRole = prefs.getString(_viewRoleKey);
+            await _restoreCreatorTenantScopeFromStorage(
+              prefs,
+              patchCurrentUser: true,
+            );
           }
         }
       }
@@ -901,6 +924,144 @@ class AuthService {
     }
     _tenantCodeCache = stored;
     return _tenantCodeCache;
+  }
+
+  bool get canSelectCreatorTenantScope =>
+      _currentUser?.role.toLowerCase().trim() == 'creator';
+
+  String? get creatorTenantScopeCode =>
+      (_creatorTenantScopeCache?.trim().isNotEmpty ?? false)
+          ? _creatorTenantScopeCache?.trim()
+          : (() {
+              final fallback = _normalizeTenantCodeScope(
+                _currentUser?.tenantCode,
+              );
+              return fallback.isEmpty ? null : fallback;
+            })();
+
+  User? _withCreatorTenantScope(
+    User? user, {
+    String? tenantCode,
+    String? tenantName,
+    String? tenantStatus,
+    String? tenantId,
+    String? subscriptionExpiresAt,
+  }) {
+    if (user == null) return null;
+    if (user.role.toLowerCase().trim() != 'creator') return user;
+    final normalizedCode = _normalizeTenantCodeScope(tenantCode);
+    return User(
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      phone: user.phone,
+      phoneAccessState: user.phoneAccessState,
+      tenantCode: normalizedCode.isEmpty ? null : normalizedCode,
+      tenantName: (tenantName ?? '').trim().isEmpty ? null : tenantName?.trim(),
+      tenantStatus:
+          (tenantStatus ?? '').trim().isEmpty ? null : tenantStatus?.trim(),
+      subscriptionExpiresAt:
+          (subscriptionExpiresAt ?? '').trim().isEmpty
+              ? null
+              : subscriptionExpiresAt?.trim(),
+      permissions: user.permissions,
+    );
+  }
+
+  Future<void> _restoreCreatorTenantScopeFromStorage(
+    SharedPreferences prefs, {
+    bool patchCurrentUser = false,
+  }) async {
+    final storedRaw = prefs.getString(_creatorTenantScopeKey)?.trim() ?? '';
+    final stored = _normalizeTenantCodeScope(storedRaw);
+    if (stored.isEmpty) {
+      final fallback = _normalizeTenantCodeScope(_currentUser?.tenantCode);
+      _creatorTenantScopeCache = fallback.isEmpty ? null : fallback;
+      if (storedRaw.isNotEmpty) {
+        await prefs.remove(_creatorTenantScopeKey);
+      }
+      if (patchCurrentUser &&
+          _currentUser?.role.toLowerCase().trim() == 'creator') {
+        _currentUser = _withCreatorTenantScope(
+          _currentUser,
+          tenantCode: _creatorTenantScopeCache,
+          tenantName: _currentUser?.tenantName,
+          tenantStatus: _currentUser?.tenantStatus,
+          subscriptionExpiresAt: _currentUser?.subscriptionExpiresAt,
+        );
+      }
+      if (_creatorTenantScopeCache != null) {
+        await prefs.setString(_creatorTenantScopeKey, _creatorTenantScopeCache!);
+      }
+      return;
+    }
+    if (stored != storedRaw) {
+      await prefs.setString(_creatorTenantScopeKey, stored);
+    }
+    _creatorTenantScopeCache = stored;
+    if (patchCurrentUser &&
+        _currentUser?.role.toLowerCase().trim() == 'creator') {
+      _currentUser = _withCreatorTenantScope(
+        _currentUser,
+        tenantCode: stored,
+        tenantName: _currentUser?.tenantName,
+        tenantStatus: _currentUser?.tenantStatus,
+        subscriptionExpiresAt: _currentUser?.subscriptionExpiresAt,
+      );
+    }
+  }
+
+  Future<void> setCreatorTenantScope(
+    String? tenantCode, {
+    String? tenantId,
+    String? tenantName,
+    String? tenantStatus,
+    String? subscriptionExpiresAt,
+  }) async {
+    if (!canSelectCreatorTenantScope) return;
+    final normalized = _normalizeTenantCodeScope(tenantCode);
+    final prefs = await SharedPreferences.getInstance();
+    if (normalized.isEmpty) {
+      _creatorTenantScopeCache = null;
+      await prefs.remove(_creatorTenantScopeKey);
+      _currentUser = _withCreatorTenantScope(_currentUser);
+    } else {
+      _creatorTenantScopeCache = normalized;
+      await prefs.setString(_creatorTenantScopeKey, normalized);
+      _currentUser = _withCreatorTenantScope(
+        _currentUser,
+        tenantCode: normalized,
+        tenantId: tenantId,
+        tenantName: tenantName,
+        tenantStatus: tenantStatus,
+        subscriptionExpiresAt: subscriptionExpiresAt,
+      );
+    }
+    await _saveUserSnapshot(_currentUser);
+    try {
+      _authController.add(_currentUser);
+    } catch (_) {}
+  }
+
+  Future<String?> getCreatorTenantScopeCode() async {
+    if (!canSelectCreatorTenantScope && _currentUser != null) {
+      return null;
+    }
+    if (_creatorTenantScopeCache != null &&
+        _creatorTenantScopeCache!.trim().isNotEmpty) {
+      return _creatorTenantScopeCache;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await _restoreCreatorTenantScopeFromStorage(prefs, patchCurrentUser: true);
+    final fallback = _normalizeTenantCodeScope(_currentUser?.tenantCode);
+    if ((_creatorTenantScopeCache ?? '').trim().isEmpty && fallback.isNotEmpty) {
+      _creatorTenantScopeCache = fallback;
+      await prefs.setString(_creatorTenantScopeKey, fallback);
+    }
+    return (_creatorTenantScopeCache ?? '').trim().isEmpty
+        ? null
+        : _creatorTenantScopeCache;
   }
 
   /// Обработать ответ от /auth (вытянуть токены и user), использовать setSessionTokens
@@ -959,6 +1120,20 @@ class AuthService {
 
     if (userMap != null) {
       _currentUser = User.fromMap(userMap);
+      if (_currentUser?.role.toLowerCase().trim() == 'creator') {
+        final scopedCode = await getCreatorTenantScopeCode();
+        if ((scopedCode ?? '').isNotEmpty) {
+          _currentUser = _withCreatorTenantScope(
+            _currentUser,
+            tenantCode: userMap['tenant_code']?.toString() ?? scopedCode,
+            tenantId: userMap['tenant_id']?.toString(),
+            tenantName: userMap['tenant_name']?.toString(),
+            tenantStatus: userMap['tenant_status']?.toString(),
+            subscriptionExpiresAt:
+                userMap['subscription_expires_at']?.toString(),
+          );
+        }
+      }
       debugPrint('👤 User extracted: ${_currentUser?.email}');
     } else {
       // Попробуем подтянуть профиль, если сервер не вернул user
@@ -983,7 +1158,16 @@ class AuthService {
       tenantCodeFromResponse = tenant['code'].toString().trim();
     }
     tenantCodeFromResponse ??= _currentUser?.tenantCode;
-    if ((tenantCodeFromResponse ?? '').isNotEmpty) {
+    if ((_currentUser?.role.toLowerCase().trim() ?? '') == 'creator') {
+      if ((tenantCodeFromResponse ?? '').isNotEmpty) {
+        await setCreatorTenantScope(
+          tenantCodeFromResponse,
+          tenantName: _currentUser?.tenantName,
+          tenantStatus: _currentUser?.tenantStatus,
+          subscriptionExpiresAt: _currentUser?.subscriptionExpiresAt,
+        );
+      }
+    } else if ((tenantCodeFromResponse ?? '').isNotEmpty) {
       await setTenantCode(tenantCodeFromResponse);
     }
 

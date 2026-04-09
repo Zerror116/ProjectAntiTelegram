@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
+import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/media_url.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/app_empty_state.dart';
@@ -58,8 +59,15 @@ class _WorkerPanelState extends State<WorkerPanel>
   String? _existingImageUrl;
   bool _removeImageOnSubmit = false;
 
+  bool get _isMobileWeb =>
+      kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
+
   bool get _cameraSupported {
-    if (kIsWeb) return false;
+    if (kIsWeb) {
+      return _isMobileWeb && WebMediaCapturePermissionService.isSupported;
+    }
     return Platform.isAndroid || Platform.isIOS;
   }
 
@@ -575,7 +583,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                   leading: Icon(Icons.info_outline),
                   title: Text('Камера недоступна на этом устройстве'),
                   subtitle: Text(
-                    'На macOS/Windows/Linux выберите фото из файлов',
+                    'На этом устройстве используйте выбор фото с устройства',
                   ),
                 ),
               ListTile(
@@ -690,7 +698,33 @@ class _WorkerPanelState extends State<WorkerPanel>
       XFile? picked;
       Uint8List? preloadedBytes;
       String? preloadedFileName;
-      if (effectiveSource == ImageSource.gallery &&
+      if (kIsWeb && effectiveSource == ImageSource.camera) {
+        try {
+          await WebMediaCapturePermissionService.requestPreferredAccess(
+            includeVideo: true,
+          );
+        } catch (_) {}
+        try {
+          picked = await _imagePicker.pickImage(
+            source: ImageSource.camera,
+            preferredCameraDevice: CameraDevice.rear,
+          );
+        } catch (_) {}
+        if (picked == null) {
+          final result = await FilePicker.platform.pickFiles(
+            type: FileType.image,
+            allowMultiple: false,
+            withData: true,
+          );
+          final selected = result?.files.single;
+          final bytes = selected?.bytes;
+          if (bytes != null && bytes.isNotEmpty) {
+            preloadedBytes = bytes;
+            preloadedFileName = (selected?.name ?? 'camera-image.jpg').trim();
+            picked = XFile.fromData(bytes, name: preloadedFileName);
+          }
+        }
+      } else if (effectiveSource == ImageSource.gallery &&
           _preferFilePickerForGallery) {
         if (kIsWeb) {
           // Web: read bytes directly from FilePicker to avoid revoked Blob URLs.

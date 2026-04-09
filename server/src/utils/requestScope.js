@@ -14,13 +14,13 @@ async function runInRequestTenantScope(req, fn) {
     throw new Error('runInRequestTenantScope: fn must be a function');
   }
   const user = req?.user || {};
-  if (user?.is_platform_creator === true) {
-    return db.runWithPlatform(fn);
-  }
-
   const tenantCode = normalizeTenantCode(user?.tenant_code || user?.tenantCode || '');
   if (tenantCode) {
     return db.runWithTenantCode(tenantCode, fn);
+  }
+
+  if (user?.is_platform_creator === true) {
+    return db.runWithPlatform(fn);
   }
 
   const tenantId = normalizeTenantId(user?.tenant_id || user?.tenantId || null);
@@ -34,4 +34,3 @@ async function runInRequestTenantScope(req, fn) {
 module.exports = {
   runInRequestTenantScope,
 };
-
