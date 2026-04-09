@@ -465,7 +465,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
     final resp = await authService.dio.get(
       '/api/chats/direct/search',
-      queryParameters: {'query': query, 'limit': 10},
+      queryParameters: {'q': query, 'limit': 10},
     );
     final root = _asMap(resp.data, context: '/api/chats/direct/search');
     if (root['ok'] != true) {
