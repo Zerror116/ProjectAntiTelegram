@@ -10,6 +10,7 @@ import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -131,6 +132,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _draftSyncInFlight = false;
   bool _hasMoreBefore = false;
   bool _stickToBottom = true;
+  bool _manualBottomLockSuppressed = false;
   int _offlineQueuedCount = 0;
   int _unreadCount = 0;
 
@@ -953,8 +955,23 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_scrollController.hasClients && _scrollController.position.pixels <= 280) {
       unawaited(_loadOlderMessages());
     }
+    final userDirection = _scrollController.hasClients
+        ? _scrollController.position.userScrollDirection
+        : ScrollDirection.idle;
     final nearBottom = _isNearBottom();
-    _stickToBottom = nearBottom;
+    if (userDirection == ScrollDirection.forward) {
+      _manualBottomLockSuppressed = true;
+      _stickToBottom = false;
+      _clearBottomSettle();
+    } else {
+      if (_manualBottomLockSuppressed &&
+          nearBottom &&
+          (userDirection == ScrollDirection.reverse ||
+              userDirection == ScrollDirection.idle)) {
+        _manualBottomLockSuppressed = false;
+      }
+      _stickToBottom = nearBottom && !_manualBottomLockSuppressed;
+    }
     if (nearBottom && _unreadCount > 0) {
       _scheduleReadSync();
     }
@@ -1049,6 +1066,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
+      _manualBottomLockSuppressed = false;
       _stickToBottom = true;
       final target = _scrollController.position.maxScrollExtent;
       if (settlePasses > 0) {
@@ -1337,7 +1355,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _pingBottomSettle();
       return;
     }
-    if (!_stickToBottom) return;
+    if (!_stickToBottom || _manualBottomLockSuppressed) return;
     _armBottomSettle(
       passes: 2,
       delay: Duration.zero,
@@ -2052,6 +2070,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _jumpToMessageById(String messageId) async {
     final trimmedMessageId = messageId.trim();
     if (trimmedMessageId.isEmpty) return;
+    _manualBottomLockSuppressed = true;
     _stickToBottom = false;
     _clearBottomSettle();
 
@@ -6218,6 +6237,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _jumpToSearchResult(int index) async {
     if (index < 0 || index >= _searchResultIds.length) return;
     final messageId = _searchResultIds[index];
+    _manualBottomLockSuppressed = true;
     _stickToBottom = false;
     _clearBottomSettle();
     final targetContext = await _resolveMessageContextWithScroll(messageId);

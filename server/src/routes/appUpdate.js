@@ -269,6 +269,21 @@ function resolveAndroidPackageName() {
   );
 }
 
+function resolveAndroidManagedManifestMinBuild() {
+  return safePositiveInt(
+    process.env.APP_UPDATE_ANDROID_MANIFEST_MIN_BUILD,
+    22,
+  );
+}
+
+function supportsManagedAndroidManifest(req) {
+  const minBuild = resolveAndroidManagedManifestMinBuild();
+  if (minBuild <= 0) return true;
+  const currentBuild = safePositiveInt(req?.query?.current_build, 0);
+  if (currentBuild <= 0) return true;
+  return currentBuild >= minBuild;
+}
+
 function resolveAllowedUpdateHosts(req) {
   const hosts = new Set();
   for (const raw of parseStringList(process.env.APP_UPDATE_ALLOWED_HOSTS)) {
@@ -835,6 +850,13 @@ router.get('/android/apk', async (req, res) => {
 
 router.get('/android/manifest', async (req, res) => {
   try {
+    if (!supportsManagedAndroidManifest(req)) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          'Для этой версии Феникс встроенный manifest не используется. Скачивание продолжится через сайт.',
+      });
+    }
     const envelope = await buildAndroidManifestEnvelope(req);
     if (!envelope) {
       const android = await buildAndroidPublicConfig(req);
