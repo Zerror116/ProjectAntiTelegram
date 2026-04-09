@@ -1501,6 +1501,7 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   );
   Timer? poller;
   var pendingInstallAfterPermission = false;
+  var browserFallbackTriggeredByManagedFailure = false;
 
   try {
     var notificationsAllowed = false;
@@ -1543,6 +1544,25 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       try {
         final state = await NativeUpdateInstaller.getManagedUpdateStatus();
         statusNotifier.value = state;
+        final failureCode = state.errorCode.trim();
+        final shouldUseBrowserFallback =
+            !browserFallbackTriggeredByManagedFailure &&
+            fallbackUri != null &&
+            state.isFailed &&
+            (failureCode == 'manifest_signature_invalid' ||
+                failureCode == 'manifest_invalid');
+        if (shouldUseBrowserFallback) {
+          browserFallbackTriggeredByManagedFailure = true;
+          final opened = await _openAndroidFallbackUpdateUri(fallbackUri);
+          if (opened) {
+            showGlobalAppNotice(
+              'Встроенная проверка обновления недоступна на этом устройстве. Открыли резервную загрузку через сайт.',
+              title: 'Обновление Феникс',
+              tone: AppNoticeTone.warning,
+              duration: const Duration(seconds: 6),
+            );
+          }
+        }
         if (pendingInstallAfterPermission && state.readyToInstall) {
           final canInstall =
               await NativeUpdateInstaller.canRequestPackageInstalls();
@@ -1608,7 +1628,12 @@ Future<bool> _downloadAndInstallAndroidUpdate({
             ),
             backgroundColor: Colors.transparent,
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 560),
+              constraints: BoxConstraints(
+                maxWidth: 560,
+                maxHeight: (MediaQuery.of(dialogContext).size.height * 0.86)
+                    .clamp(360.0, 720.0)
+                    .toDouble(),
+              ),
               child: DecoratedBox(
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(28),
@@ -1653,213 +1678,258 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                           state.isFailed && fallbackUri != null;
 
                       return Column(
-                        mainAxisSize: MainAxisSize.min,
+                        mainAxisSize: MainAxisSize.max,
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Row(
-                            children: [
-                              Container(
-                                width: 46,
-                                height: 46,
-                                decoration: BoxDecoration(
-                                  color: Colors.white.withValues(alpha: 0.18),
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                                child: const Icon(
-                                  Icons.system_update_alt_rounded,
-                                  color: Colors.white,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Text(
-                                  info.required
-                                      ? 'Требуется обновление Феникс'
-                                      : 'Что нового в версии ${info.latest.version}',
-                                  style: theme.textTheme.titleMedium?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 14),
-                          Text(
-                            'Текущая версия: $currentLabel\n'
-                            'Новая версия: $latestLabel\n'
-                            'Канал: ${(info.channel ?? 'stable').trim()}',
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w600,
-                              height: 1.35,
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          Wrap(
-                            spacing: 10,
-                            runSpacing: 10,
-                            children: [
-                              _UpdateMetaChip(
-                                label: 'Дата',
-                                value: publishedLabel,
-                              ),
-                              _UpdateMetaChip(
-                                label: 'Размер',
-                                value: info.fileSize != null
-                                    ? _formatBytesRu(info.fileSize!)
-                                    : 'Уточняется',
-                              ),
-                              _UpdateMetaChip(
-                                label: 'SHA-256',
-                                value: (info.sha256 ?? '').trim().isEmpty
-                                    ? 'Не указан'
-                                    : '${info.sha256!.substring(0, info.sha256!.length < 16 ? info.sha256!.length : 16)}…',
-                              ),
-                            ],
-                          ),
-                          if ((info.message ?? '').trim().isNotEmpty) ...[
-                            const SizedBox(height: 14),
-                            Text(
-                              info.message!.trim(),
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: Colors.white,
-                              ),
-                            ),
-                          ],
-                          if (changelogLines.isNotEmpty) ...[
-                            const SizedBox(height: 14),
-                            Text(
-                              'Что нового',
-                              style: theme.textTheme.titleSmall?.copyWith(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            ...changelogLines.map(
-                              (line) => Padding(
-                                padding: const EdgeInsets.only(bottom: 6),
-                                child: Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Padding(
-                                      padding: EdgeInsets.only(top: 6),
-                                      child: Icon(
-                                        Icons.circle,
-                                        size: 8,
-                                        color: Colors.white,
+                          Flexible(
+                            child: SingleChildScrollView(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Container(
+                                        width: 46,
+                                        height: 46,
+                                        decoration: BoxDecoration(
+                                          color: Colors.white.withValues(
+                                            alpha: 0.18,
+                                          ),
+                                          borderRadius: BorderRadius.circular(
+                                            16,
+                                          ),
+                                        ),
+                                        child: const Icon(
+                                          Icons.system_update_alt_rounded,
+                                          color: Colors.white,
+                                        ),
                                       ),
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Text(
+                                          info.required
+                                              ? 'Требуется обновление Феникс'
+                                              : 'Что нового в версии ${info.latest.version}',
+                                          style: theme.textTheme.titleMedium
+                                              ?.copyWith(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.w800,
+                                              ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 14),
+                                  Text(
+                                    'Текущая версия: $currentLabel\n'
+                                    'Новая версия: $latestLabel\n'
+                                    'Канал: ${(info.channel ?? 'stable').trim()}',
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w600,
+                                      height: 1.35,
                                     ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        line,
-                                        style: theme.textTheme.bodyMedium
-                                            ?.copyWith(color: Colors.white),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Wrap(
+                                    spacing: 10,
+                                    runSpacing: 10,
+                                    children: [
+                                      _UpdateMetaChip(
+                                        label: 'Дата',
+                                        value: publishedLabel,
+                                      ),
+                                      _UpdateMetaChip(
+                                        label: 'Размер',
+                                        value: info.fileSize != null
+                                            ? _formatBytesRu(info.fileSize!)
+                                            : 'Уточняется',
+                                      ),
+                                      _UpdateMetaChip(
+                                        label: 'SHA-256',
+                                        value:
+                                            (info.sha256 ?? '').trim().isEmpty
+                                            ? 'Не указан'
+                                            : '${info.sha256!.substring(0, info.sha256!.length < 16 ? info.sha256!.length : 16)}…',
+                                      ),
+                                    ],
+                                  ),
+                                  if ((info.message ?? '').trim().isNotEmpty) ...[
+                                    const SizedBox(height: 14),
+                                    Text(
+                                      info.message!.trim(),
+                                      style: theme.textTheme.bodyMedium
+                                          ?.copyWith(color: Colors.white),
+                                    ),
+                                  ],
+                                  if (changelogLines.isNotEmpty) ...[
+                                    const SizedBox(height: 14),
+                                    Text(
+                                      'Что нового',
+                                      style: theme.textTheme.titleSmall
+                                          ?.copyWith(
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    ...changelogLines.map(
+                                      (line) => Padding(
+                                        padding: const EdgeInsets.only(
+                                          bottom: 6,
+                                        ),
+                                        child: Row(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            const Padding(
+                                              padding: EdgeInsets.only(top: 6),
+                                              child: Icon(
+                                                Icons.circle,
+                                                size: 8,
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Expanded(
+                                              child: Text(
+                                                line,
+                                                style: theme
+                                                    .textTheme
+                                                    .bodyMedium
+                                                    ?.copyWith(
+                                                      color: Colors.white,
+                                                    ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
                                       ),
                                     ),
                                   ],
-                                ),
+                                  const SizedBox(height: 16),
+                                  Container(
+                                    width: double.infinity,
+                                    padding: const EdgeInsets.all(14),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.12,
+                                      ),
+                                      borderRadius: BorderRadius.circular(18),
+                                      border: Border.all(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.12,
+                                        ),
+                                      ),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          stageText,
+                                          style: theme.textTheme.titleSmall
+                                              ?.copyWith(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.w800,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 12),
+                                        LinearProgressIndicator(
+                                          value: progress,
+                                          minHeight: 10,
+                                          borderRadius: BorderRadius.circular(
+                                            999,
+                                          ),
+                                          backgroundColor:
+                                              Colors.white.withValues(
+                                                alpha: 0.18,
+                                              ),
+                                          valueColor:
+                                              const AlwaysStoppedAnimation<
+                                                Color
+                                              >(Colors.white),
+                                        ),
+                                        const SizedBox(height: 10),
+                                        Text(
+                                          progressText,
+                                          style: theme.textTheme.bodyMedium
+                                              ?.copyWith(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          transferText,
+                                          style: theme.textTheme.bodySmall
+                                              ?.copyWith(
+                                                color: Colors.white.withValues(
+                                                  alpha: 0.92,
+                                                ),
+                                              ),
+                                        ),
+                                        if (state.isDownloading) ...[
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            'Скорость: $speedText · Осталось: $etaText',
+                                            style: theme.textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color:
+                                                      Colors.white.withValues(
+                                                        alpha: 0.92,
+                                                      ),
+                                                ),
+                                          ),
+                                        ],
+                                        if (state.readyToInstall) ...[
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            'APK уже в приложении. Можно открывать установку.',
+                                            style: theme.textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color:
+                                                      Colors.white.withValues(
+                                                        alpha: 0.92,
+                                                      ),
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                          ),
+                                        ],
+                                        if (state.isInstalledPendingRestart) ...[
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            'Android завершил установку. Можно открыть новую версию.',
+                                            style: theme.textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color:
+                                                      Colors.white.withValues(
+                                                        alpha: 0.92,
+                                                      ),
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                          ),
+                                        ],
+                                        if (state.isFailed &&
+                                            state.errorMessage
+                                                .trim()
+                                                .isNotEmpty) ...[
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            state.errorMessage.trim(),
+                                            style: theme.textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color: Colors.white,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  ),
+                                ],
                               ),
-                            ),
-                          ],
-                          const SizedBox(height: 16),
-                          Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(14),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(18),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.12),
-                              ),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  stageText,
-                                  style: theme.textTheme.titleSmall?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 12),
-                                LinearProgressIndicator(
-                                  value: progress,
-                                  minHeight: 10,
-                                  borderRadius: BorderRadius.circular(999),
-                                  backgroundColor: Colors.white.withValues(
-                                    alpha: 0.18,
-                                  ),
-                                  valueColor:
-                                      const AlwaysStoppedAnimation<Color>(
-                                        Colors.white,
-                                      ),
-                                ),
-                                const SizedBox(height: 10),
-                                Text(
-                                  progressText,
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  transferText,
-                                  style: theme.textTheme.bodySmall?.copyWith(
-                                    color: Colors.white.withValues(alpha: 0.92),
-                                  ),
-                                ),
-                                if (state.isDownloading) ...[
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    'Скорость: $speedText · Осталось: $etaText',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: Colors.white.withValues(
-                                        alpha: 0.92,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                                if (state.readyToInstall) ...[
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    'APK уже в приложении. Можно открывать установку.',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: Colors.white.withValues(
-                                        alpha: 0.92,
-                                      ),
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ],
-                                if (state.isInstalledPendingRestart) ...[
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    'Android завершил установку. Можно открыть новую версию.',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: Colors.white.withValues(
-                                        alpha: 0.92,
-                                      ),
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ],
-                                if (state.isFailed &&
-                                    state.errorMessage.trim().isNotEmpty) ...[
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    state.errorMessage.trim(),
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ],
-                              ],
                             ),
                           ),
                           const SizedBox(height: 16),

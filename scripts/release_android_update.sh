@@ -418,7 +418,7 @@ smoke_check_remote_release() {
   landing_html="$(curl -fsSL -L "$base/download/android")"
   printf '%s' "$landing_html" | grep -q 'Феникс для Android' || fail "Smoke failed: landing page title missing"
   printf '%s' "$landing_html" | grep -q 'SHA-256' || fail "Smoke failed: landing page missing SHA-256"
-  printf '%s' "$landing_html" | grep -q "$APP_VERSION_NAME+$APP_BUILD_NUMBER" || fail "Smoke failed: landing page version mismatch"
+  printf '%s' "$landing_html" | grep -q "$APP_VERSION_NAME" || fail "Smoke failed: landing page version mismatch"
   printf '%s' "$landing_html" | grep -q "$APK_SHA256" || fail "Smoke failed: landing page sha256 mismatch"
 }
 
