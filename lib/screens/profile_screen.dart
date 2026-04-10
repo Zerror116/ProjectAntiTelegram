@@ -1259,6 +1259,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
         children: [
           _statsMetricRow('Сделано постов', '${data['posts'] ?? 0}'),
           const SizedBox(height: 8),
+          _statsMetricRow('Сделано ревизий', '${data['revisions'] ?? 0}'),
+          const SizedBox(height: 8),
           _statsMetricRow('Продано штук', '${data['sold'] ?? 0}'),
           const SizedBox(height: 8),
           _statsMetricRow('Принес денег', _formatMoneyCompact(data['amount'])),
@@ -1291,6 +1293,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _statsMetricRow('Постов работников', '${data['worker_posts'] ?? 0}'),
           const SizedBox(height: 8),
           _statsMetricRow(
+            'Ревизий работников',
+            '${data['worker_revisions'] ?? 0}',
+          ),
+          const SizedBox(height: 8),
+          _statsMetricRow(
             'Обработано админами',
             '${data['admin_processed'] ?? 0}',
           ),
@@ -1321,7 +1328,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     Widget buildWorkerPostsByNameCard() {
       if (workerPostsByName.isEmpty) {
         return _periodCard(
-          title: 'Посты рабочих',
+          title: 'Посты и ревизии рабочих',
           children: [
             Text(
               'Пока нет данных по рабочим за выбранные периоды.',
@@ -1333,17 +1340,21 @@ class _ProfileScreenState extends State<ProfileScreen> {
         );
       }
       return _periodCard(
-        title: 'Посты рабочих',
+        title: 'Посты и ревизии рабочих',
         children: workerPostsByName.take(12).map((row) {
           final name = (row['worker_name'] ?? 'Работник').toString().trim();
           final todayPosts = '${row['posts_today'] ?? 0}';
           final weekPosts = '${row['posts_week'] ?? 0}';
           final prevWeekPosts = '${row['posts_prev_week'] ?? 0}';
+          final todayRevisions = '${row['revisions_today'] ?? 0}';
+          final weekRevisions = '${row['revisions_week'] ?? 0}';
+          final prevWeekRevisions = '${row['revisions_prev_week'] ?? 0}';
           return Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: _statsMetricRow(
               name.isEmpty ? 'Работник' : name,
-              'Сегодня $todayPosts • Неделя $weekPosts • Прошлая $prevWeekPosts',
+              'Посты: $todayPosts / $weekPosts / $prevWeekPosts • '
+              'Ревизии: $todayRevisions / $weekRevisions / $prevWeekRevisions',
             ),
           );
         }).toList(),

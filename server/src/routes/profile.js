@@ -306,25 +306,53 @@ async function loadWorkerPostsByName(tenantId = null) {
              SELECT 1
              FROM products pp
              WHERE pp.created_by = u.id
-           )
+             )
          )
+     ),
+     post_counts AS (
+       SELECT p.created_by AS worker_id,
+              COUNT(*) FILTER (
+                WHERE timezone($1, p.created_at) >= date_trunc('day', timezone($1, now()))
+              )::int AS posts_today,
+              COUNT(*) FILTER (
+                WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now()))
+              )::int AS posts_week,
+              COUNT(*) FILTER (
+                WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
+                  AND timezone($1, p.created_at) < date_trunc('week', timezone($1, now()))
+              )::int AS posts_prev_week
+       FROM products p
+       GROUP BY p.created_by
+     ),
+     revision_counts AS (
+       SELECT q.queued_by AS worker_id,
+              COUNT(*) FILTER (
+                WHERE timezone($1, q.created_at) >= date_trunc('day', timezone($1, now()))
+              )::int AS revisions_today,
+              COUNT(*) FILTER (
+                WHERE timezone($1, q.created_at) >= date_trunc('week', timezone($1, now()))
+              )::int AS revisions_week,
+              COUNT(*) FILTER (
+                WHERE timezone($1, q.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
+                  AND timezone($1, q.created_at) < date_trunc('week', timezone($1, now()))
+              )::int AS revisions_prev_week
+       FROM product_publication_queue q
+       WHERE COALESCE((q.payload->>'revision_manual')::boolean, false) = true
+          OR COALESCE((q.payload->>'revision_auto')::boolean, false) = true
+       GROUP BY q.queued_by
      )
      SELECT wc.id::text AS worker_id,
             COALESCE(NULLIF(BTRIM(wc.name), ''), NULLIF(BTRIM(wc.email), ''), 'Работник') AS worker_name,
-            COUNT(p.id) FILTER (
-              WHERE timezone($1, p.created_at) >= date_trunc('day', timezone($1, now()))
-            )::int AS posts_today,
-            COUNT(p.id) FILTER (
-              WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now()))
-            )::int AS posts_week,
-            COUNT(p.id) FILTER (
-              WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
-                AND timezone($1, p.created_at) < date_trunc('week', timezone($1, now()))
-            )::int AS posts_prev_week
+            COALESCE(pc.posts_today, 0)::int AS posts_today,
+            COALESCE(pc.posts_week, 0)::int AS posts_week,
+            COALESCE(pc.posts_prev_week, 0)::int AS posts_prev_week,
+            COALESCE(rc.revisions_today, 0)::int AS revisions_today,
+            COALESCE(rc.revisions_week, 0)::int AS revisions_week,
+            COALESCE(rc.revisions_prev_week, 0)::int AS revisions_prev_week
      FROM worker_candidates wc
-     LEFT JOIN products p ON p.created_by = wc.id
-     GROUP BY wc.id, wc.name, wc.email
-     ORDER BY posts_week DESC, posts_today DESC, worker_name ASC
+     LEFT JOIN post_counts pc ON pc.worker_id = wc.id
+     LEFT JOIN revision_counts rc ON rc.worker_id = wc.id
+     ORDER BY posts_week DESC, revisions_week DESC, posts_today DESC, worker_name ASC
      LIMIT 40`,
     [SAMARA_TZ, tenantId || null],
   );
@@ -334,6 +362,9 @@ async function loadWorkerPostsByName(tenantId = null) {
     posts_today: toNumber(row.posts_today),
     posts_week: toNumber(row.posts_week),
     posts_prev_week: toNumber(row.posts_prev_week),
+    revisions_today: toNumber(row.revisions_today),
+    revisions_week: toNumber(row.revisions_week),
+    revisions_prev_week: toNumber(row.revisions_prev_week),
   }));
 }
 
@@ -724,26 +755,51 @@ async function loadWorkerStats(userId) {
      WHERE p.created_by = $1`,
     [userId, SAMARA_TZ],
   );
+  const revisionsQ = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE timezone($2, q.created_at) >= date_trunc('day', timezone($2, now()))
+       )::int AS revisions_today,
+       COUNT(*) FILTER (
+         WHERE timezone($2, q.created_at) >= timezone($2, now()) - interval '7 days'
+       )::int AS revisions_week,
+       COUNT(*) FILTER (
+         WHERE timezone($2, q.created_at) >= timezone($2, now()) - interval '30 days'
+       )::int AS revisions_month,
+       COUNT(*)::int AS revisions_all_time
+     FROM product_publication_queue q
+     WHERE q.queued_by = $1
+       AND (
+         COALESCE((q.payload->>'revision_manual')::boolean, false) = true
+         OR COALESCE((q.payload->>'revision_auto')::boolean, false) = true
+       )`,
+    [userId, SAMARA_TZ],
+  );
   const posts = postsQ.rows[0] || {};
   const sales = salesQ.rows[0] || {};
+  const revisions = revisionsQ.rows[0] || {};
   return {
     today: {
       posts: toNumber(posts.posts_today),
+      revisions: toNumber(revisions.revisions_today),
       sold: toNumber(sales.sold_today),
       amount: toNumber(sales.revenue_today),
     },
     week: {
       posts: toNumber(posts.posts_week),
+      revisions: toNumber(revisions.revisions_week),
       sold: toNumber(sales.sold_week),
       amount: toNumber(sales.revenue_week),
     },
     month: {
       posts: toNumber(posts.posts_month),
+      revisions: toNumber(revisions.revisions_month),
       sold: toNumber(sales.sold_month),
       amount: toNumber(sales.revenue_month),
     },
     all_time: {
       posts: toNumber(posts.posts_all_time),
+      revisions: toNumber(revisions.revisions_all_time),
       sold: toNumber(sales.sold_all_time),
       amount: toNumber(sales.revenue_all_time),
     },
@@ -858,6 +914,28 @@ async function loadCreatorStats(tenantId = null) {
        AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)`,
     [SAMARA_TZ, tenantId || null],
   );
+  const workerRevisionsQ = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE timezone($1, q.created_at) >= date_trunc('day', timezone($1, now()))
+       )::int AS revisions_today,
+       COUNT(*) FILTER (
+         WHERE timezone($1, q.created_at) >= timezone($1, now()) - interval '7 days'
+       )::int AS revisions_week,
+       COUNT(*) FILTER (
+         WHERE timezone($1, q.created_at) >= timezone($1, now()) - interval '30 days'
+       )::int AS revisions_month,
+       COUNT(*)::int AS revisions_all_time
+     FROM product_publication_queue q
+     JOIN users u ON u.id = q.queued_by
+     WHERE (
+         COALESCE((q.payload->>'revision_manual')::boolean, false) = true
+         OR COALESCE((q.payload->>'revision_auto')::boolean, false) = true
+       )
+       AND u.role = 'worker'
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)`,
+    [SAMARA_TZ, tenantId || null],
+  );
   const processedQ = await pool.query(
     `SELECT
        COALESCE(SUM(r.quantity) FILTER (
@@ -906,6 +984,7 @@ async function loadCreatorStats(tenantId = null) {
   );
   const totals = totalsQ.rows[0] || {};
   const workerPosts = workerPostsQ.rows[0] || {};
+  const workerRevisions = workerRevisionsQ.rows[0] || {};
   const processed = processedQ.rows[0] || {};
   const revenue = revenueQ.rows[0] || {};
   const live = liveQ.rows[0] || {};
@@ -913,24 +992,28 @@ async function loadCreatorStats(tenantId = null) {
     today: {
       users: toNumber(totals.users_today),
       worker_posts: toNumber(workerPosts.posts_today),
+      worker_revisions: toNumber(workerRevisions.revisions_today),
       admin_processed: toNumber(processed.processed_today),
       client_amount: toNumber(revenue.revenue_today),
     },
     week: {
       users: toNumber(totals.users_week),
       worker_posts: toNumber(workerPosts.posts_week),
+      worker_revisions: toNumber(workerRevisions.revisions_week),
       admin_processed: toNumber(processed.processed_week),
       client_amount: toNumber(revenue.revenue_week),
     },
     month: {
       users: toNumber(totals.users_month),
       worker_posts: toNumber(workerPosts.posts_month),
+      worker_revisions: toNumber(workerRevisions.revisions_month),
       admin_processed: toNumber(processed.processed_month),
       client_amount: toNumber(revenue.revenue_month),
     },
     all_time: {
       users: toNumber(totals.users_all_time),
       worker_posts: toNumber(workerPosts.posts_all_time),
+      worker_revisions: toNumber(workerRevisions.revisions_all_time),
       admin_processed: toNumber(processed.processed_all_time),
       client_amount: toNumber(revenue.revenue_all_time),
     },
