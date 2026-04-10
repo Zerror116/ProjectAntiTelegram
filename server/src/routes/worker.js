@@ -145,6 +145,25 @@ function roundPriceToStep(value, step = 50, min = 50) {
   return Math.max(min, rounded);
 }
 
+function roundAutoRevisionPrice(originalValue, discountPercent, step = 50, min = 50) {
+  const original = Number(originalValue);
+  const discount = Math.abs(Number(discountPercent));
+  if (!Number.isFinite(original) || original <= 0) return min;
+  if (!Number.isFinite(discount) || discount <= 0) {
+    return roundPriceToStep(original, step, min);
+  }
+
+  const discounted = original * (1 - discount / 100);
+  let rounded = roundPriceToStep(discounted, step, min);
+
+  // Keep the step-50 grid, but force an actual decrease whenever
+  // a positive revision percent was requested.
+  if (rounded >= original) {
+    rounded -= step;
+  }
+  return Math.max(min, rounded);
+}
+
 function toShelfNumber(value, fallback = 1) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
@@ -366,7 +385,7 @@ async function fetchRevisionDays(client, channelId, limit = 2) {
        AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
      GROUP BY day, label
-     ORDER BY day DESC
+     ORDER BY day ASC
      LIMIT $3`,
     [channelId, SAMARA_TZ, safeLimit]
   );
@@ -1150,7 +1169,7 @@ router.get(
       );
       const fallbackDays = selectedDates.length > 0
         ? selectedDates
-        : (await fetchRevisionDays(client, mainChannel.id, 2)).map((x) => x.day);
+        : (await fetchRevisionDays(client, mainChannel.id, 1)).map((x) => x.day);
       const posts = await fetchRevisionPosts(client, mainChannel.id, fallbackDays);
       await client.query('COMMIT');
       return res.json({
@@ -1394,13 +1413,13 @@ router.post(
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const dates = parseRevisionDates(req.body?.dates);
-    const percent = Number(req.body?.percent);
+    const discountPercent = Math.abs(Number(req.body?.percent));
     const hideOldVersions = toBoolean(req.body?.hide_old_versions, true);
 
-    if (!Number.isFinite(percent) || percent < -95 || percent > 500) {
+    if (!Number.isFinite(discountPercent) || discountPercent <= 0 || discountPercent > 95) {
       return res.status(400).json({
         ok: false,
-        error: 'Процент ревизии должен быть в диапазоне от -95 до 500',
+        error: 'Процент снижения должен быть больше 0 и не больше 95',
       });
     }
 
@@ -1415,7 +1434,7 @@ router.post(
       );
       const selectedDates = dates.length > 0
         ? dates
-        : (await fetchRevisionDays(client, mainChannel.id, 2)).map((x) => x.day);
+        : (await fetchRevisionDays(client, mainChannel.id, 1)).map((x) => x.day);
       const posts = await fetchRevisionPosts(client, mainChannel.id, selectedDates);
 
       const groups = new Map();
@@ -1447,11 +1466,7 @@ router.post(
         const basePrice = Number(post.price || 0);
         if (!Number.isFinite(basePrice) || basePrice <= 0) continue;
 
-        const revisedPrice = roundPriceToStep(
-          basePrice * (1 + percent / 100),
-          50,
-          50
-        );
+        const revisedPrice = roundAutoRevisionPrice(basePrice, discountPercent, 50, 50);
         const nextQuantity = toPositiveInteger(post.quantity, 1);
         const nextShelfNumber = toShelfNumber(post.shelf_number, 1);
         const title = String(post.title || '').trim();
