@@ -627,6 +627,7 @@ function publishDemoPostsSequentially({
 }
 
 async function allocateProductCode(client, tenantId = null) {
+  void tenantId;
   await client.query("LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE");
 
   const reusable = await client.query(
@@ -637,16 +638,8 @@ async function allocateProductCode(client, tenantId = null) {
        AND p.reusable_at <= now()
        AND p.product_code IS NOT NULL
        AND p.product_code > 0
-       AND EXISTS (
-         SELECT 1
-         FROM product_publication_queue q
-         JOIN chats c ON c.id = q.channel_id
-         WHERE q.product_id = p.id
-           AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
-       )
      ORDER BY p.product_code ASC, p.reusable_at ASC
      FOR UPDATE OF p`,
-    [tenantId || null],
   );
 
   const reusableCodes = reusable.rows
@@ -668,14 +661,7 @@ async function allocateProductCode(client, tenantId = null) {
        FROM products p
        WHERE p.product_code IS NOT NULL
          AND p.product_code > 0
-         AND NOT (p.product_code = ANY($2::int[]))
-         AND EXISTS (
-           SELECT 1
-           FROM product_publication_queue q
-           JOIN chats c ON c.id = q.channel_id
-           WHERE q.product_id = p.id
-             AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)
-         )
+         AND NOT (p.product_code = ANY($1::int[]))
      )
      SELECT COALESCE(
        (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM used WHERE product_code = 1)),
@@ -688,7 +674,7 @@ async function allocateProductCode(client, tenantId = null) {
        ),
        1
      ) AS next_code`,
-    [tenantId || null, reusableCodes],
+    [reusableCodes],
   );
   const nextCode = Number(nextRes.rows[0]?.next_code || 1);
   if (!Number.isFinite(nextCode) || nextCode <= 0) return 1;
@@ -707,6 +693,13 @@ async function allocateProductCode(client, tenantId = null) {
   }
 
   return nextCode;
+}
+
+function isProductCodeConflictError(err) {
+  return (
+    String(err?.code || "") === "23505" &&
+    String(err?.constraint || "").trim() === "products_product_code_key"
+  );
 }
 
 async function resolveUniqueProductCodeForPublish(
@@ -3965,31 +3958,42 @@ router.post(
             );
         const nextImageUrl = payload.image_url || row.image_url || null;
 
-        const productUpdate = await client.query(
-          `UPDATE products
-         SET product_code = $1,
-             title = $2,
-             description = $3,
-             price = $4,
-             quantity = $5,
-             shelf_number = $6,
-             image_url = $7,
-             status = 'published',
-             reusable_at = NULL,
-             updated_at = now()
-         WHERE id = $8
-         RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
-          [
-            code,
-            nextTitle,
-            nextDescription,
-            nextPrice,
-            nextQuantity,
-            nextShelfNumber,
-            nextImageUrl,
-            row.product_id,
-          ],
-        );
+        let productUpdate = null;
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          try {
+            productUpdate = await client.query(
+              `UPDATE products
+             SET product_code = $1,
+                 title = $2,
+                 description = $3,
+                 price = $4,
+                 quantity = $5,
+                 shelf_number = $6,
+                 image_url = $7,
+                 status = 'published',
+                 reusable_at = NULL,
+                 updated_at = now()
+             WHERE id = $8
+             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
+              [
+                code,
+                nextTitle,
+                nextDescription,
+                nextPrice,
+                nextQuantity,
+                nextShelfNumber,
+                nextImageUrl,
+                row.product_id,
+              ],
+            );
+            break;
+          } catch (err) {
+            if (!isProductCodeConflictError(err) || attempt >= 5) {
+              throw err;
+            }
+            code = await allocateProductCode(client, null);
+          }
+        }
         if (productUpdate.rowCount === 0) {
           skipped.push({
             queue_id: row.id,
