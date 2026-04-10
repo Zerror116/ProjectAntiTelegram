@@ -1698,8 +1698,10 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
        SELECT m.id, m.sender_id
        FROM messages m
      WHERE m.chat_id = $1
-       AND m.sender_id IS NOT NULL
-       AND m.sender_id <> $2
+       AND (
+         (m.sender_id IS NOT NULL AND m.sender_id <> $2)
+         OR COALESCE(m.meta->>'kind', '') = 'reserved_order_item'
+       )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
        AND NOT EXISTS (
@@ -1798,8 +1800,10 @@ async function getFirstUnreadMessageId(chatId, userId) {
     `SELECT m.id::text AS id
      FROM messages m
      WHERE m.chat_id = $1
-       AND m.sender_id IS NOT NULL
-       AND m.sender_id <> $2
+       AND (
+         (m.sender_id IS NOT NULL AND m.sender_id <> $2)
+         OR COALESCE(m.meta->>'kind', '') = 'reserved_order_item'
+       )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
        AND NOT EXISTS (
@@ -1820,8 +1824,10 @@ async function getChatUnreadCount(chatId, userId) {
     `SELECT COUNT(*)::int AS unread_count
      FROM messages m
      WHERE m.chat_id = $1
-       AND m.sender_id IS NOT NULL
-       AND m.sender_id <> $2
+       AND (
+         (m.sender_id IS NOT NULL AND m.sender_id <> $2)
+         OR COALESCE(m.meta->>'kind', '') = 'reserved_order_item'
+       )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
        AND NOT EXISTS (
@@ -2099,8 +2105,10 @@ async function listChatsHandler(req, res) {
          SELECT COUNT(*) AS unread_count
          FROM messages um
          WHERE um.chat_id = c.id
-           AND um.sender_id IS NOT NULL
-           AND um.sender_id <> $1
+           AND (
+             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
+             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
+           )
            AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
            AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
            AND NOT EXISTS (
@@ -2265,8 +2273,10 @@ async function listChatsHandler(req, res) {
          SELECT COUNT(*) AS unread_count
          FROM messages um
          WHERE um.chat_id = c.id
-           AND um.sender_id IS NOT NULL
-           AND um.sender_id <> $1
+           AND (
+             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
+             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
+           )
            AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
            AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
            AND NOT EXISTS (

@@ -3117,7 +3117,7 @@ router.post(
           [
             uuidv4(),
             reservedChannel.id,
-            req.user.id,
+            null,
             encryptMessageText(reservedOrderMessageText(row)),
             JSON.stringify(meta),
           ],

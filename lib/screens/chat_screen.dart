@@ -628,6 +628,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool _isOwnMessage(Map<String, dynamic> message) {
+    if (_isReservedOrder(message)) return false;
     final currentUserId = authService.currentUser?.id.trim() ?? '';
     if (currentUserId.isEmpty) return message['from_me'] == true;
     return (message['sender_id']?.toString().trim() ?? '') == currentUserId;
@@ -5399,12 +5400,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return null;
   }
 
-  DateTime? _reservedDayOf(Map<String, dynamic> message) {
-    final date = _parseDate(message['created_at']);
-    if (date == null) return null;
-    return DateTime(date.year, date.month, date.day);
-  }
-
   int _reservedShelfSortKeyOf(Map<String, dynamic> message) {
     final meta = _metaMapOf(message['meta']);
     final processingMode = (meta['processing_mode'] ?? '')
@@ -5418,22 +5413,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return shelf ?? ((1 << 20) - 1);
   }
 
-  String _reservedClientNameOf(Map<String, dynamic> message) {
-    final meta = _metaMapOf(message['meta']);
-    final name = (meta['client_name'] ?? '').toString().trim();
-    if (name.isNotEmpty) return name;
-    final senderName = _senderNameOf(message).trim();
-    return senderName.isNotEmpty ? senderName : 'Клиент';
-  }
-
-  String _reservedClientPhoneOf(Map<String, dynamic> message) {
-    final meta = _metaMapOf(message['meta']);
-    return _formatDisplayPhone(
-      (meta['client_phone'] ?? '').toString().trim(),
-      fallback: '',
-    );
-  }
-
   int _compareReservedTimelineMessages(
     Map<String, dynamic> a,
     Map<String, dynamic> b,
@@ -5442,25 +5421,6 @@ class _ChatScreenState extends State<ChatScreen> {
       a,
     ).compareTo(_reservedShelfSortKeyOf(b));
     if (byShelf != 0) return byShelf;
-
-    final dayA = _reservedDayOf(a);
-    final dayB = _reservedDayOf(b);
-    if (dayA == null && dayB != null) return -1;
-    if (dayA != null && dayB == null) return 1;
-    if (dayA != null && dayB != null) {
-      final byDay = dayA.compareTo(dayB);
-      if (byDay != 0) return byDay;
-    }
-
-    final byClientName = _reservedClientNameOf(
-      a,
-    ).toLowerCase().compareTo(_reservedClientNameOf(b).toLowerCase());
-    if (byClientName != 0) return byClientName;
-
-    final byClientPhone = _reservedClientPhoneOf(
-      a,
-    ).compareTo(_reservedClientPhoneOf(b));
-    if (byClientPhone != 0) return byClientPhone;
 
     final byTime = _compareByCreatedAt(a, b);
     if (byTime != 0) return byTime;
@@ -6568,6 +6528,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _senderNameOf(Map<String, dynamic> message) {
+    if (_isReservedOrder(message)) return 'Система';
     final fromMe = _isOwnMessage(message);
     if (fromMe) return 'Вы';
 
