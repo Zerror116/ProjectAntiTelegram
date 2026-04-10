@@ -991,42 +991,94 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
   try {
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ ok: true, data: [] });
+    return await runInRequestTenantScope(req, async () => {
+      const client = await db.pool.connect();
+      try {
+        const actorUserId = await resolveActorUserId(client, req.user);
+        await client.query('BEGIN');
+        const { mainChannel } = await ensureSystemChannels(
+          client,
+          actorUserId,
+          req.user.tenant_id || null,
+        );
 
-    const result = await db.query(
-      `WITH ranked AS (
-         SELECT p.id,
-                p.product_code,
-                p.shelf_number,
-                p.title,
-                p.description,
-                p.price,
-                p.quantity,
-                p.image_url,
-                p.status,
-                p.created_at,
-                p.updated_at,
-                ROW_NUMBER() OVER (
-                  PARTITION BY LOWER(TRIM(p.title))
-                  ORDER BY p.created_at DESC, p.updated_at DESC
-                ) AS title_rank
-         FROM products p
-         WHERE (p.title ILIKE $1 OR p.description ILIKE $1)
-           AND EXISTS (
-             SELECT 1
-             FROM product_publication_queue q
-             JOIN chats c ON c.id = q.channel_id
-             WHERE q.product_id = p.id
-               AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+        const result = await client.query(
+          `WITH ranked AS (
+             SELECT p.id,
+                    p.product_code,
+                    p.shelf_number,
+                    p.title,
+                    p.description,
+                    p.price,
+                    p.quantity,
+                    p.image_url,
+                    p.status,
+                    p.created_at,
+                    p.updated_at,
+                    EXISTS (
+                      SELECT 1
+                      FROM messages m
+                      WHERE m.chat_id = $3
+                        AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+                        AND COALESCE(m.meta->>'product_id', '') = p.id::text
+                        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+                    ) AS is_visible_in_main_channel,
+                    EXISTS (
+                      SELECT 1
+                      FROM product_publication_queue qp
+                      WHERE qp.product_id = p.id
+                        AND qp.channel_id = $3
+                        AND qp.status = 'pending'
+                        AND COALESCE(qp.is_sent, false) = false
+                    ) AS has_pending_in_main_channel,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY LOWER(TRIM(p.title))
+                      ORDER BY p.created_at DESC, p.updated_at DESC
+                    ) AS title_rank
+             FROM products p
+             WHERE (p.title ILIKE $1 OR p.description ILIKE $1)
+               AND EXISTS (
+                 SELECT 1
+                 FROM product_publication_queue q
+                 JOIN chats c ON c.id = q.channel_id
+                 WHERE q.product_id = p.id
+                   AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+               )
            )
-       )
-       SELECT id, product_code, shelf_number, title, description, price, quantity, image_url, status, created_at, updated_at
-       FROM ranked
-       WHERE title_rank <= 2
-       ORDER BY created_at DESC, updated_at DESC
-       LIMIT 30`,
-      [`%${q}%`, req.user?.tenant_id || null]
-    );
-    return res.json({ ok: true, data: result.rows });
+           SELECT id, product_code, shelf_number, title, description, price, quantity, image_url, status,
+                  created_at, updated_at, is_visible_in_main_channel, has_pending_in_main_channel,
+                  CASE
+                    WHEN is_visible_in_main_channel THEN false
+                    WHEN has_pending_in_main_channel THEN false
+                    ELSE true
+                  END AS requeue_allowed
+           FROM ranked
+           WHERE title_rank <= 2
+           ORDER BY requeue_allowed DESC, created_at DESC, updated_at DESC
+           LIMIT 30`,
+          [`%${q}%`, req.user?.tenant_id || null, mainChannel.id],
+        );
+        await client.query('COMMIT');
+
+        const data = result.rows.map((row) => ({
+          ...row,
+          reuse_hint:
+            row.is_visible_in_main_channel === true
+              ? 'Сейчас товар в основном канале. Используйте Ревизию.'
+              : row.has_pending_in_main_channel === true
+                  ? 'Товар уже стоит в очереди публикации.'
+                  : null,
+        }));
+        return res.json({ ok: true, data });
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
   } catch (err) {
     console.error('worker.products.search error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
@@ -1227,6 +1279,24 @@ router.post(
             return res.status(404).json({ ok: false, error: 'Товар не найден' });
           }
           const current = productQ.rows[0];
+          const liveMainChannelQ = await client.query(
+            `SELECT 1
+             FROM messages m
+             WHERE m.chat_id = $1
+               AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+               AND COALESCE(m.meta->>'product_id', '') = $2::text
+               AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+             LIMIT 1`,
+            [targetChannelId, productId],
+          );
+          if (liveMainChannelQ.rowCount > 0) {
+            removeUploadedFile(req.file);
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              ok: false,
+              error: 'Товар уже находится в основном канале. Используйте ревизию.',
+            });
+          }
 
           const nextTitle = String(title || current.title || '').trim();
           const nextDescription = String(description ?? current.description ?? '').trim();
