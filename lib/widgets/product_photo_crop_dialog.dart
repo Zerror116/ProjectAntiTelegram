@@ -49,7 +49,8 @@ class _ProductPhotoCropDialog extends StatefulWidget {
   final PhoenixPostCropPreset initialPreset;
 
   @override
-  State<_ProductPhotoCropDialog> createState() => _ProductPhotoCropDialogState();
+  State<_ProductPhotoCropDialog> createState() =>
+      _ProductPhotoCropDialogState();
 }
 
 class _ProductPhotoCropDialogState extends State<_ProductPhotoCropDialog> {
@@ -190,7 +191,8 @@ class _ProductPhotoCropDialogState extends State<_ProductPhotoCropDialog> {
                               if (!mounted) return;
                               setState(() {
                                 _exporting = false;
-                                _localError = 'Не удалось обработать изображение';
+                                _localError =
+                                    'Не удалось обработать изображение';
                               });
                           }
                         },
@@ -204,7 +206,7 @@ class _ProductPhotoCropDialogState extends State<_ProductPhotoCropDialog> {
               Text(
                 _preset == PhoenixPostCropPreset.uncropped
                     ? 'Фото сохранится целиком. Мы только выровняем ориентацию и подготовим размер для загрузки.'
-                    : 'Перемещайте и приближайте фото внутри рамки. Итоговый кадр будет таким же, как в редакторе.',
+                    : 'Потяните рамку и белые ручки, чтобы выбрать кадр. Итоговое фото сохранится точно так же, как в редакторе.',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),

@@ -79,7 +79,9 @@ class _AvatarCropDialogState extends State<_AvatarCropDialog> {
     final theme = Theme.of(context);
     final media = MediaQuery.of(context);
     final dialogWidth = (media.size.width - 28).clamp(300.0, 540.0);
-    final editorSize = dialogWidth > 420 ? 360.0 : (dialogWidth - 32).clamp(260.0, 340.0);
+    final editorSize = dialogWidth > 420
+        ? 360.0
+        : (dialogWidth - 32).clamp(260.0, 340.0);
 
     return AlertDialog(
       title: const Text('Обрезка аватарки'),
@@ -90,7 +92,7 @@ class _AvatarCropDialogState extends State<_AvatarCropDialog> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                'Подвиньте и приблизьте фото так, как оно должно выглядеть в профиле.',
+                'Потяните рамку и белые ручки, чтобы выбрать, как аватарка будет выглядеть в профиле.',
                 textAlign: TextAlign.center,
                 style: theme.textTheme.bodyMedium,
               ),
