@@ -97,6 +97,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
     });
   }
 
+  void _markChatReadLocally(String chatId, {int unreadCount = 0}) {
+    if (chatId.isEmpty) return;
+    setState(() {
+      final index = _chats.indexWhere((c) => _chatIdOf(c) == chatId);
+      if (index < 0) return;
+      _chats[index] = {
+        ..._chats[index],
+        'unread_count': unreadCount.clamp(0, 999999),
+      };
+    });
+  }
+
   void _applyIncomingMessagePreview(
     String chatId,
     Map<String, dynamic> message,
@@ -1000,6 +1012,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
         _scheduleChatsRefresh();
       }
 
+      if (type == 'chat:message:read') {
+        if (data is Map) {
+          final chatId = (data['chatId'] ?? '').toString().trim();
+          final unreadCount = int.tryParse('${data['unread_count'] ?? 0}') ?? 0;
+          if (chatId.isNotEmpty) {
+            _markChatReadLocally(chatId, unreadCount: unreadCount);
+          }
+        }
+        _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
+        return;
+      }
+
       if (type == 'chat:message:deleted') {
         _scheduleChatsRefresh();
         return;
@@ -1094,8 +1118,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
       }
     } finally {
       _refreshInFlight = false;
-      if (mounted && shouldShowLoader) {
-        setState(() => _loading = false);
+      if (mounted) {
+        if (_loading) {
+          setState(() => _loading = false);
+        }
       } else {
         _loading = false;
       }
