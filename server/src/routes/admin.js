@@ -709,6 +709,29 @@ async function allocateProductCode(client, tenantId = null) {
   return nextCode;
 }
 
+async function resolveUniqueProductCodeForPublish(
+  client,
+  requestedCode,
+  productId,
+  tenantId = null,
+) {
+  const normalizedRequested = Number(requestedCode);
+  if (Number.isFinite(normalizedRequested) && normalizedRequested > 0) {
+    const collisionQ = await client.query(
+      `SELECT id
+       FROM products
+       WHERE product_code = $1
+         AND id <> $2
+       LIMIT 1`,
+      [Math.floor(normalizedRequested), productId],
+    );
+    if (collisionQ.rowCount === 0) {
+      return Math.floor(normalizedRequested);
+    }
+  }
+  return await allocateProductCode(client, tenantId || null);
+}
+
 // Список пользователей
 router.get(
   "/users",
@@ -3885,10 +3908,12 @@ router.post(
       ).trim();
 
       for (const row of rows) {
-        let code = row.product_code;
-        if (!code) {
-          code = await allocateProductCode(client, req.user?.tenant_id || null);
-        }
+        let code = await resolveUniqueProductCodeForPublish(
+          client,
+          row.product_code,
+          row.product_id,
+          req.user?.tenant_id || null,
+        );
 
         const payload =
           row.payload &&

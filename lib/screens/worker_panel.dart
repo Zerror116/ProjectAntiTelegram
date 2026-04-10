@@ -1093,6 +1093,14 @@ class _WorkerPanelState extends State<WorkerPanel>
     return (post['revision_note'] ?? '').toString().trim();
   }
 
+  bool _oldPostRequeueAllowed(Map<String, dynamic> product) {
+    return product['requeue_allowed'] != false;
+  }
+
+  String _oldPostReuseHint(Map<String, dynamic> product) {
+    return (product['reuse_hint'] ?? '').toString().trim();
+  }
+
   void _applyRevisionProductsRemovedLocally(Set<String> productIds) {
     if (productIds.isEmpty || !mounted) return;
     final remainingPosts = _revisionPosts
@@ -1646,6 +1654,14 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Future<void> _requeueProduct(Map<String, dynamic> product) async {
+    if (!_oldPostRequeueAllowed(product)) {
+      setState(
+        () => _message = _oldPostReuseHint(product).isNotEmpty
+            ? _oldPostReuseHint(product)
+            : 'Этот товар нельзя отправлять через Старые посты.',
+      );
+      return;
+    }
     final channelId = _selectedChannelId;
     if (channelId == null || channelId.isEmpty) {
       setState(() => _message = 'Сначала выберите канал');
@@ -1768,6 +1784,14 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Future<void> _quickDuplicateProduct(Map<String, dynamic> product) async {
+    if (!_oldPostRequeueAllowed(product)) {
+      setState(
+        () => _message = _oldPostReuseHint(product).isNotEmpty
+            ? _oldPostReuseHint(product)
+            : 'Этот товар нельзя дублировать через Старые посты.',
+      );
+      return;
+    }
     final channelId = _selectedChannelId;
     if (channelId == null || channelId.isEmpty) {
       setState(() => _message = 'Сначала выберите канал');
@@ -2165,6 +2189,21 @@ class _WorkerPanelState extends State<WorkerPanel>
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.all(16),
       children: [
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: Theme.of(context).colorScheme.outlineVariant,
+            ),
+          ),
+          child: const Text(
+            'Старые посты используйте только для товаров, которых уже нет в Основном канале. '
+            'Если товар ещё находится в канале, его нужно проводить через Ревизию.',
+          ),
+        ),
+        const SizedBox(height: 12),
         Row(
           children: [
             Expanded(
@@ -2209,6 +2248,8 @@ class _WorkerPanelState extends State<WorkerPanel>
             p['shelf_number'],
           );
           final imageUrl = _resolveImageUrl((p['image_url'] ?? '').toString());
+          final requeueAllowed = _oldPostRequeueAllowed(p);
+          final reuseHint = _oldPostReuseHint(p);
           return Card(
             child: ListTile(
               leading: imageUrl != null
@@ -2236,13 +2277,16 @@ class _WorkerPanelState extends State<WorkerPanel>
                       ),
                     )
                   : null,
-              title: Text((p['title'] ?? 'Товар').toString()),
               subtitle: Text(
                 'ID: $label\n'
                 'Цена: ${p['price']} ₽\n'
                 '${(p['description'] ?? '').toString()}',
               ),
               isThreeLine: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 8,
+              ),
               trailing: PopupMenuButton<String>(
                 onSelected: (v) {
                   if (v == 'fill') {
@@ -2253,26 +2297,32 @@ class _WorkerPanelState extends State<WorkerPanel>
                     _quickDuplicateProduct(p);
                   }
                 },
-                itemBuilder: (_) => const [
+                itemBuilder: (_) => [
                   PopupMenuItem(
                     value: 'quick_requeue',
-                    child: Text('Быстрый дубль (1 клик)'),
+                    enabled: requeueAllowed,
+                    child: const Text('Быстрый дубль (1 клик)'),
                   ),
-                  PopupMenuItem(
+                  const PopupMenuItem(
                     value: 'fill',
                     child: Text('Подставить в форму'),
                   ),
                   PopupMenuItem(
                     value: 'requeue',
-                    child: Text('Сразу в очередь'),
+                    enabled: requeueAllowed,
+                    child: const Text('Сразу в очередь'),
                   ),
                 ],
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     IconButton(
-                      tooltip: 'Быстрый дубль',
-                      onPressed: _posting
+                      tooltip: requeueAllowed
+                          ? 'Быстрый дубль'
+                          : (reuseHint.isNotEmpty
+                              ? reuseHint
+                              : 'Недоступно для этого товара'),
+                      onPressed: _posting || !requeueAllowed
                           ? null
                           : () => _quickDuplicateProduct(p),
                       icon: const Icon(Icons.copy_all_outlined),
@@ -2280,6 +2330,39 @@ class _WorkerPanelState extends State<WorkerPanel>
                     const Icon(Icons.more_vert),
                   ],
                 ),
+              ),
+              titleAlignment: ListTileTitleAlignment.top,
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text((p['title'] ?? 'Товар').toString()),
+                  if (reuseHint.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: requeueAllowed
+                            ? Theme.of(context).colorScheme.surfaceContainerHighest
+                            : Theme.of(context).colorScheme.tertiaryContainer,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        reuseHint,
+                        style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              color: requeueAllowed
+                                  ? null
+                                  : Theme.of(context)
+                                      .colorScheme
+                                      .onTertiaryContainer,
+                            ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
           );
