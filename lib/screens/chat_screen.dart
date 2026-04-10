@@ -530,6 +530,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    if (_unreadCount > 0) {
+      unawaited(_flushReadStateOnExit());
+    }
     if (activeChatIdNotifier.value == widget.chatId) {
       activeChatIdNotifier.value = null;
     }
@@ -2144,16 +2147,26 @@ class _ChatScreenState extends State<ChatScreen> {
     _handleScroll();
   }
 
-  Future<void> _markChatAsRead() async {
+  Future<void> _flushReadStateOnExit() async {
+    await _markChatAsRead(flushOnExit: true);
+  }
+
+  Future<void> _markChatAsRead({bool flushOnExit = false}) async {
     final reservedOrdersChat = _isReservedOrdersChat();
-    if (!_initialViewportReady) return;
-    if (!reservedOrdersChat && !_isNearBottom()) return;
-    final visibleUntilMessageId = (_newestLoadedMessageId ?? '').trim();
-    if (visibleUntilMessageId.isEmpty) return;
+    if (!_initialViewportReady && !flushOnExit) return;
+    if (!reservedOrdersChat && !_isNearBottom() && !flushOnExit) return;
+    if (_messages.isEmpty) return;
+    final visibleUntilMessageId = reservedOrdersChat
+        ? ''
+        : (_newestLoadedMessageId ?? '').trim();
+    if (!reservedOrdersChat && visibleUntilMessageId.isEmpty) return;
+    final payload = reservedOrdersChat
+        ? const <String, dynamic>{}
+        : <String, dynamic>{'visible_until_message_id': visibleUntilMessageId};
     try {
       final resp = await authService.dio.post(
         '/api/chats/${widget.chatId}/read',
-        data: {'visible_until_message_id': visibleUntilMessageId},
+        data: payload,
       );
       final data = resp.data;
       if (data is Map && data['data'] is Map) {
