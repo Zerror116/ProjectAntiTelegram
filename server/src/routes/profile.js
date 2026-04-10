@@ -526,6 +526,9 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
         active_today: false,
         posts_current_week: 0,
         posts_previous_week: 0,
+        revisions_today: 0,
+        revisions_current_week: 0,
+        revisions_previous_week: 0,
         posted_amount_current_week: 0,
         posted_amount_previous_week: 0,
         days_worked_current_week: 0,
@@ -591,7 +594,13 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     }
   }
 
+  const workerRevisionRows = await loadWorkerPostsByName(tenantId);
+  const revisionRowsByWorkerId = new Map(
+    workerRevisionRows.map((row) => [String(row.worker_id || "").trim(), row]),
+  );
+
   const workers = Array.from(workersMap.values()).map((worker) => {
+    const revisionRow = revisionRowsByWorkerId.get(worker.worker_id) || {};
     worker.posts_current_week = worker.days_current_week.reduce(
       (sum, day) => sum + toNumber(day.posts_count),
       0,
@@ -616,6 +625,9 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
       (sum, day) => sum + toNumber(day.posted_amount),
       0,
     );
+    worker.revisions_today = toNumber(revisionRow.revisions_today);
+    worker.revisions_current_week = toNumber(revisionRow.revisions_week);
+    worker.revisions_previous_week = toNumber(revisionRow.revisions_prev_week);
     worker.history_14_days.sort((a, b) =>
       String(a.day || "").localeCompare(String(b.day || "")),
     );
@@ -640,6 +652,18 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     (sum, worker) => sum + toNumber(worker.posts_current_week),
     0,
   );
+  const revisionsToday = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.revisions_today),
+    0,
+  );
+  const revisionsCurrentWeek = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.revisions_current_week),
+    0,
+  );
+  const revisionsPreviousWeek = workers.reduce(
+    (sum, worker) => sum + toNumber(worker.revisions_previous_week),
+    0,
+  );
   const postsPreviousWeek = workers.reduce(
     (sum, worker) => sum + toNumber(worker.posts_previous_week),
     0,
@@ -658,6 +682,9 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
       posts_today: postsToday,
       posts_current_week: postsCurrentWeek,
       posts_previous_week: postsPreviousWeek,
+      revisions_today: revisionsToday,
+      revisions_current_week: revisionsCurrentWeek,
+      revisions_previous_week: revisionsPreviousWeek,
       posted_amount_today: toNumber(postedAmountToday.toFixed(2)),
       overall_avg_gap_minutes:
         weightedGapCount > 0

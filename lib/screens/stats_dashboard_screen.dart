@@ -473,7 +473,9 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     final statusColor = _workerStatusColor(theme, worker);
     final todayAmount = _formatMoney(worker['posted_amount_today'], compact: true);
     final todayPosts = _toInt(worker['posts_today']);
+    final todayRevisions = _toInt(worker['revisions_today']);
     final weekPosts = _toInt(worker['posts_current_week']);
+    final weekRevisions = _toInt(worker['revisions_current_week']);
     final weekAmount = _formatMoney(worker['posted_amount_current_week'], compact: true);
     final workedDays = _toInt(worker['days_worked_current_week']);
     final downtime = _asMap(worker['post_downtime']);
@@ -564,6 +566,16 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                   icon: Icons.calendar_view_week_rounded,
                 ),
                 _summaryCard(
+                  label: 'Ревизий сегодня',
+                  value: '$todayRevisions',
+                  icon: Icons.rule_rounded,
+                ),
+                _summaryCard(
+                  label: 'Ревизий неделя',
+                  value: '$weekRevisions',
+                  icon: Icons.fact_check_rounded,
+                ),
+                _summaryCard(
                   label: 'Дней работал',
                   value: '$workedDays / 7',
                   icon: Icons.event_available_rounded,
@@ -637,7 +649,7 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     return _section(
       title: 'Кто работает',
       subtitle:
-          'Показываем работников, их активность по дням, сумму выкладки за сегодня и подробности по периодам.',
+          'Показываем работников, их активность по дням, сумму выкладки и сколько товаров они провели через ревизию.',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -664,6 +676,16 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                 label: 'Постов сегодня',
                 value: '${_toInt(summary['posts_today'])}',
                 icon: Icons.post_add_rounded,
+              ),
+              _summaryCard(
+                label: 'Ревизий сегодня',
+                value: '${_toInt(summary['revisions_today'])}',
+                icon: Icons.rule_rounded,
+              ),
+              _summaryCard(
+                label: 'Ревизий неделя',
+                value: '${_toInt(summary['revisions_current_week'])}',
+                icon: Icons.fact_check_rounded,
               ),
             ],
           ),
