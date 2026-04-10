@@ -2897,9 +2897,16 @@ router.delete(
       return res.status(400).json({ ok: false, error: "queueId обязателен" });
     }
     try {
-      const deleted = await runInRequestTenantScope(req, async () =>
-        db.query(
-          `DELETE FROM product_publication_queue q
+      const client = await db.pool.connect();
+      let restoredMessages = [];
+      let channelId = null;
+      try {
+        await client.query("BEGIN");
+        const pendingQ = await client.query(
+          `SELECT q.id,
+                  q.channel_id,
+                  q.payload
+           FROM product_publication_queue q
            WHERE q.id = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
@@ -2909,17 +2916,94 @@ router.delete(
                WHERE c.id = q.channel_id
                  AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
              )
-           RETURNING q.id`,
+           LIMIT 1
+           FOR UPDATE`,
           [queueId, req.user.tenant_id || null],
-        ),
-      );
-      if (deleted.rowCount === 0) {
-        return res.status(404).json({
-          ok: false,
-          error: "Пост не найден или уже опубликован",
+        );
+        if (pendingQ.rowCount === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            ok: false,
+            error: "Пост не найден или уже опубликован",
+          });
+        }
+
+        const row = pendingQ.rows[0];
+        channelId = String(row.channel_id || "").trim() || null;
+        const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
+        const sourceMessageIds = Array.from(
+          new Set(
+            [
+              ...(Array.isArray(payload.source_message_ids) ? payload.source_message_ids : []),
+              payload.source_message_id,
+            ]
+              .map((value) => String(value || "").trim())
+              .filter(Boolean),
+          ),
+        );
+
+        const isRevisionQueue =
+          payload.revision_manual === true || payload.revision_auto === true;
+        if (isRevisionQueue && channelId && sourceMessageIds.length > 0) {
+          const restoredQ = await client.query(
+            `UPDATE messages
+             SET meta = jsonb_set(
+                   (COALESCE(meta, '{}'::jsonb)
+                     - 'hidden_by_revision'
+                     - 'hidden_by_revision_at'
+                     - 'hidden_by_revision_actor_id'),
+                   '{hidden_for_all}',
+                   'false'::jsonb,
+                   true
+                 )
+             WHERE chat_id = $1
+               AND id = ANY($2::uuid[])
+               AND COALESCE((meta->>'hidden_by_revision')::boolean, false) = true
+             RETURNING id, chat_id, sender_id, text, meta, created_at`,
+            [channelId, sourceMessageIds],
+          );
+          restoredMessages = restoredQ.rows;
+        }
+
+        await client.query(
+          `DELETE FROM product_publication_queue
+           WHERE id = $1`,
+          [queueId],
+        );
+        if (channelId) {
+          await client.query(
+            "UPDATE chats SET updated_at = now() WHERE id = $1",
+            [channelId],
+          );
+        }
+        await client.query("COMMIT");
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      const io = req.app.get("io");
+      if (io && channelId) {
+        for (const message of restoredMessages) {
+          io.to(`chat:${channelId}`).emit("chat:message", {
+            chatId: channelId,
+            message: decryptMessageRow(message),
+          });
+        }
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chatId: channelId,
         });
       }
-      return res.json({ ok: true });
+      return res.json({
+        ok: true,
+        data: {
+          restored_count: restoredMessages.length,
+        },
+      });
     } catch (err) {
       console.error("admin.channels.pending_posts.delete error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });

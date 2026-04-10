@@ -1077,6 +1077,116 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
+  String _revisionDayOf(Map<String, dynamic> post) {
+    final explicit = (post['day'] ?? '').toString().trim();
+    if (explicit.isNotEmpty) return explicit;
+    final createdAt = (post['created_at'] ?? '').toString().trim();
+    if (createdAt.length >= 10) return createdAt.substring(0, 10);
+    return '';
+  }
+
+  bool _isRevisionBlocked(Map<String, dynamic> post) {
+    return post['revision_allowed'] == false;
+  }
+
+  String _revisionBlockedNote(Map<String, dynamic> post) {
+    return (post['revision_note'] ?? '').toString().trim();
+  }
+
+  void _applyRevisionProductsRemovedLocally(Set<String> productIds) {
+    if (productIds.isEmpty || !mounted) return;
+    final remainingPosts = _revisionPosts
+        .where(
+          (post) => !productIds.contains((post['product_id'] ?? '').toString().trim()),
+        )
+        .toList();
+    final countsByDay = <String, int>{};
+    for (final post in remainingPosts) {
+      final day = _revisionDayOf(post);
+      if (day.isEmpty) continue;
+      countsByDay.update(day, (value) => value + 1, ifAbsent: () => 1);
+    }
+
+    final nextDates = <Map<String, dynamic>>[];
+    for (final item in _revisionDates) {
+      final copy = Map<String, dynamic>.from(item);
+      final day = (copy['day'] ?? '').toString().trim();
+      final nextCount = countsByDay[day] ?? 0;
+      if (nextCount <= 0) continue;
+      copy['posts'] = nextCount;
+      nextDates.add(copy);
+    }
+
+    var nextSelected = _selectedRevisionDates
+        .where((day) => nextDates.any((item) => (item['day'] ?? '').toString() == day))
+        .toSet();
+    if (nextSelected.isEmpty && nextDates.isNotEmpty) {
+      nextSelected = {(nextDates.first['day'] ?? '').toString()};
+    }
+
+    setState(() {
+      _revisionPosts = remainingPosts;
+      _revisionDates = nextDates;
+      _selectedRevisionDates = nextSelected;
+    });
+  }
+
+  void _mergeOwnQueuedPostLocally(Map<String, dynamic> queuedItem) {
+    if (!mounted) return;
+    final queueId = (queuedItem['queue_id'] ?? queuedItem['id'] ?? '').toString().trim();
+    if (queueId.isEmpty) return;
+
+    final payload = queuedItem['payload'] is Map
+        ? Map<String, dynamic>.from(queuedItem['payload'])
+        : <String, dynamic>{
+            'title': queuedItem['product_title'],
+            'description': queuedItem['product_description'],
+            'price': queuedItem['product_price'],
+            'quantity': queuedItem['product_quantity'],
+            'shelf_number': queuedItem['product_shelf_number'],
+            'image_url': queuedItem['product_image_url'],
+          };
+
+    final nextRow = <String, dynamic>{
+      'id': queueId,
+      'product_id': (queuedItem['product_id'] ?? '').toString(),
+      'channel_id': (_selectedChannelId ?? '').toString(),
+      'queued_by': authService.currentUser?.id,
+      'status': 'pending',
+      'is_sent': false,
+      'payload': payload,
+      'created_at':
+          queuedItem['created_at'] ?? DateTime.now().toUtc().toIso8601String(),
+      'product_code': queuedItem['product_code'],
+      'product_shelf_number': queuedItem['product_shelf_number'],
+      'product_title': queuedItem['product_title'],
+      'product_description': queuedItem['product_description'],
+      'product_price': queuedItem['product_price'],
+      'product_quantity': queuedItem['product_quantity'],
+      'product_image_url': queuedItem['product_image_url'],
+    };
+
+    final nextItems = List<Map<String, dynamic>>.from(_ownQueuedPosts);
+    final index = nextItems.indexWhere(
+      (row) => (row['id'] ?? '').toString().trim() == queueId,
+    );
+    if (index >= 0) {
+      nextItems[index] = {...nextItems[index], ...nextRow};
+    } else {
+      nextItems.insert(0, nextRow);
+    }
+
+    nextItems.sort((a, b) {
+      final left = DateTime.tryParse((a['created_at'] ?? '').toString()) ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+      final right = DateTime.tryParse((b['created_at'] ?? '').toString()) ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+      return right.compareTo(left);
+    });
+
+    setState(() => _ownQueuedPosts = nextItems);
+  }
+
   Future<void> _toggleRevisionDate(String day) async {
     final next = Set<String>.from(_selectedRevisionDates);
     if (next.contains(day)) {
@@ -1145,21 +1255,27 @@ class _WorkerPanelState extends State<WorkerPanel>
         },
       );
       final data = resp.data;
+      final payload = data is Map && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
       final updatedCount = _toIntValue(
-        data is Map && data['data'] is Map
-            ? (data['data'] as Map)['updated_count']
-            : null,
+        payload['updated_count'],
       );
       final queuedCount = _toIntValue(
-        data is Map && data['data'] is Map
-            ? (data['data'] as Map)['queued_count']
-            : updatedCount,
+        payload['queued_count'],
+        updatedCount,
       );
       final reusedCount = _toIntValue(
-        data is Map && data['data'] is Map
-            ? (data['data'] as Map)['reused_pending_count']
-            : null,
+        payload['reused_pending_count'],
       );
+      final queuedItems = payload['queued_items'] is List
+          ? List<Map<String, dynamic>>.from(payload['queued_items'])
+          : const <Map<String, dynamic>>[];
+      final affectedProductIds = queuedItems
+          .map((item) => (item['product_id'] ?? '').toString().trim())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      _applyRevisionProductsRemovedLocally(affectedProductIds);
       if (!mounted) return;
       setState(
         () => _message =
@@ -1173,7 +1289,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         tone: AppNoticeTone.success,
       );
       await playAppSound(AppUiSound.success);
-      await _loadRevisionPosts();
+      unawaited(_loadOwnQueuedPosts());
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = 'Ошибка авто-ревизии: $e');
@@ -1185,6 +1301,14 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Future<void> _manualRevisionEdit(Map<String, dynamic> post) async {
+    if (_isRevisionBlocked(post)) {
+      if (!mounted) return;
+      final note = _revisionBlockedNote(post);
+      setState(
+        () => _message = note.isNotEmpty ? note : 'Этот товар сейчас нельзя ревизовать',
+      );
+      return;
+    }
     final titleCtrl = TextEditingController(
       text: (post['title'] ?? '').toString(),
     );
@@ -1308,7 +1432,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _runningRevision = true);
     }
     try {
-      await authService.dio.post(
+      final resp = await authService.dio.post(
         '/api/worker/revision/manual',
         data: {
           'entries': [
@@ -1324,6 +1448,25 @@ class _WorkerPanelState extends State<WorkerPanel>
           ],
         },
       );
+      final data = resp.data;
+      final payload = data is Map && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
+      final queuedItems = payload['queued_items'] is List
+          ? List<Map<String, dynamic>>.from(payload['queued_items'])
+          : const <Map<String, dynamic>>[];
+      final affectedProductIds = queuedItems
+          .map((item) => (item['product_id'] ?? '').toString().trim())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      _applyRevisionProductsRemovedLocally(
+        affectedProductIds.isEmpty
+            ? {(post['product_id'] ?? '').toString().trim()}
+            : affectedProductIds,
+      );
+      if (queuedItems.isNotEmpty) {
+        _mergeOwnQueuedPostLocally(queuedItems.first);
+      }
       if (!mounted) return;
       setState(() => _message = 'Ревизия товара сохранена');
       showAppNotice(
@@ -1332,7 +1475,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         tone: AppNoticeTone.success,
       );
       await playAppSound(AppUiSound.success);
-      await _loadRevisionPosts();
+      unawaited(_loadOwnQueuedPosts());
     } catch (e) {
       if (!mounted) return;
       setState(() => _message = 'Ошибка ручной ревизии: $e');
@@ -2298,12 +2441,23 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Future<void> _deleteOwnQueuedPost(Map<String, dynamic> post) async {
     final title = (post['product_title'] ?? 'этот пост').toString().trim();
+    final payload =
+        post['payload'] is Map<String, dynamic>
+            ? post['payload'] as Map<String, dynamic>
+            : post['payload'] is Map
+                ? Map<String, dynamic>.from(post['payload'])
+                : const <String, dynamic>{};
+    final isRevisionPost =
+        payload['revision_manual'] == true || payload['revision_auto'] == true;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Удалить свой пост?'),
         content: Text(
-          'Удалить "$title" из очереди?\n\nПосле этого пост не уйдёт на канал.',
+          isRevisionPost
+              ? 'Удалить "$title" из очереди ревизии?\n\n'
+                  'После этого он не уйдёт на канал, а исходный пост вернётся обратно в Основной канал.'
+              : 'Удалить "$title" из очереди?\n\nПосле этого пост не уйдёт на канал.',
         ),
         actions: [
           TextButton(
@@ -2327,10 +2481,16 @@ class _WorkerPanelState extends State<WorkerPanel>
       await authService.dio.delete('/api/worker/queue/${post['id']}');
       await _loadOwnQueuedPosts();
       if (!mounted) return;
-      setState(() => _message = 'Пост удалён из очереди');
+      setState(
+        () => _message = isRevisionPost
+            ? 'Ревизия снята с очереди, исходный пост возвращён в канал'
+            : 'Пост удалён из очереди',
+      );
       showAppNotice(
         context,
-        'Пост удалён. Он больше не уйдёт на канал.',
+        isRevisionPost
+            ? 'Ревизия снята. Исходный пост снова виден в Основном канале.'
+            : 'Пост удалён. Он больше не уйдёт на канал.',
         tone: AppNoticeTone.success,
       );
     } catch (e) {
@@ -2540,7 +2700,8 @@ class _WorkerPanelState extends State<WorkerPanel>
             ),
             child: const Text(
               'Ревизия: выберите одну или две первые даты публикации, затем запускайте авто-ревизию '
-              'или вручную редактируйте карточки.',
+              'или вручную редактируйте карточки. Купленные, но ещё не обработанные товары '
+              'показываются с пометкой и не меняются через ревизию.',
             ),
           ),
           const SizedBox(height: 12),
@@ -2715,7 +2876,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               padding: EdgeInsets.symmetric(vertical: 10),
               child: PhoenixLoadingView(
                 title: 'Загружаем посты ревизии',
-                subtitle: 'Собираем товары по выбранным датам',
+                subtitle: 'Собираем актуальные товары по выбранным датам',
                 size: 44,
               ),
             )
@@ -2729,6 +2890,8 @@ class _WorkerPanelState extends State<WorkerPanel>
               final imageUrl = _resolveImageUrl(
                 (post['image_url'] ?? '').toString(),
               );
+              final blocked = _isRevisionBlocked(post);
+              final blockedNote = _revisionBlockedNote(post);
               final productLabel = _formatProductLabel(
                 post['product_code'],
                 post['shelf_number'],
@@ -2803,11 +2966,34 @@ class _WorkerPanelState extends State<WorkerPanel>
                             children: [
                               _statChip('ID $productLabel'),
                               _statChip(
+                                'Полка ${_toIntValue(post['shelf_number'], 1).toString().padLeft(2, '0')}',
+                              ),
+                              _statChip(
                                 '${_toDoubleValue(post['price']).toStringAsFixed(0)} ₽',
                               ),
                               _statChip('x${_toIntValue(post['quantity'], 1)}'),
                             ],
                           ),
+                          if (blockedNote.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 9,
+                              ),
+                              decoration: BoxDecoration(
+                                color: theme.colorScheme.tertiaryContainer,
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              child: Text(
+                                blockedNote,
+                                style: theme.textTheme.labelLarge?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                  color: theme.colorScheme.onTertiaryContainer,
+                                ),
+                              ),
+                            ),
+                          ],
                           if (createdAtShort.isNotEmpty) ...[
                             const SizedBox(height: 6),
                             Text(
@@ -2822,11 +3008,15 @@ class _WorkerPanelState extends State<WorkerPanel>
                     ),
                     const SizedBox(width: 8),
                     IconButton(
-                      tooltip: 'Ручная ревизия',
-                      onPressed: _runningRevision
+                      tooltip: blocked
+                          ? 'Товар уже купили, отнесите администратору'
+                          : 'Ручная ревизия',
+                      onPressed: _runningRevision || blocked
                           ? null
                           : () => _manualRevisionEdit(post),
-                      icon: const Icon(Icons.edit_outlined),
+                      icon: Icon(
+                        blocked ? Icons.inventory_2_outlined : Icons.edit_outlined,
+                      ),
                     ),
                   ],
                 ),
