@@ -1000,11 +1000,18 @@ class _WorkerPanelState extends State<WorkerPanel>
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         final dates = List<Map<String, dynamic>>.from(data['data']);
-        final nextSelected = dates
+        final availableDays = dates
             .map((e) => (e['day'] ?? '').toString())
             .where((e) => e.isNotEmpty)
+            .toList();
+        final preservedSelection = availableDays
+            .where((day) => _selectedRevisionDates.contains(day))
             .take(2)
             .toSet();
+        final nextSelected =
+            preservedSelection.isNotEmpty
+                ? preservedSelection
+                : availableDays.take(1).toSet();
         if (!mounted) return;
         setState(() {
           _revisionDates = dates;
@@ -1097,8 +1104,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       );
       return;
     }
-    // Пользователь вводит 50 => снижение на 50% (в API уходит -50).
-    final percent = -enteredPercent.abs();
+    final percent = enteredPercent.abs();
     if (_selectedRevisionDates.isEmpty) {
       setState(() => _message = 'Выберите хотя бы одну дату ревизии');
       return;
@@ -2533,7 +2539,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               border: Border.all(color: theme.colorScheme.outlineVariant),
             ),
             child: const Text(
-              'Ревизия: выберите до 2 дат публикации, затем запускайте авто-ревизию '
+              'Ревизия: выберите одну или две первые даты публикации, затем запускайте авто-ревизию '
               'или вручную редактируйте карточки.',
             ),
           ),
@@ -2543,7 +2549,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               padding: EdgeInsets.symmetric(vertical: 10),
               child: PhoenixLoadingView(
                 title: 'Загружаем даты ревизии',
-                subtitle: 'Собираем последние даты публикаций',
+                subtitle: 'Собираем первые даты публикаций',
                 size: 44,
               ),
             )
@@ -2553,20 +2559,77 @@ class _WorkerPanelState extends State<WorkerPanel>
               child: Text('Нет данных для ревизии'),
             )
           else
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: _revisionDates.map((item) {
-                final day = (item['day'] ?? '').toString();
-                final label = (item['label'] ?? day).toString();
-                final count = _toIntValue(item['posts'], 0);
-                final selected = _selectedRevisionDates.contains(day);
-                return FilterChip(
-                  selected: selected,
-                  onSelected: (_) => _toggleRevisionDate(day),
-                  label: Text('$label • $count'),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final buttonWidth =
+                    _revisionDates.length <= 1
+                        ? constraints.maxWidth
+                        : ((constraints.maxWidth - 8) / 2).clamp(0.0, double.infinity)
+                            .toDouble();
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: _revisionDates.map((item) {
+                    final day = (item['day'] ?? '').toString();
+                    final label = (item['label'] ?? day).toString();
+                    final count = _toIntValue(item['posts'], 0);
+                    final selected = _selectedRevisionDates.contains(day);
+                    final colorScheme = theme.colorScheme;
+                    return SizedBox(
+                      width: buttonWidth,
+                      child: ElevatedButton(
+                        onPressed: () => _toggleRevisionDate(day),
+                        style: ElevatedButton.styleFrom(
+                          elevation: selected ? 0 : 1,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 14,
+                          ),
+                          backgroundColor:
+                              selected
+                                  ? colorScheme.primaryContainer
+                                  : colorScheme.surfaceContainerLow,
+                          foregroundColor:
+                              selected
+                                  ? colorScheme.onPrimaryContainer
+                                  : colorScheme.onSurface,
+                          side: BorderSide(
+                            color:
+                                selected
+                                    ? colorScheme.primary
+                                    : colorScheme.outlineVariant,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              label,
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '$count товаров',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color:
+                                    selected
+                                        ? colorScheme.onPrimaryContainer.withValues(alpha: 0.78)
+                                        : colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }).toList(),
                 );
-              }).toList(),
+              },
             ),
           const SizedBox(height: 12),
           Row(
