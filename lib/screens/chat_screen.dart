@@ -202,6 +202,7 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _savedScrollAnchorMessageId;
   double? _savedScrollAnchorOffset;
   String? _firstUnreadMessageId;
+  bool _jumpedToFirstUnread = false;
   String? _lastSeenMessageId;
   String? _oldestLoadedMessageId;
   String? _oldestLoadedCreatedAt;
@@ -725,6 +726,8 @@ class _ChatScreenState extends State<ChatScreen> {
     bool restoreDraft = true,
     bool restoreScroll = true,
   }) {
+    final previousFirstUnreadMessageId = _firstUnreadMessageId;
+    final previousUnreadCount = _unreadCount;
     _lastSeenMessageId =
         (state['last_seen_message_id'] ?? '').toString().trim().isEmpty
         ? null
@@ -734,6 +737,13 @@ class _ChatScreenState extends State<ChatScreen> {
         ? null
         : (state['first_unread_message_id'] ?? '').toString().trim();
     _unreadCount = int.tryParse('${state['unread_count'] ?? 0}') ?? 0;
+    final unreadAnchorChanged =
+        (previousFirstUnreadMessageId ?? '').trim() !=
+        (_firstUnreadMessageId ?? '').trim();
+    final unreadIncreased = _unreadCount > previousUnreadCount;
+    if (_unreadCount <= 0 || unreadAnchorChanged || unreadIncreased) {
+      _jumpedToFirstUnread = false;
+    }
 
     if (restoreScroll) {
       final serverAnchorId = (state['scroll_anchor_message_id'] ?? '')
@@ -976,7 +986,8 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       _stickToBottom = nearBottom && !_manualBottomLockSuppressed;
     }
-    if (nearBottom && _unreadCount > 0) {
+    if (_unreadCount > 0 &&
+        (nearBottom || (_isReservedOrdersChat() && _initialViewportReady))) {
       _scheduleReadSync();
     }
     final shouldShow = _initialViewportReady && !nearBottom;
@@ -1300,7 +1311,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || _initialViewportReady) return;
     _initialViewportFailsafeTimer?.cancel();
     setState(() => _initialViewportReady = true);
-    if (_isNearBottom()) {
+    if (_isNearBottom() || (_isReservedOrdersChat() && _unreadCount > 0)) {
       _scheduleReadSync();
     }
   }
@@ -2066,6 +2077,11 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _jumpToFirstUnread() async {
     final messageId = (_firstUnreadMessageId ?? '').trim();
     if (messageId.isEmpty) return;
+    if (!mounted) {
+      _jumpedToFirstUnread = true;
+    } else {
+      setState(() => _jumpedToFirstUnread = true);
+    }
     await _jumpToMessageById(messageId);
   }
 
@@ -2129,7 +2145,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _markChatAsRead() async {
-    if (!_initialViewportReady || !_isNearBottom()) return;
+    final reservedOrdersChat = _isReservedOrdersChat();
+    if (!_initialViewportReady) return;
+    if (!reservedOrdersChat && !_isNearBottom()) return;
     final visibleUntilMessageId = (_newestLoadedMessageId ?? '').trim();
     if (visibleUntilMessageId.isEmpty) return;
     try {
@@ -2147,12 +2165,18 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!mounted) {
           _firstUnreadMessageId = null;
           _unreadCount = 0;
+          _jumpedToFirstUnread = false;
         } else {
           setState(() {
             _firstUnreadMessageId = null;
             _unreadCount = 0;
+            _jumpedToFirstUnread = false;
           });
         }
+        chatEventsController.add({
+          'type': 'chat:message:read',
+          'data': {'chatId': widget.chatId, 'unread_count': 0},
+        });
       }
     } catch (_) {}
   }
@@ -5401,6 +5425,11 @@ class _ChatScreenState extends State<ChatScreen> {
     Map<String, dynamic> a,
     Map<String, dynamic> b,
   ) {
+    final byShelf = _reservedShelfSortKeyOf(
+      a,
+    ).compareTo(_reservedShelfSortKeyOf(b));
+    if (byShelf != 0) return byShelf;
+
     final dayA = _reservedDayOf(a);
     final dayB = _reservedDayOf(b);
     if (dayA == null && dayB != null) return -1;
@@ -5409,11 +5438,6 @@ class _ChatScreenState extends State<ChatScreen> {
       final byDay = dayA.compareTo(dayB);
       if (byDay != 0) return byDay;
     }
-
-    final byShelf = _reservedShelfSortKeyOf(
-      a,
-    ).compareTo(_reservedShelfSortKeyOf(b));
-    if (byShelf != 0) return byShelf;
 
     final byClientName = _reservedClientNameOf(
       a,
@@ -6250,6 +6274,13 @@ class _ChatScreenState extends State<ChatScreen> {
       items.add({'type': 'message', 'data': message});
     }
     return items;
+  }
+
+  bool _shouldUseUnreadJumpButton() {
+    final hasUnreadAnchor = (_firstUnreadMessageId ?? '').trim().isNotEmpty &&
+        _unreadCount > 0 &&
+        !_searchMode;
+    return hasUnreadAnchor && !_jumpedToFirstUnread;
   }
 
   Widget _buildUnreadDivider() {
@@ -10061,43 +10092,70 @@ class _ChatScreenState extends State<ChatScreen> {
           Positioned(
             right: 14,
             bottom: scrollButtonBottom,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                if ((_firstUnreadMessageId ?? '').trim().isNotEmpty &&
-                    _unreadCount > 0 &&
-                    !_searchMode)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: FloatingActionButton.small(
-                      heroTag: 'chat-jump-first-unread',
-                      tooltip: 'К первому непрочитанному',
-                      onPressed: _jumpToFirstUnread,
-                      child: const Icon(Icons.mark_chat_unread_outlined),
-                    ),
-                  ),
-                IgnorePointer(
-                  ignoring: !_showScrollToBottomButton,
+            child: Builder(
+              builder: (context) {
+                final shouldUseUnreadJumpButton = _shouldUseUnreadJumpButton();
+                final showActionButton =
+                    shouldUseUnreadJumpButton || _showScrollToBottomButton;
+                return IgnorePointer(
+                  ignoring: !showActionButton,
                   child: AnimatedSlide(
                     duration: const Duration(milliseconds: 180),
-                    offset: _showScrollToBottomButton
+                    offset: showActionButton
                         ? Offset.zero
                         : const Offset(0, 0.6),
                     child: AnimatedOpacity(
                       duration: const Duration(milliseconds: 180),
-                      opacity: _showScrollToBottomButton ? 1 : 0,
+                      opacity: showActionButton ? 1 : 0,
                       child: FloatingActionButton.small(
-                        heroTag: 'chat-scroll-bottom',
-                        tooltip: 'В конец чата',
-                        onPressed: () => _scrollToBottom(animated: true),
-                        child: const Icon(
-                          Icons.keyboard_double_arrow_down_rounded,
+                        heroTag: 'chat-scroll-action',
+                        tooltip: shouldUseUnreadJumpButton
+                            ? 'К первому непрочитанному'
+                            : 'В конец чата',
+                        onPressed: shouldUseUnreadJumpButton
+                            ? _jumpToFirstUnread
+                            : () => _scrollToBottom(animated: true),
+                        child: Stack(
+                          clipBehavior: Clip.none,
+                          alignment: Alignment.center,
+                          children: [
+                            Icon(
+                              shouldUseUnreadJumpButton
+                                  ? Icons.mark_chat_unread_outlined
+                                  : Icons.keyboard_double_arrow_down_rounded,
+                            ),
+                            if (shouldUseUnreadJumpButton && _unreadCount > 0)
+                              Positioned(
+                                top: -7,
+                                right: -10,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 1,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Theme.of(context).colorScheme.error,
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    _unreadCount > 99 ? '99+' : '$_unreadCount',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                  ),
+                                ),
+                              ),
+                          ],
                         ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                );
+              },
             ),
           ),
           if (_voiceRecording)
