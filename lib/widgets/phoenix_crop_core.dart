@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:crop_your_image/crop_your_image.dart';
@@ -51,7 +52,10 @@ enum PhoenixPostCropPreset {
   };
 }
 
-img.Image _decodeAndBake(Uint8List bytes, {String errorText = 'Не удалось прочитать изображение'}) {
+img.Image _decodeAndBake(
+  Uint8List bytes, {
+  String errorText = 'Не удалось прочитать изображение',
+}) {
   final decoded = img.decodeImage(bytes);
   if (decoded == null) {
     throw Exception(errorText);
@@ -60,7 +64,9 @@ img.Image _decodeAndBake(Uint8List bytes, {String errorText = 'Не удалос
 }
 
 img.Image _resizeIfNeeded(img.Image source, {required int maxLongestSide}) {
-  final longestSide = source.width > source.height ? source.width : source.height;
+  final longestSide = source.width > source.height
+      ? source.width
+      : source.height;
   if (longestSide <= maxLongestSide) return source;
   final scale = maxLongestSide / longestSide;
   final targetWidth = (source.width * scale).round().clamp(1, maxLongestSide);
@@ -143,7 +149,8 @@ Uint8List _encodeJpegWithinBudget(
   const qualitySteps = <int>[97, 95, 93, 90, 87, 84, 82];
   for (final quality in qualitySteps) {
     final output = Uint8List.fromList(img.encodeJpg(working, quality: quality));
-    if (output.lengthInBytes <= maxUploadBytes || quality == qualitySteps.last) {
+    if (output.lengthInBytes <= maxUploadBytes ||
+        quality == qualitySteps.last) {
       return output;
     }
   }
@@ -168,7 +175,7 @@ PhoenixProcessedImage buildPostUploadImage(
   );
 }
 
-class PhoenixCropCore extends StatelessWidget {
+class PhoenixCropCore extends StatefulWidget {
   const PhoenixCropCore({
     super.key,
     required this.imageBytes,
@@ -193,37 +200,298 @@ class PhoenixCropCore extends StatelessWidget {
   final bool showGrid;
 
   @override
+  State<PhoenixCropCore> createState() => _PhoenixCropCoreState();
+}
+
+class _PhoenixCropCoreState extends State<PhoenixCropCore> {
+  static const double _minCropExtent = 72;
+  static const double _edgeHandleLength = 36;
+  static const double _edgeHandleThickness = 8;
+  static const double _edgeHandleTouchTarget = 30;
+
+  Rect _cropRect = Rect.zero;
+  Rect _imageRect = Rect.zero;
+
+  bool get _ready =>
+      _cropRect.width > 0 &&
+      _cropRect.height > 0 &&
+      _imageRect.width > 0 &&
+      _imageRect.height > 0;
+
+  double? get _effectiveAspectRatio =>
+      widget.withCircleUi ? 1.0 : widget.aspectRatio;
+
+  void _handleMoved(Rect cropRect, Rect imageRect) {
+    if (mounted) {
+      setState(() {
+        _cropRect = cropRect;
+        _imageRect = imageRect;
+      });
+    } else {
+      _cropRect = cropRect;
+      _imageRect = imageRect;
+    }
+    widget.onMoved?.call(cropRect, imageRect);
+  }
+
+  Rect? _resizeFromHorizontalHandle(double delta, {required bool leading}) {
+    if (!_ready) return null;
+    final current = _cropRect;
+    final imageRect = _imageRect;
+    final aspectRatio = _effectiveAspectRatio;
+
+    if (aspectRatio == null) {
+      final minWidth = _minCropExtent.toDouble();
+      final nextLeft = leading
+          ? (current.left + delta).clamp(
+              imageRect.left,
+              current.right - minWidth,
+            )
+          : current.left;
+      final nextRight = leading
+          ? current.right
+          : (current.right + delta).clamp(
+              current.left + minWidth,
+              imageRect.right,
+            );
+      return Rect.fromLTRB(nextLeft, current.top, nextRight, current.bottom);
+    }
+
+    final anchorX = leading ? current.right : current.left;
+    var targetWidth = leading
+        ? anchorX - (current.left + delta)
+        : (current.right + delta) - anchorX;
+    final minWidth = _minCropExtent.toDouble();
+    final centerY = current.center.dy;
+    final maxHalfHeight = min(
+      centerY - imageRect.top,
+      imageRect.bottom - centerY,
+    );
+    final maxWidthByHeight = maxHalfHeight * 2 * aspectRatio;
+    final maxWidthByAnchor = leading
+        ? anchorX - imageRect.left
+        : imageRect.right - anchorX;
+    var maxWidth = min(maxWidthByHeight, maxWidthByAnchor);
+    if (maxWidth < minWidth) {
+      maxWidth = minWidth;
+    }
+    targetWidth = targetWidth.clamp(minWidth, maxWidth).toDouble();
+
+    final targetHeight = targetWidth / aspectRatio;
+    var top = centerY - (targetHeight / 2);
+    var bottom = centerY + (targetHeight / 2);
+    if (top < imageRect.top) {
+      bottom += imageRect.top - top;
+      top = imageRect.top;
+    }
+    if (bottom > imageRect.bottom) {
+      top -= bottom - imageRect.bottom;
+      bottom = imageRect.bottom;
+    }
+
+    final left = leading ? anchorX - targetWidth : anchorX;
+    final right = leading ? anchorX : anchorX + targetWidth;
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  Rect? _resizeFromVerticalHandle(double delta, {required bool topEdge}) {
+    if (!_ready) return null;
+    final current = _cropRect;
+    final imageRect = _imageRect;
+    final aspectRatio = _effectiveAspectRatio;
+
+    if (aspectRatio == null) {
+      final minHeight = _minCropExtent.toDouble();
+      final nextTop = topEdge
+          ? (current.top + delta).clamp(
+              imageRect.top,
+              current.bottom - minHeight,
+            )
+          : current.top;
+      final nextBottom = topEdge
+          ? current.bottom
+          : (current.bottom + delta).clamp(
+              current.top + minHeight,
+              imageRect.bottom,
+            );
+      return Rect.fromLTRB(current.left, nextTop, current.right, nextBottom);
+    }
+
+    final anchorY = topEdge ? current.bottom : current.top;
+    var targetHeight = topEdge
+        ? anchorY - (current.top + delta)
+        : (current.bottom + delta) - anchorY;
+    final minHeight = (_minCropExtent / aspectRatio).clamp(
+      _minCropExtent.toDouble(),
+      double.infinity,
+    );
+    final centerX = current.center.dx;
+    final maxHalfWidth = min(
+      centerX - imageRect.left,
+      imageRect.right - centerX,
+    );
+    final maxHeightByWidth = (maxHalfWidth * 2) / aspectRatio;
+    final maxHeightByAnchor = topEdge
+        ? anchorY - imageRect.top
+        : imageRect.bottom - anchorY;
+    var maxHeight = min(maxHeightByWidth, maxHeightByAnchor);
+    if (maxHeight < minHeight) {
+      maxHeight = minHeight;
+    }
+    targetHeight = targetHeight.clamp(minHeight, maxHeight).toDouble();
+
+    final targetWidth = targetHeight * aspectRatio;
+    var left = centerX - (targetWidth / 2);
+    var right = centerX + (targetWidth / 2);
+    if (left < imageRect.left) {
+      right += imageRect.left - left;
+      left = imageRect.left;
+    }
+    if (right > imageRect.right) {
+      left -= right - imageRect.right;
+      right = imageRect.right;
+    }
+
+    final top = topEdge ? anchorY - targetHeight : anchorY;
+    final bottom = topEdge ? anchorY : anchorY + targetHeight;
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  void _applyCropRect(Rect? rect) {
+    if (rect == null) return;
+    widget.controller.cropRect = rect;
+  }
+
+  Widget _buildEdgeHandle({
+    required Alignment alignment,
+    required double left,
+    required double top,
+    required double width,
+    required double height,
+    required void Function(DragUpdateDetails details) onPanUpdate,
+  }) {
+    return Positioned(
+      left: left,
+      top: top,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onPanUpdate: onPanUpdate,
+        child: SizedBox(
+          width: width,
+          height: height,
+          child: Align(
+            alignment: alignment,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(999),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x33000000),
+                    blurRadius: 8,
+                    offset: Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: SizedBox(
+                width:
+                    alignment == Alignment.centerLeft ||
+                        alignment == Alignment.centerRight
+                    ? _edgeHandleThickness
+                    : _edgeHandleLength,
+                height:
+                    alignment == Alignment.centerLeft ||
+                        alignment == Alignment.centerRight
+                    ? _edgeHandleLength
+                    : _edgeHandleThickness,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return ClipRRect(
-      borderRadius: BorderRadius.circular(withCircleUi ? 24 : 18),
+      borderRadius: BorderRadius.circular(widget.withCircleUi ? 24 : 18),
       child: SizedBox(
-        width: width,
-        height: height,
-        child: Crop(
-          image: imageBytes,
-          controller: controller,
-          onCropped: onCropped,
-          aspectRatio: aspectRatio,
-          withCircleUi: withCircleUi,
-          interactive: true,
-          fixCropRect: true,
-          radius: withCircleUi ? 0 : 20,
-          baseColor: theme.colorScheme.surfaceContainerHighest,
-          maskColor: Colors.black.withValues(alpha: 0.48),
-          filterQuality: FilterQuality.high,
-          scrollZoomSensitivity: 0.08,
-          initialRectBuilder: InitialRectBuilder.withSizeAndRatio(
-            size: withCircleUi ? 0.84 : 0.9,
-            aspectRatio: withCircleUi ? 1.0 : aspectRatio,
-          ),
-          onMoved: onMoved,
-          overlayBuilder: showGrid
-              ? (context, rect) => CustomPaint(
-                    painter: _CropGridPainter(rect: rect),
-                    size: Size.infinite,
-                  )
-              : null,
+        width: widget.width,
+        height: widget.height,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Crop(
+              image: widget.imageBytes,
+              controller: widget.controller,
+              onCropped: widget.onCropped,
+              aspectRatio: widget.aspectRatio,
+              withCircleUi: widget.withCircleUi,
+              interactive: false,
+              fixCropRect: false,
+              radius: widget.withCircleUi ? 0 : 20,
+              baseColor: theme.colorScheme.surfaceContainerHighest,
+              maskColor: Colors.black.withValues(alpha: 0.48),
+              filterQuality: FilterQuality.high,
+              initialRectBuilder: InitialRectBuilder.withSizeAndRatio(
+                size: widget.withCircleUi ? 0.84 : 0.9,
+                aspectRatio: widget.withCircleUi ? 1.0 : widget.aspectRatio,
+              ),
+              onMoved: _handleMoved,
+              cornerDotBuilder: (size, _) =>
+                  const DotControl(color: Colors.white, padding: 10),
+              overlayBuilder: widget.showGrid
+                  ? (context, rect) => CustomPaint(
+                      painter: _CropGridPainter(rect: rect),
+                      size: Size.infinite,
+                    )
+                  : null,
+            ),
+            if (_ready) ...[
+              _buildEdgeHandle(
+                alignment: Alignment.topCenter,
+                left: _cropRect.center.dx - (_edgeHandleTouchTarget / 2),
+                top: _cropRect.top - (_edgeHandleTouchTarget / 2),
+                width: _edgeHandleTouchTarget,
+                height: _edgeHandleTouchTarget,
+                onPanUpdate: (details) => _applyCropRect(
+                  _resizeFromVerticalHandle(details.delta.dy, topEdge: true),
+                ),
+              ),
+              _buildEdgeHandle(
+                alignment: Alignment.bottomCenter,
+                left: _cropRect.center.dx - (_edgeHandleTouchTarget / 2),
+                top: _cropRect.bottom - (_edgeHandleTouchTarget / 2),
+                width: _edgeHandleTouchTarget,
+                height: _edgeHandleTouchTarget,
+                onPanUpdate: (details) => _applyCropRect(
+                  _resizeFromVerticalHandle(details.delta.dy, topEdge: false),
+                ),
+              ),
+              _buildEdgeHandle(
+                alignment: Alignment.centerLeft,
+                left: _cropRect.left - (_edgeHandleTouchTarget / 2),
+                top: _cropRect.center.dy - (_edgeHandleTouchTarget / 2),
+                width: _edgeHandleTouchTarget,
+                height: _edgeHandleTouchTarget,
+                onPanUpdate: (details) => _applyCropRect(
+                  _resizeFromHorizontalHandle(details.delta.dx, leading: true),
+                ),
+              ),
+              _buildEdgeHandle(
+                alignment: Alignment.centerRight,
+                left: _cropRect.right - (_edgeHandleTouchTarget / 2),
+                top: _cropRect.center.dy - (_edgeHandleTouchTarget / 2),
+                width: _edgeHandleTouchTarget,
+                height: _edgeHandleTouchTarget,
+                onPanUpdate: (details) => _applyCropRect(
+                  _resizeFromHorizontalHandle(details.delta.dx, leading: false),
+                ),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -247,7 +515,11 @@ class PhoenixAvatarLivePreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final ready = cropRect.width > 0 && cropRect.height > 0 && imageRect.width > 0 && imageRect.height > 0;
+    final ready =
+        cropRect.width > 0 &&
+        cropRect.height > 0 &&
+        imageRect.width > 0 &&
+        imageRect.height > 0;
     if (!ready) {
       return ClipOval(
         child: SizedBox(
@@ -269,9 +541,7 @@ class PhoenixAvatarLivePreview extends StatelessWidget {
       height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        border: Border.all(
-          color: theme.colorScheme.outlineVariant,
-        ),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
       ),
       clipBehavior: Clip.antiAlias,
       child: Stack(
@@ -310,12 +580,29 @@ class _CropGridPainter extends CustomPainter {
     final oneThirdY = rect.top + rect.height / 3;
     final twoThirdY = rect.top + (rect.height / 3) * 2;
 
-    canvas.drawLine(Offset(oneThirdX, rect.top), Offset(oneThirdX, rect.bottom), guidePaint);
-    canvas.drawLine(Offset(twoThirdX, rect.top), Offset(twoThirdX, rect.bottom), guidePaint);
-    canvas.drawLine(Offset(rect.left, oneThirdY), Offset(rect.right, oneThirdY), guidePaint);
-    canvas.drawLine(Offset(rect.left, twoThirdY), Offset(rect.right, twoThirdY), guidePaint);
+    canvas.drawLine(
+      Offset(oneThirdX, rect.top),
+      Offset(oneThirdX, rect.bottom),
+      guidePaint,
+    );
+    canvas.drawLine(
+      Offset(twoThirdX, rect.top),
+      Offset(twoThirdX, rect.bottom),
+      guidePaint,
+    );
+    canvas.drawLine(
+      Offset(rect.left, oneThirdY),
+      Offset(rect.right, oneThirdY),
+      guidePaint,
+    );
+    canvas.drawLine(
+      Offset(rect.left, twoThirdY),
+      Offset(rect.right, twoThirdY),
+      guidePaint,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant _CropGridPainter oldDelegate) => oldDelegate.rect != rect;
+  bool shouldRepaint(covariant _CropGridPainter oldDelegate) =>
+      oldDelegate.rect != rect;
 }
