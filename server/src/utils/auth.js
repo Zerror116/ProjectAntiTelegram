@@ -224,12 +224,23 @@ async function resolveAuthContextFromToken(
   const userRes = tenantScope
     ? await db.runWithTenantRow(tenantScope, lookupUser)
     : await db.runWithPlatform(lookupUser);
-
-  if (userRes.rowCount === 0) {
+  let row = userRes.rows[0] || null;
+  let creatorIdentitySource = tenantScope ? 'tenant' : 'platform';
+  if (!row && tenantScope) {
+    const platformUserRes = await db.runWithPlatform(lookupUser);
+    const platformRow = platformUserRes.rows[0] || null;
+    const platformRole =
+      (platformRow?.role || 'client').toString().toLowerCase().trim() || 'client';
+    const isPlatformCreatorRow =
+      platformRole === 'creator' && isPlatformCreatorEmail(platformRow?.email);
+    if (isPlatformCreatorRow) {
+      row = platformRow;
+      creatorIdentitySource = 'platform_fallback';
+    }
+  }
+  if (!row) {
     return { ok: false, status: 401, error: 'Unauthorized' };
   }
-
-  const row = userRes.rows[0];
   if (row.is_active === false) {
     const blockReason = String(row.block_reason || '').trim();
     return {
@@ -329,6 +340,8 @@ async function resolveAuthContextFromToken(
       row.subscription_expires_at ||
       null,
     is_platform_creator: isPlatformCreator,
+    is_creator_tenant_scoped: isPlatformCreator && !!tenantRegistry,
+    creator_identity_source: isPlatformCreator ? creatorIdentitySource : null,
     session_id: sessionId ? String(sessionId) : null,
   };
 

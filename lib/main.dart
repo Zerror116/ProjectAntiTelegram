@@ -926,7 +926,7 @@ ThemeData _buildDarkTheme() {
 
 Widget _wrapAppRoot(BuildContext context, Widget child) {
   final reduced = performanceModeNotifier.value;
-  final host = _maybeWrapWithDesktopSelection(_GlobalNoticeHost(child: child));
+  final host = _GlobalNoticeHost(child: child);
   if (!reduced) {
     return ScaffoldMessenger(child: host);
   }
@@ -939,25 +939,6 @@ Widget _wrapAppRoot(BuildContext context, Widget child) {
       data: media.copyWith(disableAnimations: true),
       child: host,
     ),
-  );
-}
-
-bool _supportsGlobalDesktopSelection() {
-  if (kIsWeb) {
-    return defaultTargetPlatform != TargetPlatform.android &&
-        defaultTargetPlatform != TargetPlatform.iOS;
-  }
-  return defaultTargetPlatform == TargetPlatform.macOS ||
-      defaultTargetPlatform == TargetPlatform.windows ||
-      defaultTargetPlatform == TargetPlatform.linux;
-}
-
-Widget _maybeWrapWithDesktopSelection(Widget child) {
-  if (!_supportsGlobalDesktopSelection()) return child;
-  return Overlay(
-    initialEntries: [
-      OverlayEntry(builder: (context) => SelectionArea(child: child)),
-    ],
   );
 }
 
@@ -4187,8 +4168,8 @@ void _attachAuthInterceptor() {
             options.headers['X-View-Role'] = viewRole;
           }
           if (currentRole == 'creator') {
-            final creatorTenantCode =
-                await authService.getCreatorTenantScopeCode();
+            final creatorTenantCode = await authService
+                .getCreatorTenantScopeCode();
             if (creatorTenantCode != null && creatorTenantCode.isNotEmpty) {
               options.headers['X-Tenant-Code'] = creatorTenantCode;
             }
@@ -4293,6 +4274,10 @@ void _attachAuthInterceptor() {
 Future<void> _initSocket() async {
   if (_socketInitInProgress) {
     debugPrint('⏳ _initSocket skipped: initialization already in progress');
+    return;
+  }
+  if (authService.isSessionDegraded) {
+    debugPrint('⏭️ _initSocket skipped: auth session is degraded');
     return;
   }
 
@@ -4412,6 +4397,22 @@ Future<void> _initSocket() async {
       chatEventsController.add({'type': 'chat:updated', 'data': data});
     });
 
+    socket?.on('chat:direct_request_created', (data) {
+      _socketVerboseLog('📬 Socket event chat:direct_request_created -> $data');
+      chatEventsController.add({
+        'type': 'chat:direct_request_created',
+        'data': data,
+      });
+    });
+
+    socket?.on('chat:direct_request_updated', (data) {
+      _socketVerboseLog('📬 Socket event chat:direct_request_updated -> $data');
+      chatEventsController.add({
+        'type': 'chat:direct_request_updated',
+        'data': data,
+      });
+    });
+
     socket?.on('chat:pinned', (data) {
       _socketVerboseLog('📬 Socket event chat:pinned -> $data');
       chatEventsController.add({'type': 'chat:pinned', 'data': data});
@@ -4441,6 +4442,18 @@ Future<void> _initSocket() async {
       _socketVerboseLog('📬 Socket event chat:message:read -> $data');
       chatEventsController.add({'type': 'chat:message:read', 'data': data});
       _scheduleWebPushBadgeSync();
+    });
+
+    socket?.on('chat:typing', (data) {
+      chatEventsController.add({'type': 'chat:typing', 'data': data});
+    });
+
+    socket?.on('chat:recording_voice', (data) {
+      chatEventsController.add({'type': 'chat:recording_voice', 'data': data});
+    });
+
+    socket?.on('chat:recording_video', (data) {
+      chatEventsController.add({'type': 'chat:recording_video', 'data': data});
     });
 
     socket?.on('notification:new', (data) {
@@ -5256,11 +5269,18 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           _showAuthScreen();
         } else {
           _handlingAuthFailure = false;
-          // Пользователь вошёл — инициализируем socket
-          try {
-            await _initSocket();
-          } catch (e) {
-            debugPrint('Failed to init socket after login: $e');
+          if (authService.isSessionDegraded) {
+            debugPrint(
+              '⏸️ Auth stream: degraded session, postpone realtime initialization',
+            );
+            await disconnectSocket();
+          } else {
+            // Пользователь вошёл — инициализируем socket
+            try {
+              await _initSocket();
+            } catch (e) {
+              debugPrint('Failed to init socket after login: $e');
+            }
           }
           unawaited(_probePendingPhoneAccessRequests());
           _restartOfflinePurchaseProbe();

@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-const { v4: uuidv4 } = require("uuid");
+const { v4: uuidv4, validate: uuidValidate } = require("uuid");
 
 const router = express.Router();
 const db = require("../db");
@@ -30,6 +30,9 @@ const {
   buildSecretKeyring,
   resolveSecretCandidates,
 } = require("../utils/secretKeyring");
+const {
+  getMessengerPreferencesForUser,
+} = require("../utils/messengerPreferences");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -55,9 +58,18 @@ const chatVideoUploadsDir = path.resolve(
   "chat_media",
   "video",
 );
+const chatFileUploadsDir = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "uploads",
+  "chat_media",
+  "files",
+);
 fs.mkdirSync(chatImageUploadsDir, { recursive: true });
 fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
 fs.mkdirSync(chatVideoUploadsDir, { recursive: true });
+fs.mkdirSync(chatFileUploadsDir, { recursive: true });
 
 const CHAT_MEDIA_TOKEN_TTL_SECONDS = Math.max(
   60,
@@ -87,7 +99,13 @@ const CHAT_MEDIA_MARKERS = Object.freeze({
   image: "/uploads/chat_media/images/",
   voice: "/uploads/chat_media/voice/",
   video: "/uploads/chat_media/video/",
+  file: "/uploads/chat_media/files/",
 });
+
+const DIRECT_REQUEST_COOLDOWN_HOURS = Math.max(
+  1,
+  Number(process.env.DIRECT_REQUEST_COOLDOWN_HOURS || 12),
+);
 
 const CHAT_MEDIA_MAX_FILE_SIZE_BYTES = Math.max(
   8 * 1024 * 1024,
@@ -97,11 +115,100 @@ const CHAT_MEDIA_MAX_FILE_SIZE_MB = Math.max(
   8,
   Math.round(CHAT_MEDIA_MAX_FILE_SIZE_BYTES / (1024 * 1024)),
 );
+const ATTACHMENT_QUALITY_MODES = new Set(["standard", "hd", "file"]);
+const ATTACHMENT_TYPES = new Set(["image", "voice", "video", "file"]);
+const CHAT_STATE_UUID_FIELDS = new Set([
+  "last_read_message_id",
+  "last_seen_message_id",
+  "scroll_anchor_message_id",
+]);
 
 function parsePositiveMediaNumber(raw, { round = true } = {}) {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return null;
   return round ? Math.round(value) : Number(value.toFixed(4));
+}
+
+function normalizeAttachmentQualityMode(raw) {
+  const value = String(raw || "")
+    .trim()
+    .toLowerCase();
+  return ATTACHMENT_QUALITY_MODES.has(value) ? value : "standard";
+}
+
+function normalizeAttachmentType(raw) {
+  const value = String(raw || "")
+    .trim()
+    .toLowerCase();
+  return ATTACHMENT_TYPES.has(value) ? value : "";
+}
+
+function resolveAttachmentQualityMode(raw, attachmentType) {
+  const normalizedType = normalizeAttachmentType(attachmentType);
+  const normalizedRaw = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (ATTACHMENT_QUALITY_MODES.has(normalizedRaw)) {
+    return {
+      qualityMode: normalizedRaw,
+      defaulted: false,
+      reasonCode: null,
+    };
+  }
+  return {
+    qualityMode: normalizedType == "file" ? "file" : "standard",
+    defaulted: true,
+    reasonCode: normalizedRaw ? "invalid_quality_mode" : "missing_quality_mode",
+  };
+}
+
+function normalizeUuidPatchField(raw) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    return { accepted: true, value: null, reasonCode: null };
+  }
+  if (uuidValidate(value)) {
+    return { accepted: true, value, reasonCode: null };
+  }
+  return { accepted: false, value: null, reasonCode: "invalid_uuid" };
+}
+
+function sanitizeChatStatePatch(rawPatch, { logPrefix = "chats.state.patch" } = {}) {
+  const patch =
+    rawPatch && typeof rawPatch === "object" && !Array.isArray(rawPatch)
+      ? rawPatch
+      : {};
+  const normalized = {};
+  const dropped = [];
+
+  for (const field of CHAT_STATE_UUID_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(patch, field)) continue;
+    const normalizedField = normalizeUuidPatchField(patch[field]);
+    if (normalizedField.accepted) {
+      normalized[field] = normalizedField.value;
+    } else {
+      dropped.push({
+        field,
+        reasonCode: normalizedField.reasonCode,
+      });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch, "draft_text")) {
+    normalized.draft_text = patch.draft_text;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "draft_updated_at")) {
+    normalized.draft_updated_at = patch.draft_updated_at;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "scroll_anchor_offset")) {
+    normalized.scroll_anchor_offset = patch.scroll_anchor_offset;
+  }
+
+  if (dropped.length > 0) {
+    console.warn(`${logPrefix}: dropped invalid state patch fields`, dropped);
+  }
+
+  return { patch: normalized, dropped };
 }
 
 function isVoiceMimeAllowed(mimeRaw, originalNameRaw) {
@@ -164,6 +271,10 @@ const chatMediaUpload = multer({
         cb(null, chatVideoUploadsDir);
         return;
       }
+      if (file.fieldname === "file") {
+        cb(null, chatFileUploadsDir);
+        return;
+      }
       cb(new Error("Некорректный тип вложения"));
     },
     filename: (_req, file, cb) => {
@@ -172,6 +283,8 @@ const chatMediaUpload = multer({
         ? ".m4a"
         : file.fieldname === "video"
         ? ".mp4"
+        : file.fieldname === "file"
+        ? ".bin"
         : ".jpg";
       const safeExt = ext && ext.length <= 10 ? ext : fallbackExt;
       cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
@@ -208,6 +321,10 @@ const chatMediaUpload = multer({
       cb(new Error("Можно загружать только видеофайлы"));
       return;
     }
+    if (file.fieldname === "file") {
+      cb(null, true);
+      return;
+    }
     cb(new Error("Некорректный тип вложения"));
   },
 });
@@ -239,9 +356,10 @@ const directOpenRateGuard = createRateGuard({
 
 function uploadChatMedia(req, res, next) {
   chatMediaUpload.fields([
-    { name: "image", maxCount: 1 },
+    { name: "image", maxCount: 10 },
     { name: "voice", maxCount: 1 },
-    { name: "video", maxCount: 1 },
+    { name: "video", maxCount: 10 },
+    { name: "file", maxCount: 10 },
   ])(req, res, (err) => {
     if (!err) return next();
     console.warn("[chat-media] upload error", {
@@ -429,6 +547,14 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
     }
   }
 
+  let directRequest = null;
+  if (
+    chat.type === "private" &&
+    String(settings?.kind || "").trim().toLowerCase() === "direct_message"
+  ) {
+    directRequest = await findDirectRequestByChatId(db.pool, chatId);
+  }
+
   return {
     chat,
     settings,
@@ -436,6 +562,9 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
     hasMembers,
     isMember,
     isBlacklisted: isUserBlacklisted(settings, userId),
+    viewerUserId: String(userId || "").trim(),
+    directRequest,
+    directRequestStatus: directRequestStatusForViewer(settings, userId),
   };
 }
 
@@ -486,6 +615,12 @@ function canReadChat(context, userRole, permissions = {}) {
       return hasPermission(permissions, "chat.write.support");
     }
     return false;
+  }
+
+  if (context.chat.type === "private" && context.directRequestStatus) {
+    if (context.directRequestStatus.status === "declined") {
+      return false;
+    }
   }
 
   if (context.hasMembers) return context.isMember;
@@ -549,6 +684,26 @@ function canPostChat(context, userRole, permissions = {}) {
       return false;
     }
     return context.isMember;
+  }
+  if (context.chat.type === "private" && context.directRequestStatus) {
+    const status = context.directRequestStatus.status;
+    if (status === "accepted") {
+      return context.hasMembers ? context.isMember : true;
+    }
+    if (status === "pending") {
+      const viewerId = String(context.directRequestStatus.pending_for || "").trim();
+      const currentUserId = String(context.directRequest?.requester_id || "").trim();
+      const pendingForCurrentUser = viewerId === String(context.viewerUserId || "").trim();
+      if (pendingForCurrentUser) {
+        return false;
+      }
+      return (
+        currentUserId.length > 0 &&
+        currentUserId === String(context.viewerUserId || "").trim() &&
+        !context.directRequest?.first_message_id
+      );
+    }
+    return false;
   }
   if (context.hasMembers) return context.isMember;
   // Открытые публичные чаты доступны только staff.
@@ -668,7 +823,7 @@ async function searchDirectTargets(client, requester, { query, limit = 8 }) {
   const isEmailQuery = looksLikeEmail(normalizedQuery);
   const isDigitsOnlyQuery = /^[0-9]+$/.test(normalizedQuery);
   const isFullPhoneQuery = phoneDigits.length >= 10;
-  const canSearchText = normalizedQuery.length >= 3;
+  const canSearchText = normalizedQuery.length >= 2;
   const canSearchPhone = phoneDigits.length >= 4;
 
   if (!isEmailQuery && !canSearchText && !canSearchPhone) {
@@ -686,6 +841,7 @@ async function searchDirectTargets(client, requester, { query, limit = 8 }) {
        SELECT u.id,
               u.email,
               u.name,
+              u.role,
               u.tenant_id,
               p.phone,
               u.avatar_url,
@@ -710,7 +866,7 @@ async function searchDirectTargets(client, requester, { query, limit = 8 }) {
      ),
      ranked AS (
        SELECT su.*,
-              CASE
+             CASE
                 WHEN $4::boolean AND LOWER(COALESCE(su.email, '')) = $3::text THEN 900
                 WHEN $6::boolean AND su.phone_core10 = $11::text THEN 890
                 WHEN (NOT $12::boolean) AND COALESCE(su.name, '') ILIKE $8::text ESCAPE '\\' THEN 780
@@ -728,6 +884,7 @@ async function searchDirectTargets(client, requester, { query, limit = 8 }) {
      SELECT id,
             email,
             name,
+            role,
             tenant_id,
             phone,
             avatar_url,
@@ -803,6 +960,7 @@ async function resolveDirectTargetUser(client, requester, { userId, query }) {
       `SELECT u.id,
               u.email,
               u.name,
+              u.role,
               u.tenant_id,
               p.phone,
               u.avatar_url,
@@ -826,6 +984,7 @@ async function resolveDirectTargetUser(client, requester, { userId, query }) {
         `SELECT u.id,
                 u.email,
                 u.name,
+                u.role,
                 u.tenant_id,
                 p.phone,
                 u.avatar_url,
@@ -888,6 +1047,7 @@ function mapPeerInfo(row, { includeEmail = false } = {}) {
   const payload = {
     id: row.id,
     name: row.name || "",
+    role: row.role || "",
     phone: row.phone || "",
     avatar_url: row.avatar_url || null,
     avatar_focus_x: Number(row.avatar_focus_x || 0),
@@ -948,8 +1108,22 @@ async function getDirectAliasForViewer(
 }
 
 function buildDirectChatPayloadForViewer(chat, counterpart, aliasName = "") {
+  const settings = normalizeSettings(chat?.settings);
+  const directRequestStatus = String(settings.direct_request_status || "")
+    .trim()
+    .toLowerCase();
+  const directRequestPendingFor = String(settings.direct_request_pending_for || "")
+    .trim();
+  const directRequestCreatedBy = String(settings.direct_request_created_by || "")
+    .trim();
+  const directRequestId = String(settings.direct_request_id || "").trim();
+  const directRequestFirstMessageSent =
+    settings.direct_request_first_message_sent === true;
   const title =
-    String(aliasName || "").trim() ||
+    String(settings.saved_messages === true ||
+      String(settings.kind || "").trim().toLowerCase() === "saved_messages"
+      ? "Избранное"
+      : aliasName || "").trim() ||
     String(counterpart?.name || "").trim() ||
     String(counterpart?.phone || "").trim() ||
     "Пользователь";
@@ -965,7 +1139,194 @@ function buildDirectChatPayloadForViewer(chat, counterpart, aliasName = "") {
     peer_avatar_focus_x: Number(counterpart?.avatar_focus_x || 0),
     peer_avatar_focus_y: Number(counterpart?.avatar_focus_y || 0),
     peer_avatar_zoom: Number(counterpart?.avatar_zoom || 1),
+    direct_request_status: directRequestStatus || null,
+    direct_request_id: directRequestId || null,
+    direct_request_pending_for: directRequestPendingFor || null,
+    direct_request_created_by: directRequestCreatedBy || null,
+    direct_request_first_message_sent: directRequestFirstMessageSent,
   };
+}
+
+function isSavedMessagesSettings(settings) {
+  const normalized = normalizeSettings(settings);
+  return (
+    normalized.saved_messages === true ||
+    String(normalized.kind || "").trim().toLowerCase() === "saved_messages"
+  );
+}
+
+async function ensureSavedMessagesChat(client, user) {
+  const userId = String(user?.id || "").trim();
+  const tenantId = user?.tenant_id || null;
+  if (!userId) return null;
+
+  const existingQ = await client.query(
+    `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at
+     FROM chats c
+     JOIN chat_members cm ON cm.chat_id = c.id
+     WHERE cm.user_id = $1
+       AND c.type = 'private'
+       AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+       AND (
+         COALESCE((c.settings->>'saved_messages')::boolean, false) = true
+         OR COALESCE(c.settings->>'kind', '') = 'saved_messages'
+       )
+     ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC
+     LIMIT 1`,
+    [userId, tenantId],
+  );
+  if (existingQ.rowCount > 0) {
+    const chat = existingQ.rows[0];
+    await client.query(
+      `INSERT INTO user_chat_preferences (
+         user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
+       )
+       VALUES ($1, $2, false, true, now(), now(), now())
+       ON CONFLICT (user_id, chat_id)
+       DO UPDATE
+         SET hidden = false,
+             pinned = true,
+             pinned_at = COALESCE(user_chat_preferences.pinned_at, now()),
+             updated_at = now()`,
+      [userId, chat.id],
+    );
+    return chat;
+  }
+
+  const settings = {
+    kind: "saved_messages",
+    saved_messages: true,
+    visibility: "private",
+  };
+  const insertQ = await client.query(
+    `INSERT INTO chats (
+       id,
+       title,
+       type,
+       created_by,
+       tenant_id,
+       settings,
+       created_at,
+       updated_at
+     )
+     VALUES ($1, $2, 'private', $3, $4, $5::jsonb, now(), now())
+     RETURNING id, title, type, settings, created_at, updated_at`,
+    [uuidv4(), "Избранное", userId, tenantId, JSON.stringify(settings)],
+  );
+  const chat = insertQ.rows[0];
+  await client.query(
+    `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+     VALUES ($1, $2, $3, now(), 'owner')
+     ON CONFLICT (chat_id, user_id) DO NOTHING`,
+    [uuidv4(), chat.id, userId],
+  );
+  await client.query(
+    `INSERT INTO user_chat_preferences (
+       user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
+     )
+     VALUES ($1, $2, false, true, now(), now(), now())
+     ON CONFLICT (user_id, chat_id)
+     DO UPDATE
+       SET hidden = false,
+           pinned = true,
+           pinned_at = COALESCE(user_chat_preferences.pinned_at, now()),
+           updated_at = now()`,
+    [userId, chat.id],
+  );
+  return chat;
+}
+
+async function findDirectRequestByChatId(client, chatId) {
+  const q = await client.query(
+    `SELECT id,
+            tenant_id,
+            chat_id,
+            requester_id,
+            target_user_id,
+            status,
+            first_message_id,
+            cooldown_until,
+            responded_at,
+            created_at,
+            updated_at
+     FROM direct_message_requests
+     WHERE chat_id = $1
+     LIMIT 1`,
+    [chatId],
+  );
+  return q.rowCount > 0 ? q.rows[0] : null;
+}
+
+async function findDirectRequestBetweenUsers(client, tenantId, requesterId, targetUserId) {
+  const q = await client.query(
+    `SELECT id,
+            tenant_id,
+            chat_id,
+            requester_id,
+            target_user_id,
+            status,
+            first_message_id,
+            cooldown_until,
+            responded_at,
+            created_at,
+            updated_at
+     FROM direct_message_requests
+     WHERE requester_id = $1
+       AND target_user_id = $2
+       AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+     ORDER BY updated_at DESC, created_at DESC
+     LIMIT 1`,
+    [requesterId, targetUserId, tenantId || null],
+  );
+  return q.rowCount > 0 ? q.rows[0] : null;
+}
+
+async function areUsersConnectedByContact(client, tenantId, leftUserId, rightUserId) {
+  const q = await client.query(
+    `SELECT 1
+     FROM user_contacts
+     WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid)
+       AND (
+         (user_id = $2 AND contact_user_id = $3)
+         OR (user_id = $3 AND contact_user_id = $2)
+       )
+     LIMIT 1`,
+    [tenantId || null, leftUserId, rightUserId],
+  );
+  return q.rowCount > 0;
+}
+
+function directRequestStatusForViewer(settings, viewerUserId) {
+  const normalized = normalizeSettings(settings);
+  const status = String(normalized.direct_request_status || "")
+    .trim()
+    .toLowerCase();
+  if (!status) return null;
+  const pendingFor = String(normalized.direct_request_pending_for || "").trim();
+  const createdBy = String(normalized.direct_request_created_by || "").trim();
+  const firstMessageSent = normalized.direct_request_first_message_sent === true;
+  return {
+    status,
+    pending_for: pendingFor || null,
+    created_by: createdBy || null,
+    first_message_sent: firstMessageSent,
+    is_pending_for_me:
+      status === "pending" &&
+      pendingFor.length > 0 &&
+      pendingFor === String(viewerUserId || "").trim(),
+  };
+}
+
+function isDirectMessageSettings(settings) {
+  const normalized = normalizeSettings(settings);
+  return String(normalized.kind || "").trim().toLowerCase() === "direct_message";
+}
+
+function shouldEmitRealtimeActivity(chat, settings) {
+  if (!chat) return false;
+  if (chat.type !== "private") return false;
+  if (isSavedMessagesSettings(settings)) return false;
+  return isDirectMessageSettings(settings);
 }
 
 function toChatMediaUrl(req, file) {
@@ -978,6 +1339,9 @@ function toChatMediaUrl(req, file) {
   }
   if (file.fieldname === "video") {
     return `${req.protocol}://${req.get("host")}/uploads/chat_media/video/${file.filename}`;
+  }
+  if (file.fieldname === "file") {
+    return `${req.protocol}://${req.get("host")}/uploads/chat_media/files/${file.filename}`;
   }
   return null;
 }
@@ -1046,7 +1410,7 @@ function decorateMessageMediaUrls(req, rawMessage) {
   const meta = parseMeta(rawMessage.meta);
   const nextMeta = { ...meta };
   let changed = false;
-  for (const key of ["image_url", "voice_url", "video_url"]) {
+  for (const key of ["image_url", "voice_url", "video_url", "file_url"]) {
     const value = String(nextMeta[key] || "").trim();
     if (!value) continue;
     const signed = buildSignedChatMediaUrl(req, value);
@@ -1059,6 +1423,19 @@ function decorateMessageMediaUrls(req, rawMessage) {
     message.meta = nextMeta;
   } else {
     message.meta = meta;
+  }
+  if (Array.isArray(rawMessage.attachments) && rawMessage.attachments.length > 0) {
+    message.attachments = rawMessage.attachments.map((attachment) => {
+      if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+        return attachment;
+      }
+      const nextAttachment = { ...attachment };
+      const value = String(nextAttachment.storage_url || "").trim();
+      if (value.length > 0) {
+        nextAttachment.storage_url = buildSignedChatMediaUrl(req, value);
+      }
+      return nextAttachment;
+    });
   }
   return message;
 }
@@ -1091,6 +1468,10 @@ function removeChatMediaByUrl(raw) {
       marker: "/uploads/chat_media/video/",
       baseDir: chatVideoUploadsDir,
     },
+    {
+      marker: "/uploads/chat_media/files/",
+      baseDir: chatFileUploadsDir,
+    },
   ];
 
   for (const { marker, baseDir } of mappings) {
@@ -1120,6 +1501,224 @@ async function loadMessageReactionsByUser(messageId) {
     reactions[userId] = emoji;
   }
   return reactions;
+}
+
+function legacyAttachmentsFromMeta(meta) {
+  const normalized = parseMeta(meta);
+  const caption = String(normalized.caption || "").trim();
+  const attachments = [];
+  if (String(normalized.image_url || "").trim().length > 0) {
+    attachments.push({
+      attachment_type: "image",
+      sort_order: 0,
+      storage_url: String(normalized.image_url || "").trim(),
+      width: parsePositiveMediaNumber(normalized.image_width),
+      height: parsePositiveMediaNumber(normalized.image_height),
+      aspect_ratio: parsePositiveMediaNumber(normalized.image_aspect_ratio, {
+        round: false,
+      }),
+      preprocess_tag: String(normalized.image_preprocess || "").trim() || null,
+      caption: caption.length > 0 ? caption : null,
+    });
+  }
+  if (String(normalized.voice_url || "").trim().length > 0) {
+    attachments.push({
+      attachment_type: "voice",
+      sort_order: attachments.length,
+      storage_url: String(normalized.voice_url || "").trim(),
+      duration_ms: parsePositiveMediaNumber(normalized.voice_duration_ms),
+      mime_type: String(normalized.voice_mime_type || "").trim() || null,
+      file_name: String(normalized.voice_file_name || "").trim() || null,
+      is_listen_once: normalized.listen_once === true,
+    });
+  }
+  if (String(normalized.video_url || "").trim().length > 0) {
+    attachments.push({
+      attachment_type: "video",
+      sort_order: attachments.length,
+      storage_url: String(normalized.video_url || "").trim(),
+      duration_ms: parsePositiveMediaNumber(normalized.video_duration_ms),
+      mime_type: String(normalized.video_mime_type || "").trim() || null,
+      file_name: String(normalized.video_file_name || "").trim() || null,
+      is_video_note: normalized.is_video_note === true,
+    });
+  }
+  if (String(normalized.file_url || "").trim().length > 0) {
+    attachments.push({
+      attachment_type: "file",
+      sort_order: attachments.length,
+      storage_url: String(normalized.file_url || "").trim(),
+      mime_type: String(normalized.file_mime_type || "").trim() || null,
+      file_name: String(normalized.file_name || "").trim() || null,
+      file_size: parsePositiveMediaNumber(normalized.file_size),
+    });
+  }
+  return attachments;
+}
+
+async function loadMessageAttachmentsByMessageIds(messageIds) {
+  const ids = Array.isArray(messageIds)
+    ? messageIds
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    : [];
+  if (ids.length === 0) return new Map();
+  const attachmentsQ = await db.query(
+    `SELECT id,
+            message_id::text AS message_id,
+            attachment_type,
+            sort_order,
+            media_group_id,
+            storage_url,
+            file_name,
+            mime_type,
+            file_size,
+            width,
+            height,
+            aspect_ratio,
+            duration_ms,
+            preprocess_tag,
+            quality_mode,
+            is_video_note,
+            is_listen_once,
+            created_at
+     FROM message_attachments
+     WHERE message_id = ANY($1::uuid[])
+     ORDER BY message_id ASC, sort_order ASC, created_at ASC, id ASC`,
+    [ids],
+  );
+  const byMessageId = new Map();
+  for (const row of attachmentsQ.rows) {
+    const messageId = String(row.message_id || "").trim();
+    if (!messageId) continue;
+    const current = byMessageId.get(messageId) || [];
+    current.push({
+      id: row.id,
+      attachment_type: row.attachment_type,
+      sort_order: Number(row.sort_order || 0),
+      media_group_id: row.media_group_id || null,
+      storage_url: row.storage_url || null,
+      file_name: row.file_name || null,
+      mime_type: row.mime_type || null,
+      file_size: row.file_size == null ? null : Number(row.file_size),
+      width: row.width == null ? null : Number(row.width),
+      height: row.height == null ? null : Number(row.height),
+      aspect_ratio: row.aspect_ratio == null ? null : Number(row.aspect_ratio),
+      duration_ms: row.duration_ms == null ? null : Number(row.duration_ms),
+      preprocess_tag: row.preprocess_tag || null,
+      quality_mode: normalizeAttachmentQualityMode(row.quality_mode),
+      is_video_note: row.is_video_note === true,
+      is_listen_once: row.is_listen_once === true,
+      created_at: row.created_at || null,
+    });
+    byMessageId.set(messageId, current);
+  }
+  return byMessageId;
+}
+
+async function upsertMessageAttachments({
+  messageId,
+  attachments,
+}) {
+  const normalizedMessageId = String(messageId || "").trim();
+  if (!normalizedMessageId || !Array.isArray(attachments)) return;
+  await db.query("DELETE FROM message_attachments WHERE message_id = $1", [
+    normalizedMessageId,
+  ]);
+  for (let index = 0; index < attachments.length; index += 1) {
+    const attachment = attachments[index];
+    if (!attachment || typeof attachment !== "object") continue;
+    const type = normalizeAttachmentType(attachment.attachment_type);
+    const storageUrl = String(attachment.storage_url || "").trim();
+    if (!type || !storageUrl) continue;
+    const qualityResolution = resolveAttachmentQualityMode(
+      attachment.quality_mode,
+      type,
+    );
+    if (qualityResolution.defaulted) {
+      console.warn("chats.attachments.quality.defaulted", {
+        reason_code: qualityResolution.reasonCode,
+        message_id: normalizedMessageId,
+        attachment_type: type,
+        sort_order: Number(attachment.sort_order ?? index) || 0,
+      });
+    }
+    await db.query(
+      `INSERT INTO message_attachments (
+         id,
+         message_id,
+         attachment_type,
+         sort_order,
+         media_group_id,
+         storage_url,
+         file_name,
+         mime_type,
+         file_size,
+         width,
+         height,
+         aspect_ratio,
+         duration_ms,
+         preprocess_tag,
+         quality_mode,
+         is_video_note,
+         is_listen_once,
+         created_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
+       )`,
+      [
+        uuidv4(),
+        normalizedMessageId,
+        type,
+        Number(attachment.sort_order ?? index) || 0,
+        attachment.media_group_id || null,
+        storageUrl,
+        attachment.file_name || null,
+        attachment.mime_type || null,
+        attachment.file_size == null ? null : Number(attachment.file_size),
+        attachment.width == null ? null : Number(attachment.width),
+        attachment.height == null ? null : Number(attachment.height),
+        attachment.aspect_ratio == null
+          ? null
+          : Number(attachment.aspect_ratio),
+        attachment.duration_ms == null ? null : Number(attachment.duration_ms),
+        attachment.preprocess_tag || null,
+        qualityResolution.qualityMode,
+        attachment.is_video_note === true,
+        attachment.is_listen_once === true,
+      ],
+    );
+  }
+}
+
+async function maybeBindDirectRequestFirstMessage(chatId, messageId) {
+  const normalizedChatId = String(chatId || "").trim();
+  const normalizedMessageId = String(messageId || "").trim();
+  if (!normalizedChatId || !normalizedMessageId) return;
+  const updated = await db.query(
+    `UPDATE direct_message_requests
+     SET first_message_id = COALESCE(first_message_id, $2),
+         updated_at = now()
+     WHERE chat_id = $1
+       AND status = 'pending'
+       AND first_message_id IS NULL`,
+    [normalizedChatId, normalizedMessageId],
+  );
+  if ((updated.rowCount || 0) > 0) {
+    await db.query(
+      `UPDATE chats
+       SET settings = settings || $2::jsonb,
+           updated_at = now()
+       WHERE id = $1`,
+      [
+        normalizedChatId,
+        JSON.stringify({
+          direct_request_first_message_sent: true,
+        }),
+      ],
+    );
+  }
 }
 
 async function getHydratedMessageById(messageId, currentUserId) {
@@ -1164,17 +1763,8 @@ async function getHydratedMessageById(messageId, currentUserId) {
   );
   const hydrated = decryptMessageRow(result.rows[0] || null);
   if (!hydrated) return null;
-  const meta = parseMeta(hydrated.meta);
-  const reactionMap = await loadMessageReactionsByUser(hydrated.id);
-  if (Object.keys(reactionMap).length > 0) {
-    hydrated.meta = {
-      ...meta,
-      reactions_by_user: reactionMap,
-    };
-  } else {
-    hydrated.meta = meta;
-  }
-  return hydrated;
+  const decorated = await attachReactionMapsToMessages([hydrated]);
+  return decorated[0] || null;
 }
 
 async function attachReactionMapsToMessages(messages) {
@@ -1201,22 +1791,24 @@ async function attachReactionMapsToMessages(messages) {
     current[userId] = emoji;
     byMessageId.set(messageId, current);
   }
+  const attachmentsByMessageId = await loadMessageAttachmentsByMessageIds(ids);
   return messages.map((message) => {
     const messageId = String(message?.id || "").trim();
     const meta = parseMeta(message?.meta);
     const reactionsByUser = byMessageId.get(messageId);
-    if (!reactionsByUser || Object.keys(reactionsByUser).length === 0) {
-      return {
-        ...message,
-        meta,
-      };
-    }
+    const attachments =
+      attachmentsByMessageId.get(messageId) || legacyAttachmentsFromMeta(meta);
+    const nextMeta =
+      !reactionsByUser || Object.keys(reactionsByUser).length === 0
+        ? meta
+        : {
+            ...meta,
+            reactions_by_user: reactionsByUser,
+          };
     return {
       ...message,
-      meta: {
-        ...meta,
-        reactions_by_user: reactionsByUser,
-      },
+      meta: nextMeta,
+      attachments,
     };
   });
 }
@@ -1571,7 +2163,8 @@ function parseCursorLimit(raw, fallback = 40) {
 
 function trimOptionalUuid(raw) {
   const value = String(raw || "").trim();
-  return value || null;
+  if (!value) return null;
+  return uuidValidate(value) ? value : null;
 }
 
 function trimOptionalText(raw, maxLength = 4000) {
@@ -1622,10 +2215,16 @@ async function upsertUserChatState(userId, chatId, patch = {}) {
   };
 
   if (Object.prototype.hasOwnProperty.call(patch, "last_read_message_id")) {
-    assign("last_read_message_id", trimOptionalUuid(patch.last_read_message_id));
+    const normalized = normalizeUuidPatchField(patch.last_read_message_id);
+    if (normalized.accepted) {
+      assign("last_read_message_id", normalized.value);
+    }
   }
   if (Object.prototype.hasOwnProperty.call(patch, "last_seen_message_id")) {
-    assign("last_seen_message_id", trimOptionalUuid(patch.last_seen_message_id));
+    const normalized = normalizeUuidPatchField(patch.last_seen_message_id);
+    if (normalized.accepted) {
+      assign("last_seen_message_id", normalized.value);
+    }
   }
   if (Object.prototype.hasOwnProperty.call(patch, "draft_text")) {
     assign("draft_text", trimOptionalText(patch.draft_text || "", 8000));
@@ -1634,10 +2233,10 @@ async function upsertUserChatState(userId, chatId, patch = {}) {
     assign("draft_updated_at", patch.draft_updated_at || null);
   }
   if (Object.prototype.hasOwnProperty.call(patch, "scroll_anchor_message_id")) {
-    assign(
-      "scroll_anchor_message_id",
-      trimOptionalUuid(patch.scroll_anchor_message_id),
-    );
+    const normalized = normalizeUuidPatchField(patch.scroll_anchor_message_id);
+    if (normalized.accepted) {
+      assign("scroll_anchor_message_id", normalized.value);
+    }
   }
   if (Object.prototype.hasOwnProperty.call(patch, "scroll_anchor_offset")) {
     assign("scroll_anchor_offset", parseOptionalNumber(patch.scroll_anchor_offset));
@@ -2000,11 +2599,11 @@ async function loadPagedMessages(req, {
   if (mode !== "after") {
     rows = rows.reverse();
   }
-  const decryptedRows = await attachReactionMapsToMessages(
-    rows.map((row) => decorateMessageMediaUrls(req, decryptMessageRow(row))),
+  const decoratedRows = await attachReactionMapsToMessages(
+    rows.map((row) => decryptMessageRow(row)),
   );
   return {
-    data: decryptedRows,
+    data: decoratedRows.map((row) => decorateMessageMediaUrls(req, row)),
     has_more_before: mode === "before" ? hasMore : mode === "latest" ? hasMore : false,
     has_more_after: mode === "after" ? hasMore : false,
     mode,
@@ -2022,6 +2621,8 @@ async function listChatsHandler(req, res) {
     const adminOrCreator =
       role === "admin" || role === "tenant" || role === "creator";
     const bugReportViewer = canAccessBugReportsChannel(req.user.role);
+
+    await ensureSavedMessagesChat(db.pool, req.user);
 
     const publicAndChannelQ = await db.query(
       `SELECT c.id,
@@ -2494,11 +3095,28 @@ router.patch("/:chatId/state", requireAuth, async (req, res) => {
       patch.scroll_anchor_offset = req.body.scroll_anchor_offset;
     }
 
-    const state = await upsertUserChatState(userId, chatId, patch);
+    const sanitized = sanitizeChatStatePatch(patch);
+    const sanitizedPatch = sanitized.patch;
+    if (Object.keys(sanitizedPatch).length === 0) {
+      const state = await getUserChatState(userId, chatId);
+      return res.json({
+        ok: true,
+        data: state,
+        meta: {
+          reason_code: "empty_state_patch",
+          dropped_fields: sanitized.dropped,
+        },
+      });
+    }
+    const state = await upsertUserChatState(userId, chatId, sanitizedPatch);
     return res.json({ ok: true, data: state });
   } catch (err) {
     console.error("chats.state.patch error", err);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+      error_code: "chat_state_patch_failed",
+    });
   }
 });
 
@@ -2716,7 +3334,7 @@ router.get("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
 
     const safeMessage = decorateMessageMediaUrls(
       req,
-      decryptMessageRow(messageQ.rows[0]),
+      await getHydratedMessageById(messageQ.rows[0].id, userId),
     );
     return res.json({ ok: true, data: safeMessage });
   } catch (err) {
@@ -2861,7 +3479,11 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
         .slice(0, safeLimit);
     }
 
-    return res.json({ ok: true, data: await attachReactionMapsToMessages(messages) });
+    const hydrated = await attachReactionMapsToMessages(messages);
+    return res.json({
+      ok: true,
+      data: hydrated.map((row) => decorateMessageMediaUrls(req, row)),
+    });
   } catch (err) {
     console.error("chats.search error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
@@ -3181,6 +3803,7 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     if (!messageId) {
       return res.status(500).json({ ok: false, error: "Не удалось создать сообщение" });
     }
+    await maybeBindDirectRequestFirstMessage(chatId, messageId);
 
     let promptMessageId = null;
     let autoReplyMessageId = null;
@@ -3233,6 +3856,7 @@ router.post(
       ...((req.files?.image || []).map((file) => file)),
       ...((req.files?.voice || []).map((file) => file)),
       ...((req.files?.video || []).map((file) => file)),
+      ...((req.files?.file || []).map((file) => file)),
     ];
     try {
       const userId = req.user.id;
@@ -3263,21 +3887,28 @@ router.post(
       const imageFile = req.files?.image?.[0] || null;
       const voiceFile = req.files?.voice?.[0] || null;
       const videoFile = req.files?.video?.[0] || null;
+      const fileFile = req.files?.file?.[0] || null;
 
       const pickedCount =
-        (imageFile ? 1 : 0) + (voiceFile ? 1 : 0) + (videoFile ? 1 : 0);
+        (imageFile ? 1 : 0) +
+        (voiceFile ? 1 : 0) +
+        (videoFile ? 1 : 0) +
+        (fileFile ? 1 : 0);
       if (pickedCount !== 1) {
         console.warn("[chat-media] invalid uploaded files count", {
           pickedCount,
           hasImage: Boolean(imageFile),
           hasVoice: Boolean(voiceFile),
           hasVideo: Boolean(videoFile),
+          hasFile: Boolean(fileFile),
           imageMime: imageFile?.mimetype || "",
           voiceMime: voiceFile?.mimetype || "",
           videoMime: videoFile?.mimetype || "",
+          fileMime: fileFile?.mimetype || "",
           imageSize: imageFile?.size || 0,
           voiceSize: voiceFile?.size || 0,
           videoSize: videoFile?.size || 0,
+          fileSize: fileFile?.size || 0,
           contentType: req.headers?.["content-type"] || "",
           userAgent: req.headers?.["user-agent"] || "",
           origin: req.headers?.origin || "",
@@ -3287,7 +3918,8 @@ router.post(
         removeUploadedFiles(uploadedFiles);
         return res.status(400).json({
           ok: false,
-          error: "Нужно передать либо изображение, либо голосовое сообщение, либо видео",
+          error:
+            "Нужно передать либо изображение, либо голосовое сообщение, либо видео, либо файл",
         });
       }
 
@@ -3295,8 +3927,10 @@ router.post(
         ? "image"
         : voiceFile
         ? "voice"
+        : fileFile
+        ? "file"
         : "video";
-      const uploadedFile = imageFile || voiceFile || videoFile;
+      const uploadedFile = imageFile || voiceFile || videoFile || fileFile;
       const mediaUrl = toChatMediaUrl(req, uploadedFile);
       if (!mediaUrl) {
         removeUploadedFiles(uploadedFiles);
@@ -3342,6 +3976,8 @@ router.post(
         ? (hasCaption ? caption : "Фото")
         : attachmentType === "video"
         ? (hasCaption ? caption : "Видеосообщение")
+        : attachmentType === "file"
+        ? (hasCaption ? caption : "Файл")
         : "Голосовое сообщение";
       const meta = {
         attachment_type: attachmentType,
@@ -3374,6 +4010,16 @@ router.post(
               voice_file_name: String(
                 uploadedFile.originalname || uploadedFile.filename || "",
               ).trim(),
+            }
+          : attachmentType === "file"
+          ? {
+              file_url: mediaUrl,
+              file_mime_type: String(uploadedFile.mimetype || "").trim(),
+              file_name: String(
+                uploadedFile.originalname || uploadedFile.filename || "",
+              ).trim(),
+              file_size:
+                uploadedFile.size == null ? null : Number(uploadedFile.size),
             }
           : {
               video_url: mediaUrl,
@@ -3421,6 +4067,49 @@ router.post(
           error: "Не удалось создать сообщение",
         });
       }
+      await upsertMessageAttachments({
+        messageId,
+        attachments: [
+          {
+            attachment_type: attachmentType,
+            sort_order: 0,
+            storage_url: mediaUrl,
+            file_name: String(
+              uploadedFile.originalname || uploadedFile.filename || "",
+            ).trim() || null,
+            mime_type: String(uploadedFile.mimetype || "").trim() || null,
+            file_size:
+              uploadedFile.size == null ? null : Number(uploadedFile.size),
+            width: imageWidth,
+            height: imageHeight,
+            aspect_ratio: imageAspectRatio,
+            duration_ms: durationMs > 0 ? durationMs : null,
+            preprocess_tag: imagePreprocess || null,
+            quality_mode: req.body?.quality_mode,
+            is_video_note:
+              attachmentType === "video" &&
+              (req.body?.is_video_note == true ||
+                String(req.body?.is_video_note || "").trim() == "true"),
+            is_listen_once:
+              attachmentType === "voice" &&
+              (req.body?.listen_once == true ||
+                String(req.body?.listen_once || "").trim() == "true"),
+          },
+        ],
+      });
+      const qualityResolution = resolveAttachmentQualityMode(
+        req.body?.quality_mode,
+        attachmentType,
+      );
+      if (qualityResolution.defaulted) {
+        console.warn("chats.postMediaMessage.quality.defaulted", {
+          reason_code: qualityResolution.reasonCode,
+          chat_id: chatId,
+          message_id: messageId,
+          attachment_type: attachmentType,
+        });
+      }
+      await maybeBindDirectRequestFirstMessage(chatId, messageId);
 
       let promptMessageId = null;
       let autoReplyMessageId = null;
@@ -3461,7 +4150,11 @@ router.post(
     } catch (err) {
       removeUploadedFiles(uploadedFiles);
       console.error("chats.postMediaMessage error", err);
-      return res.status(500).json({ ok: false, error: "Server error" });
+      return res.status(500).json({
+        ok: false,
+        error: "Server error",
+        error_code: "chat_media_send_failed",
+      });
     }
   },
 );
@@ -3920,6 +4613,7 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     removeChatMediaByUrl(meta?.image_url);
     removeChatMediaByUrl(meta?.voice_url);
     removeChatMediaByUrl(meta?.video_url);
+    removeChatMediaByUrl(meta?.file_url);
 
     const io = req.app.get("io");
     if (io) {
@@ -3980,6 +4674,7 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
       removeChatMediaByUrl(meta?.image_url);
       removeChatMediaByUrl(meta?.voice_url);
       removeChatMediaByUrl(meta?.video_url);
+      removeChatMediaByUrl(meta?.file_url);
     }
 
     await db.query("DELETE FROM message_reads WHERE chat_id = $1", [chatId]);
@@ -4318,7 +5013,7 @@ router.get("/direct/search", requireAuth, directSearchRateGuard, async (req, res
         too_short: true,
         exact: null,
         candidates: [],
-        message: "Введите минимум 3 символа или полный email/номер",
+        message: "Введите минимум 2 символа имени или полный email/номер",
       },
     });
   }
@@ -4337,7 +5032,7 @@ router.get("/direct/search", requireAuth, directSearchRateGuard, async (req, res
           too_short: true,
           exact: null,
           candidates: [],
-          message: "Введите минимум 3 символа или полный email/номер",
+          message: "Введите минимум 2 символа имени или полный email/номер",
         },
       });
     }
@@ -4404,6 +5099,14 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
       });
     }
 
+    const knownConnection = await areUsersConnectedByContact(
+      client,
+      req.user.tenant_id || null,
+      req.user.id,
+      peer.id,
+    );
+    const peerPreferences = await getMessengerPreferencesForUser(peer.id);
+
     const existing = await client.query(
       `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at
        FROM chats c
@@ -4426,12 +5129,205 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
 
     let chat = null;
     let created = false;
+    let requestRecord = null;
+    let requestCreated = false;
     if (existing.rowCount > 0) {
       chat = existing.rows[0];
+      requestRecord = await findDirectRequestByChatId(client, chat.id);
+      if (
+        requestRecord &&
+        requestRecord.status === "declined" &&
+        String(requestRecord.requester_id || "").trim() === String(req.user.id || "").trim() &&
+        String(requestRecord.target_user_id || "").trim() === String(peer.id || "").trim() &&
+        requestRecord.cooldown_until &&
+        new Date(requestRecord.cooldown_until).getTime() > Date.now()
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(429).json({
+          ok: false,
+          error: "Запрос уже был отклонен. Попробуйте написать позже.",
+          cooldown_until: requestRecord.cooldown_until,
+        });
+      }
+      if (
+        requestRecord &&
+        requestRecord.status === "declined" &&
+        String(requestRecord.requester_id || "").trim() === String(req.user.id || "").trim() &&
+        String(requestRecord.target_user_id || "").trim() === String(peer.id || "").trim()
+      ) {
+        if (
+          !knownConnection &&
+          (!peerPreferences.allow_unknown_dm_requests ||
+            !peerPreferences.allow_tenant_first_contact)
+        ) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            ok: false,
+            error: "Пользователь принимает ЛС только после добавления в контакты",
+          });
+        }
+
+        const nextStatus = knownConnection ? "accepted" : "pending";
+        const updatedRequestQ = await client.query(
+          `UPDATE direct_message_requests
+           SET requester_id = $2,
+               target_user_id = $3,
+               status = $4,
+               first_message_id = NULL,
+               cooldown_until = NULL,
+               responded_at = NULL,
+               updated_at = now()
+           WHERE id = $1
+           RETURNING id,
+                     tenant_id,
+                     chat_id,
+                     requester_id,
+                     target_user_id,
+                     status,
+                     first_message_id,
+                     cooldown_until,
+                     responded_at,
+                     created_at,
+                     updated_at`,
+          [
+            requestRecord.id,
+            req.user.id,
+            peer.id,
+            nextStatus,
+          ],
+        );
+        requestRecord = updatedRequestQ.rows[0] || requestRecord;
+        await client.query(
+          `UPDATE chats
+           SET settings = settings || $2::jsonb,
+               updated_at = now()
+           WHERE id = $1`,
+          [
+            chat.id,
+            JSON.stringify({
+              direct_request_id: requestRecord.id,
+              direct_request_status: nextStatus,
+              direct_request_created_by: String(req.user.id || "").trim(),
+              direct_request_pending_for:
+                nextStatus === "pending" ? String(peer.id || "").trim() : null,
+              direct_request_first_message_sent: false,
+            }),
+          ],
+        );
+        chat = {
+          ...chat,
+          settings: {
+            ...normalizeSettings(chat.settings),
+            direct_request_id: requestRecord.id,
+            direct_request_status: nextStatus,
+            direct_request_created_by: String(req.user.id || "").trim(),
+            direct_request_pending_for:
+              nextStatus === "pending" ? String(peer.id || "").trim() : null,
+            direct_request_first_message_sent: false,
+          },
+          updated_at: new Date().toISOString(),
+        };
+        requestCreated = nextStatus === "pending";
+      } else if (
+        requestRecord &&
+        requestRecord.status === "pending" &&
+        knownConnection
+      ) {
+        const acceptedRequestQ = await client.query(
+          `UPDATE direct_message_requests
+           SET status = 'accepted',
+               cooldown_until = NULL,
+               responded_at = COALESCE(responded_at, now()),
+               updated_at = now()
+           WHERE id = $1
+           RETURNING id,
+                     tenant_id,
+                     chat_id,
+                     requester_id,
+                     target_user_id,
+                     status,
+                     first_message_id,
+                     cooldown_until,
+                     responded_at,
+                     created_at,
+                     updated_at`,
+          [requestRecord.id],
+        );
+        requestRecord = acceptedRequestQ.rows[0] || requestRecord;
+        await client.query(
+          `UPDATE chats
+           SET settings = settings || $2::jsonb,
+               updated_at = now()
+           WHERE id = $1`,
+          [
+            chat.id,
+            JSON.stringify({
+              direct_request_id: requestRecord.id,
+              direct_request_status: "accepted",
+              direct_request_pending_for: null,
+            }),
+          ],
+        );
+        chat = {
+          ...chat,
+          settings: {
+            ...normalizeSettings(chat.settings),
+            direct_request_id: requestRecord.id,
+            direct_request_status: "accepted",
+            direct_request_pending_for: null,
+          },
+          updated_at: new Date().toISOString(),
+        };
+      } else if (!requestRecord) {
+        const nextSettings = {
+          ...normalizeSettings(chat.settings),
+          direct_request_status: "accepted",
+          direct_request_pending_for: null,
+          direct_request_created_by: null,
+        };
+        await client.query(
+          `UPDATE chats
+           SET settings = $2::jsonb,
+               updated_at = now()
+           WHERE id = $1`,
+          [chat.id, JSON.stringify(nextSettings)],
+        );
+        chat = {
+          ...chat,
+          settings: nextSettings,
+          updated_at: new Date().toISOString(),
+        };
+      }
     } else {
+      if (
+        !knownConnection &&
+        (!peerPreferences.allow_unknown_dm_requests ||
+          !peerPreferences.allow_tenant_first_contact)
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          error: "Пользователь принимает ЛС только после добавления в контакты",
+        });
+      }
+
+      const requestPending = !knownConnection;
       const settings = {
         kind: "direct_message",
         visibility: "private",
+        ...(requestPending
+          ? {
+              direct_request_status: "pending",
+              direct_request_created_by: String(req.user.id || "").trim(),
+              direct_request_pending_for: String(peer.id || "").trim(),
+              direct_request_first_message_sent: false,
+            }
+          : {
+              direct_request_status: "accepted",
+              direct_request_created_by: null,
+              direct_request_pending_for: null,
+              direct_request_first_message_sent: false,
+            }),
       };
       const chatInsert = await client.query(
         `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
@@ -4459,6 +5355,61 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
         [uuidv4(), chat.id, peer.id],
       );
       created = true;
+
+      if (requestPending) {
+        const insertedRequest = await client.query(
+          `INSERT INTO direct_message_requests (
+             id,
+             tenant_id,
+             chat_id,
+             requester_id,
+             target_user_id,
+             status,
+             created_at,
+             updated_at
+           )
+           VALUES ($1, $2, $3, $4, $5, 'pending', now(), now())
+           RETURNING id,
+                     tenant_id,
+                     chat_id,
+                     requester_id,
+                     target_user_id,
+                     status,
+                     first_message_id,
+                     cooldown_until,
+                     responded_at,
+                     created_at,
+                     updated_at`,
+          [
+            uuidv4(),
+            req.user.tenant_id || null,
+            chat.id,
+            req.user.id,
+            peer.id,
+          ],
+        );
+        requestRecord = insertedRequest.rows[0] || null;
+        requestCreated = true;
+        await client.query(
+          `UPDATE chats
+           SET settings = settings || $2::jsonb,
+               updated_at = now()
+           WHERE id = $1`,
+          [
+            chat.id,
+            JSON.stringify({
+              direct_request_id: requestRecord?.id || null,
+            }),
+          ],
+        );
+        chat = {
+          ...chat,
+          settings: {
+            ...normalizeSettings(chat.settings),
+            direct_request_id: requestRecord?.id,
+          },
+        };
+      }
     }
 
     await client.query(
@@ -4471,13 +5422,16 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
            updated_at = now()`,
       [req.user.id, chat.id],
     );
-    if (created) {
+    if (created || requestCreated || requestRecord?.status === "accepted") {
       await client.query(
         `INSERT INTO user_chat_preferences (
            user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
          )
          VALUES ($1, $2, false, false, NULL, now(), now())
-         ON CONFLICT (user_id, chat_id) DO NOTHING`,
+         ON CONFLICT (user_id, chat_id)
+         DO UPDATE
+           SET hidden = false,
+               updated_at = now()`,
         [peer.id, chat.id],
       );
     }
@@ -4493,6 +5447,17 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
     );
     const contactInfo =
       contactInfoQ.rowCount > 0 ? contactInfoQ.rows[0] : null;
+    const reverseContactInfoQ = await client.query(
+      `SELECT alias_name, created_at, updated_at
+       FROM user_contacts
+       WHERE user_id = $1
+         AND contact_user_id = $2
+         AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+       LIMIT 1`,
+      [peer.id, req.user.id, req.user.tenant_id || null],
+    );
+    const reverseContactInfo =
+      reverseContactInfoQ.rowCount > 0 ? reverseContactInfoQ.rows[0] : null;
 
     const reverseAliasName = await getDirectAliasForViewer(
       client,
@@ -4505,6 +5470,7 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
       req.user.id,
       req.user.tenant_id || null,
     );
+    const requestState = directRequestStatusForViewer(chat.settings, req.user.id);
     const requesterChat = buildDirectChatPayloadForViewer(
       chat,
       peer,
@@ -4530,6 +5496,21 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
           chat: peerChat,
         });
       }
+      if (requestCreated && requestRecord) {
+        emitToUser(io, peer.id, "chat:direct_request_created", {
+          request_id: requestRecord.id,
+          chat_id: chat.id,
+          requester: mapPeerInfo({
+            ...requesterCard,
+            role: req.user?.role || "",
+            alias_name: reverseContactInfo?.alias_name || "",
+            is_in_contacts: Boolean(reverseContactInfo),
+            contact_created_at: reverseContactInfo?.created_at || null,
+            contact_updated_at: reverseContactInfo?.updated_at || null,
+          }),
+          chat: peerChat,
+        });
+      }
       emitToUser(io, req.user?.id, "chat:updated", {
         chatId: chat.id,
         chat: requesterChat,
@@ -4552,6 +5533,8 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
           contact_updated_at: contactInfo?.updated_at || null,
         }),
         created,
+        request_created: requestCreated,
+        request_status: requestState?.status || "accepted",
       },
     });
   } catch (err) {
@@ -4562,6 +5545,453 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
     return res.status(500).json({ ok: false, error: "Server error" });
   } finally {
     client.release();
+  }
+});
+
+router.get("/direct/requests", requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const rows = await client.query(
+      `SELECT dmr.id,
+              dmr.chat_id,
+              dmr.requester_id,
+              dmr.target_user_id,
+              dmr.status,
+              dmr.cooldown_until,
+              dmr.created_at,
+              dmr.updated_at,
+              c.title,
+              c.type,
+              c.settings,
+              u.name,
+              u.role,
+              u.email,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+       FROM direct_message_requests dmr
+       JOIN chats c ON c.id = dmr.chat_id
+       JOIN users u ON u.id = dmr.requester_id
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE dmr.target_user_id = $1
+         AND dmr.status = 'pending'
+         AND ($2::uuid IS NULL OR dmr.tenant_id = $2::uuid)
+       ORDER BY dmr.updated_at DESC, dmr.created_at DESC`,
+      [req.user.id, req.user.tenant_id || null],
+    );
+    const data = rows.rows.map((row) => ({
+      id: row.id,
+      chat_id: row.chat_id,
+      status: row.status,
+      cooldown_until: row.cooldown_until || null,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      requester: mapPeerInfo({
+        ...row,
+        is_in_contacts: false,
+        alias_name: "",
+      }),
+      chat: buildDirectChatPayloadForViewer(
+        {
+          id: row.chat_id,
+          title: row.title,
+          type: row.type,
+          settings: row.settings,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+        },
+        row,
+        "",
+      ),
+    }));
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("chats.direct.requests.list error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+async function updateDirectRequestStatus({
+  client,
+  requestId,
+  viewer,
+  nextStatus,
+}) {
+  const requestQ = await client.query(
+    `SELECT id,
+            tenant_id,
+            chat_id,
+            requester_id,
+            target_user_id,
+            status,
+            first_message_id,
+            cooldown_until,
+            responded_at,
+            created_at,
+            updated_at
+     FROM direct_message_requests
+     WHERE id = $1
+       AND target_user_id = $2
+       AND ($3::uuid IS NULL OR tenant_id = $3::uuid)
+     LIMIT 1
+     FOR UPDATE`,
+    [requestId, viewer.id, viewer.tenant_id || null],
+  );
+  if (requestQ.rowCount === 0) {
+    return { error: "not_found" };
+  }
+  const request = requestQ.rows[0];
+  if (request.status !== "pending") {
+    return { error: "not_pending", request };
+  }
+  const cooldownUntil =
+    nextStatus === "declined"
+      ? new Date(
+          Date.now() + DIRECT_REQUEST_COOLDOWN_HOURS * 60 * 60 * 1000,
+        ).toISOString()
+      : null;
+  const chatSettingsPatch =
+    nextStatus === "accepted"
+      ? {
+          direct_request_id: request.id,
+          direct_request_status: "accepted",
+          direct_request_pending_for: null,
+          direct_request_first_message_sent: request.first_message_id != null,
+        }
+      : {
+          direct_request_id: request.id,
+          direct_request_status: "declined",
+          direct_request_pending_for: String(viewer.id || "").trim(),
+          direct_request_first_message_sent: request.first_message_id != null,
+        };
+  const updatedRequest = await client.query(
+    `UPDATE direct_message_requests
+     SET status = $2,
+         cooldown_until = $3,
+         responded_at = now(),
+         updated_at = now()
+     WHERE id = $1
+     RETURNING id,
+               tenant_id,
+               chat_id,
+               requester_id,
+               target_user_id,
+               status,
+               first_message_id,
+               cooldown_until,
+               responded_at,
+               created_at,
+               updated_at`,
+    [requestId, nextStatus, cooldownUntil],
+  );
+  await client.query(
+    `UPDATE chats
+     SET settings = settings || $2::jsonb,
+         updated_at = now()
+     WHERE id = $1`,
+    [request.chat_id, JSON.stringify(chatSettingsPatch)],
+  );
+  if (nextStatus === "declined") {
+    await client.query(
+      `INSERT INTO user_chat_preferences (
+         user_id, chat_id, hidden, pinned, pinned_at, created_at, updated_at
+       )
+       VALUES ($1, $2, true, false, NULL, now(), now())
+       ON CONFLICT (user_id, chat_id)
+       DO UPDATE
+         SET hidden = true,
+             updated_at = now()`,
+      [viewer.id, request.chat_id],
+    );
+  }
+  return { request: updatedRequest.rows[0] };
+}
+
+router.post("/direct/requests/:id/accept", requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const updated = await updateDirectRequestStatus({
+      client,
+      requestId: String(req.params?.id || "").trim(),
+      viewer: req.user,
+      nextStatus: "accepted",
+    });
+    if (updated.error === "not_found") {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Запрос не найден" });
+    }
+    if (updated.error === "not_pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "Запрос уже обработан" });
+    }
+    const chatQ = await client.query(
+      `SELECT id, title, type, settings, created_at, updated_at
+       FROM chats
+       WHERE id = $1
+       LIMIT 1`,
+      [updated.request.chat_id],
+    );
+    const requesterCard = await getDirectUserCard(
+      client,
+      updated.request.requester_id,
+      req.user.tenant_id || null,
+    );
+    const aliasName = await getDirectAliasForViewer(
+      client,
+      req.user.id,
+      updated.request.requester_id,
+      req.user.tenant_id || null,
+    );
+    const chatPayload = buildDirectChatPayloadForViewer(
+      chatQ.rows[0],
+      requesterCard,
+      aliasName,
+    );
+    const accepterCard = await getDirectUserCard(
+      client,
+      updated.request.target_user_id,
+      req.user.tenant_id || null,
+    );
+    const requesterAlias = await getDirectAliasForViewer(
+      client,
+      updated.request.requester_id,
+      updated.request.target_user_id,
+      req.user.tenant_id || null,
+    );
+    const requesterChatPayload = buildDirectChatPayloadForViewer(
+      chatQ.rows[0],
+      accepterCard,
+      requesterAlias,
+    );
+    await client.query("COMMIT");
+
+    const io = req.app.get("io");
+    if (io) {
+      emitToUser(io, updated.request.target_user_id, "chat:direct_request_updated", {
+        request_id: updated.request.id,
+        chat_id: updated.request.chat_id,
+        status: updated.request.status,
+      });
+      emitToUser(io, updated.request.requester_id, "chat:direct_request_updated", {
+        request_id: updated.request.id,
+        chat_id: updated.request.chat_id,
+        status: updated.request.status,
+      });
+      emitToUser(io, updated.request.target_user_id, "chat:updated", {
+        chatId: updated.request.chat_id,
+        chat: chatPayload,
+      });
+      emitToUser(io, updated.request.requester_id, "chat:updated", {
+        chatId: updated.request.chat_id,
+        chat: requesterChatPayload,
+      });
+    }
+    return res.json({ ok: true, data: { request: updated.request, chat: chatPayload } });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("chats.direct.requests.accept error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.post("/direct/requests/:id/decline", requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const updated = await updateDirectRequestStatus({
+      client,
+      requestId: String(req.params?.id || "").trim(),
+      viewer: req.user,
+      nextStatus: "declined",
+    });
+    if (updated.error === "not_found") {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Запрос не найден" });
+    }
+    if (updated.error === "not_pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "Запрос уже обработан" });
+    }
+    const chatQ = await client.query(
+      `SELECT id, title, type, settings, created_at, updated_at
+       FROM chats
+       WHERE id = $1
+       LIMIT 1`,
+      [updated.request.chat_id],
+    );
+    const accepterCard = await getDirectUserCard(
+      client,
+      updated.request.target_user_id,
+      req.user.tenant_id || null,
+    );
+    const requesterAlias = await getDirectAliasForViewer(
+      client,
+      updated.request.requester_id,
+      updated.request.target_user_id,
+      req.user.tenant_id || null,
+    );
+    const requesterChatPayload = buildDirectChatPayloadForViewer(
+      chatQ.rows[0],
+      accepterCard,
+      requesterAlias,
+    );
+    await client.query("COMMIT");
+    const io = req.app.get("io");
+    if (io) {
+      emitToUser(io, updated.request.target_user_id, "chat:direct_request_updated", {
+        request_id: updated.request.id,
+        chat_id: updated.request.chat_id,
+        status: updated.request.status,
+        cooldown_until: updated.request.cooldown_until || null,
+      });
+      emitToUser(io, updated.request.requester_id, "chat:direct_request_updated", {
+        request_id: updated.request.id,
+        chat_id: updated.request.chat_id,
+        status: updated.request.status,
+        cooldown_until: updated.request.cooldown_until || null,
+      });
+      emitToUser(io, updated.request.requester_id, "chat:updated", {
+        chatId: updated.request.chat_id,
+        chat: requesterChatPayload,
+      });
+    }
+    return res.json({ ok: true, data: updated.request });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("chats.direct.requests.decline error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.get("/:chatId/contact-card", requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const role = req.user.role;
+  const { chatId } = req.params;
+  try {
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+
+    if (isSavedMessagesSettings(context.settings)) {
+      const directRequest = await findDirectRequestByChatId(db.pool, chatId);
+      const selfCard = await getDirectUserCard(
+        db.pool,
+        req.user.id,
+        req.user.tenant_id || null,
+      );
+      return res.json({
+        ok: true,
+        data: {
+          is_saved_messages: true,
+          request_id: directRequest?.id || null,
+          peer: mapPeerInfo({
+            ...selfCard,
+            alias_name: "",
+            is_in_contacts: true,
+          }),
+          shared_media_count: 0,
+          shared_file_count: 0,
+        },
+      });
+    }
+
+    if (!isDirectMessageSettings(context.settings)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Карточка контакта доступна только для личных чатов",
+      });
+    }
+
+    const directRequest = await findDirectRequestByChatId(db.pool, chatId);
+
+    const peerQ = await db.query(
+      `SELECT u.id,
+              u.email,
+              u.name,
+              u.role,
+              u.tenant_id,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom,
+              uc.alias_name,
+              uc.created_at AS contact_created_at,
+              uc.updated_at AS contact_updated_at,
+              (uc.user_id IS NOT NULL) AS is_in_contacts
+       FROM chat_members cm
+       JOIN users u ON u.id = cm.user_id
+       LEFT JOIN phones p ON p.user_id = u.id
+       LEFT JOIN user_contacts uc
+         ON uc.user_id = $1
+        AND uc.contact_user_id = u.id
+        AND ($3::uuid IS NULL OR uc.tenant_id = $3::uuid)
+       WHERE cm.chat_id = $2
+         AND cm.user_id <> $1
+       ORDER BY cm.joined_at ASC
+       LIMIT 1`,
+      [userId, chatId, req.user.tenant_id || null],
+    );
+    if (peerQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Собеседник не найден" });
+    }
+    const mediaStatsQ = await db.query(
+      `SELECT COUNT(*) FILTER (
+                WHERE EXISTS (
+                  SELECT 1
+                  FROM message_attachments ma
+                  WHERE ma.message_id = m.id
+                    AND ma.attachment_type IN ('image', 'video')
+                )
+                OR COALESCE(m.meta->>'image_url', '') <> ''
+                OR COALESCE(m.meta->>'video_url', '') <> ''
+              )::int AS shared_media_count,
+              COUNT(*) FILTER (
+                WHERE EXISTS (
+                  SELECT 1
+                  FROM message_attachments ma
+                  WHERE ma.message_id = m.id
+                    AND ma.attachment_type = 'file'
+                )
+                OR COALESCE(m.meta->>'file_url', '') <> ''
+              )::int AS shared_file_count
+       FROM messages m
+       WHERE m.chat_id = $1`,
+      [chatId],
+    );
+    return res.json({
+      ok: true,
+      data: {
+        is_saved_messages: false,
+        request_id: directRequest?.id || null,
+        peer: mapPeerInfo(peerQ.rows[0], { includeEmail: true }),
+        shared_media_count:
+          Number(mediaStatsQ.rows[0]?.shared_media_count || 0) || 0,
+        shared_file_count:
+          Number(mediaStatsQ.rows[0]?.shared_file_count || 0) || 0,
+      },
+    });
+  } catch (err) {
+    console.error("chats.contactCard error", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 

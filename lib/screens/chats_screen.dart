@@ -30,6 +30,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   bool _refreshQueued = false;
   bool _loadedOnce = false;
   bool _rulesPromptInProgress = false;
+  String _activeFolder = 'primary';
 
   String _chatIdOf(Map<String, dynamic> chat) => (chat['id'] ?? '').toString();
 
@@ -192,6 +193,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   String _chatDisplayTitle(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    if (settings['saved_messages'] == true ||
+        (settings['kind'] ?? '').toString().trim().toLowerCase() ==
+            'saved_messages') {
+      return 'Избранное';
+    }
     final serverDisplay = (chat['display_title'] ?? '').toString().trim();
     if (serverDisplay.isNotEmpty) return serverDisplay;
 
@@ -340,6 +347,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ),
       );
       if (!mounted) return;
+      _markChatReadLocally(chatId, unreadCount: 0);
       _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
     } catch (e) {
       if (!mounted) return;
@@ -481,6 +489,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   String _lastMessagePreview(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    final requestStatus =
+        (chat['direct_request_status'] ??
+                settings['direct_request_status'] ??
+                '')
+            .toString()
+            .trim()
+            .toLowerCase();
+    if (requestStatus == 'pending') {
+      final pendingFor =
+          (chat['direct_request_pending_for'] ??
+                  settings['direct_request_pending_for'] ??
+                  '')
+              .toString()
+              .trim();
+      final myUserId = authService.currentUser?.id.trim() ?? '';
+      if (pendingFor.isNotEmpty && pendingFor == myUserId) {
+        return 'Запрос на личную переписку ждёт вашего решения';
+      }
+      return 'Отправлен первый запрос на личную переписку';
+    }
     return messengerBuildLastMessagePreview(
       rawText: (chat['last_message'] ?? chat['last'] ?? '').toString(),
       senderId: (chat['last_message_sender_id'] ?? '').toString(),
@@ -495,11 +524,112 @@ class _ChatsScreenState extends State<ChatsScreen> {
     return kind == 'support_ticket' || _toBool(settings['support_ticket']);
   }
 
-  ({
-    Color background,
-    Color foreground,
-    Color border,
-  }) _supportToneColors(
+  String _currentRole() {
+    return (authService.effectiveRole.isNotEmpty
+                ? authService.effectiveRole
+                : authService.currentUser?.role)
+            ?.toLowerCase()
+            .trim() ??
+        'client';
+  }
+
+  bool _isSavedMessagesChat(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    return settings['saved_messages'] == true ||
+        (settings['kind'] ?? '').toString().trim().toLowerCase() ==
+            'saved_messages';
+  }
+
+  bool _isDirectListChat(Map<String, dynamic> chat) {
+    if ((chat['type'] ?? '').toString().trim().toLowerCase() != 'private') {
+      return false;
+    }
+    if (_isSupportChat(chat)) return false;
+    final settings = _settingsOf(chat);
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    return kind.isEmpty ||
+        kind == 'direct_message' ||
+        kind == 'saved_messages' ||
+        _isSavedMessagesChat(chat);
+  }
+
+  bool _isWorkChat(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    final systemKey = (settings['system_key'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    return kind == 'reserved_orders' ||
+        systemKey == 'reserved_orders' ||
+        kind == 'support_ticket' ||
+        kind == 'delivery' ||
+        kind == 'delivery_chat' ||
+        kind == 'bug_reports' ||
+        kind == 'posts_archive';
+  }
+
+  List<({String id, String label})> _folderSpecs() {
+    final role = _currentRole();
+    if (role == 'client') {
+      return const [
+        (id: 'primary', label: 'Основные'),
+        (id: 'direct', label: 'ЛС'),
+      ];
+    }
+    return const [
+      (id: 'primary', label: 'Основные'),
+      (id: 'work', label: 'Работа'),
+      (id: 'direct', label: 'ЛС'),
+    ];
+  }
+
+  List<Map<String, dynamic>> _visibleChatsForFolder() {
+    switch (_activeFolder) {
+      case 'direct':
+        return _chats.where(_isDirectListChat).toList();
+      case 'work':
+        return _chats.where(_isWorkChat).toList();
+      case 'primary':
+      default:
+        return _chats
+            .where((chat) => !_isDirectListChat(chat) && !_isWorkChat(chat))
+            .toList();
+    }
+  }
+
+  Widget _buildFolderTabs(ThemeData theme) {
+    final specs = _folderSpecs();
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
+      child: Row(
+        children: specs.map((spec) {
+          final selected = spec.id == _activeFolder;
+          final count = switch (spec.id) {
+            'direct' => _chats.where(_isDirectListChat).length,
+            'work' => _chats.where(_isWorkChat).length,
+            _ =>
+              _chats
+                  .where(
+                    (chat) => !_isDirectListChat(chat) && !_isWorkChat(chat),
+                  )
+                  .length,
+          };
+          return Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: ChoiceChip(
+              selected: selected,
+              label: Text('${spec.label} $count'),
+              onSelected: (_) => setState(() => _activeFolder = spec.id),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  ({Color background, Color foreground, Color border}) _supportToneColors(
     ThemeData theme,
     MessengerSupportStatusTone tone,
   ) {
@@ -567,7 +697,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
           theme,
           icon: Icons.push_pin_rounded,
           label: 'Закреплён',
-          background: theme.colorScheme.primaryContainer.withValues(alpha: 0.72),
+          background: theme.colorScheme.primaryContainer.withValues(
+            alpha: 0.72,
+          ),
           foreground: theme.colorScheme.onPrimaryContainer,
           border: theme.colorScheme.primary.withValues(alpha: 0.26),
         ),
@@ -576,18 +708,21 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
     if (_isSupportChat(chat)) {
       final settings = _settingsOf(chat);
-      final assignee = (chat['support_assignee_name'] ??
-              settings['support_assignee_name'] ??
-              '')
-          .toString()
-          .trim();
+      final assignee =
+          (chat['support_assignee_name'] ??
+                  settings['support_assignee_name'] ??
+                  '')
+              .toString()
+              .trim();
       final waitingCustomer = _toBool(
-        chat['support_waiting_customer'] ?? settings['support_waiting_customer'],
+        chat['support_waiting_customer'] ??
+            settings['support_waiting_customer'],
       );
-      final statusRaw = (chat['support_ticket_status'] ??
-              settings['support_ticket_status'] ??
-              '')
-          .toString();
+      final statusRaw =
+          (chat['support_ticket_status'] ??
+                  settings['support_ticket_status'] ??
+                  '')
+              .toString();
       final statusLabel = messengerSupportStatusLabel(
         statusRaw,
         hasAssignee: assignee.isNotEmpty,
@@ -657,6 +792,27 @@ class _ChatsScreenState extends State<ChatsScreen> {
         label: 'Основной',
         icon: Icons.campaign_outlined,
         tone: _ChatListBadgeTone.primary,
+      );
+    }
+    if (_isSavedMessagesChat(chat)) {
+      return const _ChatListBadgeSpec(
+        label: 'Избранное',
+        icon: Icons.bookmark_border_rounded,
+        tone: _ChatListBadgeTone.primary,
+      );
+    }
+    final requestStatus =
+        (chat['direct_request_status'] ??
+                settings['direct_request_status'] ??
+                '')
+            .toString()
+            .trim()
+            .toLowerCase();
+    if (requestStatus == 'pending') {
+      return const _ChatListBadgeSpec(
+        label: 'Запрос',
+        icon: Icons.mark_email_unread_outlined,
+        tone: _ChatListBadgeTone.secondary,
       );
     }
     if (kind == 'reserved_orders' ||
@@ -745,10 +901,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
       itemCount: 7,
-      itemBuilder: (context, index) => _ChatsSkeletonCard(
-        index: index,
-        theme: theme,
-      ),
+      itemBuilder: (context, index) =>
+          _ChatsSkeletonCard(index: index, theme: theme),
     );
   }
 
@@ -783,9 +937,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   String _peerSubtitle(Map<String, dynamic> peer) {
+    final role = (peer['role'] ?? '').toString().trim();
     final phone = (peer['phone'] ?? '').toString().trim();
-    if (phone.isNotEmpty) return phone;
-    return '';
+    final email = (peer['email'] ?? '').toString().trim();
+    final parts = <String>[
+      if (role.isNotEmpty) role,
+      if (phone.isNotEmpty) phone else if (email.isNotEmpty) email,
+    ];
+    return parts.join(' • ');
   }
 
   Future<void> _openDirectChatDialog() async {
@@ -814,6 +973,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
     );
     if (!mounted) return;
+    _markChatReadLocally(result.chatId, unreadCount: 0);
     _scheduleChatsRefresh(delay: const Duration(milliseconds: 150));
   }
 
@@ -828,10 +988,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
     if (resolvedImageUrl.isEmpty) return;
     final media = MediaQuery.of(context);
     final isCompact = media.size.width < 640;
-    final previewDiameter = math.min(
-      media.size.width - (isCompact ? 36 : 120),
-      media.size.height - (isCompact ? 220 : 260),
-    ).clamp(180.0, isCompact ? 320.0 : 420.0);
+    final previewDiameter = math
+        .min(
+          media.size.width - (isCompact ? 36 : 120),
+          media.size.height - (isCompact ? 220 : 260),
+        )
+        .clamp(180.0, isCompact ? 320.0 : 420.0);
     await showGeneralDialog<void>(
       context: context,
       barrierDismissible: true,
@@ -985,6 +1147,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
         return;
       }
 
+      if (type == 'chat:direct_request_created' ||
+          type == 'chat:direct_request_updated') {
+        _scheduleChatsRefresh(delay: const Duration(milliseconds: 120));
+        return;
+      }
+
       if (type == 'chat:pinned') {
         _scheduleChatsRefresh();
         return;
@@ -1105,7 +1273,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
 
     try {
-      final nextChats = await loadChatsCollection()..sort(_compareChats);
+      final nextChats = await loadChatsCollection()
+        ..sort(_compareChats);
       if (!mounted) return;
       setState(() {
         _chats = nextChats;
@@ -1252,11 +1421,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       ),
                       if (metaChips.isNotEmpty) ...[
                         const SizedBox(height: 6),
-                        Wrap(
-                          spacing: 6,
-                          runSpacing: 6,
-                          children: metaChips,
-                        ),
+                        Wrap(spacing: 6, runSpacing: 6, children: metaChips),
                       ],
                       const SizedBox(height: 10),
                       Row(
@@ -1316,6 +1481,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final lightweightMode = performanceModeNotifier.value;
+    final visibleChats = _visibleChatsForFolder();
     final mainContent = RefreshIndicator(
       onRefresh: _loadChats,
       child: Container(
@@ -1408,13 +1574,48 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   ),
                 ],
               )
-            : ListView.builder(
-                physics: const BouncingScrollPhysics(
-                  parent: AlwaysScrollableScrollPhysics(),
-                ),
-                padding: const EdgeInsets.symmetric(vertical: 10),
-                itemCount: _chats.length,
-                itemBuilder: (context, i) => _buildItem(_chats[i]),
+            : Column(
+                children: [
+                  if (_chats.isNotEmpty) _buildFolderTabs(theme),
+                  Expanded(
+                    child: visibleChats.isEmpty
+                        ? ListView(
+                            physics: const BouncingScrollPhysics(
+                              parent: AlwaysScrollableScrollPhysics(),
+                            ),
+                            padding: const EdgeInsets.fromLTRB(24, 36, 24, 24),
+                            children: [
+                              Center(
+                                child: Text(
+                                  'В этой папке пока нет чатов',
+                                  style: theme.textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Center(
+                                child: Text(
+                                  'Когда здесь появятся подходящие диалоги, они сразу будут показаны в этой вкладке.',
+                                  textAlign: TextAlign.center,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          )
+                        : ListView.builder(
+                            physics: const BouncingScrollPhysics(
+                              parent: AlwaysScrollableScrollPhysics(),
+                            ),
+                            padding: const EdgeInsets.symmetric(vertical: 10),
+                            itemCount: visibleChats.length,
+                            itemBuilder: (context, i) =>
+                                _buildItem(visibleChats[i]),
+                          ),
+                  ),
+                ],
               ),
       ),
     );
@@ -1544,7 +1745,7 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
     if (_isLikelyEmail(value)) return true;
     if (digits.length >= 10) return true;
     if (digits.length >= 4) return true;
-    return value.length >= 3;
+    return value.length >= 2;
   }
 
   int _compareContacts(Map<String, dynamic> a, Map<String, dynamic> b) {
@@ -1725,7 +1926,8 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
     if (!_canStartLookup(query)) {
       setState(() {
         _lookupLoading = false;
-        _lookupMessage = 'Введите минимум 3 символа или полный email/номер';
+        _lookupMessage =
+            'Введите минимум 2 символа имени или полный email/номер';
         _exactCandidate = null;
         _searchCandidates.clear();
         _selectedCandidateId = '';
@@ -1824,7 +2026,7 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
         _lookupLoading = false;
         final errorText = widget.extractDioError(e).trim();
         _lookupMessage = errorText == 'q required'
-            ? 'Введите минимум 3 символа или полный email/номер'
+            ? 'Введите минимум 2 символа имени или полный email/номер'
             : 'Ошибка поиска: $errorText';
         _exactCandidate = null;
         _searchCandidates.clear();
@@ -1924,12 +2126,15 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
       if (chatId.isEmpty) {
         throw Exception('Не удалось открыть чат');
       }
-      final chatTitle = (chat['display_title'] ?? '').toString().trim().isNotEmpty
+      final chatTitle =
+          (chat['display_title'] ?? '').toString().trim().isNotEmpty
           ? (chat['display_title'] ?? '').toString().trim()
           : widget.peerDisplayName(peer);
       final chatSettings = chat['settings'] is Map
           ? Map<String, dynamic>.from(chat['settings'])
           : null;
+      final requestCreated = payload['request_created'] == true;
+      final requestStatus = (payload['request_status'] ?? '').toString().trim();
 
       final peerId = _peerId(peer);
       if (peerId.isNotEmpty && _isInContacts(peer)) {
@@ -1942,6 +2147,12 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
       }
 
       if (!mounted) return;
+      if (requestCreated || requestStatus.toLowerCase() == 'pending') {
+        showGlobalAppNotice(
+          'Создан запрос на переписку. Чат откроется сразу, но новые сообщения пойдут после принятия.',
+          tone: AppNoticeTone.info,
+        );
+      }
       didCloseDialog = true;
       Navigator.of(context).pop(
         _DirectChatOpenResult(
@@ -2114,6 +2325,7 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
     final peerId = _peerId(peer);
     final title = widget.peerDisplayName(peer);
     final subtitle = widget.peerSubtitle(peer);
+    final role = (peer['role'] ?? '').toString().trim();
     final isSelected =
         _selectedCandidateId.isNotEmpty && peerId == _selectedCandidateId;
     final inContacts = _isInContacts(peer);
@@ -2147,9 +2359,26 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
             radius: 18,
           ),
           title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-          subtitle: subtitle.isEmpty
+          subtitle: subtitle.isEmpty && role.isEmpty
               ? null
-              : Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (subtitle.isNotEmpty)
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    if (role.isNotEmpty)
+                      Text(
+                        'Роль: $role',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                  ],
+                ),
           trailing: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -2188,9 +2417,10 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
 
     String helper = '';
     if (query.isEmpty) {
-      helper = 'Введите email, номер или имя для поиска';
+      helper =
+          'Введите имя человека. Email и номер остаются как точный fallback';
     } else if (!canLookup) {
-      helper = 'Введите минимум 3 символа или полный email/номер';
+      helper = 'Введите минимум 2 символа имени или полный email/номер';
     } else if (_lookupLoading) {
       helper = 'Ищем пользователей...';
     } else if (_lookupMessage.isNotEmpty) {
@@ -2368,8 +2598,8 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
               controller: _controller,
               autofocus: true,
               decoration: const InputDecoration(
-                labelText: 'Телефон, email или имя',
-                hintText: 'Например: 7999..., user@mail.com',
+                labelText: 'Имя, email или номер',
+                hintText: 'Например: Ва, Анна, user@mail.com',
                 border: OutlineInputBorder(),
               ),
               onSubmitted: (_) => _openDirectFromSelection(),
@@ -2485,10 +2715,7 @@ class _ChatListBadgeColors {
 }
 
 class _ChatsSkeletonCard extends StatelessWidget {
-  const _ChatsSkeletonCard({
-    required this.index,
-    required this.theme,
-  });
+  const _ChatsSkeletonCard({required this.index, required this.theme});
 
   final int index;
   final ThemeData theme;
@@ -2516,12 +2743,7 @@ class _ChatsSkeletonCard extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
           child: Row(
             children: [
-              _SkeletonBlock(
-                width: 52,
-                height: 52,
-                radius: 26,
-                theme: theme,
-              ),
+              _SkeletonBlock(width: 52, height: 52, radius: 26, theme: theme),
               const SizedBox(width: 14),
               Expanded(
                 child: Column(
@@ -2556,7 +2778,8 @@ class _ChatsSkeletonCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 10),
                     FractionallySizedBox(
-                      widthFactor: subtitleWidths[index % subtitleWidths.length],
+                      widthFactor:
+                          subtitleWidths[index % subtitleWidths.length],
                       child: _SkeletonBlock(
                         width: double.infinity,
                         height: 14,

@@ -56,20 +56,20 @@ void main() {
 
   group('messengerSupport helpers', () {
     test('maps support statuses to user-facing labels', () {
-      expect(messengerSupportStatusLabel('waiting_customer'), 'Ждём клиента');
-      expect(messengerSupportStatusLabel('resolved'), 'Решён');
-      expect(messengerSupportStatusLabel('archived'), 'Архив');
-      expect(messengerSupportStatusLabel('open'), 'Открыт');
+      expect(messengerSupportStatusLabel('waiting_customer'), 'Ждём ваш ответ');
+      expect(messengerSupportStatusLabel('resolved'), 'Решено');
+      expect(messengerSupportStatusLabel('archived'), 'Закрыто');
+      expect(messengerSupportStatusLabel('open'), 'Новая заявка');
     });
 
     test('maps waiting side labels', () {
       expect(
         messengerSupportWaitingLabel(waitingCustomer: true),
-        'Ждём клиента',
+        'Сейчас ждём ваш ответ',
       );
       expect(
         messengerSupportWaitingLabel(waitingCustomer: false),
-        'Ждём сотрудника',
+        'Сейчас ход за поддержкой',
       );
     });
   });
@@ -97,7 +97,11 @@ void main() {
   group('messenger delivery and edits', () {
     test('builds local delivery labels', () {
       expect(
-        messengerLocalDeliveryLabel('uploading', progress: 0.42, retryable: true),
+        messengerLocalDeliveryLabel(
+          'uploading',
+          progress: 0.42,
+          retryable: true,
+        ),
         'Загружается 42%',
       );
       expect(

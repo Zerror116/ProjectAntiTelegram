@@ -182,6 +182,11 @@ class AuthService {
   bool _preferSharedPrefsSecretStore = false;
   bool _loggedSharedPrefsSecretFallback = false;
   bool _postAuthSyncInProgress = false;
+  bool _sessionDegraded = false;
+  String? _sessionDegradedReason;
+
+  bool get isSessionDegraded => _sessionDegraded;
+  String? get sessionDegradedReason => _sessionDegradedReason;
 
   String _normalizeTenantCodeScope(String? value) {
     final normalized = (value ?? '').trim().toLowerCase();
@@ -199,6 +204,41 @@ class AuthService {
       case TargetPlatform.linux:
         return true;
       default:
+        return false;
+    }
+  }
+
+  void _setSessionDegraded(bool value, {String? reason}) {
+    if (_sessionDegraded == value &&
+        (!value || (_sessionDegradedReason ?? '') == (reason ?? ''))) {
+      return;
+    }
+    _sessionDegraded = value;
+    _sessionDegradedReason = value ? (reason ?? 'unknown') : null;
+    if (value) {
+      debugPrint(
+        '⚠️ Auth session switched to degraded mode: $_sessionDegradedReason',
+      );
+    } else {
+      debugPrint('✅ Auth session restored to normal mode');
+    }
+  }
+
+  bool _isTransientNetworkOrServerError(DioException error) {
+    final status = error.response?.statusCode;
+    if (status != null) {
+      return status >= 500 || status == 408;
+    }
+    switch (error.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.connectionError:
+      case DioExceptionType.unknown:
+        return true;
+      case DioExceptionType.badCertificate:
+      case DioExceptionType.cancel:
+      case DioExceptionType.badResponse:
         return false;
     }
   }
@@ -640,6 +680,7 @@ class AuthService {
       '🔐 setSessionTokens called with token: ${_shortToken(accessToken)}..., user: ${user?.email}',
     );
     _cachedToken = accessToken;
+    _setSessionDegraded(false);
     await _saveToken(accessToken);
     if (refreshToken != null && refreshToken.trim().isNotEmpty) {
       await _saveRefreshToken(refreshToken.trim());
@@ -657,7 +698,9 @@ class AuthService {
     final responseTenantCode = (user?.tenantCode ?? '').trim();
     if ((_currentUser?.role.toLowerCase().trim() ?? '') == 'creator') {
       if (responseTenantCode.isNotEmpty) {
-        _creatorTenantScopeCache = _normalizeTenantCodeScope(responseTenantCode);
+        _creatorTenantScopeCache = _normalizeTenantCodeScope(
+          responseTenantCode,
+        );
       }
     } else if (responseTenantCode.isNotEmpty) {
       await setTenantCode(responseTenantCode);
@@ -722,6 +765,7 @@ class AuthService {
       await _removeSecret(_sessionExpiresAtKey);
       await _cleanupLegacyStoredTokenCopies();
       _cachedToken = null;
+      _setSessionDegraded(false);
       _sessionRefreshCompleter = null;
       debugPrint('✅ Auth secrets removed');
 
@@ -931,13 +975,11 @@ class AuthService {
 
   String? get creatorTenantScopeCode =>
       (_creatorTenantScopeCache?.trim().isNotEmpty ?? false)
-          ? _creatorTenantScopeCache?.trim()
-          : (() {
-              final fallback = _normalizeTenantCodeScope(
-                _currentUser?.tenantCode,
-              );
-              return fallback.isEmpty ? null : fallback;
-            })();
+      ? _creatorTenantScopeCache?.trim()
+      : (() {
+          final fallback = _normalizeTenantCodeScope(_currentUser?.tenantCode);
+          return fallback.isEmpty ? null : fallback;
+        })();
 
   User? _withCreatorTenantScope(
     User? user, {
@@ -959,12 +1001,12 @@ class AuthService {
       phoneAccessState: user.phoneAccessState,
       tenantCode: normalizedCode.isEmpty ? null : normalizedCode,
       tenantName: (tenantName ?? '').trim().isEmpty ? null : tenantName?.trim(),
-      tenantStatus:
-          (tenantStatus ?? '').trim().isEmpty ? null : tenantStatus?.trim(),
-      subscriptionExpiresAt:
-          (subscriptionExpiresAt ?? '').trim().isEmpty
-              ? null
-              : subscriptionExpiresAt?.trim(),
+      tenantStatus: (tenantStatus ?? '').trim().isEmpty
+          ? null
+          : tenantStatus?.trim(),
+      subscriptionExpiresAt: (subscriptionExpiresAt ?? '').trim().isEmpty
+          ? null
+          : subscriptionExpiresAt?.trim(),
       permissions: user.permissions,
     );
   }
@@ -992,7 +1034,10 @@ class AuthService {
         );
       }
       if (_creatorTenantScopeCache != null) {
-        await prefs.setString(_creatorTenantScopeKey, _creatorTenantScopeCache!);
+        await prefs.setString(
+          _creatorTenantScopeKey,
+          _creatorTenantScopeCache!,
+        );
       }
       return;
     }
@@ -1055,7 +1100,8 @@ class AuthService {
     final prefs = await SharedPreferences.getInstance();
     await _restoreCreatorTenantScopeFromStorage(prefs, patchCurrentUser: true);
     final fallback = _normalizeTenantCodeScope(_currentUser?.tenantCode);
-    if ((_creatorTenantScopeCache ?? '').trim().isEmpty && fallback.isNotEmpty) {
+    if ((_creatorTenantScopeCache ?? '').trim().isEmpty &&
+        fallback.isNotEmpty) {
       _creatorTenantScopeCache = fallback;
       await prefs.setString(_creatorTenantScopeKey, fallback);
     }
@@ -1129,8 +1175,8 @@ class AuthService {
             tenantId: userMap['tenant_id']?.toString(),
             tenantName: userMap['tenant_name']?.toString(),
             tenantStatus: userMap['tenant_status']?.toString(),
-            subscriptionExpiresAt:
-                userMap['subscription_expires_at']?.toString(),
+            subscriptionExpiresAt: userMap['subscription_expires_at']
+                ?.toString(),
           );
         }
       }
@@ -1576,6 +1622,9 @@ class AuthService {
           completer.complete(false);
           return false;
         }
+        if (_isTransientNetworkOrServerError(e)) {
+          _setSessionDegraded(true, reason: 'refresh_session_transient_error');
+        }
         debugPrint('⚠️ refreshSession warning: $e');
         completer.complete(false);
         return false;
@@ -1656,6 +1705,7 @@ class AuthService {
         }
         final restored = await _restoreLocalSessionFallback(token: latestToken);
         _lastStartupRefreshUsedFallback = restored;
+        _setSessionDegraded(restored, reason: 'startup_refresh_unconfirmed');
         return restored;
       }
       token = await getToken();
@@ -1701,6 +1751,7 @@ class AuthService {
             _authController.add(_currentUser);
           } catch (_) {}
           _schedulePostAuthSync();
+          _setSessionDegraded(false);
           _lastStartupRefreshUsedFallback = false;
           debugPrint(
             '✅ tryRefreshOnStartup -> user restored: ${_currentUser?.email}',
@@ -1719,6 +1770,11 @@ class AuthService {
         await clearToken();
         return false;
       }
+      if (_isTransientNetworkOrServerError(e)) {
+        _setSessionDegraded(true, reason: 'startup_refresh_transient_error');
+      } else {
+        _setSessionDegraded(false);
+      }
       final restored = await _restoreLocalSessionFallback(token: token);
       _lastStartupRefreshUsedFallback = restored;
       if (restored) {
@@ -1730,6 +1786,7 @@ class AuthService {
       }
       return restored;
     } catch (e) {
+      _setSessionDegraded(true, reason: 'startup_refresh_runtime_error');
       final restored = await _restoreLocalSessionFallback(token: token);
       _lastStartupRefreshUsedFallback = restored;
       if (restored) {
