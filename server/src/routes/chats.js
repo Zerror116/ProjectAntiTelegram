@@ -1159,6 +1159,27 @@ async function ensureSavedMessagesChat(client, user) {
   const userId = String(user?.id || "").trim();
   const tenantId = user?.tenant_id || null;
   if (!userId) return null;
+  const userExistsQ = await client.query(
+    `SELECT 1
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId],
+  );
+  if (userExistsQ.rowCount === 0) {
+    if (
+      user?.is_platform_creator === true &&
+      user?.is_creator_tenant_scoped === true
+    ) {
+      if (process.env.NODE_ENV !== "production") {
+        console.info("ensureSavedMessagesChat skipped creator tenant shadow user", {
+          userId,
+          tenantId,
+        });
+      }
+    }
+    return null;
+  }
 
   const existingQ = await client.query(
     `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at
