@@ -6,7 +6,8 @@ const { v4: uuidv4 } = require("uuid");
 const { generateInviteCode, normalizeInviteCode } = require("../utils/tenants");
 
 const router = express.Router();
-const { pool } = require("../db");
+const db = require("../db");
+const { pool } = db;
 const authMiddleware = require("../middleware/requireAuth");
 const requirePermission = require("../middleware/requirePermission");
 const { resolvePermissionSet } = require("../utils/flexibleRoles");
@@ -275,6 +276,15 @@ async function loadUserProfile(userId) {
     phone_status: row.phone_status || null,
     phone_verified_at: row.phone_verified_at || null,
   };
+}
+
+async function loadUserProfileForRequest(user) {
+  const normalizedUserId = String(user?.id || "").trim();
+  if (!normalizedUserId) return null;
+  const scopedProfile = await loadUserProfile(normalizedUserId);
+  if (scopedProfile) return scopedProfile;
+  if (user?.is_platform_creator !== true) return null;
+  return db.runWithPlatform(async () => await loadUserProfile(normalizedUserId));
 }
 
 function toNumber(value) {
@@ -1071,7 +1081,7 @@ async function loadRoleStats(userId, role, tenantId = null) {
 
 router.get("/", authMiddleware, async (req, res) => {
   try {
-    const user = await loadUserProfile(req.user.id);
+    const user = await loadUserProfileForRequest(req.user);
     const stats = await loadRoleStats(
       req.user.id,
       req.user.role,

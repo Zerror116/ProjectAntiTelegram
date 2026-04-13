@@ -7,7 +7,7 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "address-gateway": "node scripts/address-provider-gateway.js",
-    "lint": "echo \"no lint configured\"",
+    "lint": "eslint src scripts --ext .js --max-warnings=0",
     "test:critical": "node scripts/critical-integration.js",
     "test:critical:admin": "E2E_STRICT_ADMIN=1 node scripts/critical-integration.js",
     "test:phone-access:e2e": "node scripts/e2e-phone-access-flow.js",
@@ -43,6 +43,7 @@
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "eslint": "^8.57.1",
     "nodemon": "^3.0.1"
   },
   "overrides": {

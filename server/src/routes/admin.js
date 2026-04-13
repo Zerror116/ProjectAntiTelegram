@@ -3901,165 +3901,128 @@ router.post(
       ).trim();
 
       for (const row of rows) {
-        let code = await resolveUniqueProductCodeForPublish(
-          client,
-          row.product_code,
-          row.product_id,
-          req.user?.tenant_id || null,
-        );
-
-        const payload =
-          row.payload &&
-          typeof row.payload === "object" &&
-          !Array.isArray(row.payload)
-            ? row.payload
-            : {};
-
-        const nextTitle = String(payload.title || row.title || "").trim();
-        const nextDescription = String(
-          payload.description || row.description || "",
-        ).trim();
-        if (!nextTitle) {
-          skipped.push({
-            queue_id: row.id,
-            reason: "Пустое название товара",
-          });
-          continue;
-        }
-
-        const rawNextPrice = Number(payload.price ?? row.price ?? 0);
-        const fallbackPrice = Number(row.price ?? 0);
-        const nextPrice = Number.isFinite(rawNextPrice) && rawNextPrice > 0
-          ? rawNextPrice
-          : (Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : 0);
-
-        const rawNextQuantity = Number(payload.quantity ?? row.quantity ?? 1);
-        const fallbackQuantity = Number(row.quantity ?? 1);
-        const nextQuantity = Number.isFinite(rawNextQuantity) && rawNextQuantity > 0
-          ? Math.floor(rawNextQuantity)
-          : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
-            ? Math.floor(fallbackQuantity)
-            : 1);
-        if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
-          skipped.push({
-            queue_id: row.id,
-            reason: "Цена товара должна быть больше нуля",
-          });
-          continue;
-        }
-        const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 0);
-        const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
-          ? Math.floor(rawNextShelf)
-          : await resolveAutoShelfNumber(
-              client,
-              req.user?.tenant_id || null,
-              null,
-              1,
-            );
-        const nextImageUrl = payload.image_url || row.image_url || null;
-
-        let productUpdate = null;
-        for (let attempt = 0; attempt < 6; attempt += 1) {
-          try {
-            productUpdate = await client.query(
-              `UPDATE products
-             SET product_code = $1,
-                 title = $2,
-                 description = $3,
-                 price = $4,
-                 quantity = $5,
-                 shelf_number = $6,
-                 image_url = $7,
-                 status = 'published',
-                 reusable_at = NULL,
-                 updated_at = now()
-             WHERE id = $8
-             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
-              [
-                code,
-                nextTitle,
-                nextDescription,
-                nextPrice,
-                nextQuantity,
-                nextShelfNumber,
-                nextImageUrl,
-                row.product_id,
-              ],
-            );
-            break;
-          } catch (err) {
-            if (!isProductCodeConflictError(err) || attempt >= 5) {
-              throw err;
-            }
-            code = await allocateProductCode(client, null);
-          }
-        }
-        if (productUpdate.rowCount === 0) {
-          skipped.push({
-            queue_id: row.id,
-            reason: "Товар не найден",
-          });
-          continue;
-        }
-        const product = productUpdate.rows[0];
-
-        const messageMeta = {
-          kind: "catalog_product",
-          product_id: product.id,
-          product_code: product.product_code,
-          product_label: formatProductLabel(
-            product.product_code,
-            product.shelf_number,
-          ),
-          price: Number(product.price),
-          quantity: Number(product.quantity),
-          shelf_number: Number(product.shelf_number),
-          image_url: product.image_url,
-        };
-
-        const messageInsert = await client.query(
-          `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-         VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
-         RETURNING id, chat_id, sender_id, text, meta, created_at`,
-          [
-            uuidv4(),
-            row.channel_id,
-            encryptMessageText(productMessageText(product)),
-            JSON.stringify(messageMeta),
-          ],
-        );
-        const message = messageInsert.rows[0];
-
-        const shouldHidePrevious =
-          payload?.hide_old_versions === true ||
-          String(payload?.hide_old_versions || '').toLowerCase().trim() ===
-            'true';
-        const sourceMessageId = String(payload?.source_message_id || '').trim();
-        if (
-          shouldHidePrevious &&
-          isUuidLike(sourceMessageId) &&
-          sourceMessageId !== String(message.id)
-        ) {
-          const hiddenQ = await client.query(
-            `UPDATE messages
-             SET meta = jsonb_set(
-                   COALESCE(meta, '{}'::jsonb),
-                   '{hidden_for_all}',
-                   'true'::jsonb,
-                   true
-                 )
-             WHERE id = $1
-               AND chat_id = $2
-               AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
-             RETURNING id, chat_id, sender_id, text, meta, created_at`,
-            [sourceMessageId, row.channel_id],
+        await client.query("SAVEPOINT publish_pending_item");
+        let errorStage = "payload_prepare";
+        try {
+          const itemArchivePublished = [];
+          const itemHiddenRevisionMessages = [];
+          let code = await resolveUniqueProductCodeForPublish(
+            client,
+            row.product_code,
+            row.product_id,
+            req.user?.tenant_id || null,
           );
-          hiddenRevisionMessages.push(...hiddenQ.rows);
-        }
 
-        if (postsArchiveChannelId) {
-          const archiveMeta = {
-            kind: "catalog_product_archive",
+          const payload =
+            row.payload &&
+            typeof row.payload === "object" &&
+            !Array.isArray(row.payload)
+              ? row.payload
+              : {};
+
+          const nextTitle = String(payload.title || row.title || "").trim();
+          const nextDescription = String(
+            payload.description || row.description || "",
+          ).trim();
+          if (!nextTitle) {
+            skipped.push({
+              queue_id: row.id,
+              error_code: "publish_validation_title_empty",
+              error_stage: "validate_payload",
+              error_message: "Пустое название товара",
+              reason: "Пустое название товара",
+            });
+            await client.query("RELEASE SAVEPOINT publish_pending_item");
+            continue;
+          }
+
+          const rawNextPrice = Number(payload.price ?? row.price ?? 0);
+          const fallbackPrice = Number(row.price ?? 0);
+          const nextPrice = Number.isFinite(rawNextPrice) && rawNextPrice > 0
+            ? rawNextPrice
+            : (Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : 0);
+
+          const rawNextQuantity = Number(payload.quantity ?? row.quantity ?? 1);
+          const fallbackQuantity = Number(row.quantity ?? 1);
+          const nextQuantity = Number.isFinite(rawNextQuantity) && rawNextQuantity > 0
+            ? Math.floor(rawNextQuantity)
+            : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
+              ? Math.floor(fallbackQuantity)
+              : 1);
+          if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+            skipped.push({
+              queue_id: row.id,
+              error_code: "publish_validation_price_invalid",
+              error_stage: "validate_payload",
+              error_message: "Цена товара должна быть больше нуля",
+              reason: "Цена товара должна быть больше нуля",
+            });
+            await client.query("RELEASE SAVEPOINT publish_pending_item");
+            continue;
+          }
+          const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 0);
+          const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
+            ? Math.floor(rawNextShelf)
+            : await resolveAutoShelfNumber(
+                client,
+                req.user?.tenant_id || null,
+                null,
+                1,
+              );
+          const nextImageUrl = payload.image_url || row.image_url || null;
+
+          errorStage = "product_update";
+          let productUpdate = null;
+          for (let attempt = 0; attempt < 6; attempt += 1) {
+            try {
+              productUpdate = await client.query(
+                `UPDATE products
+               SET product_code = $1,
+                   title = $2,
+                   description = $3,
+                   price = $4,
+                   quantity = $5,
+                   shelf_number = $6,
+                   image_url = $7,
+                   status = 'published',
+                   reusable_at = NULL,
+                   updated_at = now()
+               WHERE id = $8
+               RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
+                [
+                  code,
+                  nextTitle,
+                  nextDescription,
+                  nextPrice,
+                  nextQuantity,
+                  nextShelfNumber,
+                  nextImageUrl,
+                  row.product_id,
+                ],
+              );
+              break;
+            } catch (err) {
+              if (!isProductCodeConflictError(err) || attempt >= 5) {
+                throw err;
+              }
+              code = await allocateProductCode(client, null);
+            }
+          }
+          if (productUpdate.rowCount === 0) {
+            skipped.push({
+              queue_id: row.id,
+              error_code: "publish_product_not_found",
+              error_stage: errorStage,
+              error_message: "Товар не найден",
+              reason: "Товар не найден",
+            });
+            await client.query("RELEASE SAVEPOINT publish_pending_item");
+            continue;
+          }
+          const product = productUpdate.rows[0];
+
+          const messageMeta = {
+            kind: "catalog_product",
             product_id: product.id,
             product_code: product.product_code,
             product_label: formatProductLabel(
@@ -4070,77 +4033,170 @@ router.post(
             quantity: Number(product.quantity),
             shelf_number: Number(product.shelf_number),
             image_url: product.image_url,
-            source_channel_id: row.channel_id,
-            source_channel_title: row.channel_title,
-            source_message_id: message.id,
-            queued_by: row.queued_by,
-            queued_by_name: row.queued_by_name || null,
-            queued_by_email: row.queued_by_email || null,
-            queued_by_phone: row.queued_by_phone || null,
           };
-          const archiveMessageInsert = await client.query(
+
+          errorStage = "message_insert";
+          const messageInsert = await client.query(
             `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-             VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
-             RETURNING id`,
+           VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
             [
               uuidv4(),
-              postsArchiveChannelId,
-              encryptMessageText(
-                archivedProductMessageText({
-                  product,
-                  sourceChannelTitle: row.channel_title,
-                  queuedByName: row.queued_by_name,
-                  queuedByEmail: row.queued_by_email,
-                  queuedByPhone: row.queued_by_phone,
-                }),
-              ),
-              JSON.stringify(archiveMeta),
+              row.channel_id,
+              encryptMessageText(productMessageText(product)),
+              JSON.stringify(messageMeta),
             ],
           );
-          const archiveMessageId = String(
-            archiveMessageInsert.rows[0]?.id || "",
-          ).trim();
+          const message = messageInsert.rows[0];
+
+          const shouldHidePrevious =
+            payload?.hide_old_versions === true ||
+            String(payload?.hide_old_versions || '').toLowerCase().trim() ===
+              'true';
+          const sourceMessageId = String(payload?.source_message_id || '').trim();
+          if (
+            shouldHidePrevious &&
+            isUuidLike(sourceMessageId) &&
+            sourceMessageId !== String(message.id)
+          ) {
+            errorStage = "hide_old_versions";
+            const hiddenQ = await client.query(
+              `UPDATE messages
+               SET meta = jsonb_set(
+                     COALESCE(meta, '{}'::jsonb),
+                     '{hidden_for_all}',
+                     'true'::jsonb,
+                     true
+                   )
+               WHERE id = $1
+                 AND chat_id = $2
+                 AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+               RETURNING id, chat_id, sender_id, text, meta, created_at`,
+              [sourceMessageId, row.channel_id],
+            );
+            itemHiddenRevisionMessages.push(...hiddenQ.rows);
+          }
+
+          if (postsArchiveChannelId) {
+            errorStage = "archive_insert";
+            const archiveMeta = {
+              kind: "catalog_product_archive",
+              product_id: product.id,
+              product_code: product.product_code,
+              product_label: formatProductLabel(
+                product.product_code,
+                product.shelf_number,
+              ),
+              price: Number(product.price),
+              quantity: Number(product.quantity),
+              shelf_number: Number(product.shelf_number),
+              image_url: product.image_url,
+              source_channel_id: row.channel_id,
+              source_channel_title: row.channel_title,
+              source_message_id: message.id,
+              queued_by: row.queued_by,
+              queued_by_name: row.queued_by_name || null,
+              queued_by_email: row.queued_by_email || null,
+              queued_by_phone: row.queued_by_phone || null,
+            };
+            const archiveMessageInsert = await client.query(
+              `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+               VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
+               RETURNING id`,
+              [
+                uuidv4(),
+                postsArchiveChannelId,
+                encryptMessageText(
+                  archivedProductMessageText({
+                    product,
+                    sourceChannelTitle: row.channel_title,
+                    queuedByName: row.queued_by_name,
+                    queuedByEmail: row.queued_by_email,
+                    queuedByPhone: row.queued_by_phone,
+                  }),
+                ),
+                JSON.stringify(archiveMeta),
+              ],
+            );
+            const archiveMessageId = String(
+              archiveMessageInsert.rows[0]?.id || "",
+            ).trim();
+            await client.query(
+              "UPDATE chats SET updated_at = now() WHERE id = $1",
+              [postsArchiveChannelId],
+            );
+            if (archiveMessageId) {
+              itemArchivePublished.push({
+                channel_id: postsArchiveChannelId,
+                message_id: archiveMessageId,
+              });
+            }
+          }
+
+          errorStage = "queue_mark_published";
+          await client.query(
+            `UPDATE product_publication_queue
+           SET status = 'published',
+               is_sent = true,
+               approved_by = $1,
+               approved_at = now(),
+               published_message_id = $2
+           WHERE id = $3`,
+            [req.user.id, message.id, row.id],
+          );
+
+          errorStage = "channel_touch";
           await client.query(
             "UPDATE chats SET updated_at = now() WHERE id = $1",
-            [postsArchiveChannelId],
+            [row.channel_id],
           );
-          if (archiveMessageId) {
-            archivePublished.push({
-              channel_id: postsArchiveChannelId,
-              message_id: archiveMessageId,
-            });
+
+          published.push({
+            queue_id: row.id,
+            channel_id: row.channel_id,
+            channel_title: row.channel_title,
+            product_id: product.id,
+            product_code: product.product_code,
+            product_label: formatProductLabel(
+              product.product_code,
+              product.shelf_number,
+            ),
+            shelf_number: Number(product.shelf_number),
+            message_id: message.id,
+          });
+          archivePublished.push(...itemArchivePublished);
+          hiddenRevisionMessages.push(...itemHiddenRevisionMessages);
+
+          await client.query("RELEASE SAVEPOINT publish_pending_item");
+        } catch (itemErr) {
+          try {
+            await client.query("ROLLBACK TO SAVEPOINT publish_pending_item");
+            await client.query("RELEASE SAVEPOINT publish_pending_item");
+          } catch (savepointErr) {
+            console.error(
+              "admin.channels.publish_pending savepoint rollback error",
+              savepointErr,
+            );
+            throw savepointErr;
           }
+          const errorCode = String(itemErr?.code || "publish_item_failed");
+          const errorMessage = String(
+            itemErr?.message || "Ошибка публикации элемента очереди",
+          ).trim();
+          skipped.push({
+            queue_id: row.id,
+            error_code: errorCode,
+            error_stage: errorStage,
+            error_message: errorMessage,
+            reason: errorMessage,
+          });
+          console.error("admin.channels.publish_pending item error", {
+            queue_id: row.id,
+            error_code: errorCode,
+            error_stage: errorStage,
+            error_message: errorMessage,
+          });
         }
-
-        await client.query(
-          `UPDATE product_publication_queue
-         SET status = 'published',
-             is_sent = true,
-             approved_by = $1,
-             approved_at = now(),
-             published_message_id = $2
-         WHERE id = $3`,
-          [req.user.id, message.id, row.id],
-        );
-
-        await client.query(
-          "UPDATE chats SET updated_at = now() WHERE id = $1",
-          [row.channel_id],
-        );
-
-        published.push({
-          queue_id: row.id,
-          channel_id: row.channel_id,
-          channel_title: row.channel_title,
-          product_id: product.id,
-          product_code: product.product_code,
-          product_label: formatProductLabel(
-            product.product_code,
-            product.shelf_number,
-          ),
-          shelf_number: Number(product.shelf_number),
-          message_id: message.id,
-        });
       }
 
       await client.query("COMMIT");
@@ -4173,6 +4229,7 @@ router.post(
       return res.json({
         ok: true,
         published_count: published.length,
+        failed_count: skipped.length,
         skipped_count: skipped.length,
         skipped,
         data: published,

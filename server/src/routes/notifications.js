@@ -2,6 +2,7 @@ const express = require("express");
 
 const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
+const db = require("../db");
 const {
   canAccessNotificationInbox,
   getNotificationPreferencesForUser,
@@ -23,9 +24,18 @@ function isCreatorBase(user) {
   return String(user?.role || "").toLowerCase().trim() === "creator";
 }
 
+async function runNotificationsInEffectiveScope(req, fn) {
+  if (req.user?.is_platform_creator === true) {
+    return db.runWithPlatform(fn);
+  }
+  return fn();
+}
+
 router.get("/preferences", requireAuth, async (req, res) => {
   try {
-    const data = await getNotificationPreferencesForUser(req.user);
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      getNotificationPreferencesForUser(req.user),
+    );
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("notifications.preferences.get error", err);
@@ -35,10 +45,12 @@ router.get("/preferences", requireAuth, async (req, res) => {
 
 router.patch("/preferences", requireAuth, async (req, res) => {
   try {
-    const data = await upsertNotificationPreferences({
-      user: req.user,
-      patch: req.body || {},
-    });
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      upsertNotificationPreferences({
+        user: req.user,
+        patch: req.body || {},
+      }),
+    );
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("notifications.preferences.patch error", err);
@@ -51,12 +63,14 @@ router.get("/inbox", requireAuth, async (req, res) => {
     if (!canAccessNotificationInbox(req.user)) {
       return res.status(403).json({ ok: false, error: "Раздел событий доступен только создателю" });
     }
-    const data = await listNotificationInbox({
-      userId: req.user.id,
-      limit: req.query?.limit,
-      unreadOnly: String(req.query?.status || "").trim().toLowerCase() === "unread",
-      category: req.query?.category || "",
-    });
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      listNotificationInbox({
+        userId: req.user.id,
+        limit: req.query?.limit,
+        unreadOnly: String(req.query?.status || "").trim().toLowerCase() === "unread",
+        category: req.query?.category || "",
+      }),
+    );
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("notifications.inbox.get error", err);
@@ -73,10 +87,12 @@ router.post("/inbox/:id/read", requireAuth, async (req, res) => {
     if (!itemId) {
       return res.status(400).json({ ok: false, error: "id обязателен" });
     }
-    const data = await markNotificationInboxItemRead({
-      userId: req.user.id,
-      itemId,
-    });
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      markNotificationInboxItemRead({
+        userId: req.user.id,
+        itemId,
+      }),
+    );
     if (!data) {
       return res.status(404).json({ ok: false, error: "Уведомление не найдено" });
     }
@@ -93,10 +109,12 @@ router.post("/inbox/:id/opened", requireAuth, async (req, res) => {
     if (!itemId) {
       return res.status(400).json({ ok: false, error: "id обязателен" });
     }
-    const data = await markNotificationInboxItemOpened({
-      userId: req.user.id,
-      itemId,
-    });
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      markNotificationInboxItemOpened({
+        userId: req.user.id,
+        itemId,
+      }),
+    );
     if (!data) {
       return res.status(404).json({ ok: false, error: "Уведомление не найдено" });
     }
@@ -112,9 +130,11 @@ router.post("/inbox/read-all", requireAuth, async (req, res) => {
     if (!canAccessNotificationInbox(req.user)) {
       return res.status(403).json({ ok: false, error: "Раздел событий доступен только создателю" });
     }
-    const unreadCount = await markAllNotificationInboxItemsRead({
-      userId: req.user.id,
-    });
+    const unreadCount = await runNotificationsInEffectiveScope(req, async () =>
+      markAllNotificationInboxItemsRead({
+        userId: req.user.id,
+      }),
+    );
     return res.json({ ok: true, data: { unread_count: unreadCount } });
   } catch (err) {
     console.error("notifications.inbox.readAll error", err);
@@ -124,9 +144,13 @@ router.post("/inbox/read-all", requireAuth, async (req, res) => {
 
 router.get("/badge-count", requireAuth, async (req, res) => {
   try {
-    const unreadCount = await computeNotificationBadgeCount(req.user.id);
-    const inboxUnreadCount = await computeNotificationInboxBadgeCount(
-      req.user.id,
+    const [unreadCount, inboxUnreadCount] = await runNotificationsInEffectiveScope(
+      req,
+      async () =>
+        Promise.all([
+          computeNotificationBadgeCount(req.user.id),
+          computeNotificationInboxBadgeCount(req.user.id),
+        ]),
     );
     return res.json({
       ok: true,
@@ -141,22 +165,24 @@ router.get("/badge-count", requireAuth, async (req, res) => {
 
 router.post("/endpoints/register", requireAuth, async (req, res) => {
   try {
-    const data = await upsertNotificationEndpoint({
-      user: req.user,
-      platform: req.body?.platform,
-      transport: req.body?.transport,
-      deviceKey: req.body?.device_key,
-      pushToken: req.body?.push_token,
-      endpoint: req.body?.endpoint,
-      subscription: req.body?.subscription,
-      permissionState: req.body?.permission_state,
-      capabilities: req.body?.capabilities,
-      appVersion: req.body?.app_version,
-      locale: req.body?.locale,
-      timezone: req.body?.timezone,
-      userAgent: req.headers["user-agent"] || req.body?.user_agent || "",
-      testOnly: req.body?.test_only === true,
-    });
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      upsertNotificationEndpoint({
+        user: req.user,
+        platform: req.body?.platform,
+        transport: req.body?.transport,
+        deviceKey: req.body?.device_key,
+        pushToken: req.body?.push_token,
+        endpoint: req.body?.endpoint,
+        subscription: req.body?.subscription,
+        permissionState: req.body?.permission_state,
+        capabilities: req.body?.capabilities,
+        appVersion: req.body?.app_version,
+        locale: req.body?.locale,
+        timezone: req.body?.timezone,
+        userAgent: req.headers["user-agent"] || req.body?.user_agent || "",
+        testOnly: req.body?.test_only === true,
+      }),
+    );
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("notifications.endpoints.register error", err);
@@ -166,22 +192,24 @@ router.post("/endpoints/register", requireAuth, async (req, res) => {
 
 router.post("/endpoints/refresh", requireAuth, async (req, res) => {
   try {
-    const data = await upsertNotificationEndpoint({
-      user: req.user,
-      platform: req.body?.platform,
-      transport: req.body?.transport,
-      deviceKey: req.body?.device_key,
-      pushToken: req.body?.push_token,
-      endpoint: req.body?.endpoint,
-      subscription: req.body?.subscription,
-      permissionState: req.body?.permission_state,
-      capabilities: req.body?.capabilities,
-      appVersion: req.body?.app_version,
-      locale: req.body?.locale,
-      timezone: req.body?.timezone,
-      userAgent: req.headers["user-agent"] || req.body?.user_agent || "",
-      testOnly: req.body?.test_only === true,
-    });
+    const data = await runNotificationsInEffectiveScope(req, async () =>
+      upsertNotificationEndpoint({
+        user: req.user,
+        platform: req.body?.platform,
+        transport: req.body?.transport,
+        deviceKey: req.body?.device_key,
+        pushToken: req.body?.push_token,
+        endpoint: req.body?.endpoint,
+        subscription: req.body?.subscription,
+        permissionState: req.body?.permission_state,
+        capabilities: req.body?.capabilities,
+        appVersion: req.body?.app_version,
+        locale: req.body?.locale,
+        timezone: req.body?.timezone,
+        userAgent: req.headers["user-agent"] || req.body?.user_agent || "",
+        testOnly: req.body?.test_only === true,
+      }),
+    );
     return res.json({ ok: true, data });
   } catch (err) {
     console.error("notifications.endpoints.refresh error", err);
@@ -191,13 +219,15 @@ router.post("/endpoints/refresh", requireAuth, async (req, res) => {
 
 router.post("/endpoints/unregister", requireAuth, async (req, res) => {
   try {
-    const ok = await deactivateNotificationEndpoint({
-      userId: req.user.id,
-      endpoint: req.body?.endpoint,
-      pushToken: req.body?.push_token,
-      deviceKey: req.body?.device_key,
-      transport: req.body?.transport,
-    });
+    const ok = await runNotificationsInEffectiveScope(req, async () =>
+      deactivateNotificationEndpoint({
+        userId: req.user.id,
+        endpoint: req.body?.endpoint,
+        pushToken: req.body?.push_token,
+        deviceKey: req.body?.device_key,
+        transport: req.body?.transport,
+      }),
+    );
     return res.json({ ok: true, data: { deactivated: ok } });
   } catch (err) {
     console.error("notifications.endpoints.unregister error", err);

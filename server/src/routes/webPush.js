@@ -1,6 +1,7 @@
 const express = require("express");
 
 const { authMiddleware } = require("../utils/auth");
+const db = require("../db");
 const {
   isWebPushEnabled,
   getWebPushPublicKey,
@@ -14,6 +15,13 @@ const {
 
 const router = express.Router();
 
+async function runWebPushInEffectiveScope(req, fn) {
+  if (req.user?.is_platform_creator === true) {
+    return db.runWithPlatform(fn);
+  }
+  return fn();
+}
+
 router.get("/config", authMiddleware, async (req, res) => {
   return res.json({
     ok: true,
@@ -24,7 +32,9 @@ router.get("/config", authMiddleware, async (req, res) => {
 
 router.get("/badge-count", authMiddleware, async (req, res) => {
   try {
-    const count = await computeNotificationInboxBadgeCount(req.user.id);
+    const count = await runWebPushInEffectiveScope(req, async () =>
+      computeNotificationInboxBadgeCount(req.user.id),
+    );
     return res.json({ ok: true, unread_count: count });
   } catch (err) {
     console.error("webPush.badgeCount error", err);
@@ -37,12 +47,14 @@ router.post("/subscriptions", authMiddleware, async (req, res) => {
     return res.status(503).json({ error: "Web push не настроен на сервере" });
   }
   try {
-    const normalized = await upsertWebPushSubscription({
-      userId: req.user.id,
-      tenantId: req.user?.tenant_id || null,
-      subscription: req.body?.subscription || req.body,
-      userAgent: req.headers["user-agent"] || "",
-    });
+    const normalized = await runWebPushInEffectiveScope(req, async () =>
+      upsertWebPushSubscription({
+        userId: req.user.id,
+        tenantId: req.user?.tenant_id || null,
+        subscription: req.body?.subscription || req.body,
+        userAgent: req.headers["user-agent"] || "",
+      }),
+    );
     return res.json({
       ok: true,
       endpoint: normalized.endpoint,
@@ -62,7 +74,9 @@ router.post("/test", authMiddleware, async (req, res) => {
     return res.status(503).json({ error: "Web push не настроен на сервере" });
   }
   try {
-    const sent = await sendTestWebPushToUser(req.user.id);
+    const sent = await runWebPushInEffectiveScope(req, async () =>
+      sendTestWebPushToUser(req.user.id),
+    );
     return res.json({ ok: true, sent });
   } catch (err) {
     console.error("webPush.test error", err);
@@ -78,10 +92,12 @@ router.delete("/subscriptions", authMiddleware, async (req, res) => {
     if (!endpoint) {
       return res.status(400).json({ error: "endpoint обязателен" });
     }
-    await removeWebPushSubscription({
-      userId: req.user.id,
-      endpoint,
-    });
+    await runWebPushInEffectiveScope(req, async () =>
+      removeWebPushSubscription({
+        userId: req.user.id,
+        endpoint,
+      }),
+    );
     return res.json({ ok: true });
   } catch (err) {
     console.error("webPush.unsubscribe error", err);

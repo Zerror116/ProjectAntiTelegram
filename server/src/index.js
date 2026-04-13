@@ -48,6 +48,7 @@ const supportRoutes = require("./routes/support");
 const appUpdateRoutes = require("./routes/appUpdate");
 const webPushRoutes = require("./routes/webPush");
 const notificationsRoutes = require("./routes/notifications");
+const messengerRoutes = require("./routes/messenger");
 const adminNotificationsRoutes = require("./routes/adminNotifications");
 const { runNotificationDigestSweep } = require("./utils/notifications");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
@@ -509,6 +510,7 @@ app.get("/download/android", (req, res) => {
 });
 app.use("/api/web-push", webPushRoutes);
 app.use("/api/notifications", notificationsRoutes);
+app.use("/api/messenger", messengerRoutes);
 app.use("/api/admin/notifications", adminNotificationsRoutes);
 app.use("/api/creator/notifications", adminNotificationsRoutes);
 
@@ -666,13 +668,21 @@ async function canUserAccessChat(user, chatId) {
   if (chatQ.rowCount === 0) return false;
 
   const chat = chatQ.rows[0];
-  if (chat.type === "channel") {
-    const settings =
-      chat.settings &&
-      typeof chat.settings === "object" &&
-      !Array.isArray(chat.settings)
+  const settings =
+    chat.settings &&
+    typeof chat.settings === "object" &&
+    !Array.isArray(chat.settings)
       ? chat.settings
       : {};
+  if (chat.type === "private") {
+    const directRequestStatus = String(settings.direct_request_status || "")
+      .toLowerCase()
+      .trim();
+    if (directRequestStatus === "declined") {
+      return false;
+    }
+  }
+  if (chat.type === "channel") {
     const blacklistedUserIds = Array.isArray(settings.blacklisted_user_ids)
       ? settings.blacklisted_user_ids
           .map((v) => String(v || "").trim())
@@ -734,6 +744,33 @@ async function canUserAccessChat(user, chatId) {
     [chatId, userId],
   );
   return memberQ.rowCount > 0;
+}
+
+async function canEmitChatActivity(user, chatId) {
+  const userId = user?.id;
+  const tenantId = user?.tenant_id || null;
+  if (!userId || !chatId) return false;
+  const chatQ = await db.query(
+    `SELECT id, type, settings
+     FROM chats
+     WHERE id = $1
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+     LIMIT 1`,
+    [chatId, tenantId],
+  );
+  if (chatQ.rowCount === 0) return false;
+  const chat = chatQ.rows[0];
+  const settings =
+    chat.settings &&
+    typeof chat.settings === "object" &&
+    !Array.isArray(chat.settings)
+      ? chat.settings
+      : {};
+  const kind = String(settings.kind || "").toLowerCase().trim();
+  if (chat.type !== "private") return false;
+  if (kind !== "direct_message") return false;
+  if (settings.saved_messages === true) return false;
+  return canUserAccessChat(user, chatId);
 }
 
 // ===================================
@@ -921,6 +958,37 @@ async function canUserAccessChat(user, chatId) {
           console.error(`Socket ${sid} leave_chat error:`, err);
         }
       });
+
+      const relayChatActivity = (eventName) => {
+        socket.on(eventName, async (payload) => {
+          try {
+            await runInSocketTenantContext(async () => {
+              const map =
+                payload && typeof payload === "object" && !Array.isArray(payload)
+                  ? payload
+                  : {};
+              const chatId = String(map.chat_id || map.chatId || "").trim();
+              if (!chatId || !uid) return;
+              const allowed = await canEmitChatActivity(socket.user, chatId);
+              if (!allowed) return;
+              socket.to(`chat:${chatId}`).emit(eventName, {
+                chat_id: chatId,
+                chatId,
+                user_id: uid,
+                userId: uid,
+                ttl_ms: 4500,
+                sent_at: new Date().toISOString(),
+              });
+            });
+          } catch (err) {
+            console.error(`Socket ${sid} ${eventName} error:`, err);
+          }
+        });
+      };
+
+      relayChatActivity("chat:typing");
+      relayChatActivity("chat:recording_voice");
+      relayChatActivity("chat:recording_video");
 
       // ✅ ИСПРАВЛЕНИЕ: Обработка отключения с логированием
       socket.on("disconnect", (reason) => {
