@@ -1282,8 +1282,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       _stickToBottom = nearBottom && !_manualBottomLockSuppressed;
     }
-    if (_unreadCount > 0 &&
-        (nearBottom || (_isReservedOrdersChat() && _initialViewportReady))) {
+    if (_unreadCount > 0 && _initialViewportReady) {
       _scheduleReadSync();
     }
     final shouldShow = _initialViewportReady && !nearBottom;
@@ -1607,7 +1606,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || _initialViewportReady) return;
     _initialViewportFailsafeTimer?.cancel();
     setState(() => _initialViewportReady = true);
-    if (_isNearBottom() || (_isReservedOrdersChat() && _unreadCount > 0)) {
+    if (_unreadCount > 0) {
       _scheduleReadSync();
     }
   }
@@ -2460,11 +2459,15 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _markChatAsRead({bool flushOnExit = false}) async {
     final reservedOrdersChat = _isReservedOrdersChat();
     if (!_initialViewportReady && !flushOnExit) return;
-    if (!reservedOrdersChat && !_isNearBottom() && !flushOnExit) return;
     if (_messages.isEmpty) return;
     final visibleUntilMessageId = reservedOrdersChat
         ? ''
-        : (_newestLoadedMessageId ?? '').trim();
+        : ((_isNearBottom()
+                      ? _newestLoadedMessageId
+                      : _lastVisibleMessageId()) ??
+                  _newestLoadedMessageId ??
+                  '')
+              .trim();
     if (!reservedOrdersChat && visibleUntilMessageId.isEmpty) return;
     final payload = reservedOrdersChat
         ? const <String, dynamic>{}

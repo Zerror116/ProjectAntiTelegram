@@ -187,6 +187,8 @@ class PhoenixCropCore extends StatefulWidget {
     this.height = 320,
     this.width,
     this.showGrid = false,
+    this.edgeHandleTopBottomTouchTarget = 30,
+    this.edgeHandleSideTouchTarget = 44,
   });
 
   final Uint8List imageBytes;
@@ -198,6 +200,8 @@ class PhoenixCropCore extends StatefulWidget {
   final double height;
   final double? width;
   final bool showGrid;
+  final double edgeHandleTopBottomTouchTarget;
+  final double edgeHandleSideTouchTarget;
 
   @override
   State<PhoenixCropCore> createState() => _PhoenixCropCoreState();
@@ -205,39 +209,122 @@ class PhoenixCropCore extends StatefulWidget {
 
 class _PhoenixCropCoreState extends State<PhoenixCropCore> {
   static const double _minCropExtent = 72;
-  static const double _edgeHandleLength = 36;
-  static const double _edgeHandleThickness = 8;
-  static const double _edgeHandleTouchTarget = 30;
+  static const double _edgeHandleVisualLength = 36;
+  static const double _edgeHandleVisualThickness = 8;
 
   Rect _cropRect = Rect.zero;
   Rect _imageRect = Rect.zero;
+  Rect? _lastValidCropRect;
+  Rect? _lastValidImageRect;
+
+  Rect get _displayCropRect =>
+      _isStableRect(_cropRect) ? _cropRect : (_lastValidCropRect ?? Rect.zero);
+
+  Rect get _displayImageRect => _isStableRect(_imageRect)
+      ? _imageRect
+      : (_lastValidImageRect ?? Rect.zero);
 
   bool get _ready =>
-      _cropRect.width > 0 &&
-      _cropRect.height > 0 &&
-      _imageRect.width > 0 &&
-      _imageRect.height > 0;
+      _isStableRect(_displayCropRect) && _isStableRect(_displayImageRect);
 
   double? get _effectiveAspectRatio =>
       widget.withCircleUi ? 1.0 : widget.aspectRatio;
 
+  Rect _normalizeRect(Rect rect) {
+    final left = min(rect.left, rect.right);
+    final right = max(rect.left, rect.right);
+    final top = min(rect.top, rect.bottom);
+    final bottom = max(rect.top, rect.bottom);
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  bool _isFiniteRect(Rect rect) {
+    return rect.left.isFinite &&
+        rect.top.isFinite &&
+        rect.right.isFinite &&
+        rect.bottom.isFinite;
+  }
+
+  bool _isStableRect(Rect rect) {
+    if (!_isFiniteRect(rect)) return false;
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  bool _isInsideRect(Rect inner, Rect outer, {double epsilon = 0.75}) {
+    return inner.left >= outer.left - epsilon &&
+        inner.top >= outer.top - epsilon &&
+        inner.right <= outer.right + epsilon &&
+        inner.bottom <= outer.bottom + epsilon;
+  }
+
+  bool _isValidCropRect(Rect cropRect, Rect? imageRect) {
+    if (!_isStableRect(cropRect)) return false;
+    if (imageRect == null || !_isStableRect(imageRect)) return true;
+    return _isInsideRect(cropRect, imageRect);
+  }
+
+  double _touchTargetForAlignment(Alignment alignment) {
+    if (alignment == Alignment.centerLeft ||
+        alignment == Alignment.centerRight) {
+      return widget.edgeHandleSideTouchTarget;
+    }
+    return widget.edgeHandleTopBottomTouchTarget;
+  }
+
+  @override
+  void didUpdateWidget(covariant PhoenixCropCore oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.imageBytes, widget.imageBytes)) {
+      _cropRect = Rect.zero;
+      _imageRect = Rect.zero;
+      _lastValidCropRect = null;
+      _lastValidImageRect = null;
+    }
+  }
+
   void _handleMoved(Rect cropRect, Rect imageRect) {
+    final normalizedCropRect = _normalizeRect(cropRect);
+    final normalizedImageRect = _normalizeRect(imageRect);
+
+    final hasValidImage = _isStableRect(normalizedImageRect);
+    final imageForValidation = hasValidImage
+        ? normalizedImageRect
+        : _lastValidImageRect;
+
+    final hasValidCrop = _isValidCropRect(
+      normalizedCropRect,
+      imageForValidation,
+    );
+
+    final nextImageRect = hasValidImage
+        ? normalizedImageRect
+        : _displayImageRect;
+    final nextCropRect = hasValidCrop ? normalizedCropRect : _displayCropRect;
+
+    if (hasValidImage) {
+      _lastValidImageRect = normalizedImageRect;
+    }
+    if (hasValidCrop) {
+      _lastValidCropRect = normalizedCropRect;
+    }
+
     if (mounted) {
       setState(() {
-        _cropRect = cropRect;
-        _imageRect = imageRect;
+        _imageRect = nextImageRect;
+        _cropRect = nextCropRect;
       });
     } else {
-      _cropRect = cropRect;
-      _imageRect = imageRect;
+      _imageRect = nextImageRect;
+      _cropRect = nextCropRect;
     }
-    widget.onMoved?.call(cropRect, imageRect);
+
+    widget.onMoved?.call(nextCropRect, nextImageRect);
   }
 
   Rect? _resizeFromHorizontalHandle(double delta, {required bool leading}) {
     if (!_ready) return null;
-    final current = _cropRect;
-    final imageRect = _imageRect;
+    final current = _displayCropRect;
+    final imageRect = _displayImageRect;
     final aspectRatio = _effectiveAspectRatio;
 
     if (aspectRatio == null) {
@@ -296,8 +383,8 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
 
   Rect? _resizeFromVerticalHandle(double delta, {required bool topEdge}) {
     if (!_ready) return null;
-    final current = _cropRect;
-    final imageRect = _imageRect;
+    final current = _displayCropRect;
+    final imageRect = _displayImageRect;
     final aspectRatio = _effectiveAspectRatio;
 
     if (aspectRatio == null) {
@@ -359,7 +446,14 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
 
   void _applyCropRect(Rect? rect) {
     if (rect == null) return;
-    widget.controller.cropRect = rect;
+    final normalizedRect = _normalizeRect(rect);
+    if (!_isStableRect(normalizedRect)) return;
+    if (_isStableRect(_displayImageRect) &&
+        !_isInsideRect(normalizedRect, _displayImageRect, epsilon: 1.0)) {
+      return;
+    }
+    _lastValidCropRect = normalizedRect;
+    widget.controller.cropRect = normalizedRect;
   }
 
   Widget _buildEdgeHandle({
@@ -397,13 +491,13 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
                 width:
                     alignment == Alignment.centerLeft ||
                         alignment == Alignment.centerRight
-                    ? _edgeHandleThickness
-                    : _edgeHandleLength,
+                    ? _edgeHandleVisualThickness
+                    : _edgeHandleVisualLength,
                 height:
                     alignment == Alignment.centerLeft ||
                         alignment == Alignment.centerRight
-                    ? _edgeHandleLength
-                    : _edgeHandleThickness,
+                    ? _edgeHandleVisualLength
+                    : _edgeHandleVisualThickness,
               ),
             ),
           ),
@@ -450,42 +544,59 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
                   : null,
             ),
             if (_ready) ...[
+              // Визуальный размер ручек остается прежним; увеличиваем только зону касания.
               _buildEdgeHandle(
                 alignment: Alignment.topCenter,
-                left: _cropRect.center.dx - (_edgeHandleTouchTarget / 2),
-                top: _cropRect.top - (_edgeHandleTouchTarget / 2),
-                width: _edgeHandleTouchTarget,
-                height: _edgeHandleTouchTarget,
+                left:
+                    _displayCropRect.center.dx -
+                    (_touchTargetForAlignment(Alignment.topCenter) / 2),
+                top:
+                    _displayCropRect.top -
+                    (_touchTargetForAlignment(Alignment.topCenter) / 2),
+                width: _touchTargetForAlignment(Alignment.topCenter),
+                height: _touchTargetForAlignment(Alignment.topCenter),
                 onPanUpdate: (details) => _applyCropRect(
                   _resizeFromVerticalHandle(details.delta.dy, topEdge: true),
                 ),
               ),
               _buildEdgeHandle(
                 alignment: Alignment.bottomCenter,
-                left: _cropRect.center.dx - (_edgeHandleTouchTarget / 2),
-                top: _cropRect.bottom - (_edgeHandleTouchTarget / 2),
-                width: _edgeHandleTouchTarget,
-                height: _edgeHandleTouchTarget,
+                left:
+                    _displayCropRect.center.dx -
+                    (_touchTargetForAlignment(Alignment.bottomCenter) / 2),
+                top:
+                    _displayCropRect.bottom -
+                    (_touchTargetForAlignment(Alignment.bottomCenter) / 2),
+                width: _touchTargetForAlignment(Alignment.bottomCenter),
+                height: _touchTargetForAlignment(Alignment.bottomCenter),
                 onPanUpdate: (details) => _applyCropRect(
                   _resizeFromVerticalHandle(details.delta.dy, topEdge: false),
                 ),
               ),
               _buildEdgeHandle(
                 alignment: Alignment.centerLeft,
-                left: _cropRect.left - (_edgeHandleTouchTarget / 2),
-                top: _cropRect.center.dy - (_edgeHandleTouchTarget / 2),
-                width: _edgeHandleTouchTarget,
-                height: _edgeHandleTouchTarget,
+                left:
+                    _displayCropRect.left -
+                    (_touchTargetForAlignment(Alignment.centerLeft) / 2),
+                top:
+                    _displayCropRect.center.dy -
+                    (_touchTargetForAlignment(Alignment.centerLeft) / 2),
+                width: _touchTargetForAlignment(Alignment.centerLeft),
+                height: _touchTargetForAlignment(Alignment.centerLeft),
                 onPanUpdate: (details) => _applyCropRect(
                   _resizeFromHorizontalHandle(details.delta.dx, leading: true),
                 ),
               ),
               _buildEdgeHandle(
                 alignment: Alignment.centerRight,
-                left: _cropRect.right - (_edgeHandleTouchTarget / 2),
-                top: _cropRect.center.dy - (_edgeHandleTouchTarget / 2),
-                width: _edgeHandleTouchTarget,
-                height: _edgeHandleTouchTarget,
+                left:
+                    _displayCropRect.right -
+                    (_touchTargetForAlignment(Alignment.centerRight) / 2),
+                top:
+                    _displayCropRect.center.dy -
+                    (_touchTargetForAlignment(Alignment.centerRight) / 2),
+                width: _touchTargetForAlignment(Alignment.centerRight),
+                height: _touchTargetForAlignment(Alignment.centerRight),
                 onPanUpdate: (details) => _applyCropRect(
                   _resizeFromHorizontalHandle(details.delta.dx, leading: false),
                 ),

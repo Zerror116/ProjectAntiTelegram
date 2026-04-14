@@ -1222,8 +1222,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
       if (type == 'chat:message:read') {
         if (data is Map) {
           final chatId = (data['chatId'] ?? '').toString().trim();
-          final unreadCount = int.tryParse('${data['unread_count'] ?? 0}') ?? 0;
-          if (chatId.isNotEmpty) {
+          final hasUnreadCount = data.containsKey('unread_count');
+          final unreadCount = hasUnreadCount
+              ? (int.tryParse('${data['unread_count'] ?? 0}') ?? 0)
+              : null;
+          if (chatId.isNotEmpty && unreadCount != null) {
             _markChatReadLocally(chatId, unreadCount: unreadCount);
           }
         }

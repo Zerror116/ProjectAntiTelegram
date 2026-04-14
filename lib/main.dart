@@ -2045,7 +2045,10 @@ Future<bool> _downloadAndInstallAndroidUpdate({
 Uri? _resolveAndroidFallbackUpdateUri(_AppUpdateInfo info) {
   final landingRaw = (info.landingUrl ?? '').trim();
   final downloadRaw = (info.downloadUrl ?? '').trim();
-  return _resolveUpdateUri(landingRaw.isNotEmpty ? landingRaw : downloadRaw);
+  final preferred = landingRaw.isNotEmpty ? landingRaw : downloadRaw;
+  final resolvedPreferred = _resolveUpdateUri(preferred);
+  if (resolvedPreferred != null) return resolvedPreferred;
+  return _resolveUpdateUri('/download/android');
 }
 
 bool _hasUpdateActionAvailable(_AppUpdateInfo info) {
