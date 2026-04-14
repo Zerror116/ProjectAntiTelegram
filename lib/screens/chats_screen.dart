@@ -34,6 +34,41 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   String _chatIdOf(Map<String, dynamic> chat) => (chat['id'] ?? '').toString();
 
+  Map<String, dynamic> _normalizeChatRow(Map<String, dynamic> row) {
+    final normalized = Map<String, dynamic>.from(row);
+    final id = (normalized['id'] ?? '').toString().trim();
+    normalized['id'] = id;
+    final settingsRaw = normalized['settings'];
+    if (settingsRaw is Map<String, dynamic>) {
+      normalized['settings'] = settingsRaw;
+    } else if (settingsRaw is Map) {
+      normalized['settings'] = Map<String, dynamic>.from(settingsRaw);
+    } else {
+      normalized['settings'] = const <String, dynamic>{};
+    }
+    return normalized;
+  }
+
+  List<Map<String, dynamic>> _sanitizeChatsForUi(
+    List<Map<String, dynamic>> rows,
+  ) {
+    final seen = <String>{};
+    final sanitized = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      final normalized = _normalizeChatRow(row);
+      final id = _chatIdOf(normalized).trim();
+      if (id.isEmpty || !seen.add(id)) continue;
+      sanitized.add(normalized);
+    }
+    return sanitized;
+  }
+
+  String _effectiveActiveFolder() {
+    final available = _folderSpecs().map((spec) => spec.id).toSet();
+    if (available.contains(_activeFolder)) return _activeFolder;
+    return available.isEmpty ? 'primary' : available.first;
+  }
+
   bool _toBool(dynamic raw) {
     if (raw is bool) return raw;
     final value = '${raw ?? ''}'.toLowerCase().trim();
@@ -77,9 +112,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   void _upsertChatLocally(Map<String, dynamic> chat) {
-    final chatId = _chatIdOf(chat);
+    final normalized = _normalizeChatRow(chat);
+    final chatId = _chatIdOf(normalized);
     if (chatId.isEmpty) return;
-    final normalized = Map<String, dynamic>.from(chat);
     setState(() {
       final index = _chats.indexWhere((c) => _chatIdOf(c) == chatId);
       if (index >= 0) {
@@ -585,32 +620,36 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   List<Map<String, dynamic>> _visibleChatsForFolder() {
-    switch (_activeFolder) {
+    final activeFolder = _effectiveActiveFolder();
+    final chatsSnapshot = List<Map<String, dynamic>>.from(_chats);
+    switch (activeFolder) {
       case 'direct':
-        return _chats.where(_isDirectListChat).toList();
+        return chatsSnapshot.where(_isDirectListChat).toList(growable: false);
       case 'work':
-        return _chats.where(_isWorkChat).toList();
+        return chatsSnapshot.where(_isWorkChat).toList(growable: false);
       case 'primary':
       default:
-        return _chats
+        return chatsSnapshot
             .where((chat) => !_isDirectListChat(chat) && !_isWorkChat(chat))
-            .toList();
+            .toList(growable: false);
     }
   }
 
   Widget _buildFolderTabs(ThemeData theme) {
     final specs = _folderSpecs();
+    final activeFolder = _effectiveActiveFolder();
+    final chatsSnapshot = List<Map<String, dynamic>>.from(_chats);
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
       child: Row(
         children: specs.map((spec) {
-          final selected = spec.id == _activeFolder;
+          final selected = spec.id == activeFolder;
           final count = switch (spec.id) {
-            'direct' => _chats.where(_isDirectListChat).length,
-            'work' => _chats.where(_isWorkChat).length,
+            'direct' => chatsSnapshot.where(_isDirectListChat).length,
+            'work' => chatsSnapshot.where(_isWorkChat).length,
             _ =>
-              _chats
+              chatsSnapshot
                   .where(
                     (chat) => !_isDirectListChat(chat) && !_isWorkChat(chat),
                   )
@@ -1277,7 +1316,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ..sort(_compareChats);
       if (!mounted) return;
       setState(() {
-        _chats = nextChats;
+        _chats = _sanitizeChatsForUi(nextChats);
+        _activeFolder = _effectiveActiveFolder();
         _loadedOnce = true;
       });
     } catch (e) {

@@ -18,6 +18,7 @@ class AdaptiveNetworkImage extends StatelessWidget {
     this.excludeFromSemantics = false,
     this.headers,
     this.maxScaleForDecode = 1.0,
+    this.gaplessPlayback = false,
   });
 
   final String url;
@@ -32,6 +33,7 @@ class AdaptiveNetworkImage extends StatelessWidget {
   final bool excludeFromSemantics;
   final Map<String, String>? headers;
   final double maxScaleForDecode;
+  final bool gaplessPlayback;
 
   int? _computeDecodeDimension({
     required double? fixed,
@@ -92,7 +94,7 @@ class AdaptiveNetworkImage extends StatelessWidget {
           cacheWidth: cacheWidth,
           cacheHeight: cacheHeight,
           isAntiAlias: !reducedMode,
-          gaplessPlayback: true,
+          gaplessPlayback: gaplessPlayback,
           errorBuilder: errorBuilder,
           loadingBuilder: loadingBuilder,
           frameBuilder: frameBuilder,

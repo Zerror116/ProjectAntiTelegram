@@ -1008,10 +1008,9 @@ class _WorkerPanelState extends State<WorkerPanel>
             .where((day) => _selectedRevisionDates.contains(day))
             .take(2)
             .toSet();
-        final nextSelected =
-            preservedSelection.isNotEmpty
-                ? preservedSelection
-                : availableDays.take(1).toSet();
+        final nextSelected = preservedSelection.isNotEmpty
+            ? preservedSelection
+            : availableDays.take(1).toSet();
         if (!mounted) return;
         setState(() {
           _revisionDates = dates;
@@ -1105,7 +1104,9 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (productIds.isEmpty || !mounted) return;
     final remainingPosts = _revisionPosts
         .where(
-          (post) => !productIds.contains((post['product_id'] ?? '').toString().trim()),
+          (post) => !productIds.contains(
+            (post['product_id'] ?? '').toString().trim(),
+          ),
         )
         .toList();
     final countsByDay = <String, int>{};
@@ -1126,7 +1127,10 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
 
     var nextSelected = _selectedRevisionDates
-        .where((day) => nextDates.any((item) => (item['day'] ?? '').toString() == day))
+        .where(
+          (day) =>
+              nextDates.any((item) => (item['day'] ?? '').toString() == day),
+        )
         .toSet();
     if (nextSelected.isEmpty && nextDates.isNotEmpty) {
       nextSelected = {(nextDates.first['day'] ?? '').toString()};
@@ -1141,7 +1145,9 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   void _mergeOwnQueuedPostLocally(Map<String, dynamic> queuedItem) {
     if (!mounted) return;
-    final queueId = (queuedItem['queue_id'] ?? queuedItem['id'] ?? '').toString().trim();
+    final queueId = (queuedItem['queue_id'] ?? queuedItem['id'] ?? '')
+        .toString()
+        .trim();
     if (queueId.isEmpty) return;
 
     final payload = queuedItem['payload'] is Map
@@ -1185,9 +1191,11 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
 
     nextItems.sort((a, b) {
-      final left = DateTime.tryParse((a['created_at'] ?? '').toString()) ??
+      final left =
+          DateTime.tryParse((a['created_at'] ?? '').toString()) ??
           DateTime.fromMillisecondsSinceEpoch(0);
-      final right = DateTime.tryParse((b['created_at'] ?? '').toString()) ??
+      final right =
+          DateTime.tryParse((b['created_at'] ?? '').toString()) ??
           DateTime.fromMillisecondsSinceEpoch(0);
       return right.compareTo(left);
     });
@@ -1266,16 +1274,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       final payload = data is Map && data['data'] is Map
           ? Map<String, dynamic>.from(data['data'])
           : <String, dynamic>{};
-      final updatedCount = _toIntValue(
-        payload['updated_count'],
-      );
-      final queuedCount = _toIntValue(
-        payload['queued_count'],
-        updatedCount,
-      );
-      final reusedCount = _toIntValue(
-        payload['reused_pending_count'],
-      );
+      final updatedCount = _toIntValue(payload['updated_count']);
+      final queuedCount = _toIntValue(payload['queued_count'], updatedCount);
+      final reusedCount = _toIntValue(payload['reused_pending_count']);
       final queuedItems = payload['queued_items'] is List
           ? List<Map<String, dynamic>>.from(payload['queued_items'])
           : const <Map<String, dynamic>>[];
@@ -1313,7 +1314,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       if (!mounted) return;
       final note = _revisionBlockedNote(post);
       setState(
-        () => _message = note.isNotEmpty ? note : 'Этот товар сейчас нельзя ревизовать',
+        () => _message = note.isNotEmpty
+            ? note
+            : 'Этот товар сейчас нельзя ревизовать',
       );
       return;
     }
@@ -1624,9 +1627,11 @@ class _WorkerPanelState extends State<WorkerPanel>
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
-        setState(
-          () => _searchResults = List<Map<String, dynamic>>.from(data['data']),
-        );
+        final normalized = (data['data'] as List)
+            .whereType<Map>()
+            .map((row) => Map<String, dynamic>.from(row))
+            .toList(growable: false);
+        setState(() => _searchResults = normalized);
       } else {
         setState(() => _message = 'Не удалось выполнить поиск');
       }
@@ -2185,6 +2190,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Widget _buildSearchTab() {
+    final searchResults = List<Map<String, dynamic>>.from(_searchResults);
     return ListView(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.all(16),
@@ -2242,7 +2248,14 @@ class _WorkerPanelState extends State<WorkerPanel>
             subtitle: 'Введите описание товара, чтобы найти старые позиции.',
             icon: Icons.search_rounded,
           ),
-        ..._searchResults.map((p) {
+        ...searchResults.map((p) {
+          final productId = (p['id'] ?? '').toString().trim();
+          final updatedAt = (p['updated_at'] ?? p['created_at'] ?? '')
+              .toString()
+              .trim();
+          final itemKey = productId.isNotEmpty
+              ? 'old-search-$productId-$updatedAt'
+              : 'old-search-${p.hashCode}-$updatedAt';
           final label = _formatProductLabel(
             p['product_code'],
             p['shelf_number'],
@@ -2251,15 +2264,18 @@ class _WorkerPanelState extends State<WorkerPanel>
           final requeueAllowed = _oldPostRequeueAllowed(p);
           final reuseHint = _oldPostReuseHint(p);
           return Card(
+            key: ValueKey(itemKey),
             child: ListTile(
               leading: imageUrl != null
                   ? ClipRRect(
                       borderRadius: BorderRadius.circular(6),
                       child: AdaptiveNetworkImage(
+                        key: ValueKey('thumb-$itemKey-$imageUrl'),
                         imageUrl,
                         width: 52,
                         height: 52,
                         fit: BoxFit.contain,
+                        gaplessPlayback: false,
                         errorBuilder: (_, error, stackTrace) => Container(
                           width: 52,
                           height: 52,
@@ -2320,8 +2336,8 @@ class _WorkerPanelState extends State<WorkerPanel>
                       tooltip: requeueAllowed
                           ? 'Быстрый дубль'
                           : (reuseHint.isNotEmpty
-                              ? reuseHint
-                              : 'Недоступно для этого товара'),
+                                ? reuseHint
+                                : 'Недоступно для этого товара'),
                       onPressed: _posting || !requeueAllowed
                           ? null
                           : () => _quickDuplicateProduct(p),
@@ -2345,20 +2361,22 @@ class _WorkerPanelState extends State<WorkerPanel>
                       ),
                       decoration: BoxDecoration(
                         color: requeueAllowed
-                            ? Theme.of(context).colorScheme.surfaceContainerHighest
+                            ? Theme.of(
+                                context,
+                              ).colorScheme.surfaceContainerHighest
                             : Theme.of(context).colorScheme.tertiaryContainer,
                         borderRadius: BorderRadius.circular(999),
                       ),
                       child: Text(
                         reuseHint,
                         style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                              fontWeight: FontWeight.w700,
-                              color: requeueAllowed
-                                  ? null
-                                  : Theme.of(context)
-                                      .colorScheme
-                                      .onTertiaryContainer,
-                            ),
+                          fontWeight: FontWeight.w700,
+                          color: requeueAllowed
+                              ? null
+                              : Theme.of(
+                                  context,
+                                ).colorScheme.onTertiaryContainer,
+                        ),
                       ),
                     ),
                   ],
@@ -2524,12 +2542,11 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Future<void> _deleteOwnQueuedPost(Map<String, dynamic> post) async {
     final title = (post['product_title'] ?? 'этот пост').toString().trim();
-    final payload =
-        post['payload'] is Map<String, dynamic>
-            ? post['payload'] as Map<String, dynamic>
-            : post['payload'] is Map
-                ? Map<String, dynamic>.from(post['payload'])
-                : const <String, dynamic>{};
+    final payload = post['payload'] is Map<String, dynamic>
+        ? post['payload'] as Map<String, dynamic>
+        : post['payload'] is Map
+        ? Map<String, dynamic>.from(post['payload'])
+        : const <String, dynamic>{};
     final isRevisionPost =
         payload['revision_manual'] == true || payload['revision_auto'] == true;
     final confirmed = await showDialog<bool>(
@@ -2539,7 +2556,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         content: Text(
           isRevisionPost
               ? 'Удалить "$title" из очереди ревизии?\n\n'
-                  'После этого он не уйдёт на канал, а исходный пост вернётся обратно в Основной канал.'
+                    'После этого он не уйдёт на канал, а исходный пост вернётся обратно в Основной канал.'
               : 'Удалить "$title" из очереди?\n\nПосле этого пост не уйдёт на канал.',
         ),
         actions: [
@@ -2749,7 +2766,10 @@ class _WorkerPanelState extends State<WorkerPanel>
                               : () => _quickDuplicateProduct(
                                   _productFromOwnQueuedPost(post),
                                 ),
-                          icon: const Icon(Icons.content_copy_outlined, size: 18),
+                          icon: const Icon(
+                            Icons.content_copy_outlined,
+                            size: 18,
+                          ),
                           label: const Text('Дубль'),
                         ),
                       ],
@@ -2805,11 +2825,11 @@ class _WorkerPanelState extends State<WorkerPanel>
           else
             LayoutBuilder(
               builder: (context, constraints) {
-                final buttonWidth =
-                    _revisionDates.length <= 1
-                        ? constraints.maxWidth
-                        : ((constraints.maxWidth - 8) / 2).clamp(0.0, double.infinity)
-                            .toDouble();
+                final buttonWidth = _revisionDates.length <= 1
+                    ? constraints.maxWidth
+                    : ((constraints.maxWidth - 8) / 2)
+                          .clamp(0.0, double.infinity)
+                          .toDouble();
                 return Wrap(
                   spacing: 8,
                   runSpacing: 8,
@@ -2829,19 +2849,16 @@ class _WorkerPanelState extends State<WorkerPanel>
                             horizontal: 14,
                             vertical: 14,
                           ),
-                          backgroundColor:
-                              selected
-                                  ? colorScheme.primaryContainer
-                                  : colorScheme.surfaceContainerLow,
-                          foregroundColor:
-                              selected
-                                  ? colorScheme.onPrimaryContainer
-                                  : colorScheme.onSurface,
+                          backgroundColor: selected
+                              ? colorScheme.primaryContainer
+                              : colorScheme.surfaceContainerLow,
+                          foregroundColor: selected
+                              ? colorScheme.onPrimaryContainer
+                              : colorScheme.onSurface,
                           side: BorderSide(
-                            color:
-                                selected
-                                    ? colorScheme.primary
-                                    : colorScheme.outlineVariant,
+                            color: selected
+                                ? colorScheme.primary
+                                : colorScheme.outlineVariant,
                           ),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(16),
@@ -2861,10 +2878,11 @@ class _WorkerPanelState extends State<WorkerPanel>
                             Text(
                               '$count товаров',
                               style: theme.textTheme.bodySmall?.copyWith(
-                                color:
-                                    selected
-                                        ? colorScheme.onPrimaryContainer.withValues(alpha: 0.78)
-                                        : colorScheme.onSurfaceVariant,
+                                color: selected
+                                    ? colorScheme.onPrimaryContainer.withValues(
+                                        alpha: 0.78,
+                                      )
+                                    : colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ],
@@ -3098,7 +3116,9 @@ class _WorkerPanelState extends State<WorkerPanel>
                           ? null
                           : () => _manualRevisionEdit(post),
                       icon: Icon(
-                        blocked ? Icons.inventory_2_outlined : Icons.edit_outlined,
+                        blocked
+                            ? Icons.inventory_2_outlined
+                            : Icons.edit_outlined,
                       ),
                     ),
                   ],
