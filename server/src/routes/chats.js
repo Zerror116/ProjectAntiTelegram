@@ -3690,27 +3690,34 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
       .map((row) => row.message_id)
       .filter(Boolean);
 
+    const unreadCount = await computeNotificationBadgeCount(userId);
     const io = req.app.get("io");
-    if (io && messageIds.length > 0) {
-      const bySender = new Map();
-      for (const row of readRows) {
-        const senderId = String(row.sender_id || "").trim();
-        const messageId = String(row.message_id || "").trim();
-        if (!senderId || !messageId) continue;
-        if (!bySender.has(senderId)) {
-          bySender.set(senderId, []);
+    if (io) {
+      if (messageIds.length > 0) {
+        const bySender = new Map();
+        for (const row of readRows) {
+          const senderId = String(row.sender_id || "").trim();
+          const messageId = String(row.message_id || "").trim();
+          if (!senderId || !messageId) continue;
+          if (!bySender.has(senderId)) {
+            bySender.set(senderId, []);
+          }
+          bySender.get(senderId).push(messageId);
         }
-        bySender.get(senderId).push(messageId);
+        for (const [senderId, senderMessageIds] of bySender.entries()) {
+          io.to(`user:${senderId}`).emit("chat:message:read", {
+            chatId,
+            readerId: String(userId),
+            messageIds: senderMessageIds,
+          });
+        }
       }
-      for (const [senderId, senderMessageIds] of bySender.entries()) {
-        io.to(`user:${senderId}`).emit("chat:message:read", {
-          chatId,
-          readerId: String(userId),
-          messageIds: senderMessageIds,
-        });
-      }
-      const unreadCount = await computeNotificationBadgeCount(userId);
       io.to(`user:${userId}`).emit("notification:badge", {
+        unread_count: unreadCount,
+      });
+      io.to(`user:${userId}`).emit("chat:message:read", {
+        chatId,
+        readerId: String(userId),
         unread_count: unreadCount,
       });
     }
@@ -3721,6 +3728,7 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         chat_id: chatId,
         message_ids: messageIds,
         visible_until_message_id: visibleUntilMessageId,
+        unread_count: unreadCount,
       },
     });
   } catch (err) {
