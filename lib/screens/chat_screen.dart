@@ -3326,18 +3326,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   List<ChatMediaViewerEntry> _chatMediaViewerEntries() {
+    final messagesSnapshot = List<Map<String, dynamic>>.from(_messages);
     final entries = <ChatMediaViewerEntry>[];
-    for (final item in _messages) {
+    for (final item in messagesSnapshot) {
       final meta = _metaMapOf(item['meta']);
       final imageUrl = _resolveImageUrl(meta['image_url']?.toString());
       if (imageUrl == null || imageUrl.isEmpty) continue;
       if (_isHiddenForAll(item)) continue;
-      final entryId = _messageIdOf(item).trim().isNotEmpty
-          ? _messageIdOf(item).trim()
-          : '${item['client_msg_id'] ?? imageUrl}-${item['created_at'] ?? ''}';
       entries.add(
         ChatMediaViewerEntry(
-          id: entryId,
+          id: _mediaViewerEntryIdForMessage(item, fallbackImageUrl: imageUrl),
           imageUrl: imageUrl,
           caption: _captionTextOf(item, meta),
           senderName: _senderNameOf(item),
@@ -3348,35 +3346,57 @@ class _ChatScreenState extends State<ChatScreen> {
     return entries;
   }
 
+  String _mediaViewerEntryIdForMessage(
+    Map<String, dynamic> message, {
+    String? fallbackImageUrl,
+  }) {
+    final messageId = _messageIdOf(message).trim();
+    if (messageId.isNotEmpty) return messageId;
+    final clientMessageId = (message['client_msg_id'] ?? '').toString().trim();
+    final createdAt = (message['created_at'] ?? '').toString().trim();
+    final imageToken = (fallbackImageUrl ?? '').trim();
+    if (clientMessageId.isNotEmpty ||
+        createdAt.isNotEmpty ||
+        imageToken.isNotEmpty) {
+      return '$clientMessageId|$createdAt|$imageToken';
+    }
+    return 'fallback-${identityHashCode(message)}';
+  }
+
   Future<void> _openImagePreviewForMessage(
     Map<String, dynamic> message,
     String imageUrl,
   ) async {
+    final targetEntryId = _mediaViewerEntryIdForMessage(
+      message,
+      fallbackImageUrl: imageUrl,
+    );
+    final singleEntry = ChatMediaViewerEntry(
+      id: targetEntryId,
+      imageUrl: imageUrl,
+      caption: _captionTextOf(message, _metaMapOf(message['meta'])),
+      senderName: _senderNameOf(message),
+      timeLabel: _formatMessageTime(message['created_at']),
+    );
     final gallery = _chatMediaViewerEntries();
     if (gallery.isEmpty) {
       await showChatMediaViewer(
         context,
-        entries: <ChatMediaViewerEntry>[
-          ChatMediaViewerEntry(
-            id: _messageIdOf(message).trim().isNotEmpty
-                ? _messageIdOf(message).trim()
-                : imageUrl,
-            imageUrl: imageUrl,
-            caption: _captionTextOf(message, _metaMapOf(message['meta'])),
-            senderName: _senderNameOf(message),
-            timeLabel: _formatMessageTime(message['created_at']),
-          ),
-        ],
+        entries: <ChatMediaViewerEntry>[singleEntry],
       );
       return;
     }
 
-    final targetId = _messageIdOf(message).trim();
-    var initialIndex = gallery.indexWhere((entry) => entry.id == targetId);
+    final initialIndex = gallery.indexWhere(
+      (entry) => entry.id == targetEntryId,
+    );
     if (initialIndex < 0) {
-      initialIndex = gallery.indexWhere((entry) => entry.imageUrl == imageUrl);
+      await showChatMediaViewer(
+        context,
+        entries: <ChatMediaViewerEntry>[singleEntry],
+      );
+      return;
     }
-    if (initialIndex < 0) initialIndex = 0;
 
     await showChatMediaViewer(
       context,
@@ -6044,7 +6064,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_searchQuery.trim().isNotEmpty && _serverSearchLoaded) {
       return [..._serverSearchMessages]..sort(_compareByCreatedAt);
     }
-    return _messages
+    final messagesSnapshot = List<Map<String, dynamic>>.from(_messages);
+    return messagesSnapshot
         .where((m) => _messageMatchesSearch(m, _searchQuery))
         .toList()
       ..sort(_compareByCreatedAt);
