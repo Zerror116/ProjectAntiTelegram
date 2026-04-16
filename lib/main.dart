@@ -19,7 +19,9 @@ import 'services/auth_service.dart';
 import 'services/input_language_service.dart';
 import 'services/native_push_service.dart';
 import 'services/native_update_installer.dart';
+import 'services/monitoring_service.dart';
 import 'services/notification_open_tracker_service.dart';
+import 'services/notification_runtime_preference_service.dart';
 import 'services/offline_purchase_queue_service.dart';
 import 'services/web_notification_service.dart';
 import 'services/web_push_client_service.dart';
@@ -77,7 +79,6 @@ final ValueNotifier<PhoneAccessOwnerRequest?> phoneAccessOwnerRequestNotifier =
 final OfflinePurchaseQueueService offlinePurchaseQueueService =
     OfflinePurchaseQueueService();
 
-const _notificationsPrefPrefix = 'notifications_enabled_';
 const _themePrefPrefix = 'theme_mode_dark_';
 const _uiDensityPrefPrefix = 'ui_density_';
 const _uiCardSizePrefPrefix = 'ui_card_size_';
@@ -94,6 +95,10 @@ String? _socketBoundTenantCode;
 String _lastConnectivityHint = '';
 bool _keyboardAssertRecoveredRecently = false;
 Timer? _webPushBadgeSyncTimer;
+DateTime? _lastSocketConnectedAt;
+DateTime? _lastSocketDisconnectedAt;
+String _lastSocketDisconnectReason = '';
+String _lastSocketConnectError = '';
 const bool _verboseSocketLogs = bool.fromEnvironment(
   'FENIX_VERBOSE_SOCKET_LOGS',
   defaultValue: false,
@@ -110,6 +115,23 @@ void _socketVerboseLog(String message) {
   if (kDebugMode && _verboseSocketLogs) {
     debugPrint(message);
   }
+}
+
+Map<String, dynamic> runtimeSocketDiagnosticsSnapshot() {
+  return <String, dynamic>{
+    'connected': socket?.connected == true,
+    'active': socket?.active == true,
+    'socket_id': socket?.id,
+    'api_base_url': _runtimeApiBaseUrl,
+    'bound_user_id': _socketBoundUserId,
+    'bound_view_role': _socketBoundViewRole,
+    'bound_tenant_code': _socketBoundTenantCode,
+    'last_connectivity_hint': _lastConnectivityHint,
+    'last_connected_at': _lastSocketConnectedAt?.toIso8601String(),
+    'last_disconnected_at': _lastSocketDisconnectedAt?.toIso8601String(),
+    'last_disconnect_reason': _lastSocketDisconnectReason,
+    'last_connect_error': _lastSocketConnectError,
+  };
 }
 
 enum AppNoticeTone { info, success, warning, error }
@@ -865,9 +887,9 @@ final ValueNotifier<_SubscriptionUiPayload> _subscriptionUiNotifier =
 DateTime? _stickySubscriptionWarningExpiresAt;
 
 String _settingsScopeUserId() {
-  final id = authService.currentUser?.id;
-  if (id != null && id.trim().isNotEmpty) return id;
-  return 'guest';
+  return NotificationRuntimePreferenceService.settingsScopeUserId(
+    authService.currentUser?.id,
+  );
 }
 
 VisualDensity _resolveVisualDensity() {
@@ -958,9 +980,9 @@ void _applyPerformanceRuntimeTuning(bool enabled) {
 
 Future<void> refreshUserPreferences() async {
   final prefs = await SharedPreferences.getInstance();
+  final notifications = await NotificationRuntimePreferenceService
+      .isEnabledForUser(authService.currentUser?.id);
   final scope = _settingsScopeUserId();
-  final notifications =
-      prefs.getBool('$_notificationsPrefPrefix$scope') ?? true;
   final darkMode = prefs.getBool('$_themePrefPrefix$scope') ?? false;
   final performanceRaw = prefs.getBool('$_performanceModePrefPrefix$scope');
   final defaultPerformanceMode =
@@ -986,10 +1008,16 @@ Future<void> refreshUserPreferences() async {
 }
 
 Future<void> setNotificationsEnabled(bool value) async {
-  final prefs = await SharedPreferences.getInstance();
-  final scope = _settingsScopeUserId();
-  await prefs.setBool('$_notificationsPrefPrefix$scope', value);
+  await NotificationRuntimePreferenceService.persistEnabledForUser(
+    authService.currentUser?.id,
+    value,
+  );
   notificationsEnabledNotifier.value = value;
+  if (authService.currentUser == null || authService.isSessionDegraded) return;
+  await NotificationRuntimePreferenceService.applyRuntimePreference(
+    authService.dio,
+    enabled: value,
+  );
 }
 
 Future<void> setDarkModeEnabled(bool value) async {
@@ -3267,7 +3295,7 @@ void _setNotificationBadgeCount(int count, {bool syncWebBadge = true}) {
   final normalized = count < 0 ? 0 : count;
   notificationBadgeCountNotifier.value = normalized;
   if (kIsWeb && syncWebBadge) {
-    unawaited(WebPushClientService.syncUnreadBadge(dio));
+    unawaited(WebPushClientService.syncUnreadBadgeCount(normalized));
   }
 }
 
@@ -3301,7 +3329,7 @@ Future<void> refreshNotificationBadgeCount() async {
     _setNotificationBadgeCount(unreadCount, syncWebBadge: false);
     _setNotificationInboxBadgeCount(inboxUnreadCount);
     if (kIsWeb) {
-      unawaited(WebPushClientService.syncUnreadBadge(dio));
+      unawaited(WebPushClientService.syncUnreadBadgeCount(unreadCount));
     }
   } catch (e) {
     debugPrint('refreshNotificationBadgeCount skipped: $e');
@@ -3961,6 +3989,10 @@ Future<void> disconnectSocket() async {
     _socketBoundUserId = null;
     _socketBoundViewRole = null;
     _socketBoundTenantCode = null;
+    _lastSocketDisconnectedAt = DateTime.now();
+    if (_lastSocketDisconnectReason.trim().isEmpty) {
+      _lastSocketDisconnectReason = 'io client disconnect';
+    }
     debugPrint('✅ Socket disconnected');
   } catch (e) {
     debugPrint('❌ Error disconnecting socket: $e');
@@ -4356,6 +4388,13 @@ Future<void> _initSocket() async {
       _runtimeApiBaseUrl,
       io.OptionBuilder()
           .setTransports(['websocket', 'polling'])
+          .setRememberUpgrade(true)
+          .enableReconnection()
+          .setReconnectionAttempts(1 << 20)
+          .setReconnectionDelay(1000)
+          .setReconnectionDelayMax(5000)
+          .setRandomizationFactor(0.25)
+          .setTimeout(30000)
           .disableAutoConnect()
           .setAuth(socketAuth)
           .setExtraHeaders(socketHeaders)
@@ -4368,6 +4407,8 @@ Future<void> _initSocket() async {
 
     socket?.on('connect', (_) {
       debugPrint('✅ Socket connected: ${socket?.id}');
+      _lastSocketConnectedAt = DateTime.now();
+      _lastSocketConnectError = '';
       chatEventsController.add({
         'type': 'socket:connected',
         'data': {'socketId': socket?.id},
@@ -4378,10 +4419,31 @@ Future<void> _initSocket() async {
 
     socket?.on('disconnect', (reason) {
       debugPrint('📡 Socket disconnected: $reason');
+      _lastSocketDisconnectedAt = DateTime.now();
+      _lastSocketDisconnectReason = '$reason';
+      unawaited(
+        MonitoringService.captureEvent(
+          subsystem: 'realtime',
+          code: 'socket_disconnected',
+          level: 'warn',
+          message: 'Socket disconnected: $reason',
+          details: runtimeSocketDiagnosticsSnapshot(),
+        ),
+      );
     });
 
     socket?.on('connect_error', (err) {
       debugPrint('❌ Socket connect_error: $err');
+      _lastSocketConnectError = '$err';
+      unawaited(
+        MonitoringService.captureEvent(
+          subsystem: 'realtime',
+          code: 'socket_connect_error',
+          level: 'warn',
+          message: 'Socket connect_error: $err',
+          details: runtimeSocketDiagnosticsSnapshot(),
+        ),
+      );
     });
 
     // Chat created -> notify listeners to reload chats
@@ -4711,6 +4773,31 @@ Future<void> main() async {
     debugPrint(
       'FlutterError caught: ${details.exceptionAsString()}\n${details.stack}',
     );
+    unawaited(
+      MonitoringService.captureError(
+        details.exception,
+        details.stack,
+        subsystem: 'client',
+        code: 'flutter_error',
+        details: <String, dynamic>{
+          'library': details.library,
+          'context': details.context?.toDescription(),
+        },
+      ),
+    );
+  };
+
+  PlatformDispatcher.instance.onError = (Object error, StackTrace stackTrace) {
+    debugPrint('PlatformDispatcher.onError: $error\n$stackTrace');
+    unawaited(
+      MonitoringService.captureError(
+        error,
+        stackTrace,
+        subsystem: 'client',
+        code: 'platform_dispatcher_error',
+      ),
+    );
+    return false;
   };
 
   ErrorWidget.builder = (FlutterErrorDetails details) {

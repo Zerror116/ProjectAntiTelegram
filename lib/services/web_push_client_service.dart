@@ -23,12 +23,37 @@ class WebPushClientService {
 
   static bool get isSupported => impl.isSupported();
 
+  static Future<WebPushSyncResult>? _ensureSubscribedInFlight;
+  static Future<void>? _syncUnreadBadgeInFlight;
+
   static Future<WebPushSyncResult> ensureSubscribed(Dio dio) {
-    return impl.ensureSubscribed(dio);
+    final inFlight = _ensureSubscribedInFlight;
+    if (inFlight != null) return inFlight;
+    final future = impl.ensureSubscribed(dio);
+    _ensureSubscribedInFlight = future;
+    future.whenComplete(() {
+      if (identical(_ensureSubscribedInFlight, future)) {
+        _ensureSubscribedInFlight = null;
+      }
+    });
+    return future;
   }
 
   static Future<void> syncUnreadBadge(Dio dio) {
-    return impl.syncUnreadBadge(dio);
+    final inFlight = _syncUnreadBadgeInFlight;
+    if (inFlight != null) return inFlight;
+    final future = impl.syncUnreadBadge(dio);
+    _syncUnreadBadgeInFlight = future;
+    future.whenComplete(() {
+      if (identical(_syncUnreadBadgeInFlight, future)) {
+        _syncUnreadBadgeInFlight = null;
+      }
+    });
+    return future;
+  }
+
+  static Future<void> syncUnreadBadgeCount(int count) {
+    return impl.syncUnreadBadgeCount(count);
   }
 
   static Future<void> unsubscribe(Dio dio) {

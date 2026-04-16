@@ -1,11 +1,14 @@
 // lib/screens/chat_screen.dart
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
+import 'dart:math' show Random, max, min;
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:camera/camera.dart' as cam;
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -20,6 +23,10 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart' as vp;
 
 import '../main.dart';
+import '../services/chat_capture_capability_service.dart';
+import '../services/chat_outbox_service.dart';
+import '../services/messenger_preferences_service.dart';
+import '../services/monitoring_service.dart';
 import '../services/sticker_print_service.dart';
 import '../services/web_image_cache_service.dart';
 import '../services/web_media_capture_permission_service.dart';
@@ -30,6 +37,7 @@ import '../src/utils/messenger_ui_helpers.dart';
 import '../utils/date_time_utils.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
+import '../widgets/adaptive_network_image.dart';
 import '../widgets/chat_media_viewer.dart';
 import '../widgets/chat_message_image.dart';
 import '../widgets/delivery_address_picker_dialog.dart';
@@ -114,6 +122,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final ImagePicker _imagePicker = ImagePicker();
   final AudioRecorder _voiceRecorder = AudioRecorder();
   final AudioPlayer _voicePlayer = AudioPlayer();
+  final Connectivity _connectivity = Connectivity();
+  late final ChatCaptureProfile _captureProfile;
 
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _incomingQueue = [];
@@ -138,6 +148,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _pinLoading = false;
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
+  bool _persistentOutboxFlushInFlight = false;
   bool _showScrollToBottomButton = false;
   bool _initialViewportApplied = false;
   bool _initialViewportReady = false;
@@ -151,6 +162,7 @@ class _ChatScreenState extends State<ChatScreen> {
   int _unreadCount = 0;
 
   String _searchQuery = '';
+  String? _stickyDateLabel;
   List<String> _searchResultIds = const [];
   int _searchResultIndex = -1;
   int _recordingSeconds = 0;
@@ -186,6 +198,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _readFlushOnExitInFlight = false;
   int _bottomSettlePassesRemaining = 0;
   VoidCallback? _bottomSettleOnComplete;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
   StreamSubscription<Duration>? _voicePositionSub;
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
@@ -233,6 +246,9 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _applyingServerDraft = false;
   String _remoteActivityLabel = '';
   DateTime? _lastTypingEmitAt;
+  MessengerPreferences _messengerPrefs = MessengerPreferences.defaults;
+  List<ConnectivityResult> _connectivityResults = const <ConnectivityResult>[];
+  final Set<String> _manualMediaLoads = <String>{};
 
   static const List<String> _quickReactions = <String>[
     '👍',
@@ -385,6 +401,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _captureProfile = ChatCaptureCapabilityService.current;
     _chatSettings = widget.chatSettings == null
         ? <String, dynamic>{}
         : Map<String, dynamic>.from(widget.chatSettings!);
@@ -394,10 +411,21 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadPinnedMessage();
     _joinRoom();
     unawaited(_refreshOfflineQueueCount());
+    unawaited(_loadMessengerPreferences());
+    unawaited(_refreshConnectivityState());
     _offlineQueueRefreshTimer = Timer.periodic(
       const Duration(seconds: 8),
       (_) => unawaited(_refreshOfflineQueueCount()),
     );
+    _connectivitySub = _connectivity.onConnectivityChanged.listen((results) {
+      if (!mounted) {
+        _connectivityResults = List<ConnectivityResult>.from(results);
+        return;
+      }
+      setState(() {
+        _connectivityResults = List<ConnectivityResult>.from(results);
+      });
+    });
 
     _searchController.addListener(() {
       final next = _searchController.text.trim();
@@ -586,6 +614,9 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       if (type == 'socket:connected') {
+        unawaited(_joinRoom());
+        unawaited(_reconcilePersistentOutbox());
+        unawaited(_flushPersistentOutbox());
         _reconnectReplayTimer?.cancel();
         _reconnectReplayTimer = Timer(const Duration(milliseconds: 220), () {
           unawaited(_replayMissedMessagesAfterReconnect());
@@ -613,6 +644,15 @@ class _ChatScreenState extends State<ChatScreen> {
   Map<String, dynamic> _effectiveChatSettings() => _chatSettings;
 
   String _myUserId() => authService.currentUser?.id.trim() ?? '';
+
+  String _outboxTenantCode() {
+    final scoped = authService.creatorTenantScopeCode?.trim() ?? '';
+    final fallback = authService.currentUser?.tenantCode?.trim() ?? '';
+    final normalized = normalizeChatOutboxTenantCode(
+      scoped.isNotEmpty ? scoped : fallback,
+    );
+    return normalized.isNotEmpty ? normalized : 'global';
+  }
 
   bool _flagFrom(dynamic raw) {
     if (raw is bool) return raw;
@@ -693,6 +733,437 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       socket?.emit(eventName, {'chat_id': widget.chatId});
     } catch (_) {}
+  }
+
+  Future<void> _hydratePersistentOutboxMessages() async {
+    try {
+      final currentUserId = _myUserId();
+      final items = await chatOutboxService.listForChat(
+        chatId: widget.chatId,
+        tenantCode: _outboxTenantCode(),
+      );
+      if (items.isEmpty) return;
+      var changed = false;
+      final nextMessages = List<Map<String, dynamic>>.from(_messages);
+      for (final item in items) {
+        if (currentUserId.isNotEmpty && item.userId != currentUserId) {
+          continue;
+        }
+        final message = Map<String, dynamic>.from(item.message);
+        final meta = _metaMapOf(message['meta']);
+        final normalizedStatus = switch (item.status.trim().toLowerCase()) {
+          'sending' || 'uploading' => 'queued',
+          'failed_permanent' => 'error',
+          'queued' || 'error' => item.status.trim().toLowerCase(),
+          _ => 'queued',
+        };
+        meta['local_only'] = true;
+        meta['delivery_status'] = normalizedStatus;
+        if ((item.errorMessage ?? '').trim().isNotEmpty) {
+          meta['error_message'] = item.errorMessage!.trim();
+        }
+        message['meta'] = meta;
+        message['client_msg_id'] = item.clientMsgId;
+        message['id'] = 'temp-${item.clientMsgId}';
+        final index = _messageIndexInList(
+          nextMessages,
+          clientMsgId: item.clientMsgId,
+        );
+        if (index >= 0) {
+          nextMessages[index] = {...nextMessages[index], ...message};
+        } else {
+          nextMessages.add(message);
+        }
+        changed = true;
+        if (normalizedStatus != item.status.trim().toLowerCase()) {
+          await chatOutboxService.updateStatus(
+            chatId: widget.chatId,
+            tenantCode: _outboxTenantCode(),
+            clientMsgId: item.clientMsgId,
+            status: normalizedStatus,
+            errorMessage: item.errorMessage,
+            message: sanitizeChatOutboxJson(message),
+          );
+        }
+      }
+      if (!changed) return;
+      nextMessages.sort(_compareByCreatedAt);
+      if (!mounted) {
+        _messages = nextMessages;
+        _refreshLoadedMessageBounds();
+        return;
+      }
+      setState(() {
+        _messages = nextMessages;
+        _refreshLoadedMessageBounds();
+      });
+      _recomputeSearchResults();
+    } catch (e, st) {
+      unawaited(
+        MonitoringService.captureError(
+          e,
+          st,
+          subsystem: 'outbox',
+          code: 'outbox_hydration_failed',
+        ),
+      );
+    }
+  }
+
+  Future<void> _persistOutboxItem({
+    required Map<String, dynamic> message,
+    required Map<String, dynamic> retryPayload,
+    required String status,
+    String? errorMessage,
+    int retryCount = 0,
+  }) async {
+    final clientMsgId = (message['client_msg_id'] ?? '').toString().trim();
+    if (clientMsgId.isEmpty) return;
+    await chatOutboxService.upsert(
+      ChatOutboxItem(
+        id: buildChatOutboxItemId(
+          chatId: widget.chatId,
+          tenantCode: _outboxTenantCode(),
+          clientMsgId: clientMsgId,
+        ),
+        chatId: widget.chatId,
+        tenantCode: _outboxTenantCode(),
+        clientMsgId: clientMsgId,
+        userId: _myUserId(),
+        status: status.trim().toLowerCase(),
+        message: sanitizeChatOutboxJson(message),
+        retryPayload: sanitizeChatOutboxJson(retryPayload),
+        errorMessage: errorMessage?.trim().isEmpty ?? true
+            ? null
+            : errorMessage!.trim(),
+        retryCount: retryCount,
+        createdAtIso: DateTime.now().toIso8601String(),
+        updatedAtIso: DateTime.now().toIso8601String(),
+      ),
+    );
+  }
+
+  Future<void> _updatePersistentOutboxStatus({
+    required String clientMsgId,
+    required String status,
+    String? errorMessage,
+    bool clearError = false,
+    int? retryCount,
+    Map<String, dynamic>? message,
+  }) async {
+    if (clientMsgId.trim().isEmpty) return;
+    await chatOutboxService.updateStatus(
+      chatId: widget.chatId,
+      tenantCode: _outboxTenantCode(),
+      clientMsgId: clientMsgId,
+      status: status.trim().toLowerCase(),
+      errorMessage: errorMessage,
+      clearError: clearError,
+      retryCount: retryCount,
+      message: message == null ? null : sanitizeChatOutboxJson(message),
+    );
+  }
+
+  Future<void> _removePersistentOutboxItem(String clientMsgId) async {
+    if (clientMsgId.trim().isEmpty) return;
+    await chatOutboxService.remove(
+      chatId: widget.chatId,
+      tenantCode: _outboxTenantCode(),
+      clientMsgId: clientMsgId,
+    );
+  }
+
+  bool _isRetryableOutboxError(Object error) {
+    if (error is DioException) {
+      if (error.type == DioExceptionType.connectionError ||
+          error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.sendTimeout ||
+          error.type == DioExceptionType.receiveTimeout) {
+        return true;
+      }
+      final statusCode = error.response?.statusCode ?? 0;
+      if (statusCode >= 500) return true;
+      if (statusCode == 408 || statusCode == 409 || statusCode == 429) {
+        return true;
+      }
+      return false;
+    }
+    final normalized = error.toString().toLowerCase();
+    return normalized.contains('network') ||
+        normalized.contains('socketexception') ||
+        normalized.contains('timeout') ||
+        normalized.contains('connection');
+  }
+
+  Future<void> _deletePersistentOutboxMessage(Map<String, dynamic> message) async {
+    final clientMsgId = (message['client_msg_id'] ?? '').toString().trim();
+    if (clientMsgId.isEmpty) return;
+    await _removePersistentOutboxItem(clientMsgId);
+    _removeMessageLocally(_messageIdOf(message));
+  }
+
+  Future<void> _reconcilePersistentOutbox() async {
+    final items = await chatOutboxService.listForChat(
+      chatId: widget.chatId,
+      tenantCode: _outboxTenantCode(),
+    );
+    if (items.isEmpty) return;
+    final clientMsgIds = items
+        .map((item) => item.clientMsgId.trim())
+        .where((id) => id.isNotEmpty)
+        .toList(growable: false);
+    if (clientMsgIds.isEmpty) return;
+    try {
+      final response = await authService.dio.post(
+        '/api/chats/${widget.chatId}/outbox/reconcile',
+        data: {'client_msg_ids': clientMsgIds},
+      );
+      final data = response.data;
+      final rows = data is Map && data['ok'] == true && data['data'] is List
+          ? List<Map<String, dynamic>>.from(
+              (data['data'] as List).whereType<Map>(),
+            )
+          : const <Map<String, dynamic>>[];
+      for (final row in rows) {
+        final clientMsgId = (row['client_msg_id'] ?? '').toString().trim();
+        if (clientMsgId.isEmpty) continue;
+        final state = (row['state'] ?? '').toString().trim().toLowerCase();
+        if (state == 'committed' && row['message'] is Map) {
+          _upsertMessage(Map<String, dynamic>.from(row['message'] as Map));
+          await _removePersistentOutboxItem(clientMsgId);
+          continue;
+        }
+        if (state == 'failed_permanent') {
+          _patchMessageLocally(
+            clientMsgId: clientMsgId,
+            transform: (current) {
+              final meta = _metaMapOf(current['meta']);
+              meta['delivery_status'] = 'error';
+              meta['error_message'] = 'Сервер отклонил файл';
+              return {...current, 'meta': meta};
+            },
+          );
+          await _updatePersistentOutboxStatus(
+            clientMsgId: clientMsgId,
+            status: 'error',
+            errorMessage: 'Сервер отклонил файл',
+          );
+          continue;
+        }
+        if (state == 'ready' ||
+            state == 'processing' ||
+            state == 'uploading' ||
+            state == 'uploaded') {
+          _patchMessageLocally(
+            clientMsgId: clientMsgId,
+            transform: (current) {
+              final meta = _metaMapOf(current['meta']);
+              meta['delivery_status'] =
+                  state == 'ready' ? 'sending' : 'uploading';
+              meta.remove('error_message');
+              return {...current, 'meta': meta};
+            },
+          );
+        }
+      }
+    } catch (e, st) {
+      unawaited(
+        MonitoringService.captureError(
+          e,
+          st,
+          subsystem: 'outbox',
+          code: 'outbox_reconcile_failed',
+        ),
+      );
+    }
+  }
+
+  Future<void> _flushPersistentOutbox({bool includeErrored = false}) async {
+    if (_persistentOutboxFlushInFlight) return;
+    _persistentOutboxFlushInFlight = true;
+    try {
+      final currentUserId = _myUserId();
+      final items = await chatOutboxService.listForChat(
+        chatId: widget.chatId,
+        tenantCode: _outboxTenantCode(),
+      );
+      for (final item in items) {
+        if (currentUserId.isNotEmpty && item.userId != currentUserId) continue;
+        final normalizedStatus = item.status.trim().toLowerCase();
+        if (!(normalizedStatus == 'queued' ||
+            normalizedStatus == 'sending' ||
+            normalizedStatus == 'uploading' ||
+            (includeErrored && normalizedStatus == 'error'))) {
+          continue;
+        }
+        final retryPayload = Map<String, dynamic>.from(item.retryPayload);
+        final retryKind = (retryPayload['kind'] ?? '').toString().trim();
+        final sendingStatus = retryKind == 'media' ? 'uploading' : 'sending';
+        if (mounted) {
+          setState(() {
+            _mediaUploading = retryKind == 'media';
+            _voiceSending =
+                retryKind == 'media' &&
+                (retryPayload['attachment_type'] ?? '').toString().trim() ==
+                    'voice';
+          });
+        } else {
+          _mediaUploading = retryKind == 'media';
+          _voiceSending =
+              retryKind == 'media' &&
+              (retryPayload['attachment_type'] ?? '').toString().trim() ==
+                  'voice';
+        }
+        _patchMessageLocally(
+          clientMsgId: item.clientMsgId,
+          transform: (current) {
+            final nextMeta = _metaMapOf(current['meta']);
+            nextMeta['delivery_status'] = sendingStatus;
+            nextMeta.remove('error_message');
+            if (sendingStatus == 'uploading') {
+              nextMeta['local_upload_progress'] = 0.0;
+            }
+            return {...current, 'meta': nextMeta};
+          },
+        );
+        await _updatePersistentOutboxStatus(
+          clientMsgId: item.clientMsgId,
+          status: sendingStatus,
+          clearError: true,
+          retryCount: item.retryCount,
+          message: item.message,
+        );
+
+        try {
+          if (retryKind == 'text') {
+            final text = (retryPayload['text'] ?? '').toString().trim();
+            if (text.isEmpty) {
+              throw StateError('Пустой текст в persistent outbox');
+            }
+            final replyPayload = _extractReplyPayloadFromRetryPayload(
+              retryPayload,
+            );
+            final resp = await authService.dio.post(
+              '/api/chats/${widget.chatId}/messages',
+              data: {
+                'text': text,
+                'client_msg_id': item.clientMsgId,
+                ...replyPayload,
+              },
+            );
+            if (resp.statusCode == 200 || resp.statusCode == 201) {
+              final data = resp.data;
+              if (data is Map && data['ok'] == true && data['data'] is Map) {
+                _upsertMessage(
+                  Map<String, dynamic>.from(data['data']),
+                  autoScroll: true,
+                );
+              }
+            }
+          } else if (retryKind == 'media') {
+            final upload = _uploadFromRetryPayload(retryPayload);
+            final attachmentType = (retryPayload['attachment_type'] ?? '')
+                .toString()
+                .trim();
+            if (upload == null || attachmentType.isEmpty) {
+              throw StateError('Media payload is unreadable');
+            }
+            final replyPayload = _extractReplyPayloadFromRetryPayload(
+              retryPayload,
+            );
+            await _postMediaMessage(
+              upload: upload,
+              attachmentType: attachmentType,
+              clientMsgId: item.clientMsgId,
+              caption: (retryPayload['caption'] ?? '').toString(),
+              replyPayload: replyPayload,
+              durationMs: int.tryParse('${retryPayload['duration_ms'] ?? 0}'),
+              isVideoNote:
+                  (retryPayload['is_video_note'] ?? false) == true ||
+                  (retryPayload['is_video_note'] ?? '').toString() == 'true',
+              listenOnce:
+                  (retryPayload['listen_once'] ?? false) == true ||
+                  (retryPayload['listen_once'] ?? '').toString() == 'true',
+            );
+          } else {
+            continue;
+          }
+
+          await _removePersistentOutboxItem(item.clientMsgId);
+          await playAppSound(AppUiSound.sent);
+          unawaited(
+            MonitoringService.captureEvent(
+              subsystem: 'outbox',
+              code: 'outbox_item_delivered',
+              level: 'info',
+              message: 'Outbox item delivered',
+              details: <String, dynamic>{
+                'chat_id': widget.chatId,
+                'client_msg_id': item.clientMsgId,
+                'kind': retryKind,
+              },
+            ),
+          );
+        } catch (e, st) {
+          final retryCount = item.retryCount + 1;
+          final isRetryable = _isRetryableOutboxError(e);
+          final nextStatus = isRetryable ? 'queued' : 'error';
+          final errorMessage = _extractDioError(e);
+          _patchMessageLocally(
+            clientMsgId: item.clientMsgId,
+            transform: (current) {
+              final nextMeta = _metaMapOf(current['meta']);
+              nextMeta['delivery_status'] = nextStatus;
+              nextMeta['error_message'] = errorMessage;
+              nextMeta.remove('local_upload_progress');
+              return {...current, 'meta': nextMeta};
+            },
+          );
+          await _updatePersistentOutboxStatus(
+            clientMsgId: item.clientMsgId,
+            status: nextStatus,
+            errorMessage: errorMessage,
+            retryCount: retryCount,
+            message: _messages
+                .where(
+                  (message) =>
+                      (message['client_msg_id'] ?? '').toString().trim() ==
+                      item.clientMsgId,
+                )
+                .cast<Map<String, dynamic>?>()
+                .firstWhere((_) => true, orElse: () => null),
+          );
+          unawaited(
+            MonitoringService.captureError(
+              e,
+              st,
+              subsystem: 'outbox',
+              code: isRetryable
+                  ? 'outbox_retry_failed'
+                  : 'outbox_permanent_failure',
+              level: isRetryable ? 'warn' : 'error',
+              details: <String, dynamic>{
+                'chat_id': widget.chatId,
+                'client_msg_id': item.clientMsgId,
+                'kind': retryKind,
+                'retry_count': retryCount,
+              },
+            ),
+          );
+        }
+        if (mounted) {
+          setState(() {
+            _mediaUploading = false;
+            _voiceSending = false;
+          });
+        } else {
+          _mediaUploading = false;
+          _voiceSending = false;
+        }
+      }
+    } finally {
+      _persistentOutboxFlushInFlight = false;
+    }
   }
 
   void _maybeEmitTypingActivity() {
@@ -806,7 +1277,10 @@ class _ChatScreenState extends State<ChatScreen> {
     await _restoreSavedScrollOffset();
     await _loadServerChatState();
     if (!mounted) return;
+    await _hydratePersistentOutboxMessages();
+    await _reconcilePersistentOutbox();
     await _loadMessages();
+    unawaited(_flushPersistentOutbox());
     await _loadContactCard();
   }
 
@@ -833,6 +1307,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _searchDebounceTimer?.cancel();
     _remoteActivityTimer?.cancel();
     _chatSub?.cancel();
+    _connectivitySub?.cancel();
     _voicePositionSub?.cancel();
     _voiceDurationSub?.cancel();
     _voiceStateSub?.cancel();
@@ -992,14 +1467,21 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _refreshLoadedMessageBounds() {
-    if (_messages.isEmpty) {
+    final persistedMessages = _messages.where((message) {
+      final meta = _metaMapOf(message['meta']);
+      final id = _messageIdOf(message);
+      return meta['local_only'] != true &&
+          id.isNotEmpty &&
+          !id.startsWith('temp-');
+    }).toList(growable: false);
+    if (persistedMessages.isEmpty) {
       _oldestLoadedMessageId = null;
       _oldestLoadedCreatedAt = null;
       _newestLoadedMessageId = null;
       _newestLoadedCreatedAt = null;
       return;
     }
-    final ordered = [..._messages]..sort(_compareByCreatedAt);
+    final ordered = [...persistedMessages]..sort(_compareByCreatedAt);
     final oldest = ordered.first;
     final newest = ordered.last;
     _oldestLoadedMessageId = _messageIdOf(oldest);
@@ -1206,6 +1688,29 @@ class _ChatScreenState extends State<ChatScreen> {
     return best;
   }
 
+  String? _stickyDateLabelForViewport() {
+    final anchor = _currentScrollAnchor();
+    final anchorMessageId = anchor?.messageId.trim() ?? '';
+    if (anchorMessageId.isEmpty) return null;
+    for (final message in _messages) {
+      if (_messageIdOf(message) != anchorMessageId) continue;
+      final createdAt = _parseDate(message['created_at']);
+      if (createdAt == null) return null;
+      return _formatDateLabel(createdAt);
+    }
+    return null;
+  }
+
+  void _refreshStickyDateLabel({required bool show}) {
+    final nextLabel = show ? _stickyDateLabelForViewport() : null;
+    if (_stickyDateLabel == nextLabel) return;
+    if (!mounted) {
+      _stickyDateLabel = nextLabel;
+      return;
+    }
+    setState(() => _stickyDateLabel = nextLabel);
+  }
+
   bool _isPersistableServerMessageId(String? messageId) {
     final normalized = (messageId ?? '').trim();
     if (normalized.isEmpty) return false;
@@ -1286,6 +1791,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _scheduleReadSync();
     }
     final shouldShow = _initialViewportReady && !nearBottom;
+    _refreshStickyDateLabel(show: shouldShow);
     if (_showScrollToBottomButton == shouldShow) return;
     setState(() => _showScrollToBottomButton = shouldShow);
   }
@@ -1902,6 +2408,10 @@ class _ChatScreenState extends State<ChatScreen> {
       _markMessageAppearing(msgId);
     }
     _recomputeSearchResults();
+
+    if (!localOnly && clientMsgId.trim().isNotEmpty) {
+      unawaited(_removePersistentOutboxItem(clientMsgId.trim()));
+    }
 
     if (autoScroll) {
       _scrollToBottom(animated: true);
@@ -2963,14 +3473,19 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _joinRoom() async {
     try {
-      if (socket != null && socket!.connected) {
-        socket!.emit('join_chat', widget.chatId);
-      } else {
-        socket?.on('connect', (_) {
-          socket?.emit('join_chat', widget.chatId);
-        });
-      }
-    } catch (e) {
+      final activeSocket = socket;
+      if (activeSocket == null || !activeSocket.connected) return;
+      activeSocket.emit('join_chat', widget.chatId);
+    } catch (e, st) {
+      unawaited(
+        MonitoringService.captureError(
+          e,
+          st,
+          subsystem: 'realtime',
+          code: 'chat_room_join_emit_failed',
+          details: <String, dynamic>{'chat_id': widget.chatId},
+        ),
+      );
       debugPrint('joinRoom error: $e');
     }
   }
@@ -3069,6 +3584,19 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       if (lastError != null) {
         debugPrint('Error loading messages: $lastError');
+        unawaited(
+          MonitoringService.captureError(
+            lastError,
+            null,
+            subsystem: 'chat',
+            code: 'chat_messages_load_failed',
+            level: _isTransientMessageLoadError(lastError) ? 'warn' : 'error',
+            details: <String, dynamic>{
+              'chat_id': widget.chatId,
+              'transient': _isTransientMessageLoadError(lastError),
+            },
+          ),
+        );
         if (mounted &&
             _messages.isEmpty &&
             _isTransientMessageLoadError(lastError)) {
@@ -3109,6 +3637,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final previousMaxExtent = hadClients
         ? _scrollController.position.maxScrollExtent
         : 0.0;
+    final viewportAnchor = hadClients ? _currentScrollAnchor() : null;
     try {
       final resp = await authService.dio.get(
         '/api/chats/${widget.chatId}/messages',
@@ -3193,12 +3722,24 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || !_scrollController.hasClients) return;
+        if (viewportAnchor != null &&
+            viewportAnchor.messageId.trim().isNotEmpty) {
+          unawaited(
+            _restoreSavedViewportByAnchor(
+              messageId: viewportAnchor.messageId,
+              desiredOffset: viewportAnchor.offset,
+              passes: 3,
+            ),
+          );
+          return;
+        }
         final nextMaxExtent = _scrollController.position.maxScrollExtent;
         final delta = nextMaxExtent - previousMaxExtent;
         final target = (previousPixels + max(0.0, delta))
             .clamp(0.0, nextMaxExtent)
             .toDouble();
         _scrollController.jumpTo(target);
+        _handleScroll();
       });
     } catch (_) {
       // ignore transient older-page failures
@@ -3285,11 +3826,35 @@ class _ChatScreenState extends State<ChatScreen> {
         _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
         _refreshLoadedMessageBounds();
       }
+      if (pageMessages.isNotEmpty) {
+        unawaited(
+          MonitoringService.captureEvent(
+            subsystem: 'realtime',
+            code: 'replay_fallback_used',
+            level: 'info',
+            message: 'Replay fallback restored messages after reconnect',
+            details: <String, dynamic>{
+              'chat_id': widget.chatId,
+              'restored_count': pageMessages.length,
+            },
+          ),
+        );
+      }
       _recomputeSearchResults();
       if (_isNearBottom()) {
         _scheduleReadSync();
       }
-    } catch (_) {
+    } catch (e, st) {
+      unawaited(
+        MonitoringService.captureError(
+          e,
+          st,
+          subsystem: 'realtime',
+          code: 'replay_fallback_failed',
+          level: 'warn',
+          details: <String, dynamic>{'chat_id': widget.chatId},
+        ),
+      );
       // ignore replay issues; next socket/API refresh will recover
     } finally {
       _loadingNewerMessages = false;
@@ -3409,9 +3974,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool get _cameraSupported {
-    if (kIsWeb) return true;
-    return defaultTargetPlatform == TargetPlatform.android ||
-        defaultTargetPlatform == TargetPlatform.iOS;
+    return _captureProfile.cameraSupported;
   }
 
   bool get _anyComposerRecording => _voiceRecording || _videoRecording;
@@ -3431,79 +3994,121 @@ class _ChatScreenState extends State<ChatScreen> {
         defaultTargetPlatform == TargetPlatform.linux;
   }
 
-  Future<MultipartFile> _multipartFromUpload(
-    _ChatUploadFile file, {
-    DioMediaType? contentType,
-  }) async {
-    final resolvedContentType =
-        contentType ?? _mediaTypeFromMimeString(file.mimeType);
-    if (!kIsWeb && file.path != null && file.path!.trim().isNotEmpty) {
-      return MultipartFile.fromFile(
-        file.path!,
-        filename: file.filename,
-        contentType: resolvedContentType,
-      );
+  bool get _isWifiLikeConnection =>
+      _connectivityResults.contains(ConnectivityResult.wifi) ||
+      _connectivityResults.contains(ConnectivityResult.ethernet);
+
+  String _autoDownloadPolicyForKind(String kind) {
+    switch (kind) {
+      case 'audio':
+        return _messengerPrefs.mediaAutoDownloadAudio;
+      case 'video':
+        return _messengerPrefs.mediaAutoDownloadVideo;
+      case 'document':
+        return _messengerPrefs.mediaAutoDownloadDocuments;
+      case 'image':
+      default:
+        return _messengerPrefs.mediaAutoDownloadImages;
     }
-    final bytes = file.bytes;
-    if (bytes == null || bytes.isEmpty) {
-      throw Exception('Не удалось прочитать файл');
+  }
+
+  bool _allowsAutoDownloadPolicy(String policy) {
+    switch (policy.trim().toLowerCase()) {
+      case 'never':
+        return false;
+      case 'wifi':
+        return _isWifiLikeConnection;
+      case 'wifi_cellular':
+      default:
+        return true;
     }
-    return MultipartFile.fromBytes(
-      bytes,
-      filename: file.filename,
-      contentType: resolvedContentType,
+  }
+
+  String _mediaLoadKey(
+    Map<String, dynamic> message, {
+    required String kind,
+    String? fallbackToken,
+  }) {
+    final messageId = _messageIdOf(message).trim();
+    if (messageId.isNotEmpty) return '$kind:$messageId';
+    final clientMsgId = (message['client_msg_id'] ?? '').toString().trim();
+    if (clientMsgId.isNotEmpty) return '$kind:$clientMsgId';
+    final token = (fallbackToken ?? '').trim();
+    if (token.isNotEmpty) return '$kind:$token';
+    return '$kind:${identityHashCode(message)}';
+  }
+
+  bool _canAutoLoadMedia(
+    Map<String, dynamic> message, {
+    required String kind,
+    String? fallbackToken,
+  }) {
+    final key = _mediaLoadKey(
+      message,
+      kind: kind,
+      fallbackToken: fallbackToken,
     );
+    return _manualMediaLoads.contains(key) ||
+        _allowsAutoDownloadPolicy(_autoDownloadPolicyForKind(kind));
   }
 
-  DioMediaType? _mediaTypeFromMimeString(String? mimeRaw) {
-    final mime = (mimeRaw ?? '').trim().toLowerCase();
-    if (mime.isEmpty || !mime.contains('/')) return null;
-    final parts = mime.split('/');
-    final type = parts.first.trim();
-    final subtype = parts.sublist(1).join('/').split(';').first.trim();
-    if (type.isEmpty || subtype.isEmpty) return null;
-    return DioMediaType(type, subtype);
+  void _allowManualMediaLoad(
+    Map<String, dynamic> message, {
+    required String kind,
+    String? fallbackToken,
+  }) {
+    final key = _mediaLoadKey(
+      message,
+      kind: kind,
+      fallbackToken: fallbackToken,
+    );
+    if (_manualMediaLoads.contains(key)) return;
+    if (!mounted) {
+      _manualMediaLoads.add(key);
+      return;
+    }
+    setState(() => _manualMediaLoads.add(key));
   }
 
-  DioMediaType? _voiceContentTypeForUpload(_ChatUploadFile upload) {
-    final mimeType = _mediaTypeFromMimeString(upload.mimeType);
-    if (mimeType != null) return mimeType;
-    final name = upload.filename.toLowerCase().trim();
-    if (name.endsWith('.m4a') || name.endsWith('.mp4')) {
-      return DioMediaType('audio', 'mp4');
-    }
-    if (name.endsWith('.aac')) {
-      return DioMediaType('audio', 'aac');
-    }
-    if (name.endsWith('.wav')) {
-      return DioMediaType('audio', 'wav');
-    }
-    if (name.endsWith('.mp3')) {
-      return DioMediaType('audio', 'mpeg');
-    }
-    if (name.endsWith('.ogg') || name.endsWith('.opus')) {
-      return DioMediaType('audio', 'ogg');
-    }
-    if (name.endsWith('.webm')) {
-      return DioMediaType('audio', 'webm');
-    }
-    return DioMediaType('application', 'octet-stream');
+  Future<void> _loadMessengerPreferences() async {
+    try {
+      final prefs = await messengerPreferencesService.load();
+      if (!mounted) {
+        _messengerPrefs = prefs;
+        return;
+      }
+      setState(() => _messengerPrefs = prefs);
+    } catch (_) {}
   }
 
-  DioMediaType? _videoContentTypeForUpload(_ChatUploadFile upload) {
-    final mimeType = _mediaTypeFromMimeString(upload.mimeType);
-    if (mimeType != null) return mimeType;
-    final name = upload.filename.toLowerCase().trim();
-    if (name.endsWith('.mp4') || name.endsWith('.m4v')) {
-      return DioMediaType('video', 'mp4');
+  Future<void> _refreshConnectivityState() async {
+    try {
+      final results = await _connectivity.checkConnectivity();
+      if (!mounted) {
+        _connectivityResults = List<ConnectivityResult>.from(results);
+        return;
+      }
+      setState(() {
+        _connectivityResults = List<ConnectivityResult>.from(results);
+      });
+    } catch (_) {}
+  }
+
+  Future<String> _recommendedMediaQualityMode() async {
+    try {
+      final prefs = await messengerPreferencesService.load();
+      final connectivity = await _connectivity.checkConnectivity();
+      final onWifi = connectivity.contains(ConnectivityResult.wifi) ||
+          connectivity.contains(ConnectivityResult.ethernet);
+      final quality = onWifi
+          ? prefs.mediaSendQualityWifi
+          : prefs.mediaSendQualityCellular;
+      final normalized = quality.trim().toLowerCase();
+      if (normalized == 'hd' || normalized == 'file') return normalized;
+      return 'standard';
+    } catch (_) {
+      return 'standard';
     }
-    if (name.endsWith('.webm')) {
-      return DioMediaType('video', 'webm');
-    }
-    if (name.endsWith('.mov')) {
-      return DioMediaType('video', 'quicktime');
-    }
-    return DioMediaType('application', 'octet-stream');
   }
 
   String _videoExtensionForMime(String? mimeRaw) {
@@ -3725,6 +4330,11 @@ class _ChatScreenState extends State<ChatScreen> {
     if (lower.endsWith('.gif')) return 'image/gif';
     if (lower.endsWith('.heic')) return 'image/heic';
     if (lower.endsWith('.heif')) return 'image/heif';
+    if (lower.endsWith('.mp4')) return 'video/mp4';
+    if (lower.endsWith('.mov')) return 'video/quicktime';
+    if (lower.endsWith('.webm')) return 'video/webm';
+    if (lower.endsWith('.m4v')) return 'video/x-m4v';
+    if (lower.endsWith('.mkv')) return 'video/x-matroska';
     if (lower.endsWith('.pdf')) return 'application/pdf';
     if (lower.endsWith('.doc')) return 'application/msword';
     if (lower.endsWith('.docx')) {
@@ -3780,34 +4390,90 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Future<_ImageSendMode?> _promptImageSendMode() async {
+  Future<_ImageSendMode> _recommendedImageSendMode() async {
+    try {
+      final prefs = await messengerPreferencesService.load();
+      final connectivity = await Connectivity().checkConnectivity();
+      final onWifi = connectivity.contains(ConnectivityResult.wifi) ||
+          connectivity.contains(ConnectivityResult.ethernet);
+      final quality = onWifi
+          ? prefs.mediaSendQualityWifi
+          : prefs.mediaSendQualityCellular;
+      switch (quality) {
+        case 'file':
+          return _ImageSendMode.file;
+        case 'hd':
+          return _ImageSendMode.hd;
+        case 'standard':
+        default:
+          return _ImageSendMode.standard;
+      }
+    } catch (_) {
+      return _ImageSendMode.standard;
+    }
+  }
+
+  Future<_ImageSendMode?> _promptImageSendMode(
+    _ImageSendMode recommended,
+  ) async {
     if (!mounted) return null;
+    final orderedModes = <_ImageSendMode>[
+      recommended,
+      ..._ImageSendMode.values.where((mode) => mode != recommended),
+    ];
+
+    String titleFor(_ImageSendMode mode) {
+      switch (mode) {
+        case _ImageSendMode.standard:
+          return 'Стандарт';
+        case _ImageSendMode.hd:
+          return 'HD';
+        case _ImageSendMode.file:
+          return 'Как файл';
+      }
+    }
+
+    String subtitleFor(_ImageSendMode mode) {
+      final suffix = mode == recommended
+          ? ' • рекомендовано для текущей сети'
+          : '';
+      switch (mode) {
+        case _ImageSendMode.standard:
+          return 'Сжать и отправить как обычное фото$suffix';
+        case _ImageSendMode.hd:
+          return 'Лучше качество, файл будет тяжелее$suffix';
+        case _ImageSendMode.file:
+          return 'Без сжатия, как документ$suffix';
+      }
+    }
+
+    IconData iconFor(_ImageSendMode mode) {
+      switch (mode) {
+        case _ImageSendMode.standard:
+          return Icons.photo_outlined;
+        case _ImageSendMode.hd:
+          return Icons.hd_outlined;
+        case _ImageSendMode.file:
+          return Icons.insert_drive_file_outlined;
+      }
+    }
+
     return showModalBottomSheet<_ImageSendMode>(
       context: context,
       showDragHandle: true,
       builder: (ctx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.photo_outlined),
-              title: const Text('Стандарт'),
-              subtitle: const Text('Сжать и отправить как обычное фото'),
-              onTap: () => Navigator.of(ctx).pop(_ImageSendMode.standard),
-            ),
-            ListTile(
-              leading: const Icon(Icons.hd_outlined),
-              title: const Text('HD'),
-              subtitle: const Text('Лучше качество, файл будет тяжелее'),
-              onTap: () => Navigator.of(ctx).pop(_ImageSendMode.hd),
-            ),
-            ListTile(
-              leading: const Icon(Icons.insert_drive_file_outlined),
-              title: const Text('Как файл'),
-              subtitle: const Text('Без сжатия, как документ'),
-              onTap: () => Navigator.of(ctx).pop(_ImageSendMode.file),
-            ),
-          ],
+          children: orderedModes
+              .map(
+                (mode) => ListTile(
+                  leading: Icon(iconFor(mode)),
+                  title: Text(titleFor(mode)),
+                  subtitle: Text(subtitleFor(mode)),
+                  onTap: () => Navigator.of(ctx).pop(mode),
+                ),
+              )
+              .toList(growable: false),
         ),
       ),
     );
@@ -3875,6 +4541,161 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<_ChatUploadFile?> _pickVideoUpload({ImageSource? source}) async {
+    final shouldUsePicker = kIsWeb ||
+        defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        defaultTargetPlatform == TargetPlatform.linux ||
+        source == null;
+    if (shouldUsePicker) {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.video,
+        allowMultiple: false,
+        withData: kIsWeb,
+      );
+      final picked = result?.files.single;
+      if (picked == null) return null;
+      final bytes = picked.bytes;
+      return _ChatUploadFile(
+        filename: picked.name.isNotEmpty ? picked.name : 'video.mp4',
+        path: (picked.path ?? '').trim().isNotEmpty ? picked.path!.trim() : null,
+        bytes: bytes == null || bytes.isEmpty ? null : bytes,
+        mimeType: _guessMimeTypeFromFilename(picked.name),
+        fileSize: picked.size,
+        qualityMode: await _recommendedMediaQualityMode(),
+      );
+    }
+
+    final picked = await _imagePicker.pickVideo(source: source);
+    if (picked == null) return null;
+    final bytes = kIsWeb ? await picked.readAsBytes() : null;
+    return _ChatUploadFile(
+      filename: picked.name.isNotEmpty ? picked.name : picked.path.split('/').last,
+      path: picked.path.trim().isNotEmpty ? picked.path : null,
+      bytes: bytes == null || bytes.isEmpty ? null : bytes,
+      mimeType: (picked.mimeType ?? '').trim().isNotEmpty == true
+          ? picked.mimeType!.trim()
+          : _guessMimeTypeFromFilename(
+              picked.name.isNotEmpty ? picked.name : picked.path.split('/').last,
+            ),
+      fileSize: bytes?.length,
+      qualityMode: await _recommendedMediaQualityMode(),
+    );
+  }
+
+  Future<Uint8List> _readUploadBytes(_ChatUploadFile upload) async {
+    final bytes = upload.bytes;
+    if (bytes != null && bytes.isNotEmpty) return bytes;
+    final path = (upload.path ?? '').trim();
+    if (path.isEmpty) {
+      throw Exception('Не удалось прочитать файл для отправки');
+    }
+    final read = await XFile(path).readAsBytes();
+    if (read.isEmpty) {
+      throw Exception('Файл пустой');
+    }
+    return Uint8List.fromList(read);
+  }
+
+  String _sha256Hex(Uint8List bytes) {
+    return crypto.sha256.convert(bytes).toString();
+  }
+
+  int _uploadChunkSizeForBytes(int totalBytes) {
+    if (totalBytes >= 20 * 1024 * 1024) return 1024 * 1024;
+    if (totalBytes >= 5 * 1024 * 1024) return 768 * 1024;
+    return 512 * 1024;
+  }
+
+  Future<Map<String, dynamic>> _createUploadSession({
+    required _ChatUploadFile upload,
+    required String attachmentType,
+    required String clientMsgId,
+    required Uint8List bytes,
+    int? durationMs,
+    bool isVideoNote = false,
+    bool listenOnce = false,
+  }) async {
+    final response = await authService.dio.post(
+      '/api/chats/uploads/sessions',
+      data: {
+        'chat_id': widget.chatId,
+        'client_msg_id': clientMsgId,
+        'attachment_kind': attachmentType,
+        'quality_mode': (upload.qualityMode ?? '').trim(),
+        'original_file_name': upload.filename,
+        'mime_type': (upload.mimeType ?? '').trim(),
+        'total_bytes': bytes.length,
+        'sha256': _sha256Hex(bytes),
+        if ((upload.width ?? 0) > 0) 'image_width': upload.width,
+        if ((upload.height ?? 0) > 0) 'image_height': upload.height,
+        if ((upload.preprocessTag ?? '').trim().isNotEmpty)
+          'image_preprocess': upload.preprocessTag,
+        if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
+        if (isVideoNote) 'is_video_note': true,
+        if (listenOnce) 'listen_once': true,
+      },
+    );
+    final data = response.data;
+    if (data is Map && data['ok'] == true && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data'] as Map);
+    }
+    throw Exception('Не удалось создать upload session');
+  }
+
+  Future<Map<String, dynamic>> _appendUploadChunk({
+    required String sessionId,
+    required Uint8List bytes,
+    required int offset,
+  }) async {
+    final response = await authService.dio.patch(
+      '/api/chats/uploads/sessions/$sessionId',
+      data: FormData.fromMap({
+        'offset': offset,
+        'chunk': MultipartFile.fromBytes(
+          bytes,
+          filename: 'chunk-${offset + bytes.length}.bin',
+        ),
+      }),
+    );
+    final data = response.data;
+    if (data is Map && data['ok'] == true && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data'] as Map);
+    }
+    throw Exception('Не удалось отправить chunk');
+  }
+
+  Future<Map<String, dynamic>> _completeUploadSession(String sessionId) async {
+    final response = await authService.dio.post(
+      '/api/chats/uploads/sessions/$sessionId/complete',
+    );
+    final data = response.data;
+    if (data is Map && data['ok'] == true && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data'] as Map);
+    }
+    throw Exception('Не удалось завершить upload session');
+  }
+
+  Future<Map<String, dynamic>> _commitUploadSession({
+    required String sessionId,
+    required String caption,
+    required Map<String, dynamic> replyPayload,
+  }) async {
+    final response = await authService.dio.post(
+      '/api/chats/${widget.chatId}/messages/media/commit',
+      data: {
+        'session_id': sessionId,
+        if (caption.trim().isNotEmpty) 'text': caption.trim(),
+        ...replyPayload,
+      },
+    );
+    final data = response.data;
+    if (data is Map && data['ok'] == true && data['data'] is Map) {
+      return Map<String, dynamic>.from(data['data'] as Map);
+    }
+    throw Exception('Не удалось опубликовать медиа-сообщение');
+  }
+
   Future<void> _postMediaMessage({
     required _ChatUploadFile upload,
     required String attachmentType,
@@ -3882,90 +4703,63 @@ class _ChatScreenState extends State<ChatScreen> {
     required String caption,
     required Map<String, dynamic> replyPayload,
     int? durationMs,
+    bool isVideoNote = false,
+    bool listenOnce = false,
   }) async {
-    var lastReportedBucket = -1;
-    final form = FormData.fromMap({
-      if (attachmentType == 'image')
-        'image': await _multipartFromUpload(upload),
-      if (attachmentType == 'image' && (upload.width ?? 0) > 0)
-        'image_width': upload.width,
-      if (attachmentType == 'image' && (upload.height ?? 0) > 0)
-        'image_height': upload.height,
-      if (attachmentType == 'image' &&
-          (upload.width ?? 0) > 0 &&
-          (upload.height ?? 0) > 0)
-        'image_aspect_ratio': (upload.width! / upload.height!).toStringAsFixed(
-          4,
-        ),
-      if (attachmentType == 'image' &&
-          (upload.preprocessTag ?? '').trim().isNotEmpty)
-        'image_preprocess': upload.preprocessTag!.trim(),
-      if (attachmentType == 'voice')
-        'voice': await _multipartFromUpload(
-          upload,
-          contentType: _voiceContentTypeForUpload(upload),
-        ),
-      if (attachmentType == 'video')
-        'video': await _multipartFromUpload(
-          upload,
-          contentType: _videoContentTypeForUpload(upload),
-        ),
-      if (attachmentType == 'file')
-        'file': await _multipartFromUpload(
-          upload,
-          contentType: _mediaTypeFromMimeString(upload.mimeType),
-        ),
-      'client_msg_id': clientMsgId,
-      ...replyPayload,
-      if (caption.trim().isNotEmpty) 'text': caption.trim(),
-      if ((upload.qualityMode ?? '').trim().isNotEmpty)
-        'quality_mode': upload.qualityMode!.trim(),
-      if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
-    });
-
-    final resp = await authService.dio.post(
-      '/api/chats/${widget.chatId}/messages/media',
-      data: form,
-      onSendProgress: (sent, total) {
-        if (total <= 0) return;
-        final progress = (sent / total).clamp(0.0, 1.0).toDouble();
-        final bucket = (progress * 100).floor();
-        if (bucket == lastReportedBucket) return;
-        lastReportedBucket = bucket;
-        _patchMessageLocally(
-          clientMsgId: clientMsgId,
-          transform: (current) {
-            final nextMeta = _metaMapOf(current['meta']);
-            nextMeta['delivery_status'] = progress >= 0.995
-                ? 'sending'
-                : 'uploading';
-            nextMeta['local_upload_progress'] = progress;
-            nextMeta.remove('error_message');
-            return {...current, 'meta': nextMeta};
-          },
-        );
-      },
+    final bytes = await _readUploadBytes(upload);
+    final session = await _createUploadSession(
+      upload: upload,
+      attachmentType: attachmentType,
+      clientMsgId: clientMsgId,
+      bytes: bytes,
+      durationMs: durationMs,
+      isVideoNote: isVideoNote,
+      listenOnce: listenOnce,
     );
-
-    if (resp.statusCode == 200 || resp.statusCode == 201) {
-      final data = resp.data;
-      if (data is Map && data['ok'] == true && data['data'] is Map) {
-        _upsertMessage(
-          Map<String, dynamic>.from(data['data']),
-          autoScroll: true,
-        );
-        return;
-      }
-      await _loadMessages(showLoader: false);
-      return;
+    final sessionId = (session['id'] ?? '').toString().trim();
+    if (sessionId.isEmpty) {
+      throw Exception('Сервер не вернул upload session id');
     }
-    throw Exception('Сервер не принял вложение');
+    final chunkSize = _uploadChunkSizeForBytes(bytes.length);
+    var offset = 0;
+    while (offset < bytes.length) {
+      final end = math.min(bytes.length, offset + chunkSize);
+      final chunk = Uint8List.sublistView(bytes, offset, end);
+      await _appendUploadChunk(
+        sessionId: sessionId,
+        bytes: chunk,
+        offset: offset,
+      );
+      offset = end;
+      final progress = (offset / bytes.length).clamp(0.0, 1.0).toDouble();
+      _patchMessageLocally(
+        clientMsgId: clientMsgId,
+        transform: (current) {
+          final nextMeta = _metaMapOf(current['meta']);
+          nextMeta['delivery_status'] = progress >= 0.995
+              ? 'sending'
+              : 'uploading';
+          nextMeta['local_upload_progress'] = progress;
+          nextMeta.remove('error_message');
+          return {...current, 'meta': nextMeta};
+        },
+      );
+    }
+    await _completeUploadSession(sessionId);
+    final message = await _commitUploadSession(
+      sessionId: sessionId,
+      caption: caption,
+      replyPayload: replyPayload,
+    );
+    _upsertMessage(message, autoScroll: true);
   }
 
   Future<void> _sendMediaMessage({
     required _ChatUploadFile upload,
     required String attachmentType,
     int? durationMs,
+    bool isVideoNote = false,
+    bool listenOnce = false,
   }) async {
     if (!_canCompose()) return;
     final clientMsgId = _generateClientMessageId();
@@ -3983,6 +4777,8 @@ class _ChatScreenState extends State<ChatScreen> {
       caption: caption,
       replyPayload: replyPayload,
       durationMs: durationMs,
+      isVideoNote: isVideoNote,
+      listenOnce: listenOnce,
     );
     if (attachmentType == 'image' ||
         attachmentType == 'video' ||
@@ -3991,56 +4787,12 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _clearReplyComposer();
     _upsertMessage(optimisticMessage, autoScroll: true);
-    setState(() {
-      _mediaUploading =
-          attachmentType == 'image' ||
-          attachmentType == 'video' ||
-          attachmentType == 'file';
-      _voiceSending = attachmentType == 'voice';
-    });
-    try {
-      await _postMediaMessage(
-        upload: upload,
-        attachmentType: attachmentType,
-        clientMsgId: clientMsgId,
-        caption: caption,
-        replyPayload: replyPayload,
-        durationMs: durationMs,
-      );
-      await playAppSound(AppUiSound.sent);
-    } catch (e) {
-      _patchMessageLocally(
-        clientMsgId: clientMsgId,
-        transform: (current) {
-          final nextMeta = _metaMapOf(current['meta']);
-          nextMeta['delivery_status'] = 'error';
-          nextMeta['error_message'] = _extractDioError(e);
-          nextMeta.remove('local_upload_progress');
-          return {...current, 'meta': nextMeta};
-        },
-      );
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        attachmentType == 'image'
-            ? 'Не удалось отправить изображение: ${_extractDioError(e)}'
-            : attachmentType == 'video'
-            ? 'Не удалось отправить видео: ${_extractDioError(e)}'
-            : attachmentType == 'file'
-            ? 'Не удалось отправить файл: ${_extractDioError(e)}'
-            : 'Не удалось отправить голосовое сообщение: ${_extractDioError(e)}',
-        tone: AppNoticeTone.error,
-        duration: const Duration(seconds: 2),
-      );
-      debugPrint('sendMediaMessage error: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _mediaUploading = false;
-          _voiceSending = false;
-        });
-      }
-    }
+    await _persistOutboxItem(
+      message: optimisticMessage,
+      retryPayload: _retryPayloadOf(_metaMapOf(optimisticMessage['meta'])),
+      status: 'queued',
+    );
+    unawaited(_flushPersistentOutbox());
   }
 
   Future<void> _pickAndSendImage(ImageSource source) async {
@@ -4050,7 +4802,8 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final rawUpload = await _pickRawImageUpload(source);
       if (rawUpload == null) return;
-      final sendMode = await _promptImageSendMode();
+      final recommendedMode = await _recommendedImageSendMode();
+      final sendMode = await _promptImageSendMode(recommendedMode);
       if (sendMode == null) return;
       final upload = await _prepareImageUploadForMode(rawUpload, sendMode);
       if (upload == null) return;
@@ -4087,6 +4840,26 @@ class _ChatScreenState extends State<ChatScreen> {
         duration: const Duration(seconds: 2),
       );
       debugPrint('pickAndSendFile error: $e');
+    }
+  }
+
+  Future<void> _pickAndSendVideo({ImageSource? source}) async {
+    if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
+      return;
+    }
+    try {
+      final upload = await _pickVideoUpload(source: source);
+      if (upload == null) return;
+      await _sendMediaMessage(upload: upload, attachmentType: 'video');
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось выбрать видео',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+      debugPrint('pickAndSendVideo error: $e');
     }
   }
 
@@ -4127,6 +4900,29 @@ class _ChatScreenState extends State<ChatScreen> {
                 );
               },
             ),
+            ListTile(
+              leading: const Icon(Icons.videocam_outlined),
+              title: const Text('Выбрать видео'),
+              onTap: () {
+                Navigator.of(context).pop();
+                Future<void>.delayed(
+                  const Duration(milliseconds: 120),
+                  _pickAndSendVideo,
+                );
+              },
+            ),
+            if (_cameraSupported && !kIsWeb)
+              ListTile(
+                leading: const Icon(Icons.video_call_outlined),
+                title: const Text('Снять видео'),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  Future<void>.delayed(
+                    const Duration(milliseconds: 120),
+                    () => _pickAndSendVideo(source: ImageSource.camera),
+                  );
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.attach_file_rounded),
               title: const Text('Документ или файл'),
@@ -4641,6 +5437,18 @@ class _ChatScreenState extends State<ChatScreen> {
         _videoStartInProgress) {
       return;
     }
+    if (!_captureProfile.videoNoteCaptureSupported) {
+      if (mounted) {
+        showAppNotice(
+          context,
+          _captureProfile.videoNoteFallbackReason,
+          tone: AppNoticeTone.info,
+          duration: const Duration(seconds: 3),
+        );
+      }
+      await _pickAndSendVideo();
+      return;
+    }
     _videoStartInProgress = true;
     try {
       if (kIsWeb) {
@@ -4778,6 +5586,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           attachmentType: 'video',
           durationMs: durationMs,
+          isVideoNote: true,
         );
       } else {
         await _sendMediaMessage(
@@ -4789,6 +5598,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           attachmentType: 'video',
           durationMs: durationMs,
+          isVideoNote: true,
         );
       }
     } catch (e) {
@@ -5388,6 +6198,26 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<void> _openExpandedVideoNote(
+    Map<String, dynamic> message,
+    Map<String, dynamic> meta,
+  ) async {
+    final videoUrl = _videoUrlOf(meta);
+    if (videoUrl == null || videoUrl.trim().isEmpty) return;
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.92),
+      builder: (ctx) => _ExpandedVideoNoteViewer(
+        videoUrl: videoUrl,
+        previewImageUrl: _videoPreviewImageUrlOf(meta),
+        durationMs: _videoDurationMsOf(meta),
+        title: _senderNameOf(message),
+        caption: _captionTextOf(message, meta),
+        timeLabel: _formatMessageTime(message['created_at']),
+      ),
+    );
+  }
+
   Map<String, dynamic> _currentReplyPayload() {
     final replyId = (_replyToMessageId ?? '').trim();
     if (replyId.isEmpty) return const <String, dynamic>{};
@@ -5479,10 +6309,14 @@ class _ChatScreenState extends State<ChatScreen> {
     required Map<String, dynamic> replyPayload,
     required String caption,
     int? durationMs,
+    bool isVideoNote = false,
+    bool listenOnce = false,
   }) {
     return <String, dynamic>{
       'kind': 'media',
       'attachment_type': attachmentType,
+      if (isVideoNote) 'is_video_note': true,
+      if (listenOnce) 'listen_once': true,
       'filename': upload.filename,
       if ((upload.path ?? '').trim().isNotEmpty) 'path': upload.path!.trim(),
       if (upload.bytes != null) 'bytes': upload.bytes,
@@ -5568,6 +6402,8 @@ class _ChatScreenState extends State<ChatScreen> {
     required String caption,
     required Map<String, dynamic> replyPayload,
     int? durationMs,
+    bool isVideoNote = false,
+    bool listenOnce = false,
   }) {
     final currentUser = authService.currentUser;
     final previewUrl = attachmentType == 'image'
@@ -5579,12 +6415,13 @@ class _ChatScreenState extends State<ChatScreen> {
       replyPayload: replyPayload,
       caption: caption,
       durationMs: durationMs,
+      isVideoNote: isVideoNote,
+      listenOnce: listenOnce,
     );
     final meta = <String, dynamic>{
       'attachment_type': attachmentType,
       'local_only': true,
-      'delivery_status': 'uploading',
-      'local_upload_progress': 0.0,
+      'delivery_status': 'queued',
       'retry_payload': retryPayload,
       ...replyPayload,
       if (attachmentType == 'image' && previewUrl != null)
@@ -5600,10 +6437,13 @@ class _ChatScreenState extends State<ChatScreen> {
         'file_size': upload.fileSize,
       if ((upload.qualityMode ?? '').trim().isNotEmpty)
         'quality_mode': upload.qualityMode!.trim(),
+      if (isVideoNote) 'is_video_note': true,
+      if (listenOnce) 'listen_once': true,
       if (attachmentType == 'voice' && (durationMs ?? 0) > 0)
         'voice_duration_ms': durationMs,
       if (attachmentType == 'video' && (durationMs ?? 0) > 0)
         'video_duration_ms': durationMs,
+      if (attachmentType == 'video' && isVideoNote) 'is_video_note': true,
       if (caption.trim().isNotEmpty && attachmentType != 'voice')
         'caption': caption.trim(),
     };
@@ -5645,120 +6485,27 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_isRetryableFailedMessage(message)) return;
     final meta = _metaMapOf(message['meta']);
     final retryPayload = _retryPayloadOf(meta);
-    final retryKind = (retryPayload['kind'] ?? '').toString().trim();
-    if (retryKind == 'media') {
-      final upload = _uploadFromRetryPayload(retryPayload);
-      final attachmentType = (retryPayload['attachment_type'] ?? '')
-          .toString()
-          .trim();
-      if (upload == null || attachmentType.isEmpty) return;
-      final replyPayload = _extractReplyPayloadFromRetryPayload(retryPayload);
-      final nextClientMsgId = _generateClientMessageId();
-      final sendingMessage = _buildOptimisticMediaMessage(
-        clientMsgId: nextClientMsgId,
-        upload: upload,
-        attachmentType: attachmentType,
-        caption: (retryPayload['caption'] ?? '').toString(),
-        replyPayload: replyPayload,
-        durationMs: int.tryParse('${retryPayload['duration_ms'] ?? 0}'),
-      );
-      _upsertMessage({
-        ...message,
-        'id': 'temp-$nextClientMsgId',
-        'client_msg_id': nextClientMsgId,
-        'text': sendingMessage['text'],
-        'meta': sendingMessage['meta'],
-      }, autoScroll: true);
-      try {
-        await _postMediaMessage(
-          upload: upload,
-          attachmentType: attachmentType,
-          clientMsgId: nextClientMsgId,
-          caption: (retryPayload['caption'] ?? '').toString(),
-          replyPayload: replyPayload,
-          durationMs: int.tryParse('${retryPayload['duration_ms'] ?? 0}'),
-        );
-        await playAppSound(AppUiSound.sent);
-      } catch (e) {
-        _patchMessageLocally(
-          clientMsgId: nextClientMsgId,
-          transform: (current) {
-            final nextMeta = _metaMapOf(current['meta']);
-            nextMeta['delivery_status'] = 'error';
-            nextMeta['error_message'] = _extractDioError(e);
-            nextMeta.remove('local_upload_progress');
-            return {...current, 'meta': nextMeta};
-          },
-        );
-        if (!mounted) return;
-        showAppNotice(
-          context,
-          'Не удалось повторно отправить вложение',
-          tone: AppNoticeTone.error,
-          duration: const Duration(seconds: 2),
-        );
-      }
-      return;
-    }
+    final clientMsgId = (message['client_msg_id'] ?? '').toString().trim();
+    if (clientMsgId.isEmpty) return;
 
-    final text = (retryPayload['text'] ?? message['text'] ?? '')
-        .toString()
-        .trim();
-    if (text.isEmpty) return;
-
-    final nextClientMsgId = _generateClientMessageId();
-    final replyPayload = _extractReplyPayloadFromRetryPayload(retryPayload);
-
-    final sendingMeta = <String, dynamic>{
+    final queuedMeta = <String, dynamic>{
       ...meta,
-      ...replyPayload,
       'local_only': true,
-      'delivery_status': 'sending',
+      'delivery_status': 'queued',
       'retry_payload': retryPayload,
     };
-    sendingMeta.remove('error_message');
-
-    _upsertMessage({
+    queuedMeta.remove('error_message');
+    final queuedMessage = {
       ...message,
-      'client_msg_id': nextClientMsgId,
-      'meta': sendingMeta,
-    });
-
-    try {
-      final resp = await authService.dio.post(
-        '/api/chats/${widget.chatId}/messages',
-        data: {'text': text, 'client_msg_id': nextClientMsgId, ...replyPayload},
-      );
-      if (resp.statusCode == 200 || resp.statusCode == 201) {
-        final data = resp.data;
-        if (data is Map && data['ok'] == true && data['data'] is Map) {
-          _upsertMessage(
-            Map<String, dynamic>.from(data['data']),
-            autoScroll: true,
-          );
-          await playAppSound(AppUiSound.sent);
-          return;
-        }
-      }
-      throw Exception('Сервер не принял повторную отправку');
-    } catch (e) {
-      _upsertMessage({
-        ...message,
-        'client_msg_id': nextClientMsgId,
-        'meta': {
-          ...sendingMeta,
-          'delivery_status': 'error',
-          'error_message': _extractDioError(e),
-        },
-      });
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        'Не удалось повторно отправить сообщение',
-        tone: AppNoticeTone.error,
-        duration: const Duration(seconds: 2),
-      );
-    }
+      'meta': queuedMeta,
+    };
+    _upsertMessage(queuedMessage, autoScroll: true);
+    await _persistOutboxItem(
+      message: queuedMessage,
+      retryPayload: retryPayload,
+      status: 'queued',
+    );
+    unawaited(_flushPersistentOutbox(includeErrored: true));
   }
 
   Future<void> _send() async {
@@ -5785,7 +6532,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'read_by_others': false,
       'read_count': 0,
       'meta': {
-        'delivery_status': 'sending',
+        'delivery_status': 'queued',
         'local_only': true,
         'retry_payload': _buildTextRetryPayload(
           text: text,
@@ -5797,39 +6544,12 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.clear();
     _clearReplyComposer();
     _upsertMessage(optimisticMessage, autoScroll: true);
-
-    try {
-      final resp = await authService.dio.post(
-        '/api/chats/${widget.chatId}/messages',
-        data: {'text': text, 'client_msg_id': clientMsgId, ...replyPayload},
-      );
-      if (resp.statusCode == 200 || resp.statusCode == 201) {
-        final data = resp.data;
-        if (data is Map && data['ok'] == true && data['data'] is Map) {
-          final msg = Map<String, dynamic>.from(data['data']);
-          _upsertMessage(msg, autoScroll: true);
-        } else {
-          await _loadMessages();
-        }
-        await playAppSound(AppUiSound.sent);
-      }
-    } catch (e) {
-      final failed = Map<String, dynamic>.from(optimisticMessage);
-      failed['meta'] = {
-        ..._metaMapOf(optimisticMessage['meta']),
-        'delivery_status': 'error',
-        'local_only': true,
-        'error_message': _extractDioError(e),
-      };
-      _upsertMessage(failed, autoScroll: true);
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        'Ошибка отправки сообщения',
-        tone: AppNoticeTone.error,
-        duration: const Duration(seconds: 2),
-      );
-    }
+    await _persistOutboxItem(
+      message: optimisticMessage,
+      retryPayload: _buildTextRetryPayload(text: text, replyPayload: replyPayload),
+      status: 'queued',
+    );
+    unawaited(_flushPersistentOutbox());
   }
 
   Future<void> _buyProduct(Map<String, dynamic> meta) async {
@@ -6030,10 +6750,31 @@ class _ChatScreenState extends State<ChatScreen> {
     return shelf ?? ((1 << 20) - 1);
   }
 
+  DateTime? _reservedTimelineDateOf(Map<String, dynamic> message) {
+    final createdAt = _parseDate(message['created_at']);
+    if (createdAt == null) return null;
+    return DateTime(createdAt.year, createdAt.month, createdAt.day);
+  }
+
+  int _compareReservedTimelineDates(
+    Map<String, dynamic> a,
+    Map<String, dynamic> b,
+  ) {
+    final ad = _reservedTimelineDateOf(a);
+    final bd = _reservedTimelineDateOf(b);
+    if (ad == null && bd == null) return 0;
+    if (ad == null) return -1;
+    if (bd == null) return 1;
+    return ad.compareTo(bd);
+  }
+
   int _compareReservedTimelineMessages(
     Map<String, dynamic> a,
     Map<String, dynamic> b,
   ) {
+    final byDate = _compareReservedTimelineDates(a, b);
+    if (byDate != 0) return byDate;
+
     final byShelf = _reservedShelfSortKeyOf(
       a,
     ).compareTo(_reservedShelfSortKeyOf(b));
@@ -6195,11 +6936,17 @@ class _ChatScreenState extends State<ChatScreen> {
         final meta = _metaMapOf(message['meta']);
         if (meta['kind']?.toString() != 'reserved_order_item') return message;
         final messageUserId = (meta['user_id'] ?? '').toString().trim();
+        final isPlaced = meta['placed'] == true ||
+            _placedCartItemIds.contains(
+              (meta['cart_item_id'] ?? '').toString().trim(),
+            );
         final processingMode = (meta['processing_mode'] ?? 'standard')
             .toString()
             .trim()
             .toLowerCase();
-        if (messageUserId != userKey || processingMode == 'oversize') {
+        if (messageUserId != userKey ||
+            processingMode == 'oversize' ||
+            isPlaced) {
           return message;
         }
         return {
@@ -6290,6 +7037,11 @@ class _ChatScreenState extends State<ChatScreen> {
           .toString()
           .trim();
       if (!mounted) return;
+      _patchReservedOrderMessageLocally(
+        reservationId: reservationId,
+        cartItemId: cartItemId,
+        patch: {'shelf_number': nextShelf},
+      );
       _patchReservedUserShelfLocally(userId: userId, shelfNumber: nextShelf);
       showAppNotice(
         context,
@@ -6817,6 +7569,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_isReservedOrdersChat()) {
       final sorted = [...messages]..sort(_compareReservedTimelineMessages);
       final items = <Map<String, dynamic>>[];
+      String? prevDate;
       final unreadDividerMessageId =
           messengerShouldShowUnreadDivider(
             searchQuery: _searchQuery,
@@ -6832,6 +7585,14 @@ class _ChatScreenState extends State<ChatScreen> {
             messageId == unreadDividerMessageId) {
           items.add({'type': 'unread_divider', 'unread_count': _unreadCount});
           insertedUnreadDivider = true;
+        }
+        final createdAt = _parseDate(message['created_at']);
+        final dateLabel = createdAt == null
+            ? 'Без даты'
+            : _formatDateLabel(createdAt);
+        if (dateLabel != prevDate) {
+          items.add({'type': 'date', 'label': dateLabel});
+          prevDate = dateLabel;
         }
         items.add({'type': 'message', 'data': message});
       }
@@ -7062,12 +7823,42 @@ class _ChatScreenState extends State<ChatScreen> {
     return int.tryParse('${meta['voice_duration_ms'] ?? 0}') ?? 0;
   }
 
+  List<double> _waveformPeaksOf(Map<String, dynamic> meta) {
+    final raw = meta['waveform_peaks'];
+    if (raw is! List || raw.isEmpty) return const <double>[];
+    final peaks = raw
+        .map((value) => value is num ? value.toDouble() : double.tryParse('$value'))
+        .whereType<double>()
+        .where((value) => value.isFinite && value >= 0)
+        .toList(growable: false);
+    if (peaks.isEmpty) return const <double>[];
+    final maxPeak = peaks.reduce(math.max);
+    if (maxPeak <= 0) return const <double>[];
+    return peaks
+        .map((value) => 4 + ((value / maxPeak).clamp(0.0, 1.0) * 12))
+        .toList(growable: false);
+  }
+
   String? _videoUrlOf(Map<String, dynamic> meta) {
     return _resolveImageUrl(meta['video_url']?.toString());
   }
 
   int _videoDurationMsOf(Map<String, dynamic> meta) {
     return int.tryParse('${meta['video_duration_ms'] ?? 0}') ?? 0;
+  }
+
+  String? _videoPreviewImageUrlOf(Map<String, dynamic> meta) {
+    return _resolveImageUrl(
+      (meta['video_preview_image_url'] ?? meta['preview_image_url'])
+          ?.toString(),
+    );
+  }
+
+  String _attachmentProcessingStateOf(Map<String, dynamic> meta) {
+    return (meta['attachment_processing_state'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
   }
 
   String? _fileUrlOf(Map<String, dynamic> meta) {
@@ -7485,6 +8276,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!fromMe) return const SizedBox.shrink();
 
     final (icon, color) = switch (status) {
+      'queued' => (
+        Icons.cloud_queue_outlined,
+        theme.colorScheme.onPrimaryContainer.withValues(alpha: 0.78),
+      ),
       'uploading' => (
         Icons.cloud_upload_outlined,
         theme.colorScheme.onPrimaryContainer.withValues(alpha: 0.78),
@@ -7511,7 +8306,10 @@ class _ChatScreenState extends State<ChatScreen> {
   ) {
     if (meta['local_only'] != true) return const SizedBox.shrink();
     final status = (meta['delivery_status'] ?? '').toString().trim();
-    if (status != 'uploading' && status != 'sending' && status != 'error') {
+    if (status != 'queued' &&
+        status != 'uploading' &&
+        status != 'sending' &&
+        status != 'error') {
       return const SizedBox.shrink();
     }
 
@@ -7531,22 +8329,30 @@ class _ChatScreenState extends State<ChatScreen> {
       retryable: retryable,
     );
     final chipBackground = switch (status) {
+      'queued' => theme.colorScheme.secondaryContainer,
       'uploading' || 'sending' => theme.colorScheme.surfaceContainerHigh,
       'error' => theme.colorScheme.errorContainer,
       _ => theme.colorScheme.surfaceContainerHigh,
     };
     final chipForeground = switch (status) {
+      'queued' => theme.colorScheme.onSecondaryContainer,
       'uploading' || 'sending' => theme.colorScheme.onSurfaceVariant,
       'error' => theme.colorScheme.onErrorContainer,
       _ => theme.colorScheme.onSurfaceVariant,
     };
-    final chipChild = status == 'uploading' || status == 'sending'
+    final chipChild =
+        status == 'uploading' || status == 'sending'
         ? const SizedBox(
             width: 12,
             height: 12,
             child: CircularProgressIndicator(strokeWidth: 2),
           )
-        : const Icon(Icons.error_outline_rounded, size: 14);
+        : Icon(
+            status == 'queued'
+                ? Icons.cloud_queue_outlined
+                : Icons.error_outline_rounded,
+            size: 14,
+          );
 
     return Padding(
       padding: const EdgeInsets.only(top: 8),
@@ -7586,7 +8392,71 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.refresh_rounded, size: 16),
               label: const Text('Повторить'),
             ),
+          if (status == 'queued' || status == 'error')
+            TextButton.icon(
+              onPressed: () => _deletePersistentOutboxMessage(message),
+              icon: const Icon(Icons.delete_outline_rounded, size: 16),
+              label: const Text('Удалить'),
+            ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildAttachmentStateRow(
+    ThemeData theme,
+    Map<String, dynamic> meta,
+  ) {
+    final state = _attachmentProcessingStateOf(meta);
+    if (state.isEmpty || state == 'ready') {
+      return const SizedBox.shrink();
+    }
+
+    final isFailed = state == 'failed';
+    final label = isFailed ? 'Ошибка обработки вложения' : 'Вложение обрабатывается';
+    final icon = isFailed
+        ? Icons.error_outline_rounded
+        : Icons.hourglass_top_rounded;
+    final background = isFailed
+        ? theme.colorScheme.errorContainer
+        : theme.colorScheme.surfaceContainerHigh;
+    final foreground = isFailed
+        ? theme.colorScheme.onErrorContainer
+        : theme.colorScheme.onSurfaceVariant;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: background,
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (isFailed)
+              Icon(icon, size: 14, color: foreground)
+            else
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  valueColor: AlwaysStoppedAnimation<Color>(foreground),
+                ),
+              ),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                color: foreground,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -8401,6 +9271,69 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Widget _buildManualMediaLoadPlaceholder(
+    ThemeData theme, {
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: onTap,
+      child: Ink(
+        padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surface.withValues(alpha: 0.74),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.7),
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 46,
+              height: 46,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(icon, color: theme.colorScheme.primary),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            FilledButton.tonalIcon(
+              onPressed: onTap,
+              icon: const Icon(Icons.download_rounded),
+              label: const Text('Загрузить'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildVoiceAttachment(
     ThemeData theme,
     Map<String, dynamic> message,
@@ -8424,7 +9357,12 @@ class _ChatScreenState extends State<ChatScreen> {
               .clamp(0.0, 1.0)
               .toDouble()
         : 0.0;
-    final waveform = _buildVoiceWaveform(theme, messageId, progress);
+    final waveform = _buildVoiceWaveform(
+      theme,
+      _waveformPeaksOf(meta),
+      messageId,
+      progress,
+    );
     final shellColor = Color.alphaBlend(
       theme.colorScheme.primary.withValues(alpha: 0.10),
       theme.colorScheme.surface,
@@ -8531,8 +9469,15 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _buildVoiceWaveform(ThemeData theme, String seed, double progress) {
-    final bars = _voiceWaveHeights(seed, 30);
+  Widget _buildVoiceWaveform(
+    ThemeData theme,
+    List<double> waveformBars,
+    String seed,
+    double progress,
+  ) {
+    final bars = waveformBars.isNotEmpty
+        ? waveformBars
+        : _voiceWaveHeights(seed, 30);
     final activeBars = (bars.length * progress).round();
     return SizedBox(
       height: 20,
@@ -9061,8 +10006,14 @@ class _ChatScreenState extends State<ChatScreen> {
     required Color textColor,
   }) {
     final videoUrl = _videoUrlOf(meta);
+    final previewImageUrl = _videoPreviewImageUrlOf(meta);
     final durationMs = _videoDurationMsOf(meta);
     final messageId = message['id']?.toString().trim() ?? '';
+    final canAutoLoadVideo = _canAutoLoadMedia(
+      message,
+      kind: 'video',
+      fallbackToken: videoUrl ?? previewImageUrl ?? messageId,
+    );
     final accent = theme.colorScheme.primary;
     final seed = messageId.isEmpty ? meta.toString() : messageId;
     final bars = _voiceWaveHeights(seed, 18);
@@ -9074,6 +10025,23 @@ class _ChatScreenState extends State<ChatScreen> {
       end: Alignment.bottomRight,
       colors: [accent.withValues(alpha: 0.82), const Color(0xFF1C2631)],
     );
+
+    if (!canAutoLoadVideo) {
+      return SizedBox(
+        width: 196,
+        child: _buildManualMediaLoadPlaceholder(
+          theme,
+          icon: Icons.videocam_outlined,
+          title: 'Видео ожидает загрузки',
+          subtitle: 'Автозагрузка видео сейчас отключена политикой сети.',
+          onTap: () => _allowManualMediaLoad(
+            message,
+            kind: 'video',
+            fallbackToken: videoUrl ?? previewImageUrl ?? messageId,
+          ),
+        ),
+      );
+    }
 
     Widget buildVideoOrb({
       required Widget content,
@@ -9289,6 +10257,14 @@ class _ChatScreenState extends State<ChatScreen> {
     Widget inactiveVideoBackdrop() {
       return Stack(
         children: [
+          if (previewImageUrl != null)
+            Positioned.fill(
+              child: AdaptiveNetworkImage(
+                previewImageUrl,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+              ),
+            ),
           Positioned.fill(
             child: ClipOval(
               child: DecoratedBox(
@@ -9329,6 +10305,34 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   );
                 }),
+              ),
+            ),
+          ),
+          Positioned(
+            right: 16,
+            bottom: 54,
+            child: Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.34),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.12),
+                ),
+              ),
+              child: IconButton(
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Открыть',
+                onPressed: videoUrl == null
+                    ? null
+                    : () => unawaited(_openExpandedVideoNote(message, meta)),
+                icon: const Icon(
+                  Icons.open_in_full_rounded,
+                  size: 18,
+                  color: Colors.white,
+                ),
               ),
             ),
           ),
@@ -9660,6 +10664,24 @@ class _ChatScreenState extends State<ChatScreen> {
     final edited = metaMap['edited'] == true;
     Widget buildMessageImage({double? width}) {
       if (imageUrl == null) return const SizedBox.shrink();
+      final manualKeyAllowed = _canAutoLoadMedia(
+        message,
+        kind: 'image',
+        fallbackToken: imageUrl,
+      );
+      if (!manualKeyAllowed) {
+        return _buildManualMediaLoadPlaceholder(
+          theme,
+          icon: Icons.image_outlined,
+          title: 'Фото ожидает загрузки',
+          subtitle: 'Автозагрузка фото сейчас отключена политикой сети.',
+          onTap: () => _allowManualMediaLoad(
+            message,
+            kind: 'image',
+            fallbackToken: imageUrl,
+          ),
+        );
+      }
       final cachedSize = cachedChatMessageImageSize(imageUrl);
       final wantsFullWidth = width == double.infinity;
       final resolvedWidth = wantsFullWidth
@@ -10212,6 +11234,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     }).toList(),
                   ),
                 ),
+              _buildAttachmentStateRow(theme, metaMap),
               if (showLocalLifecycle)
                 _buildLocalLifecycleRow(theme, message, metaMap),
               if (timeLabel.isNotEmpty) ...[
@@ -10579,6 +11602,49 @@ class _ChatScreenState extends State<ChatScreen> {
                                   title: 'Открываем чат',
                                   subtitle:
                                       'Восстанавливаем последнее место в переписке',
+                                ),
+                              ),
+                            if ((_stickyDateLabel ?? '').trim().isNotEmpty)
+                              Positioned(
+                                top: 10,
+                                left: 0,
+                                right: 0,
+                                child: IgnorePointer(
+                                  child: Center(
+                                    child: DecoratedBox(
+                                      decoration: BoxDecoration(
+                                        color: theme.colorScheme
+                                            .surfaceContainerHighest
+                                            .withValues(alpha: 0.94),
+                                        borderRadius: BorderRadius.circular(999),
+                                        border: Border.all(
+                                          color: theme.colorScheme.outlineVariant,
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black.withValues(
+                                              alpha: 0.08,
+                                            ),
+                                            blurRadius: 14,
+                                            offset: const Offset(0, 4),
+                                          ),
+                                        ],
+                                      ),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 6,
+                                        ),
+                                        child: Text(
+                                          _stickyDateLabel!,
+                                          style: theme.textTheme.labelMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
                                 ),
                               ),
                           ],
@@ -11028,6 +12094,293 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: _buildVideoRecordingBar(Theme.of(context)),
               ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ExpandedVideoNoteViewer extends StatefulWidget {
+  const _ExpandedVideoNoteViewer({
+    required this.videoUrl,
+    required this.previewImageUrl,
+    required this.durationMs,
+    required this.title,
+    required this.caption,
+    required this.timeLabel,
+  });
+
+  final String videoUrl;
+  final String? previewImageUrl;
+  final int durationMs;
+  final String title;
+  final String caption;
+  final String timeLabel;
+
+  @override
+  State<_ExpandedVideoNoteViewer> createState() =>
+      _ExpandedVideoNoteViewerState();
+}
+
+class _ExpandedVideoNoteViewerState extends State<_ExpandedVideoNoteViewer> {
+  vp.VideoPlayerController? _controller;
+  bool _loading = true;
+  String _error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_initialize());
+  }
+
+  @override
+  void dispose() {
+    unawaited(_controller?.dispose());
+    super.dispose();
+  }
+
+  Future<void> _initialize() async {
+    final uri = Uri.tryParse(widget.videoUrl);
+    if (uri == null) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Некорректная ссылка на видео';
+      });
+      return;
+    }
+    final controller = vp.VideoPlayerController.networkUrl(
+      uri,
+      videoPlayerOptions: vp.VideoPlayerOptions(mixWithOthers: false),
+    );
+    try {
+      await controller.initialize();
+      await controller.setLooping(false);
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      setState(() {
+        _controller = controller;
+        _loading = false;
+      });
+      await controller.play();
+    } catch (_) {
+      await controller.dispose();
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Не удалось открыть видеокружок';
+      });
+    }
+  }
+
+  String _formatDuration(Duration value) {
+    final totalSeconds = value.inSeconds.clamp(0, 99 * 3600);
+    final hours = totalSeconds ~/ 3600;
+    final minutes = (totalSeconds % 3600) ~/ 60;
+    final seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return '$hours:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+    }
+    return '$minutes:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final controller = _controller;
+    final resolvedTitle = widget.title.trim().isEmpty
+        ? 'Видеокружок'
+        : widget.title.trim();
+    final fallbackDuration = widget.durationMs > 0
+        ? Duration(milliseconds: widget.durationMs)
+        : Duration.zero;
+
+    Widget bodyChild;
+    if (_loading) {
+      bodyChild = const Center(child: CircularProgressIndicator());
+    } else if (_error.isNotEmpty) {
+      bodyChild = Center(
+        child: Text(
+          _error,
+          style: theme.textTheme.bodyLarge?.copyWith(color: Colors.white),
+          textAlign: TextAlign.center,
+        ),
+      );
+    } else if (controller == null) {
+      bodyChild = const SizedBox.shrink();
+    } else {
+      bodyChild = ValueListenableBuilder<vp.VideoPlayerValue>(
+        valueListenable: controller,
+        builder: (context, value, _) {
+          final initialized = value.isInitialized;
+          final duration = initialized && value.duration > Duration.zero
+              ? value.duration
+              : fallbackDuration;
+          final position = initialized ? value.position : Duration.zero;
+          final progress = duration.inMilliseconds > 0
+              ? (position.inMilliseconds / duration.inMilliseconds)
+                    .clamp(0.0, 1.0)
+                    .toDouble()
+              : 0.0;
+
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AspectRatio(
+                aspectRatio: initialized && value.aspectRatio > 0
+                    ? value.aspectRatio
+                    : 1,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(22),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      if (widget.previewImageUrl != null && !value.isPlaying)
+                        AdaptiveNetworkImage(
+                          widget.previewImageUrl!,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                        ),
+                      if (initialized)
+                        FittedBox(
+                          fit: BoxFit.cover,
+                          child: SizedBox(
+                            width: value.size.width > 0 ? value.size.width : 320,
+                            height:
+                                value.size.height > 0 ? value.size.height : 320,
+                            child: vp.VideoPlayer(controller),
+                          ),
+                        ),
+                      Center(
+                        child: IconButton.filledTonal(
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.black.withValues(alpha: 0.36),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.all(20),
+                          ),
+                          onPressed: () async {
+                            if (!initialized) return;
+                            if (value.isPlaying) {
+                              await controller.pause();
+                              return;
+                            }
+                            final total = controller.value.duration;
+                            final current = controller.value.position;
+                            if (total > Duration.zero &&
+                                current >=
+                                    total -
+                                        const Duration(milliseconds: 200)) {
+                              await controller.seekTo(Duration.zero);
+                            }
+                            await controller.play();
+                          },
+                          icon: Icon(
+                            value.isPlaying
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
+                            size: 38,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: LinearProgressIndicator(
+                  value: progress,
+                  minHeight: 5,
+                  backgroundColor: Colors.white.withValues(alpha: 0.14),
+                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Text(
+                    _formatDuration(position),
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      color: Colors.white,
+                      fontFeatures: const [ui.FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    _formatDuration(duration),
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      color: Colors.white70,
+                      fontFeatures: const [ui.FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          );
+        },
+      );
+    }
+
+    return Dialog(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 28),
+      backgroundColor: const Color(0xFF0E1218),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 760),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          resolvedTitle,
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          [
+                            'Видеокружок',
+                            if (widget.timeLabel.trim().isNotEmpty)
+                              widget.timeLabel.trim(),
+                          ].join(' • '),
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close_rounded, color: Colors.white),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              bodyChild,
+              if (widget.caption.trim().isNotEmpty) ...[
+                const SizedBox(height: 14),
+                Text(
+                  widget.caption.trim(),
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: Colors.white.withValues(alpha: 0.92),
+                  ),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     );

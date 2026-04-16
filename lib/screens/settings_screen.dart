@@ -8,10 +8,12 @@ import 'package:dio/dio.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../services/messenger_preferences_service.dart';
 import '../services/web_notification_service.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/web_notification_prompt.dart';
 import 'bug_report_screen.dart';
+import 'chat_storage_screen.dart';
 import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
 import 'notification_preferences_screen.dart';
@@ -43,6 +45,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _appVersionLabel = '—';
   String _appPlatformLabel = '';
   bool _cacheBusy = false;
+  bool _messengerPrefsLoading = false;
+  bool _messengerPrefsSaving = false;
+  MessengerPreferences _messengerPrefs = MessengerPreferences.defaults;
   WebNotificationPermissionState _webNotificationPermissionState =
       WebNotificationPermissionState.unsupported;
   late final VoidCallback _notificationsListener;
@@ -103,6 +108,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (kIsWeb) {
       unawaited(_loadWebNotificationPermissionState());
     }
+    unawaited(_loadMessengerPreferences());
     unawaited(_loadAppMeta());
   }
 
@@ -229,6 +235,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() {
       _webNotificationPermissionState = state;
     });
+  }
+
+  Future<void> _loadMessengerPreferences() async {
+    setState(() => _messengerPrefsLoading = true);
+    try {
+      final prefs = await messengerPreferencesService.load();
+      if (!mounted) return;
+      setState(() {
+        _messengerPrefs = prefs;
+        _messengerPrefsLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _messengerPrefsLoading = false);
+    }
+  }
+
+  Future<void> _updateMessengerPreferences(
+    MessengerPreferences nextPrefs,
+  ) async {
+    setState(() => _messengerPrefsSaving = true);
+    try {
+      final saved = await messengerPreferencesService.save(nextPrefs);
+      if (!mounted) return;
+      setState(() {
+        _messengerPrefs = saved;
+        _messengerPrefsSaving = false;
+      });
+      showAppNotice(
+        context,
+        'Настройки медиа сохранены',
+        tone: AppNoticeTone.success,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _messengerPrefsSaving = false);
+      showAppNotice(
+        context,
+        _extractDioMessage(
+          e,
+          fallback: 'Не удалось сохранить настройки медиа',
+        ),
+        tone: AppNoticeTone.error,
+      );
+    }
   }
 
   Future<void> _openPrinterTest() async {
@@ -1854,6 +1905,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  String _qualityLabel(String value) {
+    switch (value.trim().toLowerCase()) {
+      case 'file':
+        return 'Как файл';
+      case 'hd':
+        return 'HD';
+      case 'standard':
+      default:
+        return 'Стандарт';
+    }
+  }
+
+  Widget _buildPolicyField({
+    required String label,
+    required String value,
+    required List<DropdownMenuItem<String>> items,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return DropdownButtonFormField<String>(
+      initialValue: value,
+      decoration: InputDecoration(
+        labelText: label,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+      items: items,
+      onChanged: (_messengerPrefsLoading || _messengerPrefsSaving)
+          ? null
+          : onChanged,
+    );
+  }
+
+  Future<void> _openStorageManager() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatStorageScreen(
+          onClearVisualCache: _clearVisualCache,
+          onClearSavedSessions: _clearSavedSessionsOnDevice,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -2023,9 +2117,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: SwitchListTile.adaptive(
                     value: _notifications,
                     onChanged: _toggleNotifications,
-                    title: const Text('Звуки и локальные уведомления'),
+                    title: const Text('Уведомления на этом устройстве'),
                     subtitle: const Text(
-                      'Внутренние сигналы, звук и локальные подсказки внутри приложения.',
+                      'Отключает звуки, локальные подсказки и push именно на этом устройстве.',
                     ),
                   ),
                 ),
@@ -2105,11 +2199,188 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
             _buildSectionCard(
+              icon: Icons.wifi_tethering_outlined,
+              title: 'Медиа и сеть',
+              subtitle:
+                  'Автозагрузка медиа, поведение на Wi‑Fi/сотовой сети и базовая политика качества.',
+              children: [
+                if (_messengerPrefsLoading)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 18),
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                else ...[
+                  _buildPolicyField(
+                    label: 'Фото: автозагрузка',
+                    value: _messengerPrefs.mediaAutoDownloadImages,
+                    items: const [
+                      DropdownMenuItem(value: 'never', child: Text('Никогда')),
+                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi_cellular',
+                        child: Text('Wi‑Fi и сотовая сеть'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      unawaited(
+                        _updateMessengerPreferences(
+                          _messengerPrefs.copyWith(
+                            mediaAutoDownloadImages: value,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _buildPolicyField(
+                    label: 'Голосовые: автозагрузка',
+                    value: _messengerPrefs.mediaAutoDownloadAudio,
+                    items: const [
+                      DropdownMenuItem(value: 'never', child: Text('Никогда')),
+                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi_cellular',
+                        child: Text('Wi‑Fi и сотовая сеть'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      unawaited(
+                        _updateMessengerPreferences(
+                          _messengerPrefs.copyWith(
+                            mediaAutoDownloadAudio: value,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _buildPolicyField(
+                    label: 'Видео: автозагрузка',
+                    value: _messengerPrefs.mediaAutoDownloadVideo,
+                    items: const [
+                      DropdownMenuItem(value: 'never', child: Text('Никогда')),
+                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi_cellular',
+                        child: Text('Wi‑Fi и сотовая сеть'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      unawaited(
+                        _updateMessengerPreferences(
+                          _messengerPrefs.copyWith(
+                            mediaAutoDownloadVideo: value,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _buildPolicyField(
+                    label: 'Документы: автозагрузка',
+                    value: _messengerPrefs.mediaAutoDownloadDocuments,
+                    items: const [
+                      DropdownMenuItem(value: 'never', child: Text('Никогда')),
+                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi_cellular',
+                        child: Text('Wi‑Fi и сотовая сеть'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      unawaited(
+                        _updateMessengerPreferences(
+                          _messengerPrefs.copyWith(
+                            mediaAutoDownloadDocuments: value,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildValueCard(
+                          icon: Icons.wifi_rounded,
+                          label: 'Отправка по Wi‑Fi',
+                          value: _qualityLabel(
+                            _messengerPrefs.mediaSendQualityWifi,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _buildValueCard(
+                          icon: Icons.network_cell_rounded,
+                          label: 'Отправка по сотовой сети',
+                          value: _qualityLabel(
+                            _messengerPrefs.mediaSendQualityCellular,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  _buildPolicyField(
+                    label: 'Качество по Wi‑Fi',
+                    value: _messengerPrefs.mediaSendQualityWifi,
+                    items: const [
+                      DropdownMenuItem(value: 'standard', child: Text('Стандарт')),
+                      DropdownMenuItem(value: 'hd', child: Text('HD')),
+                      DropdownMenuItem(value: 'file', child: Text('Как файл')),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      unawaited(
+                        _updateMessengerPreferences(
+                          _messengerPrefs.copyWith(
+                            mediaSendQualityWifi: value,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _buildPolicyField(
+                    label: 'Качество по сотовой сети',
+                    value: _messengerPrefs.mediaSendQualityCellular,
+                    items: const [
+                      DropdownMenuItem(value: 'standard', child: Text('Стандарт')),
+                      DropdownMenuItem(value: 'hd', child: Text('HD')),
+                      DropdownMenuItem(value: 'file', child: Text('Как файл')),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      unawaited(
+                        _updateMessengerPreferences(
+                          _messengerPrefs.copyWith(
+                            mediaSendQualityCellular: value,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ],
+            ),
+            _buildSectionCard(
               icon: Icons.privacy_tip_outlined,
               title: 'Конфиденциальность и данные',
               subtitle:
                   'Разрешения приложения, локальные данные и очистка кэша.',
               children: [
+                _buildActionTile(
+                  icon: Icons.storage_outlined,
+                  title: 'Хранилище чатов и медиа',
+                  subtitle:
+                      'Размер локального outbox, кэш изображений и очистка хвостов загрузки.',
+                  onTap: _openStorageManager,
+                ),
                 _buildActionTile(
                   icon: Icons.perm_device_information_outlined,
                   title: 'Разрешения приложения',

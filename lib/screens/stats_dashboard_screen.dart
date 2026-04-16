@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../main.dart';
@@ -11,6 +13,8 @@ class StatsDashboardScreen extends StatefulWidget {
 
 class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
   bool _loading = true;
+  bool _financeLoading = false;
+  bool _returnsLoading = false;
   String _error = '';
   Map<String, dynamic> _extended = const <String, dynamic>{};
   Map<String, dynamic> _finance = const <String, dynamic>{};
@@ -132,43 +136,56 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
       }
       final nextExtended = _asMap(extRoot['data']);
 
-      Map<String, dynamic> nextFinance = const <String, dynamic>{};
-      try {
-        final financeResp = await authService.dio.get(
-          '/api/admin/ops/finance/summary',
-          queryParameters: {'period': 'month'},
-        );
-        final financeRoot = _asMap(financeResp.data);
-        if (financeRoot['ok'] == true && financeRoot['data'] is Map) {
-          nextFinance = _asMap(financeRoot['data']);
-        }
-      } catch (_) {}
-
-      Map<String, dynamic> nextReturns = const <String, dynamic>{};
-      try {
-        final returnsResp = await authService.dio.get(
-          '/api/admin/ops/returns/analytics',
-          queryParameters: {'days': 30, 'top_limit': 8},
-        );
-        final returnsRoot = _asMap(returnsResp.data);
-        if (returnsRoot['ok'] == true && returnsRoot['data'] is Map) {
-          nextReturns = _asMap(returnsRoot['data']);
-        }
-      } catch (_) {}
-
       if (!mounted) return;
       setState(() {
         _extended = nextExtended;
-        _finance = nextFinance;
-        _returns = nextReturns;
+        _finance = const <String, dynamic>{};
+        _returns = const <String, dynamic>{};
+        _financeLoading = true;
+        _returnsLoading = true;
         _loading = false;
         _error = '';
       });
+      unawaited(_loadSecondaryStats());
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _loading = false;
         _error = e.toString();
+      });
+    }
+  }
+
+  Future<void> _loadSecondaryStats() async {
+    try {
+      final results = await Future.wait<dynamic>([
+        authService.dio.get(
+          '/api/admin/ops/finance/summary',
+          queryParameters: {'period': 'month'},
+        ),
+        authService.dio.get(
+          '/api/admin/ops/returns/analytics',
+          queryParameters: {'days': 30, 'top_limit': 8},
+        ),
+      ]);
+      final financeRoot = _asMap(results[0].data);
+      final returnsRoot = _asMap(results[1].data);
+      if (!mounted) return;
+      setState(() {
+        _finance = financeRoot['ok'] == true && financeRoot['data'] is Map
+            ? _asMap(financeRoot['data'])
+            : const <String, dynamic>{};
+        _returns = returnsRoot['ok'] == true && returnsRoot['data'] is Map
+            ? _asMap(returnsRoot['data'])
+            : const <String, dynamic>{};
+        _financeLoading = false;
+        _returnsLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _financeLoading = false;
+        _returnsLoading = false;
       });
     }
   }
@@ -706,6 +723,15 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
 
   Widget _buildFinanceSection() {
     final financeSummary = _asMap(_finance['summary']);
+    if (_financeLoading) {
+      return _section(
+        title: 'Финансы за 30 дней',
+        child: const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      );
+    }
     if (financeSummary.isEmpty) return const SizedBox.shrink();
     return _section(
       title: 'Финансы за 30 дней',
@@ -735,6 +761,15 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
 
   Widget _buildReturnsSection() {
     final returnsSummary = _asMap(_returns['summary']);
+    if (_returnsLoading) {
+      return _section(
+        title: 'Брак и претензии',
+        child: const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      );
+    }
     if (returnsSummary.isEmpty) return const SizedBox.shrink();
     return _section(
       title: 'Брак и претензии',

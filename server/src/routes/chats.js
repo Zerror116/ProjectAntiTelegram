@@ -33,6 +33,15 @@ const {
 const {
   getMessengerPreferencesForUser,
 } = require("../utils/messengerPreferences");
+const {
+  upsertMessageSearchDocument,
+  syncMessageSearchDocumentFromMessageId,
+  deleteMessageSearchDocument,
+} = require("../utils/chatSearchIndex");
+const {
+  processAttachmentFile,
+  sha256File,
+} = require("../utils/chatMediaPipeline");
 
 const chatImageUploadsDir = path.resolve(
   __dirname,
@@ -66,10 +75,19 @@ const chatFileUploadsDir = path.resolve(
   "chat_media",
   "files",
 );
+const chatUploadSessionTempDir = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "uploads",
+  "chat_media",
+  "sessions",
+);
 fs.mkdirSync(chatImageUploadsDir, { recursive: true });
 fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
 fs.mkdirSync(chatVideoUploadsDir, { recursive: true });
 fs.mkdirSync(chatFileUploadsDir, { recursive: true });
+fs.mkdirSync(chatUploadSessionTempDir, { recursive: true });
 
 const CHAT_MEDIA_TOKEN_TTL_SECONDS = Math.max(
   60,
@@ -115,8 +133,13 @@ const CHAT_MEDIA_MAX_FILE_SIZE_MB = Math.max(
   8,
   Math.round(CHAT_MEDIA_MAX_FILE_SIZE_BYTES / (1024 * 1024)),
 );
+const CHAT_UPLOAD_SESSION_TTL_HOURS = Math.max(
+  1,
+  Number(process.env.CHAT_UPLOAD_SESSION_TTL_HOURS || 24),
+);
 const ATTACHMENT_QUALITY_MODES = new Set(["standard", "hd", "file"]);
 const ATTACHMENT_TYPES = new Set(["image", "voice", "video", "file"]);
+const ATTACHMENT_PROCESSING_STATES = new Set(["processing", "ready", "failed"]);
 const CHAT_STATE_UUID_FIELDS = new Set([
   "last_read_message_id",
   "last_seen_message_id",
@@ -141,6 +164,13 @@ function normalizeAttachmentType(raw) {
     .trim()
     .toLowerCase();
   return ATTACHMENT_TYPES.has(value) ? value : "";
+}
+
+function normalizeAttachmentProcessingState(raw) {
+  const value = String(raw || "")
+    .trim()
+    .toLowerCase();
+  return ATTACHMENT_PROCESSING_STATES.has(value) ? value : "ready";
 }
 
 function resolveAttachmentQualityMode(raw, attachmentType) {
@@ -327,6 +357,11 @@ const chatMediaUpload = multer({
     }
     cb(new Error("Некорректный тип вложения"));
   },
+});
+
+const uploadSessionChunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CHAT_MEDIA_MAX_FILE_SIZE_BYTES },
 });
 
 const directSearchRateGuard = createRateGuard({
@@ -785,6 +820,15 @@ function normalizePhoneCore10(raw) {
   const digits = normalizePhoneDigits(raw);
   if (digits.length < 10) return "";
   return digits.slice(-10);
+}
+
+function phoneMatchHashForTenant(tenantId, rawPhone) {
+  const core10 = normalizePhoneCore10(rawPhone);
+  if (!core10) return "";
+  return crypto
+    .createHash("sha256")
+    .update(`${String(tenantId || "global").trim()}:${core10}`)
+    .digest("hex");
 }
 
 function escapeLikePattern(raw) {
@@ -1455,6 +1499,13 @@ function decorateMessageMediaUrls(req, rawMessage) {
       if (value.length > 0) {
         nextAttachment.storage_url = buildSignedChatMediaUrl(req, value);
       }
+      const previewValue = String(nextAttachment.preview_image_url || "").trim();
+      if (previewValue.length > 0) {
+        nextAttachment.preview_image_url = buildSignedChatMediaUrl(
+          req,
+          previewValue,
+        );
+      }
       return nextAttachment;
     });
   }
@@ -1505,6 +1556,127 @@ function removeChatMediaByUrl(raw) {
     fs.unlink(fullPath, () => {});
     return;
   }
+}
+
+function storageBaseDirForAttachmentType(attachmentType) {
+  switch (normalizeAttachmentType(attachmentType)) {
+    case "image":
+      return chatImageUploadsDir;
+    case "voice":
+      return chatVoiceUploadsDir;
+    case "video":
+      return chatVideoUploadsDir;
+    case "file":
+      return chatFileUploadsDir;
+    default:
+      return chatUploadSessionTempDir;
+  }
+}
+
+function mediaFieldNameForAttachmentType(attachmentType) {
+  switch (normalizeAttachmentType(attachmentType)) {
+    case "image":
+      return "image";
+    case "voice":
+      return "voice";
+    case "video":
+      return "video";
+    case "file":
+      return "file";
+    default:
+      return "file";
+  }
+}
+
+function fallbackExtensionForAttachmentType(attachmentType) {
+  switch (normalizeAttachmentType(attachmentType)) {
+    case "image":
+      return ".jpg";
+    case "voice":
+      return ".m4a";
+    case "video":
+      return ".mp4";
+    case "file":
+    default:
+      return ".bin";
+  }
+}
+
+function buildChatMediaPublicUrl(req, attachmentType, filename) {
+  const fieldname = mediaFieldNameForAttachmentType(attachmentType);
+  return toChatMediaUrl(req, {
+    fieldname,
+    filename,
+  });
+}
+
+function absoluteStoragePathFromMediaUrl(rawUrl) {
+  const ref = extractChatMediaRef(rawUrl);
+  if (!ref) return null;
+  const baseDir = storageBaseDirForAttachmentType(ref.kind);
+  const absoluteBaseDir = path.resolve(baseDir);
+  const absoluteFilePath = path.resolve(baseDir, ref.filename);
+  if (
+    absoluteFilePath !== absoluteBaseDir &&
+    !absoluteFilePath.startsWith(`${absoluteBaseDir}${path.sep}`)
+  ) {
+    return null;
+  }
+  return absoluteFilePath;
+}
+
+function uploadSessionTempPath(sessionId, attachmentType, originalFileName = "") {
+  const ext = path.extname(String(originalFileName || "").trim()).toLowerCase();
+  const safeExt = ext && ext.length <= 10 ? ext : fallbackExtensionForAttachmentType(attachmentType);
+  return path.join(
+    chatUploadSessionTempDir,
+    `${String(sessionId || "").trim()}${safeExt}`,
+  );
+}
+
+function serializeUploadSession(row) {
+  if (!row || typeof row !== "object") return null;
+  return {
+    id: row.id,
+    chat_id: row.chat_id,
+    user_id: row.user_id,
+    client_msg_id: row.client_msg_id,
+    attachment_kind: row.attachment_kind,
+    quality_mode: normalizeAttachmentQualityMode(row.quality_mode),
+    original_file_name: row.original_file_name || null,
+    mime_type: row.mime_type || null,
+    total_bytes: row.total_bytes == null ? null : Number(row.total_bytes),
+    uploaded_bytes:
+      row.uploaded_bytes == null ? null : Number(row.uploaded_bytes),
+    sha256: row.sha256 || null,
+    status: String(row.status || "").trim().toLowerCase(),
+    storage_key: row.storage_key || null,
+    storage_url: row.storage_url || null,
+    media_meta:
+      row.media_meta && typeof row.media_meta === "object" ? row.media_meta : {},
+    last_error_code: row.last_error_code || null,
+    last_error_message: row.last_error_message || null,
+    expires_at: row.expires_at || null,
+    committed_message_id: row.committed_message_id || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+async function safeUnlinkFile(targetPath) {
+  const normalized = String(targetPath || "").trim();
+  if (!normalized) return;
+  try {
+    await fs.promises.unlink(normalized);
+  } catch (_) {}
+}
+
+async function removeAttachmentFiles(attachment) {
+  if (!attachment || typeof attachment !== "object") return;
+  await safeUnlinkFile(absoluteStoragePathFromMediaUrl(attachment.storage_url));
+  await safeUnlinkFile(
+    absoluteStoragePathFromMediaUrl(attachment.preview_image_url),
+  );
 }
 
 async function loadMessageReactionsByUser(messageId) {
@@ -1600,6 +1772,13 @@ async function loadMessageAttachmentsByMessageIds(messageIds) {
             duration_ms,
             preprocess_tag,
             quality_mode,
+            processing_state,
+            checksum_sha256,
+            preview_image_url,
+            preview_width,
+            preview_height,
+            waveform_peaks,
+            extra_meta,
             is_video_note,
             is_listen_once,
             created_at
@@ -1628,6 +1807,22 @@ async function loadMessageAttachmentsByMessageIds(messageIds) {
       duration_ms: row.duration_ms == null ? null : Number(row.duration_ms),
       preprocess_tag: row.preprocess_tag || null,
       quality_mode: normalizeAttachmentQualityMode(row.quality_mode),
+      processing_state: normalizeAttachmentProcessingState(
+        row.processing_state,
+      ),
+      checksum_sha256: row.checksum_sha256 || null,
+      preview_image_url: row.preview_image_url || null,
+      preview_width:
+        row.preview_width == null ? null : Number(row.preview_width),
+      preview_height:
+        row.preview_height == null ? null : Number(row.preview_height),
+      waveform_peaks: Array.isArray(row.waveform_peaks)
+        ? row.waveform_peaks.map((value) => Number(value) || 0)
+        : [],
+      extra_meta:
+        row.extra_meta && typeof row.extra_meta === "object"
+          ? row.extra_meta
+          : {},
       is_video_note: row.is_video_note === true,
       is_listen_once: row.is_listen_once === true,
       created_at: row.created_at || null,
@@ -1640,10 +1835,11 @@ async function loadMessageAttachmentsByMessageIds(messageIds) {
 async function upsertMessageAttachments({
   messageId,
   attachments,
+  queryable = db,
 }) {
   const normalizedMessageId = String(messageId || "").trim();
   if (!normalizedMessageId || !Array.isArray(attachments)) return;
-  await db.query("DELETE FROM message_attachments WHERE message_id = $1", [
+  await queryable.query("DELETE FROM message_attachments WHERE message_id = $1", [
     normalizedMessageId,
   ]);
   for (let index = 0; index < attachments.length; index += 1) {
@@ -1664,7 +1860,7 @@ async function upsertMessageAttachments({
         sort_order: Number(attachment.sort_order ?? index) || 0,
       });
     }
-    await db.query(
+    await queryable.query(
       `INSERT INTO message_attachments (
          id,
          message_id,
@@ -1681,12 +1877,19 @@ async function upsertMessageAttachments({
          duration_ms,
          preprocess_tag,
          quality_mode,
+         processing_state,
+         checksum_sha256,
+         preview_image_url,
+         preview_width,
+         preview_height,
+         waveform_peaks,
+         extra_meta,
          is_video_note,
          is_listen_once,
          created_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::jsonb, $22::jsonb, $23, now()
        )`,
       [
         uuidv4(),
@@ -1706,6 +1909,25 @@ async function upsertMessageAttachments({
         attachment.duration_ms == null ? null : Number(attachment.duration_ms),
         attachment.preprocess_tag || null,
         qualityResolution.qualityMode,
+        normalizeAttachmentProcessingState(attachment.processing_state),
+        attachment.checksum_sha256 || null,
+        attachment.preview_image_url || null,
+        attachment.preview_width == null
+          ? null
+          : Number(attachment.preview_width),
+        attachment.preview_height == null
+          ? null
+          : Number(attachment.preview_height),
+        JSON.stringify(
+          Array.isArray(attachment.waveform_peaks)
+            ? attachment.waveform_peaks.map((value) => Number(value) || 0)
+            : [],
+        ),
+        JSON.stringify(
+          attachment.extra_meta && typeof attachment.extra_meta === "object"
+            ? attachment.extra_meta
+            : {},
+        ),
         attachment.is_video_note === true,
         attachment.is_listen_once === true,
       ],
@@ -1713,11 +1935,15 @@ async function upsertMessageAttachments({
   }
 }
 
-async function maybeBindDirectRequestFirstMessage(chatId, messageId) {
+async function maybeBindDirectRequestFirstMessage(
+  chatId,
+  messageId,
+  queryable = db,
+) {
   const normalizedChatId = String(chatId || "").trim();
   const normalizedMessageId = String(messageId || "").trim();
   if (!normalizedChatId || !normalizedMessageId) return;
-  const updated = await db.query(
+  const updated = await queryable.query(
     `UPDATE direct_message_requests
      SET first_message_id = COALESCE(first_message_id, $2),
          updated_at = now()
@@ -1727,7 +1953,7 @@ async function maybeBindDirectRequestFirstMessage(chatId, messageId) {
     [normalizedChatId, normalizedMessageId],
   );
   if ((updated.rowCount || 0) > 0) {
-    await db.query(
+    await queryable.query(
       `UPDATE chats
        SET settings = settings || $2::jsonb,
            updated_at = now()
@@ -1886,6 +2112,272 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
   }
 
   return responseMessage;
+}
+
+async function loadUploadSessionForUser(
+  client,
+  sessionId,
+  user,
+  { forUpdate = false } = {},
+) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  if (!normalizedSessionId) return null;
+  const result = await client.query(
+    `SELECT s.*,
+            c.tenant_id AS chat_tenant_id
+     FROM chat_upload_sessions s
+     JOIN chats c ON c.id = s.chat_id
+     WHERE s.id = $1
+       AND s.user_id = $2
+       AND ($3::uuid IS NULL OR s.tenant_id = $3::uuid)
+     LIMIT 1
+     ${forUpdate ? "FOR UPDATE" : ""}`,
+    [normalizedSessionId, user.id, user.tenant_id || null],
+  );
+  return result.rowCount > 0 ? result.rows[0] : null;
+}
+
+function attachmentCaptionText(attachmentType, caption) {
+  const normalizedCaption = String(caption || "").trim();
+  if (normalizedCaption) return normalizedCaption;
+  switch (normalizeAttachmentType(attachmentType)) {
+    case "image":
+      return "Фото";
+    case "video":
+      return "Видеосообщение";
+    case "voice":
+      return "Голосовое сообщение";
+    case "file":
+      return "Файл";
+    default:
+      return "Вложение";
+  }
+}
+
+function mergeReplyAndForwardMeta({
+  replyToMessageId,
+  replyPreviewText,
+  replyPreviewSenderName,
+  forwardedFromMessageId,
+  forwardedFromChatId,
+  forwardedFromSenderName,
+}) {
+  const meta = {};
+  const safeReplyId = trimOptionalUuid(replyToMessageId);
+  if (safeReplyId) {
+    meta.reply_to_message_id = safeReplyId;
+    const previewText = trimOptionalText(replyPreviewText || "", 280);
+    const previewSender = trimOptionalText(replyPreviewSenderName || "", 180);
+    if (previewText) meta.reply_preview_text = previewText;
+    if (previewSender) meta.reply_preview_sender_name = previewSender;
+  }
+  const safeForwardedId = trimOptionalUuid(forwardedFromMessageId);
+  if (safeForwardedId) {
+    meta.forwarded_from_message_id = safeForwardedId;
+    meta.forwarded_from_chat_id = trimOptionalUuid(forwardedFromChatId);
+    meta.forwarded_from_sender_name = trimOptionalText(
+      forwardedFromSenderName || "",
+      180,
+    ).trim();
+  }
+  return meta;
+}
+
+async function finalizeSessionProcessing(req, client, sessionRow) {
+  const attachmentType = normalizeAttachmentType(sessionRow.attachment_kind);
+  const storagePath = String(sessionRow.storage_path || "").trim();
+  if (!attachmentType || !storagePath) {
+    throw new Error("Upload session has no storage path");
+  }
+
+  const processed = await processAttachmentFile({
+    req,
+    attachmentType,
+    filePath: storagePath,
+    uploadsRoot: path.resolve(__dirname, "..", "..", "uploads"),
+    previewOutputDir: attachmentType === "video" ? chatImageUploadsDir : null,
+    previewPrefix: String(sessionRow.id || "").trim(),
+  });
+
+  const nextMediaMeta = {
+    ...(sessionRow.media_meta && typeof sessionRow.media_meta === "object"
+      ? sessionRow.media_meta
+      : {}),
+    processing_state: processed.processing_state,
+    checksum_sha256: processed.checksum_sha256,
+    preview_image_url: processed.preview_image_url,
+    preview_width: processed.preview_width,
+    preview_height: processed.preview_height,
+    waveform_peaks: processed.waveform_peaks,
+    extra_meta: processed.extra_meta,
+    width: processed.width,
+    height: processed.height,
+    duration_ms: processed.duration_ms,
+    file_size: processed.file_size,
+  };
+
+  const updated = await client.query(
+    `UPDATE chat_upload_sessions
+     SET status = 'ready',
+         uploaded_bytes = GREATEST(uploaded_bytes, total_bytes),
+         media_meta = $2::jsonb,
+         last_error_code = NULL,
+         last_error_message = NULL,
+         updated_at = now()
+     WHERE id = $1
+     RETURNING *`,
+    [sessionRow.id, JSON.stringify(nextMediaMeta)],
+  );
+  return updated.rows[0] || sessionRow;
+}
+
+async function buildAttachmentFromUploadSession(sessionRow) {
+  const mediaMeta =
+    sessionRow.media_meta && typeof sessionRow.media_meta === "object"
+      ? sessionRow.media_meta
+      : {};
+  const attachmentType = normalizeAttachmentType(sessionRow.attachment_kind);
+  return {
+    attachment_type: attachmentType,
+    sort_order: 0,
+    storage_url: sessionRow.storage_url,
+    file_name: sessionRow.original_file_name || null,
+    mime_type: sessionRow.mime_type || null,
+    file_size:
+      mediaMeta.file_size == null ? null : Number(mediaMeta.file_size),
+    width: mediaMeta.width == null ? null : Number(mediaMeta.width),
+    height: mediaMeta.height == null ? null : Number(mediaMeta.height),
+    aspect_ratio:
+      mediaMeta.width && mediaMeta.height
+        ? Number(
+            (Number(mediaMeta.width) / Number(mediaMeta.height)).toFixed(4),
+          )
+        : null,
+    duration_ms:
+      mediaMeta.duration_ms == null ? null : Number(mediaMeta.duration_ms),
+    preprocess_tag: mediaMeta.preprocess_tag || null,
+    quality_mode: sessionRow.quality_mode,
+    processing_state: normalizeAttachmentProcessingState(
+      mediaMeta.processing_state,
+    ),
+    checksum_sha256: mediaMeta.checksum_sha256 || sessionRow.sha256 || null,
+    preview_image_url: mediaMeta.preview_image_url || null,
+    preview_width:
+      mediaMeta.preview_width == null ? null : Number(mediaMeta.preview_width),
+    preview_height:
+      mediaMeta.preview_height == null
+        ? null
+        : Number(mediaMeta.preview_height),
+    waveform_peaks: Array.isArray(mediaMeta.waveform_peaks)
+      ? mediaMeta.waveform_peaks
+      : [],
+    extra_meta:
+      mediaMeta.extra_meta && typeof mediaMeta.extra_meta === "object"
+        ? mediaMeta.extra_meta
+        : {},
+    is_video_note: mediaMeta.is_video_note === true,
+    is_listen_once: mediaMeta.is_listen_once === true,
+  };
+}
+
+function buildMessageMetaFromAttachment({
+  attachment,
+  caption = "",
+  replyMeta = {},
+}) {
+  const attachmentType = normalizeAttachmentType(attachment.attachment_type);
+  const meta = {
+    attachment_type: attachmentType,
+    ...replyMeta,
+  };
+  const normalizedCaption = String(caption || "").trim();
+  if (normalizedCaption) {
+    meta.caption = normalizedCaption;
+  }
+  if (attachmentType === "image") {
+    meta.image_url = attachment.storage_url;
+    if (attachment.width) meta.image_width = attachment.width;
+    if (attachment.height) meta.image_height = attachment.height;
+    if (attachment.aspect_ratio) meta.image_aspect_ratio = attachment.aspect_ratio;
+    if (attachment.preprocess_tag) meta.image_preprocess = attachment.preprocess_tag;
+  } else if (attachmentType === "voice") {
+    meta.voice_url = attachment.storage_url;
+    if (attachment.duration_ms) meta.voice_duration_ms = attachment.duration_ms;
+    if (attachment.mime_type) meta.voice_mime_type = attachment.mime_type;
+    if (attachment.file_name) meta.voice_file_name = attachment.file_name;
+  } else if (attachmentType === "file") {
+    meta.file_url = attachment.storage_url;
+    if (attachment.mime_type) meta.file_mime_type = attachment.mime_type;
+    if (attachment.file_name) meta.file_name = attachment.file_name;
+    if (attachment.file_size != null) meta.file_size = attachment.file_size;
+  } else if (attachmentType === "video") {
+    meta.video_url = attachment.storage_url;
+    if (attachment.duration_ms) meta.video_duration_ms = attachment.duration_ms;
+    if (attachment.mime_type) meta.video_mime_type = attachment.mime_type;
+    if (attachment.file_name) meta.video_file_name = attachment.file_name;
+    if (attachment.preview_image_url) {
+      meta.video_preview_image_url = attachment.preview_image_url;
+    }
+    if (attachment.is_video_note) meta.is_video_note = true;
+  }
+  if (attachment.preview_image_url) {
+    meta.preview_image_url = attachment.preview_image_url;
+  }
+  if (attachment.processing_state) {
+    meta.attachment_processing_state = attachment.processing_state;
+  }
+  if (attachment.waveform_peaks?.length) {
+    meta.waveform_peaks = attachment.waveform_peaks;
+  }
+  if (attachment.quality_mode) {
+    meta.quality_mode = attachment.quality_mode;
+  }
+  return meta;
+}
+
+async function commitSessionMessage({
+  req,
+  client,
+  sessionRow,
+  userId,
+  caption = "",
+  replyMeta = {},
+}) {
+  const attachment = await buildAttachmentFromUploadSession(sessionRow);
+  const text = attachmentCaptionText(attachment.attachment_type, caption);
+  const meta = buildMessageMetaFromAttachment({
+    attachment,
+    caption,
+    replyMeta,
+  });
+
+  const insert = await insertMessageWithDedup({
+    clientMsgId: String(sessionRow.client_msg_id || "").trim() || null,
+    chatId: sessionRow.chat_id,
+    senderId: userId,
+    text,
+    metaJson: JSON.stringify(meta),
+    queryable: client,
+  });
+  const messageId = insert.rows[0]?.id;
+  if (!messageId) {
+    throw new Error("Не удалось создать сообщение из upload session");
+  }
+  await upsertMessageAttachments({
+    messageId,
+    attachments: [attachment],
+    queryable: client,
+  });
+  await client.query(
+    `UPDATE chat_upload_sessions
+     SET status = 'committed',
+         committed_message_id = $2,
+         updated_at = now()
+     WHERE id = $1`,
+    [sessionRow.id, messageId],
+  );
+  await maybeBindDirectRequestFirstMessage(sessionRow.chat_id, messageId, client);
+  return messageId;
 }
 
 function normalizeSupportText(value) {
@@ -2105,6 +2597,7 @@ async function insertMessageWithDedup({
   senderId,
   text,
   metaJson = null,
+  queryable = db,
 }) {
   const encryptedText = encryptMessageText(text);
   const hasMeta = metaJson != null;
@@ -2134,14 +2627,14 @@ async function insertMessageWithDedup({
 
   if (!clientMsgId) {
     if (hasMeta) {
-      return db.query(
+      return queryable.query(
         `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
          VALUES ($1, $2, $3, $4, $5::jsonb, now())
          RETURNING id`,
         [uuidv4(), chatId, senderId, encryptedText, metaJson],
       );
     }
-    return db.query(
+    return queryable.query(
       `INSERT INTO messages (id, chat_id, sender_id, text, created_at)
        VALUES ($1, $2, $3, $4, now())
        RETURNING id`,
@@ -2150,13 +2643,13 @@ async function insertMessageWithDedup({
   }
 
   try {
-    const inserted = await db.query(insertWithConflictSql, insertWithConflictParams);
+    const inserted = await queryable.query(insertWithConflictSql, insertWithConflictParams);
     if (inserted.rowCount > 0) return inserted;
   } catch (err) {
     if (String(err?.code || "") !== "42P10") throw err;
   }
 
-  const existing = await db.query(
+  const existing = await queryable.query(
     `SELECT id
      FROM messages
      WHERE client_msg_id = $1
@@ -2165,7 +2658,7 @@ async function insertMessageWithDedup({
   );
   if (existing.rowCount > 0) return existing;
 
-  return db.query(insertDirectSql, insertDirectParams);
+  return queryable.query(insertDirectSql, insertDirectParams);
 }
 
 function parseCursorTimestamp(raw) {
@@ -3374,6 +3867,12 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
     }
     const query = String(req.query.q || "").trim();
     const safeLimit = parseCursorLimit(req.query.limit, 30);
+    const fromUserId = trimOptionalUuid(req.query.from_user_id);
+    const attachmentKindFilter = normalizeAttachmentType(
+      req.query.attachment_kind,
+    );
+    const dateFrom = parseCursorTimestamp(req.query.date_from);
+    const dateTo = parseCursorTimestamp(req.query.date_to);
 
     if (!query) {
       return res.status(400).json({ ok: false, error: "q required" });
@@ -3459,45 +3958,45 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
         decorateMessageMediaUrls(req, decryptMessageRow(row)),
       );
     } else {
-      const rowsQ = await db.query(
-        `SELECT m.id,
-                m.sender_id,
-                m.client_msg_id,
-                m.text,
-                m.meta,
-                m.created_at,
-                (m.sender_id::text = $2::text) AS from_me,
-                false AS is_read_by_me,
-                false AS read_by_others,
-                0::int AS read_count,
-                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Система') AS sender_name,
-                u.email AS sender_email,
-                u.avatar_url AS sender_avatar_url,
-                COALESCE(u.avatar_focus_x, 0) AS sender_avatar_focus_x,
-                COALESCE(u.avatar_focus_y, 0) AS sender_avatar_focus_y,
-                COALESCE(u.avatar_zoom, 1) AS sender_avatar_zoom
-         FROM messages m
-         LEFT JOIN users u ON u.id = m.sender_id
-         WHERE m.chat_id = $1
+      const like = `%${escapeLikePattern(query.toLowerCase())}%`;
+      const searchQ = await db.query(
+        `SELECT msd.message_id
+         FROM message_search_documents msd
+         JOIN messages m ON m.id = msd.message_id
+         WHERE msd.chat_id = $1
            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-         ORDER BY m.created_at DESC, m.id DESC
-         LIMIT 2000`,
-        [chatId, String(userId)],
+           AND (
+             msd.search_text_normalized LIKE $3 ESCAPE '\\'
+             OR msd.caption_normalized LIKE $3 ESCAPE '\\'
+           )
+           AND ($4::uuid IS NULL OR msd.sender_id = $4)
+           AND (
+             $5::text = ''
+             OR msd.attachment_kinds @> ARRAY[$5]::text[]
+           )
+           AND ($6::timestamptz IS NULL OR msd.created_at >= $6::timestamptz)
+           AND ($7::timestamptz IS NULL OR msd.created_at <= $7::timestamptz)
+         ORDER BY msd.created_at DESC, msd.message_id DESC
+         LIMIT $8`,
+        [
+          chatId,
+          String(userId),
+          like,
+          fromUserId,
+          attachmentKindFilter,
+          dateFrom,
+          dateTo,
+          safeLimit,
+        ],
       );
-      const q = query.toLowerCase();
-      messages = rowsQ.rows
-        .map((row) => decorateMessageMediaUrls(req, decryptMessageRow(row)))
-        .filter((row) => {
-          const meta = parseMeta(row?.meta);
-          const haystacks = [
-            String(row?.text || "").toLowerCase(),
-            String(meta.title || "").toLowerCase(),
-            String(meta.description || "").toLowerCase(),
-          ];
-          return haystacks.some((item) => item.includes(q));
-        })
-        .slice(0, safeLimit);
+      const messageIds = searchQ.rows
+        .map((row) => String(row.message_id || "").trim())
+        .filter(Boolean);
+      messages = await Promise.all(
+        messageIds.map((messageId) => getHydratedMessageById(messageId, userId)),
+      );
+      messages = messages.filter(Boolean).map((row) => decorateMessageMediaUrls(req, row));
     }
 
     const hydrated = await attachReactionMapsToMessages(messages);
@@ -3832,6 +4331,16 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
     if (!messageId) {
       return res.status(500).json({ ok: false, error: "Не удалось создать сообщение" });
     }
+    await upsertMessageSearchDocument({
+      messageId,
+      chatId,
+      tenantId: req.user.tenant_id || null,
+      senderId: userId,
+      text: String(text),
+      meta: messageMeta,
+      attachments: [],
+      createdAt: new Date().toISOString(),
+    });
     await maybeBindDirectRequestFirstMessage(chatId, messageId);
 
     let promptMessageId = null;
@@ -3873,6 +4382,654 @@ router.post("/:chatId/messages", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("chats.postMessage error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+router.post("/uploads/sessions", requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const chatId = String(req.body?.chat_id || "").trim();
+    const clientMsgId = String(req.body?.client_msg_id || "").trim();
+    const attachmentKind = normalizeAttachmentType(req.body?.attachment_kind);
+    const originalFileName = String(req.body?.original_file_name || "")
+      .trim()
+      .slice(0, 255);
+    const mimeType = String(req.body?.mime_type || "").trim().slice(0, 255);
+    const totalBytes = Math.max(0, Number(req.body?.total_bytes || 0));
+    const sha256 = String(req.body?.sha256 || "")
+      .trim()
+      .toLowerCase()
+      .slice(0, 128);
+    if (!chatId || !clientMsgId || !attachmentKind || totalBytes <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "chat_id, client_msg_id, attachment_kind и total_bytes обязательны",
+      });
+    }
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canPostChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Нет прав на отправку сообщения в этот чат",
+      });
+    }
+
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT *
+       FROM chat_upload_sessions
+       WHERE chat_id = $1
+         AND user_id = $2
+         AND client_msg_id = $3
+         AND attachment_kind = $4
+         AND ($5::uuid IS NULL OR tenant_id = $5::uuid)
+       LIMIT 1
+       FOR UPDATE`,
+      [chatId, userId, clientMsgId, attachmentKind, req.user.tenant_id || null],
+    );
+    if (existing.rowCount > 0) {
+      await client.query("COMMIT");
+      return res.json({
+        ok: true,
+        data: serializeUploadSession(existing.rows[0]),
+      });
+    }
+
+    const sessionId = uuidv4();
+    const tempPath = uploadSessionTempPath(
+      sessionId,
+      attachmentKind,
+      originalFileName,
+    );
+    const qualityResolution = resolveAttachmentQualityMode(
+      req.body?.quality_mode,
+      attachmentKind,
+    );
+    const mediaMeta = {
+      is_video_note:
+        attachmentKind === "video" &&
+        (req.body?.is_video_note === true ||
+          String(req.body?.is_video_note || "").trim() === "true"),
+      is_listen_once:
+        attachmentKind === "voice" &&
+        (req.body?.listen_once === true ||
+          String(req.body?.listen_once || "").trim() === "true"),
+      duration_ms:
+        parseOptionalNumber(req.body?.duration_ms) &&
+        Number(req.body?.duration_ms) > 0
+          ? Math.round(Number(req.body?.duration_ms))
+          : null,
+      width: parsePositiveMediaNumber(req.body?.image_width),
+      height: parsePositiveMediaNumber(req.body?.image_height),
+      preprocess_tag: String(req.body?.image_preprocess || "")
+        .trim()
+        .slice(0, 64),
+    };
+    const inserted = await client.query(
+      `INSERT INTO chat_upload_sessions (
+         id,
+         tenant_id,
+         chat_id,
+         user_id,
+         client_msg_id,
+         attachment_kind,
+         quality_mode,
+         original_file_name,
+         mime_type,
+         total_bytes,
+         uploaded_bytes,
+         sha256,
+         status,
+         storage_key,
+         storage_path,
+         media_meta,
+         expires_at,
+         created_at,
+         updated_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 'created', $12, $13, $14::jsonb,
+         now() + ($15::text || ' hours')::interval, now(), now()
+       )
+       RETURNING *`,
+      [
+        sessionId,
+        req.user.tenant_id || null,
+        chatId,
+        userId,
+        clientMsgId,
+        attachmentKind,
+        qualityResolution.qualityMode,
+        originalFileName || null,
+        mimeType || null,
+        totalBytes,
+        sha256 || null,
+        path.basename(tempPath),
+        tempPath,
+        JSON.stringify(mediaMeta),
+        String(CHAT_UPLOAD_SESSION_TTL_HOURS),
+      ],
+    );
+    await client.query("COMMIT");
+    return res.status(201).json({
+      ok: true,
+      data: serializeUploadSession(inserted.rows[0]),
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("chats.uploadSession.create error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Не удалось создать upload session",
+      error_code: "chat_upload_session_create_failed",
+    });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch(
+  "/uploads/sessions/:sessionId",
+  requireAuth,
+  uploadSessionChunkUpload.single("chunk"),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      const offset = Math.max(0, Number(req.body?.offset || 0));
+      const sessionId = String(req.params?.sessionId || "").trim();
+      const chunkBuffer = req.file?.buffer || null;
+      if (!chunkBuffer || chunkBuffer.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Нужно передать chunk",
+        });
+      }
+      await client.query("BEGIN");
+      const session = await loadUploadSessionForUser(client, sessionId, req.user, {
+        forUpdate: true,
+      });
+      if (!session) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Upload session not found" });
+      }
+      if (
+        session.expires_at &&
+        new Date(session.expires_at).getTime() > 0 &&
+        new Date(session.expires_at).getTime() < Date.now()
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(410).json({
+          ok: false,
+          error: "Upload session expired",
+          error_code: "chat_upload_session_expired",
+        });
+      }
+      const currentUploaded = Number(session.uploaded_bytes || 0);
+      if (offset !== currentUploaded) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          error: "Неверный offset для продолжения загрузки",
+          error_code: "chat_upload_offset_mismatch",
+          data: {
+            expected_offset: currentUploaded,
+          },
+        });
+      }
+      fs.mkdirSync(path.dirname(session.storage_path), { recursive: true });
+      await fs.promises.appendFile(session.storage_path, chunkBuffer);
+      const nextUploaded = currentUploaded + chunkBuffer.length;
+      const updated = await client.query(
+        `UPDATE chat_upload_sessions
+         SET uploaded_bytes = $2,
+             status = CASE
+               WHEN $2 >= total_bytes THEN 'uploaded'
+               ELSE 'uploading'
+             END,
+             updated_at = now(),
+             last_error_code = NULL,
+             last_error_message = NULL
+         WHERE id = $1
+         RETURNING *`,
+        [session.id, nextUploaded],
+      );
+      await client.query("COMMIT");
+      return res.json({
+        ok: true,
+        data: {
+          ...serializeUploadSession(updated.rows[0]),
+          expected_offset: nextUploaded,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("chats.uploadSession.patch error", err);
+      return res.status(500).json({
+        ok: false,
+        error: "Не удалось принять chunk",
+        error_code: "chat_upload_chunk_failed",
+      });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post(
+  "/uploads/sessions/:sessionId/complete",
+  requireAuth,
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const session = await loadUploadSessionForUser(
+        client,
+        req.params?.sessionId,
+        req.user,
+        { forUpdate: true },
+      );
+      if (!session) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Upload session not found" });
+      }
+      const uploadedBytes = Number(session.uploaded_bytes || 0);
+      const totalBytes = Number(session.total_bytes || 0);
+      if (uploadedBytes < totalBytes) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          error: "Файл загружен не полностью",
+          error_code: "chat_upload_incomplete",
+          data: {
+            uploaded_bytes: uploadedBytes,
+            total_bytes: totalBytes,
+          },
+        });
+      }
+      const currentChecksum = await sha256File(session.storage_path);
+      if (
+        String(session.sha256 || "").trim() &&
+        String(session.sha256 || "").trim().toLowerCase() !== currentChecksum
+      ) {
+        await client.query(
+          `UPDATE chat_upload_sessions
+           SET status = 'failed_permanent',
+               last_error_code = 'checksum_mismatch',
+               last_error_message = 'Контрольная сумма не совпала',
+               updated_at = now()
+           WHERE id = $1`,
+          [session.id],
+        );
+        await client.query("COMMIT");
+        return res.status(409).json({
+          ok: false,
+          error: "Контрольная сумма не совпала",
+          error_code: "chat_upload_checksum_mismatch",
+        });
+      }
+
+      const ext =
+        path.extname(String(session.original_file_name || "").trim()).toLowerCase() ||
+        fallbackExtensionForAttachmentType(session.attachment_kind);
+      const finalPath = path.join(
+        storageBaseDirForAttachmentType(session.attachment_kind),
+        `${Date.now()}-${uuidv4()}${ext && ext.length <= 10 ? ext : fallbackExtensionForAttachmentType(session.attachment_kind)}`,
+      );
+      fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+      await fs.promises.rename(session.storage_path, finalPath);
+      const finalUrl = buildChatMediaPublicUrl(
+        req,
+        session.attachment_kind,
+        path.basename(finalPath),
+      );
+      const moved = await client.query(
+        `UPDATE chat_upload_sessions
+         SET status = 'processing',
+             uploaded_bytes = total_bytes,
+             sha256 = $2,
+             storage_key = $3,
+             storage_url = $4,
+             storage_path = $5,
+             updated_at = now(),
+             last_error_code = NULL,
+             last_error_message = NULL
+         WHERE id = $1
+         RETURNING *`,
+        [
+          session.id,
+          currentChecksum,
+          path.basename(finalPath),
+          finalUrl,
+          finalPath,
+        ],
+      );
+      const ready = await finalizeSessionProcessing(req, client, moved.rows[0]);
+      await client.query("COMMIT");
+      return res.json({
+        ok: true,
+        data: serializeUploadSession(ready),
+      });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("chats.uploadSession.complete error", err);
+      return res.status(500).json({
+        ok: false,
+        error: "Не удалось завершить upload session",
+        error_code: "chat_upload_complete_failed",
+      });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.post("/:chatId/messages/media/commit", requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const userId = req.user.id;
+    const role = req.user.role;
+    const { chatId } = req.params;
+    const caption = String(req.body?.text || req.body?.caption || "").trim();
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canPostChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Нет прав на отправку сообщения в этот чат",
+      });
+    }
+
+    const replyMeta = mergeReplyAndForwardMeta({
+      replyToMessageId: req.body?.reply_to_message_id,
+      replyPreviewText: req.body?.reply_preview_text,
+      replyPreviewSenderName: req.body?.reply_preview_sender_name,
+      forwardedFromMessageId: req.body?.forwarded_from_message_id,
+      forwardedFromChatId: req.body?.forwarded_from_chat_id,
+      forwardedFromSenderName: req.body?.forwarded_from_sender_name,
+    });
+
+    await client.query("BEGIN");
+    const session = await loadUploadSessionForUser(
+      client,
+      req.body?.session_id,
+      req.user,
+      { forUpdate: true },
+    );
+    if (!session || String(session.chat_id || "").trim() !== String(chatId).trim()) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Upload session not found" });
+    }
+    if (session.committed_message_id) {
+      await client.query("COMMIT");
+      const responseMessage = await finalizeCreatedMessage(
+        req,
+        chatId,
+        session.committed_message_id,
+        userId,
+      );
+      return res.status(201).json({ ok: true, data: responseMessage });
+    }
+    if (!["ready", "processing"].includes(String(session.status || "").trim().toLowerCase())) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        error: "Upload session ещё не готов к публикации",
+        error_code: "chat_upload_session_not_ready",
+      });
+    }
+
+    const messageId = await commitSessionMessage({
+      req,
+      client,
+      sessionRow: session,
+      userId,
+      caption,
+      replyMeta,
+    });
+
+    let promptMessageId = null;
+    let autoReplyMessageId = null;
+    if (isSupportTicketChatContext(context)) {
+      const ticketId = supportTicketIdFromSettings(context.settings);
+      if (ticketId) {
+        const synced = await syncSupportTicketOnMessage({
+          chatId,
+          senderId: userId,
+          senderRole: role,
+          tenantId: req.user.tenant_id || null,
+          supportTicketId: ticketId,
+          messageText: caption || attachmentCaptionText(session.attachment_kind, caption),
+        });
+        promptMessageId = synced.promptMessageId || null;
+        autoReplyMessageId = synced.autoReplyMessageId || null;
+      }
+    }
+    await client.query("COMMIT");
+    await syncMessageSearchDocumentFromMessageId(messageId);
+    const responseMessage = await finalizeCreatedMessage(req, chatId, messageId, userId);
+    await upsertUserChatState(userId, chatId, {
+      last_seen_message_id: messageId,
+      draft_text: "",
+      draft_updated_at: new Date().toISOString(),
+    });
+    if (promptMessageId) {
+      await syncMessageSearchDocumentFromMessageId(promptMessageId);
+      await finalizeCreatedMessage(req, chatId, promptMessageId, userId);
+    }
+    if (autoReplyMessageId) {
+      await syncMessageSearchDocumentFromMessageId(autoReplyMessageId);
+      await finalizeCreatedMessage(req, chatId, autoReplyMessageId, userId);
+    }
+    return res.status(201).json({ ok: true, data: responseMessage });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    console.error("chats.commitMediaMessage error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Не удалось опубликовать медиа-сообщение",
+      error_code: "chat_media_commit_failed",
+    });
+  } finally {
+    client.release();
+  }
+});
+
+router.post("/:chatId/outbox/reconcile", requireAuth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const clientMsgIds = Array.isArray(req.body?.client_msg_ids)
+      ? req.body.client_msg_ids
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+          .slice(0, 100)
+      : [];
+    if (clientMsgIds.length === 0) {
+      return res.json({ ok: true, data: [] });
+    }
+    const messagesQ = await db.query(
+      `SELECT id, client_msg_id
+       FROM messages
+       WHERE chat_id = $1
+         AND client_msg_id = ANY($2::text[])`,
+      [chatId, clientMsgIds],
+    );
+    const sessionsQ = await db.query(
+      `SELECT *
+       FROM chat_upload_sessions
+       WHERE chat_id = $1
+         AND user_id = $2
+         AND client_msg_id = ANY($3::text[])`,
+      [chatId, req.user.id, clientMsgIds],
+    );
+    const messagesByClientId = new Map();
+    for (const row of messagesQ.rows) {
+      messagesByClientId.set(String(row.client_msg_id || "").trim(), row);
+    }
+    const sessionsByClientId = new Map();
+    for (const row of sessionsQ.rows) {
+      const key = String(row.client_msg_id || "").trim();
+      if (!key || sessionsByClientId.has(key)) continue;
+      sessionsByClientId.set(key, row);
+    }
+    const items = [];
+    for (const clientMsgId of clientMsgIds) {
+      const message = messagesByClientId.get(clientMsgId);
+      if (message?.id) {
+        const hydrated = await getHydratedMessageById(message.id, req.user.id);
+        items.push({
+          client_msg_id: clientMsgId,
+          state: "committed",
+          message: decorateMessageMediaUrls(req, hydrated),
+        });
+        continue;
+      }
+      const session = sessionsByClientId.get(clientMsgId);
+      if (session) {
+        items.push({
+          client_msg_id: clientMsgId,
+          state: String(session.status || "").trim().toLowerCase(),
+          session: serializeUploadSession(session),
+        });
+        continue;
+      }
+      items.push({
+        client_msg_id: clientMsgId,
+        state: "missing",
+      });
+    }
+    return res.json({ ok: true, data: items });
+  } catch (err) {
+    console.error("chats.outbox.reconcile error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Не удалось синхронизировать outbox",
+      error_code: "chat_outbox_reconcile_failed",
+    });
+  }
+});
+
+router.post("/contacts/phonebook/match", requireAuth, async (req, res) => {
+  try {
+    const contacts = Array.isArray(req.body?.contacts) ? req.body.contacts : [];
+    const normalizedContacts = contacts
+      .map((row) => {
+        const item =
+          row && typeof row === "object" && !Array.isArray(row) ? row : {};
+        const hashes = Array.isArray(item.phone_hashes || item.hashes)
+          ? (item.phone_hashes || item.hashes)
+              .map((value) => String(value || "").trim().toLowerCase())
+              .filter(Boolean)
+          : [];
+        return {
+          local_id: String(item.local_id || item.id || "").trim(),
+          display_name: String(item.display_name || item.name || "")
+            .trim()
+            .slice(0, 180),
+          hashes: Array.from(new Set(hashes)),
+        };
+      })
+      .filter((row) => row.hashes.length > 0)
+      .slice(0, 2000);
+
+    if (normalizedContacts.length === 0) {
+      return res.json({ ok: true, data: { matches: [], invites: [] } });
+    }
+
+    const allHashes = Array.from(
+      new Set(normalizedContacts.flatMap((row) => row.hashes)),
+    );
+    const usersQ = await db.query(
+      `SELECT u.id,
+              u.email,
+              u.name,
+              u.role,
+              u.tenant_id,
+              p.phone,
+              u.avatar_url,
+              COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+              COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+              COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+       FROM users u
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE u.id <> $1
+         AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)`,
+      [req.user.id, req.user.tenant_id || null],
+    );
+    const userByHash = new Map();
+    for (const row of usersQ.rows) {
+      const hash = phoneMatchHashForTenant(req.user.tenant_id, row.phone);
+      if (!hash || !allHashes.includes(hash) || userByHash.has(hash)) continue;
+      userByHash.set(hash, row);
+    }
+
+    const matches = [];
+    const invites = [];
+    for (const contact of normalizedContacts) {
+      const matchedHash = contact.hashes.find((hash) => userByHash.has(hash)) || "";
+      if (matchedHash) {
+        matches.push({
+          local_id: contact.local_id || null,
+          display_name: contact.display_name || null,
+          peer: mapPeerInfo({
+            ...userByHash.get(matchedHash),
+            is_in_contacts: false,
+            alias_name: "",
+          }),
+        });
+      } else {
+        invites.push({
+          local_id: contact.local_id || null,
+          display_name: contact.display_name || null,
+        });
+      }
+    }
+
+    await db.query(
+      `INSERT INTO user_phonebook_match_snapshots (
+         id, user_id, tenant_id, hash_count, matched_count, created_at
+       )
+       VALUES ($1, $2, $3, $4, $5, now())`,
+      [
+        uuidv4(),
+        req.user.id,
+        req.user.tenant_id || null,
+        allHashes.length,
+        matches.length,
+      ],
+    );
+
+    return res.json({
+      ok: true,
+      data: {
+        matches,
+        invites,
+      },
+    });
+  } catch (err) {
+    console.error("chats.phonebook.match error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Не удалось сопоставить контакты",
+      error_code: "chat_phonebook_match_failed",
+    });
   }
 });
 
@@ -4000,6 +5157,20 @@ router.post(
       const imagePreprocess = attachmentType === "image"
         ? String(req.body?.image_preprocess || "").trim().slice(0, 64)
         : "";
+      const processedAttachment = await processAttachmentFile({
+        req,
+        attachmentType,
+        filePath: uploadedFile.path,
+        uploadsRoot: path.resolve(__dirname, "..", "..", "uploads"),
+        previewOutputDir: attachmentType === "video" ? chatImageUploadsDir : null,
+        previewPrefix: clientMsgId || uuidv4(),
+      });
+      const normalizedWidth =
+        imageWidth || processedAttachment.width || null;
+      const normalizedHeight =
+        imageHeight || processedAttachment.height || null;
+      const normalizedDurationMs =
+        durationMs > 0 ? durationMs : processedAttachment.duration_ms || 0;
       const hasCaption = caption.length > 0;
       const text = attachmentType === "image"
         ? (hasCaption ? caption : "Фото")
@@ -4026,19 +5197,30 @@ router.post(
         ...(attachmentType === "image"
           ? {
               image_url: mediaUrl,
-              ...(imageWidth ? { image_width: imageWidth } : {}),
-              ...(imageHeight ? { image_height: imageHeight } : {}),
-              ...(imageAspectRatio ? { image_aspect_ratio: imageAspectRatio } : {}),
+              ...(normalizedWidth ? { image_width: normalizedWidth } : {}),
+              ...(normalizedHeight ? { image_height: normalizedHeight } : {}),
+              ...(imageAspectRatio
+                ? { image_aspect_ratio: imageAspectRatio }
+                : normalizedWidth && normalizedHeight
+                ? {
+                    image_aspect_ratio: Number(
+                      (normalizedWidth / normalizedHeight).toFixed(4),
+                    ),
+                  }
+                : {}),
               ...(imagePreprocess ? { image_preprocess: imagePreprocess } : {}),
             }
           : attachmentType === "voice"
           ? {
               voice_url: mediaUrl,
-              voice_duration_ms: durationMs,
+              voice_duration_ms: normalizedDurationMs,
               voice_mime_type: String(uploadedFile.mimetype || "").trim(),
               voice_file_name: String(
                 uploadedFile.originalname || uploadedFile.filename || "",
               ).trim(),
+              ...(processedAttachment.waveform_peaks?.length
+                ? { waveform_peaks: processedAttachment.waveform_peaks }
+                : {}),
             }
           : attachmentType === "file"
           ? {
@@ -4052,12 +5234,26 @@ router.post(
             }
           : {
               video_url: mediaUrl,
-              video_duration_ms: durationMs,
+              video_duration_ms: normalizedDurationMs,
               video_mime_type: String(uploadedFile.mimetype || "").trim(),
               video_file_name: String(
                 uploadedFile.originalname || uploadedFile.filename || "",
               ).trim(),
+              ...(processedAttachment.preview_image_url
+                ? {
+                    video_preview_image_url:
+                      processedAttachment.preview_image_url,
+                  }
+                : {}),
             }),
+        ...(processedAttachment.preview_image_url
+          ? { preview_image_url: processedAttachment.preview_image_url }
+          : {}),
+        ...(processedAttachment.processing_state
+          ? {
+              attachment_processing_state: processedAttachment.processing_state,
+            }
+          : {}),
       };
 
       if (clientMsgId) {
@@ -4108,13 +5304,28 @@ router.post(
             ).trim() || null,
             mime_type: String(uploadedFile.mimetype || "").trim() || null,
             file_size:
-              uploadedFile.size == null ? null : Number(uploadedFile.size),
-            width: imageWidth,
-            height: imageHeight,
-            aspect_ratio: imageAspectRatio,
-            duration_ms: durationMs > 0 ? durationMs : null,
+              processedAttachment.file_size == null
+                ? uploadedFile.size == null
+                  ? null
+                  : Number(uploadedFile.size)
+                : Number(processedAttachment.file_size),
+            width: normalizedWidth,
+            height: normalizedHeight,
+            aspect_ratio:
+              imageAspectRatio ||
+              (normalizedWidth && normalizedHeight
+                ? Number((normalizedWidth / normalizedHeight).toFixed(4))
+                : null),
+            duration_ms: normalizedDurationMs > 0 ? normalizedDurationMs : null,
             preprocess_tag: imagePreprocess || null,
             quality_mode: req.body?.quality_mode,
+            processing_state: processedAttachment.processing_state,
+            checksum_sha256: processedAttachment.checksum_sha256,
+            preview_image_url: processedAttachment.preview_image_url,
+            preview_width: processedAttachment.preview_width,
+            preview_height: processedAttachment.preview_height,
+            waveform_peaks: processedAttachment.waveform_peaks,
+            extra_meta: processedAttachment.extra_meta,
             is_video_note:
               attachmentType === "video" &&
               (req.body?.is_video_note == true ||
@@ -4126,6 +5337,7 @@ router.post(
           },
         ],
       });
+      await syncMessageSearchDocumentFromMessageId(messageId);
       const qualityResolution = resolveAttachmentQualityMode(
         req.body?.quality_mode,
         attachmentType,
@@ -4223,6 +5435,12 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
 
     const message = messageQ.rows[0];
     const meta = parseMeta(message.meta);
+    const attachmentsToDeleteQ = await db.query(
+      `SELECT storage_url, preview_image_url
+       FROM message_attachments
+       WHERE message_id = $1`,
+      [messageId],
+    );
     if (isSystemMessage(meta)) {
       return res.status(403).json({
         ok: false,
@@ -4290,6 +5508,7 @@ router.patch("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       ],
     );
     const updatedRaw = await getHydratedMessageById(upd.rows[0]?.id, userId);
+    await syncMessageSearchDocumentFromMessageId(messageId);
     const updated = decorateMessageMediaUrls(req, updatedRaw);
     if (!updated) {
       return res.status(500).json({ ok: false, error: "Не удалось загрузить сообщение" });
@@ -4643,6 +5862,10 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
     removeChatMediaByUrl(meta?.voice_url);
     removeChatMediaByUrl(meta?.video_url);
     removeChatMediaByUrl(meta?.file_url);
+    for (const attachment of attachmentsToDeleteQ.rows) {
+      await removeAttachmentFiles(attachment);
+    }
+    await deleteMessageSearchDocument(messageId);
 
     const io = req.app.get("io");
     if (io) {
@@ -4692,7 +5915,7 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
     }
 
     const mediaQ = await db.query(
-      `SELECT meta
+      `SELECT id, meta
        FROM messages
        WHERE chat_id = $1`,
       [chatId],
@@ -4704,9 +5927,21 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
       removeChatMediaByUrl(meta?.voice_url);
       removeChatMediaByUrl(meta?.video_url);
       removeChatMediaByUrl(meta?.file_url);
+      const attachmentsQ = await db.query(
+        `SELECT storage_url, preview_image_url
+         FROM message_attachments
+         WHERE message_id = $1`,
+        [row.id],
+      );
+      for (const attachment of attachmentsQ.rows) {
+        await removeAttachmentFiles(attachment);
+      }
     }
 
     await db.query("DELETE FROM message_reads WHERE chat_id = $1", [chatId]);
+    await db.query("DELETE FROM message_search_documents WHERE chat_id = $1", [
+      chatId,
+    ]);
     const deleted = await db.query(
       `DELETE FROM messages
        WHERE chat_id = $1`,

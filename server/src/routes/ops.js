@@ -10,8 +10,13 @@ const requireRole = require('../middleware/requireRole');
 const requirePermission = require('../middleware/requirePermission');
 const { logAudit } = require('../utils/audit');
 const { guardAction } = require('../utils/antifraud');
-const { logMonitoringEvent } = require('../utils/monitoring');
+const {
+  logMonitoringEvent,
+  logReleaseCheck,
+  sanitizeDetails,
+} = require('../utils/monitoring');
 const { emitToTenant } = require('../utils/socket');
+const realtimeDiagnostics = require('../utils/realtimeDiagnostics');
 const { ensureSystemChannels } = require('../utils/systemChannels');
 const {
   renderSupportTemplateBody,
@@ -199,6 +204,209 @@ function withinQuietHours({ enabled, from, to, now = new Date() }) {
     return currentMinutes >= fromMinutes && currentMinutes < toMinutes;
   }
   return currentMinutes >= fromMinutes || currentMinutes < toMinutes;
+}
+
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || '').trim(),
+  );
+}
+
+function safeLimit(value, fallback = 120, { min = 20, max = 500 } = {}) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+async function loadMonitoringCounts(tenantId) {
+  const unresolvedQ = await db.query(
+    `SELECT level, COUNT(*)::int AS total
+     FROM monitoring_events
+     WHERE resolved = false
+       AND created_at >= now() - interval '7 days'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+     GROUP BY level`,
+    [tenantId || null],
+  );
+  const byLevel = {
+    info: 0,
+    warn: 0,
+    error: 0,
+    critical: 0,
+  };
+  for (const row of unresolvedQ.rows) {
+    byLevel[String(row.level || 'info')] = Number(row.total || 0);
+  }
+  return byLevel;
+}
+
+async function loadReleaseSummary(tenantId) {
+  const statusQ = await db.query(
+    `SELECT scope,
+            status,
+            COUNT(*)::int AS total
+     FROM ops_release_checks
+     WHERE created_at >= now() - interval '14 days'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+     GROUP BY scope, status
+     ORDER BY scope ASC, status ASC`,
+    [tenantId || null],
+  );
+  const latestQ = await db.query(
+    `SELECT id,
+            scope,
+            status,
+            title,
+            target,
+            version_name,
+            build_number,
+            summary,
+            details,
+            created_at
+     FROM ops_release_checks
+     WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+     ORDER BY created_at DESC
+     LIMIT 20`,
+    [tenantId || null],
+  );
+
+  return {
+    totals: statusQ.rows.map((row) => ({
+      scope: row.scope,
+      status: row.status,
+      total: Number(row.total || 0),
+    })),
+    latest: latestQ.rows,
+  };
+}
+
+async function loadPushHealth(tenantId) {
+  const endpointsQ = await db.query(
+    `SELECT platform,
+            transport,
+            COUNT(*)::int AS total
+     FROM notification_endpoints
+     WHERE is_active = true
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+     GROUP BY platform, transport
+     ORDER BY total DESC, platform ASC`,
+    [tenantId || null],
+  );
+  const webPushQ = await db.query(
+    `SELECT COUNT(*)::int AS total
+     FROM web_push_subscriptions wps
+     JOIN users u ON u.id = wps.user_id
+     WHERE wps.is_active = true
+       AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
+    [tenantId || null],
+  );
+  return {
+    active_endpoint_count: endpointsQ.rows.reduce(
+      (sum, row) => sum + Number(row.total || 0),
+      0,
+    ),
+    active_web_push_subscriptions: Number(webPushQ.rows[0]?.total || 0),
+    by_transport: endpointsQ.rows.map((row) => ({
+      platform: row.platform,
+      transport: row.transport,
+      total: Number(row.total || 0),
+    })),
+  };
+}
+
+async function safeMonitoringSection(loader, fallback, code) {
+  try {
+    return await loader();
+  } catch (err) {
+    console.warn(`ops.monitoring.section warning (${code})`, err?.message || err);
+    return {
+      ...fallback,
+      status: 'degraded',
+      error_code: code,
+      error_message: String(err?.message || err || 'unknown_error'),
+    };
+  }
+}
+
+async function loadMonitoringCenterPayload(req) {
+  const tenantId = req.user?.tenant_id || null;
+  const started = Date.now();
+  await db.query('SELECT 1');
+  const dbLatencyMs = Date.now() - started;
+
+  const antifraudBlocksQ = await db.query(
+    `SELECT COUNT(*)::int AS total
+     FROM antifraud_blocks
+     WHERE is_active = true
+       AND blocked_until > now()
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)`,
+    [tenantId],
+  );
+  const pendingPostsQ = await db.query(
+    `SELECT COUNT(*)::int AS total
+     FROM product_publication_queue q
+     JOIN chats c ON c.id = q.channel_id
+     WHERE q.status = 'pending'
+       AND COALESCE(q.is_sent, false) = false
+       AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)`,
+    [tenantId],
+  );
+
+  const io = req.app.get('io');
+  const sockets = Number(io?.engine?.clientsCount || 0);
+  const rooms = Number(io?.sockets?.adapter?.rooms?.size || 0);
+  const monitoring = await safeMonitoringSection(
+    () => loadMonitoringCounts(tenantId),
+    { unresolved_total: 0, by_severity: [], by_subsystem: [] },
+    'monitoring_counts_failed',
+  );
+  const release = await safeMonitoringSection(
+    () => loadReleaseSummary(tenantId),
+    { totals: [], latest: [] },
+    'release_summary_failed',
+  );
+  const push = await safeMonitoringSection(
+    () => loadPushHealth(tenantId),
+    {
+      active_endpoint_count: 0,
+      active_web_push_subscriptions: 0,
+      by_transport: [],
+    },
+    'push_health_failed',
+  );
+  const realtime = realtimeDiagnostics.snapshot();
+
+  return {
+    api: {
+      status: 'ok',
+      uptime_sec: Math.floor(process.uptime()),
+    },
+    database: {
+      status: 'ok',
+      latency_ms: dbLatencyMs,
+    },
+    socket: {
+      connected_clients: sockets,
+      rooms,
+    },
+    queue: {
+      pending_posts: Number(pendingPostsQ.rows[0]?.total || 0),
+    },
+    antifraud: {
+      active_blocks: Number(antifraudBlocksQ.rows[0]?.total || 0),
+    },
+    monitoring,
+    release,
+    push,
+    realtime,
+    runtime: {
+      node: process.version,
+      platform: process.platform,
+      load_avg: os.loadavg(),
+      memory: process.memoryUsage(),
+    },
+    generated_at: new Date().toISOString(),
+  };
 }
 
 async function saveSmartNotificationEvent({
@@ -1068,87 +1276,239 @@ router.get('/diagnostics/center', requireAuth, requireRole('creator'), async (re
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    return res.json({ ok: true, data: await loadMonitoringCenterPayload(req) });
+  } catch (err) {
+    console.error('ops.diagnostics.center error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
 
-    const started = Date.now();
-    await db.query('SELECT 1');
-    const dbLatencyMs = Date.now() - started;
-
-    const unresolvedQ = await db.query(
-      `SELECT level, COUNT(*)::int AS total
-       FROM monitoring_events
-       WHERE resolved = false
-         AND created_at >= now() - interval '7 days'
-         AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
-       GROUP BY level`,
-      [req.user?.tenant_id || null],
-    );
-
-    const antifraudBlocksQ = await db.query(
-      `SELECT COUNT(*)::int AS total
-       FROM antifraud_blocks
-       WHERE is_active = true
-         AND blocked_until > now()
-         AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)`,
-      [req.user?.tenant_id || null],
-    );
-
-    const pendingPostsQ = await db.query(
-      `SELECT COUNT(*)::int AS total
-       FROM product_publication_queue q
-       JOIN chats c ON c.id = q.channel_id
-       WHERE q.status = 'pending'
-         AND COALESCE(q.is_sent, false) = false
-         AND ($1::uuid IS NULL OR c.tenant_id = $1::uuid)`,
-      [req.user?.tenant_id || null],
-    );
-
-    const io = req.app.get('io');
-    const sockets = Number(io?.engine?.clientsCount || 0);
-    const rooms = Number(io?.sockets?.adapter?.rooms?.size || 0);
-
-    const byLevel = {
-      info: 0,
-      warn: 0,
-      error: 0,
-      critical: 0,
-    };
-    for (const row of unresolvedQ.rows) {
-      byLevel[String(row.level || 'info')] = Number(row.total || 0);
+router.post('/monitoring/events', requireAuth, async (req, res) => {
+  try {
+    const body =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? req.body
+        : {};
+    const message = String(body.message || '').trim();
+    if (!message) {
+      return res.status(400).json({ ok: false, error: 'Сообщение обязательно' });
     }
 
+    const id = await logMonitoringEvent({
+      queryable: db,
+      tenantId: req.user?.tenant_id || null,
+      userId: req.user?.id || null,
+      scope: body.scope || 'client',
+      subsystem: body.subsystem || 'client',
+      level: body.level || 'warn',
+      code: body.code || 'client_monitoring_event',
+      message,
+      source:
+        String(body.source || '').trim() ||
+        String(req.headers['user-agent'] || '').trim().slice(0, 180),
+      details: sanitizeDetails(body.details || {}),
+      platform: body.platform || null,
+      appVersion: body.app_version || null,
+      appBuild: body.app_build || null,
+      userRole: req.user?.role || null,
+      tenantCode: req.user?.tenant_code || null,
+      deviceLabel: body.device_label || null,
+      releaseChannel: body.release_channel || null,
+      sessionState: body.session_state || null,
+    });
+
+    const subsystem = String(body.subsystem || '').trim().toLowerCase();
+    const code = String(body.code || '').trim().toLowerCase();
+    if (subsystem === 'outbox') {
+      if (
+        code == 'outbox_retry_success' ||
+        code == 'outbox_flush_success' ||
+        code == 'outbox_item_delivered'
+      ) {
+        realtimeDiagnostics.markOutboxRetrySuccess();
+      } else if (
+        code == 'outbox_retry_failed' ||
+        code == 'outbox_flush_failed' ||
+        code == 'outbox_permanent_failure'
+      ) {
+        realtimeDiagnostics.markOutboxRetryFailure();
+      }
+    }
+    if (subsystem === 'realtime' && code === 'replay_fallback_used') {
+      realtimeDiagnostics.markReplayFallback();
+    }
+
+    return res.status(201).json({ ok: true, data: { id } });
+  } catch (err) {
+    console.error('ops.monitoring.ingest error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/monitoring/center', requireAuth, requireRole('creator'), async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
+    }
+    return res.json({ ok: true, data: await loadMonitoringCenterPayload(req) });
+  } catch (err) {
+    console.error('ops.monitoring.center error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/monitoring/events', requireAuth, requireRole('creator'), async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    const limit = safeLimit(req.query?.limit, 120);
+    const subsystem = String(req.query?.subsystem || '').trim().toLowerCase();
+    const level = String(req.query?.level || '').trim().toLowerCase();
+    const resolvedRaw = String(req.query?.resolved || '').trim().toLowerCase();
+    const params = [tenantId, subsystem, level, limit];
+    let sql = `SELECT id,
+                      tenant_id,
+                      user_id,
+                      scope,
+                      level,
+                      code,
+                      message,
+                      source,
+                      details,
+                      subsystem,
+                      platform,
+                      app_version,
+                      app_build,
+                      user_role,
+                      tenant_code,
+                      device_label,
+                      release_channel,
+                      session_state,
+                      resolved,
+                      created_at
+               FROM monitoring_events
+               WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+                 AND ($2::text = '' OR COALESCE(subsystem, '') = $2::text)
+                 AND ($3::text = '' OR level = $3::text)`;
+    if (resolvedRaw == 'true' || resolvedRaw == 'false') {
+      params.push(resolvedRaw === 'true');
+      sql += ` AND resolved = $5`;
+    }
+    sql += ` ORDER BY created_at DESC LIMIT $4`;
+    const rows = await db.query(sql, params);
+    return res.json({ ok: true, data: rows.rows });
+  } catch (err) {
+    console.error('ops.monitoring.events error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/monitoring/releases', requireAuth, requireRole('creator'), async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
+    }
+    const data = await loadReleaseSummary(req.user?.tenant_id || null);
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error('ops.monitoring.releases error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.get('/monitoring/realtime', requireAuth, requireRole('creator'), async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    const recentEvents = await db.query(
+      `SELECT code,
+              level,
+              message,
+              source,
+              details,
+              created_at
+       FROM monitoring_events
+       WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+         AND COALESCE(subsystem, '') IN ('realtime', 'socket', 'outbox', 'push')
+         AND created_at >= now() - interval '24 hours'
+       ORDER BY created_at DESC
+       LIMIT 40`,
+      [tenantId],
+    );
     return res.json({
       ok: true,
       data: {
-        api: {
-          status: 'ok',
-          uptime_sec: Math.floor(process.uptime()),
-        },
-        database: {
-          status: 'ok',
-          latency_ms: dbLatencyMs,
-        },
-        socket: {
-          connected_clients: sockets,
-          rooms,
-        },
-        queue: {
-          pending_posts: Number(pendingPostsQ.rows[0]?.total || 0),
-        },
-        antifraud: {
-          active_blocks: Number(antifraudBlocksQ.rows[0]?.total || 0),
-        },
-        monitoring: byLevel,
-        runtime: {
-          node: process.version,
-          platform: process.platform,
-          load_avg: os.loadavg(),
-          memory: process.memoryUsage(),
-        },
-        generated_at: new Date().toISOString(),
+        snapshot: realtimeDiagnostics.snapshot(),
+        events: recentEvents.rows,
       },
     });
   } catch (err) {
-    console.error('ops.diagnostics.center error', err);
+    console.error('ops.monitoring.realtime error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.patch('/monitoring/events/:id/resolve', requireAuth, requireRole('creator'), async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
+    }
+    const id = String(req.params?.id || '').trim();
+    if (!isUuidLike(id)) {
+      return res.status(400).json({ ok: false, error: 'Некорректный id события' });
+    }
+    const tenantId = req.user?.tenant_id || null;
+    const upd = await db.query(
+      `UPDATE monitoring_events
+       SET resolved = true
+       WHERE id = $1
+         AND ($2::uuid IS NULL OR tenant_id = $2::uuid OR tenant_id IS NULL)
+       RETURNING id, resolved`,
+      [id, tenantId],
+    );
+    if (upd.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Событие не найдено' });
+    }
+    return res.json({ ok: true, data: upd.rows[0] });
+  } catch (err) {
+    console.error('ops.monitoring.resolve error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/monitoring/releases', requireAuth, requireRole('creator'), async (req, res) => {
+  try {
+    if (!isCreatorBase(req.user)) {
+      return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
+    }
+    const body =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? req.body
+        : {};
+    const title = String(body.title || '').trim();
+    if (!title) {
+      return res.status(400).json({ ok: false, error: 'title обязателен' });
+    }
+    const id = await logReleaseCheck({
+      queryable: db,
+      tenantId: req.user?.tenant_id || null,
+      createdBy: req.user?.id || null,
+      scope: body.scope || 'manual',
+      status: body.status || 'warn',
+      title,
+      target: body.target || null,
+      versionName: body.version_name || null,
+      buildNumber: body.build_number || null,
+      summary: body.summary || null,
+      details: sanitizeDetails(body.details || {}),
+    });
+    return res.status(201).json({ ok: true, data: { id } });
+  } catch (err) {
+    console.error('ops.monitoring.release.create error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   }
 });

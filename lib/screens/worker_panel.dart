@@ -659,7 +659,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       if (!mounted) return;
       final result = await showProductPhotoCropDialog(
         context: context,
-        sourceBytes: sourceBytes,
+        sourceBytes: Uint8List.fromList(sourceBytes),
         originalFileName: _resolvedPickedFileName(picked),
       );
       if (result == null || !mounted) return;
@@ -806,16 +806,37 @@ class _WorkerPanelState extends State<WorkerPanel>
         setState(() => _message = 'Выбрано пустое изображение');
         return;
       }
+      final stablePickedBytes = Uint8List.fromList(pickedBytes);
 
       if (!mounted) return;
       if (preloadedFileName != null && preloadedFileName.isNotEmpty) {
         _pickedImageUploadFileName = preloadedFileName;
       }
-      final cropResult = await showProductPhotoCropDialog(
-        context: context,
-        sourceBytes: pickedBytes,
-        originalFileName: _resolvedPickedFileName(picked),
-      );
+      ProductPhotoCropResult? cropResult;
+      try {
+        cropResult = await showProductPhotoCropDialog(
+          context: context,
+          sourceBytes: stablePickedBytes,
+          originalFileName: _resolvedPickedFileName(picked),
+        );
+      } catch (cropError) {
+        if (!mounted) return;
+        setState(() {
+          _pickedImage = picked;
+          _pickedImageBytes = stablePickedBytes;
+          _pickedImageUploadFileName = _resolvedPickedFileName(picked);
+          _removeImageOnSubmit = false;
+          _message = '';
+        });
+        showAppNotice(
+          context,
+          'Обрезка недоступна для этого файла, фото добавлено без обрезки',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+        debugPrint('worker_panel.crop_fallback error=$cropError');
+        return;
+      }
       if (cropResult == null) {
         if (!mounted) return;
         setState(() {
@@ -823,11 +844,12 @@ class _WorkerPanelState extends State<WorkerPanel>
         });
         return;
       }
+      final resolvedCropResult = cropResult;
       if (!mounted) return;
       setState(() {
         _pickedImage = picked;
-        _pickedImageBytes = cropResult.bytes;
-        _pickedImageUploadFileName = cropResult.fileName;
+        _pickedImageBytes = resolvedCropResult.bytes;
+        _pickedImageUploadFileName = resolvedCropResult.fileName;
         _removeImageOnSubmit = false;
         _message = '';
       });

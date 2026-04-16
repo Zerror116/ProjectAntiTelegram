@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 
 import '../main.dart';
 import '../services/native_push_service.dart';
+import '../services/notification_runtime_preference_service.dart';
 
 class NotificationPreferencesScreen extends StatefulWidget {
   const NotificationPreferencesScreen({super.key});
@@ -249,6 +250,10 @@ class _NotificationPreferencesScreenState
       await authService.dio.patch(
         '/api/notifications/preferences',
         data: payload,
+      );
+      await NotificationRuntimePreferenceService.applyRuntimePreference(
+        authService.dio,
+        enabled: _effectivePushEnabledFromState(),
       );
       await refreshNotificationBadgeCount();
       if (!mounted) return;

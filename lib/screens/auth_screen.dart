@@ -8,6 +8,7 @@ import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/auth_service.dart';
+import '../services/invite_referral_service.dart';
 import '../main.dart'; // глобальный authService и dio
 import '../widgets/input_language_badge.dart';
 import '../widgets/submit_on_enter.dart';
@@ -83,6 +84,7 @@ class _AuthScreenState extends State<AuthScreen> {
       _accessKeyController.text = inviteFromLink;
       _isRegister = true;
     }
+    unawaited(inviteReferralService.captureFromUri(Uri.base));
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;

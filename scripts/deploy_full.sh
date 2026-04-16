@@ -111,6 +111,19 @@ run_rsync() {
   fi
 }
 
+report_remote_release_check() {
+  local scope="$1"
+  local status="$2"
+  local title="$3"
+  local target="$4"
+  local summary="$5"
+  local details_json="${6:-{}}"
+  local details_base64
+  details_base64="$(printf '%s' "$details_json" | base64 | tr -d '\n')"
+  run_ssh "$SERVER" \
+    "cd '$REMOTE_PROJECT_DIR' && node server/scripts/report_release_health.js --scope '$scope' --status '$status' --title '$title' --target '$target' --version '${APP_VERSION_NAME:-}' --build '${APP_BUILD_NUMBER:-}' --summary '$summary' --details-base64 '$details_base64'" >/dev/null 2>&1 || true
+}
+
 echo "[deploy_full] project: $PROJECT_ROOT"
 echo "[deploy_full] branch:  $BRANCH"
 echo "[deploy_full] server:  $SERVER"
@@ -395,7 +408,27 @@ REMOTE_SCRIPT
 echo "[deploy_full] done"
 if [[ "$RUN_HEALTH_CHECK" == "1" ]]; then
   echo "[deploy_full] running production health check for $HEALTH_DOMAIN"
-  bash "$SCRIPT_DIR/prod_health_check.sh" "$HEALTH_DOMAIN"
+  if HEALTH_OUTPUT="$(bash "$SCRIPT_DIR/prod_health_check.sh" "$HEALTH_DOMAIN" 2>&1)"; then
+    printf '%s\n' "$HEALTH_OUTPUT"
+    report_remote_release_check \
+      "after_deploy_smoke" \
+      "pass" \
+      "Web/API after-deploy smoke passed" \
+      "$HEALTH_DOMAIN" \
+      "deploy smoke ok" \
+      "{\"domain\":\"$HEALTH_DOMAIN\",\"branch\":\"$BRANCH\",\"app_version\":\"${APP_VERSION_NAME:-}\",\"app_build\":\"${APP_BUILD_NUMBER:-}\",\"health_output\":$(printf '%s' "$HEALTH_OUTPUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+  else
+    HEALTH_STATUS=$?
+    printf '%s\n' "$HEALTH_OUTPUT"
+    report_remote_release_check \
+      "after_deploy_smoke" \
+      "fail" \
+      "Web/API after-deploy smoke failed" \
+      "$HEALTH_DOMAIN" \
+      "deploy smoke failed" \
+      "{\"domain\":\"$HEALTH_DOMAIN\",\"branch\":\"$BRANCH\",\"app_version\":\"${APP_VERSION_NAME:-}\",\"app_build\":\"${APP_BUILD_NUMBER:-}\",\"health_output\":$(printf '%s' "$HEALTH_OUTPUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+    exit "$HEALTH_STATUS"
+  fi
 else
   echo "[deploy_full] RUN_HEALTH_CHECK=0, skip production health check"
 fi

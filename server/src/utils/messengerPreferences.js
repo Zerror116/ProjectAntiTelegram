@@ -7,6 +7,12 @@ const DEFAULT_MESSENGER_PREFERENCES = Object.freeze({
   default_disappearing_timer: "off",
   allow_listen_once_voice: true,
   playback_speed: "1.0",
+  media_auto_download_images: "wifi_cellular",
+  media_auto_download_audio: "wifi_cellular",
+  media_auto_download_video: "wifi",
+  media_auto_download_documents: "wifi",
+  media_send_quality_wifi: "hd",
+  media_send_quality_cellular: "standard",
 });
 
 function normalizeTimer(raw) {
@@ -23,6 +29,22 @@ function normalizePlaybackSpeed(raw) {
     .toLowerCase();
   if (["1.0", "1.5", "2.0"].includes(value)) return value;
   return DEFAULT_MESSENGER_PREFERENCES.playback_speed;
+}
+
+function normalizeAutoDownload(raw) {
+  const value = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (["never", "wifi", "wifi_cellular"].includes(value)) return value;
+  return "wifi";
+}
+
+function normalizeSendQuality(raw, fallback = "standard") {
+  const value = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (["standard", "hd", "file"].includes(value)) return value;
+  return fallback;
 }
 
 function normalizeBool(raw, fallback) {
@@ -55,6 +77,26 @@ function normalizeMessengerPreferences(row) {
       DEFAULT_MESSENGER_PREFERENCES.allow_listen_once_voice,
     ),
     playback_speed: normalizePlaybackSpeed(source.playback_speed),
+    media_auto_download_images: normalizeAutoDownload(
+      source.media_auto_download_images,
+    ),
+    media_auto_download_audio: normalizeAutoDownload(
+      source.media_auto_download_audio,
+    ),
+    media_auto_download_video: normalizeAutoDownload(
+      source.media_auto_download_video,
+    ),
+    media_auto_download_documents: normalizeAutoDownload(
+      source.media_auto_download_documents,
+    ),
+    media_send_quality_wifi: normalizeSendQuality(
+      source.media_send_quality_wifi,
+      DEFAULT_MESSENGER_PREFERENCES.media_send_quality_wifi,
+    ),
+    media_send_quality_cellular: normalizeSendQuality(
+      source.media_send_quality_cellular,
+      DEFAULT_MESSENGER_PREFERENCES.media_send_quality_cellular,
+    ),
   };
 }
 
@@ -67,6 +109,12 @@ async function getMessengerPreferencesForUser(userId) {
             default_disappearing_timer,
             allow_listen_once_voice,
             playback_speed,
+            media_auto_download_images,
+            media_auto_download_audio,
+            media_auto_download_video,
+            media_auto_download_documents,
+            media_send_quality_wifi,
+            media_send_quality_cellular,
             updated_at
      FROM user_messenger_preferences
      WHERE user_id = $1
@@ -113,6 +161,48 @@ async function upsertMessengerPreferencesForUser(userId, patch = {}) {
     playback_speed: Object.prototype.hasOwnProperty.call(patch, "playback_speed")
       ? normalizePlaybackSpeed(patch.playback_speed)
       : current.playback_speed,
+    media_auto_download_images: Object.prototype.hasOwnProperty.call(
+      patch,
+      "media_auto_download_images",
+    )
+      ? normalizeAutoDownload(patch.media_auto_download_images)
+      : current.media_auto_download_images,
+    media_auto_download_audio: Object.prototype.hasOwnProperty.call(
+      patch,
+      "media_auto_download_audio",
+    )
+      ? normalizeAutoDownload(patch.media_auto_download_audio)
+      : current.media_auto_download_audio,
+    media_auto_download_video: Object.prototype.hasOwnProperty.call(
+      patch,
+      "media_auto_download_video",
+    )
+      ? normalizeAutoDownload(patch.media_auto_download_video)
+      : current.media_auto_download_video,
+    media_auto_download_documents: Object.prototype.hasOwnProperty.call(
+      patch,
+      "media_auto_download_documents",
+    )
+      ? normalizeAutoDownload(patch.media_auto_download_documents)
+      : current.media_auto_download_documents,
+    media_send_quality_wifi: Object.prototype.hasOwnProperty.call(
+      patch,
+      "media_send_quality_wifi",
+    )
+      ? normalizeSendQuality(
+          patch.media_send_quality_wifi,
+          current.media_send_quality_wifi,
+        )
+      : current.media_send_quality_wifi,
+    media_send_quality_cellular: Object.prototype.hasOwnProperty.call(
+      patch,
+      "media_send_quality_cellular",
+    )
+      ? normalizeSendQuality(
+          patch.media_send_quality_cellular,
+          current.media_send_quality_cellular,
+        )
+      : current.media_send_quality_cellular,
   };
 
   const result = await db.query(
@@ -124,9 +214,15 @@ async function upsertMessengerPreferencesForUser(userId, patch = {}) {
        default_disappearing_timer,
        allow_listen_once_voice,
        playback_speed,
+       media_auto_download_images,
+       media_auto_download_audio,
+       media_auto_download_video,
+       media_auto_download_documents,
+       media_send_quality_wifi,
+       media_send_quality_cellular,
        updated_at
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
      ON CONFLICT (user_id)
      DO UPDATE
        SET allow_unknown_dm_requests = EXCLUDED.allow_unknown_dm_requests,
@@ -135,6 +231,12 @@ async function upsertMessengerPreferencesForUser(userId, patch = {}) {
            default_disappearing_timer = EXCLUDED.default_disappearing_timer,
            allow_listen_once_voice = EXCLUDED.allow_listen_once_voice,
            playback_speed = EXCLUDED.playback_speed,
+           media_auto_download_images = EXCLUDED.media_auto_download_images,
+           media_auto_download_audio = EXCLUDED.media_auto_download_audio,
+           media_auto_download_video = EXCLUDED.media_auto_download_video,
+           media_auto_download_documents = EXCLUDED.media_auto_download_documents,
+           media_send_quality_wifi = EXCLUDED.media_send_quality_wifi,
+           media_send_quality_cellular = EXCLUDED.media_send_quality_cellular,
            updated_at = now()
      RETURNING user_id,
                allow_unknown_dm_requests,
@@ -143,6 +245,12 @@ async function upsertMessengerPreferencesForUser(userId, patch = {}) {
                default_disappearing_timer,
                allow_listen_once_voice,
                playback_speed,
+               media_auto_download_images,
+               media_auto_download_audio,
+               media_auto_download_video,
+               media_auto_download_documents,
+               media_send_quality_wifi,
+               media_send_quality_cellular,
                updated_at`,
     [
       userId,
@@ -152,6 +260,12 @@ async function upsertMessengerPreferencesForUser(userId, patch = {}) {
       next.default_disappearing_timer,
       next.allow_listen_once_voice,
       next.playback_speed,
+      next.media_auto_download_images,
+      next.media_auto_download_audio,
+      next.media_auto_download_video,
+      next.media_auto_download_documents,
+      next.media_send_quality_wifi,
+      next.media_send_quality_cellular,
     ],
   );
   return {
