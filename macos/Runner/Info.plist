@@ -32,5 +32,8 @@
 	<string>Приложению нужен доступ к микрофону, чтобы отправлять голосовые сообщения в чатах.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+
+	<key>NSContactsUsageDescription</key>
+	<string>Приложению нужен доступ к контактам, чтобы находить людей из вашей телефонной книги в Фениксе.</string>
 </dict>
 </plist>

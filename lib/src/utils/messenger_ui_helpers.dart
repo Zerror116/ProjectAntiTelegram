@@ -150,6 +150,8 @@ String messengerLocalDeliveryLabel(
       ? null
       : (normalizedProgress * 100).round().clamp(0, 100);
   switch (normalizedStatus) {
+    case 'queued':
+      return 'В очереди';
     case 'uploading':
       return progressPercent == null || progressPercent <= 0
           ? 'Загружается...'

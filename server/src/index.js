@@ -57,12 +57,47 @@ const {
   runMessageEncryptionBackfill,
 } = require("./utils/messageEncryptionBackfill");
 const { logMonitoringEvent } = require("./utils/monitoring");
+const realtimeDiagnostics = require("./utils/realtimeDiagnostics");
 const { tenantRoom } = require("./utils/socket");
 const {
   rewriteSignedUploadsInPayload,
   signedUploadGuard,
 } = require("./utils/signedUploads");
 const { queueChatMessageWebPushForRooms } = require("./utils/webPush");
+
+if (!global.__fenixProcessMonitoringHooksInstalled) {
+  global.__fenixProcessMonitoringHooksInstalled = true;
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled rejection:", reason);
+    void logMonitoringEvent({
+      queryable: db,
+      scope: "process",
+      subsystem: "runtime",
+      level: "error",
+      code: "unhandled_rejection",
+      source: "process.on(unhandledRejection)",
+      message: String(reason?.message || reason || "Unhandled promise rejection"),
+      details: {
+        stack: String(reason?.stack || "").trim() || null,
+      },
+    });
+  });
+  process.on("uncaughtException", (error) => {
+    console.error("Uncaught exception:", error);
+    void logMonitoringEvent({
+      queryable: db,
+      scope: "process",
+      subsystem: "runtime",
+      level: "critical",
+      code: "uncaught_exception",
+      source: "process.on(uncaughtException)",
+      message: String(error?.message || error || "Uncaught exception"),
+      details: {
+        stack: String(error?.stack || "").trim() || null,
+      },
+    });
+  });
+}
 
 // ===================================
 // MIDDLEWARE И КОНФИГУРАЦИЯ
@@ -811,10 +846,18 @@ async function canEmitChatActivity(user, chatId) {
       },
       allowEIO3: true,
       transports: ["websocket", "polling"],
+      pingInterval: 25000,
+      pingTimeout: 60000,
+      connectTimeout: 45000,
+      connectionStateRecovery: {
+        maxDisconnectionDuration: 2 * 60 * 1000,
+        skipMiddlewares: true,
+      },
     });
 
     // Делаем io доступным в express
     app.set("io", io);
+    app.set("realtimeDiagnostics", realtimeDiagnostics);
     global.__projectPhoenixSocketIo = io;
     patchSocketEmittersWithSignedUploads(io);
     console.log("✅ Socket.io initialized");
@@ -853,6 +896,23 @@ async function canEmitChatActivity(user, chatId) {
         );
         if (!context.ok || !context.user?.id) {
           const authError = context.error || "Unauthorized";
+          realtimeDiagnostics.markAuthDenied(authError);
+          void logMonitoringEvent({
+            queryable: db,
+            scope: "socket",
+            subsystem: "realtime",
+            level: "warn",
+            code: "socket_auth_denied",
+            source: "socket.io",
+            message: String(authError),
+            details: {
+              socket_id: socket.id,
+              requested_tenant_code:
+                socket.handshake.auth?.tenant_code ||
+                socket.handshake.query?.tenant_code ||
+                "",
+            },
+          });
           if (
             String(authError).toLowerCase().includes("сессия истекла") ||
             String(authError).toLowerCase().includes("revoked")
@@ -885,6 +945,7 @@ async function canEmitChatActivity(user, chatId) {
       const uid = socket.user?.id;
       const runInSocketTenantContext = (fn) =>
         db.runWithTenantRow(socket.tenantScope || null, fn);
+      realtimeDiagnostics.markConnection({ recovered: socket.recovered === true });
       console.log(`📡 Socket connected: ${sid} (user=${uid || "anonymous"})`);
 
       if (uid) {
@@ -902,45 +963,52 @@ async function canEmitChatActivity(user, chatId) {
 
       // Присоединение к комнате чата
       socket.on("join_chat", async (chatId) => {
+        const joinStartedAt = Date.now();
+        realtimeDiagnostics.markJoinRequest();
         try {
           await runInSocketTenantContext(async () => {
-          if (!chatId) {
-            console.warn(`Socket ${sid}: join_chat called with empty chatId`);
-            return;
-          }
-
-          if (!uid) {
-            console.warn(`Socket ${sid}: unauthorized join_chat`);
-            socket.emit("chat:error", { error: "Unauthorized" });
-            return;
-          }
-
-          const allowed = await canUserAccessChat(socket.user, chatId);
-          if (!allowed) {
-            console.warn(
-              `Socket ${sid}: user ${uid} has no access to chat ${chatId}`,
-            );
-            socket.emit("chat:error", { error: "Access denied" });
-            return;
-          }
-
-          // ✅ ИСПРАВЛЕНИЕ: Сначала выйди из всех чатов, потом присоединись к новому
-          // Получи текущие ком��аты сокета
-          const currentRooms = socket.rooms;
-
-          // Выйди из всех chat:* комнат
-          for (const room of currentRooms) {
-            if (room.startsWith("chat:")) {
-              socket.leave(room);
-              console.log(`Socket ${sid} left room ${room}`);
+            if (!chatId) {
+              console.warn(`Socket ${sid}: join_chat called with empty chatId`);
+              realtimeDiagnostics.markJoinDenied();
+              return;
             }
-          }
 
-          // Присоединись к новой комнате
-          socket.join(`chat:${chatId}`);
-          console.log(`Socket ${sid} joined chat:${chatId}`);
+            if (!uid) {
+              console.warn(`Socket ${sid}: unauthorized join_chat`);
+              realtimeDiagnostics.markJoinDenied();
+              socket.emit("chat:error", { error: "Unauthorized" });
+              return;
+            }
+
+            const allowed = await canUserAccessChat(socket.user, chatId);
+            if (!allowed) {
+              console.warn(
+                `Socket ${sid}: user ${uid} has no access to chat ${chatId}`,
+              );
+              realtimeDiagnostics.markJoinDenied();
+              socket.emit("chat:error", { error: "Access denied" });
+              return;
+            }
+
+            // ✅ ИСПРАВЛЕНИЕ: Сначала выйди из всех чатов, потом присоединись к новому
+            // Получи текущие комнаты сокета
+            const currentRooms = socket.rooms;
+
+            // Выйди из всех chat:* комнат
+            for (const room of currentRooms) {
+              if (room.startsWith("chat:")) {
+                socket.leave(room);
+                console.log(`Socket ${sid} left room ${room}`);
+              }
+            }
+
+            // Присоединись к новой комнате
+            socket.join(`chat:${chatId}`);
+            realtimeDiagnostics.markJoinSuccess(Date.now() - joinStartedAt);
+            console.log(`Socket ${sid} joined chat:${chatId}`);
           });
         } catch (err) {
+          realtimeDiagnostics.markJoinDenied();
           console.error(`Socket ${sid} join_chat error:`, err);
         }
       });
@@ -992,6 +1060,29 @@ async function canEmitChatActivity(user, chatId) {
 
       // ✅ ИСПРАВЛЕНИЕ: Обработка отключения с логированием
       socket.on("disconnect", (reason) => {
+        realtimeDiagnostics.markDisconnect(reason);
+        if (reason && reason !== "client namespace disconnect") {
+          void logMonitoringEvent({
+            queryable: db,
+            tenantId: socket.user?.tenant_id || null,
+            userId: socket.user?.id || null,
+            scope: "socket",
+            subsystem: "realtime",
+            level:
+              reason === "ping timeout" || reason === "transport close"
+                ? "warn"
+                : "info",
+            code: "socket_disconnected",
+            source: "socket.on(disconnect)",
+            message: `Socket disconnected: ${reason}`,
+            details: {
+              socket_id: sid,
+              recovered: socket.recovered === true,
+            },
+            userRole: socket.user?.role || null,
+            tenantCode: socket.user?.tenant_code || null,
+          });
+        }
         console.log(
           `📡 Socket disconnected: ${sid} (user=${uid || "anonymous"}, reason: ${reason})`,
         );

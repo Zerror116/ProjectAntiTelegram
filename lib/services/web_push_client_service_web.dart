@@ -76,14 +76,19 @@ Map<String, dynamic>? _deserializeSubscriptionJson(String? rawJson) {
   };
 }
 
-Future<dynamic> _callPushHelper(String method, [List<dynamic> args = const []]) async {
+Future<dynamic> _callPushHelper(
+  String method, [
+  List<dynamic> args = const [],
+]) async {
   final helper = js.context['projectPhoenixPush'];
   if (helper == null) {
     print('[web-push] helper missing: method=$method');
     return null;
   }
   try {
-    return await _jsPromiseToFuture(_asJsObject(helper).callMethod(method, args));
+    return await _jsPromiseToFuture(
+      _asJsObject(helper).callMethod(method, args),
+    );
   } catch (e) {
     print('[web-push] helper call failed: method=$method error=$e');
     return null;
@@ -163,7 +168,9 @@ Future<void> _syncWindowBadge(int unreadCount) async {
   try {
     if (navigator is js.JsObject && navigator.hasProperty('setAppBadge')) {
       if (normalized > 0) {
-        await _jsPromiseToFuture(navigator.callMethod('setAppBadge', [normalized]));
+        await _jsPromiseToFuture(
+          navigator.callMethod('setAppBadge', [normalized]),
+        );
       } else if (navigator.hasProperty('clearAppBadge')) {
         await _jsPromiseToFuture(navigator.callMethod('clearAppBadge'));
       } else {
@@ -303,6 +310,17 @@ Future<void> syncUnreadBadge(Dio dio) async {
     print('[web-push] syncUnreadBadge: count=$count');
   } catch (e) {
     print('[web-push] syncUnreadBadge: failed error=$e');
+  }
+}
+
+Future<void> syncUnreadBadgeCount(int count) async {
+  if (!isSupported()) return;
+  try {
+    final normalized = count < 0 ? 0 : count;
+    await _postBadgeSyncToWorker(normalized);
+    print('[web-push] syncUnreadBadgeCount: count=$normalized');
+  } catch (e) {
+    print('[web-push] syncUnreadBadgeCount: failed error=$e');
   }
 }
 

@@ -3278,6 +3278,7 @@ router.post(
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
            AND COALESCE(meta->>'user_id', '') = $3
            AND lower(COALESCE(meta->>'processing_mode', 'standard')) <> 'oversize'
+           AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
         [reservedChannel.id, shelfNumber, userIdText],
       );

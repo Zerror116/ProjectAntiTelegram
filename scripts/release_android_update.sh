@@ -143,6 +143,19 @@ run_rsync() {
   fi
 }
 
+report_remote_release_check() {
+  local scope="$1"
+  local status="$2"
+  local title="$3"
+  local target="$4"
+  local summary="$5"
+  local details_json="${6:-{}}"
+  local details_base64
+  details_base64="$(printf '%s' "$details_json" | base64 | tr -d '\n')"
+  run_ssh "$SERVER" \
+    "cd '$REMOTE_PROJECT_DIR' && node server/scripts/report_release_health.js --scope '$scope' --status '$status' --title '$title' --target '$target' --version '${APP_VERSION_NAME:-}' --build '${APP_BUILD_NUMBER:-}' --summary '$summary' --details-base64 '$details_base64'" >/dev/null 2>&1 || true
+}
+
 resolve_flutter_bin() {
   if [[ -n "$FLUTTER_BIN" ]]; then
     [[ -x "$FLUTTER_BIN" ]] || fail "FLUTTER_BIN is not executable: $FLUTTER_BIN"
@@ -475,7 +488,27 @@ IFS='|' read -r MIN_SUPPORTED_VERSION MIN_SUPPORTED_BUILD <<< "$(resolve_min_sup
 CHANGELOG_JSON="$(read_changelog_json)"
 write_release_json "$MIN_SUPPORTED_VERSION" "$MIN_SUPPORTED_BUILD" "$CHANGELOG_JSON"
 upload_release_files
-smoke_check_remote_release
+if SMOKE_OUTPUT="$(smoke_check_remote_release 2>&1)"; then
+  printf '%s\n' "$SMOKE_OUTPUT"
+  report_remote_release_check \
+    "android_release" \
+    "pass" \
+    "Android stable release published" \
+    "$PUBLIC_BASE_URL" \
+    "android release smoke ok" \
+    "{\"public_base_url\":\"$PUBLIC_BASE_URL\",\"immutable_apk_name\":\"$IMMUTABLE_APK_NAME\",\"apk_sha256\":\"$APK_SHA256\",\"apk_size\":$APK_FILE_SIZE,\"smoke_output\":$(printf '%s' "$SMOKE_OUTPUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+else
+  SMOKE_STATUS=$?
+  printf '%s\n' "$SMOKE_OUTPUT"
+  report_remote_release_check \
+    "android_release" \
+    "fail" \
+    "Android stable release smoke failed" \
+    "$PUBLIC_BASE_URL" \
+    "android release smoke failed" \
+    "{\"public_base_url\":\"$PUBLIC_BASE_URL\",\"immutable_apk_name\":\"$IMMUTABLE_APK_NAME\",\"apk_sha256\":\"$APK_SHA256\",\"apk_size\":$APK_FILE_SIZE,\"smoke_output\":$(printf '%s' "$SMOKE_OUTPUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+  exit "$SMOKE_STATUS"
+fi
 
 note "release published successfully"
 note "remote APK: $REMOTE_DOWNLOADS_DIR/$IMMUTABLE_APK_NAME"

@@ -7,7 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
-import '../services/notification_device_service.dart';
+import '../services/notification_runtime_preference_service.dart';
 import '../services/web_notification_service.dart';
 import '../services/web_push_client_service.dart';
 import '../src/utils/notification_navigation.dart';
@@ -16,6 +16,8 @@ import 'admin_panel.dart';
 import 'auth_screen.dart';
 import 'cart_screen.dart';
 import 'chats_screen.dart';
+import 'contacts_screen.dart';
+import 'monitoring_screen.dart';
 import 'notifications_screen.dart';
 import 'profile_screen.dart';
 import 'pwa_guide_screen.dart';
@@ -92,13 +94,6 @@ class _MainShellState extends State<MainShell> {
         unawaited(_syncNotificationRuntime());
         unawaited(_maybeHandleInitialNotificationDeepLink());
       }
-      if (kIsWeb &&
-          currentUser != null &&
-          _webNotificationPermissionState ==
-              WebNotificationPermissionState.granted) {
-        unawaited(WebPushClientService.ensureSubscribed(dio));
-        unawaited(WebPushClientService.syncUnreadBadge(dio));
-      }
       setState(() {
         if (_lastEffectiveRole != nextRole ||
             _lastCreatorTenantScope != nextCreatorTenantScope) {
@@ -161,13 +156,16 @@ class _MainShellState extends State<MainShell> {
         normalized == 'tenant' ||
         normalized == 'creator';
     final showNotifications = normalized == 'creator';
+    final showMonitoring = normalized == 'creator';
     return <String>[
       'chats',
+      'contacts',
       'cart',
       if (showAdmin) 'admin',
       if (showStats) 'stats',
       if (showWorker) 'worker',
       if (showNotifications) 'notifications',
+      if (showMonitoring) 'monitoring',
       'profile',
       'settings',
     ];
@@ -241,6 +239,12 @@ class _MainShellState extends State<MainShell> {
     return roles.contains(role);
   }
 
+  bool _hasMonitoringTab() {
+    const roles = {'creator'};
+    final role = _effectiveRole();
+    return roles.contains(role);
+  }
+
   bool _hasAnyPermission(List<String> keys) {
     for (final key in keys) {
       if (authService.hasPermission(key)) return true;
@@ -267,7 +271,14 @@ class _MainShellState extends State<MainShell> {
 
   Future<void> _syncNotificationRuntime() async {
     if (authService.currentUser == null) return;
-    await NotificationDeviceService.syncCurrentEndpoint(dio);
+    if (authService.isSessionDegraded) return;
+    final enabled = await NotificationRuntimePreferenceService.isEnabledForUser(
+      authService.currentUser?.id,
+    );
+    await NotificationRuntimePreferenceService.applyRuntimePreference(
+      dio,
+      enabled: enabled,
+    );
     await refreshNotificationBadgeCount();
   }
 
@@ -324,11 +335,12 @@ class _MainShellState extends State<MainShell> {
         _webNotificationPermissionState = permission;
         _webNotificationStatusLoaded = true;
       });
+      final enabled = await NotificationRuntimePreferenceService
+          .isEnabledForUser(authService.currentUser?.id);
       if (permission == WebNotificationPermissionState.granted &&
-          authService.currentUser != null) {
-        unawaited(WebPushClientService.ensureSubscribed(dio));
-        unawaited(WebPushClientService.syncUnreadBadge(dio));
-        unawaited(NotificationDeviceService.syncCurrentEndpoint(dio));
+          authService.currentUser != null &&
+          enabled) {
+        unawaited(_syncNotificationRuntime());
       }
     } catch (_) {
       if (!mounted) return;
@@ -372,7 +384,6 @@ class _MainShellState extends State<MainShell> {
         );
       } else if (current == WebNotificationPermissionState.granted) {
         await WebPushClientService.ensureSubscribed(dio);
-        await WebPushClientService.syncUnreadBadge(dio);
         final sent = await WebPushClientService.sendServerTestPush(dio);
         if (sent <= 0) {
           await WebNotificationService.showSystemNotification(
@@ -394,7 +405,6 @@ class _MainShellState extends State<MainShell> {
         if (!mounted) return;
         if (next == WebNotificationPermissionState.granted) {
           await WebPushClientService.ensureSubscribed(dio);
-          await WebPushClientService.syncUnreadBadge(dio);
           final sent = await WebPushClientService.sendServerTestPush(dio);
           if (sent <= 0) {
             await WebNotificationService.showSystemNotification(
@@ -434,8 +444,11 @@ class _MainShellState extends State<MainShell> {
       if (refreshed == WebNotificationPermissionState.granted) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_webNotificationsBannerDismissedKey, true);
-        await WebPushClientService.syncUnreadBadge(dio);
-        await NotificationDeviceService.syncCurrentEndpoint(dio);
+        final enabled = await NotificationRuntimePreferenceService
+            .isEnabledForUser(authService.currentUser?.id);
+        if (enabled) {
+          await _syncNotificationRuntime();
+        }
       }
     } finally {
       if (mounted) {
@@ -517,6 +530,7 @@ class _MainShellState extends State<MainShell> {
     required bool showStats,
     required bool showWorker,
   }) {
+    final isClient = _effectiveRole() == 'client';
     return <_ShellDestination>[
       const _ShellDestination(
         id: 'chats',
@@ -524,6 +538,13 @@ class _MainShellState extends State<MainShell> {
         icon: Icons.chat_bubble_outline_rounded,
         builder: _buildChatsScreen,
         priority: 100,
+      ),
+      const _ShellDestination(
+        id: 'contacts',
+        label: 'Контакты',
+        icon: Icons.contacts_outlined,
+        builder: _buildContactsScreen,
+        priority: 98,
       ),
       const _ShellDestination(
         id: 'cart',
@@ -564,24 +585,34 @@ class _MainShellState extends State<MainShell> {
           builder: _buildNotificationsScreen,
           priority: 92,
         ),
-      const _ShellDestination(
+      if (_hasMonitoringTab())
+        const _ShellDestination(
+          id: 'monitoring',
+          label: 'Мониторинг',
+          icon: Icons.monitor_heart_outlined,
+          builder: _buildMonitoringScreen,
+          priority: 60,
+        ),
+      _ShellDestination(
         id: 'profile',
         label: 'Профиль',
         icon: Icons.person_outline_rounded,
         builder: _buildProfileScreen,
-        priority: 90,
+        priority: isClient ? 92 : 90,
       ),
-      const _ShellDestination(
+      _ShellDestination(
         id: 'settings',
         label: 'Настройки',
         icon: Icons.tune_rounded,
         builder: _buildSettingsScreen,
-        priority: 40,
+        priority: isClient ? 91 : 40,
       ),
     ];
   }
 
   static Widget _buildChatsScreen(BuildContext context) => const ChatsScreen();
+  static Widget _buildContactsScreen(BuildContext context) =>
+      const ContactsScreen();
   static Widget _buildCartScreen(BuildContext context) => const CartScreen();
   static Widget _buildAdminScreen(BuildContext context) => const AdminPanel();
   static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
@@ -589,6 +620,8 @@ class _MainShellState extends State<MainShell> {
       const StatsDashboardScreen();
   static Widget _buildNotificationsScreen(BuildContext context) =>
       const NotificationsScreen();
+  static Widget _buildMonitoringScreen(BuildContext context) =>
+      const MonitoringScreen();
   static Widget _buildProfileScreen(BuildContext context) =>
       const ProfileScreen();
   static Widget _buildSettingsScreen(BuildContext context) =>
@@ -840,7 +873,8 @@ class _MainShellState extends State<MainShell> {
           _activatedDestinations.add(destinations[safeIndex].id);
         }
 
-        final compactNavigation = _useCompactNavigation(context);
+        final compactNavigation =
+            _effectiveRole() == 'client' ? false : _useCompactNavigation(context);
         final primaryDestinations = compactNavigation
             ? (destinations.toList()
                     ..sort((a, b) => b.priority.compareTo(a.priority)))

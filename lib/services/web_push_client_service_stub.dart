@@ -15,6 +15,8 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
 
 Future<void> syncUnreadBadge(Dio dio) async {}
 
+Future<void> syncUnreadBadgeCount(int count) async {}
+
 Future<void> unsubscribe(Dio dio) async {}
 
 Future<int> sendServerTestPush(Dio dio) async => 0;

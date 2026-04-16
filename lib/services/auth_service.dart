@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../src/utils/device_utils.dart';
+import 'notification_runtime_preference_service.dart';
 import 'notification_device_service.dart';
 import 'native_push_service.dart';
 import 'web_notification_service.dart';
@@ -21,6 +22,7 @@ class User {
   final String role;
   final String? phone;
   final String? phoneAccessState;
+  final String? tenantId;
   final String? tenantCode;
   final String? tenantName;
   final String? tenantStatus;
@@ -34,6 +36,7 @@ class User {
     required this.role,
     this.phone,
     this.phoneAccessState,
+    this.tenantId,
     this.tenantCode,
     this.tenantName,
     this.tenantStatus,
@@ -52,6 +55,10 @@ class User {
         final raw = (m['phone_access_state'] ?? m['phoneAccessState'] ?? '')
             .toString()
             .trim();
+        return raw.isEmpty ? null : raw;
+      })(),
+      tenantId: (() {
+        final raw = (m['tenant_id'] ?? m['tenantId'] ?? '').toString().trim();
         return raw.isEmpty ? null : raw;
       })(),
       tenantCode: (() {
@@ -96,6 +103,7 @@ class User {
       'role': role,
       'phone': phone,
       'phone_access_state': phoneAccessState,
+      'tenant_id': tenantId,
       'tenant_code': tenantCode,
       'tenant_name': tenantName,
       'tenant_status': tenantStatus,
@@ -416,13 +424,18 @@ class AuthService {
   Future<void> _maybeEnsureWebPushSubscription() async {
     if (!kIsWeb) return;
     try {
+      final enabled = await NotificationRuntimePreferenceService
+          .isEnabledForUser(_currentUser?.id);
+      if (!enabled) {
+        await WebPushClientService.unsubscribe(dio);
+        return;
+      }
       final permission = await WebNotificationService.getPermissionState();
       print(
         '[web-push] auth hook permission=$permission user=${_currentUser?.email ?? ''}',
       );
       if (permission != WebNotificationPermissionState.granted) return;
       await WebPushClientService.ensureSubscribed(dio);
-      await WebPushClientService.syncUnreadBadge(dio);
     } catch (e) {
       print('[web-push] auth hook error: $e');
       _authVerboseLog('⚠️ Web push sync skipped: $e');
@@ -434,6 +447,22 @@ class AuthService {
     _postAuthSyncInProgress = true;
     unawaited(() async {
       try {
+        final enabled = await NotificationRuntimePreferenceService
+            .isEnabledForUser(_currentUser?.id);
+        if (!enabled) {
+          try {
+            await NotificationDeviceService.unregisterCurrentEndpoint(dio);
+          } catch (_) {}
+          try {
+            await NativePushService.unregisterCurrentEndpoint(dio);
+          } catch (_) {}
+          try {
+            if (kIsWeb) {
+              await WebPushClientService.unsubscribe(dio);
+            }
+          } catch (_) {}
+          return;
+        }
         await _maybeEnsureWebPushSubscription();
         try {
           await NotificationDeviceService.syncCurrentEndpoint(dio);
@@ -1165,7 +1194,7 @@ class AuthService {
     debugPrint('🔐 Token extracted: ${_shortToken(tokenStr)}...');
 
     if (userMap != null) {
-      _currentUser = User.fromMap(userMap);
+      _currentUser = _hydrateUserFromMap(userMap);
       if (_currentUser?.role.toLowerCase().trim() == 'creator') {
         final scopedCode = await getCreatorTenantScopeCode();
         if ((scopedCode ?? '').isNotEmpty) {
@@ -1191,7 +1220,7 @@ class AuthService {
             profileResp.data['user'] is Map) {
           final profileMap = (profileResp.data['user'] as Map<dynamic, dynamic>)
               .cast<String, dynamic>();
-          _currentUser = User.fromMap(profileMap);
+          _currentUser = _hydrateUserFromMap(profileMap);
           debugPrint('👤 Profile fetched: ${_currentUser?.email}');
         }
       } catch (e) {
@@ -1520,12 +1549,67 @@ class AuthService {
   ) async {
     debugPrint('🔐 applyLoginResponse called');
     User? user;
-    if (userMap != null) user = User.fromMap(userMap);
+    if (userMap != null) user = _hydrateUserFromMap(userMap);
     await setToken(token, user);
   }
 
+  User _hydrateUserFromMap(Map<String, dynamic> userMap) {
+    final merged = Map<String, dynamic>.from(userMap);
+    final current = _currentUser;
+    if (current != null) {
+      final nextName = (merged['name'] ?? '').toString().trim();
+      if (nextName.isEmpty && (current.name ?? '').trim().isNotEmpty) {
+        merged['name'] = current.name;
+      }
+      final nextPhone = (merged['phone'] ?? '').toString().trim();
+      if (nextPhone.isEmpty && (current.phone ?? '').trim().isNotEmpty) {
+        merged['phone'] = current.phone;
+      }
+      final nextPhoneAccessState =
+          (merged['phone_access_state'] ?? merged['phoneAccessState'] ?? '')
+              .toString()
+              .trim();
+      if (nextPhoneAccessState.isEmpty &&
+          (current.phoneAccessState ?? '').trim().isNotEmpty) {
+        merged['phone_access_state'] = current.phoneAccessState;
+      }
+      final nextPermissions = merged['permissions'];
+      if ((nextPermissions is! Map || nextPermissions.isEmpty) &&
+          current.permissions.isNotEmpty) {
+        merged['permissions'] = current.permissions;
+      }
+    }
+
+    var user = User.fromMap(merged);
+    if (user.role.toLowerCase().trim() == 'creator') {
+      final scopedCode = _normalizeTenantCodeScope(
+        merged['tenant_code'] ?? merged['tenantCode'] ?? creatorTenantScopeCode,
+      );
+      if (scopedCode.isNotEmpty) {
+        user = _withCreatorTenantScope(
+          user,
+          tenantCode: scopedCode,
+          tenantName:
+              (merged['tenant_name'] ?? merged['tenantName'] ?? user.tenantName)
+                  ?.toString(),
+          tenantStatus:
+              (merged['tenant_status'] ??
+                      merged['tenantStatus'] ??
+                      user.tenantStatus)
+                  ?.toString(),
+          subscriptionExpiresAt:
+              (merged['subscription_expires_at'] ??
+                      merged['subscriptionExpiresAt'] ??
+                      user.subscriptionExpiresAt)
+                  ?.toString(),
+        ) ?? user;
+      }
+    }
+    return user;
+  }
+
   void updateCurrentUserFromMap(Map<String, dynamic> userMap) {
-    _currentUser = User.fromMap(userMap);
+    _currentUser = _hydrateUserFromMap(userMap);
     unawaited(_saveUserSnapshot(_currentUser));
   }
 
@@ -1743,7 +1827,7 @@ class AuthService {
         if (user is Map) {
           // ✅ ИСПРАВЛЕНИЕ: Cast правильно
           final userMap = Map<String, dynamic>.from(user);
-          _currentUser = User.fromMap(userMap);
+          _currentUser = _hydrateUserFromMap(userMap);
           final prefs = await SharedPreferences.getInstance();
           _viewRole = prefs.getString(_viewRoleKey);
           await _saveUserSnapshot(_currentUser);

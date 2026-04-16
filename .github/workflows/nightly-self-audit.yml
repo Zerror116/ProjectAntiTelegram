@@ -47,6 +47,13 @@ jobs:
         run: |
           find server/src -name "*.js" -print0 | xargs -0 -n1 node --check
           find server/scripts -name "*.js" -print0 | xargs -0 -n1 node --check
+          node --check scripts/check_android_manifest_parity.js
+
+      - name: Shell syntax check
+        run: |
+          bash -n scripts/deploy_full.sh
+          bash -n scripts/release_android_update.sh
+          bash -n scripts/prod_health_check.sh
 
       - name: Start backend for API smoke
         env:

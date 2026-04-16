@@ -56,7 +56,15 @@ img.Image _decodeAndBake(
   Uint8List bytes, {
   String errorText = 'Не удалось прочитать изображение',
 }) {
-  final decoded = img.decodeImage(bytes);
+  final safeBytes = Uint8List.fromList(bytes);
+  img.Image? decoded;
+  try {
+    decoded = img.decodeImage(safeBytes);
+  } on RangeError {
+    throw Exception('$errorText: файл поврежден или прочитан не полностью');
+  } catch (_) {
+    throw Exception(errorText);
+  }
   if (decoded == null) {
     throw Exception(errorText);
   }

@@ -9,6 +9,7 @@ const {
   describeKeyring,
 } = require("../src/utils/secretKeyring");
 const { getJwtKeyringMeta } = require("../src/utils/jwt");
+const { logReleaseCheck } = require("../src/utils/monitoring");
 
 const NODE_ENV = String(process.env.NODE_ENV || "development")
   .toLowerCase()
@@ -250,12 +251,6 @@ async function checkMonitoringBacklog() {
         error: String(err?.message || err).slice(0, 300),
       },
     );
-  } finally {
-    try {
-      await db.platformPool.end();
-    } catch (_) {
-      // ignore pool close errors
-    }
   }
 }
 
@@ -293,11 +288,20 @@ function buildMarkdownReport() {
   return lines.join("\n");
 }
 
+function buildAuditSummary() {
+  const critical = findings.filter((f) => f.level === "critical").length;
+  const warn = findings.filter((f) => f.level === "warn").length;
+  const info = findings.filter((f) => f.level === "info").length;
+  return { critical, warn, info };
+}
+
 async function main() {
   checkSecretKeyrings();
   checkTransportHardening();
   checkDependencyAudit();
   await checkMonitoringBacklog();
+
+  const summary = buildAuditSummary();
 
   const outputPath = path.resolve(
     process.cwd(),
@@ -306,6 +310,20 @@ async function main() {
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, buildMarkdownReport(), "utf8");
   console.log(`nightly self-audit report: ${outputPath}`);
+
+  await logReleaseCheck({
+    queryable: db,
+    scope: "nightly_audit",
+    status: summary.critical > 0 ? "fail" : summary.warn > 0 ? "warn" : "pass",
+    title: "Nightly self-audit",
+    target: process.env.PUBLIC_BASE_URL || process.env.API_PUBLIC_BASE_URL || "local",
+    summary: `critical=${summary.critical}, warn=${summary.warn}, info=${summary.info}`,
+    details: {
+      output_path: outputPath,
+      findings,
+      environment: NODE_ENV || "unknown",
+    },
+  });
 
   const hasCritical = findings.some((f) => f.level === "critical");
   if (hasCritical) {
@@ -316,4 +334,10 @@ async function main() {
 main().catch((err) => {
   console.error("nightly-self-audit failed", err);
   process.exit(1);
+}).finally(async () => {
+  try {
+    await db.platformPool.end();
+  } catch (_) {
+    // ignore pool close errors
+  }
 });
