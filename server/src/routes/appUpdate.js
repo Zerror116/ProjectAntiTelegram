@@ -6,9 +6,9 @@ const { resolveAuthContextFromToken } = require('../utils/auth');
 const { createNotificationInboxItem } = require('../utils/notifications');
 const { signManifestPayload } = require('../utils/appUpdateManifest');
 const { loadAndroidStableRelease } = require('../utils/androidStableRelease');
+const { downloadsRoot } = require('../utils/storagePaths');
 
 const router = express.Router();
-const downloadsRoot = path.resolve(__dirname, '..', '..', 'downloads');
 const apkMetadataCache = new Map();
 
 function parseBooleanEnv(rawValue, fallback = false) {

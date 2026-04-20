@@ -219,6 +219,26 @@ function checkDependencyAudit() {
   }
 }
 
+function runMaintenanceCommand(command, successCode, failureCode, message) {
+  const serverDir = path.resolve(__dirname, "..");
+  try {
+    const stdout = execSync(command, {
+      cwd: serverDir,
+      stdio: "pipe",
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    addFinding("info", successCode, message, {
+      output: String(stdout || "").trim().slice(0, 1000),
+    });
+  } catch (err) {
+    addFinding("warn", failureCode, `${message} failed`, {
+      stdout: String(err?.stdout || "").trim().slice(0, 1000),
+      stderr: String(err?.stderr || "").trim().slice(0, 1000),
+    });
+  }
+}
+
 async function checkMonitoringBacklog() {
   try {
     const unresolvedCritical = await db.query(
@@ -299,6 +319,18 @@ async function main() {
   checkSecretKeyrings();
   checkTransportHardening();
   checkDependencyAudit();
+  runMaintenanceCommand(
+    "node scripts/media_assets_sanitize.js",
+    "media.sanitize.ok",
+    "media.sanitize.failed",
+    "Nightly media sanitation",
+  );
+  runMaintenanceCommand(
+    "node scripts/perf_budget_smoke.js",
+    "perf.budget.ok",
+    "perf.budget.failed",
+    "Performance budget smoke",
+  );
   await checkMonitoringBacklog();
 
   const summary = buildAuditSummary();

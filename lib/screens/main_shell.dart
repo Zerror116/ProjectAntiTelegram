@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
 import '../services/auth_service.dart';
 import '../services/notification_runtime_preference_service.dart';
+import '../services/uploads_recovery_device_service.dart';
 import '../services/web_notification_service.dart';
 import '../services/web_push_client_service.dart';
 import '../src/utils/notification_navigation.dart';
@@ -93,6 +94,12 @@ class _MainShellState extends State<MainShell> {
       } else {
         unawaited(_syncNotificationRuntime());
         unawaited(_maybeHandleInitialNotificationDeepLink());
+        unawaited(
+          UploadsRecoveryDeviceService.maybeRun(
+            userId: currentUser.id,
+            role: authService.effectiveRole,
+          ),
+        );
       }
       setState(() {
         if (_lastEffectiveRole != nextRole ||
@@ -119,6 +126,15 @@ class _MainShellState extends State<MainShell> {
     unawaited(_loadWebNotificationPromptState());
     unawaited(refreshSupportQueueNotices());
     unawaited(_syncNotificationRuntime());
+    final bootstrapUser = authService.currentUser;
+    if (bootstrapUser != null) {
+      unawaited(
+        UploadsRecoveryDeviceService.maybeRun(
+          userId: bootstrapUser.id,
+          role: authService.effectiveRole,
+        ),
+      );
+    }
     _supportQueueRefreshTimer = Timer.periodic(
       const Duration(seconds: 12),
       (_) => unawaited(refreshSupportQueueNotices()),
@@ -335,8 +351,10 @@ class _MainShellState extends State<MainShell> {
         _webNotificationPermissionState = permission;
         _webNotificationStatusLoaded = true;
       });
-      final enabled = await NotificationRuntimePreferenceService
-          .isEnabledForUser(authService.currentUser?.id);
+      final enabled =
+          await NotificationRuntimePreferenceService.isEnabledForUser(
+            authService.currentUser?.id,
+          );
       if (permission == WebNotificationPermissionState.granted &&
           authService.currentUser != null &&
           enabled) {
@@ -444,8 +462,10 @@ class _MainShellState extends State<MainShell> {
       if (refreshed == WebNotificationPermissionState.granted) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_webNotificationsBannerDismissedKey, true);
-        final enabled = await NotificationRuntimePreferenceService
-            .isEnabledForUser(authService.currentUser?.id);
+        final enabled =
+            await NotificationRuntimePreferenceService.isEnabledForUser(
+              authService.currentUser?.id,
+            );
         if (enabled) {
           await _syncNotificationRuntime();
         }
@@ -873,8 +893,9 @@ class _MainShellState extends State<MainShell> {
           _activatedDestinations.add(destinations[safeIndex].id);
         }
 
-        final compactNavigation =
-            _effectiveRole() == 'client' ? false : _useCompactNavigation(context);
+        final compactNavigation = _effectiveRole() == 'client'
+            ? false
+            : _useCompactNavigation(context);
         final primaryDestinations = compactNavigation
             ? (destinations.toList()
                     ..sort((a, b) => b.priority.compareTo(a.priority)))

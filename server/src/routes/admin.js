@@ -31,6 +31,10 @@ const {
   decryptMessageRow,
 } = require("../utils/messageCrypto");
 const { runInRequestTenantScope } = require("../utils/requestScope");
+const { uploadsPath } = require("../utils/storagePaths");
+const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
+const { toOriginalPublicMediaUrl } = require("../utils/mediaAssets");
+const { upsertProductCardSnapshot } = require("../utils/productCardSnapshots");
 
 const requireProductPublishPermission = requirePermission("product.publish");
 const requireReservationFulfillPermission = requirePermission(
@@ -64,20 +68,8 @@ function emitTenantSubscriptionUpdate(io, tenantId, row, source = "admin") {
   });
 }
 
-const channelUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "channels",
-);
-const productUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "products",
-);
+const channelUploadsDir = uploadsPath("channels");
+const productUploadsDir = uploadsPath("products");
 fs.mkdirSync(channelUploadsDir, { recursive: true });
 fs.mkdirSync(productUploadsDir, { recursive: true });
 
@@ -1902,7 +1894,7 @@ router.post(
         visibility: nextVisibility,
         worker_can_post: false,
         is_post_channel: false,
-        avatar_url: String(avatar_url || "").trim(),
+        avatar_url: avatar_url ? toOriginalPublicMediaUrl(String(avatar_url || "").trim()) : "",
         avatar_focus_x: 0,
         avatar_focus_y: 0,
         avatar_zoom: 1,
@@ -1923,6 +1915,14 @@ router.post(
         ],
       );
       const channel = insert.rows[0];
+      if (settings.avatar_url) {
+        await registerPublicImageUpload({
+          queryable: db,
+          ownerKind: "channel_avatar",
+          ownerId: channel.id,
+          rawUrl: settings.avatar_url,
+        });
+      }
 
       const io = req.app.get("io");
       if (io) {
@@ -2092,7 +2092,9 @@ router.patch(
         nextSettings.visibility = normalizeVisibility(req.body.visibility);
       }
       if (Object.prototype.hasOwnProperty.call(req.body || {}, "avatar_url")) {
-        nextSettings.avatar_url = String(req.body.avatar_url || "").trim();
+        nextSettings.avatar_url = req.body.avatar_url
+          ? toOriginalPublicMediaUrl(String(req.body.avatar_url || "").trim())
+          : "";
       }
       if (Object.prototype.hasOwnProperty.call(req.body || {}, "avatar_focus_x")) {
         nextSettings.avatar_focus_x = normalizeAvatarFocus(
@@ -2136,6 +2138,14 @@ router.patch(
        RETURNING id, title, type, created_by, settings, created_at, updated_at`,
         [nextTitle, JSON.stringify(nextSettings), id],
       );
+      if (nextSettings.avatar_url) {
+        await registerPublicImageUpload({
+          queryable: db,
+          ownerKind: "channel_avatar",
+          ownerId: id,
+          rawUrl: nextSettings.avatar_url,
+        });
+      }
 
       const io = req.app.get("io");
       if (io) {
@@ -2657,6 +2667,12 @@ router.post(
         [JSON.stringify(nextSettings), id, req.user.tenant_id],
       );
       const updated = upd.rows[0];
+      await registerPublicImageUpload({
+        queryable: db,
+        ownerKind: "channel_avatar",
+        ownerId: id,
+        rawUrl: uploadedUrl,
+      });
 
       if (previousAvatar && previousAvatar !== uploadedUrl) {
         removeChannelAvatarByUrl(previousAvatar);
@@ -3970,7 +3986,9 @@ router.post(
                 null,
                 1,
               );
-          const nextImageUrl = payload.image_url || row.image_url || null;
+          const nextImageUrl = payload.image_url
+            ? toOriginalPublicMediaUrl(payload.image_url)
+            : row.image_url || null;
 
           errorStage = "product_update";
           let productUpdate = null;
@@ -4021,6 +4039,17 @@ router.post(
             continue;
           }
           const product = productUpdate.rows[0];
+          if (product?.image_url) {
+            await registerPublicImageUpload({
+              queryable: client,
+              ownerKind: "product_image",
+              ownerId: product.id,
+              rawUrl: product.image_url,
+            });
+          }
+          const productCardSnapshot = await upsertProductCardSnapshot(client, product, {
+            tenantId: req.user?.tenant_id || null,
+          });
 
           const messageMeta = {
             kind: "catalog_product",
@@ -4034,6 +4063,7 @@ router.post(
             quantity: Number(product.quantity),
             shelf_number: Number(product.shelf_number),
             image_url: product.image_url,
+            card_snapshot: productCardSnapshot,
           };
 
           errorStage = "message_insert";

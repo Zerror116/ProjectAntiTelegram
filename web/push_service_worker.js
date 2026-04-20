@@ -1,7 +1,30 @@
 const RUNTIME_CACHE_PREFIX = 'projectphoenix-runtime-';
-const IMAGE_RUNTIME_CACHE = `${RUNTIME_CACHE_PREFIX}images-v1`;
-const IMAGE_RUNTIME_CACHE_LIMIT = 120;
-const IMAGE_PRECACHE_BATCH_SIZE = 10;
+const IMAGE_PRECACHE_BATCH_SIZE = 12;
+const RUNTIME_IMAGE_CACHES = {
+  avatars: {
+    name: `${RUNTIME_CACHE_PREFIX}avatars-v2`,
+    limit: 180,
+  },
+  productThumbs: {
+    name: `${RUNTIME_CACHE_PREFIX}product-thumbs-v2`,
+    limit: 260,
+  },
+  previews: {
+    name: `${RUNTIME_CACHE_PREFIX}previews-v2`,
+    limit: 140,
+  },
+  chatMedia: {
+    name: `${RUNTIME_CACHE_PREFIX}chat-media-v2`,
+    limit: 72,
+  },
+  genericImages: {
+    name: `${RUNTIME_CACHE_PREFIX}generic-images-v2`,
+    limit: 96,
+  },
+};
+const ACTIVE_RUNTIME_CACHES = new Set(
+  Object.values(RUNTIME_IMAGE_CACHES).map((entry) => entry.name),
+);
 
 self.addEventListener('install', (event) => {
   event.waitUntil(self.skipWaiting());
@@ -12,7 +35,7 @@ self.addEventListener('activate', (event) => {
     const keys = await caches.keys();
     await Promise.all(
       keys
-        .filter((key) => key.startsWith(RUNTIME_CACHE_PREFIX) && key !== IMAGE_RUNTIME_CACHE)
+        .filter((key) => key.startsWith(RUNTIME_CACHE_PREFIX) && !ACTIVE_RUNTIME_CACHES.has(key))
         .map((key) => caches.delete(key)),
     );
     await syncBadge(0);
@@ -37,19 +60,46 @@ async function syncBadge(count) {
   }
 }
 
-function isRuntimeImageRequest(request) {
-  if (!request || request.method !== 'GET') return false;
-  let url;
+function normalizeRequestUrl(request) {
   try {
-    url = new URL(request.url);
+    return new URL(request.url);
   } catch (_) {
-    return false;
+    return null;
   }
-  if (url.origin !== self.location.origin) return false;
-  return (
-    url.pathname.startsWith('/uploads/') ||
-    url.pathname.startsWith('/api/chats/media/')
-  );
+}
+
+function resolveRuntimeCacheConfig(request) {
+  if (!request || request.method !== 'GET') return null;
+  const url = normalizeRequestUrl(request);
+  if (!url || url.origin !== self.location.origin) return null;
+
+  const pathname = url.pathname;
+  if (pathname.startsWith('/uploads/users/') || pathname.startsWith('/uploads/channels/')) {
+    return RUNTIME_IMAGE_CACHES.avatars;
+  }
+  if (pathname.startsWith('/uploads/products/variants/') || pathname.startsWith('/uploads/claims/variants/')) {
+    return RUNTIME_IMAGE_CACHES.productThumbs;
+  }
+  if (pathname.startsWith('/uploads/products/') || pathname.startsWith('/uploads/claims/')) {
+    return RUNTIME_IMAGE_CACHES.productThumbs;
+  }
+  if (pathname.startsWith('/api/chats/media/image/') || pathname.startsWith('/uploads/chat_media/images/')) {
+    return RUNTIME_IMAGE_CACHES.previews;
+  }
+  if (
+    pathname.startsWith('/api/chats/media/video/') ||
+    pathname.startsWith('/api/chats/media/voice/') ||
+    pathname.startsWith('/api/chats/media/file/') ||
+    pathname.startsWith('/uploads/chat_media/video/') ||
+    pathname.startsWith('/uploads/chat_media/voice/') ||
+    pathname.startsWith('/uploads/chat_media/files/')
+  ) {
+    return RUNTIME_IMAGE_CACHES.chatMedia;
+  }
+  if (pathname.startsWith('/uploads/')) {
+    return RUNTIME_IMAGE_CACHES.genericImages;
+  }
+  return null;
 }
 
 async function trimRuntimeCache(cacheName, limit) {
@@ -62,29 +112,35 @@ async function trimRuntimeCache(cacheName, limit) {
   }
 }
 
-async function cacheImageResponse(request, response) {
-  if (!response || !response.ok) return response;
-  const cache = await caches.open(IMAGE_RUNTIME_CACHE);
+async function cacheRuntimeResponse(request, response, config) {
+  if (!response || !response.ok || !config) return response;
+  const cache = await caches.open(config.name);
   await cache.put(request, response.clone());
-  await trimRuntimeCache(IMAGE_RUNTIME_CACHE, IMAGE_RUNTIME_CACHE_LIMIT);
+  await trimRuntimeCache(config.name, config.limit);
   return response;
 }
 
-async function handleImageRuntimeRequest(event) {
-  const cache = await caches.open(IMAGE_RUNTIME_CACHE);
+async function handleRuntimeMediaRequest(event) {
+  const config = resolveRuntimeCacheConfig(event.request);
+  if (!config) {
+    return fetch(event.request);
+  }
+
+  const cache = await caches.open(config.name);
   const cached = await cache.match(event.request);
   if (cached) {
     event.waitUntil(
       fetch(event.request)
-        .then((response) => cacheImageResponse(event.request, response))
+        .then((response) => cacheRuntimeResponse(event.request, response, config))
         .catch(() => null),
     );
     return cached;
   }
+
   const networkFetch = fetch(event.request);
   event.waitUntil(
     networkFetch
-      .then((response) => cacheImageResponse(event.request, response))
+      .then((response) => cacheRuntimeResponse(event.request, response, config))
       .catch(() => null),
   );
   return networkFetch;
@@ -92,7 +148,6 @@ async function handleImageRuntimeRequest(event) {
 
 async function precacheImageBatch(urls) {
   if (!Array.isArray(urls) || urls.length === 0) return;
-  const cache = await caches.open(IMAGE_RUNTIME_CACHE);
   const uniqueUrls = Array.from(new Set(urls))
     .filter((value) => typeof value === 'string' && value.trim().length > 0)
     .slice(0, IMAGE_PRECACHE_BATCH_SIZE);
@@ -100,21 +155,18 @@ async function precacheImageBatch(urls) {
   for (const rawUrl of uniqueUrls) {
     try {
       const url = new URL(rawUrl, self.location.origin);
-      if (
-        url.origin !== self.location.origin ||
-        (!url.pathname.startsWith('/uploads/') &&
-          !url.pathname.startsWith('/api/chats/media/'))
-      ) {
-        continue;
-      }
+      if (url.origin !== self.location.origin) continue;
       const request = new Request(url.toString(), {
         method: 'GET',
         credentials: 'same-origin',
       });
+      const config = resolveRuntimeCacheConfig(request);
+      if (!config) continue;
+      const cache = await caches.open(config.name);
       const existing = await cache.match(request);
       if (existing) continue;
       const response = await fetch(request);
-      await cacheImageResponse(request, response);
+      await cacheRuntimeResponse(request, response, config);
     } catch (_) {
       // ignore bad URLs and transient network errors
     }
@@ -172,8 +224,9 @@ self.addEventListener('message', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  if (!isRuntimeImageRequest(event.request)) return;
-  event.respondWith(handleImageRuntimeRequest(event));
+  const config = resolveRuntimeCacheConfig(event.request);
+  if (!config) return;
+  event.respondWith(handleRuntimeMediaRequest(event));
 });
 
 self.addEventListener('push', (event) => {

@@ -31,7 +31,9 @@
 		<key>NSMicrophoneUsageDescription</key>
 		<string>Приложению нужен доступ к микрофону, чтобы отправлять голосовые сообщения в чатах.</string>
 		<key>NSPhotoLibraryUsageDescription</key>
-		<string>Приложению нужен доступ к галерее, чтобы выбирать фото товаров.</string>
+		<string>Приложению нужен доступ к галерее, чтобы выбирать фото товаров и автоматически восстанавливать потерянные оригиналы.</string>
+		<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+		<true/>
 		<key>UIBackgroundModes</key>
 		<array>
 			<string>remote-notification</string>

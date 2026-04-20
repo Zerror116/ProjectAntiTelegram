@@ -11,18 +11,14 @@ const { pool } = db;
 const authMiddleware = require("../middleware/requireAuth");
 const requirePermission = require("../middleware/requirePermission");
 const { resolvePermissionSet } = require("../utils/flexibleRoles");
+const { uploadsPath } = require("../utils/storagePaths");
+const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
 const SAMARA_TZ = "Europe/Samara";
 const requireTenantInvitesManagePermission = requirePermission(
   "tenant.invites.manage",
 );
 
-const profileUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "users",
-);
+const profileUploadsDir = uploadsPath("users");
 fs.mkdirSync(profileUploadsDir, { recursive: true });
 
 const avatarUpload = multer({
@@ -1198,6 +1194,12 @@ router.post(
          WHERE id = $2`,
         [uploadedUrl, req.user.id],
       );
+      await registerPublicImageUpload({
+        queryable: pool,
+        ownerKind: "user_avatar",
+        ownerId: req.user.id,
+        rawUrl: uploadedUrl,
+      });
 
       const user = await loadUserProfile(req.user.id);
       if (!user) {

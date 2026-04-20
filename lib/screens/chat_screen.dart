@@ -1595,6 +1595,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String? _lastVisibleMessageId() {
+    if (_useApproximateViewportTracking) {
+      return _approximateViewportMessageId();
+    }
     final viewportContext = _messagesViewportKey.currentContext;
     final viewportObject = viewportContext?.findRenderObject();
     if (viewportObject is! RenderBox) return null;
@@ -1604,11 +1607,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final itemContext = entry.value.currentContext;
       final itemObject = itemContext?.findRenderObject();
       if (itemObject is! RenderBox || !itemObject.hasSize) continue;
-      final topLeft = itemObject.localToGlobal(
-        Offset.zero,
-        ancestor: viewportObject,
-      );
-      final top = topLeft.dy;
+      final top = _renderBoxTopInViewport(itemObject, viewportObject);
+      if (top == null) continue;
       final bottom = top + itemObject.size.height;
       if (bottom <= 0 || top >= viewportObject.size.height) continue;
       if (bottom > bestBottom) {
@@ -1652,6 +1652,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   ({String messageId, double offset})? _currentScrollAnchor() {
+    if (_useApproximateViewportTracking) {
+      return null;
+    }
     final viewportContext = _messagesViewportKey.currentContext;
     final viewportObject = viewportContext?.findRenderObject();
     if (viewportObject is! RenderBox) return null;
@@ -1665,11 +1668,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final itemContext = entry.value.currentContext;
       final itemObject = itemContext?.findRenderObject();
       if (itemObject is! RenderBox || !itemObject.hasSize) continue;
-      final topLeft = itemObject.localToGlobal(
-        Offset.zero,
-        ancestor: viewportObject,
-      );
-      final top = topLeft.dy;
+      final top = _renderBoxTopInViewport(itemObject, viewportObject);
+      if (top == null) continue;
       final bottom = top + itemObject.size.height;
       if (bottom <= 0 || top >= viewportObject.size.height) continue;
       final distance = top.abs();
@@ -1688,9 +1688,26 @@ class _ChatScreenState extends State<ChatScreen> {
     return best;
   }
 
+  double? _renderBoxTopInViewport(
+    RenderBox itemObject,
+    RenderBox viewportObject,
+  ) {
+    if (!itemObject.attached || !viewportObject.attached) return null;
+    try {
+      final itemGlobal = itemObject.localToGlobal(Offset.zero);
+      final viewportGlobal = viewportObject.localToGlobal(Offset.zero);
+      return itemGlobal.dy - viewportGlobal.dy;
+    } catch (_) {
+      return null;
+    }
+  }
+
   String? _stickyDateLabelForViewport() {
-    final anchor = _currentScrollAnchor();
-    final anchorMessageId = anchor?.messageId.trim() ?? '';
+    final anchorMessageId = (_useApproximateViewportTracking
+            ? _approximateViewportMessageId()
+            : _currentScrollAnchor()?.messageId)
+        ?.trim() ??
+        '';
     if (anchorMessageId.isEmpty) return null;
     for (final message in _messages) {
       if (_messageIdOf(message) != anchorMessageId) continue;
@@ -1951,7 +1968,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final savedFraction = _savedScrollFraction;
     final savedAnchorMessageId = _savedScrollAnchorMessageId;
     final savedAnchorOffset = _savedScrollAnchorOffset;
-    if (savedAnchorMessageId != null && savedAnchorMessageId.isNotEmpty) {
+    if (!_useApproximateViewportTracking &&
+        savedAnchorMessageId != null &&
+        savedAnchorMessageId.isNotEmpty) {
       unawaited(
         _restoreSavedViewportByAnchor(
           messageId: savedAnchorMessageId,
@@ -2031,9 +2050,21 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    final currentTop = targetObject
-        .localToGlobal(Offset.zero, ancestor: viewportObject)
-        .dy;
+    final currentTop = _renderBoxTopInViewport(targetObject, viewportObject);
+    if (currentTop == null) {
+      if (passes <= 1) {
+        _markInitialViewportReady();
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreSavedViewportByAnchor(
+          messageId: messageId,
+          desiredOffset: desiredOffset,
+          passes: passes - 1,
+        );
+      });
+      return;
+    }
     final correction = currentTop - desiredOffset;
     final maxExtent = _scrollController.position.maxScrollExtent;
     final nextOffset = (_scrollController.offset + correction)
@@ -2151,7 +2182,9 @@ class _ChatScreenState extends State<ChatScreen> {
   void _onMediaFramePainted() {
     if (!_initialViewportReady) {
       final anchorMessageId = _savedScrollAnchorMessageId;
-      if (anchorMessageId != null && anchorMessageId.isNotEmpty) {
+      if (!_useApproximateViewportTracking &&
+          anchorMessageId != null &&
+          anchorMessageId.isNotEmpty) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           _restoreSavedViewportByAnchor(
             messageId: anchorMessageId,
@@ -2198,6 +2231,7 @@ class _ChatScreenState extends State<ChatScreen> {
         <({int distance, Map<String, dynamic> message, String url})>[];
     for (var index = 0; index < messages.length; index++) {
       final message = messages[index];
+      if (_isCatalogProduct(message) || _isReservedOrder(message)) continue;
       final meta = _metaMapOf(message['meta']);
       final imageUrl = _resolveImageUrl(meta['image_url']?.toString());
       if (imageUrl == null || imageUrl.isEmpty) continue;
@@ -2269,6 +2303,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final candidates = <({int distance, String url})>[];
     for (var index = 0; index < messages.length; index++) {
+      if (_isCatalogProduct(messages[index]) || _isReservedOrder(messages[index])) {
+        continue;
+      }
       final meta = _metaMapOf(messages[index]['meta']);
       final imageUrl = _resolveImageUrl(meta['image_url']?.toString());
       if (imageUrl == null || imageUrl.isEmpty) continue;
@@ -2347,8 +2384,7 @@ class _ChatScreenState extends State<ChatScreen> {
       merged.add(_normalizeMessage(Map<String, dynamic>.from(localMessage)));
     }
 
-    merged.sort(_compareByCreatedAt);
-    return merged;
+    return _dedupeMessages(merged);
   }
 
   void _patchMessageLocally({
@@ -2397,7 +2433,7 @@ class _ChatScreenState extends State<ChatScreen> {
           inserted = true;
           _messages = [..._messages, normalized];
         }
-        _messages.sort(_compareByCreatedAt);
+        _messages = _dedupeMessages(_messages);
         if (!localOnly) {
           _messageIds.add(msgId);
         }
@@ -2757,8 +2793,47 @@ class _ChatScreenState extends State<ChatScreen> {
     return (pin['message_id'] ?? '').toString() == messageId;
   }
 
-  GlobalKey _messageKeyFor(String messageId) {
+  Key _messageKeyFor(String messageId) {
+    if (_useApproximateViewportTracking) {
+      return ValueKey<String>('message-$messageId');
+    }
     return _messageItemKeys.putIfAbsent(messageId, GlobalKey.new);
+  }
+
+  Future<bool> _approximateScrollToMessageId(
+    String messageId, {
+    Duration duration = const Duration(milliseconds: 220),
+    Curve curve = Curves.easeOutCubic,
+  }) async {
+    if (!_scrollController.hasClients) return false;
+    final visibleMessages = _visibleMessages();
+    if (visibleMessages.isEmpty) return false;
+    final targetIndex = visibleMessages.indexWhere(
+      (message) => (message['id'] ?? '').toString().trim() == messageId,
+    );
+    if (targetIndex < 0) return false;
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    if (targetIndex <= 0 || maxExtent <= 0 || visibleMessages.length <= 1) {
+      final clamped = 0.0.clamp(0.0, maxExtent).toDouble();
+      if (duration == Duration.zero) {
+        _scrollController.jumpTo(clamped);
+      } else {
+        await _scrollController.animateTo(clamped, duration: duration, curve: curve);
+      }
+      return true;
+    }
+    final ratio = targetIndex / (visibleMessages.length - 1);
+    final targetPixels = (maxExtent * ratio).clamp(0.0, maxExtent).toDouble();
+    if (duration == Duration.zero) {
+      _scrollController.jumpTo(targetPixels);
+    } else {
+      await _scrollController.animateTo(
+        targetPixels,
+        duration: duration,
+        curve: curve,
+      );
+    }
+    return true;
   }
 
   Future<BuildContext?> _resolveMessageContextWithScroll(
@@ -2797,11 +2872,9 @@ class _ChatScreenState extends State<ChatScreen> {
         final itemContext = entry.value.currentContext;
         final itemObject = itemContext?.findRenderObject();
         if (itemObject is! RenderBox || !itemObject.hasSize) continue;
-        final topLeft = itemObject.localToGlobal(
-          Offset.zero,
-          ancestor: viewportObject,
-        );
-        builtAnchors.add((index: builtIndex, top: topLeft.dy));
+        final top = _renderBoxTopInViewport(itemObject, viewportObject);
+        if (top == null) continue;
+        builtAnchors.add((index: builtIndex, top: top));
       }
     }
 
@@ -2907,6 +2980,36 @@ class _ChatScreenState extends State<ChatScreen> {
 
     await Future<void>.delayed(const Duration(milliseconds: 16));
     if (!mounted) return;
+
+    if (_useApproximateViewportTracking) {
+      var moved = await _approximateScrollToMessageId(trimmedMessageId);
+      if (!moved) {
+        try {
+          final resp = await authService.dio.get(
+            '/api/chats/${widget.chatId}/messages/$trimmedMessageId',
+          );
+          final data = resp.data;
+          if (data is Map && data['ok'] == true && data['data'] is Map) {
+            _upsertMessage(
+              Map<String, dynamic>.from(data['data']),
+              autoScroll: false,
+            );
+            await Future<void>.delayed(const Duration(milliseconds: 16));
+            if (!mounted) return;
+            moved = await _approximateScrollToMessageId(trimmedMessageId);
+          }
+        } catch (_) {}
+      }
+      if (!moved) {
+        showGlobalAppNotice(
+          'Не удалось перейти: сообщение недоступно',
+          tone: AppNoticeTone.warning,
+        );
+        return;
+      }
+      _handleScroll();
+      return;
+    }
 
     BuildContext? targetContext = await _resolveMessageContextWithScroll(
       trimmedMessageId,
@@ -3508,9 +3611,13 @@ class _ChatScreenState extends State<ChatScreen> {
       Object? lastError;
       for (var attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
+          final initialLimit = kIsWeb ? 60 : 80;
           final resp = await authService.dio.get(
             '/api/chats/${widget.chatId}/messages',
-            queryParameters: const {'limit': 80},
+            queryParameters: <String, dynamic>{
+              'limit': initialLimit,
+              if (kIsWeb) 'view': 'summary',
+            },
             options: Options(
               connectTimeout: const Duration(seconds: 15),
               sendTimeout: const Duration(seconds: 15),
@@ -3639,12 +3746,14 @@ class _ChatScreenState extends State<ChatScreen> {
         : 0.0;
     final viewportAnchor = hadClients ? _currentScrollAnchor() : null;
     try {
+      final olderLimit = kIsWeb ? 45 : 60;
       final resp = await authService.dio.get(
         '/api/chats/${widget.chatId}/messages',
         queryParameters: {
           'before_created_at': _oldestLoadedCreatedAt,
           'before_id': _oldestLoadedMessageId,
-          'limit': 60,
+          'limit': olderLimit,
+          if (kIsWeb) 'view': 'summary',
         },
       );
       final data = resp.data;
@@ -3702,7 +3811,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       if (mounted) {
         setState(() {
-          _messages = [...toInsert, ..._messages]..sort(_compareByCreatedAt);
+          _messages = _dedupeMessages([...toInsert, ..._messages]);
           _hasMoreBefore = paging['has_more_before'] == true;
           _applyServerChatState(
             state,
@@ -3715,37 +3824,102 @@ class _ChatScreenState extends State<ChatScreen> {
           _refreshLoadedMessageBounds();
         });
       } else {
-        _messages = [...toInsert, ..._messages]..sort(_compareByCreatedAt);
+        _messages = _dedupeMessages([...toInsert, ..._messages]);
         _hasMoreBefore = paging['has_more_before'] == true;
         _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
         _refreshLoadedMessageBounds();
       }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || !_scrollController.hasClients) return;
-        if (viewportAnchor != null &&
-            viewportAnchor.messageId.trim().isNotEmpty) {
-          unawaited(
-            _restoreSavedViewportByAnchor(
-              messageId: viewportAnchor.messageId,
-              desiredOffset: viewportAnchor.offset,
-              passes: 3,
-            ),
-          );
-          return;
-        }
-        final nextMaxExtent = _scrollController.position.maxScrollExtent;
-        final delta = nextMaxExtent - previousMaxExtent;
-        final target = (previousPixels + max(0.0, delta))
-            .clamp(0.0, nextMaxExtent)
-            .toDouble();
-        _scrollController.jumpTo(target);
-        _handleScroll();
+        _restoreViewportAfterPrepending(
+          previousPixels: previousPixels,
+          previousMaxExtent: previousMaxExtent,
+          viewportAnchor: viewportAnchor,
+          passes: 3,
+        );
       });
     } catch (_) {
       // ignore transient older-page failures
     } finally {
       _loadingOlderMessages = false;
     }
+  }
+
+  void _restoreViewportAfterPrepending({
+    required double previousPixels,
+    required double previousMaxExtent,
+    ({String messageId, double offset})? viewportAnchor,
+    int passes = 2,
+  }) {
+    if (!mounted || !_scrollController.hasClients) return;
+
+    void fallbackToDelta() {
+      if (!mounted || !_scrollController.hasClients) return;
+      final nextMaxExtent = _scrollController.position.maxScrollExtent;
+      final delta = nextMaxExtent - previousMaxExtent;
+      final target = (previousPixels + max(0.0, delta))
+          .clamp(0.0, nextMaxExtent)
+          .toDouble();
+      _scrollController.jumpTo(target);
+      _handleScroll();
+    }
+
+    final anchorId = viewportAnchor?.messageId.trim() ?? '';
+    if (anchorId.isEmpty) {
+      fallbackToDelta();
+      return;
+    }
+
+    final viewportContext = _messagesViewportKey.currentContext;
+    final viewportObject = viewportContext?.findRenderObject();
+    final targetContext = _messageItemKeys[anchorId]?.currentContext;
+    final targetObject = targetContext?.findRenderObject();
+    final canUseAnchor =
+        viewportObject is RenderBox &&
+        targetObject is RenderBox &&
+        targetObject.hasSize &&
+        targetContext != null &&
+        targetContext.mounted;
+
+    if (!canUseAnchor) {
+      if (passes <= 1) {
+        fallbackToDelta();
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreViewportAfterPrepending(
+          previousPixels: previousPixels,
+          previousMaxExtent: previousMaxExtent,
+          viewportAnchor: viewportAnchor,
+          passes: passes - 1,
+        );
+      });
+      return;
+    }
+
+    final currentTop = _renderBoxTopInViewport(targetObject, viewportObject);
+    if (currentTop == null) {
+      if (passes <= 1) {
+        fallbackToDelta();
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _restoreViewportAfterPrepending(
+          previousPixels: previousPixels,
+          previousMaxExtent: previousMaxExtent,
+          viewportAnchor: viewportAnchor,
+          passes: passes - 1,
+        );
+      });
+      return;
+    }
+    final correction = currentTop - viewportAnchor!.offset;
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    final nextOffset = (_scrollController.offset + correction)
+        .clamp(0.0, maxExtent)
+        .toDouble();
+    _scrollController.jumpTo(nextOffset);
+    _handleScroll();
   }
 
   Future<void> _replayMissedMessagesAfterReconnect() async {
@@ -3758,12 +3932,14 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _loadingNewerMessages = true;
     try {
+      final newerLimit = kIsWeb ? 60 : 80;
       final resp = await authService.dio.get(
         '/api/chats/${widget.chatId}/messages',
         queryParameters: {
           'after_created_at': newestCreatedAt,
           'after_id': newestId,
-          'limit': 80,
+          'limit': newerLimit,
+          if (kIsWeb) 'view': 'summary',
         },
       );
       final data = resp.data;
@@ -7388,6 +7564,70 @@ class _ChatScreenState extends State<ChatScreen> {
     return <String, dynamic>{};
   }
 
+  bool get _useApproximateViewportTracking => true;
+
+  String _messageIdentityKey(Map<String, dynamic> message, int fallbackIndex) {
+    final messageId = _messageIdOf(message);
+    if (messageId.isNotEmpty) return 'id:$messageId';
+    final clientMsgId = (message['client_msg_id'] ?? '').toString().trim();
+    if (clientMsgId.isNotEmpty) return 'client:$clientMsgId';
+    final createdAt = (message['created_at'] ?? '').toString().trim();
+    final text = (message['text'] ?? '').toString().trim();
+    return 'fallback:$createdAt:$text:$fallbackIndex';
+  }
+
+  List<Map<String, dynamic>> _dedupeMessages(
+    Iterable<Map<String, dynamic>> messages,
+  ) {
+    final order = <String>[];
+    final byKey = <String, Map<String, dynamic>>{};
+    var fallbackIndex = 0;
+
+    for (final rawMessage in messages) {
+      final normalized = _normalizeMessage(Map<String, dynamic>.from(rawMessage));
+      final key = _messageIdentityKey(normalized, fallbackIndex);
+      fallbackIndex += 1;
+      final existing = byKey[key];
+      if (existing == null) {
+        order.add(key);
+        byKey[key] = normalized;
+        continue;
+      }
+      byKey[key] = {
+        ...existing,
+        ...normalized,
+        'meta': {
+          ..._metaMapOf(existing['meta']),
+          ..._metaMapOf(normalized['meta']),
+        },
+      };
+    }
+
+    return order.map((key) => byKey[key]!).toList(growable: false)
+      ..sort(_compareByCreatedAt);
+  }
+
+  int? _approximateViewportMessageIndex() {
+    if (_messages.isEmpty) return null;
+    if (!_scrollController.hasClients) return _messages.length - 1;
+    final maxExtent = _scrollController.position.maxScrollExtent;
+    if (!maxExtent.isFinite || maxExtent <= 0) {
+      return (_messages.length - 1).clamp(0, _messages.length - 1);
+    }
+    final pixels = _scrollController.position.pixels;
+    if (!pixels.isFinite) return _messages.length - 1;
+    final fraction = (pixels / maxExtent).clamp(0.0, 1.0);
+    return (fraction * (_messages.length - 1))
+        .round()
+        .clamp(0, _messages.length - 1);
+  }
+
+  String? _approximateViewportMessageId() {
+    final index = _approximateViewportMessageIndex();
+    if (index == null || index < 0 || index >= _messages.length) return null;
+    return _messageIdOf(_messages[index]);
+  }
+
   double? _positiveMediaDimension(dynamic raw) {
     if (raw is num) {
       final value = raw.toDouble();
@@ -7476,7 +7716,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   List<Map<String, dynamic>> _visibleMessages() {
-    final visible = _messagesMatchingCurrentSearch().toList();
+    final visible = _dedupeMessages(_messagesMatchingCurrentSearch());
     if (_isReservedOrdersChat()) {
       visible.sort(_compareReservedTimelineMessages);
       return visible;
@@ -7542,6 +7782,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _manualBottomLockSuppressed = true;
     _stickToBottom = false;
     _clearBottomSettle();
+    if (_useApproximateViewportTracking) {
+      final moved = await _approximateScrollToMessageId(messageId);
+      if (moved) {
+        _handleScroll();
+      }
+      return;
+    }
     final targetContext = await _resolveMessageContextWithScroll(messageId);
     if (targetContext == null || !targetContext.mounted) return;
     await Scrollable.ensureVisible(
@@ -7626,6 +7873,89 @@ class _ChatScreenState extends State<ChatScreen> {
       items.add({'type': 'message', 'data': message});
     }
     return items;
+  }
+
+  Widget _buildTimelineRowSafely(Map<String, dynamic> row) {
+    try {
+      final type = (row['type'] ?? '').toString();
+      if (type == 'date') {
+        return _buildDateDivider((row['label'] ?? 'Без даты').toString());
+      }
+      if (type == 'unread_divider') {
+        return _buildUnreadDivider();
+      }
+      final rawData = row['data'];
+      if (rawData is! Map) {
+        throw StateError('timeline_row_data_missing');
+      }
+      final message = Map<String, dynamic>.from(rawData);
+      return _buildMessageItem(message);
+    } catch (error, stackTrace) {
+      final rowType = (row['type'] ?? '').toString();
+      final rawData = row['data'];
+      final message = rawData is Map ? Map<String, dynamic>.from(rawData) : null;
+      final messageId = (message?['id'] ?? '').toString().trim();
+      final kind = _metaMapOf(message?['meta'])['kind']?.toString().trim() ?? '';
+      unawaited(
+        MonitoringService.captureError(
+          error,
+          stackTrace,
+          subsystem: 'chat',
+          code: 'timeline_row_build_failed',
+          details: <String, dynamic>{
+            'chat_id': widget.chatId,
+            'row_type': rowType,
+            'message_id': messageId,
+            'kind': kind,
+          },
+        ),
+      );
+      return _buildBrokenTimelineRow(
+        messageId: messageId,
+        kind: kind,
+      );
+    }
+  }
+
+  Widget _buildBrokenTimelineRow({
+    required String messageId,
+    required String kind,
+  }) {
+    final theme = Theme.of(context);
+    final subtitleParts = <String>[
+      if (kind.isNotEmpty) 'Тип: $kind',
+      if (messageId.isNotEmpty) 'ID: $messageId',
+    ];
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.errorContainer.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: theme.colorScheme.error.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Сообщение не удалось отрисовать',
+            style: theme.textTheme.labelLarge?.copyWith(
+              color: theme.colorScheme.onErrorContainer,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          if (subtitleParts.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              subtitleParts.join(' • '),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onErrorContainer,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   bool _shouldUseUnreadJumpButton() {
@@ -11567,23 +11897,12 @@ class _ChatScreenState extends State<ChatScreen> {
                                             .onDrag,
                                     cacheExtent:
                                         media.size.height *
-                                        (kIsWeb ? 3.6 : 2.2),
+                                        (kIsWeb ? 0.7 : 2.2),
                                     itemCount: timeline.length,
                                     itemBuilder: (context, i) {
-                                      final row = timeline[i];
-                                      if (row['type'] == 'date') {
-                                        return _buildDateDivider(
-                                          (row['label'] ?? 'Без даты')
-                                              .toString(),
-                                        );
-                                      }
-                                      if (row['type'] == 'unread_divider') {
-                                        return _buildUnreadDivider();
-                                      }
-                                      final message = Map<String, dynamic>.from(
-                                        row['data'] as Map,
+                                      return _buildTimelineRowSafely(
+                                        timeline[i],
                                       );
-                                      return _buildMessageItem(message);
                                     },
                                   ),
                                 ),

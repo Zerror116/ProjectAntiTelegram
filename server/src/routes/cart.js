@@ -14,6 +14,9 @@ const { emitToTenant } = require('../utils/socket');
 const { guardAction } = require('../utils/antifraud');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
 const { resolveSharedCartOwnerId } = require('../utils/phoneAccess');
+const { uploadsPath } = require('../utils/storagePaths');
+const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
+const { toOriginalPublicMediaUrl } = require('../utils/mediaAssets');
 
 const requireReservationFulfillPermission = requirePermission('reservation.fulfill');
 const requireDeliveryManagePermission = requirePermission('delivery.manage');
@@ -43,7 +46,7 @@ const CART_RETENTION_ACTIVE_STATUSES = [
   'in_delivery',
 ];
 
-const claimsUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'claims');
+const claimsUploadsDir = uploadsPath('claims');
 fs.mkdirSync(claimsUploadsDir, { recursive: true });
 
 const claimImageUploadEngine = multer({
@@ -1265,10 +1268,17 @@ router.post('/claims/upload-image', authMiddleware, uploadClaimImage, async (req
     if (!req.file) {
       return res.status(400).json({ ok: false, error: 'Файл не получен' });
     }
+    const uploadedUrl = toAbsoluteClaimImageUrl(req, req.file);
+    await registerPublicImageUpload({
+      queryable: db,
+      ownerKind: 'claim_image',
+      ownerTextId: req.file.filename,
+      rawUrl: uploadedUrl,
+    });
     return res.status(201).json({
       ok: true,
       data: {
-        image_url: toAbsoluteClaimImageUrl(req, req.file),
+        image_url: uploadedUrl,
       },
     });
   } catch (err) {
@@ -2117,7 +2127,9 @@ router.post('/claims', authMiddleware, async (req, res) => {
       .trim()
       .toLowerCase();
     const description = String(req.body?.description || '').trim();
-    const imageUrl = String(req.body?.image_url || '').trim();
+    const imageUrl = req.body?.image_url
+      ? toOriginalPublicMediaUrl(String(req.body?.image_url || '').trim())
+      : '';
     const requestedRaw = req.body?.requested_amount;
 
     if (!cartItemId) {
@@ -2231,6 +2243,14 @@ router.post('/claims', authMiddleware, async (req, res) => {
 
     await client.query('COMMIT');
     const claim = insertQ.rows[0];
+    if (claim?.image_url) {
+      await registerPublicImageUpload({
+        queryable: client,
+        ownerKind: 'claim_image',
+        ownerId: claim.id,
+        rawUrl: claim.image_url,
+      });
+    }
     emitCartUpdated(req, userId, {
       cart_item_id: cartItemId,
       reason: 'claim_created',

@@ -35,11 +35,15 @@ Future<Size?> warmUpChatMessageImageSize(String imageUrl) async {
       );
       _chatMessageImageSizeCache[resolvedUrl] = size;
       if (!completer.isCompleted) completer.complete(size);
-      stream.removeListener(listener);
+      try {
+        stream.removeListener(listener);
+      } catch (_) {}
     },
     onError: (error, stackTrace) {
       if (!completer.isCompleted) completer.complete(null);
-      stream.removeListener(listener);
+      try {
+        stream.removeListener(listener);
+      } catch (_) {}
     },
   );
   stream.addListener(listener);
@@ -135,6 +139,15 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
     final imageProvider = NetworkImage(resolvedUrl);
     final stream = imageProvider.resolve(const ImageConfiguration());
     late final ImageStreamListener listener;
+    void detachCurrentListener() {
+      if (identical(_imageStream, stream) && identical(_imageStreamListener, listener)) {
+        _imageStream = null;
+        _imageStreamListener = null;
+      }
+      try {
+        stream.removeListener(listener);
+      } catch (_) {}
+    }
     listener = ImageStreamListener(
       (info, _) {
         final size = Size(
@@ -142,12 +155,12 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
           info.image.height.toDouble(),
         );
         _chatMessageImageSizeCache[resolvedUrl] = size;
+        detachCurrentListener();
         if (!mounted) return;
         setState(() => _intrinsicSize = size);
-        stream.removeListener(listener);
       },
       onError: (error, stackTrace) {
-        stream.removeListener(listener);
+        detachCurrentListener();
       },
     );
     _imageStream = stream;
@@ -159,7 +172,9 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
     final stream = _imageStream;
     final listener = _imageStreamListener;
     if (stream != null && listener != null) {
-      stream.removeListener(listener);
+      try {
+        stream.removeListener(listener);
+      } catch (_) {}
     }
     _imageStream = null;
     _imageStreamListener = null;
