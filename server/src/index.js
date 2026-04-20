@@ -27,6 +27,18 @@ const bodyParser = require("body-parser");
 const rateLimit = require("express-rate-limit");
 
 const db = require("./db");
+const {
+  uploadsRoot,
+  downloadsRoot,
+  ensureStorageLayout,
+} = require("./utils/storagePaths");
+const {
+  ensurePlaceholderAssets,
+  PRODUCT_PLACEHOLDER_NAME,
+  GENERIC_MEDIA_PLACEHOLDER_NAME,
+  PUBLIC_MEDIA_PLACEHOLDER_NAME,
+} = require("./utils/uploadRecovery");
+const { refreshMediaAssetCache } = require("./utils/mediaAssets");
 
 // ✅ Сначала создаём app, потом использу��м его
 const app = express();
@@ -38,6 +50,7 @@ const setupRouter = require("./routes/setup");
 const phonesRouter = require("./routes/phones");
 const chatsRouter = require("./routes/chats");
 const profileRouter = require("./routes/profile");
+const uploadsRecoveryRoutes = require("./routes/uploadsRecovery");
 const authRouter = require("./routes/auth");
 const adminRoutes = require("./routes/admin");
 const opsRoutes = require("./routes/ops");
@@ -103,17 +116,8 @@ if (!global.__fenixProcessMonitoringHooksInstalled) {
 // MIDDLEWARE И КОНФИГУРАЦИЯ
 // ===================================
 
-const uploadsRoot = path.resolve(__dirname, "..", "uploads");
-const downloadsRoot = path.resolve(__dirname, "..", "downloads");
-fs.mkdirSync(path.join(uploadsRoot, "products"), { recursive: true });
-fs.mkdirSync(path.join(uploadsRoot, "channels"), { recursive: true });
-fs.mkdirSync(path.join(uploadsRoot, "users"), { recursive: true });
-fs.mkdirSync(path.join(uploadsRoot, "claims"), { recursive: true });
-fs.mkdirSync(path.join(uploadsRoot, "chat_media", "images"), {
-  recursive: true,
-});
-fs.mkdirSync(path.join(uploadsRoot, "chat_media", "voice"), { recursive: true });
-fs.mkdirSync(downloadsRoot, { recursive: true });
+ensureStorageLayout();
+ensurePlaceholderAssets("http://localhost");
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
@@ -347,19 +351,71 @@ app.use((req, res, next) => {
   });
 });
 
+function placeholderAbsolutePathForPublicDir(publicDir) {
+  if (publicDir === "products") {
+    return path.join(uploadsRoot, "products", PRODUCT_PLACEHOLDER_NAME);
+  }
+  if (publicDir === "claims") {
+    return path.join(uploadsRoot, "claims", PUBLIC_MEDIA_PLACEHOLDER_NAME);
+  }
+  return path.join(
+    uploadsRoot,
+    "chat_media",
+    "images",
+    GENERIC_MEDIA_PLACEHOLDER_NAME,
+  );
+}
+
 for (const publicDir of ["products", "channels", "users", "claims"]) {
   const fullDir = path.join(uploadsRoot, publicDir);
   app.use(
     `/uploads/${publicDir}`,
     signedUploadGuard(publicDir),
+    (req, res, next) => {
+      const relativePath = decodeURIComponent(
+        String(req.path || req.url || "").replace(/^\/+/, ""),
+      ).replace(/\\/g, "/");
+      const parts = relativePath.split("/").filter(Boolean);
+      if (
+        parts.length === 0 ||
+        parts.some(
+          (part) =>
+            !/^[A-Za-z0-9._-]+$/.test(part) || part === "." || part === "..",
+        )
+      ) {
+        return next();
+      }
+      const absoluteDir = path.resolve(fullDir);
+      const absoluteFilePath = path.resolve(fullDir, ...parts);
+      const withinDir =
+        absoluteFilePath === absoluteDir ||
+        absoluteFilePath.startsWith(`${absoluteDir}${path.sep}`);
+      if (!withinDir) return next();
+      if (fs.existsSync(absoluteFilePath)) return next();
+
+      const placeholderPath = placeholderAbsolutePathForPublicDir(publicDir);
+      if (!placeholderPath || !fs.existsSync(placeholderPath)) {
+        return next();
+      }
+
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", "public, max-age=300");
+      res.setHeader("X-Fenix-Missing-Upload", "1");
+      return res.sendFile(placeholderPath);
+    },
     express.static(fullDir, {
       index: false,
       fallthrough: false,
-      maxAge: "5m",
-      immutable: false,
-      setHeaders(res) {
+      maxAge: "365d",
+      immutable: true,
+      setHeaders(res, filePath) {
         res.setHeader("X-Content-Type-Options", "nosniff");
-        res.setHeader("Cache-Control", "private, max-age=300");
+        const normalizedPath = String(filePath || "").replace(/\\/g, "/");
+        if (normalizedPath.includes("/variants/")) {
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          return;
+        }
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       },
     }),
   );
@@ -527,6 +583,7 @@ app.use("/api/auth", authRouter);
 
 // Остальные роуты
 app.use("/api/phones", phonesRouter);
+app.use("/api/profile/uploads-recovery", uploadsRecoveryRoutes);
 app.use("/api/profile", [profileUpdateRoutes, profileRouter]);
 app.use("/api/chats", chatsRouter);
 app.use("/api/admin", adminRoutes);
@@ -824,6 +881,7 @@ async function canEmitChatActivity(user, chatId) {
     console.log(
       `✅ DB bootstrap: created=${bootstrap.dbCreated}, applied=${bootstrap.applied.length}, main_channel=${bootstrap.systemChannels.main_channel_id}, reserved_channel=${bootstrap.systemChannels.reserved_channel_id}`,
     );
+    await refreshMediaAssetCache();
 
     // Помечаем creator (если пользователь с таким email существует)
     await ensureCreator();

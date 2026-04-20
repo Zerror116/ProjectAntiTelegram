@@ -6,11 +6,17 @@ import 'dart:html' as html;
 import 'dart:js' as js;
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 
 import 'web_notification_service.dart';
 import 'web_push_client_service.dart';
 
 const _rootWorkerUrl = '/flutter_service_worker.js';
+
+void _logWebPush(String message) {
+  if (!kDebugMode) return;
+  print(message);
+}
 
 bool isSupported() {
   return html.window.navigator.serviceWorker != null &&
@@ -82,7 +88,7 @@ Future<dynamic> _callPushHelper(
 ]) async {
   final helper = js.context['projectPhoenixPush'];
   if (helper == null) {
-    print('[web-push] helper missing: method=$method');
+    _logWebPush('[web-push] helper missing: method=$method');
     return null;
   }
   try {
@@ -90,7 +96,7 @@ Future<dynamic> _callPushHelper(
       _asJsObject(helper).callMethod(method, args),
     );
   } catch (e) {
-    print('[web-push] helper call failed: method=$method error=$e');
+    _logWebPush('[web-push] helper call failed: method=$method error=$e');
     return null;
   }
 }
@@ -98,7 +104,7 @@ Future<dynamic> _callPushHelper(
 Future<html.ServiceWorkerRegistration?> _getRegistration() async {
   final sw = html.window.navigator.serviceWorker;
   if (sw == null) {
-    print('[web-push] _getRegistration: serviceWorker unsupported');
+    _logWebPush('[web-push] _getRegistration: serviceWorker unsupported');
     return null;
   }
 
@@ -106,24 +112,24 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
     final dynamic existing = await sw.getRegistration();
     if (existing != null) {
       final registration = existing as html.ServiceWorkerRegistration;
-      print(
+      _logWebPush(
         '[web-push] _getRegistration: existing scope=${registration.scope}',
       );
       return _waitForRegistrationActivation(registration);
     }
-    print('[web-push] _getRegistration: existing=false');
+    _logWebPush('[web-push] _getRegistration: existing=false');
   } catch (e) {
-    print('[web-push] _getRegistration: getRegistration error=$e');
+    _logWebPush('[web-push] _getRegistration: getRegistration error=$e');
   }
 
   try {
     final registration = await sw.register(_rootWorkerUrl);
-    print(
+    _logWebPush(
       '[web-push] _getRegistration: registered scope=${registration.scope}',
     );
     return _waitForRegistrationActivation(registration);
   } catch (e) {
-    print('[web-push] _getRegistration: register error=$e');
+    _logWebPush('[web-push] _getRegistration: register error=$e');
     return null;
   }
 }
@@ -131,24 +137,30 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
 Future<html.ServiceWorkerRegistration> _waitForRegistrationActivation(
   html.ServiceWorkerRegistration registration,
 ) async {
-  for (var attempt = 0; attempt < 25; attempt++) {
-    final active = registration.active;
-    if (active != null && active.state == 'activated') {
-      print(
-        '[web-push] _waitForRegistrationActivation: active on attempt=$attempt',
-      );
-      return registration;
+  final sw = html.window.navigator.serviceWorker;
+  if (sw != null) {
+    try {
+      final ready = await sw.ready.timeout(const Duration(seconds: 4));
+      if (ready.active != null) {
+        _logWebPush(
+          '[web-push] _waitForRegistrationActivation: ready scope=${ready.scope}',
+        );
+        return ready;
+      }
+    } catch (_) {
+      // Fallback to current registration snapshot below.
     }
-
-    final worker = registration.installing ?? registration.waiting ?? active;
-    final state = worker?.state ?? 'none';
-    print(
-      '[web-push] _waitForRegistrationActivation: attempt=$attempt state=$state',
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
   }
 
-  print('[web-push] _waitForRegistrationActivation: timeout');
+  final active = registration.active;
+  if (active != null && active.state == 'activated') {
+    _logWebPush('[web-push] _waitForRegistrationActivation: active');
+    return registration;
+  }
+
+  final worker = registration.installing ?? registration.waiting ?? active;
+  final state = worker?.state ?? 'none';
+  _logWebPush('[web-push] _waitForRegistrationActivation: fallback state=$state');
   return registration;
 }
 
@@ -178,7 +190,7 @@ Future<void> _syncWindowBadge(int unreadCount) async {
       }
     }
   } catch (e) {
-    print('[web-push] _syncWindowBadge failed: $e');
+    _logWebPush('[web-push] _syncWindowBadge failed: $e');
   }
 }
 
@@ -191,9 +203,9 @@ Future<void> _postBadgeSyncToWorker(int unreadCount) async {
 }
 
 Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
-  print('[web-push] ensureSubscribed: start');
+  _logWebPush('[web-push] ensureSubscribed: start');
   if (!isSupported()) {
-    print('[web-push] ensureSubscribed: unsupported');
+    _logWebPush('[web-push] ensureSubscribed: unsupported');
     return const WebPushSyncResult(
       supported: false,
       enabledOnServer: false,
@@ -203,7 +215,7 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
   }
 
   final permission = await WebNotificationService.getPermissionState();
-  print('[web-push] ensureSubscribed: permission=$permission');
+  _logWebPush('[web-push] ensureSubscribed: permission=$permission');
   if (permission != WebNotificationPermissionState.granted) {
     return const WebPushSyncResult(
       supported: true,
@@ -217,7 +229,7 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
   try {
     configResp = await dio.get('/api/web-push/config');
   } catch (e) {
-    print('[web-push] ensureSubscribed: config_request_failed error=$e');
+    _logWebPush('[web-push] ensureSubscribed: config_request_failed error=$e');
     return const WebPushSyncResult(
       supported: true,
       enabledOnServer: false,
@@ -232,7 +244,7 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
       ? (root['public_key'] ?? '').toString().trim()
       : '';
   if (!enabled || publicKey.isEmpty) {
-    print(
+    _logWebPush(
       '[web-push] ensureSubscribed: server_not_configured enabled=$enabled keyEmpty=${publicKey.isEmpty}',
     );
     return const WebPushSyncResult(
@@ -244,7 +256,7 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
   }
 
   final registration = await _getRegistration();
-  print(
+  _logWebPush(
     '[web-push] ensureSubscribed: registration=${registration != null} pushManager=${registration?.pushManager != null}',
   );
   if (registration == null || registration.pushManager == null) {
@@ -258,11 +270,11 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
 
   var payload = await _getPushSubscriptionPayload();
   if (payload == null) {
-    print('[web-push] ensureSubscribed: subscribing');
+    _logWebPush('[web-push] ensureSubscribed: subscribing');
     payload = await _subscribeToPushPayload(publicKey);
   }
   if (payload == null) {
-    print('[web-push] ensureSubscribed: subscribe_failed');
+    _logWebPush('[web-push] ensureSubscribed: subscribe_failed');
     return const WebPushSyncResult(
       supported: true,
       enabledOnServer: true,
@@ -271,14 +283,14 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
     );
   }
 
-  print('[web-push] ensureSubscribed: serialized=true');
+  _logWebPush('[web-push] ensureSubscribed: serialized=true');
   try {
     await dio.post(
       '/api/web-push/subscriptions',
       data: {'subscription': payload},
     );
   } catch (e) {
-    print('[web-push] ensureSubscribed: sync_failed error=$e');
+    _logWebPush('[web-push] ensureSubscribed: sync_failed error=$e');
     return const WebPushSyncResult(
       supported: true,
       enabledOnServer: true,
@@ -288,7 +300,7 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
   }
 
   await syncUnreadBadge(dio);
-  print('[web-push] ensureSubscribed: success');
+  _logWebPush('[web-push] ensureSubscribed: success');
 
   return const WebPushSyncResult(
     supported: true,
@@ -307,9 +319,9 @@ Future<void> syncUnreadBadge(Dio dio) async {
         ? (root['unread_count'] as num?)?.toInt() ?? 0
         : 0;
     await _postBadgeSyncToWorker(count);
-    print('[web-push] syncUnreadBadge: count=$count');
+    _logWebPush('[web-push] syncUnreadBadge: count=$count');
   } catch (e) {
-    print('[web-push] syncUnreadBadge: failed error=$e');
+    _logWebPush('[web-push] syncUnreadBadge: failed error=$e');
   }
 }
 
@@ -318,9 +330,9 @@ Future<void> syncUnreadBadgeCount(int count) async {
   try {
     final normalized = count < 0 ? 0 : count;
     await _postBadgeSyncToWorker(normalized);
-    print('[web-push] syncUnreadBadgeCount: count=$normalized');
+    _logWebPush('[web-push] syncUnreadBadgeCount: count=$normalized');
   } catch (e) {
-    print('[web-push] syncUnreadBadgeCount: failed error=$e');
+    _logWebPush('[web-push] syncUnreadBadgeCount: failed error=$e');
   }
 }
 
@@ -346,7 +358,7 @@ Future<void> unsubscribe(Dio dio) async {
     await _callPushHelper('unsubscribeCurrent');
     await _postBadgeSyncToWorker(0);
   } catch (e) {
-    print('[web-push] unsubscribe failed error=$e');
+    _logWebPush('[web-push] unsubscribe failed error=$e');
   }
 }
 
@@ -359,7 +371,7 @@ Future<int> sendServerTestPush(Dio dio) async {
       return (root['sent'] as num?)?.toInt() ?? 0;
     }
   } catch (e) {
-    print('[web-push] sendServerTestPush failed error=$e');
+    _logWebPush('[web-push] sendServerTestPush failed error=$e');
   }
   return 0;
 }

@@ -13,8 +13,12 @@ const { ensureSystemChannels } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
 const { runInRequestTenantScope } = require('../utils/requestScope');
+const { uploadsPath } = require('../utils/storagePaths');
+const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
+const { upsertProductCardSnapshot } = require('../utils/productCardSnapshots');
+const { toOriginalPublicMediaUrl } = require('../utils/mediaAssets');
 
-const productUploadsDir = path.resolve(__dirname, '..', '..', 'uploads', 'products');
+const productUploadsDir = uploadsPath('products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
 const SAMARA_TZ = 'Europe/Samara';
 const productImageMaxMb = Math.max(
@@ -92,7 +96,8 @@ function toAbsoluteImageUrl(req, file) {
 function normalizeImageUrl(value) {
   if (value == null) return null;
   const trimmed = String(value).trim();
-  return trimmed ? trimmed : null;
+  if (!trimmed) return null;
+  return toOriginalPublicMediaUrl(trimmed);
 }
 
 function parseSettings(raw) {
@@ -1176,6 +1181,18 @@ router.post(
             [code, productId]
           );
           const product = productCodeUpdate.rows[0];
+          if (product?.image_url) {
+            await registerPublicImageUpload({
+              queryable: client,
+              ownerKind: 'product_image',
+              ownerId: product.id,
+              rawUrl: product.image_url,
+            });
+          }
+          const cardSnapshot = await upsertProductCardSnapshot(client, product, {
+            req,
+            tenantId: req.user?.tenant_id || null,
+          });
 
           const payload = {
             title: product.title,
@@ -1184,6 +1201,7 @@ router.post(
             quantity: Number(product.quantity),
             shelf_number: Number(product.shelf_number),
             image_url: product.image_url,
+            card_snapshot: cardSnapshot,
           };
 
           const queueInsert = await client.query(
@@ -1200,6 +1218,7 @@ router.post(
             data: {
               queue: queueInsert.rows[0],
               product,
+              card_snapshot: cardSnapshot,
               product_label: formatProductLabel(product.product_code, product.shelf_number),
               message: 'Товар отправлен в очередь. Пост появится после подтверждения админом/создателем.',
             },
@@ -1374,6 +1393,18 @@ router.post(
             ]
           );
           const product = upd.rows[0];
+          if (product?.image_url) {
+            await registerPublicImageUpload({
+              queryable: client,
+              ownerKind: 'product_image',
+              ownerId: product.id,
+              rawUrl: product.image_url,
+            });
+          }
+          const cardSnapshot = await upsertProductCardSnapshot(client, product, {
+            req,
+            tenantId: req.user?.tenant_id || null,
+          });
 
           const payload = {
             title: product.title,
@@ -1382,6 +1413,7 @@ router.post(
             quantity: Number(product.quantity),
             shelf_number: Number(product.shelf_number),
             image_url: product.image_url,
+            card_snapshot: cardSnapshot,
           };
 
           let queueRow;
@@ -1443,6 +1475,7 @@ router.post(
             data: {
               queue: queueRow,
               product,
+              card_snapshot: cardSnapshot,
               product_label: formatProductLabel(product.product_code, product.shelf_number),
               message: 'Товар переотправлен в очередь',
             },

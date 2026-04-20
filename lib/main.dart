@@ -4745,8 +4745,28 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
   return const MainShell();
 }
 
+bool _shouldSilenceReleaseWebConsoleErrors() {
+  return kReleaseMode && kIsWeb;
+}
+
+void _logClientRuntimeErrorToConsole(
+  String label,
+  Object error,
+  StackTrace? stackTrace,
+) {
+  if (_shouldSilenceReleaseWebConsoleErrors()) return;
+  if (stackTrace == null) {
+    debugPrint('$label: $error');
+    return;
+  }
+  debugPrint('$label: $error\n$stackTrace');
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (kIsWeb && kReleaseMode) {
+    debugPrint = (String? message, {int? wrapWidth}) {};
+  }
   if (kIsWeb) {
     try {
       await BrowserContextMenu.disableContextMenu();
@@ -4769,9 +4789,13 @@ Future<void> main() async {
       } catch (_) {}
       return;
     }
-    FlutterError.presentError(details);
-    debugPrint(
-      'FlutterError caught: ${details.exceptionAsString()}\n${details.stack}',
+    if (!_shouldSilenceReleaseWebConsoleErrors()) {
+      FlutterError.presentError(details);
+    }
+    _logClientRuntimeErrorToConsole(
+      'FlutterError caught',
+      details.exception,
+      details.stack,
     );
     unawaited(
       MonitoringService.captureError(
@@ -4788,7 +4812,11 @@ Future<void> main() async {
   };
 
   PlatformDispatcher.instance.onError = (Object error, StackTrace stackTrace) {
-    debugPrint('PlatformDispatcher.onError: $error\n$stackTrace');
+    _logClientRuntimeErrorToConsole(
+      'PlatformDispatcher.onError',
+      error,
+      stackTrace,
+    );
     unawaited(
       MonitoringService.captureError(
         error,
@@ -4797,7 +4825,7 @@ Future<void> main() async {
         code: 'platform_dispatcher_error',
       ),
     );
-    return false;
+    return _shouldSilenceReleaseWebConsoleErrors();
   };
 
   ErrorWidget.builder = (FlutterErrorDetails details) {

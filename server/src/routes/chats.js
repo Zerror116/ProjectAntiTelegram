@@ -42,47 +42,13 @@ const {
   processAttachmentFile,
   sha256File,
 } = require("../utils/chatMediaPipeline");
+const { uploadsRoot, uploadsPath } = require("../utils/storagePaths");
 
-const chatImageUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "chat_media",
-  "images",
-);
-const chatVoiceUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "chat_media",
-  "voice",
-);
-const chatVideoUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "chat_media",
-  "video",
-);
-const chatFileUploadsDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "chat_media",
-  "files",
-);
-const chatUploadSessionTempDir = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "uploads",
-  "chat_media",
-  "sessions",
-);
+const chatImageUploadsDir = uploadsPath("chat_media", "images");
+const chatVoiceUploadsDir = uploadsPath("chat_media", "voice");
+const chatVideoUploadsDir = uploadsPath("chat_media", "video");
+const chatFileUploadsDir = uploadsPath("chat_media", "files");
+const chatUploadSessionTempDir = uploadsPath("chat_media", "sessions");
 fs.mkdirSync(chatImageUploadsDir, { recursive: true });
 fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
 fs.mkdirSync(chatVideoUploadsDir, { recursive: true });
@@ -171,6 +137,16 @@ function normalizeAttachmentProcessingState(raw) {
     .trim()
     .toLowerCase();
   return ATTACHMENT_PROCESSING_STATES.has(value) ? value : "ready";
+}
+
+function normalizeAttachmentExtraMeta(raw) {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
+function shouldSuppressAttachmentMediaUrls(attachment) {
+  const state = normalizeAttachmentProcessingState(attachment?.processing_state);
+  const extraMeta = normalizeAttachmentExtraMeta(attachment?.extra_meta);
+  return state === "failed" && extraMeta.recovery_missing === true;
 }
 
 function resolveAttachmentQualityMode(raw, attachmentType) {
@@ -1792,12 +1768,17 @@ async function loadMessageAttachmentsByMessageIds(messageIds) {
     const messageId = String(row.message_id || "").trim();
     if (!messageId) continue;
     const current = byMessageId.get(messageId) || [];
+    const extraMeta = normalizeAttachmentExtraMeta(row.extra_meta);
+    const suppressMediaUrls = shouldSuppressAttachmentMediaUrls({
+      processing_state: row.processing_state,
+      extra_meta: extraMeta,
+    });
     current.push({
       id: row.id,
       attachment_type: row.attachment_type,
       sort_order: Number(row.sort_order || 0),
       media_group_id: row.media_group_id || null,
-      storage_url: row.storage_url || null,
+      storage_url: suppressMediaUrls ? null : row.storage_url || null,
       file_name: row.file_name || null,
       mime_type: row.mime_type || null,
       file_size: row.file_size == null ? null : Number(row.file_size),
@@ -1811,7 +1792,7 @@ async function loadMessageAttachmentsByMessageIds(messageIds) {
         row.processing_state,
       ),
       checksum_sha256: row.checksum_sha256 || null,
-      preview_image_url: row.preview_image_url || null,
+      preview_image_url: suppressMediaUrls ? null : row.preview_image_url || null,
       preview_width:
         row.preview_width == null ? null : Number(row.preview_width),
       preview_height:
@@ -1819,10 +1800,7 @@ async function loadMessageAttachmentsByMessageIds(messageIds) {
       waveform_peaks: Array.isArray(row.waveform_peaks)
         ? row.waveform_peaks.map((value) => Number(value) || 0)
         : [],
-      extra_meta:
-        row.extra_meta && typeof row.extra_meta === "object"
-          ? row.extra_meta
-          : {},
+      extra_meta: extraMeta,
       is_video_note: row.is_video_note === true,
       is_listen_once: row.is_listen_once === true,
       created_at: row.created_at || null,
@@ -2194,7 +2172,7 @@ async function finalizeSessionProcessing(req, client, sessionRow) {
     req,
     attachmentType,
     filePath: storagePath,
-    uploadsRoot: path.resolve(__dirname, "..", "..", "uploads"),
+    uploadsRoot,
     previewOutputDir: attachmentType === "video" ? chatImageUploadsDir : null,
     previewPrefix: String(sessionRow.id || "").trim(),
   });
@@ -2286,6 +2264,7 @@ function buildMessageMetaFromAttachment({
   replyMeta = {},
 }) {
   const attachmentType = normalizeAttachmentType(attachment.attachment_type);
+  const suppressMediaUrls = shouldSuppressAttachmentMediaUrls(attachment);
   const meta = {
     attachment_type: attachmentType,
     ...replyMeta,
@@ -2295,36 +2274,47 @@ function buildMessageMetaFromAttachment({
     meta.caption = normalizedCaption;
   }
   if (attachmentType === "image") {
-    meta.image_url = attachment.storage_url;
+    if (!suppressMediaUrls) {
+      meta.image_url = attachment.storage_url;
+    }
     if (attachment.width) meta.image_width = attachment.width;
     if (attachment.height) meta.image_height = attachment.height;
     if (attachment.aspect_ratio) meta.image_aspect_ratio = attachment.aspect_ratio;
     if (attachment.preprocess_tag) meta.image_preprocess = attachment.preprocess_tag;
   } else if (attachmentType === "voice") {
-    meta.voice_url = attachment.storage_url;
+    if (!suppressMediaUrls) {
+      meta.voice_url = attachment.storage_url;
+    }
     if (attachment.duration_ms) meta.voice_duration_ms = attachment.duration_ms;
     if (attachment.mime_type) meta.voice_mime_type = attachment.mime_type;
     if (attachment.file_name) meta.voice_file_name = attachment.file_name;
   } else if (attachmentType === "file") {
-    meta.file_url = attachment.storage_url;
+    if (!suppressMediaUrls) {
+      meta.file_url = attachment.storage_url;
+    }
     if (attachment.mime_type) meta.file_mime_type = attachment.mime_type;
     if (attachment.file_name) meta.file_name = attachment.file_name;
     if (attachment.file_size != null) meta.file_size = attachment.file_size;
   } else if (attachmentType === "video") {
-    meta.video_url = attachment.storage_url;
+    if (!suppressMediaUrls) {
+      meta.video_url = attachment.storage_url;
+    }
     if (attachment.duration_ms) meta.video_duration_ms = attachment.duration_ms;
     if (attachment.mime_type) meta.video_mime_type = attachment.mime_type;
     if (attachment.file_name) meta.video_file_name = attachment.file_name;
-    if (attachment.preview_image_url) {
+    if (!suppressMediaUrls && attachment.preview_image_url) {
       meta.video_preview_image_url = attachment.preview_image_url;
     }
     if (attachment.is_video_note) meta.is_video_note = true;
   }
-  if (attachment.preview_image_url) {
+  if (!suppressMediaUrls && attachment.preview_image_url) {
     meta.preview_image_url = attachment.preview_image_url;
   }
   if (attachment.processing_state) {
     meta.attachment_processing_state = attachment.processing_state;
+  }
+  if (suppressMediaUrls) {
+    meta.recovery_missing = true;
   }
   if (attachment.waveform_peaks?.length) {
     meta.waveform_peaks = attachment.waveform_peaks;
@@ -2962,8 +2952,13 @@ async function loadPagedMessages(req, {
   afterCreatedAt = null,
   afterId = null,
   limit = 40,
+  view = "full",
 }) {
-  const safeLimit = parseCursorLimit(limit, 40);
+  const summaryView = String(view || "").trim().toLowerCase() === "summary";
+  const safeLimit = Math.min(
+    parseCursorLimit(limit, summaryView ? 36 : 40),
+    summaryView ? 60 : 100,
+  );
   const userIdText = String(userId || "");
   const beforeTs = parseCursorTimestamp(beforeCreatedAt);
   const afterTs = parseCursorTimestamp(afterCreatedAt);
@@ -3642,6 +3637,10 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
     const userId = req.user.id;
     const role = req.user.role;
     const { chatId } = req.params;
+    const requestedView =
+      String(req.query.view || "").trim().toLowerCase() === "summary"
+        ? "summary"
+        : "full";
 
     const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
     if (!context)
@@ -3659,6 +3658,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
       afterCreatedAt: req.query.after_created_at,
       afterId: req.query.after_id,
       limit: req.query.limit,
+      view: requestedView,
     });
     const [state, firstUnreadMessageId, unreadCount] = await Promise.all([
       getUserChatState(userId, chatId),
@@ -3670,6 +3670,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
       data: page.data,
       paging: {
         mode: page.mode,
+        view: requestedView,
         has_more_before: page.has_more_before,
         has_more_after: page.has_more_after,
       },
@@ -5161,7 +5162,7 @@ router.post(
         req,
         attachmentType,
         filePath: uploadedFile.path,
-        uploadsRoot: path.resolve(__dirname, "..", "..", "uploads"),
+        uploadsRoot,
         previewOutputDir: attachmentType === "video" ? chatImageUploadsDir : null,
         previewPrefix: clientMsgId || uuidv4(),
       });

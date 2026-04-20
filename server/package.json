@@ -21,7 +21,14 @@
     "test:e2e:extended": "npm run test:e2e:core && npm run test:tenant-isolation:e2e && npm run test:tenant-regression:e2e && npm run test:device-limit:e2e",
     "test:e2e:full": "node scripts/e2e-full-regression.js",
     "audit:self": "node scripts/nightly-self-audit.js",
-    "audit:gate": "node scripts/audit_gate.js"
+    "audit:gate": "node scripts/audit_gate.js",
+    "media:backfill": "node scripts/media_assets_backfill.js",
+    "media:sanitize": "node scripts/media_assets_sanitize.js",
+    "perf:budget": "node scripts/perf_budget_smoke.js",
+    "recovery:audit": "node scripts/uploads_recovery_audit.js",
+    "recovery:restore": "node scripts/uploads_recovery_restore.js",
+    "recovery:placeholders": "node scripts/uploads_recovery_apply_placeholders.js",
+    "recovery:relink": "node scripts/uploads_recovery_relink_restored.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -38,6 +45,7 @@
     "otplib": "^12.0.1",
     "pdfkit": "^0.17.2",
     "pg": "^8.20.0",
+    "sharp": "^0.34.5",
     "socket.io": "^4.8.3",
     "uuid": "^13.0.0",
     "validator": "^13.15.35",
@@ -49,7 +57,8 @@
   },
   "overrides": {
     "path-to-regexp": "0.1.13",
-    "socket.io-parser": "4.2.6"
+    "socket.io-parser": "4.2.6",
+    "protobufjs": "7.5.5"
   },
   "engines": {
     "node": ">=18"

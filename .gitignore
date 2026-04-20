@@ -34,3 +34,5 @@ files_with_raw_sql.txt
 node_backend_code.txt
 project_snapshot.txt
 temp_code.txt
+
+tmp/
