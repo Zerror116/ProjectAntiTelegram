@@ -895,7 +895,9 @@ class _ChatScreenState extends State<ChatScreen> {
         normalized.contains('connection');
   }
 
-  Future<void> _deletePersistentOutboxMessage(Map<String, dynamic> message) async {
+  Future<void> _deletePersistentOutboxMessage(
+    Map<String, dynamic> message,
+  ) async {
     final clientMsgId = (message['client_msg_id'] ?? '').toString().trim();
     if (clientMsgId.isEmpty) return;
     await _removePersistentOutboxItem(clientMsgId);
@@ -958,8 +960,9 @@ class _ChatScreenState extends State<ChatScreen> {
             clientMsgId: clientMsgId,
             transform: (current) {
               final meta = _metaMapOf(current['meta']);
-              meta['delivery_status'] =
-                  state == 'ready' ? 'sending' : 'uploading';
+              meta['delivery_status'] = state == 'ready'
+                  ? 'sending'
+                  : 'uploading';
               meta.remove('error_message');
               return {...current, 'meta': meta};
             },
@@ -1467,13 +1470,15 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _refreshLoadedMessageBounds() {
-    final persistedMessages = _messages.where((message) {
-      final meta = _metaMapOf(message['meta']);
-      final id = _messageIdOf(message);
-      return meta['local_only'] != true &&
-          id.isNotEmpty &&
-          !id.startsWith('temp-');
-    }).toList(growable: false);
+    final persistedMessages = _messages
+        .where((message) {
+          final meta = _metaMapOf(message['meta']);
+          final id = _messageIdOf(message);
+          return meta['local_only'] != true &&
+              id.isNotEmpty &&
+              !id.startsWith('temp-');
+        })
+        .toList(growable: false);
     if (persistedMessages.isEmpty) {
       _oldestLoadedMessageId = null;
       _oldestLoadedCreatedAt = null;
@@ -1703,10 +1708,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String? _stickyDateLabelForViewport() {
-    final anchorMessageId = (_useApproximateViewportTracking
-            ? _approximateViewportMessageId()
-            : _currentScrollAnchor()?.messageId)
-        ?.trim() ??
+    final anchorMessageId =
+        (_useApproximateViewportTracking
+                ? _approximateViewportMessageId()
+                : _currentScrollAnchor()?.messageId)
+            ?.trim() ??
         '';
     if (anchorMessageId.isEmpty) return null;
     for (final message in _messages) {
@@ -2303,7 +2309,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final candidates = <({int distance, String url})>[];
     for (var index = 0; index < messages.length; index++) {
-      if (_isCatalogProduct(messages[index]) || _isReservedOrder(messages[index])) {
+      if (_isCatalogProduct(messages[index]) ||
+          _isReservedOrder(messages[index])) {
         continue;
       }
       final meta = _metaMapOf(messages[index]['meta']);
@@ -2818,7 +2825,11 @@ class _ChatScreenState extends State<ChatScreen> {
       if (duration == Duration.zero) {
         _scrollController.jumpTo(clamped);
       } else {
-        await _scrollController.animateTo(clamped, duration: duration, curve: curve);
+        await _scrollController.animateTo(
+          clamped,
+          duration: duration,
+          curve: curve,
+        );
       }
       return true;
     }
@@ -4274,7 +4285,8 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final prefs = await messengerPreferencesService.load();
       final connectivity = await _connectivity.checkConnectivity();
-      final onWifi = connectivity.contains(ConnectivityResult.wifi) ||
+      final onWifi =
+          connectivity.contains(ConnectivityResult.wifi) ||
           connectivity.contains(ConnectivityResult.ethernet);
       final quality = onWifi
           ? prefs.mediaSendQualityWifi
@@ -4570,7 +4582,8 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final prefs = await messengerPreferencesService.load();
       final connectivity = await Connectivity().checkConnectivity();
-      final onWifi = connectivity.contains(ConnectivityResult.wifi) ||
+      final onWifi =
+          connectivity.contains(ConnectivityResult.wifi) ||
           connectivity.contains(ConnectivityResult.ethernet);
       final quality = onWifi
           ? prefs.mediaSendQualityWifi
@@ -4718,7 +4731,8 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<_ChatUploadFile?> _pickVideoUpload({ImageSource? source}) async {
-    final shouldUsePicker = kIsWeb ||
+    final shouldUsePicker =
+        kIsWeb ||
         defaultTargetPlatform == TargetPlatform.macOS ||
         defaultTargetPlatform == TargetPlatform.windows ||
         defaultTargetPlatform == TargetPlatform.linux ||
@@ -4734,7 +4748,9 @@ class _ChatScreenState extends State<ChatScreen> {
       final bytes = picked.bytes;
       return _ChatUploadFile(
         filename: picked.name.isNotEmpty ? picked.name : 'video.mp4',
-        path: (picked.path ?? '').trim().isNotEmpty ? picked.path!.trim() : null,
+        path: (picked.path ?? '').trim().isNotEmpty
+            ? picked.path!.trim()
+            : null,
         bytes: bytes == null || bytes.isEmpty ? null : bytes,
         mimeType: _guessMimeTypeFromFilename(picked.name),
         fileSize: picked.size,
@@ -4746,13 +4762,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (picked == null) return null;
     final bytes = kIsWeb ? await picked.readAsBytes() : null;
     return _ChatUploadFile(
-      filename: picked.name.isNotEmpty ? picked.name : picked.path.split('/').last,
+      filename: picked.name.isNotEmpty
+          ? picked.name
+          : picked.path.split('/').last,
       path: picked.path.trim().isNotEmpty ? picked.path : null,
       bytes: bytes == null || bytes.isEmpty ? null : bytes,
       mimeType: (picked.mimeType ?? '').trim().isNotEmpty == true
           ? picked.mimeType!.trim()
           : _guessMimeTypeFromFilename(
-              picked.name.isNotEmpty ? picked.name : picked.path.split('/').last,
+              picked.name.isNotEmpty
+                  ? picked.name
+                  : picked.path.split('/').last,
             ),
       fileSize: bytes?.length,
       qualityMode: await _recommendedMediaQualityMode(),
@@ -6671,10 +6691,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'retry_payload': retryPayload,
     };
     queuedMeta.remove('error_message');
-    final queuedMessage = {
-      ...message,
-      'meta': queuedMeta,
-    };
+    final queuedMessage = {...message, 'meta': queuedMeta};
     _upsertMessage(queuedMessage, autoScroll: true);
     await _persistOutboxItem(
       message: queuedMessage,
@@ -6722,7 +6739,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _upsertMessage(optimisticMessage, autoScroll: true);
     await _persistOutboxItem(
       message: optimisticMessage,
-      retryPayload: _buildTextRetryPayload(text: text, replyPayload: replyPayload),
+      retryPayload: _buildTextRetryPayload(
+        text: text,
+        replyPayload: replyPayload,
+      ),
       status: 'queued',
     );
     unawaited(_flushPersistentOutbox());
@@ -6913,17 +6933,44 @@ class _ChatScreenState extends State<ChatScreen> {
     return null;
   }
 
-  int _reservedShelfSortKeyOf(Map<String, dynamic> message) {
-    final meta = _metaMapOf(message['meta']);
-    final processingMode = (meta['processing_mode'] ?? '')
-        .toString()
-        .trim()
-        .toLowerCase();
-    if (processingMode == 'oversize' || meta['is_oversize'] == true) {
-      return 1 << 20;
+  String _reservedShelfDisplayOfMeta(Map<String, dynamic> meta) {
+    final label = (meta['shelf_label'] ?? '').toString().trim();
+    if (label.isNotEmpty) return label;
+    final numberText = (meta['shelf_number'] ?? '').toString().trim();
+    if (numberText.isNotEmpty) return numberText;
+    return '';
+  }
+
+  int? _reservedShelfIntegerValue(String raw) {
+    final normalized = raw.trim();
+    if (normalized.isEmpty || !RegExp(r'^-?\d+$').hasMatch(normalized)) {
+      return null;
     }
-    final shelf = int.tryParse((meta['shelf_number'] ?? '').toString().trim());
-    return shelf ?? ((1 << 20) - 1);
+    return int.tryParse(normalized);
+  }
+
+  int _compareReservedShelfDisplays(String a, String b) {
+    final left = a.trim();
+    final right = b.trim();
+    final leftEmpty = left.isEmpty;
+    final rightEmpty = right.isEmpty;
+    if (leftEmpty && rightEmpty) return 0;
+    if (leftEmpty) return 1;
+    if (rightEmpty) return -1;
+
+    final leftInt = _reservedShelfIntegerValue(left);
+    final rightInt = _reservedShelfIntegerValue(right);
+    if (leftInt != null && rightInt != null) {
+      return leftInt.compareTo(rightInt);
+    }
+    if (leftInt != null) return -1;
+    if (rightInt != null) return 1;
+
+    final leftLower = left.toLowerCase();
+    final rightLower = right.toLowerCase();
+    final primary = leftLower.compareTo(rightLower);
+    if (primary != 0) return primary;
+    return left.compareTo(right);
   }
 
   DateTime? _reservedTimelineDateOf(Map<String, dynamic> message) {
@@ -6951,9 +6998,28 @@ class _ChatScreenState extends State<ChatScreen> {
     final byDate = _compareReservedTimelineDates(a, b);
     if (byDate != 0) return byDate;
 
-    final byShelf = _reservedShelfSortKeyOf(
-      a,
-    ).compareTo(_reservedShelfSortKeyOf(b));
+    final aMeta = _metaMapOf(a['meta']);
+    final bMeta = _metaMapOf(b['meta']);
+    final aProcessingMode = (aMeta['processing_mode'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final bProcessingMode = (bMeta['processing_mode'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final aOversize =
+        aProcessingMode == 'oversize' || aMeta['is_oversize'] == true;
+    final bOversize =
+        bProcessingMode == 'oversize' || bMeta['is_oversize'] == true;
+    if (aOversize != bOversize) {
+      return aOversize ? 1 : -1;
+    }
+
+    final byShelf = _compareReservedShelfDisplays(
+      _reservedShelfDisplayOfMeta(aMeta),
+      _reservedShelfDisplayOfMeta(bMeta),
+    );
     if (byShelf != 0) return byShelf;
 
     final byTime = _compareByCreatedAt(a, b);
@@ -7103,16 +7169,19 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _patchReservedUserShelfLocally({
     required String userId,
-    required int shelfNumber,
+    required String shelfLabel,
+    int? shelfNumber,
   }) {
     final userKey = userId.trim();
-    if (userKey.isEmpty || shelfNumber <= 0) return;
+    final normalizedShelfLabel = shelfLabel.trim();
+    if (userKey.isEmpty || normalizedShelfLabel.isEmpty) return;
     setState(() {
       _messages = _messages.map((message) {
         final meta = _metaMapOf(message['meta']);
         if (meta['kind']?.toString() != 'reserved_order_item') return message;
         final messageUserId = (meta['user_id'] ?? '').toString().trim();
-        final isPlaced = meta['placed'] == true ||
+        final isPlaced =
+            meta['placed'] == true ||
             _placedCartItemIds.contains(
               (meta['cart_item_id'] ?? '').toString().trim(),
             );
@@ -7128,29 +7197,30 @@ class _ChatScreenState extends State<ChatScreen> {
         return {
           ...message,
           'meta': Map<String, dynamic>.from(meta)
+            ..['shelf_label'] = normalizedShelfLabel
             ..['shelf_number'] = shelfNumber,
         };
       }).toList();
     });
   }
 
-  Future<int?> _promptShelfNumber({
+  Future<String?> _promptShelfLabel({
     String title = 'Укажите полку',
     String initialValue = '',
   }) async {
     var shelfDraft = initialValue.trim();
     if (!mounted) return null;
-    return showDialog<int>(
+    return showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(title),
         content: TextFormField(
           initialValue: shelfDraft,
           onChanged: (value) => shelfDraft = value,
-          keyboardType: TextInputType.number,
+          keyboardType: TextInputType.text,
           decoration: const InputDecoration(
-            labelText: 'Номер полки',
-            hintText: 'Например: 3',
+            labelText: 'Полка',
+            hintText: 'Например: 3, 0, -1, A-01',
           ),
         ),
         actions: [
@@ -7160,17 +7230,17 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           FilledButton(
             onPressed: () {
-              final parsed = int.tryParse(shelfDraft.trim());
-              if (parsed == null || parsed <= 0) {
+              final normalized = shelfDraft.trim();
+              if (normalized.isEmpty) {
                 showAppNotice(
                   context,
-                  'Введите корректный номер полки',
+                  'Введите корректную полку',
                   tone: AppNoticeTone.warning,
                   duration: const Duration(seconds: 2),
                 );
                 return;
               }
-              Navigator.of(ctx).pop(parsed);
+              Navigator.of(ctx).pop(normalized);
             },
             child: const Text('Сохранить'),
           ),
@@ -7184,12 +7254,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final reservationId = (meta['reservation_id'] ?? '').toString().trim();
     final cartItemId = (meta['cart_item_id'] ?? '').toString().trim();
     if (reservationId.isEmpty && cartItemId.isEmpty) return;
-    final currentShelf = int.tryParse((meta['shelf_number'] ?? '').toString());
-    final nextShelf = await _promptShelfNumber(
+    final currentShelf = _reservedShelfDisplayOfMeta(meta);
+    final nextShelf = await _promptShelfLabel(
       title: 'Смена полки',
-      initialValue: currentShelf == null || currentShelf <= 0
-          ? ''
-          : currentShelf.toString(),
+      initialValue: currentShelf,
     );
     if (nextShelf == null) return;
 
@@ -7212,16 +7280,29 @@ class _ChatScreenState extends State<ChatScreen> {
       final userId = (payload['user_id'] ?? meta['user_id'] ?? '')
           .toString()
           .trim();
+      final shelfLabel = (payload['shelf_label'] ?? nextShelf)
+          .toString()
+          .trim();
+      final shelfNumber = int.tryParse(
+        (payload['shelf_number'] ?? '').toString().trim(),
+      );
+      final shelfDisplay = (payload['shelf_display'] ?? shelfLabel)
+          .toString()
+          .trim();
       if (!mounted) return;
       _patchReservedOrderMessageLocally(
         reservationId: reservationId,
         cartItemId: cartItemId,
-        patch: {'shelf_number': nextShelf},
+        patch: {'shelf_label': shelfLabel, 'shelf_number': shelfNumber},
       );
-      _patchReservedUserShelfLocally(userId: userId, shelfNumber: nextShelf);
+      _patchReservedUserShelfLocally(
+        userId: userId,
+        shelfLabel: shelfLabel,
+        shelfNumber: shelfNumber,
+      );
       showAppNotice(
         context,
-        'Полка изменена на $nextShelf',
+        'Полка изменена на $shelfDisplay',
         tone: AppNoticeTone.success,
         duration: const Duration(milliseconds: 1400),
       );
@@ -7406,12 +7487,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _placedCartItemIds.contains(cartItemId)) {
       return;
     }
-    final knownShelfRaw = int.tryParse(
-      (meta['shelf_number'] ?? '').toString().trim(),
-    );
-    final knownShelf = (knownShelfRaw != null && knownShelfRaw > 0)
-        ? knownShelfRaw
-        : null;
+    final knownShelf = _reservedShelfDisplayOfMeta(meta);
     final oversize = processingMode == 'oversize';
 
     setState(() => _markingPlaced = true);
@@ -7419,12 +7495,10 @@ class _ChatScreenState extends State<ChatScreen> {
       final reservationIdValue = (reservationId ?? '').trim();
       final cartItemIdValue = (cartItemId ?? '').trim();
       Future<Response<dynamic>> sendMarkPlaced({
-        int? shelfNumber,
+        String? shelfLabel,
         bool manualShelf = false,
       }) {
-        final shelfValue = shelfNumber != null && shelfNumber > 0
-            ? shelfNumber.toString()
-            : '';
+        final shelfValue = (shelfLabel ?? '').trim();
         return authService.dio.post(
           '/api/admin/orders/mark_placed',
           data: {
@@ -7458,9 +7532,11 @@ class _ChatScreenState extends State<ChatScreen> {
         // Для админского потока не подставляем полку автоматически:
         // первый товар должен быть подтвержден ручным вводом.
         resp = await sendMarkPlaced(
-          shelfNumber: oversize
+          shelfLabel: oversize
               ? null
-              : (requiresManualByRole ? null : knownShelf),
+              : (requiresManualByRole
+                    ? null
+                    : (knownShelf.isEmpty ? null : knownShelf)),
         );
       } on DioException catch (e) {
         final rawData = e.response?.data;
@@ -7491,12 +7567,9 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         }
 
-        final manualShelf = await _promptShelfNumber();
+        final manualShelf = await _promptShelfLabel();
         if (manualShelf == null) return;
-        resp = await sendMarkPlaced(
-          shelfNumber: manualShelf,
-          manualShelf: true,
-        );
+        resp = await sendMarkPlaced(shelfLabel: manualShelf, manualShelf: true);
       }
       if ((resp.statusCode == 200 || resp.statusCode == 201) && mounted) {
         final data = resp.data is Map<String, dynamic>
@@ -7516,6 +7589,7 @@ class _ChatScreenState extends State<ChatScreen> {
             'processing_mode': resolvedMode,
             'is_oversize': resolvedMode == 'oversize',
             'shelf_number': payload['shelf_number'],
+            'shelf_label': payload['shelf_label'],
             'processed_by_name': (payload['processed_by_name'] ?? '')
                 .toString()
                 .trim(),
@@ -7584,7 +7658,9 @@ class _ChatScreenState extends State<ChatScreen> {
     var fallbackIndex = 0;
 
     for (final rawMessage in messages) {
-      final normalized = _normalizeMessage(Map<String, dynamic>.from(rawMessage));
+      final normalized = _normalizeMessage(
+        Map<String, dynamic>.from(rawMessage),
+      );
       final key = _messageIdentityKey(normalized, fallbackIndex);
       fallbackIndex += 1;
       final existing = byKey[key];
@@ -7617,9 +7693,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final pixels = _scrollController.position.pixels;
     if (!pixels.isFinite) return _messages.length - 1;
     final fraction = (pixels / maxExtent).clamp(0.0, 1.0);
-    return (fraction * (_messages.length - 1))
-        .round()
-        .clamp(0, _messages.length - 1);
+    return (fraction * (_messages.length - 1)).round().clamp(
+      0,
+      _messages.length - 1,
+    );
   }
 
   String? _approximateViewportMessageId() {
@@ -7712,6 +7789,7 @@ class _ChatScreenState extends State<ChatScreen> {
       clientName: (meta['client_name'] ?? '').toString(),
       productCode: _reservedProductCodeOf(message) ?? '',
       clientPhone: (meta['client_phone'] ?? '').toString(),
+      shelfLabel: _reservedShelfDisplayOfMeta(meta),
     );
   }
 
@@ -7893,9 +7971,12 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (error, stackTrace) {
       final rowType = (row['type'] ?? '').toString();
       final rawData = row['data'];
-      final message = rawData is Map ? Map<String, dynamic>.from(rawData) : null;
+      final message = rawData is Map
+          ? Map<String, dynamic>.from(rawData)
+          : null;
       final messageId = (message?['id'] ?? '').toString().trim();
-      final kind = _metaMapOf(message?['meta'])['kind']?.toString().trim() ?? '';
+      final kind =
+          _metaMapOf(message?['meta'])['kind']?.toString().trim() ?? '';
       unawaited(
         MonitoringService.captureError(
           error,
@@ -7910,10 +7991,7 @@ class _ChatScreenState extends State<ChatScreen> {
           },
         ),
       );
-      return _buildBrokenTimelineRow(
-        messageId: messageId,
-        kind: kind,
-      );
+      return _buildBrokenTimelineRow(messageId: messageId, kind: kind);
     }
   }
 
@@ -7932,7 +8010,9 @@ class _ChatScreenState extends State<ChatScreen> {
       decoration: BoxDecoration(
         color: theme.colorScheme.errorContainer.withValues(alpha: 0.42),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: theme.colorScheme.error.withValues(alpha: 0.4)),
+        border: Border.all(
+          color: theme.colorScheme.error.withValues(alpha: 0.4),
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -8157,7 +8237,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final raw = meta['waveform_peaks'];
     if (raw is! List || raw.isEmpty) return const <double>[];
     final peaks = raw
-        .map((value) => value is num ? value.toDouble() : double.tryParse('$value'))
+        .map(
+          (value) =>
+              value is num ? value.toDouble() : double.tryParse('$value'),
+        )
         .whereType<double>()
         .where((value) => value.isFinite && value >= 0)
         .toList(growable: false);
@@ -8670,8 +8753,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'error' => theme.colorScheme.onErrorContainer,
       _ => theme.colorScheme.onSurfaceVariant,
     };
-    final chipChild =
-        status == 'uploading' || status == 'sending'
+    final chipChild = status == 'uploading' || status == 'sending'
         ? const SizedBox(
             width: 12,
             height: 12,
@@ -8733,17 +8815,16 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _buildAttachmentStateRow(
-    ThemeData theme,
-    Map<String, dynamic> meta,
-  ) {
+  Widget _buildAttachmentStateRow(ThemeData theme, Map<String, dynamic> meta) {
     final state = _attachmentProcessingStateOf(meta);
     if (state.isEmpty || state == 'ready') {
       return const SizedBox.shrink();
     }
 
     final isFailed = state == 'failed';
-    final label = isFailed ? 'Ошибка обработки вложения' : 'Вложение обрабатывается';
+    final label = isFailed
+        ? 'Ошибка обработки вложения'
+        : 'Вложение обрабатывается';
     final icon = isFailed
         ? Icons.error_outline_rounded
         : Icons.hourglass_top_rounded;
@@ -10647,9 +10728,7 @@ class _ChatScreenState extends State<ChatScreen> {
               decoration: BoxDecoration(
                 color: Colors.black.withValues(alpha: 0.34),
                 shape: BoxShape.circle,
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.12),
-                ),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
               ),
               child: IconButton(
                 padding: EdgeInsets.zero,
@@ -10865,9 +10944,12 @@ class _ChatScreenState extends State<ChatScreen> {
     final quantityInt = int.tryParse(quantity) ?? 0;
     final isPlaced = _reservedIsPlaced(message);
     final isOversizePlaced = _reservedIsOversize(message);
+    final reservedShelfDisplay = _reservedShelfDisplayOfMeta(metaMap);
     final shelf = isOversizePlaced
         ? 'Габарит'
-        : (metaMap['shelf_number']?.toString() ?? 'не назначена');
+        : (reservedShelfDisplay.isEmpty
+              ? 'не назначена'
+              : reservedShelfDisplay);
     final reservedDescription = metaMap['description']?.toString().trim() ?? '';
     final clientName = metaMap['client_name']?.toString() ?? '—';
     final clientPhone = _formatDisplayPhone(
@@ -11932,12 +12014,16 @@ class _ChatScreenState extends State<ChatScreen> {
                                   child: Center(
                                     child: DecoratedBox(
                                       decoration: BoxDecoration(
-                                        color: theme.colorScheme
+                                        color: theme
+                                            .colorScheme
                                             .surfaceContainerHighest
                                             .withValues(alpha: 0.94),
-                                        borderRadius: BorderRadius.circular(999),
+                                        borderRadius: BorderRadius.circular(
+                                          999,
+                                        ),
                                         border: Border.all(
-                                          color: theme.colorScheme.outlineVariant,
+                                          color:
+                                              theme.colorScheme.outlineVariant,
                                         ),
                                         boxShadow: [
                                           BoxShadow(
@@ -12566,16 +12652,21 @@ class _ExpandedVideoNoteViewerState extends State<_ExpandedVideoNoteViewer> {
                         FittedBox(
                           fit: BoxFit.cover,
                           child: SizedBox(
-                            width: value.size.width > 0 ? value.size.width : 320,
-                            height:
-                                value.size.height > 0 ? value.size.height : 320,
+                            width: value.size.width > 0
+                                ? value.size.width
+                                : 320,
+                            height: value.size.height > 0
+                                ? value.size.height
+                                : 320,
                             child: vp.VideoPlayer(controller),
                           ),
                         ),
                       Center(
                         child: IconButton.filledTonal(
                           style: IconButton.styleFrom(
-                            backgroundColor: Colors.black.withValues(alpha: 0.36),
+                            backgroundColor: Colors.black.withValues(
+                              alpha: 0.36,
+                            ),
                             foregroundColor: Colors.white,
                             padding: const EdgeInsets.all(20),
                           ),
@@ -12589,8 +12680,7 @@ class _ExpandedVideoNoteViewerState extends State<_ExpandedVideoNoteViewer> {
                             final current = controller.value.position;
                             if (total > Duration.zero &&
                                 current >=
-                                    total -
-                                        const Duration(milliseconds: 200)) {
+                                    total - const Duration(milliseconds: 200)) {
                               await controller.seekTo(Duration.zero);
                             }
                             await controller.play();
