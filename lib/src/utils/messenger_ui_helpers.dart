@@ -8,10 +8,7 @@ enum MessengerReservedQuickFilter {
   shelfless,
 }
 
-String messengerSupportStatusLabel(
-  String raw, {
-  bool hasAssignee = false,
-}) {
+String messengerSupportStatusLabel(String raw, {bool hasAssignee = false}) {
   switch (raw.trim().toLowerCase()) {
     case 'waiting_customer':
       return 'Ждём ваш ответ';
@@ -41,9 +38,7 @@ MessengerSupportStatusTone messengerSupportStatusTone(String raw) {
 }
 
 String messengerSupportWaitingLabel({required bool waitingCustomer}) {
-  return waitingCustomer
-      ? 'Сейчас ждём ваш ответ'
-      : 'Сейчас ход за поддержкой';
+  return waitingCustomer ? 'Сейчас ждём ваш ответ' : 'Сейчас ход за поддержкой';
 }
 
 String messengerBuildLastMessagePreview({
@@ -83,12 +78,14 @@ bool messengerMatchesReservedSearch({
   String? clientName,
   String? productCode,
   String? clientPhone,
+  String? shelfLabel,
 }) {
   final rawQuery = query.trim();
   if (rawQuery.isEmpty) return true;
   if (reservedContext && RegExp(r'^\d+$').hasMatch(rawQuery)) {
     final normalizedProductCode = (productCode ?? '').trim();
-    return normalizedProductCode.isNotEmpty && normalizedProductCode == rawQuery;
+    return normalizedProductCode.isNotEmpty &&
+        normalizedProductCode == rawQuery;
   }
 
   final q = rawQuery.toLowerCase();
@@ -99,6 +96,7 @@ bool messengerMatchesReservedSearch({
     (clientName ?? '').toLowerCase(),
     (productCode ?? '').toLowerCase(),
     (clientPhone ?? '').toLowerCase(),
+    (shelfLabel ?? '').toLowerCase(),
   ];
   return blobs.any((value) => value.contains(q));
 }
@@ -159,9 +157,7 @@ String messengerLocalDeliveryLabel(
     case 'sending':
       return 'Отправляется...';
     case 'error':
-      return retryable
-          ? 'Не отправлено'
-          : 'Не отправлено, прикрепите заново';
+      return retryable ? 'Не отправлено' : 'Не отправлено, прикрепите заново';
     default:
       return '';
   }

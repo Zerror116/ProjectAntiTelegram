@@ -355,6 +355,32 @@ function formatProductLabel(productCode, shelfNumber) {
   return `${codePart}--${shelfPart}`;
 }
 
+function normalizeShelfLabel(raw) {
+  const normalized = String(raw ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  return normalized.slice(0, 64);
+}
+
+function parsePositiveShelfNumber(raw) {
+  const normalized = normalizeShelfLabel(raw);
+  if (!normalized || !/^\d+$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function displayShelfValue(shelfLabel, shelfNumber) {
+  const normalizedLabel = normalizeShelfLabel(shelfLabel);
+  if (normalizedLabel) return normalizedLabel;
+  const parsedShelf = Number(shelfNumber);
+  if (Number.isFinite(parsedShelf)) {
+    return String(Math.trunc(parsedShelf));
+  }
+  return "не назначена";
+}
+
 async function resolveAutoShelfNumber(
   client,
   tenantId = null,
@@ -416,6 +442,7 @@ function reservedOrderMessageText(order) {
     order.product_code,
     order.product_shelf_number,
   );
+  const clientShelf = displayShelfValue(order.shelf_label, order.shelf_number);
   const lines = [
     `📦 ${order.product_title}`,
     order.product_description
@@ -427,7 +454,7 @@ function reservedOrderMessageText(order) {
     `Цена: ${order.product_price} ₽`,
     `Куплено: ${order.quantity}`,
     `Полка товара: ${order.product_shelf_number ?? "не назначена"}`,
-    `Полка клиента: ${order.shelf_number ?? "не назначена"}`,
+    `Полка клиента: ${clientShelf}`,
     "Статус: ожидание обработки",
   ].filter(Boolean);
   return lines.join("\n");
@@ -3076,7 +3103,8 @@ router.post(
                 u.name AS client_name,
                 ph.phone AS client_phone,
                 regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g') AS client_phone_digits,
-                us.shelf_number
+                us.shelf_number,
+                NULLIF(BTRIM(us.shelf_label), '') AS shelf_label
          FROM reservations r
          JOIN products p ON p.id = r.product_id
          JOIN users u ON u.id = r.user_id
@@ -3085,6 +3113,17 @@ router.post(
          WHERE r.is_fulfilled = false
            AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
          ORDER BY DATE(COALESCE(r.created_at, now())) ASC,
+                  CASE
+                    WHEN NULLIF(BTRIM(us.shelf_label), '') ~ '^-?\\d+$' THEN 0
+                    WHEN NULLIF(BTRIM(us.shelf_label), '') IS NOT NULL THEN 1
+                    ELSE 2
+                  END ASC,
+                  CASE
+                    WHEN NULLIF(BTRIM(us.shelf_label), '') ~ '^-?\\d+$'
+                      THEN (NULLIF(BTRIM(us.shelf_label), ''))::int
+                    ELSE NULL
+                  END ASC NULLS LAST,
+                  lower(COALESCE(NULLIF(BTRIM(us.shelf_label), ''), us.shelf_number::text, p.shelf_number::text, '')) ASC,
                   COALESCE(us.shelf_number, p.shelf_number, 2147483647) ASC,
                   CASE
                     WHEN regexp_replace(COALESCE(ph.phone, ''), '\\D+', '', 'g') = '' THEN '89999999999'
@@ -3123,6 +3162,7 @@ router.post(
           client_name: row.client_name || "—",
           client_phone: formatPhoneForDisplay(row.client_phone),
           shelf_number: row.shelf_number,
+          shelf_label: row.shelf_label,
           placed: false,
         };
 
@@ -3165,6 +3205,7 @@ router.post(
           message_id: messageInsert.rows[0].id,
           user_id: row.user_id,
           shelf_number: row.shelf_number,
+          shelf_label: row.shelf_label,
           product_code: row.product_code,
           product_shelf_number: row.product_shelf_number,
           quantity: Number(row.quantity),
@@ -3225,19 +3266,18 @@ router.post(
   async (req, res) => {
     const reservationId = String(req.body?.reservation_id || "").trim();
     const cartItemId = String(req.body?.cart_item_id || "").trim();
-    const shelfRaw = Number(req.body?.shelf_number);
-    const shelfNumber =
-      Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
+    const shelfLabel = normalizeShelfLabel(req.body?.shelf_number);
+    const shelfNumber = parsePositiveShelfNumber(req.body?.shelf_number);
 
     if (!reservationId && !cartItemId) {
       return res
         .status(400)
         .json({ ok: false, error: "reservation_id или cart_item_id обязателен" });
     }
-    if (shelfNumber == null || shelfNumber <= 0) {
+    if (!shelfLabel) {
       return res
         .status(400)
-        .json({ ok: false, error: "Укажите корректный номер полки" });
+        .json({ ok: false, error: "Укажите корректную полку" });
     }
 
     const client = await db.pool.connect();
@@ -3274,46 +3314,56 @@ router.post(
       const item = reservationQ.rows[0];
       const userIdText = String(item.user_id || "").trim();
       await client.query(
-        `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
-         VALUES ($1, $2, now(), now())
+        `INSERT INTO user_shelves (user_id, shelf_number, shelf_label, created_at, updated_at)
+         VALUES ($1, $2, $3, now(), now())
          ON CONFLICT (user_id) DO UPDATE
            SET shelf_number = EXCLUDED.shelf_number,
+               shelf_label = EXCLUDED.shelf_label,
                updated_at = now()`,
-        [userIdText, shelfNumber],
+        [userIdText, shelfNumber, shelfLabel],
       );
 
       const updatedReservedMessages = await client.query(
         `UPDATE messages
          SET meta = jsonb_set(
-               COALESCE(meta, '{}'::jsonb),
-               '{shelf_number}',
-               to_jsonb($2::int),
+               jsonb_set(
+                 COALESCE(meta, '{}'::jsonb),
+                 '{shelf_number}',
+                 CASE
+                   WHEN $2::int IS NULL THEN 'null'::jsonb
+                   ELSE to_jsonb($2::int)
+                 END,
+                 true
+               ),
+               '{shelf_label}',
+               to_jsonb($3::text),
                true
              )
          WHERE chat_id = $1
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
-           AND COALESCE(meta->>'user_id', '') = $3
+           AND COALESCE(meta->>'user_id', '') = $4
            AND lower(COALESCE(meta->>'processing_mode', 'standard')) <> 'oversize'
            AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
-        [reservedChannel.id, shelfNumber, userIdText],
+        [reservedChannel.id, shelfNumber, shelfLabel, userIdText],
       );
 
       const updatedDeliveryCustomers = await client.query(
         `UPDATE delivery_batch_customers c
          SET shelf_number = $1,
+             shelf_label = $2,
              updated_at = now()
-         WHERE c.user_id = $2::uuid
+         WHERE c.user_id = $3::uuid
            AND EXISTS (
              SELECT 1
              FROM delivery_batches b
              JOIN users u ON u.id = c.user_id
              WHERE b.id = c.batch_id
                AND b.status IN ('calling', 'couriers_assigned', 'handed_off')
-               AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
+               AND ($4::uuid IS NULL OR u.tenant_id = $4::uuid)
            )
          RETURNING c.batch_id::text AS batch_id`,
-        [shelfNumber, userIdText, req.user.tenant_id || null],
+        [shelfNumber, shelfLabel, userIdText, req.user.tenant_id || null],
       );
 
       if (updatedReservedMessages.rowCount > 0) {
@@ -3344,6 +3394,7 @@ router.post(
         io.to(`user:${userIdText}`).emit("cart:updated", {
           userId: userIdText,
           shelf_number: shelfNumber,
+          shelf_label: shelfLabel,
           reason: "shelf_changed",
         });
       }
@@ -3355,6 +3406,8 @@ router.post(
           cart_item_id: item.cart_item_id ? String(item.cart_item_id) : null,
           user_id: userIdText,
           shelf_number: shelfNumber,
+          shelf_label: shelfLabel,
+          shelf_display: shelfLabel,
           updated_reserved_messages: updatedReservedMessages.rowCount,
           updated_delivery_customers: updatedDeliveryCustomers.rowCount,
         },
@@ -3381,9 +3434,8 @@ router.post(
     const processingModeRaw = String(req.body?.processing_mode || "standard")
       .trim()
       .toLowerCase();
-    const shelfRaw = Number(req.body?.shelf_number);
-    const manualShelf =
-      Number.isFinite(shelfRaw) && shelfRaw > 0 ? Math.floor(shelfRaw) : null;
+    const manualShelfLabel = normalizeShelfLabel(req.body?.shelf_number);
+    const manualShelfNumber = parsePositiveShelfNumber(req.body?.shelf_number);
     const manualShelfConfirmed = ["1", "true", "yes", "y"].includes(
       String(req.body?.manual_shelf ?? "").toLowerCase().trim(),
     );
@@ -3458,7 +3510,12 @@ router.post(
       }
 
       const carryShelfQ = await client.query(
-        `SELECT NULLIF(regexp_replace(COALESCE(meta->>'shelf_number', ''), '\\D', '', 'g'), '')::int AS shelf_number
+        `SELECT NULLIF(BTRIM(COALESCE(meta->>'shelf_label', '')), '') AS shelf_label,
+                CASE
+                  WHEN COALESCE(meta->>'shelf_number', '') ~ '^-?\\d+$'
+                    THEN (meta->>'shelf_number')::int
+                  ELSE NULL
+                END AS shelf_number
          FROM messages
          WHERE chat_id = $1
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
@@ -3466,7 +3523,10 @@ router.post(
              COALESCE(meta->>'reservation_id', '') = $2
              OR ($3 <> '' AND COALESCE(meta->>'cart_item_id', '') = $3)
            )
-           AND NULLIF(regexp_replace(COALESCE(meta->>'shelf_number', ''), '\\D', '', 'g'), '') IS NOT NULL
+           AND (
+             NULLIF(BTRIM(COALESCE(meta->>'shelf_label', '')), '') IS NOT NULL
+             OR COALESCE(meta->>'shelf_number', '') ~ '^-?\\d+$'
+           )
          ORDER BY created_at DESC
          LIMIT 1`,
         [reservedChannel.id, String(item.id), targetCartItemId],
@@ -3481,14 +3541,18 @@ router.post(
         [String(item.user_id), ["processed", "preparing_delivery", "handing_to_courier"]],
       );
       const hasActiveShelfContext = activeShelfContextQ.rowCount > 0;
-      const messageShelf = carryShelfQ.rowCount > 0
-        ? Number(carryShelfQ.rows[0].shelf_number)
+      const messageShelfLabel = carryShelfQ.rowCount > 0
+        ? displayShelfValue(
+            carryShelfQ.rows[0]?.shelf_label,
+            carryShelfQ.rows[0]?.shelf_number,
+          )
         : null;
 
-      let persistedUserShelf = null;
+      let persistedUserShelfLabel = null;
+      let persistedUserShelfNumber = null;
       if (hasActiveShelfContext) {
         const userShelfQ = await client.query(
-          `SELECT shelf_number
+          `SELECT shelf_number, shelf_label
            FROM user_shelves
            WHERE user_id = $1
            LIMIT 1`,
@@ -3496,20 +3560,28 @@ router.post(
         );
         if (userShelfQ.rowCount > 0) {
           const parsed = Number(userShelfQ.rows[0]?.shelf_number);
-          persistedUserShelf =
+          persistedUserShelfNumber =
             Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+          persistedUserShelfLabel = displayShelfValue(
+            userShelfQ.rows[0]?.shelf_label,
+            userShelfQ.rows[0]?.shelf_number,
+          );
         }
       }
 
-      const existingShelf =
-        messageShelf != null && messageShelf > 0
-          ? messageShelf
-          : persistedUserShelf;
-      const canReuseExistingShelf = existingShelf != null && existingShelf > 0;
+      const existingShelfLabel =
+        messageShelfLabel && messageShelfLabel !== "не назначена"
+          ? messageShelfLabel
+          : persistedUserShelfLabel;
+      const existingShelfNumber = messageShelfLabel && messageShelfLabel !== "не назначена"
+        ? parsePositiveShelfNumber(messageShelfLabel)
+        : persistedUserShelfNumber;
+      const canReuseExistingShelf =
+        existingShelfLabel != null && existingShelfLabel !== "не назначена";
       if (
         requiresManualShelf &&
         !hasActiveShelfContext &&
-        (manualShelf == null || manualShelfConfirmed !== true)
+        (!manualShelfLabel || manualShelfConfirmed !== true)
       ) {
         await client.query("ROLLBACK");
         return res.status(400).json({
@@ -3518,7 +3590,7 @@ router.post(
           error: "Для первого товара в корзине нужно вручную указать номер полки",
         });
       }
-      if (requiresManualShelf && manualShelf == null && !canReuseExistingShelf) {
+      if (requiresManualShelf && !manualShelfLabel && !canReuseExistingShelf) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
@@ -3527,13 +3599,16 @@ router.post(
         });
       }
 
-      let finalShelf = null;
+      let finalShelfLabel = null;
+      let finalShelfNumber = null;
       if (requiresManualShelf) {
-        finalShelf = manualShelf;
-        if (finalShelf == null) {
-          finalShelf = canReuseExistingShelf ? existingShelf : null;
+        finalShelfLabel = manualShelfLabel;
+        finalShelfNumber = manualShelfNumber;
+        if (!finalShelfLabel) {
+          finalShelfLabel = canReuseExistingShelf ? existingShelfLabel : null;
+          finalShelfNumber = canReuseExistingShelf ? existingShelfNumber : null;
         }
-        if (finalShelf == null || finalShelf <= 0) {
+        if (!finalShelfLabel) {
           await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
@@ -3541,12 +3616,13 @@ router.post(
           });
         }
         await client.query(
-          `INSERT INTO user_shelves (user_id, shelf_number, created_at, updated_at)
-           VALUES ($1, $2, now(), now())
+          `INSERT INTO user_shelves (user_id, shelf_number, shelf_label, created_at, updated_at)
+           VALUES ($1, $2, $3, now(), now())
            ON CONFLICT (user_id) DO UPDATE
              SET shelf_number = EXCLUDED.shelf_number,
+                 shelf_label = EXCLUDED.shelf_label,
                  updated_at = now()`,
-          [item.user_id, finalShelf],
+          [item.user_id, finalShelfNumber, finalShelfLabel],
         );
       }
 
@@ -3604,35 +3680,43 @@ router.post(
                    true
                  ),
                  '{is_oversize}',
-                 to_jsonb(($3::text = 'oversize')),
+                   to_jsonb(($3::text = 'oversize')),
+                   true
+                 ),
+                 '{shelf_number}',
+                 CASE
+                  WHEN $2::int IS NULL THEN 'null'::jsonb
+                  ELSE to_jsonb($2::int)
+                 END,
                  true
                ),
-               '{shelf_number}',
+               '{shelf_label}',
                CASE
-                 WHEN $2::int IS NULL THEN 'null'::jsonb
-                 ELSE to_jsonb($2::int)
+                 WHEN $4::text IS NULL THEN 'null'::jsonb
+                 ELSE to_jsonb($4::text)
                END,
                true
              ),
              '{processed_by_id}',
-             to_jsonb($4::text),
+             to_jsonb($5::text),
              true
            ),
            '{processed_by_name}',
-           to_jsonb($5::text),
+           to_jsonb($6::text),
            true
          )
          WHERE chat_id = $1
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
            AND (
-             COALESCE(meta->>'reservation_id', '') = $6
-             OR ($7 <> '' AND COALESCE(meta->>'cart_item_id', '') = $7)
+             COALESCE(meta->>'reservation_id', '') = $7
+             OR ($8 <> '' AND COALESCE(meta->>'cart_item_id', '') = $8)
            )
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
         [
           reservedChannel.id,
-          finalShelf,
+          finalShelfNumber,
           processingMode,
+          finalShelfLabel,
           String(req.user.id),
           processedByName,
           String(item.id),
@@ -3640,22 +3724,35 @@ router.post(
         ],
       );
       const syncedPendingClientMessages =
-        finalShelf == null
+        finalShelfLabel == null
           ? { rows: [] }
           : await client.query(
               `UPDATE messages
                SET meta = jsonb_set(
-                     COALESCE(meta, '{}'::jsonb),
-                     '{shelf_number}',
-                     to_jsonb($2::int),
+                     jsonb_set(
+                       COALESCE(meta, '{}'::jsonb),
+                       '{shelf_number}',
+                       CASE
+                         WHEN $2::int IS NULL THEN 'null'::jsonb
+                         ELSE to_jsonb($2::int)
+                       END,
+                       true
+                     ),
+                     '{shelf_label}',
+                     to_jsonb($3::text),
                      true
                    )
                WHERE chat_id = $1
                  AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
-                 AND COALESCE(meta->>'user_id', '') = $3
+                 AND COALESCE(meta->>'user_id', '') = $4
                  AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
                RETURNING id, chat_id, sender_id, text, meta, created_at`,
-              [reservedChannel.id, finalShelf, String(item.user_id)],
+              [
+                reservedChannel.id,
+                finalShelfNumber,
+                finalShelfLabel,
+                String(item.user_id),
+              ],
             );
 
       let hiddenCatalogMessages = [];
@@ -3747,7 +3844,8 @@ router.post(
           product_id: item.product_id ? String(item.product_id) : "",
           cart_item_id: targetCartItemId || null,
           status: "processed",
-          shelf_number: finalShelf,
+          shelf_number: finalShelfNumber,
+          shelf_label: finalShelfLabel,
           processing_mode: processingMode,
           processed_by_name: processedByName,
           reason: "item_processed",
@@ -3769,7 +3867,9 @@ router.post(
           reservation_id: item.id,
           cart_item_id: targetCartItemId || null,
           status: "processed",
-          shelf_number: finalShelf,
+          shelf_number: finalShelfNumber,
+          shelf_label: finalShelfLabel,
+          shelf_display: displayShelfValue(finalShelfLabel, finalShelfNumber),
           processing_mode: processingMode,
           processed_by_name: processedByName,
           product_hidden_after_sellout: hiddenCatalogMessages.length > 0,
