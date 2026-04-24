@@ -9,11 +9,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../src/utils/device_utils.dart';
+import 'notification_coordinator_service.dart';
 import 'notification_runtime_preference_service.dart';
-import 'notification_device_service.dart';
-import 'native_push_service.dart';
-import 'web_notification_service.dart';
-import 'web_push_client_service.dart';
 
 class User {
   final String id;
@@ -421,55 +418,24 @@ class AuthService {
     return value.isBefore(DateTime.now().toUtc().add(skew));
   }
 
-  Future<void> _maybeEnsureWebPushSubscription() async {
-    if (!kIsWeb) return;
-    try {
-      final enabled = await NotificationRuntimePreferenceService
-          .isEnabledForUser(_currentUser?.id);
-      if (!enabled) {
-        await WebPushClientService.unsubscribe(dio);
-        return;
-      }
-      final permission = await WebNotificationService.getPermissionState();
-      print(
-        '[web-push] auth hook permission=$permission user=${_currentUser?.email ?? ''}',
-      );
-      if (permission != WebNotificationPermissionState.granted) return;
-      await WebPushClientService.ensureSubscribed(dio);
-    } catch (e) {
-      print('[web-push] auth hook error: $e');
-      _authVerboseLog('⚠️ Web push sync skipped: $e');
-    }
-  }
-
   void _schedulePostAuthSync() {
     if (_postAuthSyncInProgress) return;
     _postAuthSyncInProgress = true;
     unawaited(() async {
       try {
-        final enabled = await NotificationRuntimePreferenceService
-            .isEnabledForUser(_currentUser?.id);
+        final enabled =
+            await NotificationRuntimePreferenceService.isEnabledForUser(
+              _currentUser?.id,
+            );
         if (!enabled) {
-          try {
-            await NotificationDeviceService.unregisterCurrentEndpoint(dio);
-          } catch (_) {}
-          try {
-            await NativePushService.unregisterCurrentEndpoint(dio);
-          } catch (_) {}
-          try {
-            if (kIsWeb) {
-              await WebPushClientService.unsubscribe(dio);
-            }
-          } catch (_) {}
+          await NotificationCoordinatorService.clear(dio);
           return;
         }
-        await _maybeEnsureWebPushSubscription();
-        try {
-          await NotificationDeviceService.syncCurrentEndpoint(dio);
-        } catch (_) {}
-        try {
-          await NativePushService.syncCurrentEndpoint(dio);
-        } catch (_) {}
+        await NotificationRuntimePreferenceService.refreshServerPolicy(
+          dio,
+          userId: _currentUser?.id,
+        );
+        await NotificationCoordinatorService.reconcile(dio, enabled: enabled);
       } finally {
         _postAuthSyncInProgress = false;
       }
@@ -773,17 +739,7 @@ class AuthService {
     }
     _isLoggingOut = true;
     try {
-      try {
-        await NotificationDeviceService.unregisterCurrentEndpoint(dio);
-      } catch (_) {}
-      try {
-        await NativePushService.unregisterCurrentEndpoint(dio);
-      } catch (_) {}
-      try {
-        if (kIsWeb) {
-          await WebPushClientService.unsubscribe(dio);
-        }
-      } catch (_) {}
+      await NotificationCoordinatorService.clear(dio);
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_viewRoleKey);
       await prefs.remove(_userSnapshotKey);
@@ -1586,23 +1542,27 @@ class AuthService {
         merged['tenant_code'] ?? merged['tenantCode'] ?? creatorTenantScopeCode,
       );
       if (scopedCode.isNotEmpty) {
-        user = _withCreatorTenantScope(
-          user,
-          tenantCode: scopedCode,
-          tenantName:
-              (merged['tenant_name'] ?? merged['tenantName'] ?? user.tenantName)
-                  ?.toString(),
-          tenantStatus:
-              (merged['tenant_status'] ??
-                      merged['tenantStatus'] ??
-                      user.tenantStatus)
-                  ?.toString(),
-          subscriptionExpiresAt:
-              (merged['subscription_expires_at'] ??
-                      merged['subscriptionExpiresAt'] ??
-                      user.subscriptionExpiresAt)
-                  ?.toString(),
-        ) ?? user;
+        user =
+            _withCreatorTenantScope(
+              user,
+              tenantCode: scopedCode,
+              tenantName:
+                  (merged['tenant_name'] ??
+                          merged['tenantName'] ??
+                          user.tenantName)
+                      ?.toString(),
+              tenantStatus:
+                  (merged['tenant_status'] ??
+                          merged['tenantStatus'] ??
+                          user.tenantStatus)
+                      ?.toString(),
+              subscriptionExpiresAt:
+                  (merged['subscription_expires_at'] ??
+                          merged['subscriptionExpiresAt'] ??
+                          user.subscriptionExpiresAt)
+                      ?.toString(),
+            ) ??
+            user;
       }
     }
     return user;

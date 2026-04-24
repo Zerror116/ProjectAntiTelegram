@@ -213,6 +213,62 @@ class MainActivity : FlutterActivity() {
             ).apply {
                 description = "Входы, сбросы пароля и другие security-события"
             },
+            NotificationChannel(
+                "phoenix_messages_silent",
+                "Личные сообщения (тихо)",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Личные сообщения и каналы без звука"
+                setSound(null, null)
+            },
+            NotificationChannel(
+                "phoenix_support_silent",
+                "Поддержка (тихо)",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Поддержка и служебные ответы без звука"
+                setSound(null, null)
+            },
+            NotificationChannel(
+                "phoenix_reserved_silent",
+                "Забронированный товар (тихо)",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Забронированные товары и складские действия без звука"
+                setSound(null, null)
+            },
+            NotificationChannel(
+                "phoenix_delivery_silent",
+                "Доставка (тихо)",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Доставка и логистика без звука"
+                setSound(null, null)
+            },
+            NotificationChannel(
+                "phoenix_promo_silent",
+                "Акции и промо (тихо)",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Акции и маркетинговые уведомления без звука"
+                setSound(null, null)
+            },
+            NotificationChannel(
+                "phoenix_updates_silent",
+                "Обновления (тихо)",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Обновления приложения без звука"
+                setSound(null, null)
+            },
+            NotificationChannel(
+                "phoenix_security_silent",
+                "Безопасность (тихо)",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Security-события без звука"
+                setSound(null, null)
+            },
         )
         manager.createNotificationChannels(channels)
     }

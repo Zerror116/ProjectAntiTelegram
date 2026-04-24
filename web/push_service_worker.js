@@ -243,6 +243,7 @@ self.addEventListener('push', (event) => {
   const url = payload.url || '/';
   const badgeCount = Number(payload.badgeCount || 0) || 0;
   const forceShow = payload.forceShow === true;
+  const silent = payload.silent === true;
   const tapPayload = buildNotificationTapPayload(payload);
 
   event.waitUntil((async () => {
@@ -265,7 +266,7 @@ self.addEventListener('push', (event) => {
       tag: payload.tag || 'projectphoenix-chat-message',
       icon: '/icons/Icon-192.png',
       badge: '/icons/Icon-maskable-192.png',
-      silent: false,
+      silent,
       renotify: true,
       requireInteraction: false,
       data: {

@@ -141,23 +141,23 @@ function normalizePriority(rawPriority) {
   }
 }
 
-function androidChannelIdFor(category) {
+function androidChannelIdForCategory(category, silent = false) {
   switch (normalizeCategory(category)) {
     case "chat":
-      return "phoenix_messages";
+      return silent ? "phoenix_messages_silent" : "phoenix_messages";
     case "support":
-      return "phoenix_support";
+      return silent ? "phoenix_support_silent" : "phoenix_support";
     case "reserved":
-      return "phoenix_reserved";
+      return silent ? "phoenix_reserved_silent" : "phoenix_reserved";
     case "delivery":
-      return "phoenix_delivery";
+      return silent ? "phoenix_delivery_silent" : "phoenix_delivery";
     case "promo":
-      return "phoenix_promo";
+      return silent ? "phoenix_promo_silent" : "phoenix_promo";
     case "updates":
-      return "phoenix_updates";
+      return silent ? "phoenix_updates_silent" : "phoenix_updates";
     case "security":
     default:
-      return "phoenix_security";
+      return silent ? "phoenix_security_silent" : "phoenix_security";
   }
 }
 
@@ -223,6 +223,9 @@ function buildFcmData(payload) {
   const normalizedPayload = payload?.payload && typeof payload.payload === "object"
     ? payload.payload
     : {};
+  const presentation = payload?.presentation && typeof payload.presentation === "object"
+    ? payload.presentation
+    : {};
   return normalizeStringMap({
     id: payload?.id || "",
     category: payload?.category || "",
@@ -238,6 +241,11 @@ function buildFcmData(payload) {
     version: payload?.version || "",
     required_update: payload?.required_update === true ? "true" : "false",
     thread_id: payload?.thread_id || "",
+    silent: payload?.silent === true ? "true" : "false",
+    show_when_active: presentation.show_when_active === true ? "true" : "false",
+    message_preview_enabled:
+      presentation.message_preview_enabled === false ? "false" : "true",
+    sound_enabled: presentation.sound_enabled === false ? "false" : "true",
     media: payload?.media || {},
     payload: normalizedPayload,
   });
@@ -246,6 +254,7 @@ function buildFcmData(payload) {
 function buildAndroidMessage(endpoint, payload) {
   const category = normalizeCategory(payload.category);
   const priority = normalizePriority(payload.priority);
+  const silent = payload?.silent === true;
   return {
     token: endpoint.push_token,
     data: buildFcmData(payload),
@@ -258,7 +267,7 @@ function buildAndroidMessage(endpoint, payload) {
       ttl: ttlString(payload.ttl_seconds),
       collapseKey: collapseKeyFromPayload(payload) || undefined,
       notification: {
-        channelId: androidChannelIdFor(category),
+        channelId: androidChannelIdForCategory(category, silent),
         tag: collapseKeyFromPayload(payload) || undefined,
         imageUrl: imageUrlFromPayload(payload),
       },
@@ -269,6 +278,7 @@ function buildAndroidMessage(endpoint, payload) {
 function buildAppleMessage(endpoint, payload) {
   const category = normalizeCategory(payload.category);
   const priority = normalizePriority(payload.priority);
+  const silent = payload?.silent === true;
   const badgeCount = Number.parseInt(
     String(payload.badge_count ?? "").trim(),
     10,
@@ -291,7 +301,7 @@ function buildAppleMessage(endpoint, payload) {
       },
       payload: {
         aps: {
-          sound: category === "promo" ? undefined : "default",
+          sound: silent || category === "promo" ? undefined : "default",
           badge: Number.isFinite(badgeCount) && badgeCount >= 0
             ? badgeCount
             : undefined,

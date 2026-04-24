@@ -70,6 +70,62 @@ const _androidSecurityChannel = AndroidNotificationChannel(
   importance: Importance.high,
 );
 
+const _androidMessageSilentChannel = AndroidNotificationChannel(
+  'phoenix_messages_silent',
+  'Личные сообщения (тихо)',
+  description: 'Личные сообщения без звука',
+  importance: Importance.high,
+  playSound: false,
+);
+
+const _androidSupportSilentChannel = AndroidNotificationChannel(
+  'phoenix_support_silent',
+  'Поддержка (тихо)',
+  description: 'Поддержка и служебные ответы без звука',
+  importance: Importance.high,
+  playSound: false,
+);
+
+const _androidReservedSilentChannel = AndroidNotificationChannel(
+  'phoenix_reserved_silent',
+  'Забронированный товар (тихо)',
+  description: 'Забронированные товары и складские действия без звука',
+  importance: Importance.defaultImportance,
+  playSound: false,
+);
+
+const _androidDeliverySilentChannel = AndroidNotificationChannel(
+  'phoenix_delivery_silent',
+  'Доставка (тихо)',
+  description: 'Доставка и логистика без звука',
+  importance: Importance.defaultImportance,
+  playSound: false,
+);
+
+const _androidPromoSilentChannel = AndroidNotificationChannel(
+  'phoenix_promo_silent',
+  'Акции и промо (тихо)',
+  description: 'Акции и маркетинговые уведомления без звука',
+  importance: Importance.defaultImportance,
+  playSound: false,
+);
+
+const _androidUpdatesSilentChannel = AndroidNotificationChannel(
+  'phoenix_updates_silent',
+  'Обновления (тихо)',
+  description: 'Обновления приложения без звука',
+  importance: Importance.defaultImportance,
+  playSound: false,
+);
+
+const _androidSecuritySilentChannel = AndroidNotificationChannel(
+  'phoenix_security_silent',
+  'Безопасность (тихо)',
+  description: 'Security-события без звука',
+  importance: Importance.high,
+  playSound: false,
+);
+
 @pragma('vm:entry-point')
 Future<void> nativePushBackgroundMessageHandler(RemoteMessage message) async {
   await NativePushService.ensureInitializedForBackground();
@@ -87,15 +143,23 @@ class NativePushService {
   static final FlutterLocalNotificationsPlugin _localNotifications =
       FlutterLocalNotificationsPlugin();
 
-  static const List<AndroidNotificationChannel> _androidChannels = <AndroidNotificationChannel>[
-    _androidMessageChannel,
-    _androidSupportChannel,
-    _androidReservedChannel,
-    _androidDeliveryChannel,
-    _androidPromoChannel,
-    _androidUpdatesChannel,
-    _androidSecurityChannel,
-  ];
+  static const List<AndroidNotificationChannel> _androidChannels =
+      <AndroidNotificationChannel>[
+        _androidMessageChannel,
+        _androidSupportChannel,
+        _androidReservedChannel,
+        _androidDeliveryChannel,
+        _androidPromoChannel,
+        _androidUpdatesChannel,
+        _androidSecurityChannel,
+        _androidMessageSilentChannel,
+        _androidSupportSilentChannel,
+        _androidReservedSilentChannel,
+        _androidDeliverySilentChannel,
+        _androidPromoSilentChannel,
+        _androidUpdatesSilentChannel,
+        _androidSecuritySilentChannel,
+      ];
 
   static bool _firebaseReady = false;
   static bool _localNotificationsReady = false;
@@ -108,6 +172,7 @@ class NativePushService {
   static StreamSubscription<RemoteMessage>? _foregroundSub;
   static StreamSubscription<RemoteMessage>? _openedSub;
   static String? _cachedFcmToken;
+  static bool _endpointSyncEnabled = true;
 
   static bool get isSupported {
     if (kIsWeb) return false;
@@ -117,6 +182,10 @@ class NativePushService {
   }
 
   static bool get isConfigured => FirebaseRuntimeOptions.isConfigured;
+
+  static void setEndpointSyncEnabled(bool enabled) {
+    _endpointSyncEnabled = enabled;
+  }
 
   static Future<void> initialize({
     required Dio dio,
@@ -139,7 +208,7 @@ class NativePushService {
       ) {
         _cachedFcmToken = token.trim().isEmpty ? null : token.trim();
         final localDio = _dio;
-        if (localDio != null) {
+        if (_endpointSyncEnabled && localDio != null) {
           unawaited(syncCurrentEndpoint(localDio));
         }
       });
@@ -164,8 +233,8 @@ class NativePushService {
       }
     }
 
-    final launchDetails =
-        await _localNotifications.getNotificationAppLaunchDetails();
+    final launchDetails = await _localNotifications
+        .getNotificationAppLaunchDetails();
     final launchPayload = launchDetails?.notificationResponse?.payload;
     if (launchDetails?.didNotificationLaunchApp == true &&
         launchPayload != null &&
@@ -174,7 +243,9 @@ class NativePushService {
     }
 
     // Не блокируем запуск приложения сетевой синхронизацией push endpoint.
-    unawaited(syncCurrentEndpoint(dio));
+    if (_endpointSyncEnabled) {
+      unawaited(syncCurrentEndpoint(dio));
+    }
   }
 
   static Future<void> ensureInitializedForBackground() async {
@@ -189,11 +260,14 @@ class NativePushService {
     if (defaultTargetPlatform == TargetPlatform.android) {
       final alreadyAllowed = await NativeUpdateInstaller.canPostNotifications();
       if (alreadyAllowed) return true;
-      final granted = await NativeUpdateInstaller.requestNotificationPermission();
+      final granted =
+          await NativeUpdateInstaller.requestNotificationPermission();
       if (granted) {
         final localDio = _dio;
         if (localDio != null) {
-          await syncCurrentEndpoint(localDio);
+          if (_endpointSyncEnabled) {
+            await syncCurrentEndpoint(localDio);
+          }
         }
       }
       return granted;
@@ -209,7 +283,8 @@ class NativePushService {
     }
     if (!context.mounted) return false;
 
-    final accepted = await showDialog<bool>(
+    final accepted =
+        await showDialog<bool>(
           context: context,
           builder: (dialogContext) {
             return AlertDialog(
@@ -241,7 +316,7 @@ class NativePushService {
       provisional: true,
       criticalAlert: false,
       carPlay: false,
-      providesAppNotificationSettings: false,
+      providesAppNotificationSettings: true,
     );
     final granted =
         settings.authorizationStatus == AuthorizationStatus.authorized ||
@@ -249,7 +324,9 @@ class NativePushService {
     if (granted) {
       final localDio = _dio;
       if (localDio != null) {
-        await syncCurrentEndpoint(localDio);
+        if (_endpointSyncEnabled) {
+          await syncCurrentEndpoint(localDio);
+        }
       }
     }
     return granted;
@@ -257,6 +334,7 @@ class NativePushService {
 
   static Future<void> syncCurrentEndpoint(Dio dio) async {
     if (!isSupported) return;
+    if (!_endpointSyncEnabled) return;
     await _ensureFirebaseInitialized();
     if (!_firebaseReady) return;
 
@@ -337,6 +415,11 @@ class NativePushService {
   ) async {
     final payload = _normalizeRemoteMessage(message);
     if (payload == null) return;
+    final showWhenActive =
+        payload['show_when_active'] == true ||
+        payload['presentation']?['show_when_active'] == true;
+    final appIsActive =
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
 
     final category = _normalizeCategory(payload['category']);
     if (defaultTargetPlatform == TargetPlatform.android &&
@@ -344,7 +427,8 @@ class NativePushService {
             category == 'support' ||
             category == 'security' ||
             category == 'reserved' ||
-            category == 'delivery')) {
+            category == 'delivery') &&
+        (!appIsActive || showWhenActive)) {
       await _ensureLocalNotificationsInitialized();
       if (_localNotificationsReady) {
         final details = NotificationDetails(
@@ -392,11 +476,12 @@ class NativePushService {
       await FirebaseMessaging.instance.setAutoInitEnabled(true);
       if (defaultTargetPlatform == TargetPlatform.iOS ||
           defaultTargetPlatform == TargetPlatform.macOS) {
-        await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
-          alert: false,
-          badge: true,
-          sound: true,
-        );
+        await FirebaseMessaging.instance
+            .setForegroundNotificationPresentationOptions(
+              alert: false,
+              badge: true,
+              sound: true,
+            );
       }
       _firebaseReady = true;
     } catch (e) {
@@ -407,7 +492,9 @@ class NativePushService {
 
   static Future<void> _ensureLocalNotificationsInitialized() async {
     if (_localNotificationsReady || !isSupported) return;
-    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
     const darwinSettings = DarwinInitializationSettings(
       requestAlertPermission: false,
       requestBadgePermission: false,
@@ -495,7 +582,8 @@ class NativePushService {
   static Map<String, dynamic>? _normalizeRemoteMessage(RemoteMessage message) {
     final data = Map<String, dynamic>.from(message.data);
     final notification = message.notification;
-    final media = _decodeNestedMap(data['media']) ??
+    final media =
+        _decodeNestedMap(data['media']) ??
         <String, dynamic>{
           if ((notification?.android?.imageUrl ?? '').trim().isNotEmpty)
             'image_url': notification!.android!.imageUrl,
@@ -503,9 +591,12 @@ class NativePushService {
             'image_url': notification!.apple!.imageUrl,
         };
     final payload = _decodeNestedMap(data['payload']) ?? <String, dynamic>{};
-    final category = _normalizeCategory(data['category'] ?? payload['category']);
+    final category = _normalizeCategory(
+      data['category'] ?? payload['category'],
+    );
     final inboxItemId =
-        (data['inbox_item_id'] ?? payload['inbox_item_id'] ?? '').toString()
+        (data['inbox_item_id'] ?? payload['inbox_item_id'] ?? '')
+            .toString()
             .trim();
     return <String, dynamic>{
       'id': (data['id'] ?? data['message_id'] ?? message.messageId ?? '')
@@ -518,17 +609,19 @@ class NativePushService {
           .toLowerCase(),
       'title': (data['title'] ?? notification?.title ?? '').toString().trim(),
       'body': (data['body'] ?? notification?.body ?? '').toString().trim(),
-      'deep_link': (data['deep_link'] ?? payload['deep_link'] ?? data['url'] ?? '/')
-          .toString()
-          .trim(),
+      'deep_link':
+          (data['deep_link'] ?? payload['deep_link'] ?? data['url'] ?? '/')
+              .toString()
+              .trim(),
       'media': media,
       'payload': payload,
       'force_show':
           (data['force_show'] ?? payload['force_show'] ?? 'false')
-                  .toString()
-                  .toLowerCase() ==
-              'true',
-      'badge_count': int.tryParse(
+              .toString()
+              .toLowerCase() ==
+          'true',
+      'badge_count':
+          int.tryParse(
             (data['badge_count'] ?? payload['badge_count'] ?? '').toString(),
           ) ??
           0,
@@ -544,15 +637,45 @@ class NativePushService {
           .trim(),
       'required_update':
           (data['required_update'] ?? payload['required_update'] ?? 'false')
-                  .toString()
-                  .toLowerCase() ==
-              'true',
-      'thread_id': (data['thread_id'] ??
-              payload['thread_id'] ??
-              payload['chat_id'] ??
-              '')
-          .toString()
-          .trim(),
+              .toString()
+              .toLowerCase() ==
+          'true',
+      'show_when_active':
+          (data['show_when_active'] ?? payload['show_when_active'] ?? 'false')
+              .toString()
+              .toLowerCase() ==
+          'true',
+      'silent':
+          (data['silent'] ?? payload['silent'] ?? 'false')
+              .toString()
+              .toLowerCase() ==
+          'true',
+      'presentation': <String, dynamic>{
+        'show_when_active':
+            (data['show_when_active'] ?? payload['show_when_active'] ?? 'false')
+                .toString()
+                .toLowerCase() ==
+            'true',
+        'message_preview_enabled':
+            (data['message_preview_enabled'] ??
+                    payload['message_preview_enabled'] ??
+                    'true')
+                .toString()
+                .toLowerCase() !=
+            'false',
+        'sound_enabled':
+            (data['sound_enabled'] ?? payload['sound_enabled'] ?? 'true')
+                .toString()
+                .toLowerCase() !=
+            'false',
+      },
+      'thread_id':
+          (data['thread_id'] ??
+                  payload['thread_id'] ??
+                  payload['chat_id'] ??
+                  '')
+              .toString()
+              .trim(),
       if (inboxItemId.isNotEmpty) 'message_id': inboxItemId,
     };
   }
@@ -585,6 +708,7 @@ class NativePushService {
     Map<String, dynamic> payload,
   ) {
     final category = _normalizeCategory(payload['category']);
+    final silent = payload['silent'] == true;
     final threadId =
         (payload['thread_id'] ?? payload['payload']?['chat_id'] ?? '')
             .toString()
@@ -614,9 +738,12 @@ class NativePushService {
         : BigTextStyleInformation(body.isEmpty ? title : body);
 
     return AndroidNotificationDetails(
-      _androidChannelForCategory(category).id,
-      _androidChannelForCategory(category).name,
-      channelDescription: _androidChannelForCategory(category).description,
+      _androidChannelForCategory(category, silent: silent).id,
+      _androidChannelForCategory(category, silent: silent).name,
+      channelDescription: _androidChannelForCategory(
+        category,
+        silent: silent,
+      ).description,
       importance: _importanceForCategory(category),
       priority: _priorityForCategory(category),
       styleInformation: style,
@@ -625,6 +752,7 @@ class NativePushService {
       channelShowBadge: category != 'promo' && category != 'updates',
       icon: '@mipmap/ic_launcher',
       colorized: category == 'security',
+      playSound: !silent,
     );
   }
 
@@ -632,6 +760,7 @@ class NativePushService {
     Map<String, dynamic> payload,
   ) {
     final category = _normalizeCategory(payload['category']);
+    final silent = payload['silent'] == true;
     final badge = int.tryParse(
       (payload['badge_count'] ?? '').toString().trim(),
     );
@@ -639,13 +768,16 @@ class NativePushService {
       presentBanner: false,
       presentList: false,
       presentAlert: false,
-      presentSound: category != 'promo',
+      presentSound: !silent && category != 'promo',
       presentBadge: true,
       badgeNumber: badge != null && badge >= 0 ? badge : null,
       threadIdentifier: (payload['thread_id'] ?? '').toString().trim().isEmpty
           ? null
           : (payload['thread_id'] ?? '').toString().trim(),
-      interruptionLevel: _darwinInterruptionLevel(category, payload['priority']),
+      interruptionLevel: _darwinInterruptionLevel(
+        category,
+        payload['priority'],
+      ),
     );
   }
 
@@ -675,23 +807,26 @@ class NativePushService {
     }
   }
 
-  static AndroidNotificationChannel _androidChannelForCategory(String category) {
+  static AndroidNotificationChannel _androidChannelForCategory(
+    String category, {
+    bool silent = false,
+  }) {
     switch (category) {
       case 'chat':
-        return _androidMessageChannel;
+        return silent ? _androidMessageSilentChannel : _androidMessageChannel;
       case 'support':
-        return _androidSupportChannel;
+        return silent ? _androidSupportSilentChannel : _androidSupportChannel;
       case 'reserved':
-        return _androidReservedChannel;
+        return silent ? _androidReservedSilentChannel : _androidReservedChannel;
       case 'delivery':
-        return _androidDeliveryChannel;
+        return silent ? _androidDeliverySilentChannel : _androidDeliveryChannel;
       case 'promo':
-        return _androidPromoChannel;
+        return silent ? _androidPromoSilentChannel : _androidPromoChannel;
       case 'updates':
-        return _androidUpdatesChannel;
+        return silent ? _androidUpdatesSilentChannel : _androidUpdatesChannel;
       case 'security':
       default:
-        return _androidSecurityChannel;
+        return silent ? _androidSecuritySilentChannel : _androidSecurityChannel;
     }
   }
 
@@ -747,9 +882,13 @@ class NativePushService {
   }
 
   static int _stableNotificationId(Map<String, dynamic> payload) {
-    final raw = (payload['inbox_item_id'] ?? payload['id'] ?? payload['deep_link'] ?? '')
-        .toString()
-        .trim();
+    final raw =
+        (payload['inbox_item_id'] ??
+                payload['id'] ??
+                payload['deep_link'] ??
+                '')
+            .toString()
+            .trim();
     if (raw.isEmpty) {
       return DateTime.now().millisecondsSinceEpoch.remainder(1 << 31);
     }

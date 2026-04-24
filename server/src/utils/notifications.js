@@ -290,6 +290,9 @@ function buildDefaultPreferences(user) {
     channels: defaultChannelPreferences(),
     promo_opt_in: false,
     updates_opt_in: true,
+    message_preview_enabled: true,
+    show_when_active: false,
+    sound_enabled: true,
     quiet_hours_enabled: false,
     quiet_from: "",
     quiet_to: "",
@@ -364,6 +367,9 @@ function normalizePreferencesForRole(user, rawPreferences) {
     };
     normalized.promo_opt_in = masterEnabled && normalized.categories.promo === true;
     normalized.updates_opt_in = masterEnabled;
+    normalized.message_preview_enabled = normalized.message_preview_enabled !== false;
+    normalized.show_when_active = normalized.show_when_active === true;
+    normalized.sound_enabled = normalized.sound_enabled !== false;
     return normalized;
   }
 
@@ -371,6 +377,9 @@ function normalizePreferencesForRole(user, rawPreferences) {
   if (!isCreatorRole(role)) {
     normalized.updates_opt_in = true;
   }
+  normalized.message_preview_enabled = normalized.message_preview_enabled !== false;
+  normalized.show_when_active = normalized.show_when_active === true;
+  normalized.sound_enabled = normalized.sound_enabled !== false;
 
   const locked = lockedCategoriesForRole(role);
   for (const key of locked) {
@@ -399,7 +408,26 @@ function sanitizePreferencesPatchForRole(user, patch = {}, current) {
     if (patch.promo_opt_in !== undefined) {
       next.promo_opt_in = patch.promo_opt_in === true;
     }
+    if (patch.message_preview_enabled !== undefined) {
+      next.message_preview_enabled = patch.message_preview_enabled === true;
+    }
+    if (patch.show_when_active !== undefined) {
+      next.show_when_active = patch.show_when_active === true;
+    }
+    if (patch.sound_enabled !== undefined) {
+      next.sound_enabled = patch.sound_enabled === true;
+    }
     return next;
+  }
+
+  if (patch.message_preview_enabled !== undefined) {
+    next.message_preview_enabled = patch.message_preview_enabled === true;
+  }
+  if (patch.show_when_active !== undefined) {
+    next.show_when_active = patch.show_when_active === true;
+  }
+  if (patch.sound_enabled !== undefined) {
+    next.sound_enabled = patch.sound_enabled === true;
   }
 
   if (isCreatorRole(role)) {
@@ -490,6 +518,9 @@ function mergePreferences(defaults, row) {
     channels,
     promo_opt_in: row?.promo_opt_in === true,
     updates_opt_in: row?.updates_opt_in !== false,
+    message_preview_enabled: row?.message_preview_enabled !== false,
+    show_when_active: row?.show_when_active === true,
+    sound_enabled: row?.sound_enabled !== false,
     quiet_hours_enabled: row?.quiet_hours_enabled === true,
     quiet_from: normalizeClock(row?.quiet_from),
     quiet_to: normalizeClock(row?.quiet_to),
@@ -514,6 +545,9 @@ async function getRawNotificationProfile(userId) {
             channels,
             promo_opt_in,
             updates_opt_in,
+            message_preview_enabled,
+            show_when_active,
+            sound_enabled,
             digest_mode,
             frequency_caps,
             badge_preferences,
@@ -598,12 +632,24 @@ async function upsertNotificationPreferences({ user, patch = {} }) {
   const updatesOptIn = safePatch.updates_opt_in === undefined
     ? current.updates_opt_in
     : safePatch.updates_opt_in !== false;
+  const messagePreviewEnabled = safePatch.message_preview_enabled === undefined
+    ? current.message_preview_enabled
+    : safePatch.message_preview_enabled === true;
+  const showWhenActive = safePatch.show_when_active === undefined
+    ? current.show_when_active
+    : safePatch.show_when_active === true;
+  const soundEnabled = safePatch.sound_enabled === undefined
+    ? current.sound_enabled
+    : safePatch.sound_enabled === true;
 
   const normalizedResult = normalizePreferencesForRole(user, {
     categories,
     channels,
     promo_opt_in: promoOptIn,
     updates_opt_in: updatesOptIn,
+    message_preview_enabled: messagePreviewEnabled,
+    show_when_active: showWhenActive,
+    sound_enabled: soundEnabled,
     quiet_hours_enabled: quietHoursEnabled,
     quiet_from: quietFrom,
     quiet_to: quietTo,
@@ -626,6 +672,9 @@ async function upsertNotificationPreferences({ user, patch = {} }) {
        channels,
        promo_opt_in,
        updates_opt_in,
+       message_preview_enabled,
+       show_when_active,
+       sound_enabled,
        digest_mode,
        frequency_caps,
        badge_preferences,
@@ -645,8 +694,11 @@ async function upsertNotificationPreferences({ user, patch = {} }) {
        $11,
        $12,
        $13,
-       $14::jsonb,
-       $15::jsonb,
+       $14,
+       $15,
+       $16,
+       $17::jsonb,
+       $18::jsonb,
        now()
      )
      ON CONFLICT (user_id) DO UPDATE
@@ -658,6 +710,9 @@ async function upsertNotificationPreferences({ user, patch = {} }) {
          channels = EXCLUDED.channels,
          promo_opt_in = EXCLUDED.promo_opt_in,
          updates_opt_in = EXCLUDED.updates_opt_in,
+         message_preview_enabled = EXCLUDED.message_preview_enabled,
+         show_when_active = EXCLUDED.show_when_active,
+         sound_enabled = EXCLUDED.sound_enabled,
          digest_mode = EXCLUDED.digest_mode,
          frequency_caps = EXCLUDED.frequency_caps,
          badge_preferences = EXCLUDED.badge_preferences,
@@ -676,6 +731,9 @@ async function upsertNotificationPreferences({ user, patch = {} }) {
       JSON.stringify(normalizedResult.channels),
       normalizedResult.promo_opt_in,
       normalizedResult.updates_opt_in,
+      normalizedResult.message_preview_enabled,
+      normalizedResult.show_when_active,
+      normalizedResult.sound_enabled,
       normalizedResult.digest_mode,
       JSON.stringify(normalizedResult.frequency_caps),
       JSON.stringify(normalizedResult.badge_preferences),
@@ -958,10 +1016,74 @@ async function computeNotificationInboxBadgeCount(
   return inboxCount;
 }
 
-function buildSocketPayload(item, badgeCount, inboxUnreadCount = 0) {
+function categoryAllowsMessagePreview(category) {
+  switch (normalizeCategory(category, "support")) {
+    case "chat":
+    case "support":
+    case "reserved":
+    case "delivery":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function applyNotificationPresentation(payload, preferences) {
+  const normalizedPayload = {
+    ...payload,
+    media: normalizeJsonMap(payload.media),
+    payload: normalizeJsonMap(payload.payload),
+  };
+  const category = normalizeCategory(normalizedPayload.category, "support");
+  const previewEnabled = preferences?.message_preview_enabled !== false;
+  const showWhenActive = preferences?.show_when_active === true;
+  const soundEnabled = preferences?.sound_enabled !== false;
+
+  if (!previewEnabled && categoryAllowsMessagePreview(category)) {
+    switch (category) {
+      case "chat":
+        normalizedPayload.title = "Новое сообщение";
+        normalizedPayload.body =
+          "Откройте Феникс, чтобы прочитать новое сообщение.";
+        break;
+      case "support":
+        normalizedPayload.title = "Поддержка";
+        normalizedPayload.body =
+          "Появился новый ответ поддержки в Феникс.";
+        break;
+      case "reserved":
+        normalizedPayload.title = "Забронированный товар";
+        normalizedPayload.body =
+          "Есть обновление по забронированному товару.";
+        break;
+      case "delivery":
+        normalizedPayload.title = "Доставка";
+        normalizedPayload.body = "Есть обновление по доставке.";
+        break;
+      default:
+        break;
+    }
+  }
+
+  normalizedPayload.presentation = {
+    message_preview_enabled: previewEnabled,
+    show_when_active: showWhenActive,
+    sound_enabled: soundEnabled,
+  };
+  normalizedPayload.show_when_active = showWhenActive;
+  normalizedPayload.silent = !soundEnabled;
+  return normalizedPayload;
+}
+
+function buildSocketPayload(
+  item,
+  badgeCount,
+  inboxUnreadCount = 0,
+  preferences = null,
+) {
   const media = normalizeJsonMap(item.media);
   const payload = normalizeJsonMap(item.payload);
-  return {
+  return applyNotificationPresentation({
     id: String(item.id || ""),
     category: normalizeCategory(item.category, "support"),
     priority: normalizePriority(item.priority, "normal"),
@@ -982,7 +1104,7 @@ function buildSocketPayload(item, badgeCount, inboxUnreadCount = 0) {
     thread_id: String(payload.thread_id || payload.chat_id || "").trim() || null,
     ttl_seconds: Number(item.ttl_seconds || 0) || 3600,
     collapse_key: String(item.collapse_key || "").trim() || null,
-  };
+  }, preferences);
 }
 
 function evaluatePushEligibility(item, preferences) {
@@ -1082,7 +1204,7 @@ async function maybeSendWebPushForItem(user, item, preferences) {
     user,
     preferences,
   });
-  const payload = buildSocketPayload(item, badgeCount, inboxUnreadCount);
+  const payload = buildSocketPayload(item, badgeCount, inboxUnreadCount, preferences);
   payload.type = category;
   payload.url = payload.deep_link || "/";
   // Web/PWA app badges should mirror the inbox/events counter, not chat unread totals.
@@ -1138,7 +1260,7 @@ async function maybeSendNativePushForItem(user, item, preferences) {
   }
 
   const badgeCount = await computeNotificationBadgeCount(user.id);
-  const payload = buildSocketPayload(item, badgeCount);
+  const payload = buildSocketPayload(item, badgeCount, 0, preferences);
   const { sendFcmPayloadToEndpoints } = require("./nativePush");
   return sendFcmPayloadToEndpoints({
     endpoints,
@@ -1459,7 +1581,7 @@ async function createNotificationInboxItem({
         io,
         user.id,
         "notification:new",
-        buildSocketPayload(row, badgeCount, inboxUnreadCount),
+        buildSocketPayload(row, badgeCount, inboxUnreadCount, preferences),
       );
       emitToUser(io, user.id, "notification:badge", {
         unread_count: badgeCount,

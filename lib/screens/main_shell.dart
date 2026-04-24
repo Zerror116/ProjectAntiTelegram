@@ -288,6 +288,10 @@ class _MainShellState extends State<MainShell> {
   Future<void> _syncNotificationRuntime() async {
     if (authService.currentUser == null) return;
     if (authService.isSessionDegraded) return;
+    await NotificationRuntimePreferenceService.refreshServerPolicy(
+      dio,
+      userId: authService.currentUser?.id,
+    );
     final enabled = await NotificationRuntimePreferenceService.isEnabledForUser(
       authService.currentUser?.id,
     );
