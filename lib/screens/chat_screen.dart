@@ -7790,6 +7790,7 @@ class _ChatScreenState extends State<ChatScreen> {
       productCode: _reservedProductCodeOf(message) ?? '',
       clientPhone: (meta['client_phone'] ?? '').toString(),
       shelfLabel: _reservedShelfDisplayOfMeta(meta),
+      price: (meta['price'] ?? '').toString(),
     );
   }
 
@@ -11788,8 +11789,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   controller: _searchController,
                   autofocus: true,
                   decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      hintText: 'Поиск по чату',
+                    InputDecoration(
+                      hintText: _isReservedOrdersChat()
+                          ? 'ID, клиент, цена'
+                          : 'Поиск по чату',
                       border: InputBorder.none,
                     ),
                     controller: _searchController,

@@ -3890,6 +3890,9 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
 
     const isReserved = isReservedOrdersChannel(context.chat, context.settings);
     const digitsOnly = /^[0-9]+$/.test(query);
+    const numericQuery = /^-?\d+(?:[.,]\d+)?$/.test(query)
+      ? Number(query.replace(",", "."))
+      : null;
     let messages = [];
 
     if (isReserved && digitsOnly) {
@@ -3915,10 +3918,20 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
          WHERE m.chat_id = $1
            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $3::text)
            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-           AND COALESCE(m.meta->>'product_code', '') = $2
+           AND (
+             COALESCE(m.meta->>'product_code', '') = $2
+             OR (
+               $4::numeric IS NOT NULL
+               AND CASE
+                     WHEN COALESCE(m.meta->>'price', '') ~ '^-?\\d+(?:[\\.,]\\d+)?$'
+                       THEN replace(m.meta->>'price', ',', '.')::numeric
+                     ELSE NULL
+                   END = $4::numeric
+             )
+           )
          ORDER BY m.created_at DESC, m.id DESC
-         LIMIT $4`,
-        [chatId, query, String(userId), safeLimit],
+         LIMIT $5`,
+        [chatId, query, String(userId), numericQuery, safeLimit],
       );
       messages = rowsQ.rows.map((row) =>
         decorateMessageMediaUrls(req, decryptMessageRow(row)),
@@ -3950,6 +3963,11 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
            AND (
              LOWER(COALESCE(m.meta->>'title', '')) LIKE $2 ESCAPE '\\'
              OR LOWER(COALESCE(m.meta->>'description', '')) LIKE $2 ESCAPE '\\'
+             OR LOWER(COALESCE(m.meta->>'client_name', '')) LIKE $2 ESCAPE '\\'
+             OR LOWER(COALESCE(m.meta->>'client_phone', '')) LIKE $2 ESCAPE '\\'
+             OR LOWER(COALESCE(m.meta->>'shelf_label', '')) LIKE $2 ESCAPE '\\'
+             OR LOWER(COALESCE(m.meta->>'product_code', '')) LIKE $2 ESCAPE '\\'
+             OR LOWER(COALESCE(m.meta->>'price', '')) LIKE $2 ESCAPE '\\'
            )
          ORDER BY m.created_at DESC, m.id DESC
          LIMIT $4`,
