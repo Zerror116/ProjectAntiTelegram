@@ -1020,6 +1020,7 @@ Future<void> setNotificationsEnabled(bool value) async {
   await NotificationRuntimePreferenceService.applyRuntimePreference(
     authService.dio,
     enabled: value,
+    userId: authService.currentUser?.id,
   );
 }
 
@@ -4953,6 +4954,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Timer? _appUpdateProbeTimer;
   bool _appUpdateProbeBusy = false;
   bool _bootstrapReadySent = false;
+  bool _postBootstrapWorkStarted = false;
 
   void _markBootstrapReadyAfterFrame() {
     if (_bootstrapReadySent) return;
@@ -4978,6 +4980,22 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       final navigator = navigatorKey.currentState;
       if (navigator == null || !navigator.mounted) return;
       navigator.pushNamedAndRemoveUntil('/auth', (route) => false);
+    });
+  }
+
+  void _startDeferredPostBootstrapWork() {
+    if (_postBootstrapWorkStarted) return;
+    _postBootstrapWorkStarted = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _restartSubscriptionProbe();
+      _restartPhoneAccessProbe();
+      _restartOfflinePurchaseProbe();
+      _restartAppUpdateProbe();
+      unawaited(refreshUserPreferences());
+      unawaited(_prepareAppSoundPlayer());
+      if (authService.currentUser != null) {
+        unawaited(NativePushService.consumePendingTapPayload());
+      }
     });
   }
 
@@ -5471,13 +5489,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           unawaited(NativePushService.consumePendingTapPayload());
         }
       });
-      _restartSubscriptionProbe();
-      _restartPhoneAccessProbe();
-      _restartOfflinePurchaseProbe();
-      _restartAppUpdateProbe();
-
-      await refreshUserPreferences();
-      unawaited(_prepareAppSoundPlayer());
     } catch (e, st) {
       debugPrint('Error attaching interceptor: $e\n$st');
       StartupBootstrapBridge.setStatus(
@@ -5516,11 +5527,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     setState(() {
       _home = initial;
     });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (authService.currentUser != null) {
-        unawaited(NativePushService.consumePendingTapPayload());
-      }
-    });
+    _startDeferredPostBootstrapWork();
   }
 
   @override

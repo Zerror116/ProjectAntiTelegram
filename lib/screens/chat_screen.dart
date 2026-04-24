@@ -1724,6 +1724,22 @@ class _ChatScreenState extends State<ChatScreen> {
     return null;
   }
 
+  double _timelineCacheExtentMultiplier() {
+    if (kIsWeb) {
+      return performanceModeNotifier.value ? 0.28 : 0.42;
+    }
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+        return performanceModeNotifier.value ? 0.95 : 1.45;
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+      case TargetPlatform.linux:
+      case TargetPlatform.fuchsia:
+        return performanceModeNotifier.value ? 0.7 : 1.1;
+    }
+  }
+
   void _refreshStickyDateLabel({required bool show}) {
     final nextLabel = show ? _stickyDateLabelForViewport() : null;
     if (_stickyDateLabel == nextLabel) return;
@@ -11982,7 +11998,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                             .onDrag,
                                     cacheExtent:
                                         media.size.height *
-                                        (kIsWeb ? 0.7 : 2.2),
+                                        _timelineCacheExtentMultiplier(),
                                     itemCount: timeline.length,
                                     itemBuilder: (context, i) {
                                       return _buildTimelineRowSafely(

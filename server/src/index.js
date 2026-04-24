@@ -11,6 +11,13 @@ dotenv.config({ path: path.join(serverRoot, ".env") });
 const bootNodeEnv = String(process.env.NODE_ENV || "development")
   .toLowerCase()
   .trim();
+const embeddedNotificationDigestEnabled =
+  String(
+    process.env.ENABLE_NOTIFICATION_DIGEST_IN_API ||
+      (bootNodeEnv === "production" ? "false" : "true"),
+  )
+    .toLowerCase()
+    .trim() === "true";
 if (bootNodeEnv !== "production") {
   const localEnvPath = path.join(serverRoot, ".env.local");
   if (fs.existsSync(localEnvPath)) {
@@ -1203,14 +1210,16 @@ async function canEmitChatActivity(user, chatId) {
       void runMessageEncryptionBackfill({ logger: console }).catch((err) => {
         console.error("message encryption backfill startup error:", err);
       });
-      setInterval(() => {
+      if (embeddedNotificationDigestEnabled) {
+        setInterval(() => {
+          void runNotificationDigestSweep().catch((err) => {
+            console.error("notification digest sweep error:", err);
+          });
+        }, 5 * 60 * 1000);
         void runNotificationDigestSweep().catch((err) => {
-          console.error("notification digest sweep error:", err);
+          console.error("notification digest startup sweep error:", err);
         });
-      }, 5 * 60 * 1000);
-      void runNotificationDigestSweep().catch((err) => {
-        console.error("notification digest startup sweep error:", err);
-      });
+      }
       console.log("\n");
     });
   } catch (err) {

@@ -3866,4 +3866,67 @@ router.post('/demo-mode/seed', requireAuth, requireRole('creator'), async (req, 
   }
 });
 
+router.get(
+  '/notifications/queue-health',
+  requireAuth,
+  requireRole('creator', 'admin'),
+  async (req, res) => {
+    try {
+      const [deliveryStatesQ, endpointStatesQ, pendingQ, failureQ] = await Promise.all([
+        db.query(
+          `SELECT state, COUNT(*)::int AS total
+             FROM notification_deliveries
+            WHERE channel = 'push'
+            GROUP BY state`,
+        ),
+        db.query(
+          `SELECT COALESCE(last_delivery_state, 'unknown') AS state,
+                  COUNT(*)::int AS total
+             FROM notification_endpoints
+            WHERE is_active = true
+            GROUP BY COALESCE(last_delivery_state, 'unknown')`,
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS total
+             FROM notification_deliveries
+            WHERE channel = 'push'
+              AND queue_name = 'push'
+              AND state IN ('queued', 'failed')
+              AND COALESCE(next_attempt_at, now()) <= now()`,
+        ),
+        db.query(
+          `SELECT COUNT(*)::int AS failing_endpoints
+             FROM notification_endpoints
+            WHERE is_active = true
+              AND COALESCE(consecutive_failures, 0) > 0`,
+        ),
+      ]);
+
+      return res.json({
+        ok: true,
+        data: {
+          pending_ready: Number(pendingQ.rows?.[0]?.total || 0) || 0,
+          failing_endpoints:
+            Number(failureQ.rows?.[0]?.failing_endpoints || 0) || 0,
+          deliveries_by_state: Object.fromEntries(
+            (deliveryStatesQ.rows || []).map((row) => [
+              String(row.state || 'unknown'),
+              Number(row.total || 0) || 0,
+            ]),
+          ),
+          endpoints_by_last_state: Object.fromEntries(
+            (endpointStatesQ.rows || []).map((row) => [
+              String(row.state || 'unknown'),
+              Number(row.total || 0) || 0,
+            ]),
+          ),
+        },
+      });
+    } catch (err) {
+      console.error('ops.notifications.queueHealth error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
+
 module.exports = router;

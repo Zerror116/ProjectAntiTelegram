@@ -1,0 +1,10 @@
+[Unit]
+Description=Fenix nightly backup
+After=network.target postgresql.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/fenix/server
+ExecStart=/opt/fenix/server/scripts/nightly_backup.sh

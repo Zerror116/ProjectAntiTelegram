@@ -4,6 +4,10 @@ const { computeNotificationInboxBadgeCount } = require("./notifications");
 let vapidConfigured = false;
 let cachedWebPushModule = undefined;
 
+function cleanString(value) {
+  return String(value || "").trim();
+}
+
 function getWebPushModule() {
   if (cachedWebPushModule !== undefined) {
     return cachedWebPushModule;
@@ -276,6 +280,69 @@ async function sendPayloadToUserSubscriptions(userId, payload) {
   return sent;
 }
 
+async function sendWebPushPayloadToEndpoint({ endpoint, payload }) {
+  if (!ensureWebPushConfigured()) {
+    return {
+      endpointId: endpoint?.id || null,
+      state: "failed",
+      providerMessageId: null,
+      errorMessage: "webpush_not_configured",
+      deactivateEndpoint: false,
+    };
+  }
+  const webPush = getWebPushModule();
+  if (!webPush) {
+    return {
+      endpointId: endpoint?.id || null,
+      state: "failed",
+      providerMessageId: null,
+      errorMessage: "webpush_module_missing",
+      deactivateEndpoint: false,
+    };
+  }
+  const subscription =
+    endpoint?.subscription && typeof endpoint.subscription === "object"
+      ? endpoint.subscription
+      : null;
+  const endpointUrl = String(endpoint?.endpoint || "").trim();
+  if (!subscription || !endpointUrl) {
+    return {
+      endpointId: endpoint?.id || null,
+      state: "skipped",
+      providerMessageId: null,
+      errorMessage: "webpush_endpoint_missing",
+      deactivateEndpoint: false,
+    };
+  }
+  try {
+    await webPush.sendNotification(subscription, JSON.stringify(payload), {
+      TTL: 60,
+      urgency: "high",
+    });
+    return {
+      endpointId: endpoint?.id || null,
+      state: "sent",
+      providerMessageId: null,
+      errorMessage: "",
+      deactivateEndpoint: false,
+    };
+  } catch (err) {
+    const statusCode = Number(err?.statusCode || 0);
+    const shouldDeactivate = statusCode === 404 || statusCode === 410;
+    if (shouldDeactivate) {
+      await deactivateWebPushSubscription(endpointUrl);
+    }
+    return {
+      endpointId: endpoint?.id || null,
+      state: "failed",
+      providerMessageId: null,
+      errorMessage: cleanString(err?.message || err || "webpush_send_failed"),
+      deactivateEndpoint: shouldDeactivate,
+      statusCode,
+    };
+  }
+}
+
 async function sendWebPushPayloadToUser(userId, payload) {
   return sendPayloadToUserSubscriptions(userId, payload);
 }
@@ -380,6 +447,7 @@ module.exports = {
   removeWebPushSubscription,
   computeUnreadBadgeCount,
   sendWebPushPayloadToUser,
+  sendWebPushPayloadToEndpoint,
   sendTestWebPushToUser,
   queueChatMessageWebPushForRooms,
 };

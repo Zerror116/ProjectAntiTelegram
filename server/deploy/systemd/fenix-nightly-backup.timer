@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Fenix nightly backup
+
+[Timer]
+OnCalendar=*-*-* 03:35:00
+Persistent=true
+Unit=fenix-nightly-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -13,7 +13,13 @@ class NotificationCoordinatorService {
   static Future<void>? _reconcileInFlight;
   static bool _nextEnabledState = true;
 
-  static Future<void> reconcile(Dio dio, {required bool enabled}) async {
+  static Future<void> reconcile(
+    Dio dio, {
+    required bool enabled,
+    String? userId,
+    Map<String, dynamic>? runtimePolicySnapshot,
+    String? deviceProfile,
+  }) async {
     _nextEnabledState = enabled;
     final inFlight = _reconcileInFlight;
     if (inFlight != null) {
@@ -25,7 +31,13 @@ class NotificationCoordinatorService {
       bool currentEnabled;
       do {
         currentEnabled = _nextEnabledState;
-        await _applyOnce(dio, enabled: currentEnabled);
+        await _applyOnce(
+          dio,
+          enabled: currentEnabled,
+          userId: userId,
+          runtimePolicySnapshot: runtimePolicySnapshot,
+          deviceProfile: deviceProfile,
+        );
       } while (_nextEnabledState != currentEnabled);
     })();
 
@@ -39,11 +51,28 @@ class NotificationCoordinatorService {
     }
   }
 
-  static Future<void> clear(Dio dio) async {
-    await reconcile(dio, enabled: false);
+  static Future<void> clear(
+    Dio dio, {
+    String? userId,
+    Map<String, dynamic>? runtimePolicySnapshot,
+    String? deviceProfile,
+  }) async {
+    await reconcile(
+      dio,
+      enabled: false,
+      userId: userId,
+      runtimePolicySnapshot: runtimePolicySnapshot,
+      deviceProfile: deviceProfile,
+    );
   }
 
-  static Future<void> _applyOnce(Dio dio, {required bool enabled}) async {
+  static Future<void> _applyOnce(
+    Dio dio, {
+    required bool enabled,
+    String? userId,
+    Map<String, dynamic>? runtimePolicySnapshot,
+    String? deviceProfile,
+  }) async {
     NativePushService.setEndpointSyncEnabled(enabled);
     if (enabled) {
       if (kIsWeb) {
@@ -52,19 +81,32 @@ class NotificationCoordinatorService {
         } catch (_) {}
       }
       try {
-        await NotificationDeviceService.syncCurrentEndpoint(dio);
+        await NotificationDeviceService.syncCurrentEndpoint(
+          dio,
+          userId: userId,
+          runtimePolicySnapshot: runtimePolicySnapshot,
+          deviceProfile: deviceProfile,
+        );
       } catch (_) {}
       try {
-        await NativePushService.syncCurrentEndpoint(dio);
+        await NativePushService.syncCurrentEndpoint(
+          dio,
+          userId: userId,
+          runtimePolicySnapshot: runtimePolicySnapshot,
+          deviceProfile: deviceProfile,
+        );
       } catch (_) {}
       return;
     }
 
     try {
-      await NotificationDeviceService.unregisterCurrentEndpoint(dio);
+      await NotificationDeviceService.unregisterCurrentEndpoint(
+        dio,
+        userId: userId,
+      );
     } catch (_) {}
     try {
-      await NativePushService.unregisterCurrentEndpoint(dio);
+      await NativePushService.unregisterCurrentEndpoint(dio, userId: userId);
     } catch (_) {}
     if (kIsWeb) {
       try {

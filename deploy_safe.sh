@@ -12,6 +12,7 @@ HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 RUN_TESTS="${RUN_TESTS:-0}"
 RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
+RUN_BACKUP_BEFORE_DEPLOY="${RUN_BACKUP_BEFORE_DEPLOY:-1}"
 BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 SKIP_BUILD="0"
 SKIP_BACKEND="0"
@@ -49,6 +50,7 @@ Important env vars:
   RUN_ANALYZE=1
   RUN_TESTS=0
   RUN_HEALTH_CHECK=1
+  RUN_BACKUP_BEFORE_DEPLOY=1
   BUILD_ARGS='--release --no-wasm-dry-run'
 
 Examples:
@@ -187,9 +189,34 @@ else
 fi
 
 if [[ "$SKIP_BACKEND" != "1" ]]; then
+  if [[ "$RUN_BACKUP_BEFORE_DEPLOY" == "1" ]]; then
+    echo "[deploy_safe] running remote pre-deploy backup"
+    run_ssh "$SERVER" "if [[ -x '$REMOTE_PROJECT_DIR/server/scripts/nightly_backup.sh' ]]; then '$REMOTE_PROJECT_DIR/server/scripts/nightly_backup.sh'; fi"
+  else
+    echo "[deploy_safe] RUN_BACKUP_BEFORE_DEPLOY=0, skip pre-deploy backup"
+  fi
+
   echo "[deploy_safe] syncing backend code safely"
   SERVER="$SERVER" REMOTE_PROJECT_DIR="$REMOTE_PROJECT_DIR" SSH_PASSWORD="${SSH_PASSWORD:-}" DEPLOY_CONTROL_SOCKET="$CONTROL_SOCKET" \
     "$SCRIPTS_DIR/sync_server_code_safe.sh"
+
+  echo "[deploy_safe] installing remote systemd units"
+  run_ssh "$SERVER" "\
+    set -e; \
+    install -m 644 '$REMOTE_PROJECT_DIR/server/deploy/systemd/fenix-worker.service' /etc/systemd/system/fenix-worker.service; \
+    install -m 644 '$REMOTE_PROJECT_DIR/server/deploy/systemd/fenix-nightly-backup.service' /etc/systemd/system/fenix-nightly-backup.service; \
+    install -m 644 '$REMOTE_PROJECT_DIR/server/deploy/systemd/fenix-nightly-backup.timer' /etc/systemd/system/fenix-nightly-backup.timer; \
+    install -m 644 '$REMOTE_PROJECT_DIR/server/deploy/systemd/fenix-nightly-maintenance.service' /etc/systemd/system/fenix-nightly-maintenance.service; \
+    install -m 644 '$REMOTE_PROJECT_DIR/server/deploy/systemd/fenix-nightly-maintenance.timer' /etc/systemd/system/fenix-nightly-maintenance.timer; \
+    mkdir -p /opt/fenix-backups/postgres /opt/fenix-backups/storage; \
+    systemctl daemon-reload; \
+    systemctl enable --now fenix-worker.service; \
+    systemctl enable --now fenix-nightly-backup.timer; \
+    systemctl enable --now fenix-nightly-maintenance.timer; \
+    systemctl restart fenix-worker.service; \
+    systemctl is-active fenix-server.service; \
+    systemctl is-active fenix-worker.service\
+  "
 else
   echo "[deploy_safe] --skip-backend: skip backend sync"
 fi

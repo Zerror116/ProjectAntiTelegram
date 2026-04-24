@@ -74,10 +74,45 @@ class NotificationDeviceService {
     };
   }
 
-  static Future<void> _syncCurrentEndpointNow(Dio dio) async {
+  static String _defaultDeviceProfile() {
+    if (kIsWeb) return 'constrained';
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+        return 'standard';
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+      case TargetPlatform.linux:
+      case TargetPlatform.fuchsia:
+        return 'standard';
+    }
+  }
+
+  static Map<String, dynamic> _defaultRuntimePolicy({
+    required bool enabled,
+    Map<String, dynamic>? snapshot,
+  }) {
+    final source = snapshot is Map<String, dynamic>
+        ? Map<String, dynamic>.from(snapshot)
+        : <String, dynamic>{};
+    return <String, dynamic>{
+      'enabled': enabled,
+      'message_preview_enabled': source['message_preview_enabled'] != false,
+      'sound_enabled': source['sound_enabled'] != false,
+      'show_when_active': source['show_when_active'] == true,
+    };
+  }
+
+  static Future<void> _syncCurrentEndpointNow(
+    Dio dio, {
+    String? userId,
+    Map<String, dynamic>? runtimePolicySnapshot,
+    String? deviceProfile,
+  }) async {
     final deviceKey = await generateDeviceFingerprint();
     final packageInfo = await PackageInfo.fromPlatform();
     final locale = PlatformDispatcher.instance.locale.toLanguageTag();
+    final enabled = runtimePolicySnapshot?['enabled'] != false;
     _lastSyncSnapshot = <String, dynamic>{
       'status': 'syncing',
       'platform': _platformName(),
@@ -94,6 +129,11 @@ class NotificationDeviceService {
         'device_key': deviceKey,
         'permission_state': await _permissionState(),
         'capabilities': _capabilities(),
+        'app_runtime_policy': _defaultRuntimePolicy(
+          enabled: enabled,
+          snapshot: runtimePolicySnapshot,
+        ),
+        'device_profile': (deviceProfile ?? _defaultDeviceProfile()).trim(),
         'app_version': '${packageInfo.version}+${packageInfo.buildNumber}',
         'locale': locale,
         'timezone': await resolveLocalTimeZoneId(),
@@ -106,7 +146,12 @@ class NotificationDeviceService {
     };
   }
 
-  static Future<void> syncCurrentEndpoint(Dio dio) async {
+  static Future<void> syncCurrentEndpoint(
+    Dio dio, {
+    String? userId,
+    Map<String, dynamic>? runtimePolicySnapshot,
+    String? deviceProfile,
+  }) async {
     if (_syncInFlight != null) {
       _syncRetryRequested = true;
       return _syncInFlight!;
@@ -115,7 +160,12 @@ class NotificationDeviceService {
       do {
         _syncRetryRequested = false;
         try {
-          await _syncCurrentEndpointNow(dio);
+          await _syncCurrentEndpointNow(
+            dio,
+            userId: userId,
+            runtimePolicySnapshot: runtimePolicySnapshot,
+            deviceProfile: deviceProfile,
+          );
         } catch (e) {
           _lastSyncSnapshot = <String, dynamic>{
             ..._lastSyncSnapshot,
@@ -139,7 +189,10 @@ class NotificationDeviceService {
     }
   }
 
-  static Future<void> unregisterCurrentEndpoint(Dio dio) async {
+  static Future<void> unregisterCurrentEndpoint(
+    Dio dio, {
+    String? userId,
+  }) async {
     try {
       final deviceKey = await generateDeviceFingerprint();
       await dio.post(

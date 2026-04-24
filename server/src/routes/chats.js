@@ -2956,8 +2956,8 @@ async function loadPagedMessages(req, {
 }) {
   const summaryView = String(view || "").trim().toLowerCase() === "summary";
   const safeLimit = Math.min(
-    parseCursorLimit(limit, summaryView ? 36 : 40),
-    summaryView ? 60 : 100,
+    parseCursorLimit(limit, summaryView ? 28 : 40),
+    summaryView ? 48 : 100,
   );
   const userIdText = String(userId || "");
   const beforeTs = parseCursorTimestamp(beforeCreatedAt);
