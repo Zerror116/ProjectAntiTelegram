@@ -428,14 +428,23 @@ class AuthService {
               _currentUser?.id,
             );
         if (!enabled) {
-          await NotificationCoordinatorService.clear(dio);
+          await NotificationCoordinatorService.clear(
+            dio,
+            userId: _currentUser?.id,
+          );
           return;
         }
-        await NotificationRuntimePreferenceService.refreshServerPolicy(
+        final policy =
+            await NotificationRuntimePreferenceService.refreshServerPolicy(
           dio,
           userId: _currentUser?.id,
         );
-        await NotificationCoordinatorService.reconcile(dio, enabled: enabled);
+        await NotificationCoordinatorService.reconcile(
+          dio,
+          enabled: enabled,
+          userId: _currentUser?.id,
+          runtimePolicySnapshot: policy.toJson(),
+        );
       } finally {
         _postAuthSyncInProgress = false;
       }

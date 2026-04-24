@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "worker": "node src/worker.js",
     "address-gateway": "node scripts/address-provider-gateway.js",
     "lint": "eslint src scripts --ext .js --max-warnings=0",
     "test:critical": "node scripts/critical-integration.js",
@@ -25,6 +26,8 @@
     "media:backfill": "node scripts/media_assets_backfill.js",
     "media:sanitize": "node scripts/media_assets_sanitize.js",
     "perf:budget": "node scripts/perf_budget_smoke.js",
+    "backup:nightly": "./scripts/nightly_backup.sh",
+    "maintenance:nightly": "./scripts/nightly_maintenance.sh",
     "recovery:audit": "node scripts/uploads_recovery_audit.js",
     "recovery:restore": "node scripts/uploads_recovery_restore.js",
     "recovery:placeholders": "node scripts/uploads_recovery_apply_placeholders.js",

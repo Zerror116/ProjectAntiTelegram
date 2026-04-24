@@ -33,6 +33,11 @@ const ENDPOINT_PERMISSION_STATES = new Set([
   "denied",
   "provisional",
 ]);
+const DEVICE_PROFILES = new Set([
+  "standard",
+  "constrained",
+  "aggressive_low_memory",
+]);
 
 function normalizeRole(raw) {
   return String(raw || "").toLowerCase().trim();
@@ -109,6 +114,11 @@ function normalizeEndpointPlatform(raw, fallback = "unknown") {
 function normalizePermissionState(raw, fallback = "unknown") {
   const value = String(raw || "").toLowerCase().trim();
   return ENDPOINT_PERMISSION_STATES.has(value) ? value : fallback;
+}
+
+function normalizeDeviceProfile(raw, fallback = "standard") {
+  const value = String(raw || "").toLowerCase().trim();
+  return DEVICE_PROFILES.has(value) ? value : fallback;
 }
 
 function normalizeJsonMap(raw, fallback = {}) {
@@ -760,6 +770,8 @@ async function upsertNotificationEndpoint({
   locale,
   timezone,
   userAgent,
+  appRuntimePolicy,
+  deviceProfile,
   testOnly = false,
 }) {
   const normalizedPlatform = normalizeEndpointPlatform(platform);
@@ -770,10 +782,12 @@ async function upsertNotificationEndpoint({
   const normalizedSubscription = normalizeJsonMap(subscription);
   const normalizedPermissionState = normalizePermissionState(permissionState);
   const normalizedCapabilities = normalizeJsonMap(capabilities);
+  const normalizedAppRuntimePolicy = normalizeJsonMap(appRuntimePolicy);
   const normalizedAppVersion = String(appVersion || "").trim() || null;
   const normalizedLocale = String(locale || "").trim() || null;
   const normalizedTimezone = canonicalizeNotificationTimeZone(timezone);
   const normalizedUserAgent = String(userAgent || "").trim() || null;
+  const normalizedDeviceProfile = normalizeDeviceProfile(deviceProfile);
 
   let existing = null;
   if (normalizedEndpoint) {
@@ -828,6 +842,8 @@ async function upsertNotificationEndpoint({
     JSON.stringify(normalizedSubscription),
     normalizedPermissionState,
     JSON.stringify(normalizedCapabilities),
+    JSON.stringify(normalizedAppRuntimePolicy),
+    normalizedDeviceProfile,
     normalizedAppVersion,
     normalizedLocale,
     normalizedTimezone,
@@ -848,15 +864,17 @@ async function upsertNotificationEndpoint({
               subscription = $8::jsonb,
               permission_state = $9,
               capabilities = $10::jsonb,
-              app_version = $11,
-              locale = $12,
-              timezone = $13,
-              user_agent = $14,
-              test_only = $15,
+              app_runtime_policy = $11::jsonb,
+              device_profile = $12,
+              app_version = $13,
+              locale = $14,
+              timezone = $15,
+              user_agent = $16,
+              test_only = $17,
               is_active = true,
               last_seen_at = now(),
               updated_at = now()
-        WHERE id = $16
+        WHERE id = $18
         RETURNING *`,
       [...values, existing.id],
     );
@@ -875,6 +893,8 @@ async function upsertNotificationEndpoint({
        subscription,
        permission_state,
        capabilities,
+       app_runtime_policy,
+       device_profile,
        app_version,
        locale,
        timezone,
@@ -885,7 +905,7 @@ async function upsertNotificationEndpoint({
        updated_at
      )
      VALUES (
-       $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11, $12, $13, $14, $15, true, now(), now()
+       $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11::jsonb, $12, $13, $14, $15, $16, $17, true, now(), now()
      )
      RETURNING *`,
     values,
@@ -918,14 +938,39 @@ async function markEndpointDeliveryState(endpointId, state, { errorMessage = "" 
   const normalizedState = String(state || "").trim().toLowerCase();
   if (!endpointId) return;
   const isFailure = normalizedState === "failed";
+  const isSuccess = new Set(["sent", "provider_accepted", "delivered", "opened"]).has(
+    normalizedState,
+  );
+  const isDisabled = new Set(["disabled", "expired"]).has(normalizedState);
   await db.query(
     `UPDATE notification_endpoints
         SET last_success_at = CASE WHEN $2::text IN ('sent', 'provider_accepted', 'delivered', 'opened') THEN now() ELSE last_success_at END,
             last_failure_at = CASE WHEN $3::boolean THEN now() ELSE last_failure_at END,
             last_failure_reason = CASE WHEN $3::boolean THEN NULLIF($4, '') ELSE last_failure_reason END,
+            last_delivery_state = NULLIF($5, ''),
+            last_delivery_at = CASE WHEN $6::boolean THEN now() ELSE last_delivery_at END,
+            consecutive_failures = CASE
+              WHEN $6::boolean THEN 0
+              WHEN $3::boolean THEN COALESCE(consecutive_failures, 0) + 1
+              ELSE consecutive_failures
+            END,
+            failure_backoff_until = CASE
+              WHEN $6::boolean THEN NULL
+              WHEN $3::boolean THEN now() + interval '15 minutes'
+              ELSE failure_backoff_until
+            END,
+            is_active = CASE WHEN $7::boolean THEN false ELSE is_active END,
             updated_at = now()
       WHERE id = $1`,
-    [endpointId, normalizedState, isFailure, String(errorMessage || "")],
+    [
+      endpointId,
+      normalizedState,
+      isFailure,
+      String(errorMessage || ""),
+      normalizedState,
+      isSuccess,
+      isDisabled,
+    ],
   );
 }
 
@@ -1274,11 +1319,13 @@ async function createNotificationDelivery({
   endpointId = null,
   channel = "in_app",
   provider = null,
+  transport = null,
   state = "queued",
   errorMessage = "",
   metadata = {},
 }) {
   const normalizedState = String(state || "queued").trim().toLowerCase();
+  const normalizedChannel = normalizeChannel(channel, "in_app");
   const q = await db.query(
     `INSERT INTO notification_deliveries (
        inbox_item_id,
@@ -1286,6 +1333,8 @@ async function createNotificationDelivery({
        endpoint_id,
        channel,
        provider,
+       transport,
+       queue_name,
        state,
        error_message,
        metadata,
@@ -1295,10 +1344,10 @@ async function createNotificationDelivery({
        updated_at
      )
      VALUES (
-       $1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8::jsonb,
-       CASE WHEN $6::text IN ('sent', 'provider_accepted') THEN now() ELSE NULL END,
-       CASE WHEN $6::text = 'failed' THEN now() ELSE NULL END,
-       CASE WHEN $6::text IN ('delivered', 'opened') THEN now() ELSE NULL END,
+       $1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, NULLIF($9, ''), $10::jsonb,
+       CASE WHEN $8::text IN ('sent', 'provider_accepted') THEN now() ELSE NULL END,
+       CASE WHEN $8::text = 'failed' THEN now() ELSE NULL END,
+       CASE WHEN $8::text IN ('delivered', 'opened') THEN now() ELSE NULL END,
        now()
      )
      RETURNING *`,
@@ -1306,8 +1355,10 @@ async function createNotificationDelivery({
       inboxItemId,
       userId,
       endpointId,
-      normalizeChannel(channel, "in_app"),
+      normalizedChannel,
       provider,
+      String(transport || normalizedChannel).trim(),
+      normalizedChannel === "push" ? "push" : normalizedChannel,
       normalizedState,
       String(errorMessage || ""),
       JSON.stringify(normalizeJsonMap(metadata)),
@@ -1463,6 +1514,7 @@ async function createNotificationInboxItem({
   if (!row) return null;
 
   const preferences = await getNotificationPreferencesForUser(user);
+  const { queuePushDeliveriesForItem } = require("./notificationQueue");
   const payloadMeta = normalizeJsonMap(row.payload);
   const isTestPromo = normalizedCategory === "promo" && payloadMeta.test_only === true;
   const categoryEnabled = preferences.categories[normalizedCategory] !== false;
@@ -1477,96 +1529,17 @@ async function createNotificationInboxItem({
     userId: user.id,
     channel: "in_app",
     provider: "socket",
-    state: inAppAllowed ? "queued" : "skipped",
+    state: inAppAllowed ? "delivered" : "skipped",
     errorMessage: inAppAllowed ? "" : "in_app_disabled",
-    metadata: { in_app_allowed: inAppAllowed },
+    metadata: { in_app_allowed: inAppAllowed, emitted: emit === true },
   });
 
   if (attemptPush) {
-    const pushPolicy = evaluatePushEligibility(row, preferences);
-    if (!pushPolicy.allowed) {
-      await createNotificationDelivery({
-        inboxItemId: row.id,
-        userId: user.id,
-        channel: "push",
-        provider: null,
-        state: pushPolicy.state,
-        errorMessage: "",
-        metadata: pushPolicy,
-      });
-    } else {
-      const webPushResult = await maybeSendWebPushForItem(user, row, preferences);
-      const nativePushResult = await maybeSendNativePushForItem(
-        user,
-        row,
-        preferences,
-      );
-
-      const hasWebPushSignal =
-        webPushResult.sent > 0 ||
-        webPushResult.state === "failed" ||
-        webPushResult.reason !== "no_push_endpoints";
-      if (hasWebPushSignal) {
-        await createNotificationDelivery({
-          inboxItemId: row.id,
-          userId: user.id,
-          channel: "push",
-          provider: webPushResult.reason === "webpush" ? "webpush" : null,
-          state: webPushResult.state,
-          errorMessage: webPushResult.state === "failed"
-            ? webPushResult.reason
-            : "",
-          metadata: webPushResult,
-        });
-      }
-
-      if (Array.isArray(nativePushResult.results)) {
-        for (const result of nativePushResult.results) {
-          await createNotificationDelivery({
-            inboxItemId: row.id,
-            userId: user.id,
-            endpointId: result.endpointId || null,
-            channel: "push",
-            provider: "fcm",
-            state: result.state,
-            errorMessage: result.errorMessage || "",
-            metadata: result,
-          });
-          if (result.endpointId) {
-            await markEndpointDeliveryState(result.endpointId, result.state, {
-              errorMessage: result.errorMessage || "",
-            });
-            if (result.deactivateEndpoint === true) {
-              await db.query(
-                `UPDATE notification_endpoints
-                    SET is_active = false,
-                        updated_at = now(),
-                        last_failure_at = now(),
-                        last_failure_reason = NULLIF($2, '')
-                  WHERE id = $1`,
-                [result.endpointId, String(result.errorMessage || "")],
-              );
-            }
-          }
-        }
-      }
-
-      if (!hasWebPushSignal && !(nativePushResult.results || []).length) {
-        await createNotificationDelivery({
-          inboxItemId: row.id,
-          userId: user.id,
-          channel: "push",
-          provider: null,
-          state: "skipped",
-          errorMessage: "",
-          metadata: {
-            reason: nativePushResult.configured === false
-              ? "native_push_not_configured"
-              : "no_push_endpoints",
-          },
-        });
-      }
-    }
+    await queuePushDeliveriesForItem({
+      item: row,
+      user,
+      preferences,
+    });
   }
 
   if (emit && inAppAllowed) {
@@ -1656,7 +1629,7 @@ async function markNotificationInboxItemOpened({ userId, itemId }) {
   if (!row) return null;
 
   const deliveryQ = await db.query(
-    `SELECT id
+    `SELECT id, endpoint_id
        FROM notification_deliveries
       WHERE inbox_item_id = $1
         AND user_id = $2
@@ -1665,7 +1638,8 @@ async function markNotificationInboxItemOpened({ userId, itemId }) {
       LIMIT 1`,
     [itemId, userId],
   );
-  const targetDeliveryId = deliveryQ.rows?.[0]?.id || null;
+  const targetDelivery = deliveryQ.rows?.[0] || null;
+  const targetDeliveryId = targetDelivery?.id || null;
   if (targetDeliveryId) {
     await db.query(
       `UPDATE notification_deliveries
@@ -1676,6 +1650,16 @@ async function markNotificationInboxItemOpened({ userId, itemId }) {
         WHERE id = $1`,
       [targetDeliveryId],
     );
+    const { recordDeliveryOpened } = require("./notificationQueue");
+    await recordDeliveryOpened({
+      deliveryId: targetDeliveryId,
+      inboxItemId: itemId,
+      endpointId: targetDelivery?.endpoint_id || null,
+      metadata: {
+        source: "notification_open",
+        user_id: userId,
+      },
+    });
   }
 
   const badgeCount = await computeNotificationBadgeCount(userId);
@@ -1753,6 +1737,13 @@ async function syncLegacyWebPushEndpoint({ userId, tenantId = null, endpoint, su
       badge: true,
       media_rich: true,
     },
+    appRuntimePolicy: {
+      enabled: true,
+      message_preview_enabled: true,
+      sound_enabled: true,
+      show_when_active: false,
+    },
+    deviceProfile: "constrained",
     userAgent,
   });
 }
@@ -2253,12 +2244,16 @@ async function runNotificationDigestSweep() {
 
 module.exports = {
   canAccessNotificationInbox,
+  getNotificationUser,
   getNotificationPreferencesForUser,
   upsertNotificationPreferences,
   upsertNotificationEndpoint,
   deactivateNotificationEndpoint,
   computeNotificationBadgeCount,
   computeNotificationInboxBadgeCount,
+  buildSocketPayload,
+  evaluatePushEligibility,
+  createNotificationDelivery,
   createNotificationInboxItem,
   listNotificationInbox,
   markNotificationInboxItemOpened,

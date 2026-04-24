@@ -332,7 +332,41 @@ class NativePushService {
     return granted;
   }
 
-  static Future<void> syncCurrentEndpoint(Dio dio) async {
+  static String _defaultDeviceProfile() {
+    if (kIsWeb) return 'constrained';
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+        return 'standard';
+      case TargetPlatform.macOS:
+      case TargetPlatform.windows:
+      case TargetPlatform.linux:
+      case TargetPlatform.fuchsia:
+        return 'standard';
+    }
+  }
+
+  static Map<String, dynamic> _defaultRuntimePolicy({
+    required bool enabled,
+    Map<String, dynamic>? snapshot,
+  }) {
+    final source = snapshot is Map<String, dynamic>
+        ? Map<String, dynamic>.from(snapshot)
+        : <String, dynamic>{};
+    return <String, dynamic>{
+      'enabled': enabled,
+      'message_preview_enabled': source['message_preview_enabled'] != false,
+      'sound_enabled': source['sound_enabled'] != false,
+      'show_when_active': source['show_when_active'] == true,
+    };
+  }
+
+  static Future<void> syncCurrentEndpoint(
+    Dio dio, {
+    String? userId,
+    Map<String, dynamic>? runtimePolicySnapshot,
+    String? deviceProfile,
+  }) async {
     if (!isSupported) return;
     if (!_endpointSyncEnabled) return;
     await _ensureFirebaseInitialized();
@@ -354,6 +388,11 @@ class NativePushService {
           'push_token': token,
           'permission_state': await _permissionState(),
           'capabilities': _capabilities(),
+          'app_runtime_policy': _defaultRuntimePolicy(
+            enabled: runtimePolicySnapshot?['enabled'] != false,
+            snapshot: runtimePolicySnapshot,
+          ),
+          'device_profile': (deviceProfile ?? _defaultDeviceProfile()).trim(),
           'app_version': '${packageInfo.version}+${packageInfo.buildNumber}',
           'locale': PlatformDispatcher.instance.locale.toLanguageTag(),
           'timezone': await resolveLocalTimeZoneId(),
@@ -364,7 +403,10 @@ class NativePushService {
     }
   }
 
-  static Future<void> unregisterCurrentEndpoint(Dio dio) async {
+  static Future<void> unregisterCurrentEndpoint(
+    Dio dio, {
+    String? userId,
+  }) async {
     if (!isSupported) return;
     final token = _cachedFcmToken?.trim();
     if (token == null || token.isEmpty) return;

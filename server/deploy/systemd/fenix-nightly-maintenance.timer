@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Fenix nightly maintenance
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+Unit=fenix-nightly-maintenance.service
+
+[Install]
+WantedBy=timers.target

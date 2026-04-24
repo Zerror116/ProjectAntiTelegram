@@ -214,8 +214,15 @@ class NotificationRuntimePreferenceService {
   static Future<void> applyRuntimePreference(
     Dio dio, {
     required bool enabled,
+    String? userId,
   }) async {
-    await NotificationCoordinatorService.reconcile(dio, enabled: enabled);
+    final policy = await getCachedPolicyForUser(userId);
+    await NotificationCoordinatorService.reconcile(
+      dio,
+      enabled: enabled,
+      userId: userId,
+      runtimePolicySnapshot: policy.toJson(),
+    );
   }
 
   static bool? _parseBoolLike(dynamic raw) {

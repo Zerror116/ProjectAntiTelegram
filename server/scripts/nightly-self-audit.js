@@ -274,6 +274,131 @@ async function checkMonitoringBacklog() {
   }
 }
 
+async function checkNotificationQueueHealth() {
+  try {
+    const queueQ = await db.query(
+      `SELECT
+         COUNT(*) FILTER (
+           WHERE channel = 'push'
+             AND queue_name = 'push'
+             AND state IN ('queued', 'failed')
+             AND COALESCE(next_attempt_at, now()) <= now()
+         )::int AS ready_count,
+         COUNT(*) FILTER (
+           WHERE channel = 'push'
+             AND state = 'failed'
+             AND updated_at >= now() - interval '24 hours'
+         )::int AS failed_last_24h
+       FROM notification_deliveries`,
+    );
+    const endpointQ = await db.query(
+      `SELECT COUNT(*)::int AS failing_endpoints
+         FROM notification_endpoints
+        WHERE is_active = true
+          AND COALESCE(consecutive_failures, 0) > 0`,
+    );
+    const readyCount = Number(queueQ.rows?.[0]?.ready_count || 0) || 0;
+    const failedLast24h = Number(queueQ.rows?.[0]?.failed_last_24h || 0) || 0;
+    const failingEndpoints =
+      Number(endpointQ.rows?.[0]?.failing_endpoints || 0) || 0;
+
+    if (readyCount > 250) {
+      addFinding(
+        "warn",
+        "notifications.queue.backlog",
+        `Notification queue backlog is elevated (${readyCount} ready deliveries)`,
+      );
+    } else {
+      addFinding(
+        "info",
+        "notifications.queue.backlog",
+        `Notification queue ready deliveries: ${readyCount}`,
+      );
+    }
+
+    if (failedLast24h > 0 || failingEndpoints > 0) {
+      addFinding(
+        "warn",
+        "notifications.queue.failures",
+        `Notification queue has failures (deliveries_24h=${failedLast24h}, endpoints=${failingEndpoints})`,
+      );
+    } else {
+      addFinding(
+        "info",
+        "notifications.queue.failures",
+        "Notification queue has no active failures",
+      );
+    }
+  } catch (err) {
+    addFinding(
+      "warn",
+      "notifications.queue.unavailable",
+      "Notification queue health check skipped",
+      {
+        error: String(err?.message || err).slice(0, 300),
+      },
+    );
+  }
+}
+
+function checkBackupFreshness() {
+  try {
+    const backupRoot = process.env.FENIX_BACKUP_ROOT || '/opt/fenix-backups/postgres';
+    const targetDir = backupRoot.endsWith('/postgres')
+      ? backupRoot
+      : path.join(backupRoot, 'postgres');
+    if (!fs.existsSync(targetDir)) {
+      addFinding(
+        "warn",
+        "backup.missing_dir",
+        `Backup directory not found: ${targetDir}`,
+      );
+      return;
+    }
+    const files = fs
+      .readdirSync(targetDir)
+      .map((name) => path.join(targetDir, name))
+      .filter((filePath) => {
+        try {
+          return fs.statSync(filePath).isFile();
+        } catch (_) {
+          return false;
+        }
+      })
+      .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+    if (files.length === 0) {
+      addFinding("warn", "backup.empty", "No postgres backups found");
+      return;
+    }
+    const newest = files[0];
+    const ageHours = Math.round((Date.now() - fs.statSync(newest).mtimeMs) / (60 * 60 * 1000));
+    if (ageHours > 30) {
+      addFinding(
+        "warn",
+        "backup.stale",
+        `Latest postgres backup is stale (${ageHours}h old)`,
+        { latest_backup: newest },
+      );
+      return;
+    }
+    addFinding(
+      "info",
+      "backup.fresh",
+      `Latest postgres backup age=${ageHours}h`,
+      { latest_backup: newest },
+    );
+  } catch (err) {
+    addFinding(
+      "warn",
+      "backup.check_failed",
+      "Backup freshness check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+      },
+    );
+  }
+}
+
 function buildMarkdownReport() {
   const now = new Date();
   const critical = findings.filter((f) => f.level === "critical").length;
@@ -332,6 +457,8 @@ async function main() {
     "Performance budget smoke",
   );
   await checkMonitoringBacklog();
+  await checkNotificationQueueHealth();
+  checkBackupFreshness();
 
   const summary = buildAuditSummary();
 

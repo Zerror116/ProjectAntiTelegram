@@ -281,6 +281,7 @@ class _NotificationPreferencesScreenState
       await NotificationRuntimePreferenceService.applyRuntimePreference(
         authService.dio,
         enabled: _effectivePushEnabledFromState(),
+        userId: authService.currentUser?.id,
       );
       await refreshNotificationBadgeCount();
       if (!mounted) return;

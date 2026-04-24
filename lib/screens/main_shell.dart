@@ -289,6 +289,7 @@ class _MainShellState extends State<MainShell> {
     await NotificationRuntimePreferenceService.applyRuntimePreference(
       dio,
       enabled: enabled,
+      userId: authService.currentUser?.id,
     );
     await refreshNotificationBadgeCount();
   }
