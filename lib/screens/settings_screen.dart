@@ -273,10 +273,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _messengerPrefsSaving = false);
       showAppNotice(
         context,
-        _extractDioMessage(
-          e,
-          fallback: 'Не удалось сохранить настройки медиа',
-        ),
+        _extractDioMessage(e, fallback: 'Не удалось сохранить настройки медиа'),
         tone: AppNoticeTone.error,
       );
     }
@@ -436,10 +433,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) return;
       showAppNotice(
         context,
-        _extractDioMessage(
-          e,
-          fallback: 'Не удалось очистить кэш изображений',
-        ),
+        _extractDioMessage(e, fallback: 'Не удалось очистить кэш изображений'),
         tone: AppNoticeTone.error,
       );
     } finally {
@@ -583,11 +577,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       );
     } catch (e) {
       if (!mounted) return;
-      showAppNotice(
-        context,
-        _extractDioMessage(e),
-        tone: AppNoticeTone.error,
-      );
+      showAppNotice(context, _extractDioMessage(e), tone: AppNoticeTone.error);
     } finally {
       if (mounted) setState(() => _deletingAccount = false);
     }
@@ -795,7 +785,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await showDialog<void>(
       context: context,
       builder: (dialogContext) {
-        var localServerSessions = List<Map<String, dynamic>>.from(serverSessions);
+        var localServerSessions = List<Map<String, dynamic>>.from(
+          serverSessions,
+        );
         var localSavedSessions = List<Map<String, dynamic>>.from(savedSessions);
         var busy = false;
         var localError = errorMessage;
@@ -878,9 +870,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             Expanded(
                               child: Text(
                                 'Активные входы',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .titleSmall
+                                style: Theme.of(context).textTheme.titleSmall
                                     ?.copyWith(fontWeight: FontWeight.w800),
                               ),
                             ),
@@ -918,13 +908,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                       tooltip: 'Завершить вход',
                                       onPressed: busy
                                           ? null
-                                          : () => revokeOne(
-                                                setDialogState,
-                                                id,
-                                              ),
-                                      icon: const Icon(
-                                        Icons.logout_rounded,
-                                      ),
+                                          : () => revokeOne(setDialogState, id),
+                                      icon: const Icon(Icons.logout_rounded),
                                     ),
                             );
                           }),
@@ -941,13 +926,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                       const SizedBox(height: 6),
                       if (localSavedSessions.isEmpty)
-                        const Text('На этом устройстве нет других сохранённых входов.')
+                        const Text(
+                          'На этом устройстве нет других сохранённых входов.',
+                        )
                       else
                         ...localSavedSessions.map((row) {
                           final id = (row['id'] ?? '').toString().trim();
-                          final title = ((row['tenant_name'] ?? row['tenant_code']) ?? '')
-                              .toString()
-                              .trim();
+                          final title =
+                              ((row['tenant_name'] ?? row['tenant_code']) ?? '')
+                                  .toString()
+                                  .trim();
                           final subtitle =
                               '${(row['role'] ?? 'client').toString()} • ${(row['email'] ?? '').toString().trim()}';
                           final active = id == _currentSavedSessionId;
@@ -969,9 +957,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                     onPressed: busy
                                         ? null
                                         : () => removeSavedSession(
-                                              setDialogState,
-                                              id,
-                                            ),
+                                            setDialogState,
+                                            id,
+                                          ),
                                     icon: const Icon(Icons.delete_outline),
                                   ),
                           );
@@ -1759,7 +1747,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (!_canOpenNotificationCenter) {
       showAppNotice(
         context,
-        'Раздел событий доступен только создателю.',
+        'Центр уведомлений доступен только создателю.',
         tone: AppNoticeTone.info,
       );
       return;
@@ -1856,9 +1844,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         leading: Icon(icon, color: theme.colorScheme.primary),
         title: Text(title),
         subtitle: Text(subtitle),
-        trailing:
-            trailing ??
-            const Icon(Icons.chevron_right_rounded, size: 20),
+        trailing: trailing ?? const Icon(Icons.chevron_right_rounded, size: 20),
         onTap: onTap,
       ),
     );
@@ -2088,15 +2074,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ? const SizedBox(
                               width: 14,
                               height: 14,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                              ),
+                              child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.delete_forever_outlined),
                       label: Text(
-                        _deletingAccount
-                            ? 'Удаление...'
-                            : 'Удалить аккаунт',
+                        _deletingAccount ? 'Удаление...' : 'Удалить аккаунт',
                       ),
                     ),
                   ],
@@ -2107,7 +2089,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               icon: Icons.notifications_active_outlined,
               title: 'Уведомления',
               subtitle:
-                  'Личные сообщения, поддержка, акции, системные разрешения и история событий.',
+                  'Личные сообщения, поддержка, акции, системные разрешения и центр уведомлений.',
               children: [
                 Container(
                   decoration: BoxDecoration(
@@ -2146,7 +2128,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     icon: Icons.notifications_none_rounded,
                     title: 'Центр уведомлений',
                     subtitle:
-                        'История событий, счётчики и быстрые переходы по важным действиям.',
+                        'История уведомлений, счётчики и быстрые переходы по важным действиям.',
                     onTap: _openNotificationCenter,
                   ),
               ],
@@ -2215,7 +2197,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: _messengerPrefs.mediaAutoDownloadImages,
                     items: const [
                       DropdownMenuItem(value: 'never', child: Text('Никогда')),
-                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi',
+                        child: Text('Только Wi‑Fi'),
+                      ),
                       DropdownMenuItem(
                         value: 'wifi_cellular',
                         child: Text('Wi‑Fi и сотовая сеть'),
@@ -2238,7 +2223,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: _messengerPrefs.mediaAutoDownloadAudio,
                     items: const [
                       DropdownMenuItem(value: 'never', child: Text('Никогда')),
-                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi',
+                        child: Text('Только Wi‑Fi'),
+                      ),
                       DropdownMenuItem(
                         value: 'wifi_cellular',
                         child: Text('Wi‑Fi и сотовая сеть'),
@@ -2261,7 +2249,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: _messengerPrefs.mediaAutoDownloadVideo,
                     items: const [
                       DropdownMenuItem(value: 'never', child: Text('Никогда')),
-                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi',
+                        child: Text('Только Wi‑Fi'),
+                      ),
                       DropdownMenuItem(
                         value: 'wifi_cellular',
                         child: Text('Wi‑Fi и сотовая сеть'),
@@ -2284,7 +2275,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: _messengerPrefs.mediaAutoDownloadDocuments,
                     items: const [
                       DropdownMenuItem(value: 'never', child: Text('Никогда')),
-                      DropdownMenuItem(value: 'wifi', child: Text('Только Wi‑Fi')),
+                      DropdownMenuItem(
+                        value: 'wifi',
+                        child: Text('Только Wi‑Fi'),
+                      ),
                       DropdownMenuItem(
                         value: 'wifi_cellular',
                         child: Text('Wi‑Fi и сотовая сеть'),
@@ -2330,7 +2324,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     label: 'Качество по Wi‑Fi',
                     value: _messengerPrefs.mediaSendQualityWifi,
                     items: const [
-                      DropdownMenuItem(value: 'standard', child: Text('Стандарт')),
+                      DropdownMenuItem(
+                        value: 'standard',
+                        child: Text('Стандарт'),
+                      ),
                       DropdownMenuItem(value: 'hd', child: Text('HD')),
                       DropdownMenuItem(value: 'file', child: Text('Как файл')),
                     ],
@@ -2338,9 +2335,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       if (value == null) return;
                       unawaited(
                         _updateMessengerPreferences(
-                          _messengerPrefs.copyWith(
-                            mediaSendQualityWifi: value,
-                          ),
+                          _messengerPrefs.copyWith(mediaSendQualityWifi: value),
                         ),
                       );
                     },
@@ -2350,7 +2345,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     label: 'Качество по сотовой сети',
                     value: _messengerPrefs.mediaSendQualityCellular,
                     items: const [
-                      DropdownMenuItem(value: 'standard', child: Text('Стандарт')),
+                      DropdownMenuItem(
+                        value: 'standard',
+                        child: Text('Стандарт'),
+                      ),
                       DropdownMenuItem(value: 'hd', child: Text('HD')),
                       DropdownMenuItem(value: 'file', child: Text('Как файл')),
                     ],
@@ -2446,8 +2444,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _buildSectionCard(
               icon: Icons.info_outline_rounded,
               title: 'О приложении',
-              subtitle:
-                  'Версия, платформа, обновления и загрузка Android APK.',
+              subtitle: 'Версия, платформа, обновления и загрузка Android APK.',
               children: [
                 Row(
                   children: [

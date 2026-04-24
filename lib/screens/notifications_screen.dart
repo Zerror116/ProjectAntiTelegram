@@ -49,6 +49,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   List<Map<String, dynamic>> _items = const [];
   Map<String, dynamic> _creatorAnalyticsSummary = const <String, dynamic>{};
   List<Map<String, dynamic>> _creatorAnalyticsCampaigns = const [];
+  String? _previousShellSection;
 
   bool get _isCreatorBase {
     return authService.effectiveRole.toLowerCase().trim() == 'creator';
@@ -63,9 +64,11 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   @override
   void initState() {
     super.initState();
+    _previousShellSection = activeShellSectionNotifier.value;
+    activeShellSectionNotifier.value = 'notifications';
     if (!_isCreatorBase) {
       _loading = false;
-      _message = 'Раздел событий доступен только создателю.';
+      _message = 'Центр уведомлений доступен только создателю.';
       return;
     }
     _loadAll();
@@ -82,6 +85,12 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
 
   @override
   void dispose() {
+    if (activeShellSectionNotifier.value == 'notifications') {
+      final fallback = (_previousShellSection ?? '').trim();
+      activeShellSectionNotifier.value = fallback.isEmpty
+          ? 'settings'
+          : fallback;
+    }
     _refreshDebounce?.cancel();
     _notificationsSub?.cancel();
     _promoTitleCtrl.dispose();
@@ -114,7 +123,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _message = 'Раздел событий доступен только создателю.';
+          _message = 'Центр уведомлений доступен только создателю.';
         });
       } else {
         _loading = false;
@@ -262,7 +271,10 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     final itemId = (item['id'] ?? '').toString().trim();
     final status = (item['status'] ?? 'unread').toString().trim().toLowerCase();
     if (status == 'unread') {
-      await NotificationOpenTrackerService.reportOpened(authService.dio, itemId);
+      await NotificationOpenTrackerService.reportOpened(
+        authService.dio,
+        itemId,
+      );
       if (!mounted) return;
       setState(() {
         _items = _items
@@ -334,7 +346,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       await _loadAll(showLoader: false);
       showGlobalAppNotice(
         _isCreatorBase
-            ? 'Тестовое промо отправлено вам в центр событий'
+            ? 'Тестовое промо отправлено вам в центр уведомлений'
             : 'Промо-кампания поставлена в отправку',
         title: 'Уведомления',
         tone: AppNoticeTone.success,
@@ -663,10 +675,10 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   Widget build(BuildContext context) {
     if (!_isCreatorBase) {
       return Scaffold(
-        appBar: AppBar(title: const Text('События')),
+        appBar: AppBar(title: const Text('Центр уведомлений')),
         body: const SafeArea(
           child: Center(
-            child: Text('Раздел событий доступен только создателю.'),
+            child: Text('Центр уведомлений доступен только создателю.'),
           ),
         ),
       );
@@ -712,7 +724,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                               children: [
                                 Expanded(
                                   child: Text(
-                                    'Центр событий',
+                                    'Центр уведомлений',
                                     style: Theme.of(context)
                                         .textTheme
                                         .titleMedium
@@ -733,7 +745,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                             ),
                             const SizedBox(height: 8),
                             Text(
-                              'Все события складываются сюда, даже если push был выключен, не дошёл или пришёл тихо.',
+                              'Все уведомления и важные действия складываются сюда, даже если push был выключен, не дошёл или пришёл тихо.',
                               style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(
                                     color: Theme.of(
@@ -846,7 +858,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                         child: Padding(
                           padding: const EdgeInsets.all(20),
                           child: Text(
-                            'Пока здесь пусто. Когда появятся сообщения, промо, обновления или события безопасности, они будут доступны в центре событий и в счётчике.',
+                            'Пока здесь пусто. Когда появятся сообщения, промо, обновления или события безопасности, они будут доступны в центре уведомлений и в счётчике.',
                             style: Theme.of(context).textTheme.bodyMedium,
                           ),
                         ),
