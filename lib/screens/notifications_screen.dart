@@ -32,17 +32,11 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     'security': 'Безопасность',
   };
 
-  final TextEditingController _promoTitleCtrl = TextEditingController();
-  final TextEditingController _promoBodyCtrl = TextEditingController();
-  final TextEditingController _promoLinkCtrl = TextEditingController();
-  final TextEditingController _promoImageCtrl = TextEditingController();
-
   StreamSubscription<Map<String, dynamic>>? _notificationsSub;
   Timer? _refreshDebounce;
   bool _loading = true;
   bool _loadingExtras = false;
   bool _markAllBusy = false;
-  bool _promoSending = false;
   String _message = '';
   bool _unreadOnly = false;
   String _category = '';
@@ -93,10 +87,6 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     }
     _refreshDebounce?.cancel();
     _notificationsSub?.cancel();
-    _promoTitleCtrl.dispose();
-    _promoBodyCtrl.dispose();
-    _promoLinkCtrl.dispose();
-    _promoImageCtrl.dispose();
     super.dispose();
   }
 
@@ -305,70 +295,6 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     }
   }
 
-  Future<void> _sendPromotion() async {
-    final title = _promoTitleCtrl.text.trim();
-    final body = _promoBodyCtrl.text.trim();
-    if (title.isEmpty || body.isEmpty) {
-      showAppNotice(
-        context,
-        'Нужны и заголовок, и текст уведомления',
-        tone: AppNoticeTone.warning,
-      );
-      return;
-    }
-
-    setState(() {
-      _promoSending = true;
-    });
-    try {
-      final path = _isCreatorBase
-          ? '/api/notifications/promotions/test'
-          : '/api/admin/notifications/promotions';
-      await authService.dio.post(
-        path,
-        data: <String, dynamic>{
-          'title': title,
-          'body': body,
-          'deep_link': _promoLinkCtrl.text.trim().isEmpty
-              ? '/notifications'
-              : _promoLinkCtrl.text.trim(),
-          if (_promoImageCtrl.text.trim().isNotEmpty)
-            'media': <String, dynamic>{
-              'image_url': _promoImageCtrl.text.trim(),
-            },
-        },
-      );
-      if (!mounted) return;
-      _promoTitleCtrl.clear();
-      _promoBodyCtrl.clear();
-      _promoLinkCtrl.clear();
-      _promoImageCtrl.clear();
-      await _loadAll(showLoader: false);
-      showGlobalAppNotice(
-        _isCreatorBase
-            ? 'Тестовое промо отправлено вам в центр уведомлений'
-            : 'Промо-кампания поставлена в отправку',
-        title: 'Уведомления',
-        tone: AppNoticeTone.success,
-      );
-    } catch (error) {
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        _extractDioMessage(error),
-        tone: AppNoticeTone.error,
-      );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _promoSending = false;
-        });
-      } else {
-        _promoSending = false;
-      }
-    }
-  }
-
   IconData _categoryIcon(String category) {
     switch (category) {
       case 'chat':
@@ -425,26 +351,35 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
         (item['status'] ?? 'unread').toString().trim().toLowerCase() ==
         'unread';
     final imageUrl = _previewImageUrl(item);
-    return Card(
-      elevation: unread ? 1.5 : 0,
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: unread
+              ? theme.colorScheme.primary.withValues(alpha: 0.28)
+              : theme.colorScheme.outlineVariant,
+        ),
+      ),
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(18),
         onTap: () => _openInboxItem(item),
         child: Padding(
-          padding: const EdgeInsets.all(14),
+          padding: const EdgeInsets.all(12),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Container(
-                width: 42,
-                height: 42,
+                width: 40,
+                height: 40,
                 decoration: BoxDecoration(
                   color: _categoryColor(context, category),
-                  borderRadius: BorderRadius.circular(14),
+                  borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(_categoryIcon(category)),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -472,14 +407,16 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                           ),
                       ],
                     ),
-                    const SizedBox(height: 6),
+                    const SizedBox(height: 4),
                     Wrap(
                       spacing: 8,
-                      runSpacing: 6,
+                      runSpacing: 4,
                       children: [
                         Chip(
                           label: Text(_categoryLabels[category] ?? category),
                           visualDensity: VisualDensity.compact,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
                         ),
                         Text(
                           formatDateTimeValue(item['created_at']),
@@ -490,13 +427,18 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                       ],
                     ),
                     if (body.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text(body, style: theme.textTheme.bodyMedium),
+                      const SizedBox(height: 6),
+                      Text(
+                        body,
+                        maxLines: 4,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodyMedium,
+                      ),
                     ],
                     if (imageUrl != null) ...[
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 8),
                       ClipRRect(
-                        borderRadius: BorderRadius.circular(14),
+                        borderRadius: BorderRadius.circular(12),
                         child: AspectRatio(
                           aspectRatio: 16 / 9,
                           child: Image.network(
@@ -525,93 +467,17 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     );
   }
 
-  Widget _buildPromoComposer() {
-    if (!_isCreatorBase) return const SizedBox.shrink();
-    const title = 'Тестовая промо самому себе';
-    const subtitle =
-        'Создатель может проверить промо только на себе. Реальную рассылку делает администратор.';
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              title,
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              subtitle,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _promoTitleCtrl,
-              decoration: const InputDecoration(
-                labelText: 'Заголовок',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _promoBodyCtrl,
-              minLines: 3,
-              maxLines: 5,
-              decoration: const InputDecoration(
-                labelText: 'Текст',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _promoLinkCtrl,
-              decoration: const InputDecoration(
-                labelText: 'Deep link',
-                hintText: '/notifications или /chat?chatId=...',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _promoImageCtrl,
-              decoration: const InputDecoration(
-                labelText: 'URL картинки (необязательно)',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _promoSending ? null : _sendPromotion,
-              icon: _promoSending
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Icon(
-                      _isCreatorBase
-                          ? Icons.send_outlined
-                          : Icons.campaign_outlined,
-                    ),
-              label: Text('Отправить тест себе'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildCreatorAnalytics() {
     if (!_isCreatorBase) return const SizedBox.shrink();
     final summary = _creatorAnalyticsSummary;
-    return Card(
+    return Container(
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -627,7 +493,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
             else ...[
               Wrap(
                 spacing: 8,
-                runSpacing: 8,
+                runSpacing: 6,
                 children: [
                   Chip(
                     label: Text(
@@ -655,6 +521,8 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
               else
                 ..._creatorAnalyticsCampaigns.take(6).map((campaign) {
                   return ListTile(
+                    dense: true,
+                    visualDensity: VisualDensity.compact,
                     contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.query_stats_outlined),
                     title: Text((campaign['title'] ?? 'Промо').toString()),
@@ -690,6 +558,8 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
               'unread',
         )
         .length;
+    final badgeCount = notificationInboxBadgeCountNotifier.value;
+    final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
         title: const Text('Уведомления'),
@@ -712,11 +582,18 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
             : RefreshIndicator(
                 onRefresh: () => _loadAll(showLoader: false),
                 child: ListView(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
                   children: [
-                    Card(
+                    Container(
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.surface,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: theme.colorScheme.outlineVariant,
+                        ),
+                      ),
                       child: Padding(
-                        padding: const EdgeInsets.all(16),
+                        padding: const EdgeInsets.all(14),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
@@ -725,38 +602,27 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                                 Expanded(
                                   child: Text(
                                     'Центр уведомлений',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .titleMedium
+                                    style: theme.textTheme.titleMedium
                                         ?.copyWith(fontWeight: FontWeight.w800),
                                   ),
                                 ),
-                                ValueListenableBuilder<int>(
-                                  valueListenable:
-                                      notificationInboxBadgeCountNotifier,
-                                  builder: (context, badgeCount, _) {
-                                    return Chip(
-                                      label: Text('Счётчик: $badgeCount'),
-                                      visualDensity: VisualDensity.compact,
-                                    );
-                                  },
+                                Chip(
+                                  label: Text('Новых: $badgeCount'),
+                                  visualDensity: VisualDensity.compact,
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 8),
+                            const SizedBox(height: 6),
                             Text(
                               'Все уведомления и важные действия складываются сюда, даже если push был выключен, не дошёл или пришёл тихо.',
-                              style: Theme.of(context).textTheme.bodyMedium
-                                  ?.copyWith(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
-                                  ),
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
                             ),
-                            const SizedBox(height: 12),
+                            const SizedBox(height: 10),
                             Wrap(
                               spacing: 8,
-                              runSpacing: 8,
+                              runSpacing: 6,
                               children: [
                                 ChoiceChip(
                                   label: Text(
@@ -771,6 +637,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                                     });
                                     unawaited(_loadAll(showLoader: false));
                                   },
+                                  visualDensity: VisualDensity.compact,
                                 ),
                                 ..._categoryLabels.entries.map((entry) {
                                   return ChoiceChip(
@@ -782,14 +649,20 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                                       });
                                       unawaited(_loadAll(showLoader: false));
                                     },
+                                    visualDensity: VisualDensity.compact,
                                   );
                                 }),
                               ],
                             ),
-                            const SizedBox(height: 12),
+                            const SizedBox(height: 10),
                             Row(
                               children: [
-                                Text('Непрочитанных в списке: $unreadCount'),
+                                Expanded(
+                                  child: Text(
+                                    'Непрочитанных в списке: $unreadCount',
+                                    style: theme.textTheme.bodyMedium,
+                                  ),
+                                ),
                                 const Spacer(),
                                 TextButton.icon(
                                   onPressed: _markAllBusy
@@ -813,8 +686,18 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                       ),
                     ),
                     if (_showIosPwaOnboarding) ...[
-                      Card(
+                      const SizedBox(height: 10),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surface,
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(
+                            color: theme.colorScheme.outlineVariant,
+                          ),
+                        ),
                         child: ListTile(
+                          dense: true,
+                          visualDensity: VisualDensity.compact,
                           leading: const Icon(
                             Icons.add_to_home_screen_outlined,
                           ),
@@ -835,36 +718,40 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     ],
                     if (_message.isNotEmpty)
                       Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.only(top: 10),
                         child: Container(
-                          padding: const EdgeInsets.all(14),
+                          padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
-                            color: Theme.of(context).colorScheme.errorContainer,
-                            borderRadius: BorderRadius.circular(18),
+                            color: theme.colorScheme.errorContainer,
+                            borderRadius: BorderRadius.circular(16),
                           ),
                           child: Text(
                             _message,
                             style: TextStyle(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onErrorContainer,
+                              color: theme.colorScheme.onErrorContainer,
                             ),
                           ),
                         ),
                       ),
+                    const SizedBox(height: 10),
                     ..._items.map(_buildInboxCard),
                     if (_items.isEmpty)
-                      Card(
+                      Container(
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surface,
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(
+                            color: theme.colorScheme.outlineVariant,
+                          ),
+                        ),
                         child: Padding(
-                          padding: const EdgeInsets.all(20),
+                          padding: const EdgeInsets.all(16),
                           child: Text(
                             'Пока здесь пусто. Когда появятся сообщения, промо, обновления или события безопасности, они будут доступны в центре уведомлений и в счётчике.',
-                            style: Theme.of(context).textTheme.bodyMedium,
+                            style: theme.textTheme.bodyMedium,
                           ),
                         ),
                       ),
-                    const SizedBox(height: 12),
-                    _buildPromoComposer(),
                     const SizedBox(height: 12),
                     _buildCreatorAnalytics(),
                   ],
