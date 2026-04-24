@@ -44,6 +44,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   Map<String, dynamic> _creatorAnalyticsSummary = const <String, dynamic>{};
   List<Map<String, dynamic>> _creatorAnalyticsCampaigns = const [];
   String? _previousShellSection;
+  bool _analyticsExpanded = false;
 
   bool get _isCreatorBase {
     return authService.effectiveRole.toLowerCase().trim() == 'creator';
@@ -342,6 +343,84 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
   }
 
+  String _selectedCategoryLabel() {
+    return _categoryLabels[_category] ?? 'Все';
+  }
+
+  Widget _buildMetricPill({
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
+          const SizedBox(width: 6),
+          Text(
+            '$label: $value',
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionCard({required Widget child}) {
+    final theme = Theme.of(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+        boxShadow: [
+          BoxShadow(
+            color: theme.colorScheme.shadow.withValues(alpha: 0.04),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+
+  Widget _buildCategoryFilterBar() {
+    final entries = _categoryLabels.entries.toList(growable: false);
+    return SizedBox(
+      height: 38,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: entries.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final entry = entries[index];
+          return ChoiceChip(
+            label: Text(entry.value),
+            selected: _category == entry.key,
+            visualDensity: VisualDensity.compact,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            onSelected: (_) {
+              setState(() {
+                _category = entry.key;
+              });
+              unawaited(_loadAll(showLoader: false));
+            },
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildInboxCard(Map<String, dynamic> item) {
     final theme = Theme.of(context);
     final category = (item['category'] ?? '').toString().trim().toLowerCase();
@@ -351,19 +430,22 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
         (item['status'] ?? 'unread').toString().trim().toLowerCase() ==
         'unread';
     final imageUrl = _previewImageUrl(item);
+    final categoryLabel = _categoryLabels[category] ?? 'Уведомление';
     return Container(
-      margin: const EdgeInsets.only(bottom: 10),
+      margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.circular(18),
+        color: unread
+            ? theme.colorScheme.primary.withValues(alpha: 0.04)
+            : theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(
           color: unread
-              ? theme.colorScheme.primary.withValues(alpha: 0.28)
+              ? theme.colorScheme.primary.withValues(alpha: 0.24)
               : theme.colorScheme.outlineVariant,
         ),
       ),
       child: InkWell(
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(20),
         onTap: () => _openInboxItem(item),
         child: Padding(
           padding: const EdgeInsets.all(12),
@@ -371,11 +453,11 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Container(
-                width: 40,
-                height: 40,
+                width: 42,
+                height: 42,
                 decoration: BoxDecoration(
                   color: _categoryColor(context, category),
-                  borderRadius: BorderRadius.circular(12),
+                  borderRadius: BorderRadius.circular(14),
                 ),
                 child: Icon(_categoryIcon(category)),
               ),
@@ -385,78 +467,134 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Expanded(
-                          child: Text(
-                            title.isEmpty ? 'Уведомление' : title,
-                            style: theme.textTheme.titleSmall?.copyWith(
-                              fontWeight: unread
-                                  ? FontWeight.w800
-                                  : FontWeight.w700,
-                            ),
+                          child: Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: theme.colorScheme.surfaceContainerLow,
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  categoryLabel,
+                                  style: theme.textTheme.labelSmall?.copyWith(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              Text(
+                                formatDateTimeValue(item['created_at']),
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                         if (unread)
                           Container(
-                            width: 10,
-                            height: 10,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
                             decoration: BoxDecoration(
                               color: theme.colorScheme.primary,
-                              shape: BoxShape.circle,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Text(
+                              'Новое',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onPrimary,
+                                fontWeight: FontWeight.w700,
+                              ),
                             ),
                           ),
                       ],
                     ),
-                    const SizedBox(height: 4),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 4,
+                    const SizedBox(height: 8),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Chip(
-                          label: Text(_categoryLabels[category] ?? category),
-                          visualDensity: VisualDensity.compact,
-                          materialTapTargetSize:
-                              MaterialTapTargetSize.shrinkWrap,
-                        ),
-                        Text(
-                          formatDateTimeValue(item['created_at']),
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.colorScheme.onSurfaceVariant,
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title.isEmpty ? 'Уведомление' : title,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.titleSmall?.copyWith(
+                                  fontWeight: unread
+                                      ? FontWeight.w800
+                                      : FontWeight.w700,
+                                ),
+                              ),
+                              if (body.isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  body,
+                                  maxLines: imageUrl == null ? 3 : 4,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
+                        ),
+                        if (imageUrl != null) ...[
+                          const SizedBox(width: 10),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(14),
+                            child: SizedBox(
+                              width: 88,
+                              height: 88,
+                              child: Image.network(
+                                imageUrl,
+                                fit: BoxFit.cover,
+                                errorBuilder: (context, error, stackTrace) =>
+                                    Container(
+                                      color: theme
+                                          .colorScheme
+                                          .surfaceContainerHighest,
+                                      alignment: Alignment.center,
+                                      child: const Icon(
+                                        Icons.image_not_supported_outlined,
+                                      ),
+                                    ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Text(
+                          'Открыть',
+                          style: theme.textTheme.labelLarge?.copyWith(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const Spacer(),
+                        Icon(
+                          Icons.chevron_right_rounded,
+                          color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ],
                     ),
-                    if (body.isNotEmpty) ...[
-                      const SizedBox(height: 6),
-                      Text(
-                        body,
-                        maxLines: 4,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodyMedium,
-                      ),
-                    ],
-                    if (imageUrl != null) ...[
-                      const SizedBox(height: 8),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: AspectRatio(
-                          aspectRatio: 16 / 9,
-                          child: Image.network(
-                            imageUrl,
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) =>
-                                Container(
-                                  color:
-                                      theme.colorScheme.surfaceContainerHighest,
-                                  alignment: Alignment.center,
-                                  child: const Icon(
-                                    Icons.image_not_supported_outlined,
-                                  ),
-                                ),
-                          ),
-                        ),
-                      ),
-                    ],
                   ],
                 ),
               ),
@@ -470,56 +608,77 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   Widget _buildCreatorAnalytics() {
     if (!_isCreatorBase) return const SizedBox.shrink();
     final summary = _creatorAnalyticsSummary;
-    return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Аналитика промо создателя',
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+    final theme = Theme.of(context);
+    return _buildSectionCard(
+      child: Theme(
+        data: theme.copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(22)),
+          ),
+          collapsedShape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(22)),
+          ),
+          initiallyExpanded: _analyticsExpanded,
+          onExpansionChanged: (value) {
+            setState(() {
+              _analyticsExpanded = value;
+            });
+          },
+          title: Text(
+            'Аналитика промо',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w800,
             ),
-            const SizedBox(height: 10),
+          ),
+          subtitle: Text(
+            'Кампаний: ${summary['campaigns_total'] ?? 0} • Получателей: ${summary['recipients_total'] ?? 0}',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          children: [
             if (_loadingExtras)
               const LinearProgressIndicator()
             else ...[
               Wrap(
                 spacing: 8,
-                runSpacing: 6,
+                runSpacing: 8,
                 children: [
-                  Chip(
-                    label: Text(
-                      'Кампаний: ${(summary['campaigns_total'] ?? 0)}',
-                    ),
+                  _buildMetricPill(
+                    icon: Icons.campaign_outlined,
+                    label: 'Кампаний',
+                    value: '${summary['campaigns_total'] ?? 0}',
                   ),
-                  Chip(
-                    label: Text(
-                      'Отправлено: ${(summary['campaigns_sent'] ?? 0)}',
-                    ),
+                  _buildMetricPill(
+                    icon: Icons.send_outlined,
+                    label: 'Отправлено',
+                    value: '${summary['campaigns_sent'] ?? 0}',
                   ),
-                  Chip(
-                    label: Text('Ошибок: ${(summary['campaigns_error'] ?? 0)}'),
+                  _buildMetricPill(
+                    icon: Icons.error_outline_rounded,
+                    label: 'Ошибок',
+                    value: '${summary['campaigns_error'] ?? 0}',
                   ),
-                  Chip(
-                    label: Text(
-                      'Получателей: ${(summary['recipients_total'] ?? 0)}',
-                    ),
+                  _buildMetricPill(
+                    icon: Icons.group_outlined,
+                    label: 'Получателей',
+                    value: '${summary['recipients_total'] ?? 0}',
                   ),
                 ],
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
               if (_creatorAnalyticsCampaigns.isEmpty)
-                const Text('Пока нет аналитики по промо-кампаниям.')
+                Text(
+                  'Пока нет аналитики по промо-кампаниям.',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                )
               else
-                ..._creatorAnalyticsCampaigns.take(6).map((campaign) {
+                ..._creatorAnalyticsCampaigns.take(5).map((campaign) {
                   return ListTile(
                     dense: true,
                     visualDensity: VisualDensity.compact,
@@ -527,7 +686,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     leading: const Icon(Icons.query_stats_outlined),
                     title: Text((campaign['title'] ?? 'Промо').toString()),
                     subtitle: Text(
-                      'Отправлено: ${(campaign['deliveries_sent'] ?? 0)} • Ошибок: ${(campaign['deliveries_failed'] ?? 0)} • Открыто: ${(campaign['deliveries_opened'] ?? 0)}',
+                      'Отправлено: ${(campaign['deliveries_sent'] ?? 0)} • Открыто: ${(campaign['deliveries_opened'] ?? 0)}',
                     ),
                     trailing: Text(formatDateTimeValue(campaign['created_at'])),
                   );
@@ -562,7 +721,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Уведомления'),
+        title: const Text('Центр уведомлений'),
         actions: [
           IconButton(
             onPressed: _loading ? null : _openPreferences,
@@ -584,86 +743,94 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                 child: ListView(
                   padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
                   children: [
-                    Container(
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.surface,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: theme.colorScheme.outlineVariant,
-                        ),
-                      ),
+                    _buildSectionCard(
                       child: Padding(
-                        padding: const EdgeInsets.all(14),
+                        padding: const EdgeInsets.all(16),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Expanded(
-                                  child: Text(
-                                    'Центр уведомлений',
-                                    style: theme.textTheme.titleMedium
-                                        ?.copyWith(fontWeight: FontWeight.w800),
+                                Container(
+                                  width: 42,
+                                  height: 42,
+                                  decoration: BoxDecoration(
+                                    color: theme.colorScheme.primaryContainer,
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                  child: Icon(
+                                    Icons.notifications_active_outlined,
+                                    color: theme.colorScheme.onPrimaryContainer,
                                   ),
                                 ),
-                                Chip(
-                                  label: Text('Новых: $badgeCount'),
-                                  visualDensity: VisualDensity.compact,
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'Центр уведомлений',
+                                        style: theme.textTheme.titleMedium
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        'Здесь остаются все важные уведомления, даже если push не дошёл или был выключен.',
+                                        style: theme.textTheme.bodySmall
+                                            ?.copyWith(
+                                              color: theme
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                            ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 6),
-                            Text(
-                              'Все уведомления и важные действия складываются сюда, даже если push был выключен, не дошёл или пришёл тихо.',
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
+                            const SizedBox(height: 12),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                _buildMetricPill(
+                                  icon: Icons.mark_email_unread_outlined,
+                                  label: 'Новых',
+                                  value: '$badgeCount',
+                                ),
+                                _buildMetricPill(
+                                  icon: Icons.filter_alt_outlined,
+                                  label: 'Фильтр',
+                                  value: _selectedCategoryLabel(),
+                                ),
+                                _buildMetricPill(
+                                  icon: Icons.drafts_outlined,
+                                  label: 'В списке',
+                                  value: '$unreadCount',
+                                ),
+                              ],
                             ),
                             const SizedBox(height: 10),
                             Wrap(
                               spacing: 8,
-                              runSpacing: 6,
+                              runSpacing: 8,
+                              crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
-                                ChoiceChip(
-                                  label: Text(
-                                    _unreadOnly
-                                        ? 'Только непрочитанные'
-                                        : 'Все статусы',
-                                  ),
+                                FilterChip(
+                                  label: const Text('Только непрочитанные'),
                                   selected: _unreadOnly,
+                                  visualDensity: VisualDensity.compact,
                                   onSelected: (value) {
                                     setState(() {
                                       _unreadOnly = value;
                                     });
                                     unawaited(_loadAll(showLoader: false));
                                   },
-                                  visualDensity: VisualDensity.compact,
                                 ),
-                                ..._categoryLabels.entries.map((entry) {
-                                  return ChoiceChip(
-                                    label: Text(entry.value),
-                                    selected: _category == entry.key,
-                                    onSelected: (_) {
-                                      setState(() {
-                                        _category = entry.key;
-                                      });
-                                      unawaited(_loadAll(showLoader: false));
-                                    },
-                                    visualDensity: VisualDensity.compact,
-                                  );
-                                }),
-                              ],
-                            ),
-                            const SizedBox(height: 10),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    'Непрочитанных в списке: $unreadCount',
-                                    style: theme.textTheme.bodyMedium,
-                                  ),
-                                ),
-                                const Spacer(),
                                 TextButton.icon(
                                   onPressed: _markAllBusy
                                       ? null
@@ -681,20 +848,15 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                                 ),
                               ],
                             ),
+                            const SizedBox(height: 10),
+                            _buildCategoryFilterBar(),
                           ],
                         ),
                       ),
                     ),
                     if (_showIosPwaOnboarding) ...[
                       const SizedBox(height: 10),
-                      Container(
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.surface,
-                          borderRadius: BorderRadius.circular(18),
-                          border: Border.all(
-                            color: theme.colorScheme.outlineVariant,
-                          ),
-                        ),
+                      _buildSectionCard(
                         child: ListTile(
                           dense: true,
                           visualDensity: VisualDensity.compact,
@@ -736,19 +898,23 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     const SizedBox(height: 10),
                     ..._items.map(_buildInboxCard),
                     if (_items.isEmpty)
-                      Container(
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.surface,
-                          borderRadius: BorderRadius.circular(18),
-                          border: Border.all(
-                            color: theme.colorScheme.outlineVariant,
-                          ),
-                        ),
+                      _buildSectionCard(
                         child: Padding(
                           padding: const EdgeInsets.all(16),
-                          child: Text(
-                            'Пока здесь пусто. Когда появятся сообщения, промо, обновления или события безопасности, они будут доступны в центре уведомлений и в счётчике.',
-                            style: theme.textTheme.bodyMedium,
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.inbox_outlined,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  'Пока здесь пусто. Когда появятся сообщения или системные уведомления, они будут доступны здесь.',
+                                  style: theme.textTheme.bodyMedium,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
