@@ -54,8 +54,11 @@ class _NotificationPreferencesScreenState
   bool _quietHoursEnabled = false;
   String _digestMode = 'daily_non_urgent';
   bool _loadedPushEnabled = false;
+  bool _deviceNotificationsEnabled = true;
+  bool _messagePreviewEnabled = true;
+  bool _soundEnabled = true;
+  bool _showWhenActive = false;
 
-  bool _clientMasterEnabled = true;
   bool _clientChatEnabled = true;
   bool _clientSupportEnabled = true;
   bool _clientPromoEnabled = false;
@@ -81,12 +84,7 @@ class _NotificationPreferencesScreenState
   bool get _showsDeliveryLocked =>
       _isAdminBaseRole || _isWorkerBaseRole || _isTenantBaseRole;
 
-  bool _effectivePushEnabledFromState() {
-    if (_isClientBaseRole) {
-      return _clientMasterEnabled;
-    }
-    return _channels['push'] ?? false;
-  }
+  bool _effectivePushEnabledFromState() => _deviceNotificationsEnabled;
 
   @override
   void initState() {
@@ -127,21 +125,16 @@ class _NotificationPreferencesScreenState
     return next;
   }
 
-  bool _deriveClientMasterEnabled(Map<String, dynamic> data) {
-    final categories = _boolMap(data['categories'], _categoryLabels.keys);
-    final channels = _boolMap(data['channels'], _channelLabels.keys);
-    return channels.values.any((value) => value) ||
-        categories.values.any((value) => value) ||
-        data['promo_opt_in'] == true ||
-        data['updates_opt_in'] == true;
-  }
-
   Future<void> _load() async {
     setState(() {
       _loading = true;
       _message = '';
     });
     try {
+      final localEnabled =
+          await NotificationRuntimePreferenceService.isEnabledForUser(
+            authService.currentUser?.id,
+          );
       final response = await authService.dio.get(
         '/api/notifications/preferences',
       );
@@ -159,6 +152,9 @@ class _NotificationPreferencesScreenState
         );
         _promoOptIn = data['promo_opt_in'] == true;
         _updatesOptIn = data['updates_opt_in'] != false;
+        _messagePreviewEnabled = data['message_preview_enabled'] != false;
+        _soundEnabled = data['sound_enabled'] != false;
+        _showWhenActive = data['show_when_active'] == true;
         _quietHoursEnabled = data['quiet_hours_enabled'] == true;
         _digestMode = (data['digest_mode'] ?? 'daily_non_urgent').toString();
         _quietFromCtrl.text = (data['quiet_from'] ?? '').toString();
@@ -171,13 +167,20 @@ class _NotificationPreferencesScreenState
         _lowPriorityCapCtrl.text = (caps['low_priority_per_day'] ?? 5)
             .toString();
 
-        _clientMasterEnabled = _deriveClientMasterEnabled(data);
+        _deviceNotificationsEnabled = localEnabled;
         _clientChatEnabled = _categories['chat'] ?? true;
         _clientSupportEnabled = _categories['support'] ?? true;
         _clientPromoEnabled =
             (_categories['promo'] ?? false) || data['promo_opt_in'] == true;
-        _loadedPushEnabled = _effectivePushEnabledFromState();
+        _loadedPushEnabled = localEnabled;
       });
+      await NotificationRuntimePreferenceService.persistPolicyForUser(
+        authService.currentUser?.id,
+        NotificationRuntimePolicy.fromServerPreferences(
+          data,
+          enabled: localEnabled,
+        ),
+      );
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -206,21 +209,24 @@ class _NotificationPreferencesScreenState
       if (_isClientBaseRole) {
         payload = <String, dynamic>{
           'categories': <String, bool>{
-            'chat': _clientMasterEnabled ? _clientChatEnabled : false,
-            'support': _clientMasterEnabled ? _clientSupportEnabled : false,
+            'chat': _clientChatEnabled,
+            'support': _clientSupportEnabled,
             'reserved': false,
-            'delivery': _clientMasterEnabled,
-            'promo': _clientMasterEnabled ? _clientPromoEnabled : false,
-            'updates': _clientMasterEnabled,
-            'security': _clientMasterEnabled,
+            'delivery': true,
+            'promo': _clientPromoEnabled,
+            'updates': true,
+            'security': true,
           },
           'channels': <String, bool>{
-            'push': _clientMasterEnabled,
-            'in_app': _clientMasterEnabled,
+            'push': true,
+            'in_app': true,
             'email': false,
           },
-          'promo_opt_in': _clientMasterEnabled && _clientPromoEnabled,
-          'updates_opt_in': _clientMasterEnabled,
+          'promo_opt_in': _clientPromoEnabled,
+          'updates_opt_in': true,
+          'message_preview_enabled': _messagePreviewEnabled,
+          'sound_enabled': _soundEnabled,
+          'show_when_active': _showWhenActive,
         };
       } else if (_isCreatorBaseRole) {
         payload = <String, dynamic>{
@@ -228,6 +234,9 @@ class _NotificationPreferencesScreenState
           'channels': _channels,
           'promo_opt_in': _promoOptIn,
           'updates_opt_in': _updatesOptIn,
+          'message_preview_enabled': _messagePreviewEnabled,
+          'sound_enabled': _soundEnabled,
+          'show_when_active': _showWhenActive,
           'quiet_hours_enabled': _quietHoursEnabled,
           'quiet_from': _quietFromCtrl.text.trim(),
           'quiet_to': _quietToCtrl.text.trim(),
@@ -244,12 +253,30 @@ class _NotificationPreferencesScreenState
         payload = <String, dynamic>{
           'categories': _categories,
           'channels': _channels,
+          'message_preview_enabled': _messagePreviewEnabled,
+          'sound_enabled': _soundEnabled,
+          'show_when_active': _showWhenActive,
         };
       }
 
-      await authService.dio.patch(
+      final response = await authService.dio.patch(
         '/api/notifications/preferences',
         data: payload,
+      );
+      final root = response.data;
+      final saved = root is Map && root['data'] is Map
+          ? Map<String, dynamic>.from(root['data'])
+          : payload;
+      await NotificationRuntimePreferenceService.persistEnabledForUser(
+        authService.currentUser?.id,
+        _deviceNotificationsEnabled,
+      );
+      await NotificationRuntimePreferenceService.persistPolicyForUser(
+        authService.currentUser?.id,
+        NotificationRuntimePolicy.fromServerPreferences(
+          saved,
+          enabled: _deviceNotificationsEnabled,
+        ),
       );
       await NotificationRuntimePreferenceService.applyRuntimePreference(
         authService.dio,
@@ -395,21 +422,22 @@ class _NotificationPreferencesScreenState
         _buildMessageBox(),
         if (_message.isNotEmpty) const SizedBox(height: 12),
         _buildSwitchCard(
-          title: 'Получение уведомлений',
+          title: 'Уведомления на этом устройстве',
           subtitle:
-              'Главный переключатель всех уведомлений Феникс на этом устройстве.',
-          value: _clientMasterEnabled,
+              'Локальный master-switch. Не выключает уведомления на других устройствах.',
+          value: _deviceNotificationsEnabled,
           onChanged: (value) {
             setState(() {
-              _clientMasterEnabled = value;
+              _deviceNotificationsEnabled = value;
             });
           },
         ),
+        _buildRuntimeSection(),
         _buildSwitchCard(
           title: 'Личные сообщения',
           subtitle: 'Новые сообщения и ответы в личных чатах.',
           value: _clientChatEnabled,
-          enabled: _clientMasterEnabled,
+          enabled: _deviceNotificationsEnabled,
           onChanged: (value) {
             setState(() {
               _clientChatEnabled = value;
@@ -420,7 +448,7 @@ class _NotificationPreferencesScreenState
           title: 'Поддержка',
           subtitle: 'Ответы поддержки и изменения по вашим обращениям.',
           value: _clientSupportEnabled,
-          enabled: _clientMasterEnabled,
+          enabled: _deviceNotificationsEnabled,
           onChanged: (value) {
             setState(() {
               _clientSupportEnabled = value;
@@ -431,7 +459,7 @@ class _NotificationPreferencesScreenState
           title: 'Акции и промо',
           subtitle: 'Полноэкранные предложения и промо-уведомления от Феникс.',
           value: _clientPromoEnabled,
-          enabled: _clientMasterEnabled,
+          enabled: _deviceNotificationsEnabled,
           onChanged: (value) {
             setState(() {
               _clientPromoEnabled = value;
@@ -499,6 +527,18 @@ class _NotificationPreferencesScreenState
         _buildMessageBox(),
         if (_message.isNotEmpty) const SizedBox(height: 12),
         _buildSwitchCard(
+          title: 'Уведомления на этом устройстве',
+          subtitle:
+              'Локальный master-switch для этого телефона, браузера или компьютера.',
+          value: _deviceNotificationsEnabled,
+          onChanged: (value) {
+            setState(() {
+              _deviceNotificationsEnabled = value;
+            });
+          },
+        ),
+        _buildRuntimeSection(),
+        _buildSwitchCard(
           title: 'Личные сообщения',
           subtitle: 'Сообщения в чатах и ответы по работе.',
           value: _categories['chat'] ?? true,
@@ -561,6 +601,17 @@ class _NotificationPreferencesScreenState
         const SizedBox(height: 12),
         _buildMessageBox(),
         if (_message.isNotEmpty) const SizedBox(height: 12),
+        _buildSwitchCard(
+          title: 'Уведомления на этом устройстве',
+          subtitle: 'Локальный master-switch для этого конкретного устройства.',
+          value: _deviceNotificationsEnabled,
+          onChanged: (value) {
+            setState(() {
+              _deviceNotificationsEnabled = value;
+            });
+          },
+        ),
+        _buildRuntimeSection(),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -775,6 +826,49 @@ class _NotificationPreferencesScreenState
                 )
               : const Icon(Icons.save_outlined),
           label: const Text('Сохранить настройки'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRuntimeSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildSwitchCard(
+          title: 'Предпросмотр сообщений',
+          subtitle:
+              'Если выключено, тексты сообщений и служебных ответов скрываются в push.',
+          value: _messagePreviewEnabled,
+          enabled: _deviceNotificationsEnabled,
+          onChanged: (value) {
+            setState(() {
+              _messagePreviewEnabled = value;
+            });
+          },
+        ),
+        _buildSwitchCard(
+          title: 'Звук уведомлений',
+          subtitle: 'Отключает звук и переводит push в тихий режим.',
+          value: _soundEnabled,
+          enabled: _deviceNotificationsEnabled,
+          onChanged: (value) {
+            setState(() {
+              _soundEnabled = value;
+            });
+          },
+        ),
+        _buildSwitchCard(
+          title: 'Показывать, когда приложение открыто',
+          subtitle:
+              'Если выключено, foreground-подсказки и локальные баннеры не показываются поверх активного приложения.',
+          value: _showWhenActive,
+          enabled: _deviceNotificationsEnabled,
+          onChanged: (value) {
+            setState(() {
+              _showWhenActive = value;
+            });
+          },
         ),
       ],
     );

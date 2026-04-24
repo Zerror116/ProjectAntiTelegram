@@ -37,13 +37,122 @@
     body {
       margin: 0;
       min-height: 100%;
-      background: transparent;
+      background: #0f172a;
       overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #e5eefc;
+    }
+
+    #bootstrap-shell {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background:
+        radial-gradient(circle at top, rgba(47,107,255,0.22), transparent 42%),
+        linear-gradient(180deg, #0f172a 0%, #101827 100%);
+      z-index: 999999;
+      transition: opacity 220ms ease, visibility 220ms ease;
+    }
+
+    #bootstrap-shell.is-hidden {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    .bootstrap-card {
+      width: min(92vw, 420px);
+      padding: 28px 24px;
+      border-radius: 24px;
+      background: rgba(15, 23, 42, 0.78);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      box-shadow: 0 24px 54px rgba(0, 0, 0, 0.34);
+      backdrop-filter: blur(10px);
+    }
+
+    .bootstrap-brand {
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      margin-bottom: 10px;
+    }
+
+    .bootstrap-status {
+      font-size: 15px;
+      line-height: 1.45;
+      color: rgba(226, 232, 240, 0.92);
+      min-height: 44px;
+    }
+
+    .bootstrap-subtitle {
+      margin-top: 10px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: rgba(148, 163, 184, 0.92);
+    }
+
+    .bootstrap-spinner {
+      width: 46px;
+      height: 46px;
+      border-radius: 999px;
+      border: 3px solid rgba(148, 163, 184, 0.24);
+      border-top-color: #60a5fa;
+      animation: bootstrap-spin 1s linear infinite;
+      margin-bottom: 18px;
+    }
+
+    .bootstrap-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .bootstrap-button {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: #2f6bff;
+      color: white;
+    }
+
+    .bootstrap-button.secondary {
+      background: rgba(148, 163, 184, 0.16);
+      color: #dbeafe;
+    }
+
+    .bootstrap-button[hidden] {
+      display: none;
+    }
+
+    @keyframes bootstrap-spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
   </style>
   <meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" name="viewport">
 </head>
 <body>
+  <div id="bootstrap-shell">
+    <div class="bootstrap-card">
+      <div class="bootstrap-spinner" id="bootstrap-spinner"></div>
+      <div class="bootstrap-brand">Проект Феникс</div>
+      <div class="bootstrap-status" id="bootstrap-status">
+        Загружаем приложение...
+      </div>
+      <div class="bootstrap-subtitle" id="bootstrap-subtitle">
+        Проверяем обновления и готовим безопасный запуск.
+      </div>
+      <div class="bootstrap-actions">
+        <button class="bootstrap-button" id="bootstrap-retry" hidden>Повторить</button>
+        <button class="bootstrap-button secondary" id="bootstrap-reload-cache" hidden>Сбросить кэш</button>
+      </div>
+    </div>
+  </div>
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader
@@ -58,6 +167,78 @@
       const buildVersionKey = 'projectphoenix-web-build-version';
       const reloadOnceKey = 'projectphoenix-web-reload-once';
       const versionPollTimerKey = 'projectphoenix-web-version-poll';
+      const bootstrapTimeoutMs = 14000;
+      let bootstrapTimeoutId = null;
+
+      const shell = document.getElementById('bootstrap-shell');
+      const statusNode = document.getElementById('bootstrap-status');
+      const subtitleNode = document.getElementById('bootstrap-subtitle');
+      const retryButton = document.getElementById('bootstrap-retry');
+      const reloadCacheButton = document.getElementById('bootstrap-reload-cache');
+      const spinnerNode = document.getElementById('bootstrap-spinner');
+
+      function setBootstrapStatus(text, subtitle) {
+        if (statusNode && typeof text === 'string' && text.trim()) {
+          statusNode.textContent = text.trim();
+        }
+        if (subtitleNode && typeof subtitle === 'string') {
+          subtitleNode.textContent = subtitle;
+        }
+      }
+
+      function setBootstrapFailure(message) {
+        if (bootstrapTimeoutId) {
+          window.clearTimeout(bootstrapTimeoutId);
+          bootstrapTimeoutId = null;
+        }
+        if (spinnerNode) {
+          spinnerNode.style.display = 'none';
+        }
+        setBootstrapStatus(
+          message || 'Феникс не смог запуститься с первой попытки.',
+          'Можно повторить запуск или очистить кэш этой версии сайта.',
+        );
+        if (retryButton) retryButton.hidden = false;
+        if (reloadCacheButton) reloadCacheButton.hidden = false;
+      }
+
+      function markBootstrapReady() {
+        if (bootstrapTimeoutId) {
+          window.clearTimeout(bootstrapTimeoutId);
+          bootstrapTimeoutId = null;
+        }
+        if (shell) {
+          shell.classList.add('is-hidden');
+        }
+      }
+
+      async function restartWithCacheReset() {
+        await clearOldWebCaches();
+        window.location.reload();
+      }
+
+      window.projectPhoenixBootstrap = {
+        setStatus: function (text) {
+          setBootstrapStatus(text, 'Подключаем интерфейс и локальные данные.');
+        },
+        ready: function () {
+          markBootstrapReady();
+        },
+        fail: function (text) {
+          setBootstrapFailure(text || 'Запуск Феникс завершился ошибкой.');
+        },
+      };
+
+      if (retryButton) {
+        retryButton.addEventListener('click', function () {
+          window.location.reload();
+        });
+      }
+      if (reloadCacheButton) {
+        reloadCacheButton.addEventListener('click', function () {
+          restartWithCacheReset();
+        });
+      }
 
       function isStandaloneMode() {
         return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
@@ -90,6 +271,9 @@
         const script = document.createElement('script');
         script.src = versionedAsset('flutter_bootstrap.js', versionToken);
         script.async = true;
+        script.onerror = function () {
+          setBootstrapFailure('Не удалось загрузить веб-бандл Феникс.');
+        };
         document.body.appendChild(script);
       }
 
@@ -165,6 +349,10 @@
       }
 
       (async function bootstrapWithAutoRefresh() {
+        setBootstrapStatus(
+          'Проверяем актуальную версию Феникс...',
+          'Это занимает несколько секунд при первом открытии или после обновления.',
+        );
         let serverVersion = '';
         try {
           serverVersion = await readServerBuildVersion();
@@ -203,6 +391,13 @@
           }
         } catch (_) {}
 
+        setBootstrapStatus(
+          'Загружаем интерфейс Феникс...',
+          'Если соединение нестабильно, экран загрузки останется видимым вместо пустого белого фона.',
+        );
+        bootstrapTimeoutId = window.setTimeout(function () {
+          setBootstrapFailure('Загрузка заняла слишком много времени.');
+        }, bootstrapTimeoutMs);
         appendFlutterBootstrap(serverVersion);
         startVersionPolling();
       })();

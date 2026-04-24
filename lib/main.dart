@@ -23,6 +23,7 @@ import 'services/monitoring_service.dart';
 import 'services/notification_open_tracker_service.dart';
 import 'services/notification_runtime_preference_service.dart';
 import 'services/offline_purchase_queue_service.dart';
+import 'services/startup_bootstrap_bridge.dart';
 import 'services/web_notification_service.dart';
 import 'services/web_push_client_service.dart';
 import 'src/utils/media_url.dart';
@@ -980,8 +981,10 @@ void _applyPerformanceRuntimeTuning(bool enabled) {
 
 Future<void> refreshUserPreferences() async {
   final prefs = await SharedPreferences.getInstance();
-  final notifications = await NotificationRuntimePreferenceService
-      .isEnabledForUser(authService.currentUser?.id);
+  final notifications =
+      await NotificationRuntimePreferenceService.isEnabledForUser(
+        authService.currentUser?.id,
+      );
   final scope = _settingsScopeUserId();
   final darkMode = prefs.getBool('$_themePrefPrefix$scope') ?? false;
   final performanceRaw = prefs.getBool('$_performanceModePrefPrefix$scope');
@@ -3268,7 +3271,13 @@ class _SupportQueueChip extends StatelessWidget {
   }
 }
 
-String _incomingMessagePreview(Map<String, dynamic>? message) {
+String _incomingMessagePreview(
+  Map<String, dynamic>? message, {
+  bool previewEnabled = true,
+}) {
+  if (!previewEnabled) {
+    return 'Откройте чат, чтобы посмотреть сообщение';
+  }
   if (message == null) return 'Откройте чат, чтобы посмотреть сообщение';
   final text = (message['text'] ?? '').toString().trim();
   if (text.isNotEmpty) {
@@ -3283,6 +3292,12 @@ String _incomingMessagePreview(Map<String, dynamic>? message) {
     if (title.isNotEmpty) return title;
   }
   return 'Новое сообщение';
+}
+
+Future<NotificationRuntimePolicy> _notificationRuntimePolicy() {
+  return NotificationRuntimePreferenceService.getCachedPolicyForUser(
+    authService.currentUser?.id,
+  );
 }
 
 int _notificationUnreadCountFrom(dynamic raw) {
@@ -3703,6 +3718,11 @@ Future<void> _handleIncomingNotificationPayload(
   String source = 'runtime',
 }) async {
   final map = Map<String, dynamic>.from(rawPayload);
+  final fallbackRuntimePolicy = await _notificationRuntimePolicy();
+  final runtimePolicy = NotificationRuntimePreferenceService.policyFromPayload(
+    map,
+    fallback: fallbackRuntimePolicy,
+  );
   final unreadCount = _notificationUnreadCountFrom(
     map['badge_count'] ?? map['unread_count'] ?? 0,
   );
@@ -3741,13 +3761,16 @@ Future<void> _handleIncomingNotificationPayload(
   final context = navigatorKey.currentContext;
   final deepLink = _notificationDeepLink(map);
   final nestedPayload = _notificationMetaPayload(map);
+  final appVisible = !kIsWeb || !WebNotificationService.isDocumentHidden;
 
   if (_isClientBaseNotificationUser()) {
-    final shouldShowPromoFullscreen = category == 'promo';
+    final shouldShowPromoFullscreen =
+        category == 'promo' && (fromTap || runtimePolicy.showWhenActive);
     final shouldShowUpdateFullscreen =
         category == 'updates' &&
         (fromTap || map['force_show'] == true) &&
-        !_shouldSuppressUpdateFullscreen(map);
+        !_shouldSuppressUpdateFullscreen(map) &&
+        (fromTap || runtimePolicy.showWhenActive);
 
     if (shouldShowPromoFullscreen || shouldShowUpdateFullscreen) {
       await _showFullscreenNotificationDialog({
@@ -3769,7 +3792,11 @@ Future<void> _handleIncomingNotificationPayload(
       return;
     }
 
-    if (!fromTap && category == 'security') {
+    if (!fromTap && appVisible && !runtimePolicy.showWhenActive) {
+      return;
+    }
+
+    if (!fromTap && category == 'security' && runtimePolicy.soundEnabled) {
       await playAppSound(AppUiSound.warning);
     }
     return;
@@ -3795,7 +3822,7 @@ Future<void> _handleIncomingNotificationPayload(
       tone: _notificationToneForCategory(category),
       duration: const Duration(seconds: 6),
     );
-    if (category == 'security') {
+    if (category == 'security' && runtimePolicy.soundEnabled) {
       await playAppSound(AppUiSound.warning);
     }
     return;
@@ -3803,6 +3830,7 @@ Future<void> _handleIncomingNotificationPayload(
 
   if (category == 'chat' || category == 'updates') return;
   if (kIsWeb && WebNotificationService.isDocumentHidden) return;
+  if (appVisible && !runtimePolicy.showWhenActive) return;
   if (activeShellSectionNotifier.value == 'notifications') return;
 
   showGlobalAppNotice(
@@ -3811,7 +3839,7 @@ Future<void> _handleIncomingNotificationPayload(
     tone: _notificationToneForCategory(category),
     duration: const Duration(seconds: 6),
   );
-  if (category == 'security') {
+  if (category == 'security' && runtimePolicy.soundEnabled) {
     await playAppSound(AppUiSound.warning);
   }
 }
@@ -3885,6 +3913,8 @@ void _handleSocketNotificationCampaignStatus(dynamic data) {
 
 Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
   if (!notificationsEnabledNotifier.value) return;
+  final runtimePolicy = await _notificationRuntimePolicy();
+  if (!runtimePolicy.enabled) return;
   Map<String, dynamic>? message;
   if (data is Map) {
     final raw = data['message'] ?? data;
@@ -3925,15 +3955,30 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
       message: message,
       chatId: chatId,
       messageId: messageId,
+      policy: runtimePolicy,
     ),
   );
 
-  await playAppSound(AppUiSound.incoming);
+  if (documentHidden) {
+    if (runtimePolicy.soundEnabled) {
+      await playAppSound(AppUiSound.incoming);
+    }
+    return;
+  }
+
+  if (!runtimePolicy.showWhenActive) return;
+
+  if (runtimePolicy.soundEnabled) {
+    await playAppSound(AppUiSound.incoming);
+  }
 
   final senderName = (message?['sender_name'] ?? '').toString().trim();
   final sender = senderName.isNotEmpty ? senderName : 'Новое сообщение';
   showGlobalAppNotice(
-    _incomingMessagePreview(message),
+    _incomingMessagePreview(
+      message,
+      previewEnabled: runtimePolicy.messagePreviewEnabled,
+    ),
     title: sender,
     tone: AppNoticeTone.info,
     duration: const Duration(seconds: 5),
@@ -3944,6 +3989,7 @@ Future<void> _maybeShowIncomingBrowserNotification({
   required Map<String, dynamic>? message,
   required String? chatId,
   required String? messageId,
+  required NotificationRuntimePolicy policy,
 }) async {
   if (!kIsWeb) return;
   if (!notificationsEnabledNotifier.value) return;
@@ -3960,10 +4006,14 @@ Future<void> _maybeShowIncomingBrowserNotification({
   final sender = senderName.isNotEmpty ? senderName : 'Новое сообщение';
   await WebNotificationService.showSystemNotification(
     title: sender,
-    body: _incomingMessagePreview(message),
+    body: _incomingMessagePreview(
+      message,
+      previewEnabled: policy.messagePreviewEnabled,
+    ),
     tag: (messageId?.isNotEmpty ?? false)
         ? 'message:$messageId'
         : ((chatId?.isNotEmpty ?? false) ? 'chat:$chatId' : 'incoming-message'),
+    silent: !policy.soundEnabled,
   );
 }
 
@@ -4902,6 +4952,15 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   bool _offlinePurchaseProbeBusy = false;
   Timer? _appUpdateProbeTimer;
   bool _appUpdateProbeBusy = false;
+  bool _bootstrapReadySent = false;
+
+  void _markBootstrapReadyAfterFrame() {
+    if (_bootstrapReadySent) return;
+    _bootstrapReadySent = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      StartupBootstrapBridge.markReady();
+    });
+  }
 
   void _setFastStartupHomeIfNeeded(Widget next) {
     if (!mounted || _home != null) return;
@@ -5341,6 +5400,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   Future<void> _startInit() async {
     final shouldBlockOnServerHealth = _shouldBlockStartupOnServerHealth();
     try {
+      StartupBootstrapBridge.setStatus('Инициализируем Феникс...');
       authService = AuthService(dio: dio);
       _attachAuthInterceptor();
       final hasStoredToken = await authService
@@ -5356,17 +5416,21 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
           _setFastStartupHomeIfNeeded(const AuthScreen());
         }
       }
-      await NativePushService.initialize(
-        dio: dio,
-        onNotificationOpen:
-            (payload, {required fromTap, required coldStart}) async {
-              await handleNotificationPayloadEntry(
-                payload,
-                fromTap: fromTap,
-                coldStart: coldStart,
-                source: 'native',
-              );
-            },
+      unawaited(
+        NativePushService.initialize(
+          dio: dio,
+          onNotificationOpen:
+              (payload, {required fromTap, required coldStart}) async {
+                await handleNotificationPayloadEntry(
+                  payload,
+                  fromTap: fromTap,
+                  coldStart: coldStart,
+                  source: 'native',
+                );
+              },
+        ).catchError((Object error, StackTrace stackTrace) {
+          debugPrint('NativePushService.initialize skipped: $error');
+        }),
       );
       unawaited(inputLanguageService.initialize());
 
@@ -5416,6 +5480,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       unawaited(_prepareAppSoundPlayer());
     } catch (e, st) {
       debugPrint('Error attaching interceptor: $e\n$st');
+      StartupBootstrapBridge.setStatus(
+        'Феникс запускается в безопасном режиме...',
+      );
     }
 
     final dbReady = shouldBlockOnServerHealth
@@ -5425,9 +5492,19 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       unawaited(ensureDatabaseExists(attempts: 1));
     }
 
-    final initial = await determineInitialScreen(
-      dbReady,
-    ).timeout(const Duration(seconds: 25), onTimeout: () => const AuthScreen());
+    Widget initial;
+    try {
+      initial = await determineInitialScreen(dbReady).timeout(
+        const Duration(seconds: 25),
+        onTimeout: () => const AuthScreen(),
+      );
+    } catch (e, st) {
+      debugPrint('DiagnosticBootstrap.determineInitialScreen failed: $e\n$st');
+      StartupBootstrapBridge.showError(
+        'Старт затянулся. Показываем безопасный вход в приложение.',
+      );
+      initial = const AuthScreen();
+    }
     _updateSubscriptionUiState();
     unawaited(_probePendingPhoneAccessRequests());
     await refreshUserPreferences();
@@ -5449,6 +5526,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   @override
   Widget build(BuildContext context) {
     if (_home == null) {
+      _markBootstrapReadyAfterFrame();
       return AnimatedBuilder(
         animation: Listenable.merge([
           themeModeNotifier,
@@ -5481,6 +5559,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
       );
     }
 
+    _markBootstrapReadyAfterFrame();
     return AnimatedBuilder(
       animation: Listenable.merge([
         themeModeNotifier,
