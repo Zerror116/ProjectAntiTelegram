@@ -79,13 +79,25 @@ bool messengerMatchesReservedSearch({
   String? productCode,
   String? clientPhone,
   String? shelfLabel,
+  String? price,
 }) {
   final rawQuery = query.trim();
   if (rawQuery.isEmpty) return true;
-  if (reservedContext && RegExp(r'^\d+$').hasMatch(rawQuery)) {
-    final normalizedProductCode = (productCode ?? '').trim();
-    return normalizedProductCode.isNotEmpty &&
-        normalizedProductCode == rawQuery;
+
+  final normalizedProductCode = (productCode ?? '').trim();
+  final normalizedPriceRaw = (price ?? '').trim().replaceAll(',', '.');
+  final queryDigitsOnly = RegExp(r'^\d+$').hasMatch(rawQuery);
+  final queryNumeric = double.tryParse(rawQuery.replaceAll(',', '.'));
+  final priceNumeric = double.tryParse(normalizedPriceRaw);
+
+  if (reservedContext && queryDigitsOnly) {
+    final productCodeMatch =
+        normalizedProductCode.isNotEmpty && normalizedProductCode == rawQuery;
+    final priceMatch =
+        queryNumeric != null &&
+        priceNumeric != null &&
+        (priceNumeric - queryNumeric).abs() < 0.0001;
+    return productCodeMatch || priceMatch;
   }
 
   final q = rawQuery.toLowerCase();
@@ -97,6 +109,7 @@ bool messengerMatchesReservedSearch({
     (productCode ?? '').toLowerCase(),
     (clientPhone ?? '').toLowerCase(),
     (shelfLabel ?? '').toLowerCase(),
+    (price ?? '').toLowerCase(),
   ];
   return blobs.any((value) => value.contains(q));
 }
