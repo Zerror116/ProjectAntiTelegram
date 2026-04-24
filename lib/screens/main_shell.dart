@@ -19,7 +19,6 @@ import 'cart_screen.dart';
 import 'chats_screen.dart';
 import 'contacts_screen.dart';
 import 'monitoring_screen.dart';
-import 'notifications_screen.dart';
 import 'profile_screen.dart';
 import 'pwa_guide_screen.dart';
 import 'settings_screen.dart';
@@ -171,7 +170,6 @@ class _MainShellState extends State<MainShell> {
         normalized == 'worker' ||
         normalized == 'tenant' ||
         normalized == 'creator';
-    final showNotifications = normalized == 'creator';
     final showMonitoring = normalized == 'creator';
     return <String>[
       'chats',
@@ -180,7 +178,6 @@ class _MainShellState extends State<MainShell> {
       if (showAdmin) 'admin',
       if (showStats) 'stats',
       if (showWorker) 'worker',
-      if (showNotifications) 'notifications',
       if (showMonitoring) 'monitoring',
       'profile',
       'settings',
@@ -247,12 +244,6 @@ class _MainShellState extends State<MainShell> {
       'product.requeue',
       'product.edit.own_pending',
     ]);
-  }
-
-  bool _hasNotificationsTab() {
-    const roles = {'creator'};
-    final role = _effectiveRole();
-    return roles.contains(role);
   }
 
   bool _hasMonitoringTab() {
@@ -601,14 +592,6 @@ class _MainShellState extends State<MainShell> {
           builder: _buildWorkerScreen,
           priority: 70,
         ),
-      if (_hasNotificationsTab())
-        const _ShellDestination(
-          id: 'notifications',
-          label: 'События',
-          icon: Icons.notifications_outlined,
-          builder: _buildNotificationsScreen,
-          priority: 92,
-        ),
       if (_hasMonitoringTab())
         const _ShellDestination(
           id: 'monitoring',
@@ -642,8 +625,6 @@ class _MainShellState extends State<MainShell> {
   static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
   static Widget _buildStatsScreen(BuildContext context) =>
       const StatsDashboardScreen();
-  static Widget _buildNotificationsScreen(BuildContext context) =>
-      const NotificationsScreen();
   static Widget _buildMonitoringScreen(BuildContext context) =>
       const MonitoringScreen();
   static Widget _buildProfileScreen(BuildContext context) =>
@@ -654,43 +635,7 @@ class _MainShellState extends State<MainShell> {
       const SizedBox.shrink();
 
   Widget _buildNavIcon(BuildContext context, _ShellDestination destination) {
-    if (destination.id != 'notifications') {
-      return Icon(destination.icon);
-    }
-    return ValueListenableBuilder<int>(
-      valueListenable: notificationInboxBadgeCountNotifier,
-      builder: (context, badgeCount, _) {
-        if (badgeCount <= 0) {
-          return Icon(destination.icon);
-        }
-        return Stack(
-          clipBehavior: Clip.none,
-          children: [
-            Icon(destination.icon),
-            Positioned(
-              right: -8,
-              top: -6,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.error,
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
-                alignment: Alignment.center,
-                child: Text(
-                  badgeCount > 99 ? '99+' : '$badgeCount',
-                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onError,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
+    return Icon(destination.icon);
   }
 
   Future<void> _openMoreSheet(

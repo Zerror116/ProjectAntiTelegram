@@ -31,7 +31,7 @@ String? _shellSectionFromPath(String path) {
     case '/stats':
       return 'stats';
     case '/notifications':
-      return 'notifications';
+      return 'settings';
     default:
       return null;
   }
@@ -40,8 +40,6 @@ String? _shellSectionFromPath(String path) {
 bool _canOpenShellSection(String sectionId) {
   final role = authService.effectiveRole.toLowerCase().trim();
   switch (sectionId) {
-    case 'notifications':
-      return role == 'creator';
     case 'admin':
     case 'stats':
       return role == 'admin' || role == 'tenant' || role == 'creator';
@@ -75,10 +73,6 @@ bool _looksLikeNotificationDeepLink(Uri uri) {
       path.contains('update');
 }
 
-bool _canOpenNotificationCenter() {
-  return authService.effectiveRole.toLowerCase().trim() == 'creator';
-}
-
 String? consumeInitialNotificationDeepLink() {
   if (!kIsWeb || _initialNotificationDeepLinkConsumed) return null;
   final uri = Uri.base;
@@ -89,7 +83,8 @@ String? consumeInitialNotificationDeepLink() {
 
 Map<String, dynamic>? consumeInitialNotificationTapPayload() {
   if (!kIsWeb || _initialNotificationDeepLinkConsumed) return null;
-  final rawPayload = Uri.base.queryParameters['notification_payload']?.trim() ?? '';
+  final rawPayload =
+      Uri.base.queryParameters['notification_payload']?.trim() ?? '';
   if (rawPayload.isEmpty) return null;
   try {
     final decoded = jsonDecode(rawPayload);
@@ -235,15 +230,7 @@ Future<bool> openNotificationDeepLink(
     return true;
   }
   if (path.contains('notification')) {
-    if (!_canOpenNotificationCenter()) {
-      showGlobalAppNotice(
-        'Раздел событий доступен только создателю.',
-        title: 'Уведомления',
-        tone: AppNoticeTone.info,
-      );
-      return false;
-    }
-    activeShellSectionNotifier.value = 'notifications';
+    activeShellSectionNotifier.value = 'settings';
     return true;
   }
   if (path.contains('update')) {
