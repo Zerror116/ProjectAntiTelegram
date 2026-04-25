@@ -3457,7 +3457,28 @@ router.post(
         [reservationId || null, cartItemId || null, req.user.tenant_id || null],
       );
       if (reservationQ.rowCount === 0) {
+        const cancelledReservedQ = await client.query(
+          `SELECT id
+           FROM messages
+           WHERE chat_id = $1
+             AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
+             AND (
+               COALESCE(meta->>'reservation_id', '') = $2
+               OR ($3 <> '' AND COALESCE(meta->>'cart_item_id', '') = $3)
+             )
+             AND lower(COALESCE(meta->>'client_cancelled', 'false')) = 'true'
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [reservedChannel.id, reservationId || '', cartItemId || ''],
+        );
         await client.query("ROLLBACK");
+        if (cancelledReservedQ.rowCount > 0) {
+          return res.status(409).json({
+            ok: false,
+            code: "client_cancelled",
+            error: "Клиент отказался от товара",
+          });
+        }
         return res.status(404).json({ ok: false, error: "Резерв не найден" });
       }
 
@@ -3494,6 +3515,7 @@ router.post(
            AND COALESCE(meta->>'user_id', '') = $4
            AND lower(COALESCE(meta->>'processing_mode', 'standard')) <> 'oversize'
            AND lower(COALESCE(meta->>'placed', 'false')) <> 'true'
+           AND lower(COALESCE(meta->>'client_cancelled', 'false')) <> 'true'
          RETURNING id, chat_id, sender_id, text, meta, created_at`,
         [reservedChannel.id, shelfNumber, shelfLabel, userIdText],
       );
