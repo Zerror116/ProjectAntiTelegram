@@ -3664,47 +3664,15 @@ router.post(
 
       const updatedReservedMessages = await client.query(
         `UPDATE messages
-         SET meta = jsonb_set(
-           jsonb_set(
-             jsonb_set(
-               jsonb_set(
-                 jsonb_set(
-                   jsonb_set(
-                     COALESCE(meta, '{}'::jsonb),
-                     '{placed}',
-                     'true'::jsonb,
-                     true
-                   ),
-                   '{processing_mode}',
-                   to_jsonb($3::text),
-                   true
-                 ),
-                 '{is_oversize}',
-                   to_jsonb(($3::text = 'oversize')),
-                   true
-                 ),
-                 '{shelf_number}',
-                 CASE
-                  WHEN $2::int IS NULL THEN 'null'::jsonb
-                  ELSE to_jsonb($2::int)
-                 END,
-                 true
-               ),
-               '{shelf_label}',
-               CASE
-                 WHEN $4::text IS NULL THEN 'null'::jsonb
-                 ELSE to_jsonb($4::text)
-               END,
-               true
-             ),
-             '{processed_by_id}',
-             to_jsonb($5::text),
-             true
-           ),
-           '{processed_by_name}',
-           to_jsonb($6::text),
-           true
-         )
+         SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+               'placed', true,
+               'processing_mode', $3::text,
+               'is_oversize', ($3::text = 'oversize'),
+               'shelf_number', $2::int,
+               'shelf_label', $4::text,
+               'processed_by_id', $5::text,
+               'processed_by_name', $6::text
+             )
          WHERE chat_id = $1
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
            AND (
