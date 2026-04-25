@@ -101,6 +101,16 @@ function emitCartUpdated(req, userId, payload = {}, extraUserIds = []) {
   }
 }
 
+async function acquireCartReservationOperationLock(client, cartItemId) {
+  const normalized = String(cartItemId || '').trim();
+  if (!normalized) return null;
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtext($1), 0)`,
+    [`reservation-op:${normalized}`],
+  );
+  return normalized;
+}
+
 async function resolveEffectiveCartUserId(queryable, reqUser) {
   return await resolveSharedCartOwnerId(queryable, {
     requesterUserId: reqUser?.id || null,
@@ -344,6 +354,7 @@ function buildCartRetentionWarning(row) {
 }
 
 async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQuantity }) {
+  await acquireCartReservationOperationLock(client, cartItemId);
   const itemQ = await client.query(
     `SELECT c.id,
             c.user_id,
@@ -1064,6 +1075,7 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
     }
 
     await client.query('BEGIN');
+    await acquireCartReservationOperationLock(client, cartItemId);
 
     const itemQ = await client.query(
       `SELECT c.id,
