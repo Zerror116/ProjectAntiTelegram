@@ -175,6 +175,71 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
+function normalizeMessageMeta(rawMeta) {
+  if (rawMeta && typeof rawMeta === 'object' && !Array.isArray(rawMeta)) {
+    return { ...rawMeta };
+  }
+  if (typeof rawMeta === 'string' && rawMeta.trim()) {
+    try {
+      const parsed = JSON.parse(rawMeta);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { ...parsed };
+      }
+    } catch (_) {}
+  }
+  return {};
+}
+
+async function updateReservedMessageAfterCartChange(
+  client,
+  {
+    messageId,
+    remainingQuantity,
+    cancelled = false,
+    cancelReason = 'client_declined',
+  } = {},
+) {
+  const normalizedMessageId = String(messageId || '').trim();
+  if (!normalizedMessageId) return null;
+
+  const currentQ = await client.query(
+    `SELECT id, chat_id, sender_id, text, meta, created_at
+     FROM messages
+     WHERE id = $1
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedMessageId],
+  );
+  if (currentQ.rowCount === 0) return null;
+
+  const row = currentQ.rows[0];
+  const nextMeta = normalizeMessageMeta(row.meta);
+
+  if (cancelled) {
+    nextMeta.client_cancelled = true;
+    nextMeta.cancelled_reason = cancelReason;
+    nextMeta.cancelled_at = new Date().toISOString();
+    nextMeta.remaining_quantity = 0;
+    nextMeta.placed = false;
+  } else {
+    nextMeta.quantity = remainingQuantity;
+    nextMeta.remaining_quantity = remainingQuantity;
+    delete nextMeta.client_cancelled;
+    delete nextMeta.cancelled_reason;
+    delete nextMeta.cancelled_at;
+  }
+
+  const updatedQ = await client.query(
+    `UPDATE messages
+     SET meta = $2::jsonb
+     WHERE id = $1
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [normalizedMessageId, JSON.stringify(nextMeta)],
+  );
+  if (updatedQ.rowCount === 0) return null;
+  return updatedQ.rows[0];
+}
+
 async function restoreCatalogProductAfterCartReturn(client, product) {
   const productIdText = String(product?.id || '').trim();
   if (!productIdText) {
@@ -436,15 +501,14 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
     const reservedMessageId = reservationQ.rows[0].reserved_channel_message_id;
     if (remainingQuantity <= 0) {
       if (reservedMessageId) {
-        const removedMsg = await client.query(
-          `DELETE FROM messages
-           WHERE id = $1
-           RETURNING id, chat_id`,
-          [reservedMessageId],
+        updatedReservedMessage = await updateReservedMessageAfterCartChange(
+          client,
+          {
+            messageId: reservedMessageId,
+            remainingQuantity: 0,
+            cancelled: true,
+          },
         );
-        if (removedMsg.rowCount > 0) {
-          removedReservedMessage = removedMsg.rows[0];
-        }
       }
       await client.query('DELETE FROM reservations WHERE id = $1', [reservationQ.rows[0].id]);
     } else {
@@ -456,21 +520,14 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
         [remainingQuantity, reservationQ.rows[0].id],
       );
       if (reservedMessageId) {
-        const updatedMsg = await client.query(
-          `UPDATE messages
-           SET meta = jsonb_set(
-                 COALESCE(meta, '{}'::jsonb),
-                 '{quantity}',
-                 to_jsonb($2::int),
-                 true
-               )
-           WHERE id = $1
-           RETURNING id, chat_id, sender_id, text, meta, created_at`,
-          [reservedMessageId, remainingQuantity],
+        updatedReservedMessage = await updateReservedMessageAfterCartChange(
+          client,
+          {
+            messageId: reservedMessageId,
+            remainingQuantity,
+            cancelled: false,
+          },
         );
-        if (updatedMsg.rowCount > 0) {
-          updatedReservedMessage = updatedMsg.rows[0];
-        }
       }
     }
   }
@@ -1155,15 +1212,14 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       const reservedMessageId = reservationQ.rows[0].reserved_channel_message_id;
       if (remainingQuantity <= 0) {
         if (reservedMessageId) {
-          const removedMsg = await client.query(
-            `DELETE FROM messages
-             WHERE id = $1
-             RETURNING id, chat_id`,
-            [reservedMessageId]
+          updatedReservedMessage = await updateReservedMessageAfterCartChange(
+            client,
+            {
+              messageId: reservedMessageId,
+              remainingQuantity: 0,
+              cancelled: true,
+            },
           );
-          if (removedMsg.rowCount > 0) {
-            removedReservedMessage = removedMsg.rows[0];
-          }
         }
         await client.query('DELETE FROM reservations WHERE id = $1', [reservationQ.rows[0].id]);
       } else {
@@ -1175,21 +1231,14 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
           [remainingQuantity, reservationQ.rows[0].id],
         );
         if (reservedMessageId) {
-          const updatedMsg = await client.query(
-            `UPDATE messages
-             SET meta = jsonb_set(
-                   COALESCE(meta, '{}'::jsonb),
-                   '{quantity}',
-                   to_jsonb($2::int),
-                   true
-                 )
-             WHERE id = $1
-             RETURNING id, chat_id, sender_id, text, meta, created_at`,
-            [reservedMessageId, remainingQuantity],
+          updatedReservedMessage = await updateReservedMessageAfterCartChange(
+            client,
+            {
+              messageId: reservedMessageId,
+              remainingQuantity,
+              cancelled: false,
+            },
           );
-          if (updatedMsg.rowCount > 0) {
-            updatedReservedMessage = updatedMsg.rows[0];
-          }
         }
       }
     }

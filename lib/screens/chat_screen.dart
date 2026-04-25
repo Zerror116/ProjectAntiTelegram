@@ -7048,9 +7048,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool _reservedIsPlaced(Map<String, dynamic> message) {
     final meta = _metaMapOf(message['meta']);
+    if (meta['client_cancelled'] == true) return false;
     final cartItemId = (meta['cart_item_id'] ?? '').toString().trim();
     return meta['placed'] == true ||
         (cartItemId.isNotEmpty && _placedCartItemIds.contains(cartItemId));
+  }
+
+  bool _reservedIsCancelled(Map<String, dynamic> message) {
+    final meta = _metaMapOf(message['meta']);
+    final value = meta['client_cancelled'];
+    if (value == true) return true;
+    return value != null && value.toString().trim().toLowerCase() == 'true';
   }
 
   bool _reservedIsOversize(Map<String, dynamic> message) {
@@ -7210,11 +7218,17 @@ class _ChatScreenState extends State<ChatScreen> {
             _placedCartItemIds.contains(
               (meta['cart_item_id'] ?? '').toString().trim(),
             );
+        final rawCancelled = meta['client_cancelled'];
+        final isCancelled =
+            rawCancelled == true ||
+            (rawCancelled != null &&
+                rawCancelled.toString().trim().toLowerCase() == 'true');
         final processingMode = (meta['processing_mode'] ?? 'standard')
             .toString()
             .trim()
             .toLowerCase();
         if (messageUserId != userKey ||
+            isCancelled ||
             processingMode == 'oversize' ||
             isPlaced) {
           return message;
@@ -7643,6 +7657,31 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       if (!mounted) return;
+      if (e is DioException) {
+        final rawData = e.response?.data;
+        final responseMap = rawData is Map
+            ? Map<String, dynamic>.from(rawData)
+            : const <String, dynamic>{};
+        final errorCode = (responseMap['code'] ?? '').toString().trim();
+        if (errorCode == 'client_cancelled') {
+          _patchReservedOrderMessageLocally(
+            messageId: messageId,
+            reservationId: reservationId,
+            cartItemId: cartItemId,
+            patch: {
+              'client_cancelled': true,
+              'placed': false,
+            },
+          );
+          showAppNotice(
+            context,
+            'Клиент уже отказался от товара',
+            tone: AppNoticeTone.info,
+            duration: const Duration(seconds: 2),
+          );
+          return;
+        }
+      }
       showAppNotice(
         context,
         'Ошибка: ${_extractDioError(e)}',
@@ -10975,6 +11014,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final quantity = metaMap['quantity']?.toString() ?? '—';
     final quantityInt = int.tryParse(quantity) ?? 0;
     final isPlaced = _reservedIsPlaced(message);
+    final isCancelled = _reservedIsCancelled(message);
     final isOversizePlaced = _reservedIsOversize(message);
     final reservedShelfDisplay = _reservedShelfDisplayOfMeta(metaMap);
     final shelf = isOversizePlaced
@@ -11029,7 +11069,11 @@ class _ChatScreenState extends State<ChatScreen> {
     final bubbleColor = hasBuy
         ? theme.colorScheme.surfaceContainerLow
         : isReservedOrder
-        ? (isPlaced
+        ? (isCancelled
+              ? theme.colorScheme.errorContainer.withValues(
+                  alpha: theme.brightness == Brightness.dark ? 0.30 : 0.18,
+                )
+              : isPlaced
               ? const Color(0xFF5E8F6B).withValues(
                   alpha: theme.brightness == Brightness.dark ? 0.34 : 0.18,
                 )
@@ -11166,6 +11210,23 @@ class _ChatScreenState extends State<ChatScreen> {
         return a.key.compareTo(b.key);
       });
     final showLocalLifecycle = metaMap['local_only'] == true;
+    final reservedMarkPlacedDisabled =
+        !_canMarkReservedOrderPlaced() || _markingPlaced || isCancelled;
+    final reservedOversizeDisabled =
+        !_canMarkReservedOrderPlaced() ||
+        isPlaced ||
+        isCancelled ||
+        _markingPlaced;
+    final reservedShelfChangeDisabled =
+        !_canMarkReservedOrderPlaced() ||
+        _markingPlaced ||
+        isOversizePlaced ||
+        isCancelled;
+    final cancelledTooltip = 'Клиент отказался от товара';
+    Widget wrapCancelledTooltip(Widget child) {
+      if (!isCancelled) return child;
+      return Tooltip(message: cancelledTooltip, child: child);
+    }
 
     final bubble = GestureDetector(
       onSecondaryTapDown: (details) => _showMessageActions(
@@ -11458,7 +11519,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
               Text(
-                'Статус: ${isPlaced ? (isOversizePlaced ? 'Обработано • Габарит' : 'Обработано') : 'Ожидание обработки'}',
+                'Статус: ${isCancelled ? 'Клиент отказался от товара' : (isPlaced ? (isOversizePlaced ? 'Обработано • Габарит' : 'Обработано') : 'Ожидание обработки')}',
               ),
               if (isPlaced)
                 Text(
@@ -11484,69 +11545,72 @@ class _ChatScreenState extends State<ChatScreen> {
                 children: [
                   SizedBox(
                     width: 190,
-                    child: ElevatedButton.icon(
-                      icon: Icon(
-                        isPlaced
-                            ? Icons.print_outlined
-                            : Icons.inventory_2_outlined,
-                      ),
-                      onPressed:
-                          (!_canMarkReservedOrderPlaced() || _markingPlaced)
-                          ? null
-                          : isPlaced
-                          ? (_canUseDesktopStickerPrinting
-                                ? () => _openReservedOrderStickerPrint(
-                                    metaMap,
-                                    oversize: isOversizePlaced,
-                                  )
-                                : null)
-                          : () => _markReservedOrderPlaced(
-                              metaMap,
-                              messageId: messageId,
-                              processingMode: 'standard',
-                            ),
-                      label: Text(
-                        isPlaced
-                            ? 'Дай стикер'
-                            : (_markingPlaced ? 'Сохранение...' : 'Положил'),
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 190,
-                    child: OutlinedButton.icon(
-                      icon: const Icon(Icons.all_inbox_outlined),
-                      onPressed:
-                          (!_canMarkReservedOrderPlaced() ||
-                              isPlaced ||
-                              _markingPlaced)
-                          ? null
-                          : () => _markReservedOrderPlaced(
-                              metaMap,
-                              messageId: messageId,
-                              processingMode: 'oversize',
-                            ),
-                      label: Text(
-                        isPlaced && isOversizePlaced
-                            ? 'Габарит'
-                            : (_markingPlaced ? 'Сохранение...' : 'Габарит'),
+                    child: wrapCancelledTooltip(
+                      ElevatedButton.icon(
+                        icon: Icon(
+                          isPlaced
+                              ? Icons.print_outlined
+                              : Icons.inventory_2_outlined,
+                        ),
+                        onPressed: reservedMarkPlacedDisabled
+                            ? null
+                            : isPlaced
+                            ? (_canUseDesktopStickerPrinting
+                                  ? () => _openReservedOrderStickerPrint(
+                                      metaMap,
+                                      oversize: isOversizePlaced,
+                                    )
+                                  : null)
+                            : () => _markReservedOrderPlaced(
+                                metaMap,
+                                messageId: messageId,
+                                processingMode: 'standard',
+                              ),
+                        label: Text(
+                          isPlaced
+                              ? 'Дай стикер'
+                              : (_markingPlaced
+                                    ? 'Сохранение...'
+                                    : 'Положил'),
+                        ),
                       ),
                     ),
                   ),
                   SizedBox(
                     width: 190,
-                    child: OutlinedButton.icon(
-                      icon: const Icon(Icons.swap_horiz_outlined),
-                      onPressed:
-                          (!_canMarkReservedOrderPlaced() ||
-                              _markingPlaced ||
-                              isOversizePlaced)
-                          ? null
-                          : () => _changeReservedOrderShelf(
-                              metaMap,
-                              messageId: messageId,
-                            ),
-                      label: const Text('Смена полки'),
+                    child: wrapCancelledTooltip(
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.all_inbox_outlined),
+                        onPressed: reservedOversizeDisabled
+                            ? null
+                            : () => _markReservedOrderPlaced(
+                                metaMap,
+                                messageId: messageId,
+                                processingMode: 'oversize',
+                              ),
+                        label: Text(
+                          isPlaced && isOversizePlaced
+                              ? 'Габарит'
+                              : (_markingPlaced
+                                    ? 'Сохранение...'
+                                    : 'Габарит'),
+                        ),
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 190,
+                    child: wrapCancelledTooltip(
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.swap_horiz_outlined),
+                        onPressed: reservedShelfChangeDisabled
+                            ? null
+                            : () => _changeReservedOrderShelf(
+                                metaMap,
+                                messageId: messageId,
+                              ),
+                        label: const Text('Смена полки'),
+                      ),
                     ),
                   ),
                 ],
