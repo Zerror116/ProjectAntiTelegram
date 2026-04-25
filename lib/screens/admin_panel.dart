@@ -120,6 +120,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _loading = true;
   bool _saving = false;
   bool _publishing = false;
+  bool _pendingPostsLoading = false;
   bool _dispatchingOrders = false;
   bool _avatarUpdating = false;
   bool _deliveryLoading = false;
@@ -170,7 +171,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   List<Map<String, dynamic>> _channels = [];
   List<Map<String, dynamic>> _pendingPosts = [];
-  List<Map<String, dynamic>> _lastPublished = [];
+  List<Map<String, dynamic>> _activePublishBatches = [];
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
   List<Map<String, dynamic>> _deliveryBatches = [];
   List<Map<String, dynamic>> _deliveryZones = [];
@@ -198,6 +199,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   Map<String, dynamic>? _selectedClientCartUser;
   Map<String, dynamic>? _supportNotificationSummary;
   Map<String, dynamic>? _returnsAnalytics;
+  Map<String, dynamic>? _publishingSummary;
   int _reservedPendingTotal = 0;
   int _reservedPendingUnits = 0;
   String _lastGeneratedTenantKey = '';
@@ -214,6 +216,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final Set<String> _supportFinishBusyTicketIds = <String>{};
   Timer? _supportDraftSaveTimer;
   Timer? _clientCartUndoTimer;
+  Timer? _publishProgressTimer;
   Future<void> Function()? _clientCartPendingCommit;
   VoidCallback? _clientCartPendingRollback;
   String _clientCartPendingLabel = '';
@@ -280,6 +283,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _unbindSupportTemplateDraftAutosave();
     _supportDraftSaveTimer?.cancel();
     _clientCartUndoTimer?.cancel();
+    _publishProgressTimer?.cancel();
     _clientCartPendingCommit = null;
     _clientCartPendingRollback = null;
     _channelTitleCtrl.dispose();
@@ -1332,6 +1336,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   }
 
   Future<void> _loadPendingPosts() async {
+    if (_pendingPostsLoading) return;
+    _pendingPostsLoading = true;
     try {
       final resp = await authService.dio.get(
         '/api/admin/channels/pending_posts',
@@ -1344,7 +1350,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             _pendingPosts = List<Map<String, dynamic>>.from(data['data']);
             _reservedPendingTotal = _toInt(meta['reserved_pending_total']);
             _reservedPendingUnits = _toInt(meta['reserved_pending_units']);
+            _activePublishBatches = _asMapList(meta['active_publish_batches']);
+            _publishingSummary = _asMap(meta['publishing_summary']);
           });
+          _syncPublishProgressPolling();
         }
       }
     } catch (e) {
@@ -1353,7 +1362,63 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           () => _message = 'Ошибка загрузки очереди: ${_extractDioError(e)}',
         );
       }
+    } finally {
+      _pendingPostsLoading = false;
     }
+  }
+
+  bool get _hasActivePublishBatches => _activePublishBatches.isNotEmpty;
+
+  void _syncPublishProgressPolling() {
+    final shouldPoll = _hasActivePublishBatches;
+    if (!shouldPoll) {
+      _publishProgressTimer?.cancel();
+      _publishProgressTimer = null;
+      return;
+    }
+    if (_publishProgressTimer != null) return;
+    _publishProgressTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || _isDisposed) return;
+      unawaited(_loadPendingPosts());
+    });
+  }
+
+  String _publicationStatusLabel(Map<String, dynamic> post) {
+    final status = (post['publish_status'] ?? 'pending').toString().trim();
+    switch (status) {
+      case 'queued':
+        return 'В очереди';
+      case 'publishing':
+        return 'Публикуется';
+      case 'failed':
+        return 'Ошибка публикации';
+      case 'published':
+        return 'Опубликован';
+      default:
+        return 'Ожидает';
+    }
+  }
+
+  Color _publicationStatusColor(ThemeData theme, String status) {
+    switch (status) {
+      case 'queued':
+        return theme.colorScheme.secondaryContainer;
+      case 'publishing':
+        return theme.colorScheme.primaryContainer;
+      case 'failed':
+        return theme.colorScheme.errorContainer;
+      case 'published':
+        return theme.colorScheme.tertiaryContainer;
+      default:
+        return theme.colorScheme.surfaceContainerHighest;
+    }
+  }
+
+  String _formatPublicationDelay(dynamic rawValue) {
+    final millis = _toInt(rawValue);
+    if (millis <= 0) return 'сейчас';
+    final seconds = math.max(1, (millis / 1000).ceil());
+    return '~$seconds сек';
   }
 
   Future<void> _loadFinanceSummary({bool silent = false}) async {
@@ -6262,7 +6327,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     setState(() {
       _publishing = true;
       _message = '';
-      _lastPublished = [];
     });
     try {
       final resp = await authService.dio.post(
@@ -6271,15 +6335,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true) {
-        final published = data['data'] is List
-            ? List<Map<String, dynamic>>.from(data['data'])
-            : <Map<String, dynamic>>[];
+        final acceptedCount = _toInt(data['accepted_count']);
+        final runningChannels = _asMapList(data['already_running_channels']);
         if (mounted) {
           setState(() {
-            _lastPublished = published;
-            _message = published.isEmpty
-                ? 'Нет постов для публикации'
-                : 'Опубликовано постов: ${published.length}. ID товаров выведены ниже.';
+            if (acceptedCount > 0) {
+              _message = 'Публикация запущена: $acceptedCount постов';
+            } else if (runningChannels.isNotEmpty) {
+              _message = 'Публикация уже идёт для выбранного канала';
+            } else {
+              _message = 'Нет постов для публикации';
+            }
           });
         }
         await _loadPendingPosts();
@@ -7746,6 +7812,26 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   Widget _buildModerationTab() {
     final theme = Theme.of(context);
     final compact = MediaQuery.of(context).size.width < 640;
+    final queuedCount = _pendingPosts
+        .where(
+          (post) =>
+              (post['publish_status'] ?? 'pending').toString().trim() ==
+              'queued',
+        )
+        .length;
+    final failedCount = _pendingPosts
+        .where(
+          (post) =>
+              (post['publish_status'] ?? 'pending').toString().trim() ==
+              'failed',
+        )
+        .length;
+    final currentTitle = (_publishingSummary?['current_product_title'] ?? '')
+        .toString()
+        .trim();
+    final publishProgressLabel = _hasActivePublishBatches
+        ? 'Идёт публикация: ${_toInt(_publishingSummary?['published_count'])}/${_toInt(_publishingSummary?['total_count'])}'
+        : null;
     return RefreshIndicator(
       onRefresh: _loadPendingPosts,
       child: ListView(
@@ -7806,13 +7892,117 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   ),
                 ),
               ),
+              if (queuedCount > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.secondaryContainer,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Text(
+                    'В публикации: $queuedCount',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: theme.colorScheme.onSecondaryContainer,
+                    ),
+                  ),
+                ),
+              if (failedCount > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.errorContainer,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Text(
+                    'Ошибки публикации: $failedCount',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                  ),
+                ),
             ],
           ),
+          if (_hasActivePublishBatches) ...[
+            SizedBox(height: compact ? 10 : 14),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(22),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    publishProgressLabel ?? 'Идёт публикация',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  if (currentTitle.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'Сейчас публикуется: $currentTitle',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _buildModerationChip(
+                        'Следующий через: ${_formatPublicationDelay(_publishingSummary?['next_publish_in_ms'])}',
+                      ),
+                      _buildModerationChip(
+                        'Ошибок: ${_toInt(_publishingSummary?['failed_count'])}',
+                      ),
+                      _buildModerationChip(
+                        'Активных каналов: ${_activePublishBatches.length}',
+                      ),
+                    ],
+                  ),
+                  if (_activePublishBatches.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    ..._activePublishBatches.take(3).map((batch) {
+                      final channelTitle =
+                          (batch['channel_title'] ?? 'Канал').toString();
+                      final batchCurrentTitle =
+                          (batch['current_product_title'] ?? '').toString();
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          '$channelTitle · ${_toInt(batch['published_count'])}/${_toInt(batch['total_count'])}'
+                          '${batchCurrentTitle.isNotEmpty ? ' · $batchCurrentTitle' : ''}',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                ],
+              ),
+            ),
+          ],
           SizedBox(height: compact ? 10 : 14),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
-              onPressed: (_publishing || !_canPublishProducts())
+              onPressed: (_publishing || _hasActivePublishBatches || !_canPublishProducts())
                   ? null
                   : _publishPendingPosts,
               icon: _publishing
@@ -7824,9 +8014,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                         color: Colors.white,
                       ),
                     )
+                  : _hasActivePublishBatches
+                  ? const Icon(Icons.schedule_send_outlined)
                   : const Icon(Icons.campaign),
               label: Text(
-                _publishing ? 'Публикация...' : 'Отправить посты на каналы',
+                _publishing
+                    ? 'Запуск публикации...'
+                    : _hasActivePublishBatches
+                    ? 'Публикация уже идёт'
+                    : 'Отправить посты на каналы',
               ),
             ),
           ),
@@ -7862,6 +8058,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               final workerName =
                   (p['queued_by_name'] ?? p['queued_by_email'] ?? 'Работник')
                       .toString();
+              final publishStatus = (p['publish_status'] ?? 'pending')
+                  .toString()
+                  .trim();
               final productLabel = _formatProductLabel(
                 p['product_code'],
                 p['product_shelf_number'],
@@ -7942,12 +8141,40 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                 runSpacing: 6,
                                 children: [
                                   _buildModerationChip('ID $productLabel'),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 8,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: _publicationStatusColor(
+                                        theme,
+                                        publishStatus,
+                                      ),
+                                      borderRadius: BorderRadius.circular(999),
+                                    ),
+                                    child: Text(
+                                      _publicationStatusLabel(p),
+                                      style:
+                                          theme.textTheme.labelLarge?.copyWith(
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                    ),
+                                  ),
                                   _buildModerationChip(
                                     _formatMoney(p['product_price']),
                                   ),
                                   _buildModerationChip(
                                     'x${_toInt(p['product_quantity'])}',
                                   ),
+                                  if (publishStatus == 'failed' &&
+                                      (p['publish_error_code'] ?? '')
+                                          .toString()
+                                          .trim()
+                                          .isNotEmpty)
+                                    _buildModerationChip(
+                                      'Код: ${(p['publish_error_code'] ?? '').toString()}',
+                                    ),
                                 ],
                               ),
                             ],
@@ -7975,7 +8202,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           runSpacing: 8,
                           children: [
                             FilledButton.tonalIcon(
-                              onPressed: _saving
+                              onPressed: _saving ||
+                                      publishStatus == 'queued' ||
+                                      publishStatus == 'publishing'
                                   ? null
                                   : () => _editPendingPost(p),
                               icon: const Icon(Icons.edit_outlined, size: 18),
@@ -7983,7 +8212,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                             ),
                             if (_canDeletePendingPost())
                               OutlinedButton.icon(
-                                onPressed: _saving
+                                onPressed: _saving ||
+                                        publishStatus == 'queued' ||
+                                        publishStatus == 'publishing'
                                     ? null
                                     : () => _deletePendingPost(p),
                                 icon: const Icon(
@@ -7996,35 +8227,24 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                         ),
                       ],
                     ),
+                    if (publishStatus == 'failed' &&
+                        (p['publish_error_message'] ?? '')
+                            .toString()
+                            .trim()
+                            .isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        (p['publish_error_message'] ?? '').toString(),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.error,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               );
             }),
-          if (_lastPublished.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            const Text(
-              'Опубликованные товары и их ID:',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            ..._lastPublished.map((item) {
-              final channelTitle = (item['channel_title'] ?? 'Канал')
-                  .toString();
-              final productLabel =
-                  item['product_label']?.toString() ??
-                  _formatProductLabel(
-                    item['product_code'],
-                    item['shelf_number'],
-                  );
-              final productId = item['product_id']?.toString() ?? '—';
-              return Card(
-                child: ListTile(
-                  title: Text('ID товара: $productLabel'),
-                  subtitle: Text('Канал: $channelTitle\nDB ID: $productId'),
-                ),
-              );
-            }),
-          ],
           if (_lastDispatchedOrders.isNotEmpty) ...[
             const SizedBox(height: 16),
             const Text(

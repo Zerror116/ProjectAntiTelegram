@@ -1514,6 +1514,7 @@ router.get(
                   q.queued_by,
                   q.status,
                   q.is_sent,
+                  COALESCE(q.publish_status, 'pending') AS publish_status,
                   q.payload,
                   q.created_at,
                   c.title AS channel_title,
@@ -1597,6 +1598,7 @@ router.patch(
              AND q.queued_by = $2
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
+             AND COALESCE(q.publish_status, 'pending') NOT IN ('queued', 'publishing')
            RETURNING q.id`,
           [
             queueId,
@@ -1610,6 +1612,27 @@ router.patch(
         );
       });
       if (result.rowCount === 0) {
+        const stateQ = await runInRequestTenantScope(req, async () => {
+          const actorUserId = await resolveActorUserId(db, req.user);
+          return db.query(
+            `SELECT COALESCE(q.publish_status, 'pending') AS publish_status
+             FROM product_publication_queue q
+             WHERE q.id = $1
+               AND q.queued_by = $2
+             LIMIT 1`,
+            [queueId, actorUserId],
+          );
+        });
+        if (
+          ['queued', 'publishing'].includes(
+            String(stateQ.rows[0]?.publish_status || '').trim(),
+          )
+        ) {
+          return res.status(409).json({
+            ok: false,
+            error: 'Пост уже поставлен в очередь публикации и недоступен для изменения',
+          });
+        }
         return res.status(404).json({
           ok: false,
           error: 'Пост не найден, уже опубликован или не принадлежит вам',
@@ -1650,12 +1673,31 @@ router.delete(
              AND q.queued_by = $2
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
+             AND COALESCE(q.publish_status, 'pending') NOT IN ('queued', 'publishing')
            LIMIT 1
            FOR UPDATE`,
           [queueId, actorUserId],
         );
         if (queueQ.rowCount === 0) {
+          const stateQ = await client.query(
+            `SELECT COALESCE(q.publish_status, 'pending') AS publish_status
+             FROM product_publication_queue q
+             WHERE q.id = $1
+               AND q.queued_by = $2
+             LIMIT 1`,
+            [queueId, actorUserId],
+          );
           await client.query('ROLLBACK');
+          if (
+            ['queued', 'publishing'].includes(
+              String(stateQ.rows[0]?.publish_status || '').trim(),
+            )
+          ) {
+            return res.status(409).json({
+              ok: false,
+              error: 'Пост уже поставлен в очередь публикации и недоступен для удаления',
+            });
+          }
           return res.status(404).json({
             ok: false,
             error: 'Пост не найден, уже опубликован или не принадлежит вам',

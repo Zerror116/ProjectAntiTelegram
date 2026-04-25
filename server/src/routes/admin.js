@@ -34,13 +34,20 @@ const { runInRequestTenantScope } = require("../utils/requestScope");
 const { uploadsPath } = require("../utils/storagePaths");
 const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
 const { toOriginalPublicMediaUrl } = require("../utils/mediaAssets");
-const { upsertProductCardSnapshot } = require("../utils/productCardSnapshots");
+const {
+  DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
+  enqueueChannelPublicationBatches,
+  listActivePublicationBatches,
+  buildPublicationSummary,
+  getChannelPublicationBatch,
+  kickChannelPublicationProcessor,
+} = require("../utils/channelPublicationQueue");
 
 const requireProductPublishPermission = requirePermission("product.publish");
 const requireReservationFulfillPermission = requirePermission(
   "reservation.fulfill",
 );
-const PUBLISH_POST_INTERVAL_MS = 3000;
+const PUBLISH_POST_INTERVAL_MS = DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS;
 const SAMARA_TZ = "Europe/Samara";
 const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$/;
 
@@ -2795,7 +2802,7 @@ router.get(
   requireProductPublishPermission,
   async (req, res) => {
     try {
-      const [result, reservedStatsQ] = await runInRequestTenantScope(
+      const [result, reservedStatsQ, activePublishBatches] = await runInRequestTenantScope(
         req,
         async () => {
           const pendingRows = await db.query(
@@ -2805,6 +2812,13 @@ router.get(
                   q.queued_by,
                   q.status,
                   q.is_sent,
+                  q.publish_batch_id,
+                  q.publish_order,
+                  COALESCE(q.publish_status, 'pending') AS publish_status,
+                  q.publish_started_at,
+                  q.publish_finished_at,
+                  q.publish_error_code,
+                  q.publish_error_message,
                   q.payload,
                   q.created_at,
                   c.title AS channel_title,
@@ -2836,19 +2850,56 @@ router.get(
                AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)`,
             [req.user.tenant_id || null],
           );
-          return [pendingRows, reservedStats];
+          const activeBatches = await listActivePublicationBatches(
+            db,
+            req.user.tenant_id || null,
+          );
+          return [pendingRows, reservedStats, activeBatches];
         },
       );
+      const publishingSummary = buildPublicationSummary(activePublishBatches);
       return res.json({
         ok: true,
         data: result.rows,
         meta: {
           reserved_pending_total: Number(reservedStatsQ.rows[0]?.total || 0),
           reserved_pending_units: Number(reservedStatsQ.rows[0]?.units || 0),
+          active_publish_batch:
+            activePublishBatches.length === 1 ? activePublishBatches[0] : null,
+          active_publish_batches: activePublishBatches,
+          publishing_summary: publishingSummary,
         },
       });
     } catch (err) {
       console.error("admin.channels.pending_posts error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.get(
+  "/channels/publish_batches/:batchId",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  requireProductPublishPermission,
+  async (req, res) => {
+    const batchId = String(req.params.batchId || "").trim();
+    if (!batchId) {
+      return res.status(400).json({ ok: false, error: "batchId обязателен" });
+    }
+    try {
+      const batch = await runInRequestTenantScope(req, async () =>
+        getChannelPublicationBatch(db, batchId, req.user.tenant_id || null),
+      );
+      if (!batch) {
+        return res.status(404).json({
+          ok: false,
+          error: "Пакет публикации не найден",
+        });
+      }
+      return res.json({ ok: true, data: batch });
+    } catch (err) {
+      console.error("admin.channels.publish_batch_status error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     }
   },
@@ -2913,6 +2964,7 @@ router.patch(
            WHERE q.id = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
+             AND COALESCE(q.publish_status, 'pending') NOT IN ('queued', 'publishing')
              AND EXISTS (
                SELECT 1
                FROM chats c
@@ -2932,6 +2984,30 @@ router.patch(
         ),
       );
       if (updated.rowCount === 0) {
+        const stateQ = await runInRequestTenantScope(req, async () =>
+          db.query(
+            `SELECT COALESCE(q.publish_status, 'pending') AS publish_status
+             FROM product_publication_queue q
+             WHERE q.id = $1
+               AND EXISTS (
+                 SELECT 1
+                 FROM chats c
+                 WHERE c.id = q.channel_id
+                   AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+               )
+             LIMIT 1`,
+            [queueId, req.user.tenant_id || null],
+          ),
+        );
+        const publishStatus = String(
+          stateQ.rows[0]?.publish_status || "",
+        ).trim();
+        if (["queued", "publishing"].includes(publishStatus)) {
+          return res.status(409).json({
+            ok: false,
+            error: "Пост уже стоит в очереди публикации и сейчас недоступен для изменения",
+          });
+        }
         return res.status(404).json({
           ok: false,
           error: "Пост не найден или уже опубликован",
@@ -2969,6 +3045,7 @@ router.delete(
            WHERE q.id = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
+             AND COALESCE(q.publish_status, 'pending') NOT IN ('queued', 'publishing')
              AND EXISTS (
                SELECT 1
                FROM chats c
@@ -2980,7 +3057,30 @@ router.delete(
           [queueId, req.user.tenant_id || null],
         );
         if (pendingQ.rowCount === 0) {
+          const stateQ = await client.query(
+            `SELECT COALESCE(q.publish_status, 'pending') AS publish_status
+             FROM product_publication_queue q
+             WHERE q.id = $1
+               AND EXISTS (
+                 SELECT 1
+                 FROM chats c
+                 WHERE c.id = q.channel_id
+                   AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+               )
+             LIMIT 1`,
+            [queueId, req.user.tenant_id || null],
+          );
           await client.query("ROLLBACK");
+          if (
+            ["queued", "publishing"].includes(
+              String(stateQ.rows[0]?.publish_status || "").trim(),
+            )
+          ) {
+            return res.status(409).json({
+              ok: false,
+              error: "Пост уже стоит в очереди публикации и сейчас недоступен для удаления",
+            });
+          }
           return res.status(404).json({
             ok: false,
             error: "Пост не найден или уже опубликован",
@@ -3896,448 +3996,38 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
-
-      let rows;
-      if (onlySelected) {
-        const lockedQ = await client.query(
-          `SELECT q.id
-           FROM product_publication_queue q
-           WHERE q.status = 'pending'
-             AND COALESCE(q.is_sent, false) = false
-             AND q.id = ANY($1::uuid[])
-             AND EXISTS (
-               SELECT 1
-               FROM chats c
-               WHERE c.id = q.channel_id
-                 AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
-             )
-           ORDER BY q.created_at ASC, q.id ASC
-           FOR UPDATE OF q`,
-          [queueIds, req.user.tenant_id || null],
-        );
-        const lockedIds = lockedQ.rows.map((row) => row.id);
-        if (lockedIds.length === 0) {
-          rows = [];
-        } else {
-          const detailsQ = await client.query(
-            `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
-                  p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url, p.product_code,
-                  c.title AS channel_title,
-                  u.name AS queued_by_name,
-                  u.email AS queued_by_email,
-                  ph.phone AS queued_by_phone
-             FROM product_publication_queue q
-             JOIN products p ON p.id = q.product_id
-             JOIN chats c ON c.id = q.channel_id
-             LEFT JOIN users u ON u.id = q.queued_by
-             LEFT JOIN phones ph ON ph.user_id = q.queued_by
-             WHERE q.id = ANY($1::uuid[])
-             ORDER BY q.created_at ASC, q.id ASC`,
-            [lockedIds],
-          );
-          rows = detailsQ.rows;
-        }
-      } else {
-        const lockedQ = await client.query(
-          `SELECT q.id
-           FROM product_publication_queue q
-           WHERE q.status = 'pending'
-             AND COALESCE(q.is_sent, false) = false
-             AND ($1::uuid IS NULL OR q.channel_id = $1::uuid)
-             AND EXISTS (
-               SELECT 1
-               FROM chats c
-               WHERE c.id = q.channel_id
-                 AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
-             )
-           ORDER BY q.created_at ASC, q.id ASC
-           FOR UPDATE OF q`,
-          [channelId, req.user.tenant_id || null],
-        );
-        const lockedIds = lockedQ.rows.map((row) => row.id);
-        if (lockedIds.length === 0) {
-          rows = [];
-        } else {
-          const detailsQ = await client.query(
-            `SELECT q.id, q.product_id, q.channel_id, q.payload, q.queued_by,
-                  p.title, p.description, p.price, p.quantity, p.shelf_number, p.image_url, p.product_code,
-                  c.title AS channel_title,
-                  u.name AS queued_by_name,
-                  u.email AS queued_by_email,
-                  ph.phone AS queued_by_phone
-             FROM product_publication_queue q
-             JOIN products p ON p.id = q.product_id
-             JOIN chats c ON c.id = q.channel_id
-             LEFT JOIN users u ON u.id = q.queued_by
-             LEFT JOIN phones ph ON ph.user_id = q.queued_by
-             WHERE q.id = ANY($1::uuid[])
-             ORDER BY q.created_at ASC, q.id ASC`,
-            [lockedIds],
-          );
-          rows = detailsQ.rows;
-        }
-      }
-
-      const published = [];
-      const archivePublished = [];
-      const hiddenRevisionMessages = [];
-      const skipped = [];
-      const ensuredSystem = await ensureSystemChannels(
-        client,
-        req.user.id || null,
-        req.user.tenant_id || null,
-      );
-      const postsArchiveChannelId = String(
-        ensuredSystem?.postsArchiveChannel?.id || "",
-      ).trim();
-
-      for (const row of rows) {
-        await client.query("SAVEPOINT publish_pending_item");
-        let errorStage = "payload_prepare";
-        try {
-          const itemArchivePublished = [];
-          const itemHiddenRevisionMessages = [];
-          let code = await resolveUniqueProductCodeForPublish(
-            client,
-            row.product_code,
-            row.product_id,
-            req.user?.tenant_id || null,
-          );
-
-          const payload =
-            row.payload &&
-            typeof row.payload === "object" &&
-            !Array.isArray(row.payload)
-              ? row.payload
-              : {};
-
-          const nextTitle = String(payload.title || row.title || "").trim();
-          const nextDescription = String(
-            payload.description || row.description || "",
-          ).trim();
-          if (!nextTitle) {
-            skipped.push({
-              queue_id: row.id,
-              error_code: "publish_validation_title_empty",
-              error_stage: "validate_payload",
-              error_message: "Пустое название товара",
-              reason: "Пустое название товара",
-            });
-            await client.query("RELEASE SAVEPOINT publish_pending_item");
-            continue;
-          }
-
-          const rawNextPrice = Number(payload.price ?? row.price ?? 0);
-          const fallbackPrice = Number(row.price ?? 0);
-          const nextPrice = Number.isFinite(rawNextPrice) && rawNextPrice > 0
-            ? rawNextPrice
-            : (Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : 0);
-
-          const rawNextQuantity = Number(payload.quantity ?? row.quantity ?? 1);
-          const fallbackQuantity = Number(row.quantity ?? 1);
-          const nextQuantity = Number.isFinite(rawNextQuantity) && rawNextQuantity > 0
-            ? Math.floor(rawNextQuantity)
-            : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0
-              ? Math.floor(fallbackQuantity)
-              : 1);
-          if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
-            skipped.push({
-              queue_id: row.id,
-              error_code: "publish_validation_price_invalid",
-              error_stage: "validate_payload",
-              error_message: "Цена товара должна быть больше нуля",
-              reason: "Цена товара должна быть больше нуля",
-            });
-            await client.query("RELEASE SAVEPOINT publish_pending_item");
-            continue;
-          }
-          const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 0);
-          const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
-            ? Math.floor(rawNextShelf)
-            : await resolveAutoShelfNumber(
-                client,
-                req.user?.tenant_id || null,
-                null,
-                1,
-              );
-          const nextImageUrl = payload.image_url
-            ? toOriginalPublicMediaUrl(payload.image_url)
-            : row.image_url || null;
-
-          errorStage = "product_update";
-          let productUpdate = null;
-          for (let attempt = 0; attempt < 6; attempt += 1) {
-            try {
-              productUpdate = await client.query(
-                `UPDATE products
-               SET product_code = $1,
-                   title = $2,
-                   description = $3,
-                   price = $4,
-                   quantity = $5,
-                   shelf_number = $6,
-                   image_url = $7,
-                   status = 'published',
-                   reusable_at = NULL,
-                   updated_at = now()
-               WHERE id = $8
-               RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url`,
-                [
-                  code,
-                  nextTitle,
-                  nextDescription,
-                  nextPrice,
-                  nextQuantity,
-                  nextShelfNumber,
-                  nextImageUrl,
-                  row.product_id,
-                ],
-              );
-              break;
-            } catch (err) {
-              if (!isProductCodeConflictError(err) || attempt >= 5) {
-                throw err;
-              }
-              code = await allocateProductCode(client, null);
-            }
-          }
-          if (productUpdate.rowCount === 0) {
-            skipped.push({
-              queue_id: row.id,
-              error_code: "publish_product_not_found",
-              error_stage: errorStage,
-              error_message: "Товар не найден",
-              reason: "Товар не найден",
-            });
-            await client.query("RELEASE SAVEPOINT publish_pending_item");
-            continue;
-          }
-          const product = productUpdate.rows[0];
-          if (product?.image_url) {
-            await registerPublicImageUpload({
-              queryable: client,
-              ownerKind: "product_image",
-              ownerId: product.id,
-              rawUrl: product.image_url,
-            });
-          }
-          const productCardSnapshot = await upsertProductCardSnapshot(client, product, {
-            tenantId: req.user?.tenant_id || null,
-          });
-
-          const messageMeta = {
-            kind: "catalog_product",
-            product_id: product.id,
-            product_code: product.product_code,
-            product_label: formatProductLabel(
-              product.product_code,
-              product.shelf_number,
-            ),
-            price: Number(product.price),
-            quantity: Number(product.quantity),
-            shelf_number: Number(product.shelf_number),
-            image_url: product.image_url,
-            card_snapshot: productCardSnapshot,
-          };
-
-          errorStage = "message_insert";
-          const messageInsert = await client.query(
-            `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-           VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
-           RETURNING id, chat_id, sender_id, text, meta, created_at`,
-            [
-              uuidv4(),
-              row.channel_id,
-              encryptMessageText(productMessageText(product)),
-              JSON.stringify(messageMeta),
-            ],
-          );
-          const message = messageInsert.rows[0];
-
-          const shouldHidePrevious =
-            payload?.hide_old_versions === true ||
-            String(payload?.hide_old_versions || '').toLowerCase().trim() ===
-              'true';
-          const sourceMessageId = String(payload?.source_message_id || '').trim();
-          if (
-            shouldHidePrevious &&
-            isUuidLike(sourceMessageId) &&
-            sourceMessageId !== String(message.id)
-          ) {
-            errorStage = "hide_old_versions";
-            const hiddenQ = await client.query(
-              `UPDATE messages
-               SET meta = jsonb_set(
-                     COALESCE(meta, '{}'::jsonb),
-                     '{hidden_for_all}',
-                     'true'::jsonb,
-                     true
-                   )
-               WHERE id = $1
-                 AND chat_id = $2
-                 AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
-               RETURNING id, chat_id, sender_id, text, meta, created_at`,
-              [sourceMessageId, row.channel_id],
-            );
-            itemHiddenRevisionMessages.push(...hiddenQ.rows);
-          }
-
-          if (postsArchiveChannelId) {
-            errorStage = "archive_insert";
-            const archiveMeta = {
-              kind: "catalog_product_archive",
-              product_id: product.id,
-              product_code: product.product_code,
-              product_label: formatProductLabel(
-                product.product_code,
-                product.shelf_number,
-              ),
-              price: Number(product.price),
-              quantity: Number(product.quantity),
-              shelf_number: Number(product.shelf_number),
-              image_url: product.image_url,
-              source_channel_id: row.channel_id,
-              source_channel_title: row.channel_title,
-              source_message_id: message.id,
-              queued_by: row.queued_by,
-              queued_by_name: row.queued_by_name || null,
-              queued_by_email: row.queued_by_email || null,
-              queued_by_phone: row.queued_by_phone || null,
-            };
-            const archiveMessageInsert = await client.query(
-              `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
-               VALUES ($1, $2, NULL, $3, $4::jsonb, clock_timestamp())
-               RETURNING id`,
-              [
-                uuidv4(),
-                postsArchiveChannelId,
-                encryptMessageText(
-                  archivedProductMessageText({
-                    product,
-                    sourceChannelTitle: row.channel_title,
-                    queuedByName: row.queued_by_name,
-                    queuedByEmail: row.queued_by_email,
-                    queuedByPhone: row.queued_by_phone,
-                  }),
-                ),
-                JSON.stringify(archiveMeta),
-              ],
-            );
-            const archiveMessageId = String(
-              archiveMessageInsert.rows[0]?.id || "",
-            ).trim();
-            await client.query(
-              "UPDATE chats SET updated_at = now() WHERE id = $1",
-              [postsArchiveChannelId],
-            );
-            if (archiveMessageId) {
-              itemArchivePublished.push({
-                channel_id: postsArchiveChannelId,
-                message_id: archiveMessageId,
-              });
-            }
-          }
-
-          errorStage = "queue_mark_published";
-          await client.query(
-            `UPDATE product_publication_queue
-           SET status = 'published',
-               is_sent = true,
-               approved_by = $1,
-               approved_at = now(),
-               published_message_id = $2
-           WHERE id = $3`,
-            [req.user.id, message.id, row.id],
-          );
-
-          errorStage = "channel_touch";
-          await client.query(
-            "UPDATE chats SET updated_at = now() WHERE id = $1",
-            [row.channel_id],
-          );
-
-          published.push({
-            queue_id: row.id,
-            channel_id: row.channel_id,
-            channel_title: row.channel_title,
-            product_id: product.id,
-            product_code: product.product_code,
-            product_label: formatProductLabel(
-              product.product_code,
-              product.shelf_number,
-            ),
-            shelf_number: Number(product.shelf_number),
-            message_id: message.id,
-          });
-          archivePublished.push(...itemArchivePublished);
-          hiddenRevisionMessages.push(...itemHiddenRevisionMessages);
-
-          await client.query("RELEASE SAVEPOINT publish_pending_item");
-        } catch (itemErr) {
-          try {
-            await client.query("ROLLBACK TO SAVEPOINT publish_pending_item");
-            await client.query("RELEASE SAVEPOINT publish_pending_item");
-          } catch (savepointErr) {
-            console.error(
-              "admin.channels.publish_pending savepoint rollback error",
-              savepointErr,
-            );
-            throw savepointErr;
-          }
-          const errorCode = String(itemErr?.code || "publish_item_failed");
-          const errorMessage = String(
-            itemErr?.message || "Ошибка публикации элемента очереди",
-          ).trim();
-          skipped.push({
-            queue_id: row.id,
-            error_code: errorCode,
-            error_stage: errorStage,
-            error_message: errorMessage,
-            reason: errorMessage,
-          });
-          console.error("admin.channels.publish_pending item error", {
-            queue_id: row.id,
-            error_code: errorCode,
-            error_stage: errorStage,
-            error_message: errorMessage,
-          });
-        }
-      }
+      const enqueueResult = await enqueueChannelPublicationBatches({
+        queryable: client,
+        tenantId: req.user.tenant_id || null,
+        createdBy: req.user.id || null,
+        channelId,
+        queueIds: onlySelected ? queueIds : [],
+        intervalMs: DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
+      });
 
       await client.query("COMMIT");
 
-      schedulePublishedMessages(
-        req.app.get("io"),
-        published,
-        req.user?.tenant_id || null,
-      );
-      if (archivePublished.length > 0) {
-        schedulePublishedMessages(
-          req.app.get("io"),
-          archivePublished,
-          req.user?.tenant_id || null,
-        );
-      }
-      const io = req.app.get("io");
-      if (io && hiddenRevisionMessages.length > 0) {
-        for (const message of hiddenRevisionMessages) {
-          io.to(`chat:${message.chat_id}`).emit("chat:message", {
-            chatId: message.chat_id,
-            message: decryptMessageRow(message),
-          });
-          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
-            chatId: message.chat_id,
-          });
-        }
-      }
+      kickChannelPublicationProcessor(req.app.get("io"));
+
+      const batches = Array.isArray(enqueueResult.batches)
+        ? enqueueResult.batches
+        : [];
+      const alreadyRunningChannels = Array.isArray(
+        enqueueResult.already_running_channels,
+      )
+        ? enqueueResult.already_running_channels
+        : [];
 
       return res.json({
         ok: true,
-        published_count: published.length,
-        failed_count: skipped.length,
-        skipped_count: skipped.length,
-        skipped,
-        data: published,
+        accepted_count: Number(enqueueResult.accepted_count || 0),
+        interval_ms: Number(
+          enqueueResult.interval_ms || DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
+        ),
+        batch_id: batches.length === 1 ? batches[0].batch_id : null,
+        already_running_for_channel: alreadyRunningChannels.length > 0,
+        already_running_channels: alreadyRunningChannels,
+        data: batches,
       });
     } catch (err) {
       await client.query("ROLLBACK");

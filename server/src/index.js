@@ -84,6 +84,9 @@ const {
   signedUploadGuard,
 } = require("./utils/signedUploads");
 const { queueChatMessageWebPushForRooms } = require("./utils/webPush");
+const {
+  startChannelPublicationProcessor,
+} = require("./utils/channelPublicationQueue");
 
 if (!global.__fenixProcessMonitoringHooksInstalled) {
   global.__fenixProcessMonitoringHooksInstalled = true;
@@ -925,6 +928,7 @@ async function canEmitChatActivity(user, chatId) {
     app.set("realtimeDiagnostics", realtimeDiagnostics);
     global.__projectPhoenixSocketIo = io;
     patchSocketEmittersWithSignedUploads(io);
+    startChannelPublicationProcessor({ io });
     console.log("✅ Socket.io initialized");
     if (typeof deliveryRoutes.startBackgroundTasks === "function") {
       deliveryRoutes.startBackgroundTasks(io);
