@@ -251,7 +251,7 @@ function formatProductLabel(productCode, shelfNumber) {
 function formatShelfLabel(shelfNumber, fallback = '—') {
   const shelf = toShelfNumber(shelfNumber, 0);
   if (shelf <= 0) return fallback;
-  return String(shelf).padLeft(2, '0');
+  return String(shelf).padStart(2, '0');
 }
 
 function revisionDayToTimestamp(day) {
