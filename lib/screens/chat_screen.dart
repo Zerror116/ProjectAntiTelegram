@@ -7153,28 +7153,37 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _patchReservedOrderMessageLocally({
+    String? messageId,
     String? reservationId,
     String? cartItemId,
     required Map<String, dynamic> patch,
   }) {
+    final messageKey = (messageId ?? '').trim();
     final reservationKey = (reservationId ?? '').trim();
     final cartItemKey = (cartItemId ?? '').trim();
-    if (reservationKey.isEmpty && cartItemKey.isEmpty) return;
+    if (messageKey.isEmpty && reservationKey.isEmpty && cartItemKey.isEmpty) {
+      return;
+    }
     setState(() {
       _messages = _messages.map((message) {
         final meta = _metaMapOf(message['meta']);
         if (meta['kind']?.toString() != 'reserved_order_item') return message;
+        final currentMessageId = (message['id'] ?? '').toString().trim();
         final messageReservationId = (meta['reservation_id'] ?? '')
             .toString()
             .trim();
         final messageCartItemId = (meta['cart_item_id'] ?? '')
             .toString()
             .trim();
+        final matchesMessageId =
+            messageKey.isNotEmpty && currentMessageId == messageKey;
         final matchesReservation =
             reservationKey.isNotEmpty && messageReservationId == reservationKey;
         final matchesCartItem =
             cartItemKey.isNotEmpty && messageCartItemId == cartItemKey;
-        if (!matchesReservation && !matchesCartItem) return message;
+        if (!matchesMessageId && !matchesReservation && !matchesCartItem) {
+          return message;
+        }
         return {
           ...message,
           'meta': Map<String, dynamic>.from(meta)..addAll(patch),
@@ -7265,7 +7274,10 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Future<void> _changeReservedOrderShelf(Map<String, dynamic> meta) async {
+  Future<void> _changeReservedOrderShelf(
+    Map<String, dynamic> meta, {
+    String? messageId,
+  }) async {
     if (!_canMarkReservedOrderPlaced()) return;
     final reservationId = (meta['reservation_id'] ?? '').toString().trim();
     final cartItemId = (meta['cart_item_id'] ?? '').toString().trim();
@@ -7307,6 +7319,7 @@ class _ChatScreenState extends State<ChatScreen> {
           .trim();
       if (!mounted) return;
       _patchReservedOrderMessageLocally(
+        messageId: messageId,
         reservationId: reservationId,
         cartItemId: cartItemId,
         patch: {'shelf_label': shelfLabel, 'shelf_number': shelfNumber},
@@ -7490,6 +7503,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _markReservedOrderPlaced(
     Map<String, dynamic> meta, {
+    String? messageId,
     String processingMode = 'standard',
   }) async {
     final reservationId = meta['reservation_id']?.toString();
@@ -7598,6 +7612,7 @@ class _ChatScreenState extends State<ChatScreen> {
             .toString()
             .trim();
         _patchReservedOrderMessageLocally(
+          messageId: messageId,
           reservationId: reservationId,
           cartItemId: cartItemId,
           patch: {
@@ -11487,6 +11502,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                 : null)
                           : () => _markReservedOrderPlaced(
                               metaMap,
+                              messageId: messageId,
                               processingMode: 'standard',
                             ),
                       label: Text(
@@ -11507,6 +11523,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           ? null
                           : () => _markReservedOrderPlaced(
                               metaMap,
+                              messageId: messageId,
                               processingMode: 'oversize',
                             ),
                       label: Text(
@@ -11525,7 +11542,10 @@ class _ChatScreenState extends State<ChatScreen> {
                               _markingPlaced ||
                               isOversizePlaced)
                           ? null
-                          : () => _changeReservedOrderShelf(metaMap),
+                          : () => _changeReservedOrderShelf(
+                              metaMap,
+                              messageId: messageId,
+                            ),
                       label: const Text('Смена полки'),
                     ),
                   ),
