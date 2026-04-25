@@ -159,6 +159,46 @@ function normalizePhoneDigits(raw) {
   return String(raw || "").replace(/\D/g, "").slice(0, 20);
 }
 
+async function acquireReservationOperationLock(
+  client,
+  { reservationId = null, cartItemId = null, tenantId = null } = {},
+) {
+  const normalizedReservationId = String(reservationId || "").trim();
+  const normalizedCartItemId = String(cartItemId || "").trim();
+  let lockKey = normalizedCartItemId;
+
+  if (!lockKey && normalizedReservationId) {
+    const lockKeyQ = await client.query(
+      `SELECT COALESCE(r.cart_item_id::text, r.id::text) AS lock_key
+       FROM reservations r
+       JOIN users buyer ON buyer.id = r.user_id
+       WHERE (
+         ($1::uuid IS NOT NULL AND r.id = $1::uuid)
+         OR
+         ($1::uuid IS NULL AND $2::uuid IS NOT NULL AND r.cart_item_id = $2::uuid)
+       )
+         AND ($3::uuid IS NULL OR buyer.tenant_id = $3::uuid)
+       ORDER BY r.created_at DESC
+       LIMIT 1`,
+      [normalizedReservationId || null, normalizedCartItemId || null, tenantId || null],
+    );
+    if (lockKeyQ.rowCount > 0) {
+      lockKey = String(lockKeyQ.rows[0]?.lock_key || "").trim();
+    }
+  }
+
+  if (!lockKey) {
+    lockKey = normalizedReservationId || normalizedCartItemId;
+  }
+  if (!lockKey) return null;
+
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtext($1), 0)`,
+    [`reservation-op:${lockKey}`],
+  );
+  return lockKey;
+}
+
 function formatPhoneForDisplay(raw) {
   const digits = normalizePhoneDigits(raw);
   if (digits.length === 10) return `8${digits}`;
@@ -3180,6 +3220,11 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
+      await acquireReservationOperationLock(client, {
+        reservationId,
+        cartItemId,
+        tenantId: req.user.tenant_id || null,
+      });
       const { reservedChannel } = await ensureSystemChannels(
         client,
         req.user.id,
@@ -3383,6 +3428,11 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
+      await acquireReservationOperationLock(client, {
+        reservationId,
+        cartItemId,
+        tenantId: req.user.tenant_id || null,
+      });
       const { reservedChannel } = await ensureSystemChannels(
         client,
         req.user.id,
