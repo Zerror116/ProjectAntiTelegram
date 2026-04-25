@@ -1441,6 +1441,21 @@ router.post("/tickets/:ticketId/claim", authMiddleware, ensureSupportStaffAccess
       tenantId: req.user.tenant_id || null,
     });
 
+    await client.query(
+      `INSERT INTO user_chat_preferences (user_id, chat_id, hidden, pinned, created_at, updated_at)
+       SELECT member.user_id, $1::uuid, false, false, now(), now()
+       FROM (
+         SELECT $2::uuid AS user_id
+         UNION
+         SELECT $3::uuid
+       ) member
+       WHERE member.user_id IS NOT NULL
+       ON CONFLICT (user_id, chat_id) DO UPDATE
+         SET hidden = false,
+             updated_at = now()`,
+      [ticket.chat_id, ticket.customer_id || null, req.user.id || null],
+    );
+
     await client.query("COMMIT");
 
     emitSupportQueueClaimedEvent(req, req.user.tenant_id || null, {
@@ -1500,6 +1515,33 @@ router.post(
       const ticket = ticketRes.rows[0];
       const requesterId = String(req.user.id || "").trim();
       const isAssignee = String(ticket.assignee_id || "").trim() === requesterId;
+
+      if (ticket.status === "resolved") {
+        await client.query("ROLLBACK");
+        return res.json({
+          ok: true,
+          data: {
+            ticket_id: ticket.id,
+            status: "resolved",
+            status_display: buildSupportTicketStatusLabel("resolved"),
+            status_hint: buildSupportTicketStatusHint("resolved"),
+            can_customer_confirm_resolution: true,
+          },
+        });
+      }
+      if (ticket.status === "archived") {
+        await client.query("ROLLBACK");
+        return res.json({
+          ok: true,
+          data: {
+            ticket_id: ticket.id,
+            status: "archived",
+            status_display: buildSupportTicketStatusLabel("archived"),
+            status_hint: buildSupportTicketStatusHint("archived"),
+            can_customer_confirm_resolution: false,
+          },
+        });
+      }
 
       if (!isAssignee) {
         await client.query("ROLLBACK");
@@ -1745,6 +1787,18 @@ router.post(
         String(ticket.assignee_id || "").trim() === requesterId;
       const canForceArchive =
         forceArchive && requesterRole !== "creator";
+      if (ticket.status === "archived") {
+        await client.query("ROLLBACK");
+        return res.json({
+          ok: true,
+          data: {
+            ticket_id: ticket.id,
+            status: "archived",
+            status_display: buildSupportTicketStatusLabel("archived"),
+            status_hint: buildSupportTicketStatusHint("archived"),
+          },
+        });
+      }
       if (!isAssignee && !canForceArchive) {
         await client.query("ROLLBACK");
         return res.status(403).json({

@@ -12,6 +12,7 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 import 'package:url_launcher/url_launcher.dart';
 
 import 'screens/auth_screen.dart';
+import 'screens/chat_screen.dart';
 import 'screens/phone_access_pending_screen.dart';
 import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
@@ -548,6 +549,9 @@ final Map<String, DateTime> _recentNotificationPresentationTimestamps =
 class _SupportQueueNoticePayload {
   final String ticketId;
   final String? chatId;
+  final String chatTitle;
+  final String chatType;
+  final Map<String, dynamic>? chatSettings;
   final String subject;
   final String category;
   final String customerName;
@@ -561,6 +565,9 @@ class _SupportQueueNoticePayload {
   const _SupportQueueNoticePayload({
     required this.ticketId,
     required this.chatId,
+    required this.chatTitle,
+    required this.chatType,
+    required this.chatSettings,
     required this.subject,
     required this.category,
     required this.customerName,
@@ -578,6 +585,8 @@ _supportQueueNoticeNotifier = ValueNotifier<List<_SupportQueueNoticePayload>>(
   const [],
 );
 final ValueNotifier<Set<String>> _supportQueueClaimBusyNotifier =
+    ValueNotifier<Set<String>>(<String>{});
+final ValueNotifier<Set<String>> _supportQueueDismissedNotifier =
     ValueNotifier<Set<String>>(<String>{});
 final ValueNotifier<String> activeShellSectionNotifier = ValueNotifier<String>(
   '',
@@ -627,6 +636,11 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
   final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
   final category = (map['category'] ?? 'general').toString().trim();
   final productTitle = (map['product_title'] ?? '').toString().trim();
+  final chatTitle = (map['chat_title'] ?? 'Поддержка').toString().trim();
+  final chatType = (map['chat_type'] ?? 'private').toString().trim();
+  final chatSettings = map['chat_settings'] is Map
+      ? Map<String, dynamic>.from(map['chat_settings'])
+      : null;
   final status = (map['status'] ?? 'open').toString().trim().toLowerCase();
   final statusDisplay = (map['status_display'] ?? '').toString().trim();
   final statusHint = (map['status_hint'] ?? '').toString().trim();
@@ -634,6 +648,9 @@ _SupportQueueNoticePayload? _parseSupportQueueNotice(dynamic raw) {
   return _SupportQueueNoticePayload(
     ticketId: ticketId,
     chatId: chatIdRaw.isEmpty ? null : chatIdRaw,
+    chatTitle: chatTitle.isEmpty ? 'Поддержка' : chatTitle,
+    chatType: chatType.isEmpty ? 'private' : chatType,
+    chatSettings: chatSettings,
     subject: subject.isEmpty ? 'Новый вопрос в поддержку' : subject,
     category: category.isEmpty ? 'general' : category,
     customerName: customerName.isEmpty ? 'Клиент' : customerName,
@@ -658,11 +675,20 @@ _SupportQueueNoticePayload? _parseAssignedSupportNotice(dynamic raw) {
   final customerName = (map['customer_name'] ?? 'Клиент').toString().trim();
   final productTitle = (map['product_title'] ?? '').toString().trim();
   final chatId = (map['chat_id'] ?? '').toString().trim();
+  final chatTitle = (map['chat_title'] ?? 'Поддержка').toString().trim();
+  final chatType = (map['chat_type'] ?? 'private').toString().trim();
+  final chatSettings = map['chat_settings'] is Map
+      ? Map<String, dynamic>.from(map['chat_settings'])
+      : null;
   final statusDisplay = (map['status_display'] ?? '').toString().trim();
   final statusHint = (map['status_hint'] ?? '').toString().trim();
+  if (status == 'resolved') return null;
   return _SupportQueueNoticePayload(
     ticketId: ticketId,
     chatId: chatId.isEmpty ? null : chatId,
+    chatTitle: chatTitle.isEmpty ? 'Поддержка' : chatTitle,
+    chatType: chatType.isEmpty ? 'private' : chatType,
+    chatSettings: chatSettings,
     subject: subject.isEmpty ? 'Вопрос в поддержку' : subject,
     category: category.isEmpty ? 'general' : category,
     customerName: customerName.isEmpty ? 'Клиент' : customerName,
@@ -678,6 +704,7 @@ _SupportQueueNoticePayload? _parseAssignedSupportNotice(dynamic raw) {
 void _clearSupportQueueNotices() {
   _supportQueueNoticeNotifier.value = const [];
   _supportQueueClaimBusyNotifier.value = <String>{};
+  _supportQueueDismissedNotifier.value = <String>{};
 }
 
 void _upsertSupportQueueNotice(_SupportQueueNoticePayload notice) {
@@ -693,6 +720,18 @@ void _upsertSupportQueueNotice(_SupportQueueNoticePayload notice) {
   _supportQueueNoticeNotifier.value = current;
 }
 
+void _dismissSupportQueueNotice(String ticketId) {
+  final id = ticketId.trim();
+  if (id.isEmpty) return;
+  final next = Set<String>.from(_supportQueueDismissedNotifier.value)..add(id);
+  _supportQueueDismissedNotifier.value = next;
+}
+
+void resetSupportQueueNoticeDismissals() {
+  if (_supportQueueDismissedNotifier.value.isEmpty) return;
+  _supportQueueDismissedNotifier.value = <String>{};
+}
+
 void _removeSupportQueueNotice(String ticketId) {
   final id = ticketId.trim();
   if (id.isEmpty) return;
@@ -702,6 +741,42 @@ void _removeSupportQueueNotice(String ticketId) {
   final busy = Set<String>.from(_supportQueueClaimBusyNotifier.value);
   busy.remove(id);
   _supportQueueClaimBusyNotifier.value = busy;
+  final dismissed = Set<String>.from(_supportQueueDismissedNotifier.value);
+  dismissed.remove(id);
+  _supportQueueDismissedNotifier.value = dismissed;
+}
+
+Map<String, dynamic> _normalizedSupportQueueChatSettings(
+  _SupportQueueNoticePayload notice,
+) {
+  final settings = <String, dynamic>{...(notice.chatSettings ?? const {})};
+  settings['kind'] = settings['kind'] ?? 'support_ticket';
+  settings['support_ticket'] = true;
+  settings['support_ticket_status'] = notice.status;
+  settings['support_archived'] = notice.status == 'archived';
+  if (notice.ticketId.isNotEmpty) {
+    settings['support_ticket_id'] =
+        settings['support_ticket_id'] ?? notice.ticketId;
+  }
+  return settings;
+}
+
+Future<void> _openSupportQueueNoticeChat(_SupportQueueNoticePayload notice) async {
+  final chatId = (notice.chatId ?? '').trim();
+  if (chatId.isEmpty) return;
+  final navigator = navigatorKey.currentState;
+  if (navigator == null) return;
+  await navigator.push(
+    MaterialPageRoute(
+      builder: (_) => ChatScreen(
+        chatId: chatId,
+        chatTitle: notice.chatTitle,
+        chatType: notice.chatType,
+        chatSettings: _normalizedSupportQueueChatSettings(notice),
+      ),
+    ),
+  );
+  unawaited(_refreshSupportQueueNotices());
 }
 
 Future<void> _refreshSupportQueueNotices() async {
@@ -733,7 +808,7 @@ Future<void> _refreshSupportQueueNotices() async {
     if (canClaim) {
       final activeResp = await dio.get(
         '/api/support/tickets',
-        queryParameters: {'status': 'open,waiting_customer,resolved'},
+        queryParameters: {'status': 'open,waiting_customer'},
       );
       final activeData = activeResp.data;
       final activeRows =
@@ -778,6 +853,13 @@ Future<void> refreshSupportQueueNotices() async {
 Future<void> _claimSupportQueueNotice(String ticketId) async {
   final id = ticketId.trim();
   if (id.isEmpty) return;
+  _SupportQueueNoticePayload? notice;
+  for (final item in _supportQueueNoticeNotifier.value) {
+    if (item.ticketId == id) {
+      notice = item;
+      break;
+    }
+  }
   if (!_canCurrentUserClaimSupportQueueAlerts()) {
     showGlobalAppNotice(
       'Эти заявки доступны для принятия только администраторам поддержки.',
@@ -793,6 +875,9 @@ Future<void> _claimSupportQueueNotice(String ticketId) async {
   try {
     await dio.post('/api/support/tickets/$id/claim');
     _removeSupportQueueNotice(id);
+    if (notice != null) {
+      await _openSupportQueueNoticeChat(notice);
+    }
     showGlobalAppNotice(
       'Заявка поддержки принята. Теперь этот чат виден только вам.',
       title: 'Поддержка',
@@ -831,29 +916,32 @@ Future<void> _closeSupportQueueNotice(String ticketId) async {
   busy.add(id);
   _supportQueueClaimBusyNotifier.value = busy;
   try {
-    await dio.post('/api/support/tickets/$id/resolve');
+    await dio.post(
+      '/api/support/tickets/$id/archive',
+      data: {'reason': 'queue_closed', 'force': true},
+    );
     _removeSupportQueueNotice(id);
     showGlobalAppNotice(
-      'Обращение отмечено как решённое',
+      'Обращение закрыто',
       title: 'Поддержка',
       tone: AppNoticeTone.success,
     );
     chatEventsController.add({
       'type': 'support:queue:changed',
-      'data': {'ticket_id': id, 'action': 'resolved'},
+      'data': {'ticket_id': id, 'action': 'archived'},
     });
   } on DioException catch (e) {
     final message = _extractApiErrorMessage(e);
     showGlobalAppNotice(
       message.isNotEmpty
           ? message
-          : 'Не удалось отметить обращение как решённое',
+          : 'Не удалось закрыть обращение',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
   } catch (_) {
     showGlobalAppNotice(
-      'Не удалось отметить обращение как решённое',
+      'Не удалось закрыть обращение',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
@@ -2788,20 +2876,29 @@ class _GlobalNoticeHost extends StatelessWidget {
                   child: ValueListenableBuilder<List<_SupportQueueNoticePayload>>(
                     valueListenable: _supportQueueNoticeNotifier,
                     builder: (context, notices, _) {
-                      if (notices.isEmpty ||
-                          !_canCurrentUserObserveSupportQueueAlerts()) {
-                        return const SizedBox.shrink();
-                      }
-                      final canClaim = _canCurrentUserClaimSupportQueueAlerts();
-                      final canForceClose =
-                          _canCurrentUserForceCloseSupportQueueAlerts();
-                      return ConstrainedBox(
-                        constraints: BoxConstraints(maxWidth: cardWidth),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            ...notices.take(maxCards).map((notice) {
+                      return ValueListenableBuilder<Set<String>>(
+                        valueListenable: _supportQueueDismissedNotifier,
+                        builder: (context, dismissedIds, ignoredChild) {
+                          final visibleNotices = notices
+                              .where(
+                                (item) => !dismissedIds.contains(item.ticketId),
+                              )
+                              .toList(growable: false);
+                          if (visibleNotices.isEmpty ||
+                              !_canCurrentUserObserveSupportQueueAlerts()) {
+                            return const SizedBox.shrink();
+                          }
+                          final canClaim =
+                              _canCurrentUserClaimSupportQueueAlerts();
+                          final canForceClose =
+                              _canCurrentUserForceCloseSupportQueueAlerts();
+                          return ConstrainedBox(
+                            constraints: BoxConstraints(maxWidth: cardWidth),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                ...visibleNotices.take(maxCards).map((notice) {
                               return Padding(
                                 padding: const EdgeInsets.only(bottom: 8),
                                 child: ValueListenableBuilder<Set<String>>(
@@ -2905,6 +3002,19 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                     ],
                                                   ),
                                                 ),
+                                                IconButton(
+                                                  tooltip:
+                                                      'Скрыть до следующего входа в Чаты',
+                                                  onPressed: () =>
+                                                      _dismissSupportQueueNotice(
+                                                        notice.ticketId,
+                                                      ),
+                                                  icon: const Icon(
+                                                    Icons.close_rounded,
+                                                  ),
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                ),
                                               ],
                                             ),
                                             const SizedBox(height: 10),
@@ -3001,7 +3111,24 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                         label: Text(
                                                           actionBusy
                                                               ? 'Принимаем...'
-                                                              : 'Принять заявку',
+                                                              : 'Ответить',
+                                                        ),
+                                                      ),
+                                                    if (!notice.claimable &&
+                                                        (notice.chatId ?? '')
+                                                            .trim()
+                                                            .isNotEmpty)
+                                                      FilledButton.tonalIcon(
+                                                        onPressed: actionBusy
+                                                            ? null
+                                                            : () => _openSupportQueueNoticeChat(
+                                                                notice,
+                                                              ),
+                                                        icon: const Icon(
+                                                          Icons.forum_outlined,
+                                                        ),
+                                                        label: const Text(
+                                                          'Открыть чат',
                                                         ),
                                                       ),
                                                     if (notice.closable ||
@@ -3028,8 +3155,8 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                               ),
                                                         label: Text(
                                                           actionBusy
-                                                              ? 'Отмечаем...'
-                                                              : 'Отметить решённой',
+                                                              ? 'Закрываем...'
+                                                              : 'Закрыть обращение',
                                                         ),
                                                       ),
                                                   ],
@@ -3054,8 +3181,8 @@ class _GlobalNoticeHost extends StatelessWidget {
                                   },
                                 ),
                               );
-                            }),
-                            if (notices.length > maxCards)
+                                }),
+                                if (visibleNotices.length > maxCards)
                               Material(
                                 color: theme.colorScheme.surfaceContainer,
                                 elevation: 4,
@@ -3066,13 +3193,15 @@ class _GlobalNoticeHost extends StatelessWidget {
                                     vertical: 8,
                                   ),
                                   child: Text(
-                                    'Ещё заявок: ${notices.length - maxCards}',
+                                    'Ещё заявок: ${visibleNotices.length - maxCards}',
                                     style: theme.textTheme.labelLarge,
                                   ),
                                 ),
                               ),
-                          ],
-                        ),
+                              ],
+                            ),
+                          );
+                        },
                       );
                     },
                   ),
