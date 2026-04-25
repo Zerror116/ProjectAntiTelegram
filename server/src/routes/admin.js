@@ -3436,9 +3436,6 @@ router.post(
       .toLowerCase();
     const manualShelfLabel = normalizeShelfLabel(req.body?.shelf_number);
     const manualShelfNumber = parsePositiveShelfNumber(req.body?.shelf_number);
-    const manualShelfConfirmed = ["1", "true", "yes", "y"].includes(
-      String(req.body?.manual_shelf ?? "").toLowerCase().trim(),
-    );
     if (
       processingModeRaw !== "standard" &&
       processingModeRaw !== "oversize"
@@ -3476,6 +3473,7 @@ router.post(
                 r.quantity,
                 r.is_fulfilled,
                 c.status AS cart_status,
+                c.processing_mode AS cart_processing_mode,
                 p.product_code,
                 p.title,
                 p.price
@@ -3500,22 +3498,15 @@ router.post(
       }
       const item = reservationQ.rows[0];
       const targetCartItemId = item.cart_item_id ? String(item.cart_item_id) : "";
-      if (item.is_fulfilled === true) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          error: "Этот товар уже обработан",
-          data: { status: "processed" },
-        });
-      }
-
       const carryShelfQ = await client.query(
         `SELECT NULLIF(BTRIM(COALESCE(meta->>'shelf_label', '')), '') AS shelf_label,
                 CASE
                   WHEN COALESCE(meta->>'shelf_number', '') ~ '^-?\\d+$'
                     THEN (meta->>'shelf_number')::int
                   ELSE NULL
-                END AS shelf_number
+                END AS shelf_number,
+                NULLIF(BTRIM(COALESCE(meta->>'processing_mode', '')), '') AS processing_mode,
+                NULLIF(BTRIM(COALESCE(meta->>'processed_by_name', '')), '') AS processed_by_name
          FROM messages
          WHERE chat_id = $1
            AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
@@ -3578,16 +3569,31 @@ router.post(
         : persistedUserShelfNumber;
       const canReuseExistingShelf =
         existingShelfLabel != null && existingShelfLabel !== "не назначена";
-      if (
-        requiresManualShelf &&
-        !hasActiveShelfContext &&
-        (!manualShelfLabel || manualShelfConfirmed !== true)
-      ) {
+      const existingProcessingMode =
+        String(carryShelfQ.rows[0]?.processing_mode || item.cart_processing_mode || processingMode)
+          .trim()
+          .toLowerCase() || processingMode;
+      const existingProcessedByName = String(
+        carryShelfQ.rows[0]?.processed_by_name || "",
+      ).trim();
+      if (item.is_fulfilled === true) {
         await client.query("ROLLBACK");
-        return res.status(400).json({
-          ok: false,
-          code: "manual_shelf_required",
-          error: "Для первого товара в корзине нужно вручную указать номер полки",
+        return res.json({
+          ok: true,
+          data: {
+            reservation_id: item.id,
+            cart_item_id: targetCartItemId || null,
+            status: "processed",
+            shelf_number: existingShelfNumber,
+            shelf_label: existingShelfLabel,
+            shelf_display: displayShelfValue(
+              existingShelfLabel,
+              existingShelfNumber,
+            ),
+            processing_mode:
+              existingProcessingMode === "oversize" ? "oversize" : "standard",
+            processed_by_name: existingProcessedByName,
+          },
         });
       }
       if (requiresManualShelf && !manualShelfLabel && !canReuseExistingShelf) {
