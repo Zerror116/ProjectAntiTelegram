@@ -101,6 +101,25 @@ class _WorkerPanelState extends State<WorkerPanel>
     return parsed ?? fallback;
   }
 
+  double? _parsedRevisionPercent() {
+    final raw = _revisionPercentCtrl.text.trim().replaceAll(',', '.');
+    if (raw.isEmpty) return null;
+    final value = double.tryParse(raw);
+    if (value == null || value <= 0 || value > 95) return null;
+    return value.abs();
+  }
+
+  int? _previewRevisionPrice(dynamic rawPrice) {
+    final percent = _parsedRevisionPercent();
+    if (percent == null) return null;
+    final price = _toDoubleValue(rawPrice, 0);
+    if (price <= 0) return null;
+    final discounted = price * (1 - percent / 100);
+    final roundedDown = (discounted / 50).floor() * 50;
+    final safe = roundedDown < 50 ? 50 : roundedDown;
+    return safe.toInt();
+  }
+
   void _dismissKeyboard() {
     final focus = FocusManager.instance.primaryFocus;
     if (focus?.hasFocus ?? false) {
@@ -172,7 +191,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   List<Map<String, dynamic>> _ownQueuedPosts = [];
   List<Map<String, dynamic>> _revisionDates = [];
   List<Map<String, dynamic>> _revisionPosts = [];
-  Set<String> _selectedRevisionDates = {};
+  String? _selectedRevisionDate;
 
   @override
   void initState() {
@@ -1026,24 +1045,22 @@ class _WorkerPanelState extends State<WorkerPanel>
             .map((e) => (e['day'] ?? '').toString())
             .where((e) => e.isNotEmpty)
             .toList();
-        final preservedSelection = availableDays
-            .where((day) => _selectedRevisionDates.contains(day))
-            .take(2)
-            .toSet();
-        final nextSelected = preservedSelection.isNotEmpty
-            ? preservedSelection
-            : availableDays.take(1).toSet();
+        final nextSelected =
+            (_selectedRevisionDate != null &&
+                availableDays.contains(_selectedRevisionDate))
+            ? _selectedRevisionDate
+            : (availableDays.isNotEmpty ? availableDays.first : null);
         if (!mounted) return;
         setState(() {
           _revisionDates = dates;
-          _selectedRevisionDates = nextSelected;
+          _selectedRevisionDate = nextSelected;
         });
         await _loadRevisionPosts();
       } else {
         if (!mounted) return;
         setState(() {
           _revisionDates = [];
-          _selectedRevisionDates = {};
+          _selectedRevisionDate = null;
           _revisionPosts = [];
         });
       }
@@ -1062,10 +1079,10 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _loadingRevisionPosts = true);
     }
     try {
-      final selected = _selectedRevisionDates.toList()..sort();
+      final selected = (_selectedRevisionDate ?? '').trim();
       final resp = await authService.dio.get(
         '/api/worker/revision/posts',
-        queryParameters: {if (selected.isNotEmpty) 'dates': selected.join(',')},
+        queryParameters: {if (selected.isNotEmpty) 'dates': selected},
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -1077,12 +1094,18 @@ class _WorkerPanelState extends State<WorkerPanel>
             ? (payload['dates'] as List)
                   .map((e) => e?.toString() ?? '')
                   .where((e) => e.isNotEmpty)
-                  .toSet()
-            : _selectedRevisionDates;
+                  .toList()
+            : (_selectedRevisionDate == null
+                  ? <String>[]
+                  : <String>[_selectedRevisionDate!]);
+        final nextSelected =
+            _selectedRevisionDate != null && dates.contains(_selectedRevisionDate)
+            ? _selectedRevisionDate
+            : (dates.isNotEmpty ? dates.first : null);
         if (!mounted) return;
         setState(() {
           _revisionPosts = posts;
-          _selectedRevisionDates = dates;
+          _selectedRevisionDate = nextSelected;
         });
       } else {
         if (!mounted) return;
@@ -1148,20 +1171,20 @@ class _WorkerPanelState extends State<WorkerPanel>
       nextDates.add(copy);
     }
 
-    var nextSelected = _selectedRevisionDates
-        .where(
-          (day) =>
-              nextDates.any((item) => (item['day'] ?? '').toString() == day),
-        )
-        .toSet();
-    if (nextSelected.isEmpty && nextDates.isNotEmpty) {
-      nextSelected = {(nextDates.first['day'] ?? '').toString()};
-    }
+    final nextSelected =
+        (_selectedRevisionDate != null &&
+            nextDates.any(
+              (item) => (item['day'] ?? '').toString() == _selectedRevisionDate,
+            ))
+        ? _selectedRevisionDate
+        : (nextDates.isNotEmpty
+              ? (nextDates.first['day'] ?? '').toString()
+              : null);
 
     setState(() {
       _revisionPosts = remainingPosts;
       _revisionDates = nextDates;
-      _selectedRevisionDates = nextSelected;
+      _selectedRevisionDate = nextSelected;
     });
   }
 
@@ -1226,16 +1249,11 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Future<void> _toggleRevisionDate(String day) async {
-    final next = Set<String>.from(_selectedRevisionDates);
-    if (next.contains(day)) {
-      if (next.length == 1) return;
-      next.remove(day);
-    } else {
-      if (next.length >= 2) return;
-      next.add(day);
-    }
+    final normalizedDay = day.trim();
+    if (normalizedDay.isEmpty) return;
+    if (_selectedRevisionDate == normalizedDay) return;
     if (!mounted) return;
-    setState(() => _selectedRevisionDates = next);
+    setState(() => _selectedRevisionDate = normalizedDay);
     await _loadRevisionPosts();
   }
 
@@ -1253,8 +1271,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       return;
     }
     final percent = enteredPercent.abs();
-    if (_selectedRevisionDates.isEmpty) {
-      setState(() => _message = 'Выберите хотя бы одну дату ревизии');
+    final selectedDate = (_selectedRevisionDate ?? '').trim();
+    if (selectedDate.isEmpty) {
+      setState(() => _message = 'Выберите дату ревизии');
       return;
     }
 
@@ -1287,7 +1306,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       final resp = await authService.dio.post(
         '/api/worker/revision/auto',
         data: {
-          'dates': _selectedRevisionDates.toList(),
+          'dates': [selectedDate],
           'percent': percent,
           'hide_old_versions': _autoHideOldRevisionPosts,
         },
@@ -2824,7 +2843,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               border: Border.all(color: theme.colorScheme.outlineVariant),
             ),
             child: const Text(
-              'Ревизия: выберите одну или две первые даты публикации, затем запускайте авто-ревизию '
+              'Ревизия: выберите первую или вторую дату публикации, затем запускайте авто-ревизию '
               'или вручную редактируйте карточки. Купленные, но ещё не обработанные товары '
               'показываются с пометкой и не меняются через ревизию.',
             ),
@@ -2859,7 +2878,10 @@ class _WorkerPanelState extends State<WorkerPanel>
                     final day = (item['day'] ?? '').toString();
                     final label = (item['label'] ?? day).toString();
                     final count = _toIntValue(item['posts'], 0);
-                    final selected = _selectedRevisionDates.contains(day);
+                    final revisionShelfLabel = (item['revision_shelf_label'] ?? '')
+                        .toString()
+                        .trim();
+                    final selected = _selectedRevisionDate == day;
                     final colorScheme = theme.colorScheme;
                     return SizedBox(
                       width: buttonWidth,
@@ -2907,6 +2929,17 @@ class _WorkerPanelState extends State<WorkerPanel>
                                     : colorScheme.onSurfaceVariant,
                               ),
                             ),
+                            const SizedBox(height: 2),
+                            Text(
+                              'Полка ${revisionShelfLabel.isNotEmpty ? revisionShelfLabel : '—'}',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: selected
+                                    ? colorScheme.onPrimaryContainer.withValues(
+                                        alpha: 0.78,
+                                      )
+                                    : colorScheme.onSurfaceVariant,
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -2926,6 +2959,9 @@ class _WorkerPanelState extends State<WorkerPanel>
                     decimal: true,
                     signed: false,
                   ),
+                  onChanged: (_) {
+                    if (mounted) setState(() {});
+                  },
                   decoration: withInputLanguageBadge(
                     const InputDecoration(
                       labelText: 'Процент снижения (например: 10, 25, 50)',
@@ -2975,6 +3011,9 @@ class _WorkerPanelState extends State<WorkerPanel>
                                       offset: _revisionPercentCtrl.text.length,
                                     ),
                                   );
+                              if (mounted) {
+                                setState(() {});
+                              }
                             },
                     ),
                   )
@@ -3006,7 +3045,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           else if (_revisionPosts.isEmpty)
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('Нет постов для выбранных дат'),
+              child: Text('Нет постов для выбранной даты'),
             )
           else
             ..._revisionPosts.map((post) {
@@ -3015,9 +3054,14 @@ class _WorkerPanelState extends State<WorkerPanel>
               );
               final blocked = _isRevisionBlocked(post);
               final blockedNote = _revisionBlockedNote(post);
+              final revisionShelfNumber = _toIntValue(
+                post['revision_shelf_number'] ?? post['shelf_number'],
+                1,
+              );
+              final previewPrice = _previewRevisionPrice(post['price']);
               final productLabel = _formatProductLabel(
                 post['product_code'],
-                post['shelf_number'],
+                revisionShelfNumber,
               );
               final createdAt = (post['created_at'] ?? '').toString();
               final createdAtShort = createdAt.length >= 16
@@ -3089,11 +3133,13 @@ class _WorkerPanelState extends State<WorkerPanel>
                             children: [
                               _statChip('ID $productLabel'),
                               _statChip(
-                                'Полка ${_toIntValue(post['shelf_number'], 1).toString().padLeft(2, '0')}',
+                                'Полка ${revisionShelfNumber.toString().padLeft(2, '0')}',
                               ),
                               _statChip(
                                 '${_toDoubleValue(post['price']).toStringAsFixed(0)} ₽',
                               ),
+                              if (previewPrice != null)
+                                _statChip('Будет: $previewPrice ₽'),
                               _statChip('x${_toIntValue(post['quantity'], 1)}'),
                             ],
                           ),

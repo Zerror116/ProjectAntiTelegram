@@ -16,7 +16,11 @@ const { runInRequestTenantScope } = require('../utils/requestScope');
 const { uploadsPath } = require('../utils/storagePaths');
 const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
 const { upsertProductCardSnapshot } = require('../utils/productCardSnapshots');
-const { toOriginalPublicMediaUrl } = require('../utils/mediaAssets');
+const {
+  toOriginalPublicMediaUrl,
+  normalizePublicUploadRef,
+  absoluteUploadPathFromCanonical,
+} = require('../utils/mediaAssets');
 
 const productUploadsDir = uploadsPath('products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
@@ -131,14 +135,14 @@ function parseRevisionDates(value) {
     const normalized = value
       .map((item) => String(item || '').trim())
       .filter((item) => item && isIsoDay(item));
-    return Array.from(new Set(normalized)).slice(0, 2);
+    return Array.from(new Set(normalized));
   }
   if (typeof value === 'string') {
     const normalized = value
       .split(',')
       .map((item) => item.trim())
       .filter((item) => item && isIsoDay(item));
-    return Array.from(new Set(normalized)).slice(0, 2);
+    return Array.from(new Set(normalized));
   }
   return [];
 }
@@ -164,18 +168,12 @@ function roundAutoRevisionPrice(originalValue, discountPercent, step = 50, min =
   const discount = Math.abs(Number(discountPercent));
   if (!Number.isFinite(original) || original <= 0) return min;
   if (!Number.isFinite(discount) || discount <= 0) {
-    return roundPriceToStep(original, step, min);
+    return Math.max(min, Math.floor(original / step) * step);
   }
 
   const discounted = original * (1 - discount / 100);
-  let rounded = roundPriceToStep(discounted, step, min);
-
-  // Keep the step-50 grid, but force an actual decrease whenever
-  // a positive revision percent was requested.
-  if (rounded >= original) {
-    rounded -= step;
-  }
-  return Math.max(min, rounded);
+  const roundedDown = Math.floor(discounted / step) * step;
+  return Math.max(min, roundedDown);
 }
 
 function toShelfNumber(value, fallback = 1) {
@@ -248,6 +246,18 @@ function formatProductLabel(productCode, shelfNumber) {
     ? String(Math.floor(shelf)).padStart(2, '0')
     : '—';
   return `${codePart}--${shelfPart}`;
+}
+
+function formatShelfLabel(shelfNumber, fallback = '—') {
+  const shelf = toShelfNumber(shelfNumber, 0);
+  if (shelf <= 0) return fallback;
+  return String(shelf).padLeft(2, '0');
+}
+
+function revisionDayToTimestamp(day) {
+  const normalized = String(day || '').trim();
+  if (!isIsoDay(normalized)) return null;
+  return `${normalized}T00:00:00+04:00`;
 }
 
 function toBoolean(value, fallback = false) {
@@ -461,6 +471,25 @@ function uniqStrings(values) {
   );
 }
 
+const REVISION_PLACEHOLDER_FILENAMES = new Set([
+  'demo-placeholder.png',
+  'public-media-unavailable.png',
+  'media-unavailable.png',
+]);
+
+function isRevisionMissingPhoto(imageUrl) {
+  const normalized = normalizeImageUrl(imageUrl);
+  if (!normalized) return true;
+  const ref = normalizePublicUploadRef(normalized);
+  if (!ref) return false;
+  if (REVISION_PLACEHOLDER_FILENAMES.has(String(ref.filename || '').toLowerCase())) {
+    return true;
+  }
+  const absolutePath = absoluteUploadPathFromCanonical(ref.canonicalPath);
+  if (!absolutePath) return true;
+  return !fs.existsSync(absolutePath);
+}
+
 function extractSourceMessageIdsFromPayload(payload) {
   const data = parseSettings(payload);
   const ids = [];
@@ -553,6 +582,73 @@ async function restoreCatalogMessagesHiddenByRevision(client, channelId, message
     [channelId, ids],
   );
   return q.rows;
+}
+
+async function hideCatalogMessagesMissingPhoto(client, channelId, messageIds, actorUserId = null) {
+  const ids = uniqStrings(messageIds);
+  if (!ids.length) return [];
+  const q = await client.query(
+    `UPDATE messages
+     SET meta = COALESCE(meta, '{}'::jsonb)
+       || jsonb_build_object(
+            'hidden_for_all', true,
+            'hidden_missing_photo', true,
+            'hidden_missing_photo_at', now()::text,
+            'hidden_missing_photo_actor_id', NULLIF($3::text, '')
+          )
+     WHERE chat_id = $1
+       AND id = ANY($2::uuid[])
+       AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [channelId, ids, actorUserId ? String(actorUserId) : ''],
+  );
+  return q.rows;
+}
+
+async function sanitizeRevisionVisibleCatalogMessages(
+  client,
+  channelId,
+  { actorUserId = null, selectedDates = [] } = {},
+) {
+  const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
+  const q = await client.query(
+    `SELECT m.id AS message_id,
+            m.chat_id,
+            m.sender_id,
+            m.text,
+            m.meta,
+            m.created_at,
+            p.image_url AS product_image_url
+     FROM messages m
+     LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+     WHERE m.chat_id = $1
+       AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND (
+         $2::text[] IS NULL
+         OR to_char((m.created_at AT TIME ZONE $3), 'YYYY-MM-DD') = ANY($2::text[])
+       )`,
+    [channelId, dateFilter, SAMARA_TZ],
+  );
+  const messageIdsToHide = [];
+  for (const row of q.rows) {
+    const meta = parseSettings(row.meta);
+    const imageUrl =
+      normalizeImageUrl(row.product_image_url) || normalizeImageUrl(meta.image_url);
+    if (isRevisionMissingPhoto(imageUrl)) {
+      messageIdsToHide.push(String(row.message_id || '').trim());
+    }
+  }
+  const hiddenMessages = await hideCatalogMessagesMissingPhoto(
+    client,
+    channelId,
+    messageIdsToHide,
+    actorUserId,
+  );
+  return {
+    hiddenMessages,
+    hiddenCount: hiddenMessages.length,
+  };
 }
 
 async function fetchRevisionTarget(client, channelId, item) {
@@ -702,7 +798,7 @@ function buildRevisionQueuePayload({
   };
 }
 
-async function fetchRevisionDays(client, channelId, limit = 2) {
+async function fetchRevisionDays(client, channelId, tenantId = null, limit = 2) {
   const safeLimit = Math.min(Math.max(Number(limit) || 2, 1), 10);
   const q = await client.query(
     `WITH visible_catalog AS (
@@ -761,10 +857,24 @@ async function fetchRevisionDays(client, channelId, limit = 2) {
       safeLimit,
     ],
   );
-  return q.rows;
+  const rows = [];
+  for (const row of q.rows) {
+    const revisionShelfNumber = await resolveAutoShelfNumber(
+      client,
+      tenantId || null,
+      revisionDayToTimestamp(row.day),
+      1,
+    );
+    rows.push({
+      ...row,
+      revision_shelf_number: revisionShelfNumber,
+      revision_shelf_label: formatShelfLabel(revisionShelfNumber),
+    });
+  }
+  return rows;
 }
 
-async function fetchRevisionPosts(client, channelId, selectedDates) {
+async function fetchRevisionPosts(client, channelId, tenantId, selectedDates) {
   const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
   const rows = await client.query(
     `WITH visible_catalog AS (
@@ -851,23 +961,41 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
       REVISION_COMPLETED_CART_STATUSES,
     ]
   );
-  return rows.rows.map((row) => {
+  const revisionShelfCache = new Map();
+  const mapped = [];
+  for (const row of rows.rows) {
     const meta = parseSettings(row.meta);
     const fallbackPrice = toPositiveNumber(meta.price, 0);
     const fallbackQuantity = toPositiveInteger(meta.quantity, 1);
     const fallbackImage = normalizeImageUrl(meta.image_url);
     const state = normalizeRevisionState(row);
-    return {
+    const day = String(row.day || '').trim();
+    let revisionShelfNumber = revisionShelfCache.get(day);
+    if (revisionShelfNumber == null) {
+      revisionShelfNumber = await resolveAutoShelfNumber(
+        client,
+        tenantId || null,
+        revisionDayToTimestamp(day),
+        1,
+      );
+      revisionShelfCache.set(day, revisionShelfNumber);
+    }
+    mapped.push({
       message_id: row.message_id,
       chat_id: row.chat_id,
       created_at: row.created_at,
       text: row.text,
       meta,
-      day: String(row.day || '').trim(),
+      day,
       day_label: String(row.day_label || '').trim(),
       product_id: row.product_id || meta.product_id || null,
       product_code: row.product_code ?? meta.product_code ?? null,
-      shelf_number: Number(row.product_shelf_number ?? meta.shelf_number ?? 1),
+      shelf_number: revisionShelfNumber,
+      revision_shelf_number: revisionShelfNumber,
+      revision_shelf_label: formatShelfLabel(revisionShelfNumber),
+      source_product_shelf_number: Number(
+        row.product_shelf_number ?? meta.shelf_number ?? 1,
+      ),
       title: String(row.product_title || '').trim(),
       description: String(row.product_description || '').trim(),
       price: Number(row.product_price ?? fallbackPrice),
@@ -878,8 +1006,9 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
       revision_note: state.revision_note,
       has_pending_processing: row.has_pending_processing === true,
       has_unfulfilled_reservation: row.has_unfulfilled_reservation === true,
-    };
-  }).sort(compareRevisionPosts);
+    });
+  }
+  return mapped.sort(compareRevisionPosts);
 }
 
 async function allocateProductCode(client, tenantId = null) {
@@ -1775,8 +1904,28 @@ router.get(
         actorUserId,
         req.user.tenant_id || null
       );
-      const days = await fetchRevisionDays(client, mainChannel.id, 2);
+      const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
+        actorUserId,
+      });
+      const days = await fetchRevisionDays(
+        client,
+        mainChannel.id,
+        req.user.tenant_id || null,
+        2,
+      );
       await client.query('COMMIT');
+      const io = req.app.get('io');
+      if (io && sanitation.hiddenMessages.length > 0) {
+        for (const message of sanitation.hiddenMessages) {
+          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+            chatId: mainChannel.id,
+            message: decryptMessageRow(message),
+          });
+        }
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: mainChannel.id,
+        });
+      }
       return res.json({ ok: true, data: days });
     } catch (err) {
       try {
@@ -1796,6 +1945,12 @@ router.get(
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const selectedDates = parseRevisionDates(req.query?.dates);
+    if (selectedDates.length > 1) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Для ревизии можно выбрать только одну дату',
+      });
+    }
     const client = await db.pool.connect();
     try {
       const actorUserId = await resolveActorUserId(client, req.user);
@@ -1805,11 +1960,41 @@ router.get(
         actorUserId,
         req.user.tenant_id || null
       );
+      const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
+        actorUserId,
+        selectedDates,
+      });
       const fallbackDays = selectedDates.length > 0
         ? selectedDates
-        : (await fetchRevisionDays(client, mainChannel.id, 1)).map((x) => x.day);
-      const posts = await fetchRevisionPosts(client, mainChannel.id, fallbackDays);
+        : (
+            await fetchRevisionDays(
+              client,
+              mainChannel.id,
+              req.user.tenant_id || null,
+              1,
+            )
+          ).map((x) => x.day);
+      const posts = fallbackDays.length > 0
+        ? await fetchRevisionPosts(
+            client,
+            mainChannel.id,
+            req.user.tenant_id || null,
+            fallbackDays,
+          )
+        : [];
       await client.query('COMMIT');
+      const io = req.app.get('io');
+      if (io && sanitation.hiddenMessages.length > 0) {
+        for (const message of sanitation.hiddenMessages) {
+          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+            chatId: mainChannel.id,
+            message: decryptMessageRow(message),
+          });
+        }
+        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+          chatId: mainChannel.id,
+        });
+      }
       return res.json({
         ok: true,
         data: {
@@ -1917,8 +2102,13 @@ router.post(
         ]);
 
         const nextQuantity = Math.floor(item.quantity);
-        const nextShelfNumber = toShelfNumber(target.product_shelf_number, 1);
-        const nextPrice = roundPriceToStep(item.price, 50, 50);
+        const nextShelfNumber = await resolveAutoShelfNumber(
+          client,
+          req.user.tenant_id || null,
+          revisionDayToTimestamp(target.day),
+          1,
+        );
+        const nextPrice = Number(item.price);
         const nextImageUrl = item.image_url || normalizeImageUrl(target.product_image_url) || null;
         const payload = buildRevisionQueuePayload({
           post: {
@@ -2052,6 +2242,12 @@ router.post(
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const dates = parseRevisionDates(req.body?.dates);
+    if (dates.length > 1) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Для ревизии можно выбрать только одну дату',
+      });
+    }
     const discountPercent = Math.abs(Number(req.body?.percent));
     const hideOldVersions = toBoolean(req.body?.hide_old_versions, true);
 
@@ -2071,10 +2267,28 @@ router.post(
         actorUserId,
         req.user.tenant_id || null
       );
+      await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
+        actorUserId,
+        selectedDates: dates,
+      });
       const selectedDates = dates.length > 0
         ? dates
-        : (await fetchRevisionDays(client, mainChannel.id, 1)).map((x) => x.day);
-      const posts = await fetchRevisionPosts(client, mainChannel.id, selectedDates);
+        : (
+            await fetchRevisionDays(
+              client,
+              mainChannel.id,
+              req.user.tenant_id || null,
+              1,
+            )
+          ).map((x) => x.day);
+      const posts = selectedDates.length > 0
+        ? await fetchRevisionPosts(
+            client,
+            mainChannel.id,
+            req.user.tenant_id || null,
+            selectedDates,
+          )
+        : [];
 
       const groups = new Map();
       for (const post of posts) {
@@ -2103,7 +2317,7 @@ router.post(
 
         const revisedPrice = roundAutoRevisionPrice(basePrice, discountPercent, 50, 50);
         const nextQuantity = toPositiveInteger(post.quantity, 1);
-        const nextShelfNumber = toShelfNumber(post.shelf_number, 1);
+        const nextShelfNumber = toShelfNumber(post.revision_shelf_number, 1);
         const title = String(post.title || '').trim();
         if (!title) continue;
         const description = String(post.description || '').trim();
