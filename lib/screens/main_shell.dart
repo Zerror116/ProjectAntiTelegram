@@ -311,6 +311,10 @@ class _MainShellState extends State<MainShell> {
       _index = nextIndex;
       _activatedDestinations.add(destinations[nextIndex].id);
     });
+    if (destinations[nextIndex].id == 'chats') {
+      resetSupportQueueNoticeDismissals();
+      unawaited(refreshSupportQueueNotices());
+    }
   }
 
   Future<void> _maybeHandleInitialNotificationDeepLink() async {
@@ -703,6 +707,7 @@ class _MainShellState extends State<MainShell> {
     });
     activeShellSectionNotifier.value = allDestinations[nextIndex].id;
     if (allDestinations[nextIndex].id == 'chats') {
+      resetSupportQueueNoticeDismissals();
       unawaited(refreshSupportQueueNotices());
     }
   }
@@ -933,6 +938,7 @@ class _MainShellState extends State<MainShell> {
               });
               activeShellSectionNotifier.value = destinations[nextIndex].id;
               if (destinations[nextIndex].id == 'chats') {
+                resetSupportQueueNoticeDismissals();
                 unawaited(refreshSupportQueueNotices());
               }
             },

@@ -593,6 +593,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return '$codePart--$shelfPart';
   }
 
+  String _displayShelfValue(dynamic shelfLabel, dynamic shelfNumber) {
+    final label = (shelfLabel ?? '').toString().trim();
+    if (label.isNotEmpty) return label;
+    final rawNumber = (shelfNumber ?? '').toString().trim();
+    if (rawNumber.isNotEmpty) return rawNumber;
+    return 'не назначена';
+  }
+
   double _toFocus(dynamic value) {
     final parsed = double.tryParse('${value ?? ''}');
     if (parsed == null || !parsed.isFinite) return 0;
@@ -4043,7 +4051,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ? ((data['data']['chat_id'] ?? '').toString().trim())
           : '';
       if (chatId.isNotEmpty) {
-        var updatedTicket = ticket;
+        var updatedTicket = <String, dynamic>{
+          ...ticket,
+          'chat_id': chatId,
+          'assignee_id': authService.currentUser?.id,
+          'status': 'open',
+        };
         for (final item in _supportActiveTickets) {
           if ((item['id'] ?? '').toString().trim() == ticketId) {
             updatedTicket = item;
@@ -8028,7 +8041,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     item['product_shelf_number'],
                   );
               final quantity = (item['quantity'] ?? '—').toString();
-              final shelf = (item['shelf_number'] ?? 'не назначена').toString();
+              final shelf = _displayShelfValue(
+                item['shelf_label'],
+                item['shelf_number'],
+              );
               return Card(
                 child: ListTile(
                   title: Text('Клиент: $clientName'),
@@ -10639,7 +10655,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final sum = _formatMoney(
       customer['agreed_sum'] ?? customer['processed_sum'],
     );
-    final shelf = (customer['shelf_number'] ?? 'не назначена').toString();
+    final shelf = _displayShelfValue(
+      customer['shelf_label'],
+      customer['shelf_number'],
+    );
     final address = (customer['address_text'] ?? '').toString().trim();
     final status = _deliveryCustomerStatusLabel(
       (customer['delivery_status'] ?? customer['call_status'] ?? '').toString(),
