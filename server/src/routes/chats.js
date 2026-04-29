@@ -4009,9 +4009,55 @@ router.get("/:chatId/search", requireAuth, async (req, res, next) => {
           safeLimit,
         ],
       );
-      const messageIds = searchQ.rows
+      const indexedMessageIds = searchQ.rows
         .map((row) => String(row.message_id || "").trim())
         .filter(Boolean);
+      let fallbackMessageIds = [];
+      if (indexedMessageIds.length < safeLimit) {
+        const fallbackQ = await db.query(
+          `SELECT m.id AS message_id
+           FROM messages m
+           WHERE m.chat_id = $1
+             AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+             AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+             AND ($4::uuid IS NULL OR m.sender_id = $4)
+             AND ($5::timestamptz IS NULL OR m.created_at >= $5::timestamptz)
+             AND ($6::timestamptz IS NULL OR m.created_at <= $6::timestamptz)
+             AND (
+               LOWER(COALESCE(m.meta->>'title', '')) LIKE $3 ESCAPE '\\'
+               OR LOWER(COALESCE(m.meta->>'description', '')) LIKE $3 ESCAPE '\\'
+               OR LOWER(COALESCE(m.meta->>'product_label', '')) LIKE $3 ESCAPE '\\'
+               OR LOWER(COALESCE(m.meta->>'product_code', '')) LIKE $3 ESCAPE '\\'
+               OR LOWER(COALESCE(m.meta->>'price', '')) LIKE $3 ESCAPE '\\'
+               OR LOWER(COALESCE(m.meta->'card_snapshot'->>'title', '')) LIKE $3 ESCAPE '\\'
+               OR LOWER(COALESCE(m.meta->'card_snapshot'->>'short_description', '')) LIKE $3 ESCAPE '\\'
+             )
+           ORDER BY m.created_at DESC, m.id DESC
+           LIMIT $7`,
+          [
+            chatId,
+            String(userId),
+            like,
+            fromUserId,
+            dateFrom,
+            dateTo,
+            safeLimit,
+          ],
+        );
+        fallbackMessageIds = fallbackQ.rows
+          .map((row) => String(row.message_id || "").trim())
+          .filter(Boolean);
+        if (fallbackMessageIds.length > 0) {
+          await Promise.allSettled(
+            fallbackMessageIds.map((messageId) =>
+              syncMessageSearchDocumentFromMessageId(messageId),
+            ),
+          );
+        }
+      }
+      const messageIds = Array.from(
+        new Set([...indexedMessageIds, ...fallbackMessageIds]),
+      ).slice(0, safeLimit);
       messages = await Promise.all(
         messageIds.map((messageId) => getHydratedMessageById(messageId, userId)),
       );

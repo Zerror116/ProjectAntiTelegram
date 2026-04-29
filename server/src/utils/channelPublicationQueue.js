@@ -8,6 +8,7 @@ const { registerPublicImageUpload } = require('./publicMediaRegistration');
 const { toOriginalPublicMediaUrl } = require('./mediaAssets');
 const { upsertProductCardSnapshot } = require('./productCardSnapshots');
 const { logMonitoringEvent } = require('./monitoring');
+const { upsertMessageSearchDocument } = require('./chatSearchIndex');
 
 const DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS = Math.max(
   1000,
@@ -850,6 +851,16 @@ async function processBatchItem(client, batch) {
       ],
     );
     const message = messageInsert.rows[0];
+    await upsertMessageSearchDocument({
+      messageId: message.id,
+      chatId: row.channel_id,
+      tenantId: batch.tenant_id || null,
+      senderId: null,
+      text: productMessageText(product),
+      meta: messageMeta,
+      attachments: [],
+      createdAt: message.created_at || null,
+    });
     emitted.mainMessage = decryptMessageRow(message);
 
     const shouldHidePrevious =
@@ -917,6 +928,22 @@ async function processBatchItem(client, batch) {
           JSON.stringify(archiveMeta),
         ],
       );
+      await upsertMessageSearchDocument({
+        messageId: archiveInsert.rows[0]?.id,
+        chatId: postsArchiveChannelId,
+        tenantId: batch.tenant_id || null,
+        senderId: null,
+        text: archivedProductMessageText({
+          product,
+          sourceChannelTitle: row.channel_title,
+          queuedByName: row.queued_by_name,
+          queuedByEmail: row.queued_by_email,
+          queuedByPhone: row.queued_by_phone,
+        }),
+        meta: archiveMeta,
+        attachments: [],
+        createdAt: archiveInsert.rows[0]?.created_at || null,
+      });
       await client.query('UPDATE chats SET updated_at = now() WHERE id = $1', [postsArchiveChannelId]);
       emitted.archiveMessages = archiveInsert.rows.map((item) => decryptMessageRow(item));
     }

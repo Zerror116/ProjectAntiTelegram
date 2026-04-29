@@ -42,6 +42,7 @@ const {
   getChannelPublicationBatch,
   kickChannelPublicationProcessor,
 } = require("../utils/channelPublicationQueue");
+const { upsertMessageSearchDocument } = require("../utils/chatSearchIndex");
 
 const requireProductPublishPermission = requirePermission("product.publish");
 const requireReservationFulfillPermission = requirePermission(
@@ -642,6 +643,21 @@ function publishDemoPostsSequentially({
             JSON.stringify(messageMeta),
           ],
         );
+        await upsertMessageSearchDocument({
+          messageId: messageInsert.rows[0]?.id,
+          chatId: channelId,
+          tenantId: tenantId || null,
+          senderId: null,
+          text: productMessageText({
+            title: demo.title,
+            description: demo.description,
+            price: demo.price,
+            quantity: demo.quantity,
+          }),
+          meta: messageMeta,
+          attachments: [],
+          createdAt: messageInsert.rows[0]?.created_at || null,
+        });
 
         await client.query(
           `INSERT INTO product_publication_queue (
