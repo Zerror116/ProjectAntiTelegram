@@ -4579,7 +4579,8 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<_ChatUploadFile?> _pickRawImageUpload(ImageSource source) async {
-    if (source == ImageSource.gallery && _preferFilePickerForImages) {
+    if (kIsWeb ||
+        (source == ImageSource.gallery && _preferFilePickerForImages)) {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.image,
         allowMultiple: false,
@@ -5113,7 +5114,7 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (_cameraSupported)
+            if (_cameraSupported && !kIsWeb)
               ListTile(
                 leading: const Icon(Icons.photo_camera_outlined),
                 title: const Text('Сделать фото'),
