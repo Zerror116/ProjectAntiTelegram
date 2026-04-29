@@ -268,6 +268,23 @@
         }
       }
 
+      function isSafariLikeBrowser() {
+        const ua = String(window.navigator.userAgent || '');
+        const hasSafari = /Safari\//.test(ua);
+        const hasChromium = /Chrome\/|CriOS\/|EdgiOS\/|Edg\//.test(ua);
+        const hasFirefox = /Firefox\/|FxiOS\//.test(ua);
+        return hasSafari && !hasChromium && !hasFirefox;
+      }
+
+      function armBootstrapTimeout(timeoutMs, message) {
+        if (bootstrapTimeoutId) {
+          window.clearTimeout(bootstrapTimeoutId);
+        }
+        bootstrapTimeoutId = window.setTimeout(function () {
+          setBootstrapFailure(message || 'Загрузка заняла слишком много времени.');
+        }, timeoutMs);
+      }
+
       function appendFlutterBootstrap(versionToken) {
         const script = document.createElement('script');
         script.src = versionedAsset('flutter_bootstrap.js', versionToken);
@@ -415,22 +432,4 @@
       })();
     })();
   </script>
-
-
 </body></html>
-      function isSafariLikeBrowser() {
-        const ua = String(window.navigator.userAgent || '');
-        const hasSafari = /Safari\//.test(ua);
-        const hasChromium = /Chrome\/|CriOS\/|EdgiOS\/|Edg\//.test(ua);
-        const hasFirefox = /Firefox\/|FxiOS\//.test(ua);
-        return hasSafari && !hasChromium && !hasFirefox;
-      }
-
-      function armBootstrapTimeout(timeoutMs, message) {
-        if (bootstrapTimeoutId) {
-          window.clearTimeout(bootstrapTimeoutId);
-        }
-        bootstrapTimeoutId = window.setTimeout(function () {
-          setBootstrapFailure(message || 'Загрузка заняла слишком много времени.');
-        }, timeoutMs);
-      }
