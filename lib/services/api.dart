@@ -22,6 +22,14 @@ class ApiService {
     final scheme = uri.scheme.toLowerCase();
     final host = uri.host.trim();
     if ((scheme == 'http' || scheme == 'https') && host.isNotEmpty) {
+      final isLoopback =
+          host == '127.0.0.1' ||
+          host == 'localhost' ||
+          host == '0.0.0.0' ||
+          host == '::1';
+      if (kDebugMode && isLoopback) {
+        return _localDebugBaseUrl;
+      }
       final portPart = uri.hasPort ? ':${uri.port}' : '';
       return '$scheme://$host$portPart';
     }

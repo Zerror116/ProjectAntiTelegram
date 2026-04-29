@@ -310,6 +310,15 @@ String _defaultApiBaseUrl() {
   final host = base.host.trim();
   if (host.isEmpty) return nativeDebugFallback;
 
+  final isLoopback =
+      host == '127.0.0.1' ||
+      host == 'localhost' ||
+      host == '0.0.0.0' ||
+      host == '::1';
+  if (kDebugMode && isLoopback) {
+    return nativeDebugFallback;
+  }
+
   final portPart = base.hasPort ? ':${base.port}' : '';
   return '$scheme://$host$portPart';
 }
@@ -761,7 +770,9 @@ Map<String, dynamic> _normalizedSupportQueueChatSettings(
   return settings;
 }
 
-Future<void> _openSupportQueueNoticeChat(_SupportQueueNoticePayload notice) async {
+Future<void> _openSupportQueueNoticeChat(
+  _SupportQueueNoticePayload notice,
+) async {
   final chatId = (notice.chatId ?? '').trim();
   if (chatId.isEmpty) return;
   final navigator = navigatorKey.currentState;
@@ -933,9 +944,7 @@ Future<void> _closeSupportQueueNotice(String ticketId) async {
   } on DioException catch (e) {
     final message = _extractApiErrorMessage(e);
     showGlobalAppNotice(
-      message.isNotEmpty
-          ? message
-          : 'Не удалось закрыть обращение',
+      message.isNotEmpty ? message : 'Не удалось закрыть обращение',
       title: 'Поддержка',
       tone: AppNoticeTone.error,
     );
@@ -2773,78 +2782,152 @@ class _GlobalNoticeHost extends StatelessWidget {
                             child: ConstrainedBox(
                               constraints: const BoxConstraints(maxWidth: 760),
                               child: Material(
-                                color: theme.colorScheme.surfaceContainerHigh,
+                                color: Colors.transparent,
                                 elevation: 8,
-                                borderRadius: BorderRadius.circular(16),
+                                borderRadius: BorderRadius.circular(22),
                                 child: InkWell(
-                                  borderRadius: BorderRadius.circular(16),
+                                  borderRadius: BorderRadius.circular(22),
                                   onTap: () => _appNoticeNotifier.value = null,
-                                  child: Padding(
-                                    padding: const EdgeInsets.fromLTRB(
-                                      14,
-                                      12,
-                                      14,
-                                      12,
-                                    ),
-                                    child: Builder(
-                                      builder: (context) {
-                                        final visuals = _noticeVisuals(
-                                          context,
-                                          notice.tone,
-                                        );
-                                        return Row(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Padding(
-                                              padding: const EdgeInsets.only(
-                                                top: 1,
-                                              ),
-                                              child: Icon(
-                                                visuals.icon,
-                                                color: visuals.accent,
-                                                size: 20,
-                                              ),
-                                            ),
-                                            const SizedBox(width: 10),
-                                            Expanded(
-                                              child: Column(
-                                                mainAxisSize: MainAxisSize.min,
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.start,
-                                                children: [
-                                                  if (notice.title != null)
-                                                    Text(
-                                                      notice.title!,
-                                                      style: theme
-                                                          .textTheme
-                                                          .labelLarge
-                                                          ?.copyWith(
-                                                            color: theme
-                                                                .colorScheme
-                                                                .onSurface,
-                                                            fontWeight:
-                                                                FontWeight.w700,
-                                                          ),
-                                                    ),
-                                                  Text(
-                                                    notice.message,
-                                                    style: theme
-                                                        .textTheme
-                                                        .bodyMedium
-                                                        ?.copyWith(
-                                                          color: theme
-                                                              .colorScheme
-                                                              .onSurface,
-                                                        ),
-                                                  ),
-                                                ],
-                                              ),
+                                  child: Builder(
+                                    builder: (context) {
+                                      final visuals = _noticeVisuals(
+                                        context,
+                                        notice.tone,
+                                      );
+                                      return Container(
+                                        decoration: BoxDecoration(
+                                          color: theme
+                                              .colorScheme
+                                              .surfaceContainerHigh,
+                                          borderRadius: BorderRadius.circular(
+                                            22,
+                                          ),
+                                          border: Border.all(
+                                            color: theme
+                                                .colorScheme
+                                                .outlineVariant,
+                                          ),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: theme.colorScheme.shadow
+                                                  .withValues(alpha: 0.16),
+                                              blurRadius: 28,
+                                              offset: const Offset(0, 12),
                                             ),
                                           ],
-                                        );
-                                      },
-                                    ),
+                                        ),
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(
+                                            22,
+                                          ),
+                                          child: Row(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.stretch,
+                                            children: [
+                                              Container(
+                                                width: 5,
+                                                color: visuals.accent,
+                                              ),
+                                              Expanded(
+                                                child: Padding(
+                                                  padding:
+                                                      const EdgeInsets.fromLTRB(
+                                                        14,
+                                                        12,
+                                                        10,
+                                                        12,
+                                                      ),
+                                                  child: Row(
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
+                                                    children: [
+                                                      Container(
+                                                        width: 34,
+                                                        height: 34,
+                                                        decoration:
+                                                            BoxDecoration(
+                                                              color: visuals
+                                                                  .accent
+                                                                  .withValues(
+                                                                    alpha: 0.12,
+                                                                  ),
+                                                              shape: BoxShape
+                                                                  .circle,
+                                                            ),
+                                                        alignment:
+                                                            Alignment.center,
+                                                        child: Icon(
+                                                          visuals.icon,
+                                                          color: visuals.accent,
+                                                          size: 18,
+                                                        ),
+                                                      ),
+                                                      const SizedBox(width: 12),
+                                                      Expanded(
+                                                        child: Column(
+                                                          mainAxisSize:
+                                                              MainAxisSize.min,
+                                                          crossAxisAlignment:
+                                                              CrossAxisAlignment
+                                                                  .start,
+                                                          children: [
+                                                            if (notice.title !=
+                                                                null)
+                                                              Text(
+                                                                notice.title!,
+                                                                style: theme
+                                                                    .textTheme
+                                                                    .labelLarge
+                                                                    ?.copyWith(
+                                                                      color: theme
+                                                                          .colorScheme
+                                                                          .onSurface,
+                                                                      fontWeight:
+                                                                          FontWeight
+                                                                              .w800,
+                                                                    ),
+                                                              ),
+                                                            Text(
+                                                              notice.message,
+                                                              style: theme
+                                                                  .textTheme
+                                                                  .bodyMedium
+                                                                  ?.copyWith(
+                                                                    color: theme
+                                                                        .colorScheme
+                                                                        .onSurface,
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w700,
+                                                                  ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      ),
+                                                      IconButton(
+                                                        onPressed: () =>
+                                                            _appNoticeNotifier
+                                                                    .value =
+                                                                null,
+                                                        tooltip: 'Скрыть',
+                                                        icon: const Icon(
+                                                          Icons.close_rounded,
+                                                          size: 18,
+                                                        ),
+                                                        visualDensity:
+                                                            VisualDensity
+                                                                .compact,
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    },
                                   ),
                                 ),
                               ),
@@ -2899,305 +2982,328 @@ class _GlobalNoticeHost extends StatelessWidget {
                               crossAxisAlignment: CrossAxisAlignment.end,
                               children: [
                                 ...visibleNotices.take(maxCards).map((notice) {
-                              return Padding(
-                                padding: const EdgeInsets.only(bottom: 8),
-                                child: ValueListenableBuilder<Set<String>>(
-                                  valueListenable:
-                                      _supportQueueClaimBusyNotifier,
-                                  builder: (context, busyIds, _) {
-                                    final actionBusy = busyIds.contains(
-                                      notice.ticketId,
-                                    );
-                                    return Material(
-                                      color: theme
-                                          .colorScheme
-                                          .surfaceContainerHigh,
-                                      elevation: compact ? 6 : 10,
-                                      borderRadius: BorderRadius.circular(
-                                        compact ? 14 : 18,
-                                      ),
-                                      child: Container(
-                                        width: cardWidth,
-                                        padding: EdgeInsets.fromLTRB(
-                                          compact ? 12 : 14,
-                                          compact ? 12 : 14,
-                                          compact ? 12 : 14,
-                                          compact ? 12 : 14,
-                                        ),
-                                        decoration: BoxDecoration(
+                                  return Padding(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    child: ValueListenableBuilder<Set<String>>(
+                                      valueListenable:
+                                          _supportQueueClaimBusyNotifier,
+                                      builder: (context, busyIds, _) {
+                                        final actionBusy = busyIds.contains(
+                                          notice.ticketId,
+                                        );
+                                        return Material(
+                                          color: theme
+                                              .colorScheme
+                                              .surfaceContainerHigh,
+                                          elevation: compact ? 6 : 10,
                                           borderRadius: BorderRadius.circular(
                                             compact ? 14 : 18,
                                           ),
-                                          border: Border.all(
-                                            color: theme.colorScheme.primary
-                                                .withValues(alpha: 0.16),
-                                          ),
-                                        ),
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Row(
-                                              children: [
-                                                Container(
-                                                  width: compact ? 32 : 38,
-                                                  height: compact ? 32 : 38,
-                                                  decoration: BoxDecoration(
-                                                    color: theme
-                                                        .colorScheme
-                                                        .primary
-                                                        .withValues(
-                                                          alpha: 0.12,
-                                                        ),
-                                                    shape: BoxShape.circle,
-                                                  ),
-                                                  alignment: Alignment.center,
-                                                  child: Icon(
-                                                    Icons
-                                                        .support_agent_outlined,
-                                                    color: theme
-                                                        .colorScheme
-                                                        .primary,
-                                                    size: compact ? 18 : 20,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 10),
-                                                Expanded(
-                                                  child: Column(
-                                                    crossAxisAlignment:
-                                                        CrossAxisAlignment
-                                                            .start,
-                                                    children: [
-                                                      Text(
-                                                        notice.claimable
-                                                            ? 'Новый вопрос в поддержку'
-                                                            : 'Активная заявка поддержки',
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow
-                                                            .ellipsis,
-                                                        style: theme
-                                                            .textTheme
-                                                            .titleSmall
-                                                            ?.copyWith(
-                                                              fontWeight:
-                                                                  FontWeight
-                                                                      .w800,
-                                                            ),
-                                                      ),
-                                                      Text(
-                                                        'Клиент: ${notice.customerName}',
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow
-                                                            .ellipsis,
-                                                        style: theme
-                                                            .textTheme
-                                                            .bodySmall
-                                                            ?.copyWith(
-                                                              color: theme
-                                                                  .colorScheme
-                                                                  .onSurfaceVariant,
-                                                            ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                ),
-                                                IconButton(
-                                                  tooltip:
-                                                      'Скрыть до следующего входа в Чаты',
-                                                  onPressed: () =>
-                                                      _dismissSupportQueueNotice(
-                                                        notice.ticketId,
-                                                      ),
-                                                  icon: const Icon(
-                                                    Icons.close_rounded,
-                                                  ),
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                ),
-                                              ],
+                                          child: Container(
+                                            width: cardWidth,
+                                            padding: EdgeInsets.fromLTRB(
+                                              compact ? 12 : 14,
+                                              compact ? 12 : 14,
+                                              compact ? 12 : 14,
+                                              compact ? 12 : 14,
                                             ),
-                                            const SizedBox(height: 10),
-                                            Text(
-                                              notice.subject,
-                                              maxLines: compact ? 2 : 3,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: theme.textTheme.bodyMedium
-                                                  ?.copyWith(
-                                                    fontWeight: FontWeight.w700,
+                                            decoration: BoxDecoration(
+                                              borderRadius:
+                                                  BorderRadius.circular(
+                                                    compact ? 14 : 18,
                                                   ),
-                                            ),
-                                            const SizedBox(height: 6),
-                                            Wrap(
-                                              spacing: 8,
-                                              runSpacing: 8,
-                                              children: [
-                                                _SupportQueueChip(
-                                                  label:
-                                                      notice.statusDisplay
-                                                          .trim()
-                                                          .isNotEmpty
-                                                      ? notice.statusDisplay
-                                                      : _supportStatusLabel(
-                                                          notice.status,
-                                                        ),
-                                                ),
-                                                _SupportQueueChip(
-                                                  label: _supportCategoryLabel(
-                                                    notice.category,
-                                                  ),
-                                                ),
-                                                if ((notice.productTitle ?? '')
-                                                        .trim()
-                                                        .isNotEmpty &&
-                                                    !compact)
-                                                  _SupportQueueChip(
-                                                    label: notice.productTitle!
-                                                        .trim(),
-                                                  ),
-                                              ],
-                                            ),
-                                            const SizedBox(height: 10),
-                                            if (notice.statusHint
-                                                .trim()
-                                                .isNotEmpty) ...[
-                                              Text(
-                                                notice.statusHint.trim(),
-                                                maxLines: compact ? 2 : 3,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: theme.textTheme.bodySmall
-                                                    ?.copyWith(
-                                                      color: theme
-                                                          .colorScheme
-                                                          .onSurfaceVariant,
-                                                    ),
+                                              border: Border.all(
+                                                color: theme.colorScheme.primary
+                                                    .withValues(alpha: 0.16),
                                               ),
-                                              const SizedBox(height: 10),
-                                            ],
-                                            if ((canClaim &&
-                                                    notice.claimable) ||
-                                                notice.closable ||
-                                                canForceClose)
-                                              Align(
-                                                alignment:
-                                                    Alignment.centerRight,
-                                                child: Wrap(
+                                            ),
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Row(
+                                                  children: [
+                                                    Container(
+                                                      width: compact ? 32 : 38,
+                                                      height: compact ? 32 : 38,
+                                                      decoration: BoxDecoration(
+                                                        color: theme
+                                                            .colorScheme
+                                                            .primary
+                                                            .withValues(
+                                                              alpha: 0.12,
+                                                            ),
+                                                        shape: BoxShape.circle,
+                                                      ),
+                                                      alignment:
+                                                          Alignment.center,
+                                                      child: Icon(
+                                                        Icons
+                                                            .support_agent_outlined,
+                                                        color: theme
+                                                            .colorScheme
+                                                            .primary,
+                                                        size: compact ? 18 : 20,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 10),
+                                                    Expanded(
+                                                      child: Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .start,
+                                                        children: [
+                                                          Text(
+                                                            notice.claimable
+                                                                ? 'Новый вопрос в поддержку'
+                                                                : 'Активная заявка поддержки',
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                            style: theme
+                                                                .textTheme
+                                                                .titleSmall
+                                                                ?.copyWith(
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w800,
+                                                                ),
+                                                          ),
+                                                          Text(
+                                                            'Клиент: ${notice.customerName}',
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                            style: theme
+                                                                .textTheme
+                                                                .bodySmall
+                                                                ?.copyWith(
+                                                                  color: theme
+                                                                      .colorScheme
+                                                                      .onSurfaceVariant,
+                                                                ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                    IconButton(
+                                                      tooltip:
+                                                          'Скрыть до следующего входа в Чаты',
+                                                      onPressed: () =>
+                                                          _dismissSupportQueueNotice(
+                                                            notice.ticketId,
+                                                          ),
+                                                      icon: const Icon(
+                                                        Icons.close_rounded,
+                                                      ),
+                                                      visualDensity:
+                                                          VisualDensity.compact,
+                                                    ),
+                                                  ],
+                                                ),
+                                                const SizedBox(height: 10),
+                                                Text(
+                                                  notice.subject,
+                                                  maxLines: compact ? 2 : 3,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: theme
+                                                      .textTheme
+                                                      .bodyMedium
+                                                      ?.copyWith(
+                                                        fontWeight:
+                                                            FontWeight.w700,
+                                                      ),
+                                                ),
+                                                const SizedBox(height: 6),
+                                                Wrap(
                                                   spacing: 8,
                                                   runSpacing: 8,
-                                                  alignment: WrapAlignment.end,
                                                   children: [
-                                                    if (canClaim &&
-                                                        notice.claimable)
-                                                      FilledButton.icon(
-                                                        onPressed: actionBusy
-                                                            ? null
-                                                            : () => _claimSupportQueueNotice(
-                                                                notice.ticketId,
-                                                              ),
-                                                        icon: actionBusy
-                                                            ? const SizedBox(
-                                                                width: 16,
-                                                                height: 16,
-                                                                child:
-                                                                    CircularProgressIndicator(
-                                                                      strokeWidth:
-                                                                          2,
-                                                                    ),
-                                                              )
-                                                            : const Icon(
-                                                                Icons
-                                                                    .record_voice_over_outlined,
-                                                              ),
-                                                        label: Text(
-                                                          actionBusy
-                                                              ? 'Принимаем...'
-                                                              : 'Ответить',
-                                                        ),
-                                                      ),
-                                                    if (!notice.claimable &&
-                                                        (notice.chatId ?? '')
+                                                    _SupportQueueChip(
+                                                      label:
+                                                          notice.statusDisplay
+                                                              .trim()
+                                                              .isNotEmpty
+                                                          ? notice.statusDisplay
+                                                          : _supportStatusLabel(
+                                                              notice.status,
+                                                            ),
+                                                    ),
+                                                    _SupportQueueChip(
+                                                      label:
+                                                          _supportCategoryLabel(
+                                                            notice.category,
+                                                          ),
+                                                    ),
+                                                    if ((notice.productTitle ??
+                                                                '')
                                                             .trim()
-                                                            .isNotEmpty)
-                                                      FilledButton.tonalIcon(
-                                                        onPressed: actionBusy
-                                                            ? null
-                                                            : () => _openSupportQueueNoticeChat(
-                                                                notice,
-                                                              ),
-                                                        icon: const Icon(
-                                                          Icons.forum_outlined,
-                                                        ),
-                                                        label: const Text(
-                                                          'Открыть чат',
-                                                        ),
-                                                      ),
-                                                    if (notice.closable ||
-                                                        canForceClose)
-                                                      OutlinedButton.icon(
-                                                        onPressed: actionBusy
-                                                            ? null
-                                                            : () => _closeSupportQueueNotice(
-                                                                notice.ticketId,
-                                                              ),
-                                                        icon: actionBusy
-                                                            ? const SizedBox(
-                                                                width: 16,
-                                                                height: 16,
-                                                                child:
-                                                                    CircularProgressIndicator(
-                                                                      strokeWidth:
-                                                                          2,
-                                                                    ),
-                                                              )
-                                                            : const Icon(
-                                                                Icons
-                                                                    .archive_outlined,
-                                                              ),
-                                                        label: Text(
-                                                          actionBusy
-                                                              ? 'Закрываем...'
-                                                              : 'Закрыть обращение',
-                                                        ),
+                                                            .isNotEmpty &&
+                                                        !compact)
+                                                      _SupportQueueChip(
+                                                        label: notice
+                                                            .productTitle!
+                                                            .trim(),
                                                       ),
                                                   ],
                                                 ),
-                                              )
-                                            else
-                                              Text(
-                                                notice.claimable
-                                                    ? 'Заявка исчезнет, когда её примет администратор.'
-                                                    : 'Уведомление останется, пока заявка не будет закрыта.',
-                                                style: theme.textTheme.bodySmall
-                                                    ?.copyWith(
-                                                      color: theme
-                                                          .colorScheme
-                                                          .onSurfaceVariant,
+                                                const SizedBox(height: 10),
+                                                if (notice.statusHint
+                                                    .trim()
+                                                    .isNotEmpty) ...[
+                                                  Text(
+                                                    notice.statusHint.trim(),
+                                                    maxLines: compact ? 2 : 3,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: theme
+                                                        .textTheme
+                                                        .bodySmall
+                                                        ?.copyWith(
+                                                          color: theme
+                                                              .colorScheme
+                                                              .onSurfaceVariant,
+                                                        ),
+                                                  ),
+                                                  const SizedBox(height: 10),
+                                                ],
+                                                if ((canClaim &&
+                                                        notice.claimable) ||
+                                                    notice.closable ||
+                                                    canForceClose)
+                                                  Align(
+                                                    alignment:
+                                                        Alignment.centerRight,
+                                                    child: Wrap(
+                                                      spacing: 8,
+                                                      runSpacing: 8,
+                                                      alignment:
+                                                          WrapAlignment.end,
+                                                      children: [
+                                                        if (canClaim &&
+                                                            notice.claimable)
+                                                          FilledButton.icon(
+                                                            onPressed:
+                                                                actionBusy
+                                                                ? null
+                                                                : () => _claimSupportQueueNotice(
+                                                                    notice
+                                                                        .ticketId,
+                                                                  ),
+                                                            icon: actionBusy
+                                                                ? const SizedBox(
+                                                                    width: 16,
+                                                                    height: 16,
+                                                                    child: CircularProgressIndicator(
+                                                                      strokeWidth:
+                                                                          2,
+                                                                    ),
+                                                                  )
+                                                                : const Icon(
+                                                                    Icons
+                                                                        .record_voice_over_outlined,
+                                                                  ),
+                                                            label: Text(
+                                                              actionBusy
+                                                                  ? 'Принимаем...'
+                                                                  : 'Ответить',
+                                                            ),
+                                                          ),
+                                                        if (!notice.claimable &&
+                                                            (notice.chatId ??
+                                                                    '')
+                                                                .trim()
+                                                                .isNotEmpty)
+                                                          FilledButton.tonalIcon(
+                                                            onPressed:
+                                                                actionBusy
+                                                                ? null
+                                                                : () =>
+                                                                      _openSupportQueueNoticeChat(
+                                                                        notice,
+                                                                      ),
+                                                            icon: const Icon(
+                                                              Icons
+                                                                  .forum_outlined,
+                                                            ),
+                                                            label: const Text(
+                                                              'Открыть чат',
+                                                            ),
+                                                          ),
+                                                        if (notice.closable ||
+                                                            canForceClose)
+                                                          OutlinedButton.icon(
+                                                            onPressed:
+                                                                actionBusy
+                                                                ? null
+                                                                : () => _closeSupportQueueNotice(
+                                                                    notice
+                                                                        .ticketId,
+                                                                  ),
+                                                            icon: actionBusy
+                                                                ? const SizedBox(
+                                                                    width: 16,
+                                                                    height: 16,
+                                                                    child: CircularProgressIndicator(
+                                                                      strokeWidth:
+                                                                          2,
+                                                                    ),
+                                                                  )
+                                                                : const Icon(
+                                                                    Icons
+                                                                        .archive_outlined,
+                                                                  ),
+                                                            label: Text(
+                                                              actionBusy
+                                                                  ? 'Закрываем...'
+                                                                  : 'Закрыть обращение',
+                                                            ),
+                                                          ),
+                                                      ],
                                                     ),
-                                              ),
-                                          ],
-                                        ),
-                                      ),
-                                    );
-                                  },
-                                ),
-                              );
+                                                  )
+                                                else
+                                                  Text(
+                                                    notice.claimable
+                                                        ? 'Заявка исчезнет, когда её примет администратор.'
+                                                        : 'Уведомление останется, пока заявка не будет закрыта.',
+                                                    style: theme
+                                                        .textTheme
+                                                        .bodySmall
+                                                        ?.copyWith(
+                                                          color: theme
+                                                              .colorScheme
+                                                              .onSurfaceVariant,
+                                                        ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  );
                                 }),
                                 if (visibleNotices.length > maxCards)
-                              Material(
-                                color: theme.colorScheme.surfaceContainer,
-                                elevation: 4,
-                                borderRadius: BorderRadius.circular(14),
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 12,
-                                    vertical: 8,
+                                  Material(
+                                    color: theme.colorScheme.surfaceContainer,
+                                    elevation: 4,
+                                    borderRadius: BorderRadius.circular(14),
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 8,
+                                      ),
+                                      child: Text(
+                                        'Ещё заявок: ${visibleNotices.length - maxCards}',
+                                        style: theme.textTheme.labelLarge,
+                                      ),
+                                    ),
                                   ),
-                                  child: Text(
-                                    'Ещё заявок: ${visibleNotices.length - maxCards}',
-                                    style: theme.textTheme.labelLarge,
-                                  ),
-                                ),
-                              ),
                               ],
                             ),
                           );
@@ -4206,9 +4312,13 @@ Future<bool> ensureDatabaseExists({int attempts = 4}) async {
         );
         if (health.statusCode == 200) {
           final data = health.data;
-          _lastConnectivityHint = '';
-          if (data is Map && data['ok'] == true) return true;
-          return true;
+          if (data is Map && data['ok'] == true) {
+            _lastConnectivityHint = '';
+            return true;
+          }
+          debugPrint(
+            'ensureDatabaseExists: /health[$base] returned non-health payload, continuing',
+          );
         }
       } catch (e) {
         lastError = e;

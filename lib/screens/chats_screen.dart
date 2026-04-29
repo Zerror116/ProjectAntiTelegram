@@ -11,6 +11,8 @@ import '../src/utils/messenger_ui_helpers.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
+import '../widgets/app_empty_state.dart';
+import '../widgets/app_skeleton.dart';
 import 'chat_screen.dart';
 
 class ChatsScreen extends StatefulWidget {
@@ -940,8 +942,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
       ),
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 18),
       itemCount: 7,
-      itemBuilder: (context, index) =>
-          _ChatsSkeletonCard(index: index, theme: theme),
+      itemBuilder: (context, index) => AppSkeletonCard(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        height: 122,
+        radius: 24,
+      ),
     );
   }
 
@@ -1549,17 +1554,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
                 children: [
                   Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Text(
-                      _error,
-                      style: TextStyle(color: theme.colorScheme.error),
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: ElevatedButton(
-                      onPressed: _loadChats,
-                      child: const Text('Повторить'),
+                    padding: const EdgeInsets.only(top: 28),
+                    child: AppEmptyState(
+                      badge: 'Ошибка загрузки',
+                      title: 'Не удалось загрузить чаты',
+                      subtitle: _error,
+                      icon: Icons.cloud_off_rounded,
+                      accentColor: theme.colorScheme.error,
+                      action: ElevatedButton.icon(
+                        onPressed: _loadChats,
+                        icon: const Icon(Icons.refresh_rounded),
+                        label: const Text('Повторить'),
+                      ),
                     ),
                   ),
                 ],
@@ -1628,22 +1634,28 @@ class _ChatsScreenState extends State<ChatsScreen> {
                             ),
                             padding: const EdgeInsets.fromLTRB(24, 36, 24, 24),
                             children: [
-                              Center(
-                                child: Text(
-                                  'В этой папке пока нет чатов',
-                                  style: theme.textTheme.titleMedium?.copyWith(
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              Center(
-                                child: Text(
-                                  'Когда здесь появятся подходящие диалоги, они сразу будут показаны в этой вкладке.',
-                                  textAlign: TextAlign.center,
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                    color: theme.colorScheme.onSurfaceVariant,
-                                  ),
+                              AppEmptyState(
+                                badge: 'Папка чатов',
+                                title: 'В этой папке пока пусто',
+                                subtitle:
+                                    'Когда появятся подходящие диалоги, они сразу отобразятся здесь.',
+                                icon: Icons.forum_outlined,
+                                action: Wrap(
+                                  alignment: WrapAlignment.center,
+                                  spacing: 10,
+                                  runSpacing: 10,
+                                  children: [
+                                    FilledButton.icon(
+                                      onPressed: _openDirectChatDialog,
+                                      icon: const Icon(Icons.person_outline),
+                                      label: const Text('Личные сообщения'),
+                                    ),
+                                    OutlinedButton.icon(
+                                      onPressed: _loadChats,
+                                      icon: const Icon(Icons.refresh_rounded),
+                                      label: const Text('Обновить'),
+                                    ),
+                                  ],
                                 ),
                               ),
                             ],
@@ -2755,121 +2767,4 @@ class _ChatListBadgeColors {
   final Color background;
   final Color foreground;
   final Color border;
-}
-
-class _ChatsSkeletonCard extends StatelessWidget {
-  const _ChatsSkeletonCard({required this.index, required this.theme});
-
-  final int index;
-  final ThemeData theme;
-
-  @override
-  Widget build(BuildContext context) {
-    final widths = <double>[0.72, 0.58, 0.66, 0.49, 0.61, 0.54, 0.69];
-    final subtitleWidths = <double>[0.86, 0.76, 0.82, 0.68, 0.73, 0.78, 0.84];
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              theme.colorScheme.surface,
-              theme.colorScheme.surfaceContainerLowest,
-            ],
-          ),
-          borderRadius: BorderRadius.circular(22),
-          border: Border.all(color: theme.colorScheme.outlineVariant),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-          child: Row(
-            children: [
-              _SkeletonBlock(width: 52, height: 52, radius: 26, theme: theme),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        _SkeletonBlock(
-                          width: 78,
-                          height: 24,
-                          radius: 999,
-                          theme: theme,
-                        ),
-                        const Spacer(),
-                        _SkeletonBlock(
-                          width: 42,
-                          height: 14,
-                          radius: 8,
-                          theme: theme,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    FractionallySizedBox(
-                      widthFactor: widths[index % widths.length],
-                      child: _SkeletonBlock(
-                        width: double.infinity,
-                        height: 18,
-                        radius: 9,
-                        theme: theme,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    FractionallySizedBox(
-                      widthFactor:
-                          subtitleWidths[index % subtitleWidths.length],
-                      child: _SkeletonBlock(
-                        width: double.infinity,
-                        height: 14,
-                        radius: 8,
-                        theme: theme,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _SkeletonBlock extends StatelessWidget {
-  const _SkeletonBlock({
-    required this.width,
-    required this.height,
-    required this.radius,
-    required this.theme,
-  });
-
-  final double width;
-  final double height;
-  final double radius;
-  final ThemeData theme;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: width,
-      height: height,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(radius),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            theme.colorScheme.surfaceContainerHighest,
-            theme.colorScheme.surfaceContainerHigh,
-          ],
-        ),
-      ),
-    );
-  }
 }

@@ -20,6 +20,7 @@ const {
   toOriginalPublicMediaUrl,
   normalizePublicUploadRef,
   absoluteUploadPathFromCanonical,
+  listPublicMediaAssetsForOwner,
 } = require('../utils/mediaAssets');
 
 const productUploadsDir = uploadsPath('products');
@@ -102,6 +103,35 @@ function normalizeImageUrl(value) {
   const trimmed = String(value).trim();
   if (!trimmed) return null;
   return toOriginalPublicMediaUrl(trimmed);
+}
+
+async function attachProductMediaToRows(queryable, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+  const mediaCache = new Map();
+  for (const row of rows) {
+    const productId = String(row?.product_id || row?.id || '').trim();
+    if (!isUuid(productId) || mediaCache.has(productId)) continue;
+    const media = await listPublicMediaAssetsForOwner(queryable, {
+      ownerKind: 'product_image',
+      ownerId: productId,
+    });
+    mediaCache.set(productId, Array.isArray(media) ? media : []);
+  }
+  return rows.map((row) => {
+    const productId = String(row?.product_id || row?.id || '').trim();
+    const media = mediaCache.get(productId) || [];
+    return {
+      ...row,
+      cover_image_url:
+        media[0]?.card_url ||
+        media[0]?.detail_url ||
+        media[0]?.original_url ||
+        normalizeImageUrl(row?.product_image_url) ||
+        normalizeImageUrl(row?.image_url) ||
+        null,
+      media,
+    };
+  });
 }
 
 function parseSettings(raw) {
@@ -1194,7 +1224,7 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
         );
         await client.query('COMMIT');
 
-        const data = result.rows.map((row) => ({
+        const data = await attachProductMediaToRows(client, result.rows.map((row) => ({
           ...row,
           reuse_hint:
             row.is_visible_in_main_channel === true
@@ -1202,7 +1232,7 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
               : row.has_pending_in_main_channel === true
                   ? 'Товар уже стоит в очереди публикации.'
                   : null,
-        }));
+        })));
         return res.json({ ok: true, data });
       } catch (err) {
         try {
@@ -1664,7 +1694,10 @@ router.get(
           [actorUserId]
         );
       });
-      return res.json({ ok: true, data: result.rows });
+      return res.json({
+        ok: true,
+        data: await attachProductMediaToRows(db, result.rows),
+      });
     } catch (err) {
       console.error('worker.queue.mine error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
@@ -1982,6 +2015,7 @@ router.get(
             fallbackDays,
           )
         : [];
+      const enrichedPosts = await attachProductMediaToRows(client, posts);
       await client.query('COMMIT');
       const io = req.app.get('io');
       if (io && sanitation.hiddenMessages.length > 0) {
@@ -1999,7 +2033,7 @@ router.get(
         ok: true,
         data: {
           dates: fallbackDays,
-          posts,
+          posts: enrichedPosts,
         },
       });
     } catch (err) {

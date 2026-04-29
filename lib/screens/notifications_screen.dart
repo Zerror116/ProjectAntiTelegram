@@ -10,6 +10,8 @@ import '../services/web_notification_service.dart';
 import '../src/utils/media_url.dart';
 import '../src/utils/notification_navigation.dart';
 import '../utils/date_time_utils.dart';
+import '../widgets/app_empty_state.dart';
+import '../widgets/app_skeleton.dart';
 import 'notification_preferences_screen.dart';
 import 'pwa_guide_screen.dart';
 
@@ -737,7 +739,24 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       ),
       body: SafeArea(
         child: _loading
-            ? const Center(child: CircularProgressIndicator())
+            ? ListView(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
+                children: const [
+                  AppSkeletonCard(
+                    height: 144,
+                    margin: EdgeInsets.only(bottom: 10),
+                    showImage: false,
+                  ),
+                  AppSkeletonCard(
+                    height: 132,
+                    margin: EdgeInsets.only(bottom: 10),
+                  ),
+                  AppSkeletonCard(
+                    height: 132,
+                    margin: EdgeInsets.only(bottom: 10),
+                  ),
+                ],
+              )
             : RefreshIndicator(
                 onRefresh: () => _loadAll(showLoader: false),
                 child: ListView(
@@ -881,42 +900,24 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     if (_message.isNotEmpty)
                       Padding(
                         padding: const EdgeInsets.only(top: 10),
-                        child: Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: theme.colorScheme.errorContainer,
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: Text(
-                            _message,
-                            style: TextStyle(
-                              color: theme.colorScheme.onErrorContainer,
-                            ),
-                          ),
+                        child: AppEmptyState(
+                          badge: 'Ошибка',
+                          title: 'Не удалось загрузить центр уведомлений',
+                          subtitle: _message,
+                          icon: Icons.notifications_off_outlined,
+                          compact: true,
+                          accentColor: theme.colorScheme.error,
                         ),
                       ),
                     const SizedBox(height: 10),
                     ..._items.map(_buildInboxCard),
                     if (_items.isEmpty)
-                      _buildSectionCard(
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.inbox_outlined,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  'Пока здесь пусто. Когда появятся сообщения или системные уведомления, они будут доступны здесь.',
-                                  style: theme.textTheme.bodyMedium,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                      const AppEmptyState(
+                        badge: 'Inbox',
+                        title: 'Пока здесь пусто',
+                        subtitle:
+                            'Когда появятся сообщения, поддержка или системные уведомления, они останутся здесь даже без push.',
+                        icon: Icons.notifications_none_rounded,
                       ),
                     const SizedBox(height: 12),
                     _buildCreatorAnalytics(),

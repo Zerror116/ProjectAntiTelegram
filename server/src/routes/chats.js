@@ -4676,6 +4676,19 @@ router.post(
           },
         });
       }
+      const normalizedStatus = String(session.status || "")
+        .trim()
+        .toLowerCase();
+      if (
+        ["ready", "processing"].includes(normalizedStatus) &&
+        String(session.storage_url || "").trim()
+      ) {
+        await client.query("COMMIT");
+        return res.json({
+          ok: true,
+          data: serializeUploadSession(session),
+        });
+      }
       const currentChecksum = await sha256File(session.storage_path);
       if (
         String(session.sha256 || "").trim() &&
@@ -4910,29 +4923,48 @@ router.post("/:chatId/outbox/reconcile", requireAuth, async (req, res) => {
     }
     const items = [];
     for (const clientMsgId of clientMsgIds) {
-      const message = messagesByClientId.get(clientMsgId);
-      if (message?.id) {
-        const hydrated = await getHydratedMessageById(message.id, req.user.id);
+      try {
+        const message = messagesByClientId.get(clientMsgId);
+        if (message?.id) {
+          const hydrated = await getHydratedMessageById(message.id, req.user.id);
+          if (hydrated) {
+            items.push({
+              client_msg_id: clientMsgId,
+              state: "committed",
+              message: decorateMessageMediaUrls(req, hydrated),
+            });
+          } else {
+            items.push({
+              client_msg_id: clientMsgId,
+              state: "missing",
+            });
+          }
+          continue;
+        }
+        const session = sessionsByClientId.get(clientMsgId);
+        if (session) {
+          items.push({
+            client_msg_id: clientMsgId,
+            state: String(session.status || "").trim().toLowerCase(),
+            session: serializeUploadSession(session),
+          });
+          continue;
+        }
         items.push({
           client_msg_id: clientMsgId,
-          state: "committed",
-          message: decorateMessageMediaUrls(req, hydrated),
+          state: "missing",
         });
-        continue;
-      }
-      const session = sessionsByClientId.get(clientMsgId);
-      if (session) {
+      } catch (itemErr) {
+        console.error("chats.outbox.reconcile item error", {
+          clientMsgId,
+          error: itemErr,
+        });
         items.push({
           client_msg_id: clientMsgId,
-          state: String(session.status || "").trim().toLowerCase(),
-          session: serializeUploadSession(session),
+          state: "failed",
+          error_code: "chat_outbox_reconcile_item_failed",
         });
-        continue;
       }
-      items.push({
-        client_msg_id: clientMsgId,
-        state: "missing",
-      });
     }
     return res.json({ ok: true, data: items });
   } catch (err) {

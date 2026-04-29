@@ -41,9 +41,14 @@ import '../widgets/adaptive_network_image.dart';
 import '../widgets/chat_media_viewer.dart';
 import '../widgets/chat_message_image.dart';
 import '../widgets/delivery_address_picker_dialog.dart';
+import '../widgets/app_empty_state.dart';
+import '../widgets/app_skeleton.dart';
+import '../widgets/app_status_badge.dart';
+import '../widgets/app_surface_card.dart';
 import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/product_media_gallery.dart';
 import '../widgets/submit_on_enter.dart';
 
 class _ChatUploadFile {
@@ -7668,10 +7673,7 @@ class _ChatScreenState extends State<ChatScreen> {
             messageId: messageId,
             reservationId: reservationId,
             cartItemId: cartItemId,
-            patch: {
-              'client_cancelled': true,
-              'placed': false,
-            },
+            patch: {'client_cancelled': true, 'placed': false},
           );
           showAppNotice(
             context,
@@ -8198,22 +8200,113 @@ class _ChatScreenState extends State<ChatScreen> {
     Color? foregroundColor,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
       decoration: BoxDecoration(
-        color:
-            backgroundColor ??
-            theme.colorScheme.secondaryContainer.withValues(alpha: 0.55),
+        color: backgroundColor ?? theme.colorScheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.9),
+        ),
       ),
-      child: Text(
-        '$label: $value',
-        style: TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w600,
-          color: foregroundColor ?? theme.colorScheme.onSecondaryContainer,
+      child: RichText(
+        text: TextSpan(
+          children: [
+            TextSpan(
+              text: '$label · ',
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: foregroundColor ?? theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            TextSpan(
+              text: value,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: foregroundColor ?? theme.colorScheme.onSurface,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
         ),
       ),
     );
+  }
+
+  Map<String, dynamic> _productCardSnapshotOf(Map<String, dynamic> metaMap) {
+    return _metaMapOf(metaMap['card_snapshot']);
+  }
+
+  List<Map<String, dynamic>> _productMediaItemsOf(
+    Map<String, dynamic> metaMap,
+  ) {
+    final snapshot = _productCardSnapshotOf(metaMap);
+    final rawLists = <dynamic>[
+      snapshot['media'],
+      snapshot['images'],
+      metaMap['media'],
+      metaMap['images'],
+    ];
+    for (final raw in rawLists) {
+      if (raw is! List) continue;
+      final mapped = raw
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .where((entry) {
+            final anyUrl =
+                (entry['card_url'] ??
+                        entry['detail_url'] ??
+                        entry['thumb_url'] ??
+                        entry['original_url'] ??
+                        entry['url'] ??
+                        '')
+                    .toString()
+                    .trim();
+            return anyUrl.isNotEmpty;
+          })
+          .toList(growable: false);
+      if (mapped.isNotEmpty) return mapped;
+    }
+
+    final coverCandidates = <String?>[
+      snapshot['image_card_url']?.toString(),
+      snapshot['image_detail_url']?.toString(),
+      snapshot['image_thumb_url']?.toString(),
+      snapshot['image_original_url']?.toString(),
+      metaMap['image_card_url']?.toString(),
+      metaMap['image_detail_url']?.toString(),
+      metaMap['image_thumb_url']?.toString(),
+      metaMap['image_original_url']?.toString(),
+      metaMap['image_url']?.toString(),
+    ];
+    String? first;
+    for (final candidate in coverCandidates) {
+      final resolved = _resolveImageUrl(candidate);
+      if (resolved != null && resolved.trim().isNotEmpty) {
+        first = resolved;
+        break;
+      }
+    }
+    if (first == null) return const <Map<String, dynamic>>[];
+    return <Map<String, dynamic>>[
+      <String, dynamic>{
+        'card_url': first,
+        'detail_url': first,
+        'original_url': first,
+      },
+    ];
+  }
+
+  String? _productCoverImageOf(Map<String, dynamic> metaMap) {
+    final snapshot = _productCardSnapshotOf(metaMap);
+    return [
+      snapshot['image_card_url']?.toString(),
+      snapshot['image_detail_url']?.toString(),
+      snapshot['image_thumb_url']?.toString(),
+      snapshot['image_url']?.toString(),
+      metaMap['image_card_url']?.toString(),
+      metaMap['image_detail_url']?.toString(),
+      metaMap['image_thumb_url']?.toString(),
+      metaMap['image_url']?.toString(),
+    ].map(_resolveImageUrl).whereType<String>().firstOrNull;
   }
 
   String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
@@ -8780,7 +8873,18 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     };
 
-    return Icon(icon, size: 16, color: color);
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 180),
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeIn,
+      transitionBuilder: (child, animation) {
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(scale: animation, child: child),
+        );
+      },
+      child: Icon(icon, key: ValueKey<String>(status), size: 16, color: color),
+    );
   }
 
   Widget _buildLocalLifecycleRow(
@@ -11002,6 +11106,15 @@ class _ChatScreenState extends State<ChatScreen> {
     final imageUrl = _resolveImageUrl(metaMap['image_url']?.toString());
     final captionText = _captionTextOf(message, metaMap);
     final catalogTexts = _extractCatalogTexts(text);
+    final catalogSnapshot = _productCardSnapshotOf(metaMap);
+    final productMediaItems = _productMediaItemsOf(metaMap);
+    final productCoverImage = _productCoverImageOf(metaMap) ?? imageUrl;
+    final productDescriptionText =
+        (catalogSnapshot['short_description'] ??
+                catalogTexts['description'] ??
+                '')
+            .toString()
+            .trim();
     final productLabel = (() {
       final fromMeta = metaMap['product_label']?.toString().trim() ?? '';
       if (fromMeta.isNotEmpty) return fromMeta;
@@ -11065,19 +11178,11 @@ class _ChatScreenState extends State<ChatScreen> {
     final supportFeedbackBusy =
         supportTicketId.isNotEmpty &&
         _supportFeedbackBusyTicketIds.contains(supportTicketId);
+    final isAppearing =
+        messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
 
-    final bubbleColor = hasBuy
-        ? theme.colorScheme.surfaceContainerLow
-        : isReservedOrder
-        ? (isCancelled
-              ? theme.colorScheme.errorContainer.withValues(
-                  alpha: theme.brightness == Brightness.dark ? 0.30 : 0.18,
-                )
-              : isPlaced
-              ? const Color(0xFF5E8F6B).withValues(
-                  alpha: theme.brightness == Brightness.dark ? 0.34 : 0.18,
-                )
-              : theme.colorScheme.surfaceContainerHigh)
+    final bubbleColor = hasBuy || isReservedOrder
+        ? Colors.transparent
         : isDeliveryOffer
         ? theme.colorScheme.surfaceContainerHigh
         : (fromMe
@@ -11266,15 +11371,30 @@ class _ChatScreenState extends State<ChatScreen> {
         constraints: BoxConstraints(
           maxWidth: maxBubbleWidth > 620 ? 620 : maxBubbleWidth,
         ),
-        padding: const EdgeInsets.all(12),
+        padding: hasBuy || isReservedOrder
+            ? EdgeInsets.zero
+            : const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: bubbleColor,
           border: Border.all(
             color: hasBuy || isReservedOrder
-                ? theme.colorScheme.outlineVariant
+                ? Colors.transparent
                 : Colors.transparent,
           ),
-          borderRadius: BorderRadius.circular(18),
+          borderRadius: BorderRadius.circular(
+            hasBuy || isReservedOrder ? 24 : 18,
+          ),
+          boxShadow: hasBuy || isReservedOrder
+              ? [
+                  BoxShadow(
+                    color: theme.colorScheme.primary.withValues(
+                      alpha: isAppearing ? 0.18 : 0.06,
+                    ),
+                    blurRadius: isAppearing ? 28 : 16,
+                    offset: const Offset(0, 10),
+                  ),
+                ]
+              : null,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -11428,192 +11548,370 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ],
             ] else if (hasBuy) ...[
-              if (imageUrl != null) ...[
-                buildMessageImage(width: double.infinity),
-                const SizedBox(height: 12),
-              ],
-              Text(
-                catalogTexts['title'] ?? 'Товар',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                  color: theme.colorScheme.onSurface,
-                ),
-              ),
-              if ((catalogTexts['description'] ?? '').isNotEmpty) ...[
-                const SizedBox(height: 6),
-                _buildHighlightedText(
-                  catalogTexts['description'] ?? '',
-                  style: TextStyle(
-                    color: theme.colorScheme.onSurfaceVariant,
-                    fontSize: 13,
-                  ),
-                ),
-              ],
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  _catalogMetaBadge(theme, 'Цена', '$price ₽'),
-                  _catalogMetaBadge(theme, 'В наличии', quantity),
-                ],
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.shopping_cart_checkout_outlined),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                  onPressed: (_buyLoading || quantityInt <= 0)
-                      ? null
-                      : () => _buyProduct(metaMap),
-                  label: Text(
-                    quantityInt <= 0
-                        ? 'Нет в наличии'
-                        : (_buyLoading ? 'Добавление...' : 'Купить'),
-                  ),
+              AppSurfaceCard(
+                padding: EdgeInsets.zero,
+                radius: 24,
+                compact: true,
+                highlight: isAppearing,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ProductMediaGallery(
+                      coverImageUrl: productCoverImage,
+                      media: productMediaItems,
+                      heroLabel: 'Товар',
+                      height: isCompactMedia ? 220 : 248,
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    AppStatusBadge(
+                                      label: quantityInt > 0
+                                          ? 'На канале'
+                                          : 'Нет в наличии',
+                                      icon: quantityInt > 0
+                                          ? Icons.campaign_outlined
+                                          : Icons.remove_shopping_cart_outlined,
+                                      background: quantityInt > 0
+                                          ? theme.colorScheme.primaryContainer
+                                                .withValues(alpha: 0.42)
+                                          : theme.colorScheme.errorContainer
+                                                .withValues(alpha: 0.28),
+                                      foreground: quantityInt > 0
+                                          ? theme.colorScheme.onPrimaryContainer
+                                          : theme.colorScheme.onErrorContainer,
+                                      border: quantityInt > 0
+                                          ? theme.colorScheme.primary
+                                                .withValues(alpha: 0.22)
+                                          : theme.colorScheme.error.withValues(
+                                              alpha: 0.22,
+                                            ),
+                                      compact: true,
+                                    ),
+                                    if (timeLabel.isNotEmpty)
+                                      _catalogMetaBadge(
+                                        theme,
+                                        'Опубликован',
+                                        timeLabel,
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            (catalogSnapshot['title'] ??
+                                    catalogTexts['title'] ??
+                                    'Товар')
+                                .toString(),
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                          if (productDescriptionText.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            _buildHighlightedText(
+                              productDescriptionText,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 12),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              _catalogMetaBadge(theme, 'ID', productLabel),
+                              _catalogMetaBadge(theme, 'Цена', '$price ₽'),
+                              _catalogMetaBadge(theme, 'В наличии', quantity),
+                              if ((catalogSnapshot['shelf_number'] ??
+                                      metaMap['shelf_number'] ??
+                                      '')
+                                  .toString()
+                                  .trim()
+                                  .isNotEmpty)
+                                _catalogMetaBadge(
+                                  theme,
+                                  'Полка',
+                                  (catalogSnapshot['shelf_number'] ??
+                                          metaMap['shelf_number'] ??
+                                          '')
+                                      .toString(),
+                                ),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              icon: Icon(
+                                quantityInt > 0
+                                    ? Icons.shopping_cart_checkout_outlined
+                                    : Icons.block_rounded,
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 13,
+                                ),
+                              ),
+                              onPressed: (_buyLoading || quantityInt <= 0)
+                                  ? null
+                                  : () => _buyProduct(metaMap),
+                              label: Text(
+                                quantityInt <= 0
+                                    ? 'Нет в наличии'
+                                    : (_buyLoading
+                                          ? 'Добавление...'
+                                          : 'Купить'),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ] else if (isReservedOrder) ...[
-              if (imageUrl != null) ...[
-                buildMessageImage(width: double.infinity),
-                const SizedBox(height: 12),
-              ],
-              Text(
-                metaMap['title']?.toString().isNotEmpty == true
-                    ? metaMap['title'].toString()
-                    : catalogTexts['title'] ?? 'Заказ',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                  color: theme.colorScheme.onSurface,
-                ),
-              ),
-              const SizedBox(height: 6),
-              if (reservedDescription.isNotEmpty) ...[
-                _buildHighlightedText(
-                  reservedDescription,
-                  style: TextStyle(
-                    color: theme.colorScheme.onSurfaceVariant,
-                    fontSize: 13,
-                  ),
-                ),
-                const SizedBox(height: 6),
-              ],
-              Text('Покупатель: $clientName'),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  Expanded(child: Text('Телефон: $clientPhone')),
-                  IconButton(
-                    tooltip: 'Скопировать номер',
-                    icon: const Icon(Icons.copy_rounded, size: 18),
-                    visualDensity: VisualDensity.compact,
-                    onPressed: clientPhone.trim().isEmpty || clientPhone == '—'
-                        ? null
-                        : () => _copyText(clientPhone),
-                  ),
-                ],
-              ),
-              Text(
-                'Статус: ${isCancelled ? 'Клиент отказался от товара' : (isPlaced ? (isOversizePlaced ? 'Обработано • Габарит' : 'Обработано') : 'Ожидание обработки')}',
-              ),
-              if (isPlaced)
-                Text(
-                  'Кто обработал: ${processedByName.isNotEmpty ? processedByName : '—'}',
-                ),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  _catalogMetaBadge(theme, 'ID', productLabel),
-                  _catalogMetaBadge(theme, 'Цена', '$price ₽'),
-                  _catalogMetaBadge(theme, 'Куплено', quantity),
-                  _catalogMetaBadge(theme, 'Полка', shelf),
-                  if (isOversizePlaced)
-                    _catalogMetaBadge(theme, 'Режим', 'Габарит'),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  SizedBox(
-                    width: 190,
-                    child: wrapCancelledTooltip(
-                      ElevatedButton.icon(
-                        icon: Icon(
-                          isPlaced
-                              ? Icons.print_outlined
-                              : Icons.inventory_2_outlined,
-                        ),
-                        onPressed: reservedMarkPlacedDisabled
-                            ? null
-                            : isPlaced
-                            ? (_canUseDesktopStickerPrinting
-                                  ? () => _openReservedOrderStickerPrint(
-                                      metaMap,
-                                      oversize: isOversizePlaced,
-                                    )
-                                  : null)
-                            : () => _markReservedOrderPlaced(
-                                metaMap,
-                                messageId: messageId,
-                                processingMode: 'standard',
+              AppSurfaceCard(
+                padding: EdgeInsets.zero,
+                radius: 24,
+                compact: true,
+                highlight: isAppearing,
+                borderColor: isCancelled
+                    ? theme.colorScheme.error.withValues(alpha: 0.22)
+                    : isPlaced
+                    ? const Color(0xFF1AA36A).withValues(alpha: 0.28)
+                    : null,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ProductMediaGallery(
+                      coverImageUrl: productCoverImage,
+                      media: productMediaItems,
+                      heroLabel: 'Резерв',
+                      height: isCompactMedia ? 204 : 228,
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              if (isCancelled)
+                                AppStatusBadge.preset(
+                                  context,
+                                  'client_cancelled',
+                                  compact: true,
+                                )
+                              else if (isPlaced && isOversizePlaced) ...[
+                                AppStatusBadge.preset(
+                                  context,
+                                  'processed',
+                                  compact: true,
+                                ),
+                                AppStatusBadge.preset(
+                                  context,
+                                  'oversized',
+                                  compact: true,
+                                ),
+                              ] else if (isPlaced)
+                                AppStatusBadge.preset(
+                                  context,
+                                  'processed',
+                                  compact: true,
+                                )
+                              else
+                                AppStatusBadge.preset(
+                                  context,
+                                  'reserved',
+                                  compact: true,
+                                ),
+                              if (timeLabel.isNotEmpty)
+                                _catalogMetaBadge(theme, 'В ленте', timeLabel),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            metaMap['title']?.toString().isNotEmpty == true
+                                ? metaMap['title'].toString()
+                                : catalogTexts['title'] ?? 'Заказ',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                          if (reservedDescription.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            _buildHighlightedText(
+                              reservedDescription,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
                               ),
-                        label: Text(
-                          isPlaced
-                              ? 'Дай стикер'
-                              : (_markingPlaced
-                                    ? 'Сохранение...'
-                                    : 'Положил'),
-                        ),
+                            ),
+                          ],
+                          const SizedBox(height: 12),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      clientName,
+                                      style: theme.textTheme.titleSmall
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      clientPhone,
+                                      style: theme.textTheme.bodyMedium
+                                          ?.copyWith(
+                                            color: theme
+                                                .colorScheme
+                                                .onSurfaceVariant,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: 'Скопировать номер',
+                                icon: const Icon(Icons.copy_rounded, size: 18),
+                                visualDensity: VisualDensity.compact,
+                                onPressed:
+                                    clientPhone.trim().isEmpty ||
+                                        clientPhone == '—'
+                                    ? null
+                                    : () => _copyText(clientPhone),
+                              ),
+                            ],
+                          ),
+                          if (isPlaced) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              'Обработал: ${processedByName.isNotEmpty ? processedByName : '—'}',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 12),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              _catalogMetaBadge(theme, 'ID', productLabel),
+                              _catalogMetaBadge(theme, 'Цена', '$price ₽'),
+                              _catalogMetaBadge(theme, 'Куплено', quantity),
+                              _catalogMetaBadge(theme, 'Полка', shelf),
+                              if (isOversizePlaced)
+                                _catalogMetaBadge(theme, 'Режим', 'Габарит'),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              SizedBox(
+                                width: 190,
+                                child: wrapCancelledTooltip(
+                                  ElevatedButton.icon(
+                                    icon: Icon(
+                                      isPlaced
+                                          ? Icons.print_outlined
+                                          : Icons.inventory_2_outlined,
+                                    ),
+                                    onPressed: reservedMarkPlacedDisabled
+                                        ? null
+                                        : isPlaced
+                                        ? (_canUseDesktopStickerPrinting
+                                              ? () =>
+                                                    _openReservedOrderStickerPrint(
+                                                      metaMap,
+                                                      oversize:
+                                                          isOversizePlaced,
+                                                    )
+                                              : null)
+                                        : () => _markReservedOrderPlaced(
+                                            metaMap,
+                                            messageId: messageId,
+                                            processingMode: 'standard',
+                                          ),
+                                    label: Text(
+                                      isPlaced
+                                          ? 'Дай стикер'
+                                          : (_markingPlaced
+                                                ? 'Сохранение...'
+                                                : 'Положил'),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 190,
+                                child: wrapCancelledTooltip(
+                                  OutlinedButton.icon(
+                                    icon: const Icon(Icons.all_inbox_outlined),
+                                    onPressed: reservedOversizeDisabled
+                                        ? null
+                                        : () => _markReservedOrderPlaced(
+                                            metaMap,
+                                            messageId: messageId,
+                                            processingMode: 'oversize',
+                                          ),
+                                    label: Text(
+                                      isPlaced && isOversizePlaced
+                                          ? 'Габарит'
+                                          : (_markingPlaced
+                                                ? 'Сохранение...'
+                                                : 'Габарит'),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 190,
+                                child: wrapCancelledTooltip(
+                                  OutlinedButton.icon(
+                                    icon: const Icon(Icons.swap_horiz_outlined),
+                                    onPressed: reservedShelfChangeDisabled
+                                        ? null
+                                        : () => _changeReservedOrderShelf(
+                                            metaMap,
+                                            messageId: messageId,
+                                          ),
+                                    label: const Text('Смена полки'),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ),
-                  ),
-                  SizedBox(
-                    width: 190,
-                    child: wrapCancelledTooltip(
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.all_inbox_outlined),
-                        onPressed: reservedOversizeDisabled
-                            ? null
-                            : () => _markReservedOrderPlaced(
-                                metaMap,
-                                messageId: messageId,
-                                processingMode: 'oversize',
-                              ),
-                        label: Text(
-                          isPlaced && isOversizePlaced
-                              ? 'Габарит'
-                              : (_markingPlaced
-                                    ? 'Сохранение...'
-                                    : 'Габарит'),
-                        ),
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 190,
-                    child: wrapCancelledTooltip(
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.swap_horiz_outlined),
-                        onPressed: reservedShelfChangeDisabled
-                            ? null
-                            : () => _changeReservedOrderShelf(
-                                metaMap,
-                                messageId: messageId,
-                              ),
-                        label: const Text('Смена полки'),
-                      ),
-                    ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ] else ...[
               if (isVoiceMessage) ...[
@@ -11788,9 +12086,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     final showAvatar = !hasBuy && !isReservedOrder;
-
-    final isAppearing =
-        messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
 
     final bubbleRow = Padding(
       padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
@@ -12054,10 +12349,18 @@ class _ChatScreenState extends State<ChatScreen> {
                       ? Center(
                           child: _searchQuery.isNotEmpty && _serverSearchLoading
                               ? const CircularProgressIndicator()
-                              : Text(
-                                  _searchQuery.isEmpty
-                                      ? 'Нет сообщений'
+                              : AppEmptyState(
+                                  badge: _searchQuery.isEmpty ? 'Чат' : 'Поиск',
+                                  title: _searchQuery.isEmpty
+                                      ? 'Здесь пока нет сообщений'
                                       : 'Ничего не найдено',
+                                  subtitle: _searchQuery.isEmpty
+                                      ? 'Когда в переписке появятся сообщения, они будут показаны здесь.'
+                                      : 'Попробуйте изменить запрос или очистить поиск.',
+                                  icon: _searchQuery.isEmpty
+                                      ? Icons.chat_bubble_outline_rounded
+                                      : Icons.search_off_rounded,
+                                  compact: true,
                                 ),
                         )
                       : Stack(
@@ -12904,145 +13207,6 @@ class _ChatTimelineLoadingView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      physics: const NeverScrollableScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 18),
-      children: const [
-        _ChatSkeletonDateDivider(),
-        SizedBox(height: 10),
-        _ChatSkeletonBubble(
-          alignEnd: false,
-          widthFactor: 0.62,
-          height: 92,
-          showThumb: true,
-        ),
-        SizedBox(height: 12),
-        _ChatSkeletonBubble(alignEnd: true, widthFactor: 0.54, height: 64),
-        SizedBox(height: 18),
-        _ChatSkeletonDateDivider(),
-        SizedBox(height: 10),
-        _ChatSkeletonBubble(alignEnd: false, widthFactor: 0.78, height: 72),
-        SizedBox(height: 12),
-        _ChatSkeletonBubble(
-          alignEnd: true,
-          widthFactor: 0.66,
-          height: 118,
-          showThumb: true,
-        ),
-      ],
-    );
-  }
-}
-
-class _ChatSkeletonDateDivider extends StatelessWidget {
-  const _ChatSkeletonDateDivider();
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Center(
-      child: Container(
-        width: 108,
-        height: 26,
-        decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainerHigh,
-          borderRadius: BorderRadius.circular(999),
-        ),
-      ),
-    );
-  }
-}
-
-class _ChatSkeletonBubble extends StatelessWidget {
-  const _ChatSkeletonBubble({
-    required this.alignEnd,
-    required this.widthFactor,
-    required this.height,
-    this.showThumb = false,
-  });
-
-  final bool alignEnd;
-  final double widthFactor;
-  final double height;
-  final bool showThumb;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final bubbleColor = alignEnd
-        ? theme.colorScheme.primaryContainer.withValues(alpha: 0.72)
-        : theme.colorScheme.surfaceContainerHigh;
-    final lineColor = alignEnd
-        ? theme.colorScheme.primary.withValues(alpha: 0.12)
-        : theme.colorScheme.surfaceContainerHighest;
-    final width = MediaQuery.of(context).size.width * widthFactor;
-    return Align(
-      alignment: alignEnd ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(maxWidth: width.clamp(220.0, 520.0)),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: bubbleColor,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(20),
-            topRight: const Radius.circular(20),
-            bottomLeft: Radius.circular(alignEnd ? 20 : 8),
-            bottomRight: Radius.circular(alignEnd ? 8 : 20),
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (showThumb) ...[
-              Container(
-                height: height - 36,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(14),
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [lineColor, lineColor.withValues(alpha: 0.66)],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 10),
-            ],
-            FractionallySizedBox(
-              widthFactor: 0.86,
-              child: Container(
-                height: 12,
-                decoration: BoxDecoration(
-                  color: lineColor,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            FractionallySizedBox(
-              widthFactor: 0.58,
-              child: Container(
-                height: 12,
-                decoration: BoxDecoration(
-                  color: lineColor.withValues(alpha: 0.92),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Align(
-              alignment: Alignment.centerRight,
-              child: Container(
-                width: 42,
-                height: 10,
-                decoration: BoxDecoration(
-                  color: lineColor.withValues(alpha: 0.86),
-                  borderRadius: BorderRadius.circular(999),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+    return const AppMessageSkeletonList(count: 8);
   }
 }

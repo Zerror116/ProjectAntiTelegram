@@ -451,6 +451,64 @@ async function upsertMediaAsset(queryable = db, payload = {}) {
   return asset;
 }
 
+async function listPublicMediaAssetsForOwner(
+  queryable = db,
+  {
+    ownerKind = '',
+    ownerId = null,
+    ownerTextId = null,
+    context = {},
+    fieldKey = 'image_url',
+  } = {},
+) {
+  const normalizedOwnerKind = cleanString(ownerKind);
+  const normalizedOwnerId = cleanString(ownerId) || null;
+  const normalizedOwnerTextId = cleanString(ownerTextId) || null;
+  if (!normalizedOwnerKind || (!normalizedOwnerId && !normalizedOwnerTextId)) {
+    return [];
+  }
+
+  const whereClause = normalizedOwnerId
+    ? 'owner_id = $2::uuid'
+    : 'owner_text_id = $2';
+  const identity = normalizedOwnerId || normalizedOwnerTextId;
+  const result = await queryable.query(
+    `SELECT id, owner_kind, owner_id, owner_text_id, slot, storage_kind,
+            original_path, original_filename, mime_type, byte_size,
+            width, height, duration_ms, checksum_sha256, asset_version,
+            variants, placeholder_applied_at, created_at, updated_at, last_verified_at
+     FROM media_assets
+     WHERE owner_kind = $1
+       AND ${whereClause}
+     ORDER BY CASE WHEN slot = 'default' THEN 0 ELSE 1 END,
+              NULLIF(regexp_replace(slot, '\\D', '', 'g'), '')::int NULLS LAST,
+              slot ASC,
+              created_at ASC NULLS LAST,
+              updated_at ASC NULLS LAST`,
+    [normalizedOwnerKind, identity],
+  );
+
+  return (result.rows || [])
+    .map((row) => {
+      setAssetCacheRow(row);
+      const urls = buildPublicMediaVariantUrls(row.original_path, context, {
+        fieldKey,
+      });
+      if (!urls) return null;
+      return {
+        id: row.id,
+        slot: cleanString(row.slot) || 'default',
+        asset_version: urls.asset_version || 1,
+        url: urls.default_url,
+        thumb_url: urls.thumb_url || null,
+        card_url: urls.card_url || null,
+        detail_url: urls.detail_url || null,
+        original_url: urls.original_url || null,
+      };
+    })
+    .filter(Boolean);
+}
+
 module.exports = {
   PUBLIC_UPLOAD_KINDS,
   normalizePublicUploadRef,
@@ -464,5 +522,6 @@ module.exports = {
   ensureMediaAssetCache,
   getMediaAssetByPath,
   upsertMediaAsset,
+  listPublicMediaAssetsForOwner,
   clearAssetCache,
 };

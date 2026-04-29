@@ -11,10 +11,13 @@ import 'package:image_picker/image_picker.dart';
 import '../main.dart';
 import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/media_url.dart';
-import '../widgets/adaptive_network_image.dart';
 import '../widgets/app_empty_state.dart';
+import '../widgets/app_status_badge.dart';
+import '../widgets/app_skeleton.dart';
+import '../widgets/app_surface_card.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/product_media_gallery.dart';
 import '../widgets/product_photo_crop_dialog.dart';
 
 class WorkerPanel extends StatefulWidget {
@@ -118,6 +121,32 @@ class _WorkerPanelState extends State<WorkerPanel>
     final roundedDown = (discounted / 50).floor() * 50;
     final safe = roundedDown < 50 ? 50 : roundedDown;
     return safe.toInt();
+  }
+
+  List<Map<String, dynamic>> _mediaItemsOf(Map<String, dynamic> item) {
+    final raw = item['media'];
+    if (raw is List) {
+      return raw.whereType<Map>().map(Map<String, dynamic>.from).toList();
+    }
+    return const <Map<String, dynamic>>[];
+  }
+
+  String? _coverImageOf(
+    Map<String, dynamic> item, {
+    String fallbackKey = 'image_url',
+  }) {
+    final cover = _resolveImageUrl((item['cover_image_url'] ?? '').toString());
+    if (cover != null) return cover;
+    final media = _mediaItemsOf(item);
+    for (final candidate in media) {
+      final resolved =
+          _resolveImageUrl((candidate['card_url'] ?? '').toString()) ??
+          _resolveImageUrl((candidate['detail_url'] ?? '').toString()) ??
+          _resolveImageUrl((candidate['original_url'] ?? '').toString()) ??
+          _resolveImageUrl((candidate['url'] ?? '').toString());
+      if (resolved != null) return resolved;
+    }
+    return _resolveImageUrl((item[fallbackKey] ?? '').toString());
   }
 
   void _dismissKeyboard() {
@@ -1099,7 +1128,8 @@ class _WorkerPanelState extends State<WorkerPanel>
                   ? <String>[]
                   : <String>[_selectedRevisionDate!]);
         final nextSelected =
-            _selectedRevisionDate != null && dates.contains(_selectedRevisionDate)
+            _selectedRevisionDate != null &&
+                dates.contains(_selectedRevisionDate)
             ? _selectedRevisionDate
             : (dates.isNotEmpty ? dates.first : null);
         if (!mounted) return;
@@ -1947,127 +1977,64 @@ class _WorkerPanelState extends State<WorkerPanel>
         (localPath != null && localPath.isNotEmpty);
     final remoteUrl = _resolveImageUrl(_existingImageUrl);
     final hasImage = hasLocalPickedImage || remoteUrl != null;
-    const previewWidth = 220.0;
-    Widget withPreviewSurface(Widget child) => Container(
-      color: theme.colorScheme.surfaceContainerHighest,
-      alignment: Alignment.center,
-      child: child,
-    );
-    Widget imageErrorPlaceholder() => Container(
-      color: theme.colorScheme.surfaceContainerHighest,
-      alignment: Alignment.center,
-      child: Icon(
-        Icons.broken_image_outlined,
-        color: theme.colorScheme.onSurfaceVariant,
-      ),
-    );
-    Widget buildLocalPathPreview(String path) {
-      if (kIsWeb) {
-        final lower = path.toLowerCase();
-        final canUseNetworkLikePath =
-            lower.startsWith('http://') ||
-            lower.startsWith('https://') ||
-            lower.startsWith('blob:') ||
-            lower.startsWith('data:');
-        if (!canUseNetworkLikePath) {
-          return imageErrorPlaceholder();
-        }
-        return AdaptiveNetworkImage(
-          path,
-          fit: BoxFit.contain,
-          errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
-        );
-      }
-      return withPreviewSurface(
-        Image(
-          image: FileImage(File(path)),
-          fit: BoxFit.contain,
-          filterQuality: FilterQuality.high,
-          errorBuilder: (context, error, stackTrace) => imageErrorPlaceholder(),
-        ),
-      );
-    }
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
+        Text(
           'Фото товара',
-          style: TextStyle(fontWeight: FontWeight.w600),
+          style: theme.textTheme.titleSmall?.copyWith(
+            fontWeight: FontWeight.w800,
+          ),
         ),
-        const SizedBox(height: 8),
-        if (hasImage)
-          Align(
-            alignment: Alignment.centerLeft,
+        const SizedBox(height: 6),
+        Text(
+          'Cover останется совместимым со старым single-image сценарием. Галерея может расширяться additively.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (localBytes != null && localBytes.isNotEmpty)
+          ClipRRect(
+            borderRadius: BorderRadius.circular(22),
             child: SizedBox(
-              width: previewWidth,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    minHeight: 140,
-                    maxHeight: previewWidth * 1.25,
-                  ),
-                  child: (localBytes != null && localBytes.isNotEmpty)
-                      ? withPreviewSurface(
-                          Image.memory(
-                            localBytes,
-                            fit: BoxFit.contain,
-                            filterQuality: FilterQuality.high,
-                          ),
-                        )
-                      : (localPath != null && localPath.isNotEmpty)
-                      ? buildLocalPathPreview(localPath)
-                      : withPreviewSurface(
-                          AdaptiveNetworkImage(
-                            remoteUrl!,
-                            fit: BoxFit.contain,
-                            errorBuilder: (context, error, stackTrace) =>
-                                imageErrorPlaceholder(),
-                          ),
-                        ),
-                ),
+              height: 236,
+              child: Image.memory(
+                localBytes,
+                width: double.infinity,
+                fit: BoxFit.cover,
+                filterQuality: FilterQuality.high,
+              ),
+            ),
+          )
+        else if (localPath != null && localPath.isNotEmpty && !kIsWeb)
+          ClipRRect(
+            borderRadius: BorderRadius.circular(22),
+            child: SizedBox(
+              height: 236,
+              width: double.infinity,
+              child: Image(
+                image: FileImage(File(localPath)),
+                fit: BoxFit.cover,
+                filterQuality: FilterQuality.high,
               ),
             ),
           )
         else
-          Align(
-            alignment: Alignment.centerLeft,
-            child: SizedBox(
-              width: previewWidth,
-              child: ConstrainedBox(
-                constraints: BoxConstraints(
-                  minHeight: 140,
-                  maxHeight: previewWidth * 1.25,
-                ),
-                child: Container(
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerLow,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: theme.colorScheme.outlineVariant),
-                  ),
-                  alignment: Alignment.center,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.photo_outlined,
-                        size: 28,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'Фото не выбрано',
-                        style: TextStyle(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
+          ProductMediaGallery(
+            coverImageUrl: hasImage ? remoteUrl : null,
+            media: hasImage && remoteUrl != null
+                ? [
+                    <String, dynamic>{
+                      'card_url': remoteUrl,
+                      'detail_url': remoteUrl,
+                      'original_url': remoteUrl,
+                    },
+                  ]
+                : const <Map<String, dynamic>>[],
+            height: 236,
+            heroLabel: hasImage ? 'Cover' : 'Нет фото',
+            fit: BoxFit.contain,
           ),
         const SizedBox(height: 10),
         Row(
@@ -2101,129 +2068,164 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Widget _buildQueueTab() {
+    final theme = Theme.of(context);
     return ListView(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.all(16),
       children: [
-        if (_loadingChannels)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 24),
-            child: PhoenixLoadingView(
-              title: 'Загружаем каналы',
-              subtitle: 'Получаем доступные каналы для публикации',
-              size: 50,
-            ),
-          )
-        else if (_channels.isEmpty)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 12),
-            child: Text(
-              'Системный "Основной канал" недоступен. Проверьте сервер инициализации.',
-            ),
-          )
-        else
-          DropdownButtonFormField<String>(
-            key: ValueKey<String?>(_selectedChannelId),
-            initialValue: _selectedChannelId,
-            decoration: const InputDecoration(
-              labelText: 'Канал для публикации',
-              border: OutlineInputBorder(),
-            ),
-            items: _channels
-                .map(
-                  (c) => DropdownMenuItem<String>(
-                    value: c['id']?.toString(),
-                    child: Text((c['title'] ?? 'Канал').toString()),
+        const AppSurfaceCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Новый товар',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+              ),
+              SizedBox(height: 6),
+              Text(
+                'Подготовьте карточку товара для очереди публикации. Полка назначится автоматически по дате, а фото сразу станет обложкой поста.',
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        AppSurfaceCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (_loadingChannels)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: PhoenixLoadingView(
+                    title: 'Загружаем каналы',
+                    subtitle: 'Получаем доступные каналы для публикации',
+                    size: 50,
                   ),
                 )
-                .toList(),
-            onChanged: (v) => setState(() => _selectedChannelId = v),
-          ),
-        const SizedBox(height: 16),
-        TextField(
-          controller: _titleCtrl,
-          decoration: withInputLanguageBadge(
-            const InputDecoration(
-              labelText: 'Название товара',
-              border: OutlineInputBorder(),
-            ),
-            controller: _titleCtrl,
-          ),
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _descriptionCtrl,
-          minLines: 3,
-          maxLines: 5,
-          decoration: withInputLanguageBadge(
-            const InputDecoration(
-              labelText: 'Описание',
-              border: OutlineInputBorder(),
-            ),
-            controller: _descriptionCtrl,
-          ),
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              flex: 3,
-              child: TextField(
-                controller: _priceCtrl,
-                keyboardType: const TextInputType.numberWithOptions(
-                  decimal: true,
-                ),
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Цена',
+              else if (_channels.isEmpty)
+                const AppEmptyState(
+                  compact: true,
+                  badge: 'Каналы',
+                  title: 'Основной канал недоступен',
+                  subtitle:
+                      'Системный канал для публикации не найден. Проверьте инициализацию сервера.',
+                  icon: Icons.wifi_tethering_error_rounded,
+                )
+              else
+                DropdownButtonFormField<String>(
+                  key: ValueKey<String?>(_selectedChannelId),
+                  initialValue: _selectedChannelId,
+                  decoration: const InputDecoration(
+                    labelText: 'Канал для публикации',
                     border: OutlineInputBorder(),
                   ),
-                  controller: _priceCtrl,
+                  items: _channels
+                      .map(
+                        (c) => DropdownMenuItem<String>(
+                          value: c['id']?.toString(),
+                          child: Text((c['title'] ?? 'Канал').toString()),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (v) => setState(() => _selectedChannelId = v),
                 ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              flex: 2,
-              child: TextField(
-                controller: _quantityCtrl,
-                keyboardType: TextInputType.number,
+              const SizedBox(height: 16),
+              TextField(
+                controller: _titleCtrl,
                 decoration: withInputLanguageBadge(
                   const InputDecoration(
-                    labelText: 'Кол-во',
+                    labelText: 'Название товара',
                     border: OutlineInputBorder(),
                   ),
-                  controller: _quantityCtrl,
+                  controller: _titleCtrl,
                 ),
               ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Text(
-          'Номер полки назначается автоматически по дате.',
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
-        ),
-        const SizedBox(height: 12),
-        _buildPhotoPicker(),
-        const SizedBox(height: 16),
-        SizedBox(
-          width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: _posting ? null : _queueProduct,
-            icon: _posting
-                ? SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Theme.of(context).colorScheme.onPrimary,
+              const SizedBox(height: 12),
+              TextField(
+                controller: _descriptionCtrl,
+                minLines: 3,
+                maxLines: 5,
+                decoration: withInputLanguageBadge(
+                  const InputDecoration(
+                    labelText: 'Описание',
+                    border: OutlineInputBorder(),
+                  ),
+                  controller: _descriptionCtrl,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    flex: 3,
+                    child: TextField(
+                      controller: _priceCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Цена',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _priceCtrl,
+                      ),
                     ),
-                  )
-                : const Icon(Icons.send),
-            label: Text(_posting ? 'Отправка...' : 'Отправить в очередь'),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 2,
+                    child: TextField(
+                      controller: _quantityCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Кол-во',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: _quantityCtrl,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  AppStatusBadge.preset(context, 'queued', compact: true),
+                  _statChip('Полка назначится автоматически'),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Номер полки привязывается к дате публикации. Здесь его вручную вводить не нужно.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 12),
+              _buildPhotoPicker(),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: _posting ? null : _queueProduct,
+                  icon: _posting
+                      ? SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Theme.of(context).colorScheme.onPrimary,
+                          ),
+                        )
+                      : const Icon(Icons.send),
+                  label: Text(_posting ? 'Отправка...' : 'Отправить в очередь'),
+                ),
+              ),
+            ],
           ),
         ),
       ],
@@ -2231,56 +2233,50 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Widget _buildSearchTab() {
+    final theme = Theme.of(context);
     final searchResults = List<Map<String, dynamic>>.from(_searchResults);
     return ListView(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.all(16),
       children: [
-        Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surfaceContainerLow,
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(
-              color: Theme.of(context).colorScheme.outlineVariant,
-            ),
-          ),
-          child: const Text(
-            'Старые посты используйте только для товаров, которых уже нет в Основном канале. '
-            'Если товар ещё находится в канале, его нужно проводить через Ревизию.',
+        const AppSurfaceCard(
+          child: Text(
+            'Старые посты используйте только для товаров, которых уже нет в Основном канале. Если товар ещё находится в канале, его нужно проводить через Ревизию.',
           ),
         ),
         const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _searchCtrl,
-                decoration: withInputLanguageBadge(
-                  const InputDecoration(
-                    labelText: 'Поиск старого товара по описанию',
-                    border: OutlineInputBorder(),
-                  ),
+        AppSurfaceCard(
+          compact: true,
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
                   controller: _searchCtrl,
+                  decoration: withInputLanguageBadge(
+                    const InputDecoration(
+                      labelText: 'Поиск старого товара по описанию',
+                      border: OutlineInputBorder(),
+                    ),
+                    controller: _searchCtrl,
+                  ),
+                  onSubmitted: (_) => _searchOldProducts(),
                 ),
-                onSubmitted: (_) => _searchOldProducts(),
               ),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              onPressed: _searching ? null : _searchOldProducts,
-              icon: const Icon(Icons.search),
-            ),
-          ],
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                onPressed: _searching ? null : _searchOldProducts,
+                icon: const Icon(Icons.search),
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 12),
         if (_searching)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 12),
-            child: PhoenixLoadingView(
-              title: 'Ищем товары',
-              subtitle: 'Подбираем похожие позиции по описанию',
-              size: 46,
+          ...List.generate(
+            3,
+            (index) => const AppSkeletonCard(
+              margin: EdgeInsets.only(bottom: 10),
+              height: 176,
             ),
           ),
         if (!_searching && _searchResults.isEmpty)
@@ -2301,128 +2297,154 @@ class _WorkerPanelState extends State<WorkerPanel>
             p['product_code'],
             p['shelf_number'],
           );
-          final imageUrl = _resolveImageUrl((p['image_url'] ?? '').toString());
+          final imageUrl = _coverImageOf(p);
+          final mediaItems = _mediaItemsOf(p);
           final requeueAllowed = _oldPostRequeueAllowed(p);
           final reuseHint = _oldPostReuseHint(p);
-          return Card(
+          return AppSurfaceCard(
             key: ValueKey(itemKey),
-            child: ListTile(
-              leading: imageUrl != null
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(6),
-                      child: AdaptiveNetworkImage(
-                        key: ValueKey('thumb-$itemKey-$imageUrl'),
-                        imageUrl,
-                        width: 52,
-                        height: 52,
-                        fit: BoxFit.contain,
-                        gaplessPlayback: false,
-                        errorBuilder: (_, error, stackTrace) => Container(
-                          width: 52,
-                          height: 52,
-                          color: Theme.of(
-                            context,
-                          ).colorScheme.surfaceContainerHighest,
-                          child: Icon(
-                            Icons.image_not_supported_outlined,
-                            size: 18,
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ),
-                    )
-                  : null,
-              subtitle: Text(
-                'ID: $label\n'
-                'Цена: ${p['price']} ₽\n'
-                '${(p['description'] ?? '').toString()}',
-              ),
-              isThreeLine: true,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 8,
-              ),
-              trailing: PopupMenuButton<String>(
-                onSelected: (v) {
-                  if (v == 'fill') {
-                    _fillFormFromProduct(p);
-                  } else if (v == 'requeue') {
-                    _requeueProduct(p);
-                  } else if (v == 'quick_requeue') {
-                    _quickDuplicateProduct(p);
-                  }
-                },
-                itemBuilder: (_) => [
-                  PopupMenuItem(
-                    value: 'quick_requeue',
-                    enabled: requeueAllowed,
-                    child: const Text('Быстрый дубль (1 клик)'),
+            compact: true,
+            margin: const EdgeInsets.only(bottom: 10),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 104,
+                  child: ProductMediaGallery(
+                    coverImageUrl: imageUrl,
+                    media: mediaItems,
+                    height: 116,
+                    borderRadius: 18,
+                    heroLabel: 'Архив',
+                    fit: BoxFit.contain,
                   ),
-                  const PopupMenuItem(
-                    value: 'fill',
-                    child: Text('Подставить в форму'),
-                  ),
-                  PopupMenuItem(
-                    value: 'requeue',
-                    enabled: requeueAllowed,
-                    child: const Text('Сразу в очередь'),
-                  ),
-                ],
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      tooltip: requeueAllowed
-                          ? 'Быстрый дубль'
-                          : (reuseHint.isNotEmpty
-                                ? reuseHint
-                                : 'Недоступно для этого товара'),
-                      onPressed: _posting || !requeueAllowed
-                          ? null
-                          : () => _quickDuplicateProduct(p),
-                      icon: const Icon(Icons.copy_all_outlined),
-                    ),
-                    const Icon(Icons.more_vert),
-                  ],
                 ),
-              ),
-              titleAlignment: ListTileTitleAlignment.top,
-              title: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text((p['title'] ?? 'Товар').toString()),
-                  if (reuseHint.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 8,
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          AppStatusBadge.preset(
+                            context,
+                            requeueAllowed ? 'queued' : 'published',
+                            compact: true,
+                          ),
+                          _statChip('ID $label'),
+                          _statChip('${p['price']} ₽'),
+                        ],
                       ),
-                      decoration: BoxDecoration(
-                        color: requeueAllowed
-                            ? Theme.of(
-                                context,
-                              ).colorScheme.surfaceContainerHighest
-                            : Theme.of(context).colorScheme.tertiaryContainer,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Text(
-                        reuseHint,
-                        style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
-                          color: requeueAllowed
-                              ? null
-                              : Theme.of(
-                                  context,
-                                ).colorScheme.onTertiaryContainer,
+                      const SizedBox(height: 10),
+                      Text(
+                        (p['title'] ?? 'Товар').toString(),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
                         ),
                       ),
-                    ),
-                  ],
-                ],
-              ),
+                      const SizedBox(height: 6),
+                      Text(
+                        (p['description'] ?? '').toString(),
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      if (reuseHint.isNotEmpty) ...[
+                        const SizedBox(height: 10),
+                        AppStatusBadge(
+                          icon: requeueAllowed
+                              ? Icons.info_outline_rounded
+                              : Icons.block_rounded,
+                          label: reuseHint,
+                          background: requeueAllowed
+                              ? theme.colorScheme.primaryContainer.withValues(
+                                  alpha: 0.42,
+                                )
+                              : theme.colorScheme.tertiaryContainer.withValues(
+                                  alpha: 0.52,
+                                ),
+                          foreground: requeueAllowed
+                              ? theme.colorScheme.onPrimaryContainer
+                              : theme.colorScheme.onTertiaryContainer,
+                          border: requeueAllowed
+                              ? theme.colorScheme.primary.withValues(
+                                  alpha: 0.18,
+                                )
+                              : theme.colorScheme.tertiary.withValues(
+                                  alpha: 0.18,
+                                ),
+                          compact: false,
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton.tonalIcon(
+                              onPressed: _posting || !requeueAllowed
+                                  ? null
+                                  : () => _quickDuplicateProduct(p),
+                              icon: const Icon(
+                                Icons.copy_all_outlined,
+                                size: 18,
+                              ),
+                              label: const Text('Быстрый дубль'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          PopupMenuButton<String>(
+                            onSelected: (v) {
+                              if (v == 'fill') {
+                                _fillFormFromProduct(p);
+                              } else if (v == 'requeue') {
+                                _requeueProduct(p);
+                              } else if (v == 'quick_requeue') {
+                                _quickDuplicateProduct(p);
+                              }
+                            },
+                            itemBuilder: (_) => [
+                              PopupMenuItem(
+                                value: 'quick_requeue',
+                                enabled: requeueAllowed,
+                                child: const Text('Быстрый дубль (1 клик)'),
+                              ),
+                              const PopupMenuItem(
+                                value: 'fill',
+                                child: Text('Подставить в форму'),
+                              ),
+                              PopupMenuItem(
+                                value: 'requeue',
+                                enabled: requeueAllowed,
+                                child: const Text('Сразу в очередь'),
+                              ),
+                            ],
+                            child: Container(
+                              height: 40,
+                              width: 40,
+                              decoration: BoxDecoration(
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(
+                                  color: theme.colorScheme.outlineVariant,
+                                ),
+                              ),
+                              alignment: Alignment.center,
+                              child: const Icon(Icons.more_horiz_rounded),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           );
         }),
@@ -2649,13 +2671,13 @@ class _WorkerPanelState extends State<WorkerPanel>
   Widget _buildOwnPostsTab() {
     final theme = Theme.of(context);
     if (_loadingOwnPosts) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 20),
-        child: PhoenixLoadingView(
-          title: 'Загружаем ваши посты',
-          subtitle: 'Собираем еще не опубликованные позиции',
-          size: 46,
-        ),
+      return ListView(
+        padding: const EdgeInsets.all(16),
+        children: const [
+          AppSkeletonCard(height: 176, margin: EdgeInsets.only(bottom: 10)),
+          AppSkeletonCard(height: 176, margin: EdgeInsets.only(bottom: 10)),
+          AppSkeletonCard(height: 176, margin: EdgeInsets.only(bottom: 10)),
+        ],
       );
     }
     if (_ownQueuedPosts.isEmpty) {
@@ -2680,48 +2702,29 @@ class _WorkerPanelState extends State<WorkerPanel>
         separatorBuilder: (context, index) => const SizedBox(height: 12),
         itemBuilder: (context, index) {
           final post = _ownQueuedPosts[index];
-          final imageUrl = _resolveImageUrl(
-            (post['product_image_url'] ?? '').toString(),
+          final imageUrl = _coverImageOf(
+            post,
+            fallbackKey: 'product_image_url',
           );
-          return Container(
+          final mediaItems = _mediaItemsOf(post);
+          return AppSurfaceCard(
+            compact: true,
             padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerLow,
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: theme.colorScheme.outlineVariant),
-            ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(14),
-                      child: SizedBox(
-                        width: 92,
-                        height: 92,
-                        child: imageUrl != null
-                            ? AdaptiveNetworkImage(
-                                imageUrl,
-                                fit: BoxFit.contain,
-                                errorBuilder: (context, error, stackTrace) =>
-                                    Container(
-                                      color: theme
-                                          .colorScheme
-                                          .surfaceContainerHighest,
-                                      alignment: Alignment.center,
-                                      child: const Icon(
-                                        Icons.image_not_supported_outlined,
-                                      ),
-                                    ),
-                              )
-                            : Container(
-                                color:
-                                    theme.colorScheme.surfaceContainerHighest,
-                                alignment: Alignment.center,
-                                child: const Icon(Icons.photo_outlined),
-                              ),
+                    SizedBox(
+                      width: 106,
+                      child: ProductMediaGallery(
+                        coverImageUrl: imageUrl,
+                        media: mediaItems,
+                        height: 120,
+                        borderRadius: 18,
+                        heroLabel: 'Очередь',
+                        fit: BoxFit.contain,
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -2751,6 +2754,11 @@ class _WorkerPanelState extends State<WorkerPanel>
                             spacing: 6,
                             runSpacing: 6,
                             children: [
+                              AppStatusBadge.preset(
+                                context,
+                                'queued',
+                                compact: true,
+                              ),
                               _statChip(
                                 'ID ${_formatProductLabel(post['product_code'], post['product_shelf_number'])}',
                               ),
@@ -2827,6 +2835,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Widget _buildRevisionTab() {
     final theme = Theme.of(context);
+    final selectedDay = _selectedRevisionDate;
     return RefreshIndicator(
       onRefresh: () async {
         await _loadRevisionDates();
@@ -2835,33 +2844,38 @@ class _WorkerPanelState extends State<WorkerPanel>
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerLow,
-              borderRadius: BorderRadius.circular(18),
-              border: Border.all(color: theme.colorScheme.outlineVariant),
-            ),
-            child: const Text(
-              'Ревизия: выберите первую или вторую дату публикации, затем запускайте авто-ревизию '
-              'или вручную редактируйте карточки. Купленные, но ещё не обработанные товары '
-              'показываются с пометкой и не меняются через ревизию.',
+          const AppSurfaceCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Ревизия',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+                ),
+                SizedBox(height: 6),
+                Text(
+                  'Выберите первую или вторую дату публикации, затем применяйте авто-ревизию или вручную редактируйте карточки. Даты больше не смешиваются, полка жёстко привязана к выбранному дню.',
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
           if (_loadingRevisionDates)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 10),
-              child: PhoenixLoadingView(
-                title: 'Загружаем даты ревизии',
-                subtitle: 'Собираем первые даты публикаций',
-                size: 44,
+            ...List.generate(
+              2,
+              (index) => const AppSkeletonCard(
+                margin: EdgeInsets.only(bottom: 10),
+                height: 110,
+                showImage: false,
               ),
             )
           else if (_revisionDates.isEmpty)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('Нет данных для ревизии'),
+            const AppEmptyState(
+              badge: 'Ревизия',
+              title: 'Нет данных для ревизии',
+              subtitle:
+                  'Когда в канале появятся подходящие товары, здесь отобразятся доступные даты публикации.',
+              icon: Icons.tune_rounded,
             )
           else
             LayoutBuilder(
@@ -2878,69 +2892,81 @@ class _WorkerPanelState extends State<WorkerPanel>
                     final day = (item['day'] ?? '').toString();
                     final label = (item['label'] ?? day).toString();
                     final count = _toIntValue(item['posts'], 0);
-                    final revisionShelfLabel = (item['revision_shelf_label'] ?? '')
-                        .toString()
-                        .trim();
-                    final selected = _selectedRevisionDate == day;
+                    final revisionShelfLabel =
+                        (item['revision_shelf_label'] ?? '').toString().trim();
+                    final selected = selectedDay == day;
                     final colorScheme = theme.colorScheme;
                     return SizedBox(
                       width: buttonWidth,
-                      child: ElevatedButton(
-                        onPressed: () => _toggleRevisionDate(day),
-                        style: ElevatedButton.styleFrom(
-                          elevation: selected ? 0 : 1,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 14,
-                          ),
-                          backgroundColor: selected
-                              ? colorScheme.primaryContainer
-                              : colorScheme.surfaceContainerLow,
-                          foregroundColor: selected
-                              ? colorScheme.onPrimaryContainer
-                              : colorScheme.onSurface,
-                          side: BorderSide(
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(22),
+                        onTap: () => _toggleRevisionDate(day),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 180),
+                          curve: Curves.easeOut,
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
                             color: selected
-                                ? colorScheme.primary
-                                : colorScheme.outlineVariant,
+                                ? colorScheme.primaryContainer.withValues(
+                                    alpha: 0.52,
+                                  )
+                                : colorScheme.surfaceContainerLow,
+                            borderRadius: BorderRadius.circular(22),
+                            border: Border.all(
+                              color: selected
+                                  ? colorScheme.primary.withValues(alpha: 0.30)
+                                  : colorScheme.outlineVariant,
+                            ),
+                            boxShadow: selected
+                                ? [
+                                    BoxShadow(
+                                      color: colorScheme.primary.withValues(
+                                        alpha: 0.14,
+                                      ),
+                                      blurRadius: 22,
+                                      offset: const Offset(0, 10),
+                                    ),
+                                  ]
+                                : const [],
                           ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      label,
+                                      style: theme.textTheme.titleMedium
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w800,
+                                            color: selected
+                                                ? colorScheme.onPrimaryContainer
+                                                : colorScheme.onSurface,
+                                          ),
+                                    ),
+                                  ),
+                                  if (selected)
+                                    Icon(
+                                      Icons.check_circle_rounded,
+                                      color: colorScheme.primary,
+                                      size: 18,
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _statChip('$count товаров'),
+                                  _statChip(
+                                    'Полка ${revisionShelfLabel.isNotEmpty ? revisionShelfLabel : '—'}',
+                                  ),
+                                ],
+                              ),
+                            ],
                           ),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              label,
-                              style: theme.textTheme.titleMedium?.copyWith(
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              '$count товаров',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: selected
-                                    ? colorScheme.onPrimaryContainer.withValues(
-                                        alpha: 0.78,
-                                      )
-                                    : colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              'Полка ${revisionShelfLabel.isNotEmpty ? revisionShelfLabel : '—'}',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: selected
-                                    ? colorScheme.onPrimaryContainer.withValues(
-                                        alpha: 0.78,
-                                      )
-                                    : colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ],
                         ),
                       ),
                     );
@@ -2948,110 +2974,118 @@ class _WorkerPanelState extends State<WorkerPanel>
                 );
               },
             ),
-          const SizedBox(height: 12),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _revisionPercentCtrl,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                    signed: false,
-                  ),
-                  onChanged: (_) {
-                    if (mounted) setState(() {});
-                  },
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Процент снижения (например: 10, 25, 50)',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: _revisionPercentCtrl,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              SizedBox(
-                height: 56,
-                child: ElevatedButton.icon(
-                  onPressed: _runningRevision ? null : _runAutoRevision,
-                  icon: _runningRevision
-                      ? SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Theme.of(context).colorScheme.onPrimary,
+          const SizedBox(height: 14),
+          AppSurfaceCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _revisionPercentCtrl,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                          signed: false,
+                        ),
+                        onChanged: (_) {
+                          if (mounted) setState(() {});
+                        },
+                        decoration: withInputLanguageBadge(
+                          const InputDecoration(
+                            labelText:
+                                'Процент снижения (например: 10, 25, 50)',
+                            border: OutlineInputBorder(),
                           ),
-                        )
-                      : const Icon(Icons.auto_fix_high_outlined),
-                  label: const Text('Авто'),
+                          controller: _revisionPercentCtrl,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    SizedBox(
+                      height: 54,
+                      child: ElevatedButton.icon(
+                        onPressed: _runningRevision ? null : _runAutoRevision,
+                        icon: _runningRevision
+                            ? SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onPrimary,
+                                ),
+                              )
+                            : const Icon(Icons.auto_awesome_outlined),
+                        label: const Text('Авто'),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [10, 25, 50]
-                  .map(
-                    (value) => ActionChip(
-                      label: Text('$value%'),
-                      onPressed: _runningRevision
-                          ? null
-                          : () {
-                              _revisionPercentCtrl.text = '$value';
-                              _revisionPercentCtrl.selection =
-                                  TextSelection.fromPosition(
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [10, 25, 50]
+                      .map(
+                        (value) => ActionChip(
+                          label: Text('$value%'),
+                          onPressed: _runningRevision
+                              ? null
+                              : () {
+                                  _revisionPercentCtrl.text = '$value';
+                                  _revisionPercentCtrl
+                                      .selection = TextSelection.fromPosition(
                                     TextPosition(
                                       offset: _revisionPercentCtrl.text.length,
                                     ),
                                   );
-                              if (mounted) {
-                                setState(() {});
-                              }
-                            },
-                    ),
-                  )
-                  .toList(),
+                                  if (mounted) {
+                                    setState(() {});
+                                  }
+                                },
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _autoHideOldRevisionPosts,
+                  onChanged: _runningRevision
+                      ? null
+                      : (v) => setState(() => _autoHideOldRevisionPosts = v),
+                  title: const Text('Скрывать старые версии постов'),
+                  subtitle: const Text(
+                    'Оставлять только самый свежий вариант товара',
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 8),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            value: _autoHideOldRevisionPosts,
-            onChanged: _runningRevision
-                ? null
-                : (v) => setState(() => _autoHideOldRevisionPosts = v),
-            title: const Text('Скрывать старые версии постов'),
-            subtitle: const Text(
-              'Оставлять только самый свежий вариант товара',
-            ),
-          ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 14),
           if (_loadingRevisionPosts)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 10),
-              child: PhoenixLoadingView(
-                title: 'Загружаем посты ревизии',
-                subtitle: 'Собираем актуальные товары по выбранным датам',
-                size: 44,
+            ...List.generate(
+              3,
+              (index) => const AppSkeletonCard(
+                margin: EdgeInsets.only(bottom: 10),
+                height: 188,
               ),
             )
           else if (_revisionPosts.isEmpty)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('Нет постов для выбранной даты'),
+            const AppEmptyState(
+              badge: 'Выбранная дата',
+              title: 'Нет постов для выбранной даты',
+              subtitle:
+                  'Либо подходящих товаров нет, либо они уже не участвуют в ревизии.',
+              icon: Icons.inventory_2_outlined,
             )
           else
             ..._revisionPosts.map((post) {
-              final imageUrl = _resolveImageUrl(
-                (post['image_url'] ?? '').toString(),
-              );
+              final imageUrl = _coverImageOf(post);
+              final mediaItems = _mediaItemsOf(post);
               final blocked = _isRevisionBlocked(post);
               final blockedNote = _revisionBlockedNote(post);
               final revisionShelfNumber = _toIntValue(
@@ -3067,48 +3101,45 @@ class _WorkerPanelState extends State<WorkerPanel>
               final createdAtShort = createdAt.length >= 16
                   ? createdAt.substring(0, 16).replaceFirst('T', ' ')
                   : createdAt;
-              return Container(
-                margin: const EdgeInsets.only(bottom: 10),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surfaceContainerLow,
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(color: theme.colorScheme.outlineVariant),
-                ),
+              return AppSurfaceCard(
+                margin: const EdgeInsets.only(bottom: 12),
+                compact: true,
+                borderColor: blocked
+                    ? theme.colorScheme.error.withValues(alpha: 0.20)
+                    : null,
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: SizedBox(
-                        width: 78,
-                        height: 78,
-                        child: imageUrl != null
-                            ? AdaptiveNetworkImage(
-                                imageUrl,
-                                fit: BoxFit.contain,
-                                errorBuilder: (context, error, stackTrace) =>
-                                    Container(
-                                      color: theme
-                                          .colorScheme
-                                          .surfaceContainerHighest,
-                                      alignment: Alignment.center,
-                                      child: const Icon(Icons.photo_outlined),
-                                    ),
-                              )
-                            : Container(
-                                color:
-                                    theme.colorScheme.surfaceContainerHighest,
-                                alignment: Alignment.center,
-                                child: const Icon(Icons.photo_outlined),
-                              ),
+                    SizedBox(
+                      width: 118,
+                      child: ProductMediaGallery(
+                        coverImageUrl: imageUrl,
+                        media: mediaItems,
+                        height: 132,
+                        borderRadius: 18,
+                        heroLabel: 'Ревизия',
+                        fit: BoxFit.contain,
                       ),
                     ),
-                    const SizedBox(width: 10),
+                    const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              AppStatusBadge.preset(
+                                context,
+                                blocked ? 'reserved' : 'revision-needed',
+                                compact: true,
+                              ),
+                              if (createdAtShort.isNotEmpty)
+                                _statChip(createdAtShort),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
                           Text(
                             (post['title'] ?? 'Товар').toString(),
                             maxLines: 2,
@@ -3126,7 +3157,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                               color: theme.colorScheme.onSurfaceVariant,
                             ),
                           ),
-                          const SizedBox(height: 8),
+                          const SizedBox(height: 10),
                           Wrap(
                             spacing: 6,
                             runSpacing: 6,
@@ -3144,31 +3175,21 @@ class _WorkerPanelState extends State<WorkerPanel>
                             ],
                           ),
                           if (blockedNote.isNotEmpty) ...[
-                            const SizedBox(height: 8),
-                            Container(
+                            const SizedBox(height: 10),
+                            AppSurfaceCard(
+                              compact: true,
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 12,
-                                vertical: 9,
+                                vertical: 10,
                               ),
-                              decoration: BoxDecoration(
-                                color: theme.colorScheme.tertiaryContainer,
-                                borderRadius: BorderRadius.circular(14),
-                              ),
+                              borderColor: theme.colorScheme.tertiary
+                                  .withValues(alpha: 0.20),
                               child: Text(
                                 blockedNote,
                                 style: theme.textTheme.labelLarge?.copyWith(
-                                  fontWeight: FontWeight.w700,
-                                  color: theme.colorScheme.onTertiaryContainer,
+                                  fontWeight: FontWeight.w800,
+                                  color: theme.colorScheme.onSurface,
                                 ),
-                              ),
-                            ),
-                          ],
-                          if (createdAtShort.isNotEmpty) ...[
-                            const SizedBox(height: 6),
-                            Text(
-                              createdAtShort,
-                              style: theme.textTheme.labelSmall?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ],
@@ -3199,35 +3220,15 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Widget _buildNoAccessTab() {
-    final theme = Theme.of(context);
-    return Center(
+    return const Center(
       child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.lock_outline_rounded,
-              size: 44,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(height: 12),
-            Text(
-              'Нет прав для панели работника',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.titleMedium?.copyWith(
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
+        padding: EdgeInsets.all(24),
+        child: AppEmptyState(
+          badge: 'Worker',
+          title: 'Нет прав для панели работника',
+          subtitle:
               'Попросите арендатора или администратора выдать доступ к товарам.',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
+          icon: Icons.lock_outline_rounded,
         ),
       ),
     );
@@ -3236,15 +3237,16 @@ class _WorkerPanelState extends State<WorkerPanel>
   Widget _statChip(String label) {
     final theme = Theme.of(context);
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
       ),
       child: Text(
         label,
         style: theme.textTheme.labelLarge?.copyWith(
-          fontWeight: FontWeight.w700,
+          fontWeight: FontWeight.w800,
         ),
       ),
     );

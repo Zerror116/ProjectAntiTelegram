@@ -1,4 +1,7 @@
-const { buildPublicMediaVariantUrls } = require('./mediaAssets');
+const {
+  buildPublicMediaVariantUrls,
+  listPublicMediaAssetsForOwner,
+} = require('./mediaAssets');
 
 function cleanString(rawValue) {
   return String(rawValue || '').trim();
@@ -9,11 +12,33 @@ function toNumberOrNull(rawValue) {
   return Number.isFinite(value) ? value : null;
 }
 
-function buildProductCardSnapshot(product, context = {}) {
+async function buildProductCardSnapshot(queryable, product, context = {}) {
   if (!product || typeof product !== 'object') return null;
   const media = buildPublicMediaVariantUrls(product.image_url || '', context, {
     fieldKey: 'product_image_url',
   });
+  let gallery = [];
+  if (product.id) {
+    gallery = await listPublicMediaAssetsForOwner(queryable, {
+      ownerKind: 'product_image',
+      ownerId: product.id,
+      context,
+      fieldKey: 'product_image_url',
+    });
+  }
+  if ((!gallery || gallery.length === 0) && media?.default_url) {
+    gallery = [
+      {
+        slot: 'default',
+        asset_version: media.asset_version || 1,
+        url: media.default_url,
+        thumb_url: media.thumb_url || null,
+        card_url: media.card_url || null,
+        detail_url: media.detail_url || null,
+        original_url: media.original_url || cleanString(product.image_url) || null,
+      },
+    ];
+  }
   const shortDescription = cleanString(product.description).slice(0, 280);
   return {
     id: cleanString(product.id),
@@ -24,18 +49,20 @@ function buildProductCardSnapshot(product, context = {}) {
     quantity: toNumberOrNull(product.quantity),
     shelf_number: toNumberOrNull(product.shelf_number),
     status: cleanString(product.status),
+    cover_image_url: media?.default_url || cleanString(product.image_url) || null,
     image_url: media?.default_url || cleanString(product.image_url) || null,
     image_thumb_url: media?.thumb_url || null,
     image_card_url: media?.card_url || null,
     image_detail_url: media?.detail_url || null,
     image_original_url: media?.original_url || cleanString(product.image_url) || null,
     image_asset_version: media?.asset_version || 1,
+    media: gallery,
     updated_at: product.updated_at || new Date().toISOString(),
   };
 }
 
 async function upsertProductCardSnapshot(queryable, product, context = {}) {
-  const snapshot = buildProductCardSnapshot(product, context);
+  const snapshot = await buildProductCardSnapshot(queryable, product, context);
   if (!snapshot || !snapshot.id) return null;
   await queryable.query(
     `INSERT INTO product_card_snapshots (product_id, tenant_id, snapshot, media_version, updated_at)

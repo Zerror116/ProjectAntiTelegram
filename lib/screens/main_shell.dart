@@ -920,9 +920,9 @@ class _MainShellState extends State<MainShell> {
               ],
             ),
           ),
-          bottomNavigationBar: BottomNavigationBar(
-            currentIndex: currentNavIndex,
-            onTap: (i) async {
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: currentNavIndex,
+            onDestinationSelected: (i) async {
               final tapped = visibleDestinations[i];
               if (tapped.id == 'more') {
                 await _openMoreSheet(context, hiddenDestinations, destinations);
@@ -942,21 +942,17 @@ class _MainShellState extends State<MainShell> {
                 unawaited(refreshSupportQueueNotices());
               }
             },
-            items: visibleDestinations
+            labelBehavior: compactNavigation
+                ? NavigationDestinationLabelBehavior.onlyShowSelected
+                : NavigationDestinationLabelBehavior.alwaysShow,
+            destinations: visibleDestinations
                 .map(
-                  (destination) => BottomNavigationBarItem(
+                  (destination) => NavigationDestination(
                     icon: _buildNavIcon(context, destination),
                     label: destination.label,
                   ),
                 )
                 .toList(),
-            type: visibleDestinations.length > 3
-                ? BottomNavigationBarType.fixed
-                : BottomNavigationBarType.shifting,
-            iconSize: compactNavigation ? 24 : 22,
-            selectedFontSize: compactNavigation ? 12 : 11,
-            unselectedFontSize: compactNavigation ? 11 : 10,
-            showUnselectedLabels: !compactNavigation,
           ),
         );
       },

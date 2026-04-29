@@ -3220,11 +3220,10 @@ router.post(
     const client = await db.pool.connect();
     try {
       await client.query("BEGIN");
-      await acquireReservationOperationLock(client, {
-        reservationId,
-        cartItemId,
-        tenantId: req.user.tenant_id || null,
-      });
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1), 0)`,
+        [`dispatch-reserved:${req.user.tenant_id || "global"}`],
+      );
       const { reservedChannel } = await ensureSystemChannels(
         client,
         req.user.id,
@@ -3256,6 +3255,7 @@ router.post(
          LEFT JOIN phones ph ON ph.user_id = r.user_id
          LEFT JOIN user_shelves us ON us.user_id = r.user_id
          WHERE r.is_fulfilled = false
+           AND COALESCE(r.is_sent, false) = false
            AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
          ORDER BY DATE(COALESCE(r.created_at, now())) ASC,
                   CASE
