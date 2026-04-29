@@ -2760,15 +2760,15 @@ class _GlobalNoticeHost extends StatelessWidget {
       fit: StackFit.expand,
       children: [
         child,
-        IgnorePointer(
-          ignoring: false,
-          child: SafeArea(
-            child: Align(
-              alignment: Alignment.topCenter,
-              child: ValueListenableBuilder<_AppNoticePayload?>(
-                valueListenable: _appNoticeNotifier,
-                builder: (context, notice, _) {
-                  return AnimatedSwitcher(
+        ValueListenableBuilder<_AppNoticePayload?>(
+          valueListenable: _appNoticeNotifier,
+          builder: (context, notice, _) {
+            return IgnorePointer(
+              ignoring: notice == null,
+              child: SafeArea(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: AnimatedSwitcher(
                     duration: reducedMotion
                         ? Duration.zero
                         : const Duration(milliseconds: 220),
@@ -2821,11 +2821,16 @@ class _GlobalNoticeHost extends StatelessWidget {
                                             22,
                                           ),
                                           child: Row(
+                                            mainAxisSize: MainAxisSize.max,
                                             crossAxisAlignment:
-                                                CrossAxisAlignment.stretch,
+                                                CrossAxisAlignment.start,
                                             children: [
                                               Container(
                                                 width: 5,
+                                                constraints:
+                                                    const BoxConstraints(
+                                                      minHeight: 58,
+                                                    ),
                                                 color: visuals.accent,
                                               ),
                                               Expanded(
@@ -2933,11 +2938,11 @@ class _GlobalNoticeHost extends StatelessWidget {
                               ),
                             ),
                           ),
-                  );
-                },
+                  ),
+                ),
               ),
-            ),
-          ),
+            );
+          },
         ),
         SafeArea(
           child: Align(

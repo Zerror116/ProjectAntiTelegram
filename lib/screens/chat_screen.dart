@@ -5108,6 +5108,15 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
     }
+    void launchAttachmentAction(Future<void> Function() action) {
+      Navigator.of(context).pop();
+      if (kIsWeb) {
+        unawaited(action());
+        return;
+      }
+      Future<void>.delayed(const Duration(milliseconds: 120), action);
+    }
+
     await showModalBottomSheet<void>(
       context: context,
       builder: (context) => SafeArea(
@@ -5118,13 +5127,9 @@ class _ChatScreenState extends State<ChatScreen> {
               ListTile(
                 leading: const Icon(Icons.photo_camera_outlined),
                 title: const Text('Сделать фото'),
-                onTap: () {
-                  Navigator.of(context).pop();
-                  Future<void>.delayed(
-                    const Duration(milliseconds: 120),
-                    () => _pickAndSendImage(ImageSource.camera),
-                  );
-                },
+                onTap: () => launchAttachmentAction(
+                  () => _pickAndSendImage(ImageSource.camera),
+                ),
               ),
             ListTile(
               leading: const Icon(Icons.photo_library_outlined),
@@ -5133,47 +5138,27 @@ class _ChatScreenState extends State<ChatScreen> {
                     ? 'Выбрать фото с устройства'
                     : 'Выбрать из галереи',
               ),
-              onTap: () {
-                Navigator.of(context).pop();
-                Future<void>.delayed(
-                  const Duration(milliseconds: 120),
-                  () => _pickAndSendImage(ImageSource.gallery),
-                );
-              },
+              onTap: () => launchAttachmentAction(
+                () => _pickAndSendImage(ImageSource.gallery),
+              ),
             ),
             ListTile(
               leading: const Icon(Icons.videocam_outlined),
               title: const Text('Выбрать видео'),
-              onTap: () {
-                Navigator.of(context).pop();
-                Future<void>.delayed(
-                  const Duration(milliseconds: 120),
-                  _pickAndSendVideo,
-                );
-              },
+              onTap: () => launchAttachmentAction(_pickAndSendVideo),
             ),
             if (_cameraSupported && !kIsWeb)
               ListTile(
                 leading: const Icon(Icons.video_call_outlined),
                 title: const Text('Снять видео'),
-                onTap: () {
-                  Navigator.of(context).pop();
-                  Future<void>.delayed(
-                    const Duration(milliseconds: 120),
-                    () => _pickAndSendVideo(source: ImageSource.camera),
-                  );
-                },
+                onTap: () => launchAttachmentAction(
+                  () => _pickAndSendVideo(source: ImageSource.camera),
+                ),
               ),
             ListTile(
               leading: const Icon(Icons.attach_file_rounded),
               title: const Text('Документ или файл'),
-              onTap: () {
-                Navigator.of(context).pop();
-                Future<void>.delayed(
-                  const Duration(milliseconds: 120),
-                  _pickAndSendFile,
-                );
-              },
+              onTap: () => launchAttachmentAction(_pickAndSendFile),
             ),
           ],
         ),
