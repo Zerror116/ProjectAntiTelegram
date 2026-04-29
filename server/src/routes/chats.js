@@ -4254,7 +4254,10 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
       .map((row) => row.message_id)
       .filter(Boolean);
 
-    const unreadCount = await computeNotificationBadgeCount(userId);
+    const [chatUnreadCount, badgeCount] = await Promise.all([
+      getChatUnreadCount(chatId, userId),
+      computeNotificationBadgeCount(userId),
+    ]);
     const io = req.app.get("io");
     if (io) {
       if (messageIds.length > 0) {
@@ -4277,12 +4280,13 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         }
       }
       io.to(`user:${userId}`).emit("notification:badge", {
-        unread_count: unreadCount,
+        unread_count: badgeCount,
       });
       io.to(`user:${userId}`).emit("chat:message:read", {
         chatId,
         readerId: String(userId),
-        unread_count: unreadCount,
+        unread_count: chatUnreadCount,
+        badge_count: badgeCount,
       });
     }
 
@@ -4292,7 +4296,8 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         chat_id: chatId,
         message_ids: messageIds,
         visible_until_message_id: visibleUntilMessageId,
-        unread_count: unreadCount,
+        unread_count: chatUnreadCount,
+        badge_count: badgeCount,
       },
     });
   } catch (err) {
