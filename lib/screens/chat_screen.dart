@@ -3102,9 +3102,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _markChatAsRead({bool flushOnExit = false}) async {
     final reservedOrdersChat = _isReservedOrdersChat();
+    final bugReportsChat = _isBugReportsChat();
     if (!_initialViewportReady && !flushOnExit) return;
     if (_messages.isEmpty) return;
-    final visibleUntilMessageId = reservedOrdersChat
+    final visibleUntilMessageId = (reservedOrdersChat || bugReportsChat)
         ? ''
         : ((_isNearBottom()
                       ? _newestLoadedMessageId
@@ -3112,8 +3113,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   _newestLoadedMessageId ??
                   '')
               .trim();
-    if (!reservedOrdersChat && visibleUntilMessageId.isEmpty) return;
-    final payload = reservedOrdersChat
+    if (!reservedOrdersChat && !bugReportsChat && visibleUntilMessageId.isEmpty) {
+      return;
+    }
+    final payload = (reservedOrdersChat || bugReportsChat)
         ? const <String, dynamic>{}
         : <String, dynamic>{'visible_until_message_id': visibleUntilMessageId};
     try {
@@ -3123,26 +3126,34 @@ class _ChatScreenState extends State<ChatScreen> {
       );
       final data = resp.data;
       if (data is Map && data['data'] is Map) {
-        final ids = ((data['data']['message_ids'] ?? const []) as List)
+        final resultData = Map<String, dynamic>.from(data['data'] as Map);
+        final ids = ((resultData['message_ids'] ?? const []) as List)
             .map((e) => e?.toString() ?? '')
             .where((e) => e.isNotEmpty)
             .toSet();
+        final unreadCount =
+            int.tryParse('${resultData['unread_count'] ?? 0}') ?? 0;
         _applyReadState(ids, readByMe: true);
         if (!mounted) {
-          _firstUnreadMessageId = null;
-          _unreadCount = 0;
+          _firstUnreadMessageId =
+              unreadCount <= 0 ? null : _firstUnreadMessageId;
+          _unreadCount = unreadCount;
           _jumpedToFirstUnread = false;
         } else {
           setState(() {
-            _firstUnreadMessageId = null;
-            _unreadCount = 0;
+            _firstUnreadMessageId =
+                unreadCount <= 0 ? null : _firstUnreadMessageId;
+            _unreadCount = unreadCount;
             _jumpedToFirstUnread = false;
           });
         }
         chatEventsController.add({
           'type': 'chat:message:read',
-          'data': {'chatId': widget.chatId, 'unread_count': 0},
+          'data': {'chatId': widget.chatId, 'unread_count': unreadCount},
         });
+        if (unreadCount > 0) {
+          unawaited(_loadServerChatState());
+        }
       }
     } catch (_) {}
   }
@@ -6920,6 +6931,14 @@ class _ChatScreenState extends State<ChatScreen> {
     return kind == 'reserved_orders' ||
         systemKey == 'reserved_orders' ||
         title == 'забронированный товар';
+  }
+
+  bool _isBugReportsChat() {
+    if ((widget.chatType ?? '').toLowerCase().trim() != 'channel') return false;
+    final settings = _effectiveChatSettings();
+    final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
+    final title = _chatTitle.toLowerCase().trim();
+    return kind == 'bug_reports' || title == 'баг-репорты';
   }
 
   String? _reservedProductCodeOf(Map<String, dynamic> message) {
