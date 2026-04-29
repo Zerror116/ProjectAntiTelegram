@@ -3113,7 +3113,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   _newestLoadedMessageId ??
                   '')
               .trim();
-    if (!reservedOrdersChat && !bugReportsChat && visibleUntilMessageId.isEmpty) {
+    if (!reservedOrdersChat &&
+        !bugReportsChat &&
+        visibleUntilMessageId.isEmpty) {
       return;
     }
     final payload = (reservedOrdersChat || bugReportsChat)
@@ -3135,14 +3137,16 @@ class _ChatScreenState extends State<ChatScreen> {
             int.tryParse('${resultData['unread_count'] ?? 0}') ?? 0;
         _applyReadState(ids, readByMe: true);
         if (!mounted) {
-          _firstUnreadMessageId =
-              unreadCount <= 0 ? null : _firstUnreadMessageId;
+          _firstUnreadMessageId = unreadCount <= 0
+              ? null
+              : _firstUnreadMessageId;
           _unreadCount = unreadCount;
           _jumpedToFirstUnread = false;
         } else {
           setState(() {
-            _firstUnreadMessageId =
-                unreadCount <= 0 ? null : _firstUnreadMessageId;
+            _firstUnreadMessageId = unreadCount <= 0
+                ? null
+                : _firstUnreadMessageId;
             _unreadCount = unreadCount;
             _jumpedToFirstUnread = false;
           });
@@ -4549,6 +4553,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (lower.endsWith('.gif')) return 'image/gif';
     if (lower.endsWith('.heic')) return 'image/heic';
     if (lower.endsWith('.heif')) return 'image/heif';
+    if (lower.endsWith('.m4a')) return 'audio/mp4';
+    if (lower.endsWith('.aac')) return 'audio/aac';
+    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.mp3')) return 'audio/mpeg';
+    if (lower.endsWith('.ogg')) return 'audio/ogg';
+    if (lower.endsWith('.opus')) return 'audio/ogg';
     if (lower.endsWith('.mp4')) return 'video/mp4';
     if (lower.endsWith('.mov')) return 'video/quicktime';
     if (lower.endsWith('.webm')) return 'video/webm';
@@ -5040,11 +5050,14 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     } catch (e) {
       if (!mounted) return;
+      final errorText = _extractDioError(e);
       showAppNotice(
         context,
-        'Не удалось выбрать изображение',
+        errorText.isNotEmpty && errorText != e.toString()
+            ? 'Не удалось отправить изображение: $errorText'
+            : 'Не удалось выбрать изображение',
         tone: AppNoticeTone.error,
-        duration: const Duration(seconds: 2),
+        duration: const Duration(seconds: 3),
       );
       debugPrint('pickAndSendImage error: $e');
     }
@@ -5923,11 +5936,12 @@ class _ChatScreenState extends State<ChatScreen> {
           );
           return;
         }
+        final filename = _buildWebVoiceFilename();
         await _sendMediaMessage(
           upload: _ChatUploadFile(
-            filename:
-                'voice-${DateTime.now().millisecondsSinceEpoch}.$_activeVoiceUploadExtension',
+            filename: filename,
             bytes: bytes,
+            mimeType: _guessMimeTypeFromFilename(filename),
           ),
           attachmentType: 'voice',
           durationMs: durationMs,
@@ -5983,6 +5997,10 @@ class _ChatScreenState extends State<ChatScreen> {
       tone: AppNoticeTone.info,
       duration: const Duration(milliseconds: 900),
     );
+  }
+
+  String _buildWebVoiceFilename() {
+    return 'voice-${DateTime.now().millisecondsSinceEpoch}.$_activeVoiceUploadExtension';
   }
 
   void _toggleComposerMediaMode() {

@@ -66,11 +66,11 @@ Map<String, Object> _preprocessChatImagePayload(Map<String, Object> payload) {
   if (decoded == null) {
     return <String, Object>{
       'bytes': bytes,
-      'filename': _normalizeJpgFilename(filename),
-      'mimeType': 'image/jpeg',
+      'filename': _sanitizeOriginalFilename(filename),
+      'mimeType': _guessImageMimeTypeFromFilename(filename),
       'width': 0,
       'height': 0,
-      'preprocessTag': 'chat_image_passthrough_v1',
+      'preprocessTag': 'chat_image_passthrough_v2',
     };
   }
 
@@ -106,12 +106,37 @@ img.Image _resizeToMaxSide(img.Image image, {required int maxSide}) {
 }
 
 String _normalizeJpgFilename(String raw) {
+  final safeBase = _sanitizeBaseFilename(raw);
+  final base = safeBase.isEmpty ? 'chat-image' : safeBase;
+  return '$base.jpg';
+}
+
+String _sanitizeOriginalFilename(String raw) {
   final trimmed = raw.trim();
-  final safeBase = trimmed
+  final extensionMatch = RegExp(r'\.([A-Za-z0-9]{1,10})$').firstMatch(trimmed);
+  final extension = extensionMatch == null
+      ? ''
+      : '.${extensionMatch.group(1)!.toLowerCase()}';
+  final safeBase = _sanitizeBaseFilename(trimmed);
+  final fallbackBase = safeBase.isEmpty ? 'chat-image' : safeBase;
+  return '$fallbackBase$extension';
+}
+
+String _sanitizeBaseFilename(String raw) {
+  return raw
+      .trim()
       .replaceAll(RegExp(r'\.[^.]+$'), '')
       .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '-')
       .replaceAll(RegExp(r'-{2,}'), '-')
       .replaceAll(RegExp(r'^[-.]+|[-.]+$'), '');
-  final base = safeBase.isEmpty ? 'chat-image' : safeBase;
-  return '$base.jpg';
+}
+
+String _guessImageMimeTypeFromFilename(String filename) {
+  final lower = filename.trim().toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.heic')) return 'image/heic';
+  if (lower.endsWith('.heif')) return 'image/heif';
+  return 'image/jpeg';
 }

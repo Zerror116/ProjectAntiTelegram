@@ -146,23 +146,12 @@ async function processAttachmentFile({
   const absolutePath = path.resolve(filePath);
   const stat = await fs.promises.stat(absolutePath);
   const checksum = await sha256File(absolutePath);
-  const probe = await ffprobeJson(absolutePath);
-  const videoStream = pickStream(probe, 'video');
-  const audioStream = pickStream(probe, 'audio');
-  const formatDurationMs = parsePositiveMs(probe?.format?.duration);
-  const width = parsePositiveInt(videoStream?.width);
-  const height = parsePositiveInt(videoStream?.height);
-  const durationMs =
-    parsePositiveMs(videoStream?.duration) ||
-    parsePositiveMs(audioStream?.duration) ||
-    formatDurationMs;
-
   const result = {
     file_size: stat.size,
     checksum_sha256: checksum,
-    width,
-    height,
-    duration_ms: durationMs,
+    width: null,
+    height: null,
+    duration_ms: null,
     processing_state: 'ready',
     preview_image_path: null,
     preview_image_url: null,
@@ -172,9 +161,24 @@ async function processAttachmentFile({
     extra_meta: {},
   };
 
-  if ((attachmentType === 'video' || attachmentType === 'image') && width && height) {
-    result.preview_width = width;
-    result.preview_height = height;
+  try {
+    const probe = await ffprobeJson(absolutePath);
+    const videoStream = pickStream(probe, 'video');
+    const audioStream = pickStream(probe, 'audio');
+    const formatDurationMs = parsePositiveMs(probe?.format?.duration);
+    result.width = parsePositiveInt(videoStream?.width);
+    result.height = parsePositiveInt(videoStream?.height);
+    result.duration_ms =
+      parsePositiveMs(videoStream?.duration) ||
+      parsePositiveMs(audioStream?.duration) ||
+      formatDurationMs;
+  } catch (err) {
+    result.extra_meta.ffprobe_error = String(err?.message || err);
+  }
+
+  if ((attachmentType === 'video' || attachmentType === 'image') && result.width && result.height) {
+    result.preview_width = result.width;
+    result.preview_height = result.height;
   }
 
   if (attachmentType === 'video' && previewOutputDir && previewPrefix) {
