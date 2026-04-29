@@ -48,7 +48,6 @@ import '../widgets/app_surface_card.dart';
 import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
-import '../widgets/product_media_gallery.dart';
 import '../widgets/submit_on_enter.dart';
 
 class _ChatUploadFile {
@@ -8235,80 +8234,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return _metaMapOf(metaMap['card_snapshot']);
   }
 
-  List<Map<String, dynamic>> _productMediaItemsOf(
-    Map<String, dynamic> metaMap,
-  ) {
-    final snapshot = _productCardSnapshotOf(metaMap);
-    final rawLists = <dynamic>[
-      snapshot['media'],
-      snapshot['images'],
-      metaMap['media'],
-      metaMap['images'],
-    ];
-    for (final raw in rawLists) {
-      if (raw is! List) continue;
-      final mapped = raw
-          .whereType<Map>()
-          .map((entry) => Map<String, dynamic>.from(entry))
-          .where((entry) {
-            final anyUrl =
-                (entry['card_url'] ??
-                        entry['detail_url'] ??
-                        entry['thumb_url'] ??
-                        entry['original_url'] ??
-                        entry['url'] ??
-                        '')
-                    .toString()
-                    .trim();
-            return anyUrl.isNotEmpty;
-          })
-          .toList(growable: false);
-      if (mapped.isNotEmpty) return mapped;
-    }
-
-    final coverCandidates = <String?>[
-      snapshot['image_card_url']?.toString(),
-      snapshot['image_detail_url']?.toString(),
-      snapshot['image_thumb_url']?.toString(),
-      snapshot['image_original_url']?.toString(),
-      metaMap['image_card_url']?.toString(),
-      metaMap['image_detail_url']?.toString(),
-      metaMap['image_thumb_url']?.toString(),
-      metaMap['image_original_url']?.toString(),
-      metaMap['image_url']?.toString(),
-    ];
-    String? first;
-    for (final candidate in coverCandidates) {
-      final resolved = _resolveImageUrl(candidate);
-      if (resolved != null && resolved.trim().isNotEmpty) {
-        first = resolved;
-        break;
-      }
-    }
-    if (first == null) return const <Map<String, dynamic>>[];
-    return <Map<String, dynamic>>[
-      <String, dynamic>{
-        'card_url': first,
-        'detail_url': first,
-        'original_url': first,
-      },
-    ];
-  }
-
-  String? _productCoverImageOf(Map<String, dynamic> metaMap) {
-    final snapshot = _productCardSnapshotOf(metaMap);
-    return [
-      snapshot['image_card_url']?.toString(),
-      snapshot['image_detail_url']?.toString(),
-      snapshot['image_thumb_url']?.toString(),
-      snapshot['image_url']?.toString(),
-      metaMap['image_card_url']?.toString(),
-      metaMap['image_detail_url']?.toString(),
-      metaMap['image_thumb_url']?.toString(),
-      metaMap['image_url']?.toString(),
-    ].map(_resolveImageUrl).whereType<String>().firstOrNull;
-  }
-
   String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
     final code = int.tryParse('${productCode ?? ''}') ?? 0;
     final shelf = int.tryParse('${shelfNumber ?? ''}') ?? 0;
@@ -11107,8 +11032,6 @@ class _ChatScreenState extends State<ChatScreen> {
     final captionText = _captionTextOf(message, metaMap);
     final catalogTexts = _extractCatalogTexts(text);
     final catalogSnapshot = _productCardSnapshotOf(metaMap);
-    final productMediaItems = _productMediaItemsOf(metaMap);
-    final productCoverImage = _productCoverImageOf(metaMap) ?? imageUrl;
     final productDescriptionText =
         (catalogSnapshot['short_description'] ??
                 catalogTexts['description'] ??
@@ -11556,12 +11479,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    ProductMediaGallery(
-                      coverImageUrl: productCoverImage,
-                      media: productMediaItems,
-                      heroLabel: 'Товар',
-                      height: isCompactMedia ? 220 : 248,
-                    ),
+                    if (imageUrl != null) ...[
+                      buildMessageImage(width: double.infinity),
+                      const SizedBox(height: 2),
+                    ],
                     Padding(
                       padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
                       child: Column(
@@ -11699,12 +11620,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    ProductMediaGallery(
-                      coverImageUrl: productCoverImage,
-                      media: productMediaItems,
-                      heroLabel: 'Резерв',
-                      height: isCompactMedia ? 204 : 228,
-                    ),
+                    if (imageUrl != null) ...[
+                      buildMessageImage(width: double.infinity),
+                      const SizedBox(height: 2),
+                    ],
                     Padding(
                       padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
                       child: Column(
