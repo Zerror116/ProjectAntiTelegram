@@ -167,7 +167,8 @@
       const buildVersionKey = 'projectphoenix-web-build-version';
       const reloadOnceKey = 'projectphoenix-web-reload-once';
       const versionPollTimerKey = 'projectphoenix-web-version-poll';
-      const bootstrapTimeoutMs = 14000;
+      const bootstrapTimeoutMs = 28000;
+      const bootstrapExtendedTimeoutMs = 45000;
       let bootstrapTimeoutId = null;
 
       const shell = document.getElementById('bootstrap-shell');
@@ -271,6 +272,16 @@
         const script = document.createElement('script');
         script.src = versionedAsset('flutter_bootstrap.js', versionToken);
         script.async = true;
+        script.onload = function () {
+          setBootstrapStatus(
+            'Подключаем движок Феникс...',
+            'Первый запуск после обновления может занять больше времени, особенно в Safari.',
+          );
+          armBootstrapTimeout(
+            isSafariLikeBrowser() ? bootstrapExtendedTimeoutMs + 15000 : bootstrapExtendedTimeoutMs,
+            'Феникс загрузился слишком медленно. Можно повторить запуск или очистить кэш.',
+          );
+        };
         script.onerror = function () {
           setBootstrapFailure('Не удалось загрузить веб-бандл Феникс.');
         };
@@ -395,9 +406,10 @@
           'Загружаем интерфейс Феникс...',
           'Если соединение нестабильно, экран загрузки останется видимым вместо пустого белого фона.',
         );
-        bootstrapTimeoutId = window.setTimeout(function () {
-          setBootstrapFailure('Загрузка заняла слишком много времени.');
-        }, bootstrapTimeoutMs);
+        armBootstrapTimeout(
+          isSafariLikeBrowser() ? bootstrapTimeoutMs + 12000 : bootstrapTimeoutMs,
+          'Загрузка заняла слишком много времени.',
+        );
         appendFlutterBootstrap(serverVersion);
         startVersionPolling();
       })();
@@ -406,3 +418,19 @@
 
 
 </body></html>
+      function isSafariLikeBrowser() {
+        const ua = String(window.navigator.userAgent || '');
+        const hasSafari = /Safari\//.test(ua);
+        const hasChromium = /Chrome\/|CriOS\/|EdgiOS\/|Edg\//.test(ua);
+        const hasFirefox = /Firefox\/|FxiOS\//.test(ua);
+        return hasSafari && !hasChromium && !hasFirefox;
+      }
+
+      function armBootstrapTimeout(timeoutMs, message) {
+        if (bootstrapTimeoutId) {
+          window.clearTimeout(bootstrapTimeoutId);
+        }
+        bootstrapTimeoutId = window.setTimeout(function () {
+          setBootstrapFailure(message || 'Загрузка заняла слишком много времени.');
+        }, timeoutMs);
+      }
