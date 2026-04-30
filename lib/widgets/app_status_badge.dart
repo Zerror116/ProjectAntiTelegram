@@ -137,13 +137,13 @@ class AppStatusPreset {
           icon: Icons.check_circle_outline_rounded,
           background: isDark
               ? const Color(0xFF19A36B).withValues(alpha: 0.16)
-              : const Color(0xFFD8F4E4),
+              : const Color(0xFF16935F),
           foreground: isDark
               ? const Color(0xFF7CE2B6)
-              : const Color(0xFF0D6B42),
+              : Colors.white,
           border: isDark
               ? const Color(0xFF19A36B).withValues(alpha: 0.34)
-              : const Color(0xFF16935F),
+              : const Color(0xFF0D6B42),
         );
       case 'oversized':
       case 'oversize':
