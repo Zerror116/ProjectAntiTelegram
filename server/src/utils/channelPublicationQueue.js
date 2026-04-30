@@ -20,7 +20,7 @@ const CHANNEL_PUBLICATION_POLL_MS = Math.max(
 );
 const CHANNEL_PUBLICATION_RECOVERY_MS = Math.max(
   60_000,
-  Number.parseInt(process.env.CHANNEL_PUBLICATION_RECOVERY_MS || `${5 * 60 * 1000}`, 10) || 5 * 60 * 1000,
+  Number.parseInt(process.env.CHANNEL_PUBLICATION_RECOVERY_MS || '60000', 10) || 60_000,
 );
 const SAMARA_TZ = 'Europe/Samara';
 const PROCESSOR_ID = process.env.FENIX_CHANNEL_PUBLICATION_PROCESSOR_ID || `api:${process.pid}`;

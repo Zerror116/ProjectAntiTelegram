@@ -3,6 +3,8 @@ const { ensurePublicImageVariants } = require('./publicImagePipeline');
 const {
   normalizePublicUploadRef,
   absoluteUploadPathFromCanonical,
+  ensureMediaAssetCache,
+  getMediaAssetByPath,
   upsertMediaAsset,
 } = require('./mediaAssets');
 
@@ -20,6 +22,28 @@ async function registerPublicImageUpload({
 }) {
   const ref = normalizePublicUploadRef(rawUrl);
   if (!ref) return null;
+  await ensureMediaAssetCache(queryable);
+  const existingMatch = getMediaAssetByPath(ref.canonicalPath);
+  const existingAsset = existingMatch?.asset || null;
+  if (existingAsset && String(existingAsset.original_path || '').trim() === ref.canonicalPath) {
+    return upsertMediaAsset(queryable, {
+      ownerKind,
+      ownerId: cleanString(ownerId) || null,
+      ownerTextId: cleanString(ownerTextId) || null,
+      slot: cleanString(slot) || 'default',
+      storageKind: 'public',
+      originalPath: existingAsset.original_path,
+      originalFilename: existingAsset.original_filename || ref.filename,
+      mimeType: existingAsset.mime_type,
+      byteSize: existingAsset.byte_size,
+      width: existingAsset.width,
+      height: existingAsset.height,
+      durationMs: existingAsset.duration_ms,
+      checksumSha256: existingAsset.checksum_sha256,
+      variants: existingAsset.variants || {},
+      placeholderAppliedAt: existingAsset.placeholder_applied_at || null,
+    });
+  }
   const absolutePath = absoluteUploadPathFromCanonical(ref.canonicalPath);
   if (!absolutePath) return null;
   let processed;

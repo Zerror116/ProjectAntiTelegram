@@ -1377,7 +1377,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       return;
     }
     if (_publishProgressTimer != null) return;
-    _publishProgressTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _publishProgressTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (!mounted || _isDisposed) return;
       unawaited(_loadPendingPosts());
     });
