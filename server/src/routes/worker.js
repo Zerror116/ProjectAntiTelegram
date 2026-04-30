@@ -916,19 +916,10 @@ async function fetchRevisionDayStats(client, channelId) {
   return q.rows;
 }
 
-async function fetchRevisionDaySequence(client, channelId, tenantId = null) {
+async function fetchRevisionDaySequence(client, channelId) {
   const rows = await fetchRevisionDayStats(client, channelId);
   if (rows.length === 0) return [];
-
-  let baseShelfNumber = toPositiveShelfNumberOrNull(rows[0]?.anchor_shelf_number);
-  if (baseShelfNumber == null) {
-    baseShelfNumber = await resolveAutoShelfNumber(
-      client,
-      tenantId || null,
-      revisionDayToTimestamp(rows[0].day),
-      1,
-    );
-  }
+  const baseShelfNumber = 2;
 
   return rows.map((row, index) => {
     const revisionShelfNumber = baseShelfNumber + index;
@@ -940,15 +931,15 @@ async function fetchRevisionDaySequence(client, channelId, tenantId = null) {
   });
 }
 
-async function fetchRevisionDays(client, channelId, tenantId = null, limit = 2) {
+async function fetchRevisionDays(client, channelId, limit = 2) {
   const safeLimit = Math.min(Math.max(Number(limit) || 2, 1), 10);
-  const rows = await fetchRevisionDaySequence(client, channelId, tenantId);
+  const rows = await fetchRevisionDaySequence(client, channelId);
   return rows.slice(0, safeLimit);
 }
 
-async function fetchRevisionPosts(client, channelId, tenantId, selectedDates) {
+async function fetchRevisionPosts(client, channelId, selectedDates) {
   const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
-  const revisionDaySequence = await fetchRevisionDaySequence(client, channelId, tenantId);
+  const revisionDaySequence = await fetchRevisionDaySequence(client, channelId);
   const revisionShelfCache = new Map(
     revisionDaySequence.map((item) => [
       String(item.day || '').trim(),
@@ -2026,7 +2017,6 @@ router.get(
       const days = await fetchRevisionDays(
         client,
         mainChannel.id,
-        req.user.tenant_id || null,
         2,
       );
       await client.query('COMMIT');
@@ -2090,7 +2080,6 @@ router.get(
             await fetchRevisionDays(
               client,
               mainChannel.id,
-              req.user.tenant_id || null,
               1,
             )
           ).map((x) => x.day);
@@ -2098,7 +2087,6 @@ router.get(
         ? await fetchRevisionPosts(
             client,
             mainChannel.id,
-            req.user.tenant_id || null,
             fallbackDays,
           )
         : [];
@@ -2199,7 +2187,6 @@ router.post(
           await fetchRevisionDaySequence(
             client,
             mainChannel.id,
-            req.user.tenant_id || null,
           )
         ).map((item) => [
           String(item.day || '').trim(),
@@ -2418,7 +2405,6 @@ router.post(
             await fetchRevisionDays(
               client,
               mainChannel.id,
-              req.user.tenant_id || null,
               1,
             )
           ).map((x) => x.day);
@@ -2426,7 +2412,6 @@ router.post(
         ? await fetchRevisionPosts(
             client,
             mainChannel.id,
-            req.user.tenant_id || null,
             selectedDates,
           )
         : [];
