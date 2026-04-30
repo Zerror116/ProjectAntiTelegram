@@ -292,8 +292,9 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     if (!opened && mounted) {
       showAppNotice(
         context,
-        'Уведомление отмечено как прочитанное. Для него пока нет отдельного экрана перехода.',
+        'Для этого уведомления пока нет отдельного экрана.',
         tone: AppNoticeTone.info,
+        duration: const Duration(seconds: 3),
       );
     }
   }
