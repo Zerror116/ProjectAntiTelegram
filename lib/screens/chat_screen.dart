@@ -11516,49 +11516,6 @@ class _ChatScreenState extends State<ChatScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Expanded(
-                                child: Wrap(
-                                  spacing: 8,
-                                  runSpacing: 8,
-                                  children: [
-                                    AppStatusBadge(
-                                      label: quantityInt > 0
-                                          ? 'На канале'
-                                          : 'Нет в наличии',
-                                      icon: quantityInt > 0
-                                          ? Icons.campaign_outlined
-                                          : Icons.remove_shopping_cart_outlined,
-                                      background: quantityInt > 0
-                                          ? theme.colorScheme.primaryContainer
-                                                .withValues(alpha: 0.42)
-                                          : theme.colorScheme.errorContainer
-                                                .withValues(alpha: 0.28),
-                                      foreground: quantityInt > 0
-                                          ? theme.colorScheme.onPrimaryContainer
-                                          : theme.colorScheme.onErrorContainer,
-                                      border: quantityInt > 0
-                                          ? theme.colorScheme.primary
-                                                .withValues(alpha: 0.22)
-                                          : theme.colorScheme.error.withValues(
-                                              alpha: 0.22,
-                                            ),
-                                      compact: true,
-                                    ),
-                                    if (timeLabel.isNotEmpty)
-                                      _catalogMetaBadge(
-                                        theme,
-                                        'Опубликован',
-                                        timeLabel,
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
                           Text(
                             (catalogSnapshot['title'] ??
                                     catalogTexts['title'] ??
