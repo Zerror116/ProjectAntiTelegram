@@ -3847,6 +3847,27 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
+  String _clientCartStatusLabel(String raw) {
+    switch (raw.trim()) {
+      case 'pending_processing':
+        return 'В обработке';
+      case 'processed':
+        return 'Обработано';
+      case 'preparing_delivery':
+        return 'Готовится к доставке';
+      case 'handing_to_courier':
+        return 'Передаётся курьеру';
+      case 'in_delivery':
+        return 'В доставке';
+      case 'delivered':
+        return 'Доставлено';
+      case 'cancelled':
+        return 'Отменено';
+      default:
+        return raw.trim().isEmpty ? '—' : raw.trim();
+    }
+  }
+
   Future<void> _loadDeliveryDashboard() async {
     final effectiveRole = authService.effectiveRole.toLowerCase().trim();
     if (effectiveRole != 'admin' &&
@@ -9944,6 +9965,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 final title = (item['title'] ?? 'Товар').toString().trim();
                 final qty = _toInt(item['quantity']);
                 final status = (item['status'] ?? '').toString().trim();
+                final statusLabel = _clientCartStatusLabel(status);
                 final price = _toDouble(item['price']);
                 final lineTotal = _toDouble(item['line_total']) > 0
                     ? _toDouble(item['line_total'])
@@ -9961,7 +9983,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           style: const TextStyle(fontWeight: FontWeight.w700),
                         ),
                         const SizedBox(height: 4),
-                        Text('Количество: $qty • Статус: $status'),
+                        Text('Количество: $qty • Статус: $statusLabel'),
                         Text(
                           'Цена: ${_formatMoney(price)} • Сумма: ${_formatMoney(lineTotal)}',
                         ),
