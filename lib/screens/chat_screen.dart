@@ -11578,23 +11578,8 @@ class _ChatScreenState extends State<ChatScreen> {
                             spacing: 8,
                             runSpacing: 8,
                             children: [
-                              _catalogMetaBadge(theme, 'ID', productLabel),
                               _catalogMetaBadge(theme, 'Цена', '$price ₽'),
                               _catalogMetaBadge(theme, 'В наличии', quantity),
-                              if ((catalogSnapshot['shelf_number'] ??
-                                      metaMap['shelf_number'] ??
-                                      '')
-                                  .toString()
-                                  .trim()
-                                  .isNotEmpty)
-                                _catalogMetaBadge(
-                                  theme,
-                                  'Полка',
-                                  (catalogSnapshot['shelf_number'] ??
-                                          metaMap['shelf_number'] ??
-                                          '')
-                                      .toString(),
-                                ),
                             ],
                           ),
                           const SizedBox(height: 14),
