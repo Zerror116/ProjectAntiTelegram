@@ -874,7 +874,7 @@ async function fetchRevisionDayStats(client, channelId) {
               BOOL_OR(r.is_fulfilled = true) AS has_fulfilled_reservation
        FROM reservations r
        GROUP BY r.product_id
-     )
+     ),
      filtered_catalog AS (
        SELECT vc.message_id,
               vc.created_at,
