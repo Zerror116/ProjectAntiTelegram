@@ -29,6 +29,7 @@ function captionFromMeta(meta = {}) {
 }
 
 async function upsertMessageSearchDocument({
+  queryable = null,
   messageId,
   chatId,
   tenantId = null,
@@ -45,8 +46,9 @@ async function upsertMessageSearchDocument({
   const searchText = normalizeText(text);
   const captionText = normalizeText(captionFromMeta(meta));
   const attachmentKinds = attachmentKindsFromMessage(meta, attachments);
+  const runner = queryable && typeof queryable.query === 'function' ? queryable : db;
 
-  await db.query(
+  await runner.query(
     `INSERT INTO message_search_documents (
        message_id,
        chat_id,
@@ -90,10 +92,14 @@ async function deleteMessageSearchDocument(messageId) {
   ]);
 }
 
-async function syncMessageSearchDocumentFromMessageId(messageId) {
+async function syncMessageSearchDocumentFromMessageId(messageId, options = {}) {
   const normalized = String(messageId || '').trim();
   if (!normalized) return;
-  const result = await db.query(
+  const queryable =
+    options?.queryable && typeof options.queryable.query === 'function'
+      ? options.queryable
+      : db;
+  const result = await queryable.query(
     `SELECT m.id,
             m.chat_id,
             m.sender_id,
@@ -112,7 +118,7 @@ async function syncMessageSearchDocumentFromMessageId(messageId) {
     return;
   }
   const row = result.rows[0];
-  const attachmentsResult = await db.query(
+  const attachmentsResult = await queryable.query(
     `SELECT attachment_type
      FROM message_attachments
      WHERE message_id = $1
@@ -120,6 +126,7 @@ async function syncMessageSearchDocumentFromMessageId(messageId) {
     [normalized],
   );
   await upsertMessageSearchDocument({
+    queryable,
     messageId: row.id,
     chatId: row.chat_id,
     tenantId: row.tenant_id || null,

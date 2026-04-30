@@ -644,6 +644,7 @@ function publishDemoPostsSequentially({
           ],
         );
         await upsertMessageSearchDocument({
+          queryable: client,
           messageId: messageInsert.rows[0]?.id,
           chatId: channelId,
           tenantId: tenantId || null,

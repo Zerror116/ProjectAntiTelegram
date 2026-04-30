@@ -852,6 +852,7 @@ async function processBatchItem(client, batch) {
     );
     const message = messageInsert.rows[0];
     await upsertMessageSearchDocument({
+      queryable: client,
       messageId: message.id,
       chatId: row.channel_id,
       tenantId: batch.tenant_id || null,
@@ -929,6 +930,7 @@ async function processBatchItem(client, batch) {
         ],
       );
       await upsertMessageSearchDocument({
+        queryable: client,
         messageId: archiveInsert.rows[0]?.id,
         chatId: postsArchiveChannelId,
         tenantId: batch.tenant_id || null,
