@@ -2030,17 +2030,21 @@ router.get(
         2,
       );
       await client.query('COMMIT');
-      const io = req.app.get('io');
-      if (io && sanitation.hiddenMessages.length > 0) {
-        for (const message of sanitation.hiddenMessages) {
-          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+      try {
+        const io = req.app.get('io');
+        if (io && sanitation.hiddenMessages.length > 0) {
+          for (const message of sanitation.hiddenMessages) {
+            io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+              chatId: mainChannel.id,
+              message: decryptMessageRow(message),
+            });
+          }
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
             chatId: mainChannel.id,
-            message: decryptMessageRow(message),
           });
         }
-        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
-          chatId: mainChannel.id,
-        });
+      } catch (emitErr) {
+        console.error('worker.revision.dates post-commit emit error', emitErr);
       }
       return res.json({ ok: true, data: days });
     } catch (err) {
@@ -2100,17 +2104,21 @@ router.get(
         : [];
       const enrichedPosts = await attachProductMediaToRows(client, posts);
       await client.query('COMMIT');
-      const io = req.app.get('io');
-      if (io && sanitation.hiddenMessages.length > 0) {
-        for (const message of sanitation.hiddenMessages) {
-          io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+      try {
+        const io = req.app.get('io');
+        if (io && sanitation.hiddenMessages.length > 0) {
+          for (const message of sanitation.hiddenMessages) {
+            io.to(`chat:${mainChannel.id}`).emit('chat:message', {
+              chatId: mainChannel.id,
+              message: decryptMessageRow(message),
+            });
+          }
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
             chatId: mainChannel.id,
-            message: decryptMessageRow(message),
           });
         }
-        emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
-          chatId: mainChannel.id,
-        });
+      } catch (emitErr) {
+        console.error('worker.revision.posts post-commit emit error', emitErr);
       }
       return res.json({
         ok: true,
