@@ -11736,17 +11736,67 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           ],
                           const SizedBox(height: 12),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              _catalogMetaBadge(theme, 'ID', productLabel),
-                              _catalogMetaBadge(theme, 'Цена', '$price ₽'),
-                              _catalogMetaBadge(theme, 'Куплено', quantity),
-                              _catalogMetaBadge(theme, 'Полка', shelf),
-                              if (isOversizePlaced)
-                                _catalogMetaBadge(theme, 'Режим', 'Габарит'),
-                            ],
+                          Builder(
+                            builder: (context) {
+                              final prominentBadgeLabelStyle = theme.textTheme
+                                  .labelMedium
+                                  ?.copyWith(fontSize: 16, height: 1.05);
+                              final prominentBadgeValueStyle = theme.textTheme
+                                  .labelMedium
+                                  ?.copyWith(fontSize: 16, height: 1.05);
+                              const prominentBadgePadding =
+                                  EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 10,
+                                  );
+                              return Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _catalogMetaBadge(
+                                    theme,
+                                    'ID',
+                                    productLabel,
+                                    labelStyle: prominentBadgeLabelStyle,
+                                    valueStyle: prominentBadgeValueStyle,
+                                    padding: prominentBadgePadding,
+                                  ),
+                                  _catalogMetaBadge(
+                                    theme,
+                                    'Цена',
+                                    '$price ₽',
+                                    labelStyle: prominentBadgeLabelStyle,
+                                    valueStyle: prominentBadgeValueStyle,
+                                    padding: prominentBadgePadding,
+                                  ),
+                                  _catalogMetaBadge(
+                                    theme,
+                                    'Куплено',
+                                    quantity,
+                                    labelStyle: prominentBadgeLabelStyle,
+                                    valueStyle: prominentBadgeValueStyle,
+                                    padding: prominentBadgePadding,
+                                  ),
+                                  _catalogMetaBadge(
+                                    theme,
+                                    'Полка',
+                                    shelf,
+                                    labelStyle: prominentBadgeLabelStyle,
+                                    valueStyle: prominentBadgeValueStyle,
+                                    padding: prominentBadgePadding,
+                                  ),
+                                  if (isOversizePlaced)
+                                    _catalogMetaBadge(
+                                      theme,
+                                      'Режим',
+                                      'Габарит',
+                                      labelStyle: prominentBadgeLabelStyle,
+                                      valueStyle: prominentBadgeValueStyle,
+                                      padding: prominentBadgePadding,
+                                    ),
+                                ],
+                              );
+                            },
                           ),
                           const SizedBox(height: 14),
                           Wrap(
