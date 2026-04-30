@@ -128,7 +128,7 @@ strip_web_debug_artifacts() {
     "$PROJECT_ROOT/build/web/flutter_bootstrap.js"
   do
     [[ -f "$file" ]] || continue
-    perl -0pi -e 's/[[:space:]]*\/\/# sourceMappingURL=flutter\.js\.map//g; s/[[:space:]]*sourceMappingURL=flutter\.js\.map# sourceMappingURL=flutter\.js\.map//g' "$file" || true
+    perl -0pi -e 's/^\s*\/\/# sourceMappingURL=.*\R?//mg' "$file" || true
     rm -f "$file.bak"
   done
 }
