@@ -8220,6 +8220,7 @@ class _ChatScreenState extends State<ChatScreen> {
     String value, {
     Color? backgroundColor,
     Color? foregroundColor,
+    TextStyle? valueStyle,
   }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
@@ -8242,10 +8243,11 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             TextSpan(
               text: value,
-              style: theme.textTheme.labelSmall?.copyWith(
-                color: foregroundColor ?? theme.colorScheme.onSurface,
-                fontWeight: FontWeight.w800,
-              ),
+              style:
+                  (valueStyle ?? theme.textTheme.labelSmall)?.copyWith(
+                    color: foregroundColor ?? theme.colorScheme.onSurface,
+                    fontWeight: FontWeight.w800,
+                  ),
             ),
           ],
         ),
@@ -11578,7 +11580,19 @@ class _ChatScreenState extends State<ChatScreen> {
                             spacing: 8,
                             runSpacing: 8,
                             children: [
-                              _catalogMetaBadge(theme, 'Цена', '$price ₽'),
+                              _catalogMetaBadge(
+                                theme,
+                                'Цена',
+                                '$price ₽',
+                                valueStyle:
+                                    theme.textTheme.labelSmall?.copyWith(
+                                      fontSize:
+                                          (theme.textTheme.labelSmall?.fontSize ??
+                                              11) *
+                                          2,
+                                      height: 1,
+                                    ),
+                              ),
                               _catalogMetaBadge(theme, 'В наличии', quantity),
                             ],
                           ),
