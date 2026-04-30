@@ -213,6 +213,12 @@ function toShelfNumber(value, fallback = 1) {
   return Math.floor(n);
 }
 
+function toPositiveShelfNumberOrNull(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+
 async function resolveAutoShelfNumber(
   client,
   tenantId = null,
@@ -829,13 +835,13 @@ function buildRevisionQueuePayload({
   };
 }
 
-async function fetchRevisionDays(client, channelId, tenantId = null, limit = 2) {
-  const safeLimit = Math.min(Math.max(Number(limit) || 2, 1), 10);
+async function fetchRevisionDayStats(client, channelId) {
   const q = await client.query(
     `WITH visible_catalog AS (
        SELECT m.id AS message_id,
               m.created_at,
-              p.id AS product_id
+              p.id AS product_id,
+              COALESCE(NULLIF(m.meta->>'shelf_number', '')::int, p.shelf_number) AS source_shelf_number
        FROM messages m
        LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
        WHERE m.chat_id = $1
@@ -865,48 +871,86 @@ async function fetchRevisionDays(client, channelId, tenantId = null, limit = 2) 
        FROM reservations r
        GROUP BY r.product_id
      )
-     SELECT to_char((vc.created_at AT TIME ZONE $4), 'YYYY-MM-DD') AS day,
-            to_char((vc.created_at AT TIME ZONE $4), 'DD.MM.YYYY') AS label,
-            COUNT(*)::int AS posts
-     FROM visible_catalog vc
-     LEFT JOIN queue_state qs ON qs.product_id = vc.product_id
-     LEFT JOIN cart_state cs ON cs.product_id = vc.product_id
-     LEFT JOIN reservation_state rs ON rs.product_id = vc.product_id
-     WHERE COALESCE(qs.has_pending, false) = false
-       AND NOT (
-         COALESCE(cs.has_processed_delivery, false) = true
-         OR COALESCE(rs.has_fulfilled_reservation, false) = true
-       )
+     filtered_catalog AS (
+       SELECT vc.message_id,
+              vc.created_at,
+              vc.source_shelf_number,
+              to_char((vc.created_at AT TIME ZONE $4), 'YYYY-MM-DD') AS day,
+              to_char((vc.created_at AT TIME ZONE $4), 'DD.MM.YYYY') AS label
+       FROM visible_catalog vc
+       LEFT JOIN queue_state qs ON qs.product_id = vc.product_id
+       LEFT JOIN cart_state cs ON cs.product_id = vc.product_id
+       LEFT JOIN reservation_state rs ON rs.product_id = vc.product_id
+       WHERE COALESCE(qs.has_pending, false) = false
+         AND NOT (
+           COALESCE(cs.has_processed_delivery, false) = true
+           OR COALESCE(rs.has_fulfilled_reservation, false) = true
+         )
+     ),
+     ranked_days AS (
+       SELECT fc.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY fc.day
+                ORDER BY fc.created_at ASC, fc.message_id ASC
+              ) AS day_rank
+       FROM filtered_catalog fc
+     )
+     SELECT day,
+            label,
+            COUNT(*)::int AS posts,
+            MAX(CASE WHEN day_rank = 1 THEN source_shelf_number END)::int AS anchor_shelf_number
+     FROM ranked_days
      GROUP BY day, label
-     ORDER BY day ASC
-     LIMIT $5`,
+     ORDER BY day ASC`,
     [
       channelId,
       REVISION_PENDING_CART_STATUSES,
       REVISION_COMPLETED_CART_STATUSES,
       SAMARA_TZ,
-      safeLimit,
     ],
   );
-  const rows = [];
-  for (const row of q.rows) {
-    const revisionShelfNumber = await resolveAutoShelfNumber(
+  return q.rows;
+}
+
+async function fetchRevisionDaySequence(client, channelId, tenantId = null) {
+  const rows = await fetchRevisionDayStats(client, channelId);
+  if (rows.length === 0) return [];
+
+  let baseShelfNumber = toPositiveShelfNumberOrNull(rows[0]?.anchor_shelf_number);
+  if (baseShelfNumber == null) {
+    baseShelfNumber = await resolveAutoShelfNumber(
       client,
       tenantId || null,
-      revisionDayToTimestamp(row.day),
+      revisionDayToTimestamp(rows[0].day),
       1,
     );
-    rows.push({
+  }
+
+  return rows.map((row, index) => {
+    const revisionShelfNumber = baseShelfNumber + index;
+    return {
       ...row,
       revision_shelf_number: revisionShelfNumber,
       revision_shelf_label: formatShelfLabel(revisionShelfNumber),
-    });
-  }
-  return rows;
+    };
+  });
+}
+
+async function fetchRevisionDays(client, channelId, tenantId = null, limit = 2) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 2, 1), 10);
+  const rows = await fetchRevisionDaySequence(client, channelId, tenantId);
+  return rows.slice(0, safeLimit);
 }
 
 async function fetchRevisionPosts(client, channelId, tenantId, selectedDates) {
   const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
+  const revisionDaySequence = await fetchRevisionDaySequence(client, channelId, tenantId);
+  const revisionShelfCache = new Map(
+    revisionDaySequence.map((item) => [
+      String(item.day || '').trim(),
+      toShelfNumber(item.revision_shelf_number, 1),
+    ]),
+  );
   const rows = await client.query(
     `WITH visible_catalog AS (
        SELECT m.id AS message_id,
@@ -992,7 +1036,6 @@ async function fetchRevisionPosts(client, channelId, tenantId, selectedDates) {
       REVISION_COMPLETED_CART_STATUSES,
     ]
   );
-  const revisionShelfCache = new Map();
   const mapped = [];
   for (const row of rows.rows) {
     const meta = parseSettings(row.meta);
@@ -1003,12 +1046,10 @@ async function fetchRevisionPosts(client, channelId, tenantId, selectedDates) {
     const day = String(row.day || '').trim();
     let revisionShelfNumber = revisionShelfCache.get(day);
     if (revisionShelfNumber == null) {
-      revisionShelfNumber = await resolveAutoShelfNumber(
-        client,
-        tenantId || null,
-        revisionDayToTimestamp(day),
-        1,
+      const sourceShelfNumber = toPositiveShelfNumberOrNull(
+        meta.shelf_number ?? row.product_shelf_number,
       );
+      revisionShelfNumber = sourceShelfNumber ?? 1;
       revisionShelfCache.set(day, revisionShelfNumber);
     }
     mapped.push({
@@ -1025,7 +1066,7 @@ async function fetchRevisionPosts(client, channelId, tenantId, selectedDates) {
       revision_shelf_number: revisionShelfNumber,
       revision_shelf_label: formatShelfLabel(revisionShelfNumber),
       source_product_shelf_number: Number(
-        row.product_shelf_number ?? meta.shelf_number ?? 1,
+        meta.shelf_number ?? row.product_shelf_number ?? 1,
       ),
       title: String(row.product_title || '').trim(),
       description: String(row.product_description || '').trim(),
@@ -2141,6 +2182,18 @@ router.post(
       const queuedItems = [];
       let reusedPendingCount = 0;
       let blockedCount = 0;
+      const revisionShelfByDay = new Map(
+        (
+          await fetchRevisionDaySequence(
+            client,
+            mainChannel.id,
+            req.user.tenant_id || null,
+          )
+        ).map((item) => [
+          String(item.day || '').trim(),
+          toShelfNumber(item.revision_shelf_number, 1),
+        ]),
+      );
 
       for (const item of normalized) {
         const target = await fetchRevisionTarget(client, mainChannel.id, item);
@@ -2174,10 +2227,8 @@ router.post(
         ]);
 
         const nextQuantity = Math.floor(item.quantity);
-        const nextShelfNumber = await resolveAutoShelfNumber(
-          client,
-          req.user.tenant_id || null,
-          revisionDayToTimestamp(target.day),
+        const nextShelfNumber = toShelfNumber(
+          revisionShelfByDay.get(String(target.day || '').trim()),
           1,
         );
         const nextPrice = Number(item.price);
