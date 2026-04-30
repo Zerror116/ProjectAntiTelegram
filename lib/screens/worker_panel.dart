@@ -233,7 +233,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           (_hasVisibleTab('new') || _hasVisibleTab('old'))) {
         _loadChannels();
       }
-      if (type == 'chat:updated') {
+      if (type == 'chat:updated' || type == 'catalog:queue:updated') {
         _ownPostsRefreshDebounce?.cancel();
         _ownPostsRefreshDebounce = Timer(
           const Duration(milliseconds: 650),

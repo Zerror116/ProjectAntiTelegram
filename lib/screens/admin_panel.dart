@@ -217,6 +217,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   Timer? _supportDraftSaveTimer;
   Timer? _clientCartUndoTimer;
   Timer? _publishProgressTimer;
+  Timer? _pendingPostsRefreshDebounce;
   Future<void> Function()? _clientCartPendingCommit;
   VoidCallback? _clientCartPendingRollback;
   String _clientCartPendingLabel = '';
@@ -242,6 +243,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (type == 'support:queue:changed' && _canViewSupportTab()) {
         unawaited(_loadSupportTickets(silent: true));
         unawaited(_loadSupportNotificationCenter(silent: true));
+        return;
+      }
+      if (type == 'catalog:queue:updated' && _canViewModerationTab()) {
+        _schedulePendingPostsRealtimeRefresh();
         return;
       }
       if (type == 'claims:updated' && _canViewSupportTab()) {
@@ -284,6 +289,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _supportDraftSaveTimer?.cancel();
     _clientCartUndoTimer?.cancel();
     _publishProgressTimer?.cancel();
+    _pendingPostsRefreshDebounce?.cancel();
     _clientCartPendingCommit = null;
     _clientCartPendingRollback = null;
     _channelTitleCtrl.dispose();
@@ -1365,6 +1371,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     } finally {
       _pendingPostsLoading = false;
     }
+  }
+
+  void _schedulePendingPostsRealtimeRefresh() {
+    _pendingPostsRefreshDebounce?.cancel();
+    _pendingPostsRefreshDebounce = Timer(
+      const Duration(milliseconds: 250),
+      () {
+        if (!mounted || _isDisposed) return;
+        unawaited(_loadPendingPosts());
+      },
+    );
   }
 
   bool get _hasActivePublishBatches => _activePublishBatches.isNotEmpty;

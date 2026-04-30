@@ -11,6 +11,7 @@ const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
 const { ensureSystemChannels } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
+const { emitCatalogQueueUpdated } = require('../utils/catalogQueueSocket');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
 const { runInRequestTenantScope } = require('../utils/requestScope');
 const { uploadsPath } = require('../utils/storagePaths');
@@ -1372,6 +1373,17 @@ router.post(
 
           await client.query('COMMIT');
 
+          const io = req.app.get('io');
+          if (io) {
+            emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+              action: 'created',
+              channel_id: targetChannelId,
+              queue_id: queueInsert.rows[0]?.id || null,
+              product_id: product.id,
+              queued_by: actorUserId,
+            });
+          }
+
           return res.status(201).json({
             ok: true,
             data: {
@@ -1629,6 +1641,17 @@ router.post(
 
           await client.query('COMMIT');
 
+          const io = req.app.get('io');
+          if (io) {
+            emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+              action: 'requeued',
+              channel_id: targetChannelId,
+              queue_id: queueRow?.id || null,
+              product_id: product.id,
+              queued_by: actorUserId,
+            });
+          }
+
           return res.status(201).json({
             ok: true,
             data: {
@@ -1690,6 +1713,7 @@ router.get(
            WHERE q.queued_by = $1
              AND q.status = 'pending'
              AND COALESCE(q.is_sent, false) = false
+             AND COALESCE(q.publish_status, 'pending') NOT IN ('queued', 'publishing', 'published')
            ORDER BY q.created_at DESC, q.id DESC`,
           [actorUserId]
         );
@@ -1800,6 +1824,14 @@ router.patch(
           error: 'Пост не найден, уже опубликован или не принадлежит вам',
         });
       }
+      const io = req.app.get('io');
+      if (io) {
+        emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+          action: 'updated',
+          queue_id: queueId,
+          queued_by: req.user?.id || null,
+        });
+      }
       return res.json({ ok: true });
     } catch (err) {
       console.error('worker.queue.patch error', err);
@@ -1907,6 +1939,12 @@ router.delete(
         }
         emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
           chatId: channelId,
+        });
+        emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+          action: 'deleted',
+          channel_id: channelId,
+          queue_id: queueId,
+          queued_by: req.user?.id || null,
         });
       }
 
@@ -2244,6 +2282,12 @@ router.post(
           emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
             chatId: mainChannel.id,
           });
+          emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+            action: 'revision_manual_queued',
+            channel_id: mainChannel.id,
+            queue_ids: queuedItems.map((item) => item.queue_id).filter(Boolean),
+            queued_by: actorUserId,
+          });
         }
       }
 
@@ -2453,6 +2497,12 @@ router.post(
         if (queuedItems.length > 0 || hiddenMessagesById.size > 0) {
           emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
             chatId: mainChannel.id,
+          });
+          emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+            action: 'revision_auto_queued',
+            channel_id: mainChannel.id,
+            queue_ids: queuedItems.map((item) => item.queue_id).filter(Boolean),
+            queued_by: actorUserId,
           });
         }
       }

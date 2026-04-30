@@ -4893,6 +4893,11 @@ Future<void> _initSocket() async {
       chatEventsController.add({'type': 'claims:updated', 'data': data});
     });
 
+    socket?.on('catalog:queue:updated', (data) {
+      _socketVerboseLog('📬 Socket event catalog:queue:updated -> $data');
+      chatEventsController.add({'type': 'catalog:queue:updated', 'data': data});
+    });
+
     socket?.on('support:ticket:queued', (data) {
       _socketVerboseLog('📬 Socket event support:ticket:queued -> $data');
       chatEventsController.add({'type': 'support:queue:changed', 'data': data});

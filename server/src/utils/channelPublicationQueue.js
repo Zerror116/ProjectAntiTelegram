@@ -4,6 +4,7 @@ const db = require('../db');
 const { ensureSystemChannels } = require('./systemChannels');
 const { encryptMessageText, decryptMessageRow } = require('./messageCrypto');
 const { emitToTenant } = require('./socket');
+const { emitCatalogQueueUpdated } = require('./catalogQueueSocket');
 const { registerPublicImageUpload } = require('./publicMediaRegistration');
 const { toOriginalPublicMediaUrl } = require('./mediaAssets');
 const { upsertProductCardSnapshot } = require('./productCardSnapshots');
@@ -1012,6 +1013,7 @@ async function processBatchItem(client, batch) {
       tenantId: batch.tenant_id || null,
       channelId: row.channel_id,
       archiveChannelId: emitted.archiveMessages[0]?.chat_id || null,
+      queueItemId: row.id,
       emitted,
     };
   } catch (error) {
@@ -1120,6 +1122,14 @@ async function processNextChannelPublicationStep({ io = null } = {}) {
           chatId: archiveMessage.chat_id,
         });
       }
+    }
+    if (socketIo && result?.processed) {
+      emitCatalogQueueUpdated(socketIo, result.tenantId || null, {
+        action: result.kind || 'updated',
+        channel_id: result.channelId || null,
+        archive_channel_id: result.archiveChannelId || null,
+        queue_id: result.queueItemId || null,
+      });
     }
     return result;
   } catch (error) {

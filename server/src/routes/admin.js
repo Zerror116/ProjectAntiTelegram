@@ -25,6 +25,7 @@ const {
 } = require("../utils/tenantDatabases");
 const { logMonitoringEvent } = require("../utils/monitoring");
 const { emitToTenant } = require("../utils/socket");
+const { emitCatalogQueueUpdated } = require("../utils/catalogQueueSocket");
 const { antifraudGuard } = require("../utils/antifraud");
 const {
   encryptMessageText,
@@ -3070,6 +3071,10 @@ router.patch(
           error: "Пост не найден или уже опубликован",
         });
       }
+      emitCatalogQueueUpdated(req.app.get("io"), req.user?.tenant_id || null, {
+        action: "admin_updated",
+        queue_id: queueId,
+      });
       return res.json({ ok: true });
     } catch (err) {
       console.error("admin.channels.pending_posts.patch error", err);
@@ -3212,6 +3217,11 @@ router.delete(
         }
         emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
           chatId: channelId,
+        });
+        emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+          action: "admin_deleted",
+          channel_id: channelId,
+          queue_id: queueId,
         });
       }
       return res.json({
@@ -4093,14 +4103,20 @@ router.post(
         queueIds: onlySelected ? queueIds : [],
         intervalMs: DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
       });
-
-      await client.query("COMMIT");
-
-      kickChannelPublicationProcessor(req.app.get("io"));
-
       const batches = Array.isArray(enqueueResult.batches)
         ? enqueueResult.batches
         : [];
+
+      await client.query("COMMIT");
+
+      emitCatalogQueueUpdated(req.app.get("io"), req.user?.tenant_id || null, {
+        action: "publish_enqueued",
+        channel_id: channelId,
+        queue_ids: queueIds,
+        batch_ids: batches.map((item) => item.batch_id).filter(Boolean),
+      });
+      kickChannelPublicationProcessor(req.app.get("io"));
+
       const alreadyRunningChannels = Array.isArray(
         enqueueResult.already_running_channels,
       )
