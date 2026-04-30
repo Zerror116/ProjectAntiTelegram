@@ -17,6 +17,7 @@ const { runInRequestTenantScope } = require('../utils/requestScope');
 const { uploadsPath } = require('../utils/storagePaths');
 const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
 const { upsertProductCardSnapshot } = require('../utils/productCardSnapshots');
+const { normalizeCatalogTitle } = require('../utils/catalogTitle');
 const {
   toOriginalPublicMediaUrl,
   normalizePublicUploadRef,
@@ -1306,7 +1307,7 @@ router.post(
           } = req.body || {};
 
           const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
-          const normalizedTitle = String(title || '').trim();
+          const normalizedTitle = normalizeCatalogTitle(title);
           if (!normalizedTitle) {
             removeUploadedFile(req.file);
             return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
@@ -1524,7 +1525,7 @@ router.post(
             });
           }
 
-          const nextTitle = String(title || current.title || '').trim();
+          const nextTitle = normalizeCatalogTitle(title || current.title || '');
           const nextDescription = String(description ?? current.description ?? '').trim();
           const nextPrice = price != null ? toPositiveNumber(price, -1) : Number(current.price);
           const nextQuantity =
@@ -1771,7 +1772,7 @@ router.patch(
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
     const queueId = String(req.params.queueId || '').trim();
-    const title = String(req.body?.title || '').trim();
+    const title = normalizeCatalogTitle(req.body?.title || '');
     const description = String(req.body?.description || '').trim();
     const price = Number(req.body?.price);
     const quantity = Number(req.body?.quantity);

@@ -35,6 +35,7 @@ const { runInRequestTenantScope } = require("../utils/requestScope");
 const { uploadsPath } = require("../utils/storagePaths");
 const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
 const { toOriginalPublicMediaUrl } = require("../utils/mediaAssets");
+const { normalizeCatalogTitle } = require("../utils/catalogTitle");
 const {
   DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
   enqueueChannelPublicationBatches,
@@ -2970,7 +2971,7 @@ router.patch(
   requireProductPublishPermission,
   async (req, res) => {
     const queueId = String(req.params.queueId || "").trim();
-    const title = String(req.body?.title || "").trim();
+    const title = normalizeCatalogTitle(req.body?.title || "");
     const description = String(req.body?.description || "").trim();
     const price = Number(req.body?.price);
     const quantity = Number(req.body?.quantity);

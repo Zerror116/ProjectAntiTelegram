@@ -10,6 +10,7 @@ const { toOriginalPublicMediaUrl } = require('./mediaAssets');
 const { upsertProductCardSnapshot } = require('./productCardSnapshots');
 const { logMonitoringEvent } = require('./monitoring');
 const { upsertMessageSearchDocument } = require('./chatSearchIndex');
+const { normalizeCatalogTitle } = require('./catalogTitle');
 
 const DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS = Math.max(
   1000,
@@ -746,7 +747,7 @@ async function processBatchItem(client, batch) {
       ? row.payload
       : {};
 
-    const nextTitle = String(payload.title || row.title || '').trim();
+    const nextTitle = normalizeCatalogTitle(payload.title || row.title || '');
     const nextDescription = String(payload.description || row.description || '').trim();
     if (!nextTitle) {
       throw publicationValidationError('publish_validation_title_empty', 'Пустое название товара');
