@@ -8220,10 +8220,12 @@ class _ChatScreenState extends State<ChatScreen> {
     String value, {
     Color? backgroundColor,
     Color? foregroundColor,
+    TextStyle? labelStyle,
     TextStyle? valueStyle,
+    EdgeInsetsGeometry? padding,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding: padding ?? const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
       decoration: BoxDecoration(
         color: backgroundColor ?? theme.colorScheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(999),
@@ -8236,10 +8238,11 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             TextSpan(
               text: '$label · ',
-              style: theme.textTheme.labelSmall?.copyWith(
-                color: foregroundColor ?? theme.colorScheme.onSurfaceVariant,
-                fontWeight: FontWeight.w800,
-              ),
+              style:
+                  (labelStyle ?? theme.textTheme.labelSmall)?.copyWith(
+                    color: foregroundColor ?? theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w800,
+                  ),
             ),
             TextSpan(
               text: value,
@@ -11576,25 +11579,44 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           ],
                           const SizedBox(height: 12),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              _catalogMetaBadge(
-                                theme,
-                                'Цена',
-                                '$price ₽',
-                                valueStyle:
-                                    theme.textTheme.labelSmall?.copyWith(
-                                      fontSize:
-                                          (theme.textTheme.labelSmall?.fontSize ??
-                                              11) *
-                                          2,
-                                      height: 1,
-                                    ),
-                              ),
-                              _catalogMetaBadge(theme, 'В наличии', quantity),
-                            ],
+                          Builder(
+                            builder: (context) {
+                              final prominentBadgeLabelStyle = theme
+                                  .textTheme
+                                  .labelMedium
+                                  ?.copyWith(fontSize: 16, height: 1.05);
+                              final prominentBadgeValueStyle = theme
+                                  .textTheme
+                                  .labelMedium
+                                  ?.copyWith(fontSize: 16, height: 1.05);
+                              const prominentBadgePadding =
+                                  EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 10,
+                                  );
+                              return Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _catalogMetaBadge(
+                                    theme,
+                                    'Цена',
+                                    '$price ₽',
+                                    labelStyle: prominentBadgeLabelStyle,
+                                    valueStyle: prominentBadgeValueStyle,
+                                    padding: prominentBadgePadding,
+                                  ),
+                                  _catalogMetaBadge(
+                                    theme,
+                                    'В наличии',
+                                    quantity,
+                                    labelStyle: prominentBadgeLabelStyle,
+                                    valueStyle: prominentBadgeValueStyle,
+                                    padding: prominentBadgePadding,
+                                  ),
+                                ],
+                              );
+                            },
                           ),
                           const SizedBox(height: 14),
                           SizedBox(
