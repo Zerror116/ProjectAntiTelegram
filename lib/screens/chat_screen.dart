@@ -7555,6 +7555,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     if (cartItemId != null &&
         cartItemId.isNotEmpty &&
+        processingMode != 'oversize' &&
         _placedCartItemIds.contains(cartItemId)) {
       return;
     }
@@ -11270,7 +11271,6 @@ class _ChatScreenState extends State<ChatScreen> {
         !_canMarkReservedOrderPlaced() || _markingPlaced || isCancelled;
     final reservedOversizeDisabled =
         !_canMarkReservedOrderPlaced() ||
-        isPlaced ||
         isCancelled ||
         _markingPlaced;
     final reservedShelfChangeDisabled =

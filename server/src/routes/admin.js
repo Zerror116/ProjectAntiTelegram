@@ -3776,6 +3776,87 @@ router.post(
         carryShelfQ.rows[0]?.processed_by_name || "",
       ).trim();
       if (item.is_fulfilled === true) {
+        let resolvedProcessingMode =
+          existingProcessingMode === "oversize" ? "oversize" : "standard";
+        if (processingMode === "oversize" && resolvedProcessingMode !== "oversize") {
+          if (targetCartItemId) {
+            await client.query(
+              `UPDATE cart_items
+               SET processing_mode = 'oversize',
+                   updated_at = now()
+               WHERE id = $1`,
+              [targetCartItemId],
+            );
+          }
+
+          const updatedReservedMessages = await client.query(
+            `UPDATE messages
+             SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                   'placed', true,
+                   'processing_mode', 'oversize',
+                   'is_oversize', true,
+                   'processed_by_id', $2::text,
+                   'processed_by_name', $3::text
+                 )
+             WHERE chat_id = $1
+               AND COALESCE(meta->>'kind', '') = 'reserved_order_item'
+               AND (
+                 COALESCE(meta->>'reservation_id', '') = $4
+                 OR ($5 <> '' AND COALESCE(meta->>'cart_item_id', '') = $5)
+               )
+             RETURNING id, chat_id, sender_id, text, meta, created_at`,
+            [
+              reservedChannel.id,
+              String(req.user.id),
+              existingProcessedByName,
+              String(item.id),
+              targetCartItemId,
+            ],
+          );
+
+          await client.query("COMMIT");
+
+          const io = req.app.get("io");
+          if (io) {
+            for (const message of updatedReservedMessages.rows) {
+              io.to(`chat:${reservedChannel.id}`).emit("chat:message", {
+                chatId: reservedChannel.id,
+                message: decryptMessageRow(message),
+              });
+              emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+                chatId: reservedChannel.id,
+              });
+            }
+            io.to(`user:${item.user_id}`).emit("cart:updated", {
+              userId: String(item.user_id),
+              product_id: item.product_id ? String(item.product_id) : "",
+              cart_item_id: targetCartItemId || null,
+              status: "processed",
+              shelf_number: existingShelfNumber,
+              shelf_label: existingShelfLabel,
+              processing_mode: "oversize",
+              processed_by_name: existingProcessedByName,
+              reason: "item_marked_oversize_after_processed",
+            });
+          }
+
+          return res.json({
+            ok: true,
+            data: {
+              reservation_id: item.id,
+              cart_item_id: targetCartItemId || null,
+              status: "processed",
+              shelf_number: existingShelfNumber,
+              shelf_label: existingShelfLabel,
+              shelf_display: displayShelfValue(
+                existingShelfLabel,
+                existingShelfNumber,
+              ),
+              processing_mode: "oversize",
+              processed_by_name: existingProcessedByName,
+            },
+          });
+        }
         await client.query("ROLLBACK");
         return res.json({
           ok: true,
