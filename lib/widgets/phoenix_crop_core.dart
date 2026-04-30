@@ -39,9 +39,9 @@ enum PhoenixPostCropPreset {
 
   String get label => switch (this) {
     PhoenixPostCropPreset.square => 'Квадрат',
-    PhoenixPostCropPreset.portrait => 'Вертикально',
-    PhoenixPostCropPreset.wide => 'Широко',
-    PhoenixPostCropPreset.uncropped => 'Без обрезки',
+    PhoenixPostCropPreset.portrait => '4:5',
+    PhoenixPostCropPreset.wide => '16:9',
+    PhoenixPostCropPreset.uncropped => 'Оригинал',
   };
 
   double? get aspectRatio => switch (this) {
@@ -197,6 +197,12 @@ class PhoenixCropCore extends StatefulWidget {
     this.showGrid = false,
     this.edgeHandleTopBottomTouchTarget = 30,
     this.edgeHandleSideTouchTarget = 44,
+    this.edgeHandleVisualLength = 36,
+    this.edgeHandleVisualThickness = 8,
+    this.cornerHandlePadding = 10,
+    this.initialRectSize = 0.9,
+    this.maskOpacity = 0.48,
+    this.gridOpacity = 0.35,
   });
 
   final Uint8List imageBytes;
@@ -210,6 +216,12 @@ class PhoenixCropCore extends StatefulWidget {
   final bool showGrid;
   final double edgeHandleTopBottomTouchTarget;
   final double edgeHandleSideTouchTarget;
+  final double edgeHandleVisualLength;
+  final double edgeHandleVisualThickness;
+  final double cornerHandlePadding;
+  final double initialRectSize;
+  final double maskOpacity;
+  final double gridOpacity;
 
   @override
   State<PhoenixCropCore> createState() => _PhoenixCropCoreState();
@@ -217,8 +229,6 @@ class PhoenixCropCore extends StatefulWidget {
 
 class _PhoenixCropCoreState extends State<PhoenixCropCore> {
   static const double _minCropExtent = 72;
-  static const double _edgeHandleVisualLength = 36;
-  static const double _edgeHandleVisualThickness = 8;
 
   Rect _cropRect = Rect.zero;
   Rect _imageRect = Rect.zero;
@@ -499,13 +509,13 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
                 width:
                     alignment == Alignment.centerLeft ||
                         alignment == Alignment.centerRight
-                    ? _edgeHandleVisualThickness
-                    : _edgeHandleVisualLength,
+                    ? widget.edgeHandleVisualThickness
+                    : widget.edgeHandleVisualLength,
                 height:
                     alignment == Alignment.centerLeft ||
                         alignment == Alignment.centerRight
-                    ? _edgeHandleVisualLength
-                    : _edgeHandleVisualThickness,
+                    ? widget.edgeHandleVisualLength
+                    : widget.edgeHandleVisualThickness,
               ),
             ),
           ),
@@ -535,18 +545,23 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
               fixCropRect: false,
               radius: widget.withCircleUi ? 0 : 20,
               baseColor: theme.colorScheme.surfaceContainerHighest,
-              maskColor: Colors.black.withValues(alpha: 0.48),
+              maskColor: Colors.black.withValues(alpha: widget.maskOpacity),
               filterQuality: FilterQuality.high,
               initialRectBuilder: InitialRectBuilder.withSizeAndRatio(
-                size: widget.withCircleUi ? 0.84 : 0.9,
+                size: widget.withCircleUi ? 0.84 : widget.initialRectSize,
                 aspectRatio: widget.withCircleUi ? 1.0 : widget.aspectRatio,
               ),
               onMoved: _handleMoved,
-              cornerDotBuilder: (size, _) =>
-                  const DotControl(color: Colors.white, padding: 10),
+              cornerDotBuilder: (size, _) => DotControl(
+                color: Colors.white,
+                padding: widget.cornerHandlePadding,
+              ),
               overlayBuilder: widget.showGrid
                   ? (context, rect) => CustomPaint(
-                      painter: _CropGridPainter(rect: rect),
+                      painter: _CropGridPainter(
+                        rect: rect,
+                        opacity: widget.gridOpacity,
+                      ),
                       size: Size.infinite,
                     )
                   : null,
@@ -683,14 +698,15 @@ class PhoenixAvatarLivePreview extends StatelessWidget {
 }
 
 class _CropGridPainter extends CustomPainter {
-  const _CropGridPainter({required this.rect});
+  const _CropGridPainter({required this.rect, required this.opacity});
 
   final Rect rect;
+  final double opacity;
 
   @override
   void paint(Canvas canvas, Size size) {
     final guidePaint = Paint()
-      ..color = Colors.white.withValues(alpha: 0.35)
+      ..color = Colors.white.withValues(alpha: opacity)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1;
 
@@ -723,5 +739,5 @@ class _CropGridPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _CropGridPainter oldDelegate) =>
-      oldDelegate.rect != rect;
+      oldDelegate.rect != rect || oldDelegate.opacity != opacity;
 }

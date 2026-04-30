@@ -886,10 +886,6 @@ class _WorkerPanelState extends State<WorkerPanel>
         return;
       }
       if (cropResult == null) {
-        if (!mounted) return;
-        setState(() {
-          _message = 'Выбор фото отменен';
-        });
         return;
       }
       final resolvedCropResult = cropResult;
