@@ -841,7 +841,11 @@ async function fetchRevisionDayStats(client, channelId) {
        SELECT m.id AS message_id,
               m.created_at,
               p.id AS product_id,
-              COALESCE(NULLIF(m.meta->>'shelf_number', '')::int, p.shelf_number) AS source_shelf_number
+              CASE
+                WHEN COALESCE(m.meta->>'shelf_number', '') ~ '^[0-9]+$'
+                  THEN (m.meta->>'shelf_number')::int
+                ELSE p.shelf_number
+              END AS source_shelf_number
        FROM messages m
        LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
        WHERE m.chat_id = $1
