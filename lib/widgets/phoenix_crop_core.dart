@@ -201,8 +201,11 @@ class PhoenixCropCore extends StatefulWidget {
     this.edgeHandleVisualThickness = 8,
     this.cornerHandlePadding = 10,
     this.initialRectSize = 0.9,
+    this.initialCropAspectRatio,
     this.maskOpacity = 0.48,
     this.gridOpacity = 0.35,
+    this.lockResizeToAspectRatio = true,
+    this.showCornerHandles = false,
   });
 
   final Uint8List imageBytes;
@@ -220,8 +223,11 @@ class PhoenixCropCore extends StatefulWidget {
   final double edgeHandleVisualThickness;
   final double cornerHandlePadding;
   final double initialRectSize;
+  final double? initialCropAspectRatio;
   final double maskOpacity;
   final double gridOpacity;
+  final bool lockResizeToAspectRatio;
+  final bool showCornerHandles;
 
   @override
   State<PhoenixCropCore> createState() => _PhoenixCropCoreState();
@@ -245,8 +251,13 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
   bool get _ready =>
       _isStableRect(_displayCropRect) && _isStableRect(_displayImageRect);
 
-  double? get _effectiveAspectRatio =>
-      widget.withCircleUi ? 1.0 : widget.aspectRatio;
+  double? get _effectiveAspectRatio => widget.withCircleUi
+      ? 1.0
+      : (widget.lockResizeToAspectRatio ? widget.aspectRatio : null);
+
+  double? get _initialAspectRatio => widget.withCircleUi
+      ? 1.0
+      : (widget.initialCropAspectRatio ?? widget.aspectRatio);
 
   Rect _normalizeRect(Rect rect) {
     final left = min(rect.left, rect.right);
@@ -462,6 +473,54 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
     return Rect.fromLTRB(left, top, right, bottom);
   }
 
+  Rect? _resizeFromCornerHandle(
+    Offset delta, {
+    required bool leading,
+    required bool topEdge,
+  }) {
+    if (!_ready) return null;
+    final current = _displayCropRect;
+    final imageRect = _displayImageRect;
+    final aspectRatio = _effectiveAspectRatio;
+
+    if (aspectRatio != null) {
+      final horizontal = _resizeFromHorizontalHandle(
+        delta.dx,
+        leading: leading,
+      );
+      final vertical = _resizeFromVerticalHandle(delta.dy, topEdge: topEdge);
+      return vertical ?? horizontal;
+    }
+
+    final minWidth = _minCropExtent.toDouble();
+    final minHeight = _minCropExtent.toDouble();
+    final nextLeft = leading
+        ? (current.left + delta.dx).clamp(
+            imageRect.left,
+            current.right - minWidth,
+          )
+        : current.left;
+    final nextRight = leading
+        ? current.right
+        : (current.right + delta.dx).clamp(
+            current.left + minWidth,
+            imageRect.right,
+          );
+    final nextTop = topEdge
+        ? (current.top + delta.dy).clamp(
+            imageRect.top,
+            current.bottom - minHeight,
+          )
+        : current.top;
+    final nextBottom = topEdge
+        ? current.bottom
+        : (current.bottom + delta.dy).clamp(
+            current.top + minHeight,
+            imageRect.bottom,
+          );
+    return Rect.fromLTRB(nextLeft, nextTop, nextRight, nextBottom);
+  }
+
   void _applyCropRect(Rect? rect) {
     if (rect == null) return;
     final normalizedRect = _normalizeRect(rect);
@@ -524,6 +583,50 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
     );
   }
 
+  Widget _buildCornerHandle({
+    required double centerX,
+    required double centerY,
+    required bool leading,
+    required bool topEdge,
+  }) {
+    const touchTarget = 44.0;
+    const visualSize = 18.0;
+    return Positioned(
+      left: centerX - (touchTarget / 2),
+      top: centerY - (touchTarget / 2),
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onPanUpdate: (details) => _applyCropRect(
+          _resizeFromCornerHandle(
+            details.delta,
+            leading: leading,
+            topEdge: topEdge,
+          ),
+        ),
+        child: SizedBox(
+          width: touchTarget,
+          height: touchTarget,
+          child: Center(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.white,
+                shape: BoxShape.circle,
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x33000000),
+                    blurRadius: 8,
+                    offset: Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: const SizedBox(width: visualSize, height: visualSize),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -539,7 +642,7 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
               image: widget.imageBytes,
               controller: widget.controller,
               onCropped: widget.onCropped,
-              aspectRatio: widget.aspectRatio,
+              aspectRatio: _effectiveAspectRatio,
               withCircleUi: widget.withCircleUi,
               interactive: false,
               fixCropRect: false,
@@ -549,7 +652,7 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
               filterQuality: FilterQuality.high,
               initialRectBuilder: InitialRectBuilder.withSizeAndRatio(
                 size: widget.withCircleUi ? 0.84 : widget.initialRectSize,
-                aspectRatio: widget.withCircleUi ? 1.0 : widget.aspectRatio,
+                aspectRatio: _initialAspectRatio,
               ),
               onMoved: _handleMoved,
               cornerDotBuilder: (size, _) => DotControl(
@@ -567,7 +670,6 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
                   : null,
             ),
             if (_ready) ...[
-              // Визуальный размер ручек остается прежним; увеличиваем только зону касания.
               _buildEdgeHandle(
                 alignment: Alignment.topCenter,
                 left:
@@ -624,6 +726,32 @@ class _PhoenixCropCoreState extends State<PhoenixCropCore> {
                   _resizeFromHorizontalHandle(details.delta.dx, leading: false),
                 ),
               ),
+              if (widget.showCornerHandles && !widget.withCircleUi) ...[
+                _buildCornerHandle(
+                  centerX: _displayCropRect.left,
+                  centerY: _displayCropRect.top,
+                  leading: true,
+                  topEdge: true,
+                ),
+                _buildCornerHandle(
+                  centerX: _displayCropRect.right,
+                  centerY: _displayCropRect.top,
+                  leading: false,
+                  topEdge: true,
+                ),
+                _buildCornerHandle(
+                  centerX: _displayCropRect.left,
+                  centerY: _displayCropRect.bottom,
+                  leading: true,
+                  topEdge: false,
+                ),
+                _buildCornerHandle(
+                  centerX: _displayCropRect.right,
+                  centerY: _displayCropRect.bottom,
+                  leading: false,
+                  topEdge: false,
+                ),
+              ],
             ],
           ],
         ),

@@ -106,6 +106,8 @@ class _ProductPhotoCropEditorScreenState
   late PhoenixPostCropPreset _preset = widget.initialPreset;
   bool _exporting = false;
   String _localError = '';
+  Rect _cropRect = Rect.zero;
+  Rect _imageRect = Rect.zero;
 
   double get _sourceAspectRatio {
     final width = widget.prepared.width <= 0 ? 1 : widget.prepared.width;
@@ -118,14 +120,51 @@ class _ProductPhotoCropEditorScreenState
     Navigator.of(context).pop();
   }
 
+  bool _isStableRect(Rect rect) => rect.width > 0 && rect.height > 0;
+
+  Rect _buildPresetRect(PhoenixPostCropPreset preset) {
+    final imageRect = _imageRect;
+    if (!_isStableRect(imageRect)) return Rect.zero;
+    final aspectRatio = preset.aspectRatio;
+    if (aspectRatio == null) {
+      return imageRect.deflate(10);
+    }
+    final fallbackCenter = imageRect.center;
+    final preferredCenter = _isStableRect(_cropRect)
+        ? _cropRect.center
+        : fallbackCenter;
+    final maxWidth = imageRect.width * 0.92;
+    final maxHeight = imageRect.height * 0.92;
+    var width = maxWidth;
+    var height = width / aspectRatio;
+    if (height > maxHeight) {
+      height = maxHeight;
+      width = height * aspectRatio;
+    }
+    var left = preferredCenter.dx - (width / 2);
+    var top = preferredCenter.dy - (height / 2);
+    final minLeft = imageRect.left;
+    final minTop = imageRect.top;
+    final maxLeft = imageRect.right - width;
+    final maxTop = imageRect.bottom - height;
+    left = left.clamp(minLeft, maxLeft).toDouble();
+    top = top.clamp(minTop, maxTop).toDouble();
+    return Rect.fromLTWH(left, top, width, height);
+  }
+
+  void _applyPresetRect(PhoenixPostCropPreset preset) {
+    final nextRect = _buildPresetRect(preset);
+    if (!_isStableRect(nextRect)) return;
+    _controller.cropRect = nextRect;
+    _cropRect = nextRect;
+  }
+
   void _resetEditor() {
     if (_exporting) return;
-    _controller.withCircleUi = false;
-    _controller.aspectRatio = _preset.aspectRatio;
-    _controller.image = widget.prepared.bytes;
     setState(() {
       _localError = '';
     });
+    _applyPresetRect(_preset);
   }
 
   void _applyPreset(PhoenixPostCropPreset preset) {
@@ -136,9 +175,10 @@ class _ProductPhotoCropEditorScreenState
     });
     unawaited(_rememberWorkerCropPreset(preset));
     if (preset != PhoenixPostCropPreset.uncropped) {
-      _controller.withCircleUi = false;
-      _controller.aspectRatio = preset.aspectRatio;
-      _controller.image = widget.prepared.bytes;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _applyPresetRect(preset);
+      });
     }
   }
 
@@ -261,9 +301,12 @@ class _ProductPhotoCropEditorScreenState
                       }
                     },
                     aspectRatio: _preset.aspectRatio,
+                    initialCropAspectRatio: _preset.aspectRatio,
                     height: viewportSize.height,
                     width: viewportSize.width,
                     showGrid: true,
+                    lockResizeToAspectRatio: false,
+                    showCornerHandles: true,
                     edgeHandleTopBottomTouchTarget: 58,
                     edgeHandleSideTouchTarget: 62,
                     edgeHandleVisualLength: 52,
@@ -272,6 +315,10 @@ class _ProductPhotoCropEditorScreenState
                     initialRectSize: 0.94,
                     maskOpacity: 0.62,
                     gridOpacity: 0.46,
+                    onMoved: (cropRect, imageRect) {
+                      _cropRect = cropRect;
+                      _imageRect = imageRect;
+                    },
                   ),
           ),
         );
@@ -458,7 +505,7 @@ class _ProductPhotoCropEditorScreenState
                       Text(
                         _preset == PhoenixPostCropPreset.uncropped
                             ? 'Оставим фото целиком. Система только выровняет ориентацию и подготовит размер.'
-                            : 'Тяни рамку и ручки. В пост уйдёт ровно этот кадр.',
+                            : 'Тяни углы и стороны свободно. Режим задаёт стартовую форму кадра.',
                         style: darkTheme.textTheme.bodySmall?.copyWith(
                           color: darkTheme.colorScheme.onSurfaceVariant,
                           height: 1.35,
