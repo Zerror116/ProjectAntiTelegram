@@ -131,12 +131,19 @@ class AppStatusPreset {
           border: scheme.error.withValues(alpha: 0.24),
         );
       case 'processed':
+        final isDark = theme.brightness == Brightness.dark;
         return AppStatusPreset(
           label: 'Обработан',
           icon: Icons.check_circle_outline_rounded,
-          background: const Color(0xFF19A36B).withValues(alpha: 0.16),
-          foreground: const Color(0xFF7CE2B6),
-          border: const Color(0xFF19A36B).withValues(alpha: 0.34),
+          background: isDark
+              ? const Color(0xFF19A36B).withValues(alpha: 0.16)
+              : const Color(0xFFD8F4E4),
+          foreground: isDark
+              ? const Color(0xFF7CE2B6)
+              : const Color(0xFF0D6B42),
+          border: isDark
+              ? const Color(0xFF19A36B).withValues(alpha: 0.34)
+              : const Color(0xFF16935F),
         );
       case 'oversized':
       case 'oversize':
