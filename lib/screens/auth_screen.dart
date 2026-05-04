@@ -83,6 +83,7 @@ class _AuthScreenState extends State<AuthScreen> {
     if (inviteFromLink.isNotEmpty) {
       _accessKeyController.text = inviteFromLink;
       _isRegister = true;
+      unawaited(_primeTenantScopeFromInvite(inviteFromLink));
     }
     unawaited(inviteReferralService.captureFromUri(Uri.base));
 
@@ -411,6 +412,84 @@ class _AuthScreenState extends State<AuthScreen> {
     return value;
   }
 
+  String _normalizeInviteCode(String raw) {
+    return raw.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9-]'), '').trim();
+  }
+
+  bool _looksLikeInviteCode(String raw) {
+    return _normalizeInviteCode(raw).startsWith('INV-');
+  }
+
+  Future<String> _resolveTenantCodeByInvite(String inviteCode) async {
+    final normalized = _normalizeInviteCode(inviteCode);
+    if (normalized.isEmpty) return '';
+    final tenantHint = _tenantCodeFromLink.trim();
+    final resp = await _authService.dio.post(
+      '/api/auth/invite/resolve',
+      data: {
+        'invite_code': normalized,
+        if (tenantHint.isNotEmpty) 'tenant_code': tenantHint,
+      },
+    );
+    final data = resp.data;
+    if (data is Map && data['ok'] == true && data['data'] is Map) {
+      final row = Map<String, dynamic>.from(data['data'] as Map);
+      return _normalizeTenantCode((row['tenant_code'] ?? '').toString());
+    }
+    return '';
+  }
+
+  Future<void> _primeTenantScopeFromInvite(String inviteCode) async {
+    if (!_looksLikeInviteCode(inviteCode)) return;
+    try {
+      final tenantCode = await _resolveTenantCodeByInvite(inviteCode);
+      if (tenantCode.isEmpty) return;
+      await _authService.setTenantCode(tenantCode);
+      if (!mounted) return;
+      setState(() => _tenantCodeFromLink = tenantCode);
+    } catch (_) {
+      // Не показываем ошибку при автозаполнении ссылки: явная проверка будет на submit.
+    }
+  }
+
+  Future<bool> _prepareTenantScopeForRegistration({
+    required String email,
+    required String accessKey,
+  }) async {
+    final normalizedEmail = email.trim().toLowerCase();
+    if (normalizedEmail == _creatorEmail.toLowerCase()) return true;
+    if (!_looksLikeInviteCode(accessKey)) return true;
+
+    try {
+      final tenantCode = await _resolveTenantCodeByInvite(accessKey);
+      if (tenantCode.isEmpty) {
+        if (!mounted) return false;
+        setState(
+          () => _message = 'Не удалось определить группу по коду приглашения',
+        );
+        return false;
+      }
+      await _authService.setTenantCode(tenantCode);
+      if (mounted) {
+        setState(() => _tenantCodeFromLink = tenantCode);
+      }
+      return true;
+    } on DioException catch (e) {
+      if (!mounted) return false;
+      setState(
+        () => _message = _extractServerMessage(
+          e,
+          fallback: 'Не удалось проверить код приглашения',
+        ),
+      );
+      return false;
+    } catch (e) {
+      if (!mounted) return false;
+      setState(() => _message = 'Ошибка проверки кода приглашения: $e');
+      return false;
+    }
+  }
+
   String _extractUriParam(Iterable<String> keys) {
     try {
       final uri = Uri.base;
@@ -605,8 +684,9 @@ class _AuthScreenState extends State<AuthScreen> {
                     decoration: InputDecoration(
                       labelText: 'Новый пароль',
                       suffixIcon: IconButton(
-                        tooltip:
-                            showNewPassword ? 'Скрыть пароль' : 'Показать пароль',
+                        tooltip: showNewPassword
+                            ? 'Скрыть пароль'
+                            : 'Показать пароль',
                         onPressed: () => setDialogState(
                           () => showNewPassword = !showNewPassword,
                         ),
@@ -629,8 +709,7 @@ class _AuthScreenState extends State<AuthScreen> {
                             ? 'Скрыть пароль'
                             : 'Показать пароль',
                         onPressed: () => setDialogState(
-                          () =>
-                              showConfirmPassword = !showConfirmPassword,
+                          () => showConfirmPassword = !showConfirmPassword,
                         ),
                         icon: Icon(
                           showConfirmPassword
@@ -842,7 +921,9 @@ class _AuthScreenState extends State<AuthScreen> {
       setState(() {
         _passwordResetEnabled = false;
         _magicLinkEnabled = false;
-        _registrationEmailCodeEnabled = false;
+        // Если status-запрос не ответил, безопаснее запросить email-код явно:
+        // сервер всё равно отклонит регистрацию без токена, когда SMTP включён.
+        _registrationEmailCodeEnabled = true;
         _emailRecoveryStatusLoaded = true;
       });
     }
@@ -1030,6 +1111,16 @@ class _AuthScreenState extends State<AuthScreen> {
 
     try {
       if (_isRegister) {
+        final tenantScopeReady = await _prepareTenantScopeForRegistration(
+          email: email,
+          accessKey: accessKey,
+        );
+        if (!tenantScopeReady) {
+          if (mounted) {
+            setState(() => _loading = false);
+          }
+          return;
+        }
         if (!_emailRecoveryStatusLoaded) {
           await _loadEmailRecoveryAvailability();
         }

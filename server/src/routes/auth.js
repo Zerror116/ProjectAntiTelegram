@@ -769,10 +769,8 @@ async function resolveTenantByUserEmail(email) {
   return matchedTenant;
 }
 
-async function resolveTenantInviteByCode(inviteCode) {
-  const normalized = normalizeInviteCode(inviteCode);
-  if (!normalized) return null;
-  const inviteRes = await db.platformQuery(
+async function loadPlatformTenantInviteByCode(normalizedInviteCode) {
+  return await db.platformQuery(
     `SELECT i.id,
             i.tenant_id,
             i.code,
@@ -794,10 +792,106 @@ async function resolveTenantInviteByCode(inviteCode) {
      WHERE i.code = $1
      LIMIT 1
      FOR UPDATE`,
-    [normalized],
+    [normalizedInviteCode],
   );
-  if (inviteRes.rowCount === 0) return null;
-  return inviteRes.rows[0];
+}
+
+async function migrateLegacyTenantInviteToPlatform(normalizedInviteCode, tenantRow) {
+  if (!tenantRow?.id) return null;
+  if (!db.isIsolatedTenantRow(tenantRow) && !db.isSchemaIsolatedTenantRow(tenantRow)) {
+    return null;
+  }
+
+  const legacyInvite = await db.runWithTenantRow(tenantRow, async () => {
+    try {
+      const legacyQ = await db.query(
+        `SELECT code, role, is_active, max_uses, used_count, expires_at,
+                last_used_at, notes, created_at, updated_at
+         FROM tenant_invites
+         WHERE code = $1
+         LIMIT 1`,
+        [normalizedInviteCode],
+      );
+      return legacyQ.rows[0] || null;
+    } catch (err) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn('auth.invite legacy lookup skipped', {
+          tenant_id: tenantRow.id,
+          error: err?.message || String(err),
+        });
+      }
+      return null;
+    }
+  });
+  if (!legacyInvite) return null;
+
+  await db.platformQuery(
+    `INSERT INTO tenant_invites (
+       id, tenant_id, code, role, is_active, max_uses,
+       used_count, expires_at, created_by, last_used_at, notes, created_at, updated_at
+     )
+     VALUES (
+       $1, $2, $3, $4, $5, $6,
+       $7, $8, NULL, $9, $10, COALESCE($11, now()), COALESCE($12, now())
+     )
+     ON CONFLICT (code) DO NOTHING`,
+    [
+      uuidv4(),
+      tenantRow.id,
+      normalizedInviteCode,
+      String(legacyInvite.role || 'client').toLowerCase().trim() || 'client',
+      legacyInvite.is_active === true,
+      legacyInvite.max_uses,
+      Number(legacyInvite.used_count || 0),
+      legacyInvite.expires_at || null,
+      legacyInvite.last_used_at || null,
+      legacyInvite.notes || 'Migrated from tenant invite storage',
+      legacyInvite.created_at || null,
+      legacyInvite.updated_at || null,
+    ],
+  );
+
+  const migrated = await loadPlatformTenantInviteByCode(normalizedInviteCode);
+  return migrated.rows[0] || null;
+}
+
+async function resolveTenantInviteByCode(inviteCode, options = {}) {
+  const normalized = normalizeInviteCode(inviteCode);
+  if (!normalized) return null;
+  const inviteRes = await loadPlatformTenantInviteByCode(normalized);
+  if (inviteRes.rowCount > 0) return inviteRes.rows[0];
+
+  const tenantCodeHint = db.normalizeTenantCode(options?.tenantCodeHint || '');
+  const candidates = [];
+  if (tenantCodeHint) {
+    const hintedTenant = await db.resolveTenantByCode(tenantCodeHint);
+    if (hintedTenant) candidates.push(hintedTenant);
+  } else {
+    const tenantCandidates = await db.platformQuery(
+      `SELECT id, code, name, status, subscription_expires_at,
+              db_mode, db_url, db_name, db_schema
+       FROM tenants
+       WHERE COALESCE(status, 'active') <> 'deleted'
+         AND COALESCE(db_mode, 'shared') IN ('isolated', 'schema_isolated')
+       ORDER BY created_at DESC
+       LIMIT 200`,
+    );
+    candidates.push(...tenantCandidates.rows);
+  }
+
+  let migrated = null;
+  for (const tenantRow of candidates) {
+    const match = await migrateLegacyTenantInviteToPlatform(
+      normalized,
+      tenantRow,
+    );
+    if (!match) continue;
+    if (migrated && String(migrated.tenant_id) !== String(match.tenant_id)) {
+      return null;
+    }
+    migrated = match;
+  }
+  return migrated;
 }
 
 async function resolveDefaultTenant() {
@@ -1633,7 +1727,9 @@ router.post('/invite/resolve', async (req, res) => {
       });
     }
 
-    const invite = await resolveTenantInviteByCode(normalized);
+    const invite = await resolveTenantInviteByCode(normalized, {
+      tenantCodeHint: extractTenantCodeHint(req),
+    });
     if (!invite) {
       return res.status(404).json({
         ok: false,
@@ -1749,6 +1845,7 @@ router.post('/register', async (req, res) => {
         });
       }
     } else {
+      const tenantCodeHint = extractTenantCodeHint(req);
       const rawInputCode = String(access_key || '').trim();
       const rawAccessKey = normalizeAccessKey(rawInputCode);
       const rawInviteCode = normalizeInviteCode(invite_code || access_key);
@@ -1771,7 +1868,9 @@ router.post('/register', async (req, res) => {
         }
         role = 'tenant';
       } else if (rawInviteCode) {
-        invite = await resolveTenantInviteByCode(rawInviteCode);
+        invite = await resolveTenantInviteByCode(rawInviteCode, {
+          tenantCodeHint,
+        });
         if (!invite) {
           return res.status(403).json({ error: 'Неверный или устаревший код приглашения.' });
         }
@@ -3056,10 +3155,10 @@ router.get('/tenant/public-invite', authMiddleware, async (req, res) => {
              )
              VALUES (
                $1, $2, $3, 'client', true, NULL,
-               0, NULL, $4, 'Публичная клиентская ссылка', now(), now()
+               0, NULL, NULL, 'Публичная клиентская ссылка', now(), now()
              )
              RETURNING id, code`,
-            [uuidv4(), tenantId, code, req.user.id],
+            [uuidv4(), tenantId, code],
           );
           created = insert.rows[0];
           break;

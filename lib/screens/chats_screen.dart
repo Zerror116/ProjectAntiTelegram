@@ -55,11 +55,24 @@ class _ChatsScreenState extends State<ChatsScreen> {
     List<Map<String, dynamic>> rows,
   ) {
     final seen = <String>{};
+    var savedMessagesSeen = false;
     final sanitized = <Map<String, dynamic>>[];
     for (final row in rows) {
       final normalized = _normalizeChatRow(row);
       final id = _chatIdOf(normalized).trim();
       if (id.isEmpty || !seen.add(id)) continue;
+      if (_isSavedMessagesChat(normalized)) {
+        if (savedMessagesSeen) continue;
+        savedMessagesSeen = true;
+        normalized['title'] = 'Избранное';
+        normalized['display_title'] = 'Избранное';
+        normalized['settings'] = {
+          ..._settingsOf(normalized),
+          'kind': 'saved_messages',
+          'saved_messages': true,
+          'visibility': 'private',
+        };
+      }
       sanitized.add(normalized);
     }
     return sanitized;
@@ -118,6 +131,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final chatId = _chatIdOf(normalized);
     if (chatId.isEmpty) return;
     setState(() {
+      if (_isSavedMessagesChat(normalized)) {
+        final savedIndex = _chats.indexWhere(_isSavedMessagesChat);
+        if (savedIndex >= 0 && _chatIdOf(_chats[savedIndex]) != chatId) {
+          return;
+        }
+        normalized['title'] = 'Избранное';
+        normalized['display_title'] = 'Избранное';
+      }
       final index = _chats.indexWhere((c) => _chatIdOf(c) == chatId);
       if (index >= 0) {
         _chats[index] = {..._chats[index], ...normalized};
@@ -572,9 +593,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   bool _isSavedMessagesChat(Map<String, dynamic> chat) {
     final settings = _settingsOf(chat);
-    return settings['saved_messages'] == true ||
+    if (settings['saved_messages'] == true ||
         (settings['kind'] ?? '').toString().trim().toLowerCase() ==
-            'saved_messages';
+            'saved_messages') {
+      return true;
+    }
+    final type = (chat['type'] ?? '').toString().trim().toLowerCase();
+    final title = (chat['display_title'] ?? chat['title'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final peerUserId = (chat['peer_user_id'] ?? '').toString().trim();
+    return type == 'private' && title == 'избранное' && peerUserId.isEmpty;
   }
 
   bool _isDirectListChat(Map<String, dynamic> chat) {

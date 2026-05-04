@@ -1175,6 +1175,14 @@ function isSavedMessagesSettings(settings) {
   );
 }
 
+function isSavedMessagesChatRow(row) {
+  if (isSavedMessagesSettings(row?.settings)) return true;
+  const type = String(row?.type || "").trim().toLowerCase();
+  const title = String(row?.display_title || row?.title || "").trim().toLowerCase();
+  const peerUserId = String(row?.peer_user_id || "").trim();
+  return type === "private" && title === "избранное" && !peerUserId;
+}
+
 async function ensureSavedMessagesChat(client, user) {
   const userId = String(user?.id || "").trim();
   const tenantId = user?.tenant_id || null;
@@ -3435,6 +3443,8 @@ async function listChatsHandler(req, res) {
       if (!byId.has(row.id)) byId.set(row.id, row);
     }
     const chats = Array.from(byId.values());
+    const visibleChats = [];
+    let savedMessagesIncluded = false;
     for (const chat of chats) {
       const settings = normalizeSettings(chat.settings);
       const supportStatus = String(chat.support_ticket_status || "").trim();
@@ -3449,9 +3459,22 @@ async function listChatsHandler(req, res) {
       }
       chat.settings = settings;
       chat.last_message = decryptMessageText(chat.last_message);
+      if (isSavedMessagesChatRow(chat)) {
+        if (savedMessagesIncluded) continue;
+        savedMessagesIncluded = true;
+        chat.title = "Избранное";
+        chat.display_title = "Избранное";
+        chat.settings = {
+          ...settings,
+          kind: "saved_messages",
+          saved_messages: true,
+          visibility: "private",
+        };
+      }
+      visibleChats.push(chat);
     }
 
-    return res.json({ ok: true, data: chats });
+    return res.json({ ok: true, data: visibleChats });
   } catch (err) {
     console.error("chats.list error", err);
     return res.status(500).json({ ok: false, error: "Server error" });

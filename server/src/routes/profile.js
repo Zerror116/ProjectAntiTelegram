@@ -139,7 +139,7 @@ async function resolveTenantCode(tenantId, fallbackCode = "") {
   const normalizedTenantId = String(tenantId || "").trim();
   if (!normalizedTenantId) return "";
   try {
-    const tenantQ = await pool.query(
+    const tenantQ = await db.platformQuery(
       `SELECT code
        FROM tenants
        WHERE id = $1::uuid
@@ -166,7 +166,7 @@ async function getOrCreateClientInvite({ tenantId, userId }) {
     };
   }
 
-  const existing = await pool.query(
+  const existing = await db.platformQuery(
     `SELECT id, code
      FROM tenant_invites
      WHERE tenant_id = $1::uuid
@@ -192,17 +192,17 @@ async function getOrCreateClientInvite({ tenantId, userId }) {
   for (let i = 0; i < 5; i += 1) {
     const nextCode = normalizeInviteCode(generateInviteCode());
     try {
-      const insert = await pool.query(
+      const insert = await db.platformQuery(
         `INSERT INTO tenant_invites (
            id, tenant_id, code, role, is_active, max_uses,
            used_count, expires_at, created_by, notes, created_at, updated_at
          )
          VALUES (
            $1, $2::uuid, $3, 'client', true, NULL,
-           0, NULL, $4::uuid, 'Публичная клиентская ссылка', now(), now()
+           0, NULL, NULL, 'Публичная клиентская ссылка', now(), now()
          )
          RETURNING id, code`,
-        [uuidv4(), normalizedTenantId, nextCode, normalizedUserId],
+        [uuidv4(), normalizedTenantId, nextCode],
       );
       return {
         ok: true,
