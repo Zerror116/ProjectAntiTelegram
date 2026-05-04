@@ -3241,6 +3241,14 @@ async function listChatsHandler(req, res) {
          (
            c.type <> 'channel'
            AND NOT EXISTS (SELECT 1 FROM chat_members cm WHERE cm.chat_id = c.id)
+           AND NOT (
+             c.type = 'private'
+             AND (
+               COALESCE((c.settings->>'saved_messages')::boolean, false) = true
+               OR COALESCE(c.settings->>'kind', '') = 'saved_messages'
+               OR LOWER(TRIM(c.title)) = 'избранное'
+             )
+           )
          )
          OR
          (
