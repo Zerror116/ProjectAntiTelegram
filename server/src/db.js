@@ -254,8 +254,15 @@ async function query(text, params) {
   }
 }
 
-function platformQuery(text, params) {
-  return platformPool.query(text, params);
+async function platformQuery(text, params) {
+  const client = await platformPool.connect();
+  try {
+    await client.query("SELECT set_config('app.tenant_id', '', false)");
+    await client.query("SELECT set_config('search_path', 'public', false)");
+    return await client.query(text, params);
+  } finally {
+    client.release();
+  }
 }
 
 function platformConnect() {
