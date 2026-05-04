@@ -138,6 +138,14 @@ function tenantFilterSql(alias = 'u', tenantParamIndex = 1) {
   return `($${tenantParamIndex}::uuid IS NULL OR ${alias}.tenant_id = $${tenantParamIndex}::uuid)`;
 }
 
+function canAccessPlatformGlobalRows(user) {
+  return isCreatorBase(user) && user?.is_creator_tenant_scoped !== true;
+}
+
+function tenantVisibilitySql(column = 'tenant_id', tenantParamIndex = 1, allowNullParamIndex = 2) {
+  return `(${column} = $${tenantParamIndex}::uuid OR ($${allowNullParamIndex}::boolean = true AND ${column} IS NULL))`;
+}
+
 function periodStartExpression(period) {
   switch (period) {
     case 'day':
@@ -218,15 +226,15 @@ function safeLimit(value, fallback = 120, { min = 20, max = 500 } = {}) {
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
-async function loadMonitoringCounts(tenantId) {
+async function loadMonitoringCounts(tenantId, allowNullTenantRows = false) {
   const unresolvedQ = await db.query(
     `SELECT level, COUNT(*)::int AS total
      FROM monitoring_events
      WHERE resolved = false
        AND created_at >= now() - interval '7 days'
-       AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+       AND ${tenantVisibilitySql('tenant_id', 1, 2)}
      GROUP BY level`,
-    [tenantId || null],
+    [tenantId || null, allowNullTenantRows === true],
   );
   const byLevel = {
     info: 0,
@@ -240,17 +248,17 @@ async function loadMonitoringCounts(tenantId) {
   return byLevel;
 }
 
-async function loadReleaseSummary(tenantId) {
+async function loadReleaseSummary(tenantId, allowNullTenantRows = false) {
   const statusQ = await db.query(
     `SELECT scope,
             status,
             COUNT(*)::int AS total
      FROM ops_release_checks
      WHERE created_at >= now() - interval '14 days'
-       AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+       AND ${tenantVisibilitySql('tenant_id', 1, 2)}
      GROUP BY scope, status
      ORDER BY scope ASC, status ASC`,
-    [tenantId || null],
+    [tenantId || null, allowNullTenantRows === true],
   );
   const latestQ = await db.query(
     `SELECT id,
@@ -264,10 +272,10 @@ async function loadReleaseSummary(tenantId) {
             details,
             created_at
      FROM ops_release_checks
-     WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+     WHERE ${tenantVisibilitySql('tenant_id', 1, 2)}
      ORDER BY created_at DESC
      LIMIT 20`,
-    [tenantId || null],
+    [tenantId || null, allowNullTenantRows === true],
   );
 
   return {
@@ -330,6 +338,7 @@ async function safeMonitoringSection(loader, fallback, code) {
 
 async function loadMonitoringCenterPayload(req) {
   const tenantId = req.user?.tenant_id || null;
+  const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
   const started = Date.now();
   await db.query('SELECT 1');
   const dbLatencyMs = Date.now() - started;
@@ -339,8 +348,8 @@ async function loadMonitoringCenterPayload(req) {
      FROM antifraud_blocks
      WHERE is_active = true
        AND blocked_until > now()
-       AND ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)`,
-    [tenantId],
+       AND ${tenantVisibilitySql('tenant_id', 1, 2)}`,
+    [tenantId, allowNullTenantRows],
   );
   const pendingPostsQ = await db.query(
     `SELECT COUNT(*)::int AS total
@@ -356,12 +365,12 @@ async function loadMonitoringCenterPayload(req) {
   const sockets = Number(io?.engine?.clientsCount || 0);
   const rooms = Number(io?.sockets?.adapter?.rooms?.size || 0);
   const monitoring = await safeMonitoringSection(
-    () => loadMonitoringCounts(tenantId),
+    () => loadMonitoringCounts(tenantId, allowNullTenantRows),
     { unresolved_total: 0, by_severity: [], by_subsystem: [] },
     'monitoring_counts_failed',
   );
   const release = await safeMonitoringSection(
-    () => loadReleaseSummary(tenantId),
+    () => loadReleaseSummary(tenantId, allowNullTenantRows),
     { totals: [], latest: [] },
     'release_summary_failed',
   );
@@ -774,8 +783,8 @@ router.get('/audit/logs', requireAuth, requireRole('tenant', 'creator'), async (
     const dateTo = String(req.query?.date_to || '').trim();
     const limit = parsePositiveInt(req.query?.limit, 200, 1, 1000);
 
-    const params = [req.user?.tenant_id || null];
-    const where = ['($1::uuid IS NULL OR al.tenant_id = $1::uuid OR al.tenant_id IS NULL)'];
+    const params = [req.user?.tenant_id || null, canAccessPlatformGlobalRows(req.user)];
+    const where = [tenantVisibilitySql('al.tenant_id', 1, 2)];
 
     if (action) {
       params.push(action);
@@ -831,8 +840,8 @@ router.get('/audit/logs', requireAuth, requireRole('tenant', 'creator'), async (
 router.get('/audit/logs/export', requireAuth, requireRole('tenant', 'creator'), async (req, res) => {
   try {
     const action = String(req.query?.action || '').trim();
-    const params = [req.user?.tenant_id || null];
-    const where = ['($1::uuid IS NULL OR al.tenant_id = $1::uuid OR al.tenant_id IS NULL)'];
+    const params = [req.user?.tenant_id || null, canAccessPlatformGlobalRows(req.user)];
+    const where = [tenantVisibilitySql('al.tenant_id', 1, 2)];
 
     if (action) {
       params.push(action);
@@ -899,8 +908,8 @@ router.get('/antifraud/events', requireAuth, requireRole('admin', 'creator'), as
     const status = String(req.query?.status || '').trim();
     const limit = parsePositiveInt(req.query?.limit, 200, 1, 1000);
 
-    const params = [req.user?.tenant_id || null];
-    const where = ['($1::uuid IS NULL OR e.tenant_id = $1::uuid OR e.tenant_id IS NULL)'];
+    const params = [req.user?.tenant_id || null, canAccessPlatformGlobalRows(req.user)];
+    const where = [tenantVisibilitySql('e.tenant_id', 1, 2)];
 
     if (actionKey) {
       params.push(actionKey);
@@ -948,6 +957,7 @@ router.get('/antifraud/events', requireAuth, requireRole('admin', 'creator'), as
 router.get('/antifraud/blocks', requireAuth, requireRole('admin', 'creator'), async (req, res) => {
   try {
     const activeOnly = String(req.query?.active_only || '1') !== '0';
+    const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const rows = await db.query(
       `SELECT b.id,
               b.user_id,
@@ -960,11 +970,11 @@ router.get('/antifraud/blocks', requireAuth, requireRole('admin', 'creator'), as
               COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Неизвестный') AS user_name
        FROM antifraud_blocks b
        LEFT JOIN users u ON u.id = b.user_id
-       WHERE ($1::uuid IS NULL OR b.tenant_id = $1::uuid OR b.tenant_id IS NULL)
+       WHERE ${tenantVisibilitySql('b.tenant_id', 1, 3)}
          AND ($2::boolean = false OR b.is_active = true)
        ORDER BY b.updated_at DESC, b.created_at DESC
        LIMIT 2000`,
-      [req.user?.tenant_id || null, activeOnly],
+      [req.user?.tenant_id || null, activeOnly, allowNullTenantRows],
     );
     return res.json({ ok: true, data: rows.rows });
   } catch (err) {
@@ -979,15 +989,16 @@ router.patch('/antifraud/blocks/:id/release', requireAuth, requireRole('admin', 
     if (!blockId) {
       return res.status(400).json({ ok: false, error: 'id блокировки обязателен' });
     }
+    const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const updated = await db.query(
       `UPDATE antifraud_blocks
        SET is_active = false,
            blocked_until = now(),
            updated_at = now()
        WHERE id = $1
-         AND ($2::uuid IS NULL OR tenant_id = $2::uuid OR tenant_id IS NULL)
+         AND ${tenantVisibilitySql('tenant_id', 2, 3)}
        RETURNING id`,
-      [blockId, req.user?.tenant_id || null],
+      [blockId, req.user?.tenant_id || null, allowNullTenantRows],
     );
     if (updated.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Блокировка не найдена' });
@@ -1363,11 +1374,12 @@ router.get('/monitoring/events', requireAuth, requireRole('creator'), async (req
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
     const tenantId = req.user?.tenant_id || null;
+    const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const limit = safeLimit(req.query?.limit, 120);
     const subsystem = String(req.query?.subsystem || '').trim().toLowerCase();
     const level = String(req.query?.level || '').trim().toLowerCase();
     const resolvedRaw = String(req.query?.resolved || '').trim().toLowerCase();
-    const params = [tenantId, subsystem, level, limit];
+    const params = [tenantId, subsystem, level, limit, allowNullTenantRows];
     let sql = `SELECT id,
                       tenant_id,
                       user_id,
@@ -1389,12 +1401,12 @@ router.get('/monitoring/events', requireAuth, requireRole('creator'), async (req
                       resolved,
                       created_at
                FROM monitoring_events
-               WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+               WHERE ${tenantVisibilitySql('tenant_id', 1, 5)}
                  AND ($2::text = '' OR COALESCE(subsystem, '') = $2::text)
                  AND ($3::text = '' OR level = $3::text)`;
     if (resolvedRaw == 'true' || resolvedRaw == 'false') {
       params.push(resolvedRaw === 'true');
-      sql += ` AND resolved = $5`;
+      sql += ` AND resolved = $${params.length}`;
     }
     sql += ` ORDER BY created_at DESC LIMIT $4`;
     const rows = await db.query(sql, params);
@@ -1410,7 +1422,10 @@ router.get('/monitoring/releases', requireAuth, requireRole('creator'), async (r
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
-    const data = await loadReleaseSummary(req.user?.tenant_id || null);
+    const data = await loadReleaseSummary(
+      req.user?.tenant_id || null,
+      canAccessPlatformGlobalRows(req.user),
+    );
     return res.json({ ok: true, data });
   } catch (err) {
     console.error('ops.monitoring.releases error', err);
@@ -1424,6 +1439,7 @@ router.get('/monitoring/realtime', requireAuth, requireRole('creator'), async (r
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
     const tenantId = req.user?.tenant_id || null;
+    const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const recentEvents = await db.query(
       `SELECT code,
               level,
@@ -1432,12 +1448,12 @@ router.get('/monitoring/realtime', requireAuth, requireRole('creator'), async (r
               details,
               created_at
        FROM monitoring_events
-       WHERE ($1::uuid IS NULL OR tenant_id = $1::uuid OR tenant_id IS NULL)
+       WHERE ${tenantVisibilitySql('tenant_id', 1, 2)}
          AND COALESCE(subsystem, '') IN ('realtime', 'socket', 'outbox', 'push')
          AND created_at >= now() - interval '24 hours'
        ORDER BY created_at DESC
        LIMIT 40`,
-      [tenantId],
+      [tenantId, allowNullTenantRows],
     );
     return res.json({
       ok: true,
@@ -1462,13 +1478,14 @@ router.patch('/monitoring/events/:id/resolve', requireAuth, requireRole('creator
       return res.status(400).json({ ok: false, error: 'Некорректный id события' });
     }
     const tenantId = req.user?.tenant_id || null;
+    const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const upd = await db.query(
       `UPDATE monitoring_events
        SET resolved = true
        WHERE id = $1
-         AND ($2::uuid IS NULL OR tenant_id = $2::uuid OR tenant_id IS NULL)
+         AND ${tenantVisibilitySql('tenant_id', 2, 3)}
        RETURNING id, resolved`,
-      [id, tenantId],
+      [id, tenantId, allowNullTenantRows],
     );
     if (upd.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Событие не найдено' });
@@ -2058,13 +2075,14 @@ router.patch('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), a
       return res.status(400).json({ ok: false, error: 'id FAQ обязателен' });
     }
 
+    const canManageGlobalRows = canAccessPlatformGlobalRows(req.user);
     const beforeQ = await db.query(
       `SELECT *
        FROM support_faq_entries
        WHERE id = $1
-         AND (tenant_id = $2::uuid OR tenant_id IS NULL)
+         AND ${tenantVisibilitySql('tenant_id', 2, 3)}
        LIMIT 1`,
-      [id, req.user?.tenant_id || null],
+      [id, req.user?.tenant_id || null, canManageGlobalRows],
     );
     if (beforeQ.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'FAQ не найден' });
@@ -2087,6 +2105,7 @@ router.patch('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), a
            is_active = CASE WHEN $11::boolean THEN $12 ELSE is_active END,
            updated_at = now()
        WHERE id = $13
+         AND ${tenantVisibilitySql('tenant_id', 14, 15)}
        RETURNING *`,
       [
         hasQuestion,
@@ -2102,6 +2121,8 @@ router.patch('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), a
         hasActive,
         req.body?.is_active === true,
         id,
+        req.user?.tenant_id || null,
+        canManageGlobalRows,
       ],
     );
 
@@ -2127,13 +2148,14 @@ router.delete('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), 
       return res.status(400).json({ ok: false, error: 'id FAQ обязателен' });
     }
 
+    const canManageGlobalRows = canAccessPlatformGlobalRows(req.user);
     const beforeQ = await db.query(
       `SELECT *
        FROM support_faq_entries
        WHERE id = $1
-         AND (tenant_id = $2::uuid OR tenant_id IS NULL)
+         AND ${tenantVisibilitySql('tenant_id', 2, 3)}
        LIMIT 1`,
-      [id, req.user?.tenant_id || null],
+      [id, req.user?.tenant_id || null, canManageGlobalRows],
     );
     if (beforeQ.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'FAQ не найден' });
@@ -2141,8 +2163,9 @@ router.delete('/support/faq/:id', requireAuth, requireRole('admin', 'creator'), 
 
     await db.query(
       `DELETE FROM support_faq_entries
-       WHERE id = $1`,
-      [id],
+       WHERE id = $1
+         AND ${tenantVisibilitySql('tenant_id', 2, 3)}`,
+      [id, req.user?.tenant_id || null, canManageGlobalRows],
     );
 
     await insertAuditFromReq(req, {
@@ -2228,13 +2251,14 @@ router.patch('/support/templates/:id', requireAuth, requireRole('admin', 'creato
       return res.status(400).json({ ok: false, error: 'id шаблона обязателен' });
     }
 
+    const canManageGlobalRows = canAccessPlatformGlobalRows(req.user);
     const beforeQ = await db.query(
       `SELECT *
        FROM support_reply_templates
        WHERE id = $1
-         AND (tenant_id = $2::uuid OR tenant_id IS NULL)
+         AND ${tenantVisibilitySql('tenant_id', 2, 3)}
        LIMIT 1`,
-      [id, req.user?.tenant_id || null],
+      [id, req.user?.tenant_id || null, canManageGlobalRows],
     );
     if (beforeQ.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Шаблон не найден' });
@@ -2287,6 +2311,7 @@ router.patch('/support/templates/:id', requireAuth, requireRole('admin', 'creato
            priority = CASE WHEN $10::boolean THEN $9::integer ELSE priority END,
            updated_at = now()
        WHERE id = $11
+         AND ${tenantVisibilitySql('tenant_id', 12, 13)}
        RETURNING *`,
       [
         title,
@@ -2300,6 +2325,8 @@ router.patch('/support/templates/:id', requireAuth, requireRole('admin', 'creato
         priority,
         hasPriority,
         id,
+        req.user?.tenant_id || null,
+        canManageGlobalRows,
       ],
     );
 

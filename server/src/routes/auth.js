@@ -183,11 +183,12 @@ function resolveRefreshScopeKey({
   tenantCode = '',
   isPlatformCreator = false,
 } = {}) {
-  if (isPlatformCreator) return 'platform';
   const normalizedTenantCode = db.normalizeTenantCode(
     tenantCode || tenant?.code || user?.tenant_code || '',
   );
-  return normalizedTenantCode || 'platform';
+  if (normalizedTenantCode) return normalizedTenantCode;
+  if (isPlatformCreator) return 'platform';
+  return 'platform';
 }
 
 function buildRefreshToken(scopeKey) {
@@ -739,14 +740,20 @@ async function resolveTenantByUserEmail(email) {
   for (const tenantRow of tenantCandidatesRes.rows) {
     const tenantId = String(tenantRow?.id || '').trim();
     if (!tenantId) continue;
+    const allowLegacyNullTenantRows =
+      db.isIsolatedTenantRow(tenantRow) ||
+      db.isSchemaIsolatedTenantRow(tenantRow);
     try {
       const hasUser = await db.runWithTenantRow(tenantRow, async () => {
+        const tenantFilter = allowLegacyNullTenantRows
+          ? `AND (u.tenant_id = $2::uuid OR u.tenant_id IS NULL)`
+          : `AND u.tenant_id = $2::uuid`;
         const q = await db.query(
           `SELECT u.id
            FROM users u
            WHERE lower(u.email) = $1
              AND u.is_active = true
-             AND (u.tenant_id = $2::uuid OR u.tenant_id IS NULL)
+             ${tenantFilter}
            LIMIT 1`,
           [normalizedEmail, tenantId],
         );
@@ -2594,9 +2601,13 @@ router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
   }
 
   try {
-    const tenantScope = req.user?.is_platform_creator
-      ? null
-      : await db.resolveTenantByCode(req.user?.tenant_code || '');
+    const tenantScopeCode = db.normalizeTenantCode(req.user?.tenant_code || '');
+    const tenantScope = tenantScopeCode
+      ? await db.resolveTenantByCode(tenantScopeCode)
+      : null;
+    if (tenantScopeCode && !tenantScope) {
+      return res.status(401).json({ error: 'Арендатор сессии не найден' });
+    }
     return await db.runWithTenantRow(tenantScope, async () => {
       const client = await db.pool.connect();
       try {

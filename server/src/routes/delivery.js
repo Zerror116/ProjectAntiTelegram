@@ -2383,7 +2383,10 @@ async function ensureDeliveryChat(queryable, userId, createdBy, tenantId = null)
      FROM chats c
      JOIN chat_members cm ON cm.chat_id = c.id
      WHERE cm.user_id = $1
-       AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid OR c.tenant_id IS NULL)
+       AND (
+         ($2::uuid IS NULL AND c.tenant_id IS NULL)
+         OR c.tenant_id = $2::uuid
+       )
        AND ${deliveryDialogWhere("c")}
      ORDER BY
        CASE

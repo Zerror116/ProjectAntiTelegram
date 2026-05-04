@@ -35,9 +35,17 @@ void main() {
   final apiState = _ApiStubState();
   late InterceptorsWrapper interceptor;
 
-  setUp(() {
+  setUp(() async {
     apiState.resetCounters();
     app.debugSetApiBaseUrlForTesting('http://integration.test');
+    await app.authService.clearToken();
+    await app.authService.setTenantCode(null);
+    final savedSessions = await app.authService.listSavedTenantSessions();
+    for (final session in savedSessions) {
+      final id = (session['id'] ?? '').toString().trim();
+      if (id.isEmpty) continue;
+      await app.authService.removeSavedTenantSession(id);
+    }
   });
 
   setUpAll(() {

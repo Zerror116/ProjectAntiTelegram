@@ -1021,20 +1021,14 @@ async function resolveDirectTargetUser(client, requester, { userId, query }) {
                SELECT 1
                FROM support_tickets st
                WHERE st.customer_id = u.id
-                 AND (
-                   st.tenant_id = $3::uuid
-                   OR st.tenant_id IS NULL
-                 )
+                 AND st.tenant_id = $3::uuid
                LIMIT 1
              )
              OR EXISTS (
                SELECT 1
                FROM customer_claims cc
                WHERE cc.user_id = u.id
-                 AND (
-                   cc.tenant_id = $3::uuid
-                   OR cc.tenant_id IS NULL
-                 )
+                 AND cc.tenant_id = $3::uuid
                LIMIT 1
              )
            )
@@ -1127,6 +1121,61 @@ async function getDirectAliasForViewer(
   return q.rowCount > 0 ? String(q.rows[0]?.alias_name || "").trim() : "";
 }
 
+async function ensureScopedViewerUser(client, user) {
+  const userId = trimOptionalUuid(user?.id);
+  if (!userId) return null;
+
+  const existingQ = await client.query(
+    `SELECT id
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId],
+  );
+  if (existingQ.rowCount > 0) return existingQ.rows[0].id;
+
+  const role = normalizeRole(user?.base_role || user?.role || "client");
+  const email = String(user?.email || "")
+    .trim()
+    .toLowerCase();
+  const name = String(user?.name || "").trim();
+  const tenantId = trimOptionalUuid(user?.tenant_id);
+
+  const insertedQ = await client.query(
+    `INSERT INTO users (
+       id,
+       email,
+       role,
+       name,
+       is_active,
+       tenant_id,
+       created_at,
+       updated_at
+     )
+     VALUES (
+       $1::uuid,
+       NULLIF($2::text, ''),
+       $3::text,
+       NULLIF($4::text, ''),
+       true,
+       $5::uuid,
+       now(),
+       now()
+     )
+     ON CONFLICT (id)
+     DO UPDATE SET
+       email = COALESCE(users.email, EXCLUDED.email),
+       role = COALESCE(NULLIF(users.role, ''), EXCLUDED.role),
+       name = COALESCE(users.name, EXCLUDED.name),
+       tenant_id = COALESCE(users.tenant_id, EXCLUDED.tenant_id),
+       is_active = true,
+       updated_at = now()
+     RETURNING id`,
+    [userId, email, role, name, tenantId],
+  );
+  return insertedQ.rows[0]?.id || userId;
+}
+
 function buildDirectChatPayloadForViewer(chat, counterpart, aliasName = "") {
   const settings = normalizeSettings(chat?.settings);
   const directRequestStatus = String(settings.direct_request_status || "")
@@ -1184,30 +1233,9 @@ function isSavedMessagesChatRow(row) {
 }
 
 async function ensureSavedMessagesChat(client, user) {
-  const userId = String(user?.id || "").trim();
+  const userId = String((await ensureScopedViewerUser(client, user)) || "").trim();
   const tenantId = user?.tenant_id || null;
   if (!userId) return null;
-  const userExistsQ = await client.query(
-    `SELECT 1
-     FROM users
-     WHERE id = $1
-     LIMIT 1`,
-    [userId],
-  );
-  if (userExistsQ.rowCount === 0) {
-    if (
-      user?.is_platform_creator === true &&
-      user?.is_creator_tenant_scoped === true
-    ) {
-      if (process.env.NODE_ENV !== "production") {
-        console.info("ensureSavedMessagesChat skipped creator tenant shadow user", {
-          userId,
-          tenantId,
-        });
-      }
-    }
-    return null;
-  }
 
   const existingQ = await client.query(
     `SELECT c.id, c.title, c.type, c.settings, c.created_at, c.updated_at

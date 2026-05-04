@@ -2,7 +2,7 @@ const express = require("express");
 
 const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
-const db = require("../db");
+const { runInRequestTenantScope } = require("../utils/requestScope");
 const {
   canAccessNotificationInbox,
   getNotificationPreferencesForUser,
@@ -24,16 +24,9 @@ function isCreatorBase(user) {
   return String(user?.role || "").toLowerCase().trim() === "creator";
 }
 
-async function runNotificationsInEffectiveScope(req, fn) {
-  if (req.user?.is_platform_creator === true) {
-    return db.runWithPlatform(fn);
-  }
-  return fn();
-}
-
 router.get("/preferences", requireAuth, async (req, res) => {
   try {
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       getNotificationPreferencesForUser(req.user),
     );
     return res.json({ ok: true, data });
@@ -45,7 +38,7 @@ router.get("/preferences", requireAuth, async (req, res) => {
 
 router.patch("/preferences", requireAuth, async (req, res) => {
   try {
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       upsertNotificationPreferences({
         user: req.user,
         patch: req.body || {},
@@ -63,7 +56,7 @@ router.get("/inbox", requireAuth, async (req, res) => {
     if (!canAccessNotificationInbox(req.user)) {
       return res.status(403).json({ ok: false, error: "Раздел событий доступен только создателю" });
     }
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       listNotificationInbox({
         userId: req.user.id,
         limit: req.query?.limit,
@@ -87,7 +80,7 @@ router.post("/inbox/:id/read", requireAuth, async (req, res) => {
     if (!itemId) {
       return res.status(400).json({ ok: false, error: "id обязателен" });
     }
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       markNotificationInboxItemRead({
         userId: req.user.id,
         itemId,
@@ -109,7 +102,7 @@ router.post("/inbox/:id/opened", requireAuth, async (req, res) => {
     if (!itemId) {
       return res.status(400).json({ ok: false, error: "id обязателен" });
     }
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       markNotificationInboxItemOpened({
         userId: req.user.id,
         itemId,
@@ -130,7 +123,7 @@ router.post("/inbox/read-all", requireAuth, async (req, res) => {
     if (!canAccessNotificationInbox(req.user)) {
       return res.status(403).json({ ok: false, error: "Раздел событий доступен только создателю" });
     }
-    const unreadCount = await runNotificationsInEffectiveScope(req, async () =>
+    const unreadCount = await runInRequestTenantScope(req, async () =>
       markAllNotificationInboxItemsRead({
         userId: req.user.id,
       }),
@@ -144,7 +137,7 @@ router.post("/inbox/read-all", requireAuth, async (req, res) => {
 
 router.get("/badge-count", requireAuth, async (req, res) => {
   try {
-    const [unreadCount, inboxUnreadCount] = await runNotificationsInEffectiveScope(
+    const [unreadCount, inboxUnreadCount] = await runInRequestTenantScope(
       req,
       async () =>
         Promise.all([
@@ -165,7 +158,7 @@ router.get("/badge-count", requireAuth, async (req, res) => {
 
 router.post("/endpoints/register", requireAuth, async (req, res) => {
   try {
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       upsertNotificationEndpoint({
         user: req.user,
         platform: req.body?.platform,
@@ -194,7 +187,7 @@ router.post("/endpoints/register", requireAuth, async (req, res) => {
 
 router.post("/endpoints/refresh", requireAuth, async (req, res) => {
   try {
-    const data = await runNotificationsInEffectiveScope(req, async () =>
+    const data = await runInRequestTenantScope(req, async () =>
       upsertNotificationEndpoint({
         user: req.user,
         platform: req.body?.platform,
@@ -223,7 +216,7 @@ router.post("/endpoints/refresh", requireAuth, async (req, res) => {
 
 router.post("/endpoints/unregister", requireAuth, async (req, res) => {
   try {
-    const ok = await runNotificationsInEffectiveScope(req, async () =>
+    const ok = await runInRequestTenantScope(req, async () =>
       deactivateNotificationEndpoint({
         userId: req.user.id,
         endpoint: req.body?.endpoint,

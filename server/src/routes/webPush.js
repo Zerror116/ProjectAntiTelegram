@@ -1,7 +1,7 @@
 const express = require("express");
 
 const { authMiddleware } = require("../utils/auth");
-const db = require("../db");
+const { runInRequestTenantScope } = require("../utils/requestScope");
 const {
   isWebPushEnabled,
   getWebPushPublicKey,
@@ -15,13 +15,6 @@ const {
 
 const router = express.Router();
 
-async function runWebPushInEffectiveScope(req, fn) {
-  if (req.user?.is_platform_creator === true) {
-    return db.runWithPlatform(fn);
-  }
-  return fn();
-}
-
 router.get("/config", authMiddleware, async (req, res) => {
   return res.json({
     ok: true,
@@ -32,7 +25,7 @@ router.get("/config", authMiddleware, async (req, res) => {
 
 router.get("/badge-count", authMiddleware, async (req, res) => {
   try {
-    const count = await runWebPushInEffectiveScope(req, async () =>
+    const count = await runInRequestTenantScope(req, async () =>
       computeNotificationInboxBadgeCount(req.user.id),
     );
     return res.json({ ok: true, unread_count: count });
@@ -47,7 +40,7 @@ router.post("/subscriptions", authMiddleware, async (req, res) => {
     return res.status(503).json({ error: "Web push не настроен на сервере" });
   }
   try {
-    const normalized = await runWebPushInEffectiveScope(req, async () =>
+    const normalized = await runInRequestTenantScope(req, async () =>
       upsertWebPushSubscription({
         userId: req.user.id,
         tenantId: req.user?.tenant_id || null,
@@ -74,7 +67,7 @@ router.post("/test", authMiddleware, async (req, res) => {
     return res.status(503).json({ error: "Web push не настроен на сервере" });
   }
   try {
-    const sent = await runWebPushInEffectiveScope(req, async () =>
+    const sent = await runInRequestTenantScope(req, async () =>
       sendTestWebPushToUser(req.user.id),
     );
     return res.json({ ok: true, sent });
@@ -92,7 +85,7 @@ router.delete("/subscriptions", authMiddleware, async (req, res) => {
     if (!endpoint) {
       return res.status(400).json({ error: "endpoint обязателен" });
     }
-    await runWebPushInEffectiveScope(req, async () =>
+    await runInRequestTenantScope(req, async () =>
       removeWebPushSubscription({
         userId: req.user.id,
         endpoint,
