@@ -23,6 +23,7 @@
     "test:e2e:full": "node scripts/e2e-full-regression.js",
     "audit:self": "node scripts/nightly-self-audit.js",
     "audit:gate": "node scripts/audit_gate.js",
+    "migrate:tenants": "node scripts/migrate_tenant_databases.js",
     "media:backfill": "node scripts/media_assets_backfill.js",
     "media:sanitize": "node scripts/media_assets_sanitize.js",
     "perf:budget": "node scripts/perf_budget_smoke.js",

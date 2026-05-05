@@ -278,9 +278,32 @@ async function loadUserProfileForRequest(user) {
   const normalizedUserId = String(user?.id || "").trim();
   if (!normalizedUserId) return null;
   const scopedProfile = await loadUserProfile(normalizedUserId);
-  if (scopedProfile) return scopedProfile;
-  if (user?.is_platform_creator !== true) return null;
-  return db.runWithPlatform(async () => await loadUserProfile(normalizedUserId));
+  if (scopedProfile && String(scopedProfile.name || "").trim()) {
+    return scopedProfile;
+  }
+  if (user?.is_platform_creator !== true) return scopedProfile || null;
+  const platformProfile = await db.runWithPlatform(
+    async () => await loadUserProfile(normalizedUserId),
+  );
+  if (!platformProfile) {
+    return scopedProfile || null;
+  }
+  if (!scopedProfile) return platformProfile;
+  return {
+    ...scopedProfile,
+    email:
+      String(scopedProfile.email || "").trim() ||
+      String(platformProfile.email || "").trim() ||
+      null,
+    name:
+      String(scopedProfile.name || "").trim() ||
+      String(platformProfile.name || "").trim() ||
+      null,
+    avatar_url:
+      String(scopedProfile.avatar_url || "").trim() ||
+      String(platformProfile.avatar_url || "").trim() ||
+      null,
+  };
 }
 
 function toNumber(value) {
@@ -1097,6 +1120,10 @@ router.get("/", authMiddleware, async (req, res) => {
       String(req.user?.tenant_code || "").trim()
         ? {
             ...user,
+            name:
+              String(user?.name || "").trim() ||
+              String(req.user?.name || "").trim() ||
+              null,
             tenant_code: req.user?.tenant_code || null,
             tenant_name: req.user?.tenant_name || null,
             tenant_status: req.user?.tenant_status || null,

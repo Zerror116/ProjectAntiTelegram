@@ -153,6 +153,56 @@ async function resolveCreatorTenantScope(requestedTenantCode = '') {
   return tenantRow;
 }
 
+function normalizeScopedUserRole(rawRole) {
+  const role = String(rawRole || 'client').toLowerCase().trim();
+  if (['client', 'worker', 'admin', 'tenant', 'creator'].includes(role)) {
+    return role;
+  }
+  return 'client';
+}
+
+async function ensureScopedAuthUserShadowRow(user, tenantScope) {
+  const userId = String(user?.id || '').trim();
+  const tenantId = String(tenantScope?.id || user?.tenant_id || '').trim();
+  if (!userId || !tenantId) return;
+
+  const email = String(user?.email || '').trim().toLowerCase();
+  const name = String(user?.name || '').trim();
+  const role = normalizeScopedUserRole(user?.base_role || user?.role);
+
+  await db.query(
+    `INSERT INTO users (
+       id,
+       email,
+       role,
+       name,
+       is_active,
+       tenant_id,
+       created_at,
+       updated_at
+     )
+     VALUES (
+       $1::uuid,
+       NULLIF($2::text, ''),
+       $3::text,
+       NULLIF($4::text, ''),
+       true,
+       $5::uuid,
+       now(),
+       now()
+     )
+     ON CONFLICT (id)
+     DO UPDATE SET
+       email = COALESCE(NULLIF(users.email, ''), EXCLUDED.email),
+       role = COALESCE(NULLIF(users.role, ''), EXCLUDED.role),
+       name = COALESCE(NULLIF(users.name, ''), EXCLUDED.name),
+       tenant_id = COALESCE(users.tenant_id, EXCLUDED.tenant_id),
+       is_active = true,
+       updated_at = now()`,
+    [userId, email, role, name, tenantId],
+  );
+}
+
 async function resolveAuthContextFromToken(
   token,
   requestedViewRole = '',
@@ -209,7 +259,7 @@ async function resolveAuthContextFromToken(
 
   const lookupUser = async () =>
     await db.query(
-      `SELECT u.id, u.email, u.role, u.is_active, u.block_reason, u.tenant_id,
+      `SELECT u.id, u.email, u.name, u.role, u.is_active, u.block_reason, u.tenant_id,
               t.code AS tenant_code,
               t.name AS tenant_name,
               t.status AS tenant_status,
@@ -327,6 +377,7 @@ async function resolveAuthContextFromToken(
     ...payload,
     id: row.id,
     email: row.email,
+    name: row.name || null,
     role: effectiveRole,
     base_role: baseRole,
     effective_role: effectiveRole,
@@ -438,7 +489,10 @@ async function authMiddleware(req, res, next) {
       return db.runWithPlatform(() => next());
     }
     if (context.tenantScope) {
-      return db.runWithTenantRow(context.tenantScope, () => next());
+      return db.runWithTenantRow(context.tenantScope, async () => {
+        await ensureScopedAuthUserShadowRow(context.user, context.tenantScope);
+        return next();
+      });
     }
     return db.runWithPlatform(() => next());
   } catch (err) {

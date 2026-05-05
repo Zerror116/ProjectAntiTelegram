@@ -53,5 +53,8 @@ run_rsync -avz --delete \
   --exclude 'downloads.legacy*' \
   "$PROJECT_ROOT/server/" "$SERVER:$REMOTE_PROJECT_DIR/server/"
 
+echo "[sync_server_code_safe] installing backend dependencies and reconciling tenant migrations"
+run_ssh "$SERVER" "cd '$REMOTE_PROJECT_DIR/server' && npm ci --omit=dev && npm run migrate:tenants"
+
 echo "[sync_server_code_safe] restarting backend"
-run_ssh "$SERVER" "cd '$REMOTE_PROJECT_DIR/server' && npm ci --omit=dev && systemctl restart fenix-server.service && systemctl is-active fenix-server.service"
+run_ssh "$SERVER" "systemctl restart fenix-server.service && systemctl is-active fenix-server.service"
