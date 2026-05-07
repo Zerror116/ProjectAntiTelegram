@@ -24,12 +24,19 @@ const CHANNEL_PUBLICATION_RECOVERY_MS = Math.max(
   60_000,
   Number.parseInt(process.env.CHANNEL_PUBLICATION_RECOVERY_MS || '60000', 10) || 60_000,
 );
+const CHANNEL_PUBLICATION_TENANT_CACHE_MS = Math.max(
+  5_000,
+  Number.parseInt(process.env.CHANNEL_PUBLICATION_TENANT_CACHE_MS || '10000', 10) || 10_000,
+);
 const SAMARA_TZ = 'Europe/Samara';
 const PROCESSOR_ID = process.env.FENIX_CHANNEL_PUBLICATION_PROCESSOR_ID || `api:${process.pid}`;
 
 let processorTimer = null;
 let processorTickRunning = false;
 let processorStarted = false;
+let processorTenantTargetsCache = [];
+let processorTenantTargetsCacheExpiresAt = 0;
+let processorScopeCursor = 0;
 
 function normalizeQueueUuidList(raw) {
   if (!Array.isArray(raw)) return [];
@@ -621,7 +628,46 @@ async function finalizeBatch(client, batchId) {
   return true;
 }
 
-async function selectDueBatch(client) {
+async function loadProcessorTenantTargets({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && processorTenantTargetsCacheExpiresAt > now) {
+    return processorTenantTargetsCache;
+  }
+
+  const tenantsQ = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            db_mode,
+            db_url,
+            db_name,
+            db_schema
+     FROM tenants
+     WHERE COALESCE(is_deleted, false) = false
+     ORDER BY created_at ASC, id ASC`,
+  );
+
+  processorTenantTargetsCache = tenantsQ.rows;
+  processorTenantTargetsCacheExpiresAt = now + CHANNEL_PUBLICATION_TENANT_CACHE_MS;
+  return processorTenantTargetsCache;
+}
+
+function buildProcessorScopes(tenantRows = []) {
+  const scopes = Array.isArray(tenantRows) ? [...tenantRows] : [];
+  scopes.push(null);
+  return scopes;
+}
+
+function rotateProcessorScopes(scopes = []) {
+  if (!Array.isArray(scopes) || scopes.length <= 1) return scopes;
+  const startIndex = Math.abs(processorScopeCursor) % scopes.length;
+  processorScopeCursor = (startIndex + 1) % scopes.length;
+  return scopes.slice(startIndex).concat(scopes.slice(0, startIndex));
+}
+
+async function selectDueBatch(client, tenantId = null) {
   const batchQ = await client.query(
     `SELECT b.id,
             b.channel_id,
@@ -643,10 +689,15 @@ async function selectDueBatch(client) {
      FROM channel_publication_batches b
      JOIN chats c ON c.id = b.channel_id
      WHERE b.status IN ('queued', 'running')
+       AND (
+         ($1::uuid IS NULL AND b.tenant_id IS NULL)
+         OR b.tenant_id = $1::uuid
+       )
        AND COALESCE(b.next_publish_at, now()) <= now()
      ORDER BY b.created_at ASC, b.id ASC
      FOR UPDATE OF b SKIP LOCKED
      LIMIT 1`,
+    [tenantId || null],
   );
   return batchQ.rows[0] || null;
 }
@@ -1082,81 +1133,100 @@ async function processBatchItem(client, batch) {
   }
 }
 
-async function processNextChannelPublicationStep({ io = null } = {}) {
-  const client = await db.platformConnect();
-  try {
-    await client.query('BEGIN');
-    const batch = await selectDueBatch(client);
-    if (!batch) {
-      await client.query('ROLLBACK');
-      return null;
-    }
-    const result = await processBatchItem(client, batch);
-    await client.query('COMMIT');
-
-    const socketIo = io || global.__projectPhoenixSocketIo || null;
-    if (socketIo && result?.kind === 'published') {
-      for (const message of result.emitted.hiddenRevisionMessages || []) {
-        socketIo.to(`chat:${message.chat_id}`).emit('chat:message', {
-          chatId: message.chat_id,
-          message,
-        });
-        emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
-          chatId: message.chat_id,
-        });
-      }
-      if (result.emitted.mainMessage) {
-        socketIo.to(`chat:${result.emitted.mainMessage.chat_id}`).emit('chat:message', {
-          chatId: result.emitted.mainMessage.chat_id,
-          message: result.emitted.mainMessage,
-        });
-        emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
-          chatId: result.emitted.mainMessage.chat_id,
-        });
-      }
-      for (const archiveMessage of result.emitted.archiveMessages || []) {
-        socketIo.to(`chat:${archiveMessage.chat_id}`).emit('chat:message', {
-          chatId: archiveMessage.chat_id,
-          message: archiveMessage,
-        });
-        emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
-          chatId: archiveMessage.chat_id,
-        });
-      }
-    }
-    if (socketIo && result?.processed) {
-      emitCatalogQueueUpdated(socketIo, result.tenantId || null, {
-        action: result.kind || 'updated',
-        channel_id: result.channelId || null,
-        archive_channel_id: result.archiveChannelId || null,
-        queue_id: result.queueItemId || null,
+function emitProcessedPublicationResult(result, io = null) {
+  const socketIo = io || global.__projectPhoenixSocketIo || null;
+  if (!socketIo || !result?.processed) return;
+  if (result.kind === 'published') {
+    for (const message of result.emitted.hiddenRevisionMessages || []) {
+      socketIo.to(`chat:${message.chat_id}`).emit('chat:message', {
+        chatId: message.chat_id,
+        message,
+      });
+      emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
+        chatId: message.chat_id,
       });
     }
-    return result;
-  } catch (error) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (_) {}
-    console.error('channel publication processor error', error);
-    try {
-      await logMonitoringEvent({
-        queryable: db,
-        scope: 'process',
-        subsystem: 'catalog_publish',
-        level: 'error',
-        code: 'channel_publication_processor_error',
-        source: 'server/src/utils/channelPublicationQueue.js',
-        message: String(error?.message || error || 'channel publication processor error'),
-        details: {
-          worker_id: PROCESSOR_ID,
-          stack: String(error?.stack || '').trim() || null,
-        },
+    if (result.emitted.mainMessage) {
+      socketIo.to(`chat:${result.emitted.mainMessage.chat_id}`).emit('chat:message', {
+        chatId: result.emitted.mainMessage.chat_id,
+        message: result.emitted.mainMessage,
       });
-    } catch (_) {}
-    return null;
-  } finally {
-    client.release();
+      emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
+        chatId: result.emitted.mainMessage.chat_id,
+      });
+    }
+    for (const archiveMessage of result.emitted.archiveMessages || []) {
+      socketIo.to(`chat:${archiveMessage.chat_id}`).emit('chat:message', {
+        chatId: archiveMessage.chat_id,
+        message: archiveMessage,
+      });
+      emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
+        chatId: archiveMessage.chat_id,
+      });
+    }
   }
+  emitCatalogQueueUpdated(socketIo, result.tenantId || null, {
+    action: result.kind || 'updated',
+    channel_id: result.channelId || null,
+    archive_channel_id: result.archiveChannelId || null,
+    queue_id: result.queueItemId || null,
+  });
+}
+
+async function processNextChannelPublicationStepForScope(scope, { io = null } = {}) {
+  return db.runWithTenantRow(scope, async () => {
+    const client = await db.connect();
+    const scopeTenantId = String(scope?.id || '').trim() || null;
+    try {
+      await client.query('BEGIN');
+      const batch = await selectDueBatch(client, scopeTenantId);
+      if (!batch) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const result = await processBatchItem(client, batch);
+      await client.query('COMMIT');
+      emitProcessedPublicationResult(result, io);
+      return result;
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('channel publication processor error', error);
+      try {
+        await logMonitoringEvent({
+          queryable: db,
+          scope: 'process',
+          subsystem: 'catalog_publish',
+          level: 'error',
+          code: 'channel_publication_processor_error',
+          source: 'server/src/utils/channelPublicationQueue.js',
+          message: String(error?.message || error || 'channel publication processor error'),
+          details: {
+            worker_id: PROCESSOR_ID,
+            tenant_id: scopeTenantId,
+            tenant_code: String(scope?.code || '').trim() || null,
+            stack: String(error?.stack || '').trim() || null,
+          },
+        });
+      } catch (_) {}
+      return null;
+    } finally {
+      client.release();
+    }
+  });
+}
+
+async function processNextChannelPublicationStep({ io = null } = {}) {
+  const tenantRows = await loadProcessorTenantTargets();
+  const scopes = rotateProcessorScopes(buildProcessorScopes(tenantRows));
+  for (const scope of scopes) {
+    const result = await processNextChannelPublicationStepForScope(scope, { io });
+    if (result?.processed) {
+      return result;
+    }
+  }
+  return null;
 }
 
 async function runProcessorTick(io = null) {
