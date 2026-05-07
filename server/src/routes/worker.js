@@ -801,6 +801,8 @@ function buildRevisionQueuePayload({
   price,
   quantity,
   shelfNumber,
+  productShelfNumber,
+  revisionShelfNumber,
   imageUrl,
   selectedDates = [],
   sourceMessageIds = [],
@@ -809,6 +811,14 @@ function buildRevisionQueuePayload({
   auto = false,
 }) {
   const previous = parseSettings(existingPayload);
+  const resolvedProductShelfNumber = toShelfNumber(
+    productShelfNumber ?? previous.shelf_number ?? shelfNumber,
+    1,
+  );
+  const resolvedRevisionShelfNumber = toShelfNumber(
+    revisionShelfNumber ?? previous.revision_shelf_number ?? shelfNumber,
+    resolvedProductShelfNumber,
+  );
   const mergedSourceMessageIds = uniqStrings([
     ...extractSourceMessageIdsFromPayload(previous),
     ...sourceMessageIds,
@@ -819,7 +829,8 @@ function buildRevisionQueuePayload({
     description,
     price,
     quantity,
-    shelf_number: shelfNumber,
+    shelf_number: resolvedProductShelfNumber,
+    revision_shelf_number: resolvedRevisionShelfNumber,
     image_url: imageUrl,
     revision_manual: manual,
     revision_auto: auto,
@@ -920,10 +931,9 @@ async function fetchRevisionDayStats(client, channelId) {
 async function fetchRevisionDaySequence(client, channelId) {
   const rows = await fetchRevisionDayStats(client, channelId);
   if (rows.length === 0) return [];
-  const baseShelfNumber = 2;
 
   return rows.map((row, index) => {
-    const revisionShelfNumber = baseShelfNumber + index;
+    const revisionShelfNumber = (index % 10) + 1;
     return {
       ...row,
       revision_shelf_number: revisionShelfNumber,
@@ -1062,7 +1072,7 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
       revision_shelf_number: revisionShelfNumber,
       revision_shelf_label: formatShelfLabel(revisionShelfNumber),
       source_product_shelf_number: Number(
-        meta.shelf_number ?? row.product_shelf_number ?? 1,
+        row.product_shelf_number ?? meta.shelf_number ?? 1,
       ),
       title: String(row.product_title || '').trim(),
       description: String(row.product_description || '').trim(),
@@ -1738,7 +1748,7 @@ router.get(
                   q.created_at,
                   c.title AS channel_title,
                   p.product_code,
-                  COALESCE(NULLIF(q.payload->>'shelf_number', '')::int, p.shelf_number) AS product_shelf_number,
+                  p.shelf_number AS product_shelf_number,
                   COALESCE(NULLIF(BTRIM(q.payload->>'title'), ''), p.title) AS product_title,
                   COALESCE(NULLIF(BTRIM(q.payload->>'description'), ''), p.description) AS product_description,
                   COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
@@ -2227,10 +2237,11 @@ router.post(
         ]);
 
         const nextQuantity = Math.floor(item.quantity);
-        const nextShelfNumber = toShelfNumber(
+        const nextRevisionShelfNumber = toShelfNumber(
           revisionShelfByDay.get(String(target.day || '').trim()),
           1,
         );
+        const nextProductShelfNumber = toShelfNumber(target.product_shelf_number, 1);
         const nextPrice = Number(item.price);
         const nextImageUrl = item.image_url || normalizeImageUrl(target.product_image_url) || null;
         const payload = buildRevisionQueuePayload({
@@ -2242,7 +2253,9 @@ router.post(
           description: item.description,
           price: nextPrice,
           quantity: nextQuantity,
-          shelfNumber: nextShelfNumber,
+          shelfNumber: nextProductShelfNumber,
+          productShelfNumber: nextProductShelfNumber,
+          revisionShelfNumber: nextRevisionShelfNumber,
           imageUrl: nextImageUrl,
           selectedDates: [],
           sourceMessageIds,
@@ -2306,7 +2319,8 @@ router.post(
           product_id: productId,
           source_message_ids: sourceMessageIds,
           product_code: target.product_code,
-          product_shelf_number: nextShelfNumber,
+          product_shelf_number: nextProductShelfNumber,
+          revision_shelf_number: nextRevisionShelfNumber,
           product_title: item.title,
           product_description: item.description,
           product_price: nextPrice,
@@ -2444,7 +2458,11 @@ router.post(
 
         const revisedPrice = roundAutoRevisionPrice(basePrice, discountPercent, 50, 50);
         const nextQuantity = toPositiveInteger(post.quantity, 1);
-        const nextShelfNumber = toShelfNumber(post.revision_shelf_number, 1);
+        const nextRevisionShelfNumber = toShelfNumber(post.revision_shelf_number, 1);
+        const nextProductShelfNumber = toShelfNumber(
+          post.source_product_shelf_number ?? post.product_shelf_number,
+          1,
+        );
         const title = String(post.title || '').trim();
         if (!title) continue;
         const description = String(post.description || '').trim();
@@ -2466,7 +2484,9 @@ router.post(
           description,
           price: revisedPrice,
           quantity: nextQuantity,
-          shelfNumber: nextShelfNumber,
+          shelfNumber: nextProductShelfNumber,
+          productShelfNumber: nextProductShelfNumber,
+          revisionShelfNumber: nextRevisionShelfNumber,
           imageUrl,
           selectedDates,
           sourceMessageIds,

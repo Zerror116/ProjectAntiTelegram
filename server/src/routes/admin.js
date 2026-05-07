@@ -2885,7 +2885,7 @@ router.get(
                   COALESCE(NULLIF(BTRIM(q.payload->>'description'), ''), p.description) AS product_description,
                   COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
                   COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
-                  COALESCE(NULLIF(q.payload->>'shelf_number', '')::int, p.shelf_number) AS product_shelf_number,
+                  p.shelf_number AS product_shelf_number,
                   COALESCE(NULLIF(BTRIM(q.payload->>'image_url'), ''), p.image_url) AS product_image_url,
                   p.product_code,
                   u.email AS queued_by_email,

@@ -383,7 +383,7 @@ async function getChannelPublicationBatch(queryable, batchId, tenantId = null) {
             COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
             COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
             p.product_code,
-            COALESCE(NULLIF(q.payload->>'shelf_number', '')::int, p.shelf_number) AS product_shelf_number
+            p.shelf_number AS product_shelf_number
      FROM product_publication_queue q
      JOIN products p ON p.id = q.product_id
      WHERE q.publish_batch_id = $1
@@ -819,9 +819,10 @@ async function processBatchItem(client, batch) {
       ? Math.floor(rawNextQuantity)
       : (Number.isFinite(fallbackQuantity) && fallbackQuantity > 0 ? Math.floor(fallbackQuantity) : 1);
 
-    const rawNextShelf = Number(payload.shelf_number ?? row.shelf_number ?? 0);
-    const nextShelfNumber = Number.isFinite(rawNextShelf) && rawNextShelf > 0
-      ? Math.floor(rawNextShelf)
+    // Product shelf is assigned on creation/requeue and must not be moved by revision payloads.
+    const rawProductShelf = Number(row.shelf_number ?? 0);
+    const nextShelfNumber = Number.isFinite(rawProductShelf) && rawProductShelf > 0
+      ? Math.floor(rawProductShelf)
       : await resolveAutoShelfNumber(client, batch.tenant_id || null, null, 1);
     const nextImageUrl = payload.image_url
       ? toOriginalPublicMediaUrl(payload.image_url)

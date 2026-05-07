@@ -1681,9 +1681,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
         final shouldUseBrowserFallback =
             !browserFallbackTriggeredByManagedFailure &&
             fallbackUri != null &&
-            state.isFailed &&
-            (failureCode == 'manifest_signature_invalid' ||
-                failureCode == 'manifest_invalid');
+            (state.isFailed || state.status == 'paused') &&
+            _shouldUseAndroidBrowserFallbackForManagedFailure(failureCode);
         if (state.isFailed && failureCode.isNotEmpty) {
           debugPrint('appUpdate: android managed update failure=$failureCode');
         }
@@ -1811,7 +1810,11 @@ Future<bool> _downloadAndInstallAndroidUpdate({
                           state.isVerifying ||
                           state.isInstalling;
                       final canUseBrowserFallback =
-                          state.isFailed && fallbackUri != null;
+                          fallbackUri != null &&
+                          (state.isFailed || state.status == 'paused') &&
+                          _shouldUseAndroidBrowserFallbackForManagedFailure(
+                            state.errorCode,
+                          );
 
                       return Column(
                         mainAxisSize: MainAxisSize.max,
@@ -2169,6 +2172,19 @@ Future<bool> _downloadAndInstallAndroidUpdate({
     statusNotifier.dispose();
     _nativeAndroidUpdateBusy = false;
   }
+}
+
+bool _shouldUseAndroidBrowserFallbackForManagedFailure(String rawCode) {
+  final code = rawCode.trim().toLowerCase();
+  return code == 'manifest_signature_invalid' ||
+      code == 'manifest_invalid' ||
+      code == 'manifest_missing' ||
+      code == 'download_url_rejected' ||
+      code == 'download_interrupted' ||
+      code == 'download_failed' ||
+      code == 'sha256_mismatch' ||
+      code == 'apk_empty' ||
+      code == 'apk_package_mismatch';
 }
 
 Uri? _resolveAndroidFallbackUpdateUri(_AppUpdateInfo info) {
@@ -2799,16 +2815,16 @@ class _GlobalNoticeHost extends StatelessWidget {
                                 onTap: () => _appNoticeNotifier.value = null,
                                 child: Container(
                                   decoration: BoxDecoration(
-                                    color: theme.colorScheme.surfaceContainerHigh,
+                                    color:
+                                        theme.colorScheme.surfaceContainerHigh,
                                     borderRadius: BorderRadius.circular(22),
                                     border: Border.all(
                                       color: theme.colorScheme.outlineVariant,
                                     ),
                                     boxShadow: [
                                       BoxShadow(
-                                        color: theme.colorScheme.shadow.withValues(
-                                          alpha: 0.16,
-                                        ),
+                                        color: theme.colorScheme.shadow
+                                            .withValues(alpha: 0.16),
                                         blurRadius: 28,
                                         offset: const Offset(0, 12),
                                       ),
@@ -2827,12 +2843,13 @@ class _GlobalNoticeHost extends StatelessWidget {
                                           ),
                                           Expanded(
                                             child: Padding(
-                                              padding: const EdgeInsets.fromLTRB(
-                                                14,
-                                                12,
-                                                10,
-                                                12,
-                                              ),
+                                              padding:
+                                                  const EdgeInsets.fromLTRB(
+                                                    14,
+                                                    12,
+                                                    10,
+                                                    12,
+                                                  ),
                                               child: Row(
                                                 crossAxisAlignment:
                                                     CrossAxisAlignment.start,
@@ -2842,7 +2859,9 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                     height: 34,
                                                     decoration: BoxDecoration(
                                                       color: visuals.accent
-                                                          .withValues(alpha: 0.12),
+                                                          .withValues(
+                                                            alpha: 0.12,
+                                                          ),
                                                       shape: BoxShape.circle,
                                                     ),
                                                     alignment: Alignment.center,
@@ -2858,14 +2877,17 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                       mainAxisSize:
                                                           MainAxisSize.min,
                                                       crossAxisAlignment:
-                                                          CrossAxisAlignment.start,
+                                                          CrossAxisAlignment
+                                                              .start,
                                                       children: [
-                                                        if (notice.title != null)
+                                                        if (notice.title !=
+                                                            null)
                                                           Text(
                                                             notice.title!,
                                                             maxLines: 1,
-                                                            overflow: TextOverflow
-                                                                .ellipsis,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
                                                             style: theme
                                                                 .textTheme
                                                                 .labelLarge
@@ -2883,14 +2905,16 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                           maxLines: 2,
                                                           overflow: TextOverflow
                                                               .ellipsis,
-                                                          style: theme.textTheme
+                                                          style: theme
+                                                              .textTheme
                                                               .bodyMedium
                                                               ?.copyWith(
                                                                 color: theme
                                                                     .colorScheme
                                                                     .onSurface,
                                                                 fontWeight:
-                                                                    FontWeight.w700,
+                                                                    FontWeight
+                                                                        .w700,
                                                               ),
                                                         ),
                                                       ],
@@ -2898,7 +2922,8 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                   ),
                                                   IconButton(
                                                     onPressed: () =>
-                                                        _appNoticeNotifier.value =
+                                                        _appNoticeNotifier
+                                                                .value =
                                                             null,
                                                     tooltip: 'Скрыть',
                                                     icon: const Icon(
