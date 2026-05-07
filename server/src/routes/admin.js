@@ -479,7 +479,9 @@ async function resolveAutoShelfNumber(
   }
 
   const diffQ = await client.query(
-    `SELECT GREATEST(0, ($1::date - $2::date))::int AS diff_days`,
+    `SELECT GREATEST(0, COUNT(*)::int - 1) AS diff_days
+     FROM generate_series($2::date, $1::date, interval '1 day') AS day(value)
+     WHERE EXTRACT(ISODOW FROM day.value) < 7`,
     [currentDay, startDay],
   );
   const diffDays = Number(diffQ.rows[0]?.diff_days || 0);

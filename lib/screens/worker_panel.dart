@@ -84,7 +84,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool _posting = false;
   bool _searching = false;
   bool _savingOwnPost = false;
-  bool _loadingRevisionDates = false;
+  bool _loadingRevisionShelves = false;
   bool _loadingRevisionPosts = false;
   bool _runningRevision = false;
   bool _autoHideOldRevisionPosts = true;
@@ -218,9 +218,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   String? _selectedChannelId;
   List<Map<String, dynamic>> _searchResults = [];
   List<Map<String, dynamic>> _ownQueuedPosts = [];
-  List<Map<String, dynamic>> _revisionDates = [];
+  List<Map<String, dynamic>> _revisionShelves = [];
   List<Map<String, dynamic>> _revisionPosts = [];
-  String? _selectedRevisionDate;
+  int? _selectedRevisionShelfNumber;
 
   @override
   void initState() {
@@ -401,7 +401,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       _loadOwnQueuedPosts();
     }
     if (_hasVisibleTab('revision')) {
-      _loadRevisionDates();
+      _loadRevisionShelves();
     }
   }
 
@@ -1057,44 +1057,51 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
-  Future<void> _loadRevisionDates() async {
+  Future<void> _loadRevisionShelves() async {
     if (mounted) {
-      setState(() => _loadingRevisionDates = true);
+      setState(() => _loadingRevisionShelves = true);
     }
     try {
       final resp = await authService.dio.get('/api/worker/revision/dates');
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
-        final dates = List<Map<String, dynamic>>.from(data['data']);
-        final availableDays = dates
-            .map((e) => (e['day'] ?? '').toString())
-            .where((e) => e.isNotEmpty)
+        final shelves = List<Map<String, dynamic>>.from(data['data']);
+        final availableShelves = shelves
+            .map((e) => _toIntValue(e['shelf_number'], 0))
+            .where((e) => e >= 1 && e <= 10)
             .toList();
+        final firstWithPosts = shelves
+            .where((e) => _toIntValue(e['posts'], 0) > 0)
+            .map((e) => _toIntValue(e['shelf_number'], 0))
+            .where((e) => e >= 1 && e <= 10)
+            .cast<int?>()
+            .firstWhere((_) => true, orElse: () => null);
         final nextSelected =
-            (_selectedRevisionDate != null &&
-                availableDays.contains(_selectedRevisionDate))
-            ? _selectedRevisionDate
-            : (availableDays.isNotEmpty ? availableDays.first : null);
+            (_selectedRevisionShelfNumber != null &&
+                availableShelves.contains(_selectedRevisionShelfNumber))
+            ? _selectedRevisionShelfNumber
+            : (firstWithPosts ??
+                  (availableShelves.isNotEmpty ? availableShelves.first : 1));
         if (!mounted) return;
         setState(() {
-          _revisionDates = dates;
-          _selectedRevisionDate = nextSelected;
+          _revisionShelves = shelves;
+          _selectedRevisionShelfNumber = nextSelected;
         });
         await _loadRevisionPosts();
       } else {
         if (!mounted) return;
         setState(() {
-          _revisionDates = [];
-          _selectedRevisionDate = null;
+          _revisionShelves = [];
+          _selectedRevisionShelfNumber = 1;
           _revisionPosts = [];
         });
       }
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = 'Ошибка загрузки дат ревизии: $e');
+      setState(() => _message = 'Ошибка загрузки полок ревизии: $e');
     } finally {
       if (mounted) {
-        setState(() => _loadingRevisionDates = false);
+        setState(() => _loadingRevisionShelves = false);
       }
     }
   }
@@ -1104,10 +1111,10 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _loadingRevisionPosts = true);
     }
     try {
-      final selected = (_selectedRevisionDate ?? '').trim();
+      final selected = _selectedRevisionShelfNumber ?? 1;
       final resp = await authService.dio.get(
         '/api/worker/revision/posts',
-        queryParameters: {if (selected.isNotEmpty) 'dates': selected},
+        queryParameters: {'shelf_number': selected},
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -1115,23 +1122,14 @@ class _WorkerPanelState extends State<WorkerPanel>
         final posts = payload['posts'] is List
             ? List<Map<String, dynamic>>.from(payload['posts'])
             : <Map<String, dynamic>>[];
-        final dates = payload['dates'] is List
-            ? (payload['dates'] as List)
-                  .map((e) => e?.toString() ?? '')
-                  .where((e) => e.isNotEmpty)
-                  .toList()
-            : (_selectedRevisionDate == null
-                  ? <String>[]
-                  : <String>[_selectedRevisionDate!]);
-        final nextSelected =
-            _selectedRevisionDate != null &&
-                dates.contains(_selectedRevisionDate)
-            ? _selectedRevisionDate
-            : (dates.isNotEmpty ? dates.first : null);
+        final responseShelf = _toIntValue(payload['shelf_number'], selected);
+        final nextSelected = responseShelf >= 1 && responseShelf <= 10
+            ? responseShelf
+            : selected;
         if (!mounted) return;
         setState(() {
           _revisionPosts = posts;
-          _selectedRevisionDate = nextSelected;
+          _selectedRevisionShelfNumber = nextSelected;
         });
       } else {
         if (!mounted) return;
@@ -1147,12 +1145,14 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
-  String _revisionDayOf(Map<String, dynamic> post) {
-    final explicit = (post['day'] ?? '').toString().trim();
-    if (explicit.isNotEmpty) return explicit;
-    final createdAt = (post['created_at'] ?? '').toString().trim();
-    if (createdAt.length >= 10) return createdAt.substring(0, 10);
-    return '';
+  int _revisionShelfOf(Map<String, dynamic> post) {
+    final shelf = _toIntValue(
+      post['revision_shelf_number'] ??
+          post['shelf_number'] ??
+          post['source_product_shelf_number'],
+      0,
+    );
+    return shelf >= 1 && shelf <= 10 ? shelf : 0;
   }
 
   bool _isRevisionBlocked(Map<String, dynamic> post) {
@@ -1180,37 +1180,38 @@ class _WorkerPanelState extends State<WorkerPanel>
           ),
         )
         .toList();
-    final countsByDay = <String, int>{};
+    final countsByShelf = <int, int>{};
     for (final post in remainingPosts) {
-      final day = _revisionDayOf(post);
-      if (day.isEmpty) continue;
-      countsByDay.update(day, (value) => value + 1, ifAbsent: () => 1);
+      final shelf = _revisionShelfOf(post);
+      if (shelf <= 0) continue;
+      countsByShelf.update(shelf, (value) => value + 1, ifAbsent: () => 1);
     }
 
-    final nextDates = <Map<String, dynamic>>[];
-    for (final item in _revisionDates) {
+    final nextShelves = <Map<String, dynamic>>[];
+    for (final item in _revisionShelves) {
       final copy = Map<String, dynamic>.from(item);
-      final day = (copy['day'] ?? '').toString().trim();
-      final nextCount = countsByDay[day] ?? 0;
-      if (nextCount <= 0) continue;
+      final shelf = _toIntValue(copy['shelf_number'], 0);
+      final nextCount = countsByShelf[shelf] ?? 0;
       copy['posts'] = nextCount;
-      nextDates.add(copy);
+      nextShelves.add(copy);
     }
 
     final nextSelected =
-        (_selectedRevisionDate != null &&
-            nextDates.any(
-              (item) => (item['day'] ?? '').toString() == _selectedRevisionDate,
+        (_selectedRevisionShelfNumber != null &&
+            nextShelves.any(
+              (item) =>
+                  _toIntValue(item['shelf_number'], 0) ==
+                  _selectedRevisionShelfNumber,
             ))
-        ? _selectedRevisionDate
-        : (nextDates.isNotEmpty
-              ? (nextDates.first['day'] ?? '').toString()
-              : null);
+        ? _selectedRevisionShelfNumber
+        : (nextShelves.isNotEmpty
+              ? _toIntValue(nextShelves.first['shelf_number'], 1)
+              : 1);
 
     setState(() {
       _revisionPosts = remainingPosts;
-      _revisionDates = nextDates;
-      _selectedRevisionDate = nextSelected;
+      _revisionShelves = nextShelves;
+      _selectedRevisionShelfNumber = nextSelected;
     });
   }
 
@@ -1274,12 +1275,11 @@ class _WorkerPanelState extends State<WorkerPanel>
     setState(() => _ownQueuedPosts = nextItems);
   }
 
-  Future<void> _toggleRevisionDate(String day) async {
-    final normalizedDay = day.trim();
-    if (normalizedDay.isEmpty) return;
-    if (_selectedRevisionDate == normalizedDay) return;
+  Future<void> _selectRevisionShelf(int shelfNumber) async {
+    if (shelfNumber < 1 || shelfNumber > 10) return;
+    if (_selectedRevisionShelfNumber == shelfNumber) return;
     if (!mounted) return;
-    setState(() => _selectedRevisionDate = normalizedDay);
+    setState(() => _selectedRevisionShelfNumber = shelfNumber);
     await _loadRevisionPosts();
   }
 
@@ -1297,9 +1297,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       return;
     }
     final percent = enteredPercent.abs();
-    final selectedDate = (_selectedRevisionDate ?? '').trim();
-    if (selectedDate.isEmpty) {
-      setState(() => _message = 'Выберите дату ревизии');
+    final selectedShelf = _selectedRevisionShelfNumber ?? 0;
+    if (selectedShelf < 1 || selectedShelf > 10) {
+      setState(() => _message = 'Выберите полку ревизии');
       return;
     }
 
@@ -1332,7 +1332,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       final resp = await authService.dio.post(
         '/api/worker/revision/auto',
         data: {
-          'dates': [selectedDate],
+          'shelf_number': selectedShelf,
           'percent': percent,
           'hide_old_versions': _autoHideOldRevisionPosts,
         },
@@ -1521,6 +1521,12 @@ class _WorkerPanelState extends State<WorkerPanel>
               'description': description,
               'price': price,
               'quantity': quantity,
+              'shelf_number':
+                  post['source_product_shelf_number'] ??
+                  post['product_shelf_number'] ??
+                  post['shelf_number'],
+              'revision_shelf_number':
+                  post['revision_shelf_number'] ?? post['shelf_number'],
               'image_url': (post['image_url'] ?? '').toString(),
             },
           ],
@@ -2831,10 +2837,15 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Widget _buildRevisionTab() {
     final theme = Theme.of(context);
-    final selectedDay = _selectedRevisionDate;
+    final selectedShelf = _selectedRevisionShelfNumber ?? 1;
+    final selectedShelfData = _revisionShelves
+        .where((item) => _toIntValue(item['shelf_number'], 0) == selectedShelf)
+        .cast<Map<String, dynamic>?>()
+        .firstWhere((_) => true, orElse: () => null);
+    final selectedShelfPosts = _toIntValue(selectedShelfData?['posts'], 0);
     return RefreshIndicator(
       onRefresh: () async {
-        await _loadRevisionDates();
+        await _loadRevisionShelves();
       },
       child: ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
@@ -2850,126 +2861,63 @@ class _WorkerPanelState extends State<WorkerPanel>
                 ),
                 SizedBox(height: 6),
                 Text(
-                  'Выберите первую или вторую дату публикации, затем применяйте авто-ревизию или вручную редактируйте карточки. Даты больше не смешиваются, полка жёстко привязана к выбранному дню.',
+                  'Выберите нужную полку от 01 до 10. Ревизия покажет товары только с этой полки и не зависит от дат, выходных или воскресенья.',
                 ),
               ],
             ),
           ),
           const SizedBox(height: 14),
-          if (_loadingRevisionDates)
-            ...List.generate(
-              2,
-              (index) => const AppSkeletonCard(
-                margin: EdgeInsets.only(bottom: 10),
-                height: 110,
-                showImage: false,
-              ),
+          if (_loadingRevisionShelves)
+            const AppSkeletonCard(
+              margin: EdgeInsets.only(bottom: 10),
+              height: 92,
+              showImage: false,
             )
-          else if (_revisionDates.isEmpty)
+          else if (_revisionShelves.isEmpty)
             const AppEmptyState(
               badge: 'Ревизия',
-              title: 'Нет данных для ревизии',
+              title: 'Нет полок для ревизии',
               subtitle:
-                  'Когда в канале появятся подходящие товары, здесь отобразятся доступные даты публикации.',
+                  'Когда в канале появятся подходящие товары, здесь появится выбор полок.',
               icon: Icons.tune_rounded,
             )
           else
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final buttonWidth = _revisionDates.length <= 1
-                    ? constraints.maxWidth
-                    : ((constraints.maxWidth - 8) / 2)
-                          .clamp(0.0, double.infinity)
-                          .toDouble();
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: _revisionDates.map((item) {
-                    final day = (item['day'] ?? '').toString();
-                    final label = (item['label'] ?? day).toString();
-                    final count = _toIntValue(item['posts'], 0);
-                    final revisionShelfLabel =
-                        (item['revision_shelf_label'] ?? '').toString().trim();
-                    final selected = selectedDay == day;
-                    final colorScheme = theme.colorScheme;
-                    return SizedBox(
-                      width: buttonWidth,
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(22),
-                        onTap: () => _toggleRevisionDate(day),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 180),
-                          curve: Curves.easeOut,
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: selected
-                                ? colorScheme.primaryContainer.withValues(
-                                    alpha: 0.52,
-                                  )
-                                : colorScheme.surfaceContainerLow,
-                            borderRadius: BorderRadius.circular(22),
-                            border: Border.all(
-                              color: selected
-                                  ? colorScheme.primary.withValues(alpha: 0.30)
-                                  : colorScheme.outlineVariant,
-                            ),
-                            boxShadow: selected
-                                ? [
-                                    BoxShadow(
-                                      color: colorScheme.primary.withValues(
-                                        alpha: 0.14,
-                                      ),
-                                      blurRadius: 22,
-                                      offset: const Offset(0, 10),
-                                    ),
-                                  ]
-                                : const [],
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      label,
-                                      style: theme.textTheme.titleMedium
-                                          ?.copyWith(
-                                            fontWeight: FontWeight.w800,
-                                            color: selected
-                                                ? colorScheme.onPrimaryContainer
-                                                : colorScheme.onSurface,
-                                          ),
-                                    ),
-                                  ),
-                                  if (selected)
-                                    Icon(
-                                      Icons.check_circle_rounded,
-                                      color: colorScheme.primary,
-                                      size: 18,
-                                    ),
-                                ],
-                              ),
-                              const SizedBox(height: 10),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 8,
-                                children: [
-                                  _statChip('$count товаров'),
-                                  _statChip(
-                                    'Полка ${revisionShelfLabel.isNotEmpty ? revisionShelfLabel : '—'}',
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  }).toList(),
-                );
-              },
+            AppSurfaceCard(
+              compact: true,
+              child: DropdownButtonFormField<int>(
+                key: ValueKey('revision-shelf-$selectedShelf'),
+                initialValue: selectedShelf,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Полка для ревизии',
+                  border: OutlineInputBorder(),
+                ),
+                items: _revisionShelves.map((item) {
+                  final shelf = _toIntValue(item['shelf_number'], 1);
+                  final shelfLabel =
+                      (item['shelf_label'] ??
+                              item['revision_shelf_label'] ??
+                              shelf.toString().padLeft(2, '0'))
+                          .toString();
+                  final count = _toIntValue(item['posts'], 0);
+                  return DropdownMenuItem<int>(
+                    value: shelf,
+                    child: Text('Полка $shelfLabel · $count товаров'),
+                  );
+                }).toList(),
+                onChanged: _runningRevision
+                    ? null
+                    : (value) {
+                        if (value != null) {
+                          unawaited(_selectRevisionShelf(value));
+                        }
+                      },
+              ),
             ),
+          const SizedBox(height: 8),
+          _statChip(
+            "Выбрана полка ${selectedShelf.toString().padLeft(2, '0')} · $selectedShelfPosts товаров",
+          ),
           const SizedBox(height: 14),
           AppSurfaceCard(
             child: Column(
@@ -3072,8 +3020,8 @@ class _WorkerPanelState extends State<WorkerPanel>
             )
           else if (_revisionPosts.isEmpty)
             const AppEmptyState(
-              badge: 'Выбранная дата',
-              title: 'Нет постов для выбранной даты',
+              badge: 'Выбранная полка',
+              title: 'Нет постов для выбранной полки',
               subtitle:
                   'Либо подходящих товаров нет, либо они уже не участвуют в ревизии.',
               icon: Icons.inventory_2_outlined,

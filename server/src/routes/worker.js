@@ -179,6 +179,13 @@ function parseRevisionDates(value) {
   return [];
 }
 
+function parseRevisionShelfNumber(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const shelf = Number(String(raw ?? '').trim());
+  if (!Number.isFinite(shelf) || shelf < 1 || shelf > 10) return null;
+  return Math.floor(shelf);
+}
+
 const REVISION_PENDING_CART_STATUSES = ['pending_processing'];
 const REVISION_COMPLETED_CART_STATUSES = [
   'processed',
@@ -268,7 +275,9 @@ async function resolveAutoShelfNumber(
   }
 
   const diffQ = await client.query(
-    `SELECT GREATEST(0, ($1::date - $2::date))::int AS diff_days`,
+    `SELECT GREATEST(0, COUNT(*)::int - 1) AS diff_days
+     FROM generate_series($2::date, $1::date, interval '1 day') AS day(value)
+     WHERE EXTRACT(ISODOW FROM day.value) < 7`,
     [currentDay, startDay]
   );
   const diffDays = Number(diffQ.rows[0]?.diff_days || 0);
@@ -424,6 +433,7 @@ function normalizeRevisionEntry(raw) {
   const price = Number(item.price);
   const quantity = Number(item.quantity);
   const shelfNumber = Number(item.shelf_number);
+  const revisionShelfNumber = Number(item.revision_shelf_number);
   return {
     product_id: String(item.product_id || '').trim(),
     message_id: String(item.message_id || '').trim(),
@@ -432,6 +442,7 @@ function normalizeRevisionEntry(raw) {
     price,
     quantity,
     shelf_number: shelfNumber,
+    revision_shelf_number: revisionShelfNumber,
     image_url: normalizeImageUrl(item.image_url),
   };
 }
@@ -646,9 +657,10 @@ async function hideCatalogMessagesMissingPhoto(client, channelId, messageIds, ac
 async function sanitizeRevisionVisibleCatalogMessages(
   client,
   channelId,
-  { actorUserId = null, selectedDates = [] } = {},
+  { actorUserId = null, selectedDates = [], selectedShelfNumber = null } = {},
 ) {
   const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
+  const shelfFilter = parseRevisionShelfNumber(selectedShelfNumber);
   const q = await client.query(
     `SELECT m.id AS message_id,
             m.chat_id,
@@ -656,6 +668,7 @@ async function sanitizeRevisionVisibleCatalogMessages(
             m.text,
             m.meta,
             m.created_at,
+            p.shelf_number AS product_shelf_number,
             p.image_url AS product_image_url
      FROM messages m
      LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
@@ -665,8 +678,12 @@ async function sanitizeRevisionVisibleCatalogMessages(
        AND (
          $2::text[] IS NULL
          OR to_char((m.created_at AT TIME ZONE $3), 'YYYY-MM-DD') = ANY($2::text[])
+       )
+       AND (
+         $4::int IS NULL
+         OR p.shelf_number = $4::int
        )`,
-    [channelId, dateFilter, SAMARA_TZ],
+    [channelId, dateFilter, SAMARA_TZ, shelfFilter],
   );
   const messageIdsToHide = [];
   for (const row of q.rows) {
@@ -948,8 +965,89 @@ async function fetchRevisionDays(client, channelId, limit = 2) {
   return rows.slice(0, safeLimit);
 }
 
-async function fetchRevisionPosts(client, channelId, selectedDates) {
-  const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
+async function fetchRevisionShelves(client, channelId) {
+  const q = await client.query(
+    `WITH visible_catalog AS (
+       SELECT m.id AS message_id,
+              p.id AS product_id,
+              p.shelf_number AS product_shelf_number
+       FROM messages m
+       JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+       WHERE m.chat_id = $1
+         AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         AND p.shelf_number BETWEEN 1 AND 10
+     ),
+     queue_state AS (
+       SELECT q.product_id,
+              true AS has_pending
+       FROM product_publication_queue q
+       WHERE q.channel_id = $1
+         AND q.status = 'pending'
+         AND COALESCE(q.is_sent, false) = false
+       GROUP BY q.product_id
+     ),
+     cart_state AS (
+       SELECT ci.product_id,
+              BOOL_OR(ci.status = ANY($2::text[])) AS has_processed_delivery
+       FROM cart_items ci
+       GROUP BY ci.product_id
+     ),
+     reservation_state AS (
+       SELECT r.product_id,
+              BOOL_OR(r.is_fulfilled = true) AS has_fulfilled_reservation
+       FROM reservations r
+       GROUP BY r.product_id
+     )
+     SELECT vc.product_shelf_number::int AS shelf_number,
+            COUNT(*)::int AS posts
+     FROM visible_catalog vc
+     LEFT JOIN queue_state qs ON qs.product_id = vc.product_id
+     LEFT JOIN cart_state cs ON cs.product_id = vc.product_id
+     LEFT JOIN reservation_state rs ON rs.product_id = vc.product_id
+     WHERE COALESCE(qs.has_pending, false) = false
+       AND NOT (
+         COALESCE(cs.has_processed_delivery, false) = true
+         OR COALESCE(rs.has_fulfilled_reservation, false) = true
+       )
+     GROUP BY vc.product_shelf_number
+     ORDER BY vc.product_shelf_number ASC`,
+    [
+      channelId,
+      REVISION_COMPLETED_CART_STATUSES,
+    ],
+  );
+  const countByShelf = new Map(
+    q.rows.map((row) => [
+      toShelfNumber(row.shelf_number, 0),
+      Number(row.posts || 0),
+    ]),
+  );
+  return Array.from({ length: 10 }, (_, index) => {
+    const shelfNumber = index + 1;
+    const shelfLabel = formatShelfLabel(shelfNumber);
+    return {
+      shelf_number: shelfNumber,
+      shelf_label: shelfLabel,
+      revision_shelf_number: shelfNumber,
+      revision_shelf_label: shelfLabel,
+      label: `Полка ${shelfLabel}`,
+      day: `shelf-${shelfLabel}`,
+      posts: countByShelf.get(shelfNumber) || 0,
+    };
+  });
+}
+
+async function fetchRevisionPosts(client, channelId, selection = {}) {
+  const selectedDates = Array.isArray(selection)
+    ? selection
+    : Array.isArray(selection.selectedDates)
+      ? selection.selectedDates
+      : [];
+  const dateFilter = selectedDates.length > 0 ? selectedDates : null;
+  const shelfFilter = parseRevisionShelfNumber(
+    Array.isArray(selection) ? null : selection.selectedShelfNumber,
+  );
   const revisionDaySequence = await fetchRevisionDaySequence(client, channelId);
   const revisionShelfCache = new Map(
     revisionDaySequence.map((item) => [
@@ -981,6 +1079,10 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
            $2::text[] IS NULL
            OR to_char((m.created_at AT TIME ZONE $3), 'YYYY-MM-DD') = ANY($2::text[])
          )
+         AND (
+           $4::int IS NULL
+           OR p.shelf_number = $4::int
+         )
      ),
      queue_state AS (
        SELECT q.product_id,
@@ -993,8 +1095,8 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
      ),
      cart_state AS (
        SELECT ci.product_id,
-              BOOL_OR(ci.status = ANY($4::text[])) AS has_pending_processing,
-              BOOL_OR(ci.status = ANY($5::text[])) AS has_processed_delivery
+              BOOL_OR(ci.status = ANY($5::text[])) AS has_pending_processing,
+              BOOL_OR(ci.status = ANY($6::text[])) AS has_processed_delivery
        FROM cart_items ci
        GROUP BY ci.product_id
      ),
@@ -1038,6 +1140,7 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
       channelId,
       dateFilter,
       SAMARA_TZ,
+      shelfFilter,
       REVISION_PENDING_CART_STATUSES,
       REVISION_COMPLETED_CART_STATUSES,
     ]
@@ -1050,12 +1153,11 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
     const fallbackImage = normalizeImageUrl(meta.image_url);
     const state = normalizeRevisionState(row);
     const day = String(row.day || '').trim();
-    let revisionShelfNumber = revisionShelfCache.get(day);
+    const sourceProductShelfNumber =
+      toPositiveShelfNumberOrNull(row.product_shelf_number ?? meta.shelf_number) ?? 1;
+    let revisionShelfNumber = shelfFilter ?? revisionShelfCache.get(day);
     if (revisionShelfNumber == null) {
-      const sourceShelfNumber = toPositiveShelfNumberOrNull(
-        meta.shelf_number ?? row.product_shelf_number,
-      );
-      revisionShelfNumber = sourceShelfNumber ?? 1;
+      revisionShelfNumber = sourceProductShelfNumber;
       revisionShelfCache.set(day, revisionShelfNumber);
     }
     mapped.push({
@@ -1071,9 +1173,7 @@ async function fetchRevisionPosts(client, channelId, selectedDates) {
       shelf_number: revisionShelfNumber,
       revision_shelf_number: revisionShelfNumber,
       revision_shelf_label: formatShelfLabel(revisionShelfNumber),
-      source_product_shelf_number: Number(
-        row.product_shelf_number ?? meta.shelf_number ?? 1,
-      ),
+      source_product_shelf_number: sourceProductShelfNumber,
       title: String(row.product_title || '').trim(),
       description: String(row.product_description || '').trim(),
       price: Number(row.product_price ?? fallbackPrice),
@@ -2025,11 +2125,7 @@ router.get(
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
       });
-      const days = await fetchRevisionDays(
-        client,
-        mainChannel.id,
-        2,
-      );
+      const shelves = await fetchRevisionShelves(client, mainChannel.id);
       await client.query('COMMIT');
       try {
         const io = req.app.get('io');
@@ -2047,7 +2143,7 @@ router.get(
       } catch (emitErr) {
         console.error('worker.revision.dates post-commit emit error', emitErr);
       }
-      return res.json({ ok: true, data: days });
+      return res.json({ ok: true, data: shelves });
     } catch (err) {
       try {
         await client.query('ROLLBACK');
@@ -2065,8 +2161,11 @@ router.get(
   authMiddleware,
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
+    const requestedShelfNumber = parseRevisionShelfNumber(
+      req.query?.shelf_number ?? req.query?.shelf,
+    );
     const selectedDates = parseRevisionDates(req.query?.dates);
-    if (selectedDates.length > 1) {
+    if (requestedShelfNumber == null && selectedDates.length > 1) {
       return res.status(400).json({
         ok: false,
         error: 'Для ревизии можно выбрать только одну дату',
@@ -2083,24 +2182,25 @@ router.get(
       );
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
-        selectedDates,
+        selectedDates: requestedShelfNumber == null ? selectedDates : [],
+        selectedShelfNumber: requestedShelfNumber,
       });
-      const fallbackDays = selectedDates.length > 0
-        ? selectedDates
-        : (
-            await fetchRevisionDays(
-              client,
-              mainChannel.id,
-              1,
-            )
-          ).map((x) => x.day);
-      const posts = fallbackDays.length > 0
-        ? await fetchRevisionPosts(
-            client,
-            mainChannel.id,
-            fallbackDays,
-          )
-        : [];
+      const shelves = await fetchRevisionShelves(client, mainChannel.id);
+      const selectedShelfNumber =
+        requestedShelfNumber ??
+        shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
+        1;
+      const fallbackDays =
+        requestedShelfNumber == null && selectedDates.length > 0
+          ? selectedDates
+          : [];
+      const posts = await fetchRevisionPosts(
+        client,
+        mainChannel.id,
+        fallbackDays.length > 0
+          ? { selectedDates: fallbackDays }
+          : { selectedShelfNumber },
+      );
       const enrichedPosts = await attachProductMediaToRows(client, posts);
       await client.query('COMMIT');
       try {
@@ -2123,6 +2223,8 @@ router.get(
         ok: true,
         data: {
           dates: fallbackDays,
+          shelf_number: selectedShelfNumber,
+          shelves,
           posts: enrichedPosts,
         },
       });
@@ -2193,17 +2295,6 @@ router.post(
       const queuedItems = [];
       let reusedPendingCount = 0;
       let blockedCount = 0;
-      const revisionShelfByDay = new Map(
-        (
-          await fetchRevisionDaySequence(
-            client,
-            mainChannel.id,
-          )
-        ).map((item) => [
-          String(item.day || '').trim(),
-          toShelfNumber(item.revision_shelf_number, 1),
-        ]),
-      );
 
       for (const item of normalized) {
         const target = await fetchRevisionTarget(client, mainChannel.id, item);
@@ -2238,8 +2329,8 @@ router.post(
 
         const nextQuantity = Math.floor(item.quantity);
         const nextRevisionShelfNumber = toShelfNumber(
-          revisionShelfByDay.get(String(target.day || '').trim()),
-          1,
+          item.revision_shelf_number ?? item.shelf_number ?? target.product_shelf_number,
+          toShelfNumber(target.product_shelf_number, 1),
         );
         const nextProductShelfNumber = toShelfNumber(target.product_shelf_number, 1);
         const nextPrice = Number(item.price);
@@ -2384,8 +2475,11 @@ router.post(
   authMiddleware,
   requireRole('worker', 'admin', 'tenant', 'creator'),
   async (req, res) => {
+    const requestedShelfNumber = parseRevisionShelfNumber(
+      req.body?.shelf_number ?? req.body?.shelf,
+    );
     const dates = parseRevisionDates(req.body?.dates);
-    if (dates.length > 1) {
+    if (requestedShelfNumber == null && dates.length > 1) {
       return res.status(400).json({
         ok: false,
         error: 'Для ревизии можно выбрать только одну дату',
@@ -2412,24 +2506,26 @@ router.post(
       );
       await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
-        selectedDates: dates,
+        selectedDates: requestedShelfNumber == null ? dates : [],
+        selectedShelfNumber: requestedShelfNumber,
       });
-      const selectedDates = dates.length > 0
-        ? dates
-        : (
-            await fetchRevisionDays(
+      const shelves = await fetchRevisionShelves(client, mainChannel.id);
+      const selectedShelfNumber =
+        requestedShelfNumber ??
+        shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
+        null;
+      const selectedDates =
+        requestedShelfNumber == null && dates.length > 0 ? dates : [];
+      const posts =
+        selectedShelfNumber != null || selectedDates.length > 0
+          ? await fetchRevisionPosts(
               client,
               mainChannel.id,
-              1,
+              selectedDates.length > 0
+                ? { selectedDates }
+                : { selectedShelfNumber },
             )
-          ).map((x) => x.day);
-      const posts = selectedDates.length > 0
-        ? await fetchRevisionPosts(
-            client,
-            mainChannel.id,
-            selectedDates,
-          )
-        : [];
+          : [];
 
       const groups = new Map();
       for (const post of posts) {
@@ -2580,6 +2676,7 @@ router.post(
         ok: true,
         data: {
           dates: selectedDates,
+          shelf_number: selectedShelfNumber,
           percent: discountPercent,
           updated_count: queuedItems.length,
           hidden_old_count: hiddenMessagesById.size,
