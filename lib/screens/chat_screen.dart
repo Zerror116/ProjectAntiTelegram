@@ -22,6 +22,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart' as vp;
 
+import '../assets/phoenix_assets.dart';
 import '../main.dart';
 import '../services/chat_capture_capability_service.dart';
 import '../services/chat_outbox_service.dart';
@@ -47,6 +48,7 @@ import '../widgets/app_status_badge.dart';
 import '../widgets/app_surface_card.dart';
 import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
+import '../widgets/phoenix_ambient_background.dart';
 import '../widgets/phoenix_loader.dart';
 import '../widgets/submit_on_enter.dart';
 
@@ -8226,7 +8228,8 @@ class _ChatScreenState extends State<ChatScreen> {
     EdgeInsetsGeometry? padding,
   }) {
     return Container(
-      padding: padding ?? const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding:
+          padding ?? const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
       decoration: BoxDecoration(
         color: backgroundColor ?? theme.colorScheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(999),
@@ -8239,19 +8242,17 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             TextSpan(
               text: '$label · ',
-              style:
-                  (labelStyle ?? theme.textTheme.labelSmall)?.copyWith(
-                    color: foregroundColor ?? theme.colorScheme.onSurfaceVariant,
-                    fontWeight: FontWeight.w800,
-                  ),
+              style: (labelStyle ?? theme.textTheme.labelSmall)?.copyWith(
+                color: foregroundColor ?? theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w800,
+              ),
             ),
             TextSpan(
               text: value,
-              style:
-                  (valueStyle ?? theme.textTheme.labelSmall)?.copyWith(
-                    color: foregroundColor ?? theme.colorScheme.onSurface,
-                    fontWeight: FontWeight.w800,
-                  ),
+              style: (valueStyle ?? theme.textTheme.labelSmall)?.copyWith(
+                color: foregroundColor ?? theme.colorScheme.onSurface,
+                fontWeight: FontWeight.w800,
+              ),
             ),
           ],
         ),
@@ -11270,9 +11271,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final reservedMarkPlacedDisabled =
         !_canMarkReservedOrderPlaced() || _markingPlaced || isCancelled;
     final reservedOversizeDisabled =
-        !_canMarkReservedOrderPlaced() ||
-        isCancelled ||
-        _markingPlaced;
+        !_canMarkReservedOrderPlaced() || isCancelled || _markingPlaced;
     final reservedShelfChangeDisabled =
         !_canMarkReservedOrderPlaced() ||
         _markingPlaced ||
@@ -11738,10 +11737,12 @@ class _ChatScreenState extends State<ChatScreen> {
                           const SizedBox(height: 12),
                           Builder(
                             builder: (context) {
-                              final prominentBadgeLabelStyle = theme.textTheme
+                              final prominentBadgeLabelStyle = theme
+                                  .textTheme
                                   .labelMedium
                                   ?.copyWith(fontSize: 16, height: 1.05);
-                              final prominentBadgeValueStyle = theme.textTheme
+                              final prominentBadgeValueStyle = theme
+                                  .textTheme
                                   .labelMedium
                                   ?.copyWith(fontSize: 16, height: 1.05);
                               const prominentBadgePadding =
@@ -12227,6 +12228,26 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         body: Stack(
           children: [
+            Positioned.fill(
+              child: ValueListenableBuilder<String>(
+                valueListenable: chatBackgroundEffectNotifier,
+                builder: (context, mode, _) {
+                  return ValueListenableBuilder<bool>(
+                    valueListenable: performanceModeNotifier,
+                    builder: (context, performanceMode, _) {
+                      return PhoenixAmbientBackground(
+                        mode: mode,
+                        chat: true,
+                        enabled: !performanceMode,
+                        opacity: theme.brightness == Brightness.dark
+                            ? 0.68
+                            : 0.52,
+                      );
+                    },
+                  );
+                },
+              ),
+            ),
             Column(
               children: [
                 _buildDirectRequestBanner(),
@@ -12330,6 +12351,9 @@ class _ChatScreenState extends State<ChatScreen> {
                                   icon: _searchQuery.isEmpty
                                       ? Icons.chat_bubble_outline_rounded
                                       : Icons.search_off_rounded,
+                                  assetPath: _searchQuery.isEmpty
+                                      ? PhoenixAssets.emptyStateNoChats
+                                      : null,
                                   compact: true,
                                 ),
                         )
@@ -12388,42 +12412,8 @@ class _ChatScreenState extends State<ChatScreen> {
                                 right: 0,
                                 child: IgnorePointer(
                                   child: Center(
-                                    child: DecoratedBox(
-                                      decoration: BoxDecoration(
-                                        color: theme
-                                            .colorScheme
-                                            .surfaceContainerHighest
-                                            .withValues(alpha: 0.94),
-                                        borderRadius: BorderRadius.circular(
-                                          999,
-                                        ),
-                                        border: Border.all(
-                                          color:
-                                              theme.colorScheme.outlineVariant,
-                                        ),
-                                        boxShadow: [
-                                          BoxShadow(
-                                            color: Colors.black.withValues(
-                                              alpha: 0.08,
-                                            ),
-                                            blurRadius: 14,
-                                            offset: const Offset(0, 4),
-                                          ),
-                                        ],
-                                      ),
-                                      child: Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
-                                          vertical: 6,
-                                        ),
-                                        child: Text(
-                                          _stickyDateLabel!,
-                                          style: theme.textTheme.labelMedium
-                                              ?.copyWith(
-                                                fontWeight: FontWeight.w700,
-                                              ),
-                                        ),
-                                      ),
+                                    child: _StickyDateTimelineCapsule(
+                                      label: _stickyDateLabel!,
                                     ),
                                   ),
                                 ),

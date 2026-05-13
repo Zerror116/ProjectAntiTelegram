@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../assets/phoenix_assets.dart';
 import '../main.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
@@ -1221,6 +1222,7 @@ class _CartScreenState extends State<CartScreen> {
                       title: 'Не удалось загрузить корзину',
                       subtitle: _error,
                       icon: Icons.error_outline_rounded,
+                      assetPath: PhoenixAssets.emptyStateNetworkError,
                       action: FilledButton.icon(
                         onPressed: _load,
                         icon: const Icon(Icons.refresh_rounded),
@@ -1240,6 +1242,7 @@ class _CartScreenState extends State<CartScreen> {
                         subtitle:
                             'Добавьте товар из канала, чтобы он появился здесь.',
                         icon: Icons.shopping_basket_outlined,
+                        assetPath: PhoenixAssets.emptyStateEmptyCart,
                       )
                     else ...[
                       if (basketItems.isNotEmpty) ...[

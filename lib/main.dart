@@ -73,6 +73,15 @@ final ValueNotifier<String> uiDensityNotifier = ValueNotifier('standard');
 final ValueNotifier<String> uiCardSizeNotifier = ValueNotifier('standard');
 final ValueNotifier<bool> performanceModeNotifier = ValueNotifier(false);
 final ValueNotifier<int> themeStyleVersionNotifier = ValueNotifier(0);
+final ValueNotifier<String> navIconAnimationModeNotifier = ValueNotifier(
+  'bounce',
+);
+final ValueNotifier<String> appBackgroundEffectNotifier = ValueNotifier(
+  'embers',
+);
+final ValueNotifier<String> chatBackgroundEffectNotifier = ValueNotifier(
+  'feathers',
+);
 final ValueNotifier<String?> activeChatIdNotifier = ValueNotifier<String?>(
   null,
 );
@@ -85,6 +94,9 @@ const _themePrefPrefix = 'theme_mode_dark_';
 const _uiDensityPrefPrefix = 'ui_density_';
 const _uiCardSizePrefPrefix = 'ui_card_size_';
 const _performanceModePrefPrefix = 'performance_mode_';
+const _navIconAnimationPrefPrefix = 'nav_icon_animation_';
+const _appBackgroundEffectPrefPrefix = 'app_background_effect_';
+const _chatBackgroundEffectPrefPrefix = 'chat_background_effect_';
 String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
 String? _activePhoneAccessDialogRequestId;
@@ -315,7 +327,7 @@ String _defaultApiBaseUrl() {
       host == 'localhost' ||
       host == '0.0.0.0' ||
       host == '::1';
-  if (kDebugMode && isLoopback) {
+  if (isLoopback) {
     return nativeDebugFallback;
   }
 
@@ -1088,6 +1100,12 @@ Future<void> refreshUserPreferences() async {
   final defaultPerformanceMode =
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
   final performanceMode = performanceRaw ?? defaultPerformanceMode;
+  final navIconAnimation =
+      prefs.getString('$_navIconAnimationPrefPrefix$scope') ?? 'bounce';
+  final appBackgroundEffect =
+      prefs.getString('$_appBackgroundEffectPrefPrefix$scope') ?? 'embers';
+  final chatBackgroundEffect =
+      prefs.getString('$_chatBackgroundEffectPrefPrefix$scope') ?? 'feathers';
 
   notificationsEnabledNotifier.value = notifications;
   themeModeNotifier.value = darkMode ? ThemeMode.dark : ThemeMode.light;
@@ -1103,6 +1121,9 @@ Future<void> refreshUserPreferences() async {
     await prefs.setBool('$_performanceModePrefPrefix$scope', true);
   }
   performanceModeNotifier.value = performanceMode;
+  navIconAnimationModeNotifier.value = navIconAnimation;
+  appBackgroundEffectNotifier.value = appBackgroundEffect;
+  chatBackgroundEffectNotifier.value = chatBackgroundEffect;
   _applyPerformanceRuntimeTuning(performanceMode);
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
 }
@@ -1151,6 +1172,49 @@ Future<void> setPerformanceModeEnabled(bool value) async {
   performanceModeNotifier.value = value;
   _applyPerformanceRuntimeTuning(value);
   themeStyleVersionNotifier.value = themeStyleVersionNotifier.value + 1;
+}
+
+Future<void> setNavIconAnimationMode(String value) async {
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  final normalized = _normalizeVisualEffect(value, const {
+    'off',
+    'bounce',
+    'glow',
+  });
+  await prefs.setString('$_navIconAnimationPrefPrefix$scope', normalized);
+  navIconAnimationModeNotifier.value = normalized;
+}
+
+Future<void> setAppBackgroundEffect(String value) async {
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  final normalized = _normalizeVisualEffect(value, const {
+    'off',
+    'embers',
+    'network',
+    'constellation',
+  });
+  await prefs.setString('$_appBackgroundEffectPrefPrefix$scope', normalized);
+  appBackgroundEffectNotifier.value = normalized;
+}
+
+Future<void> setChatBackgroundEffect(String value) async {
+  final prefs = await SharedPreferences.getInstance();
+  final scope = _settingsScopeUserId();
+  final normalized = _normalizeVisualEffect(value, const {
+    'off',
+    'feathers',
+    'constellation',
+  });
+  await prefs.setString('$_chatBackgroundEffectPrefPrefix$scope', normalized);
+  chatBackgroundEffectNotifier.value = normalized;
+}
+
+String _normalizeVisualEffect(String value, Set<String> allowed) {
+  final normalized = value.trim().toLowerCase();
+  if (allowed.contains(normalized)) return normalized;
+  return allowed.contains('off') ? 'off' : allowed.first;
 }
 
 Future<void> _prepareAppSoundPlayer() async {
@@ -2769,214 +2833,115 @@ class _GlobalNoticeHost extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final reducedMotion =
-        performanceModeNotifier.value ||
-        (MediaQuery.maybeOf(context)?.disableAnimations == true);
     return Stack(
       fit: StackFit.expand,
       children: [
         child,
-        Positioned.fill(
-          child: ValueListenableBuilder<_AppNoticePayload?>(
-            valueListenable: _appNoticeNotifier,
-            builder: (context, notice, _) {
-              return IgnorePointer(
-                ignoring: notice == null,
-                child: SafeArea(
-                  child: Align(
-                    alignment: Alignment.topCenter,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                      child: AnimatedSwitcher(
-                        duration: reducedMotion
-                            ? Duration.zero
-                            : const Duration(milliseconds: 220),
-                        switchInCurve: Curves.easeOut,
-                        switchOutCurve: Curves.easeIn,
-                        child: notice == null
-                            ? const SizedBox.shrink(key: ValueKey('empty'))
-                            : LayoutBuilder(
-                                key: ValueKey(notice.id),
-                                builder: (context, constraints) {
-                                  final maxWidth = constraints.maxWidth > 760
-                                      ? 760.0
-                                      : constraints.maxWidth;
-                                  final visuals = _noticeVisuals(
-                                    context,
-                                    notice.tone,
-                                  );
-                                  return SizedBox(
-                                    width: maxWidth,
-                                    child: Material(
-                                      color: Colors.transparent,
-                                      elevation: 8,
-                                      borderRadius: BorderRadius.circular(22),
-                                      child: InkWell(
-                                        borderRadius: BorderRadius.circular(22),
-                                        onTap: () =>
-                                            _appNoticeNotifier.value = null,
-                                        child: Container(
-                                          decoration: BoxDecoration(
-                                            color: theme
-                                                .colorScheme
-                                                .surfaceContainerHigh,
-                                            borderRadius: BorderRadius.circular(
-                                              22,
-                                            ),
-                                            border: Border.all(
-                                              color: theme
-                                                  .colorScheme
-                                                  .outlineVariant,
-                                            ),
-                                            boxShadow: [
-                                              BoxShadow(
-                                                color: theme.colorScheme.shadow
-                                                    .withValues(alpha: 0.16),
-                                                blurRadius: 28,
-                                                offset: const Offset(0, 12),
-                                              ),
-                                            ],
-                                          ),
-                                          child: ClipRRect(
-                                            borderRadius: BorderRadius.circular(
-                                              22,
-                                            ),
-                                            child: IntrinsicHeight(
-                                              child: Row(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.stretch,
-                                                children: [
-                                                  Container(
-                                                    width: 5,
-                                                    color: visuals.accent,
-                                                  ),
-                                                  Expanded(
-                                                    child: Padding(
-                                                      padding:
-                                                          const EdgeInsets.fromLTRB(
-                                                            14,
-                                                            12,
-                                                            10,
-                                                            12,
-                                                          ),
-                                                      child: Row(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .start,
-                                                        children: [
-                                                          Container(
-                                                            width: 34,
-                                                            height: 34,
-                                                            decoration:
-                                                                BoxDecoration(
-                                                                  color: visuals
-                                                                      .accent
-                                                                      .withValues(
-                                                                        alpha:
-                                                                            0.12,
-                                                                      ),
-                                                                  shape: BoxShape
-                                                                      .circle,
-                                                                ),
-                                                            alignment: Alignment
-                                                                .center,
-                                                            child: Icon(
-                                                              visuals.icon,
-                                                              color: visuals
-                                                                  .accent,
-                                                              size: 18,
-                                                            ),
-                                                          ),
-                                                          const SizedBox(
-                                                            width: 12,
-                                                          ),
-                                                          Expanded(
-                                                            child: Column(
-                                                              mainAxisSize:
-                                                                  MainAxisSize
-                                                                      .min,
-                                                              crossAxisAlignment:
-                                                                  CrossAxisAlignment
-                                                                      .start,
-                                                              children: [
-                                                                if (notice
-                                                                        .title !=
-                                                                    null)
-                                                                  Text(
-                                                                    notice
-                                                                        .title!,
-                                                                    maxLines: 1,
-                                                                    overflow:
-                                                                        TextOverflow
-                                                                            .ellipsis,
-                                                                    style: theme
-                                                                        .textTheme
-                                                                        .labelLarge
-                                                                        ?.copyWith(
-                                                                          color: theme
-                                                                              .colorScheme
-                                                                              .onSurface,
-                                                                          fontWeight:
-                                                                              FontWeight.w800,
-                                                                        ),
-                                                                  ),
-                                                                Text(
-                                                                  notice
-                                                                      .message,
-                                                                  maxLines: 2,
-                                                                  overflow:
-                                                                      TextOverflow
-                                                                          .ellipsis,
-                                                                  style: theme
-                                                                      .textTheme
-                                                                      .bodyMedium
-                                                                      ?.copyWith(
-                                                                        color: theme
-                                                                            .colorScheme
-                                                                            .onSurface,
-                                                                        fontWeight:
-                                                                            FontWeight.w700,
-                                                                      ),
-                                                                ),
-                                                              ],
-                                                            ),
-                                                          ),
-                                                          IconButton(
-                                                            onPressed: () =>
-                                                                _appNoticeNotifier
-                                                                        .value =
-                                                                    null,
-                                                            tooltip: 'Скрыть',
-                                                            icon: const Icon(
-                                                              Icons
-                                                                  .close_rounded,
-                                                              size: 18,
-                                                            ),
-                                                            visualDensity:
-                                                                VisualDensity
-                                                                    .compact,
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  );
-                                },
+        ValueListenableBuilder<_AppNoticePayload?>(
+          valueListenable: _appNoticeNotifier,
+          builder: (context, notice, _) {
+            if (notice == null) return const SizedBox.shrink();
+            final visuals = _noticeVisuals(context, notice.tone);
+            final top = MediaQuery.paddingOf(context).top + 8;
+            return Positioned(
+              top: top,
+              left: 12,
+              right: 12,
+              child: IgnorePointer(
+                ignoring: false,
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 760),
+                    child: Material(
+                      color: Colors.transparent,
+                      elevation: 8,
+                      borderRadius: BorderRadius.circular(22),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(22),
+                        onTap: () => _appNoticeNotifier.value = null,
+                        child: Container(
+                          padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHigh,
+                            borderRadius: BorderRadius.circular(22),
+                            border: Border.all(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: theme.colorScheme.shadow.withValues(
+                                  alpha: 0.16,
+                                ),
+                                blurRadius: 28,
+                                offset: const Offset(0, 12),
                               ),
+                            ],
+                          ),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                width: 34,
+                                height: 34,
+                                decoration: BoxDecoration(
+                                  color: visuals.accent.withValues(alpha: 0.12),
+                                  shape: BoxShape.circle,
+                                ),
+                                alignment: Alignment.center,
+                                child: Icon(
+                                  visuals.icon,
+                                  color: visuals.accent,
+                                  size: 18,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    if (notice.title != null)
+                                      Text(
+                                        notice.title!,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: theme.textTheme.labelLarge
+                                            ?.copyWith(
+                                              color:
+                                                  theme.colorScheme.onSurface,
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                      ),
+                                    Text(
+                                      notice.message,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: theme.textTheme.bodyMedium
+                                          ?.copyWith(
+                                            color: theme.colorScheme.onSurface,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: () =>
+                                    _appNoticeNotifier.value = null,
+                                icon: const Icon(Icons.close_rounded, size: 18),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ),
                 ),
-              );
-            },
-          ),
+              ),
+            );
+          },
         ),
         SafeArea(
           child: Align(
@@ -5208,11 +5173,6 @@ Future<void> main() async {
       theme: _buildLightTheme(),
       darkTheme: _buildDarkTheme(),
       themeMode: themeModeNotifier.value,
-      builder: (context, child) {
-        return ScaffoldMessenger(
-          child: _GlobalNoticeHost(child: child ?? const SizedBox.shrink()),
-        );
-      },
     );
   };
 

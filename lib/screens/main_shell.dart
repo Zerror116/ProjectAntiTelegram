@@ -12,6 +12,8 @@ import '../services/uploads_recovery_device_service.dart';
 import '../services/web_notification_service.dart';
 import '../services/web_push_client_service.dart';
 import '../src/utils/notification_navigation.dart';
+import '../widgets/phoenix_ambient_background.dart';
+import '../widgets/phoenix_animated_nav_icon.dart';
 import '../widgets/web_notification_prompt.dart';
 import 'admin_panel.dart';
 import 'auth_screen.dart';
@@ -66,6 +68,7 @@ class _MainShellState extends State<MainShell> {
   Timer? _supportQueueRefreshTimer;
   VoidCallback? _activeSectionListener;
   bool _initialNotificationDeepLinkHandled = false;
+  int _navTapPulse = 0;
 
   @override
   void initState() {
@@ -639,8 +642,27 @@ class _MainShellState extends State<MainShell> {
   static Widget _buildEmptyScreen(BuildContext context) =>
       const SizedBox.shrink();
 
-  Widget _buildNavIcon(BuildContext context, _ShellDestination destination) {
-    return Icon(destination.icon);
+  Widget _buildNavIcon(
+    BuildContext context,
+    _ShellDestination destination, {
+    bool selected = false,
+  }) {
+    return ValueListenableBuilder<String>(
+      valueListenable: navIconAnimationModeNotifier,
+      builder: (context, mode, _) {
+        return ValueListenableBuilder<bool>(
+          valueListenable: performanceModeNotifier,
+          builder: (context, performanceMode, _) {
+            return PhoenixAnimatedNavIcon(
+              icon: destination.icon,
+              selected: selected,
+              mode: performanceMode ? 'off' : mode,
+              pulse: _navTapPulse,
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _openMoreSheet(
@@ -678,7 +700,7 @@ class _MainShellState extends State<MainShell> {
                   final isSelected =
                       allDestinations[_index].id == destination.id;
                   return ListTile(
-                    leading: Icon(destination.icon),
+                    leading: _buildNavIcon(sheetContext, destination),
                     title: Text(destination.label),
                     trailing: isSelected
                         ? Icon(
@@ -704,6 +726,7 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       _index = nextIndex;
       _activatedDestinations.add(allDestinations[nextIndex].id);
+      _navTapPulse += 1;
     });
     activeShellSectionNotifier.value = allDestinations[nextIndex].id;
     if (allDestinations[nextIndex].id == 'chats') {
@@ -901,20 +924,49 @@ class _MainShellState extends State<MainShell> {
                 _buildPhoneAccessOwnerBanner(context),
                 _buildWebNotificationBanner(context),
                 Expanded(
-                  child: IndexedStack(
-                    key: ValueKey('shell-$effectiveRole-$creatorTenantScope'),
-                    index: _index,
-                    children: destinations.map((destination) {
-                      if (!_activatedDestinations.contains(destination.id)) {
-                        return const SizedBox.shrink();
-                      }
-                      return KeyedSubtree(
+                  child: Stack(
+                    children: [
+                      IndexedStack(
                         key: ValueKey(
-                          'page-${destination.id}-$effectiveRole-$creatorTenantScope',
+                          'shell-$effectiveRole-$creatorTenantScope',
                         ),
-                        child: destination.builder(context),
-                      );
-                    }).toList(),
+                        index: _index,
+                        children: destinations.map((destination) {
+                          if (!_activatedDestinations.contains(
+                            destination.id,
+                          )) {
+                            return const SizedBox.shrink();
+                          }
+                          return KeyedSubtree(
+                            key: ValueKey(
+                              'page-${destination.id}-$effectiveRole-$creatorTenantScope',
+                            ),
+                            child: destination.builder(context),
+                          );
+                        }).toList(),
+                      ),
+                      Positioned.fill(
+                        child: ValueListenableBuilder<String>(
+                          valueListenable: appBackgroundEffectNotifier,
+                          builder: (context, mode, _) {
+                            return ValueListenableBuilder<bool>(
+                              valueListenable: performanceModeNotifier,
+                              builder: (context, performanceMode, _) {
+                                return PhoenixAmbientBackground(
+                                  mode: mode,
+                                  enabled: !performanceMode,
+                                  opacity:
+                                      Theme.of(context).brightness ==
+                                          Brightness.dark
+                                      ? 0.62
+                                      : 0.52,
+                                );
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -935,6 +987,7 @@ class _MainShellState extends State<MainShell> {
               setState(() {
                 _index = nextIndex;
                 _activatedDestinations.add(destinations[nextIndex].id);
+                _navTapPulse += 1;
               });
               activeShellSectionNotifier.value = destinations[nextIndex].id;
               if (destinations[nextIndex].id == 'chats') {
@@ -949,6 +1002,11 @@ class _MainShellState extends State<MainShell> {
                 .map(
                   (destination) => NavigationDestination(
                     icon: _buildNavIcon(context, destination),
+                    selectedIcon: _buildNavIcon(
+                      context,
+                      destination,
+                      selected: true,
+                    ),
                     label: destination.label,
                   ),
                 )

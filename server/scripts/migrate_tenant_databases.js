@@ -4,6 +4,7 @@ const path = require('path');
 
 const db = require('../src/db');
 const { applyMigrationsToTarget } = require('../src/utils/bootstrap');
+const { syncTenantShadowTenantState } = require('../src/utils/tenantDatabases');
 
 function parseArgs(argv = process.argv.slice(2)) {
   const result = {
@@ -31,6 +32,8 @@ async function loadTenantTargets(tenantCode = '') {
     `SELECT id,
             code,
             name,
+            status,
+            subscription_expires_at,
             db_mode,
             db_url,
             db_name,
@@ -96,6 +99,7 @@ async function main() {
   let tenantsWithChanges = 0;
   for (const tenant of tenants) {
     const result = await migrateTenantRow(tenant, migrationsDir);
+    const shadowSync = await syncTenantShadowTenantState(tenant);
     const applied = Array.isArray(result?.applied) ? result.applied : [];
     if (applied.length > 0) tenantsWithChanges += 1;
     results.push({
@@ -106,6 +110,7 @@ async function main() {
       db_name: tenant.db_name || null,
       db_schema: tenant.db_schema || null,
       applied,
+      shadow_sync: shadowSync,
       message: result?.message || 'ok',
     });
   }

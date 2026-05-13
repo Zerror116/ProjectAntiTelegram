@@ -171,6 +171,96 @@ async function upsertTenantShadowRow({
   }
 }
 
+function resolveTenantShadowTarget(tenantRow) {
+  const mode = String(tenantRow?.db_mode || '')
+    .toLowerCase()
+    .trim();
+  if (mode === 'isolated') {
+    const dbUrl = String(tenantRow?.db_url || '').trim();
+    if (!dbUrl) {
+      return {
+        ok: false,
+        reason: 'isolated_tenant_without_db_url',
+      };
+    }
+    return {
+      ok: true,
+      mode,
+      dbUrl,
+      dbSchema: null,
+    };
+  }
+  if (mode === 'schema_isolated') {
+    const dbSchema = String(tenantRow?.db_schema || '').trim();
+    if (!dbSchema) {
+      return {
+        ok: false,
+        reason: 'schema_isolated_tenant_without_db_schema',
+      };
+    }
+    return {
+      ok: true,
+      mode,
+      dbUrl:
+        process.env.DATABASE_URL ||
+        'postgresql://projectphoenix:projectphoenix@localhost:5432/projectphoenix',
+      dbSchema,
+    };
+  }
+  return {
+    ok: false,
+    reason: 'tenant_uses_shared_database',
+  };
+}
+
+async function syncTenantShadowTenantState(tenantRow) {
+  const tenantId = String(tenantRow?.id || '').trim();
+  if (!tenantId) {
+    return {
+      synced: false,
+      reason: 'missing_tenant_id',
+      row_count: 0,
+    };
+  }
+  const target = resolveTenantShadowTarget(tenantRow);
+  if (!target.ok) {
+    return {
+      synced: false,
+      reason: target.reason,
+      row_count: 0,
+    };
+  }
+
+  const pool = new Pool({ connectionString: target.dbUrl });
+  const client = await pool.connect();
+  try {
+    if (target.dbSchema) {
+      await setSessionSchemaSearchPath(client, target.dbSchema);
+    }
+    const result = await client.query(
+      `UPDATE tenants
+       SET status = $2,
+           subscription_expires_at = $3,
+           updated_at = now()
+       WHERE id = $1`,
+      [
+        tenantId,
+        String(tenantRow?.status || 'active').toLowerCase().trim() || 'active',
+        tenantRow?.subscription_expires_at || null,
+      ],
+    );
+    return {
+      synced: result.rowCount > 0,
+      reason: result.rowCount > 0 ? 'updated' : 'shadow_tenant_missing',
+      row_count: result.rowCount,
+      db_mode: target.mode,
+    };
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+
 async function provisionIsolatedTenantDatabase({
   platformDbUrl,
   tenantId,
@@ -258,4 +348,5 @@ module.exports = {
   buildTenantSchemaName,
   isCreateDbPermissionError,
   provisionIsolatedTenantDatabase,
+  syncTenantShadowTenantState,
 };

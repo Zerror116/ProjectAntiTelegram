@@ -7,7 +7,9 @@ import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../assets/phoenix_assets.dart';
 import '../services/auth_service.dart';
+import '../services/deep_link_service.dart';
 import '../services/invite_referral_service.dart';
 import '../main.dart'; // глобальный authService и dio
 import '../widgets/input_language_badge.dart';
@@ -32,6 +34,11 @@ class _AuthScreenState extends State<AuthScreen> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   final _accessKeyController = TextEditingController();
+  final _nameController = TextEditingController();
+  final _phoneController = TextEditingController();
+  final _tenantGroupNameController = TextEditingController();
+  final _mainChannelTitleController = TextEditingController();
+  final _creatorSecretController = TextEditingController();
   final _otpController = TextEditingController();
   bool _loading = false;
   String _message = '';
@@ -42,6 +49,8 @@ class _AuthScreenState extends State<AuthScreen> {
   String? _apkDownloadUrl;
   String _apkInfoMessage = '';
   String _tenantCodeFromLink = '';
+  String _tenantNameFromInvite = '';
+  String _inviteResolveMessage = '';
   bool _handledIncomingAuthAction = false;
   bool _routeNoticeApplied = false;
   bool _passwordResetEnabled = false;
@@ -49,6 +58,8 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _emailRecoveryStatusLoaded = false;
   bool _registrationEmailCodeEnabled = false;
   bool _showPassword = false;
+  bool _passkeySupported = false;
+  bool _passkeyBusy = false;
 
   late final AuthService _authService;
 
@@ -56,6 +67,11 @@ class _AuthScreenState extends State<AuthScreen> {
   late final VoidCallback _emailListener;
   late final VoidCallback _passwordListener;
   late final VoidCallback _accessKeyListener;
+  late final VoidCallback _nameListener;
+  late final VoidCallback _phoneListener;
+  late final VoidCallback _tenantGroupNameListener;
+  late final VoidCallback _mainChannelTitleListener;
+  late final VoidCallback _creatorSecretListener;
   late final VoidCallback _otpListener;
 
   @override
@@ -67,10 +83,20 @@ class _AuthScreenState extends State<AuthScreen> {
     _emailListener = () => setState(() {});
     _passwordListener = () => setState(() {});
     _accessKeyListener = () => setState(() {});
+    _nameListener = () => setState(() {});
+    _phoneListener = () => setState(() {});
+    _tenantGroupNameListener = () => setState(() {});
+    _mainChannelTitleListener = () => setState(() {});
+    _creatorSecretListener = () => setState(() {});
     _otpListener = () => setState(() {});
     _emailController.addListener(_emailListener);
     _passwordController.addListener(_passwordListener);
     _accessKeyController.addListener(_accessKeyListener);
+    _nameController.addListener(_nameListener);
+    _phoneController.addListener(_phoneListener);
+    _tenantGroupNameController.addListener(_tenantGroupNameListener);
+    _mainChannelTitleController.addListener(_mainChannelTitleListener);
+    _creatorSecretController.addListener(_creatorSecretListener);
     _otpController.addListener(_otpListener);
 
     final tenantFromLink = _extractTenantFromUri();
@@ -85,11 +111,13 @@ class _AuthScreenState extends State<AuthScreen> {
       _isRegister = true;
       unawaited(_primeTenantScopeFromInvite(inviteFromLink));
     }
+    unawaited(_applyNativeDeepLinkIfAvailable());
     unawaited(inviteReferralService.captureFromUri(Uri.base));
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _prepareWebExperience();
+      unawaited(_loadPasskeyAvailability());
       unawaited(_loadEmailRecoveryAvailability());
       unawaited(_handleIncomingAuthActionIfNeeded());
     });
@@ -140,6 +168,35 @@ class _AuthScreenState extends State<AuthScreen> {
 
   bool _isAndroidWebRestricted() {
     return _isAndroidWeb();
+  }
+
+  Future<void> _loadPasskeyAvailability() async {
+    final supported = await _authService.isPasskeySupported();
+    if (!mounted) return;
+    setState(() => _passkeySupported = supported);
+  }
+
+  Future<void> _applyNativeDeepLinkIfAvailable() async {
+    final uri =
+        await DeepLinkService.getInitialUri() ??
+        await DeepLinkService.consumeLatestUri();
+    if (uri == null) return;
+    final invite = _extractInviteFromUri(uri);
+    final tenant = _extractTenantFromUri(uri);
+    if (tenant.isNotEmpty) {
+      await _authService.setTenantCode(tenant);
+    }
+    if (!mounted) return;
+    setState(() {
+      if (tenant.isNotEmpty) _tenantCodeFromLink = tenant;
+      if (invite.isNotEmpty) {
+        _accessKeyController.text = invite;
+        _isRegister = true;
+      }
+    });
+    if (invite.isNotEmpty) {
+      unawaited(_primeTenantScopeFromInvite(invite));
+    }
   }
 
   String _extractServerMessage(
@@ -255,7 +312,8 @@ class _AuthScreenState extends State<AuthScreen> {
       );
       return;
     }
-    final uri = Uri.tryParse(raw);
+    final parsed = Uri.tryParse(raw);
+    final uri = parsed == null ? null : _appendInviteParams(parsed);
     if (uri == null) {
       showAppNotice(
         context,
@@ -275,6 +333,16 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Uri _appendInviteParams(Uri uri) {
+    final invite = _accessKeyController.text.trim().toUpperCase();
+    final tenant = _tenantCodeFromLink.trim().toLowerCase();
+    if (invite.isEmpty && tenant.isEmpty) return uri;
+    final qp = Map<String, String>.from(uri.queryParameters);
+    if (invite.isNotEmpty) qp['invite'] = invite;
+    if (tenant.isNotEmpty) qp['tenant'] = tenant;
+    return uri.replace(queryParameters: qp);
+  }
+
   Future<void> _copyApkLink() async {
     final raw = (_apkDownloadUrl ?? '').trim();
     if (raw.isEmpty) {
@@ -285,7 +353,12 @@ class _AuthScreenState extends State<AuthScreen> {
       );
       return;
     }
-    await Clipboard.setData(ClipboardData(text: raw));
+    final parsed = Uri.tryParse(raw);
+    await Clipboard.setData(
+      ClipboardData(
+        text: parsed == null ? raw : _appendInviteParams(parsed).toString(),
+      ),
+    );
     if (!mounted) return;
     showAppNotice(
       context,
@@ -311,6 +384,36 @@ class _AuthScreenState extends State<AuthScreen> {
       'Код приглашения скопирован',
       tone: AppNoticeTone.success,
     );
+  }
+
+  Future<void> _openInstalledAppWithInvite() async {
+    final invite = _accessKeyController.text.trim().toUpperCase();
+    if (invite.isEmpty) {
+      showAppNotice(
+        context,
+        'Код приглашения не найден',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
+    final base = Uri.base;
+    final uri = base.replace(
+      path: '/join/$invite',
+      queryParameters: {
+        if (_tenantCodeFromLink.trim().isNotEmpty)
+          'tenant': _tenantCodeFromLink.trim().toLowerCase(),
+      },
+      fragment: '',
+    );
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!mounted) return;
+    if (!opened) {
+      showAppNotice(
+        context,
+        'Не удалось открыть приложение. Скопируйте код вручную.',
+        tone: AppNoticeTone.warning,
+      );
+    }
   }
 
   Future<void> _maybeShowIosAddToHomeHint() async {
@@ -355,9 +458,25 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
-  String _extractInviteFromUri() {
+  String _extractInviteFromUri([Uri? overrideUri]) {
     try {
-      final uri = Uri.base;
+      final uri = overrideUri ?? Uri.base;
+      final pathSegments = uri.pathSegments
+          .map((segment) => Uri.decodeComponent(segment).trim())
+          .where((segment) => segment.isNotEmpty)
+          .toList();
+      if (uri.scheme.toLowerCase() == 'phoenix' &&
+          uri.host.toLowerCase() == 'join' &&
+          pathSegments.isNotEmpty) {
+        return pathSegments.first;
+      }
+      final joinIndex = pathSegments.indexWhere(
+        (segment) => segment.toLowerCase() == 'join',
+      );
+      if (joinIndex >= 0 && joinIndex + 1 < pathSegments.length) {
+        final value = pathSegments[joinIndex + 1].trim();
+        if (value.isNotEmpty) return value;
+      }
       final direct =
           uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '';
       if (direct.trim().isNotEmpty) return direct.trim();
@@ -377,9 +496,9 @@ class _AuthScreenState extends State<AuthScreen> {
     return '';
   }
 
-  String _extractTenantFromUri() {
+  String _extractTenantFromUri([Uri? overrideUri]) {
     try {
-      final uri = Uri.base;
+      final uri = overrideUri ?? Uri.base;
       final direct =
           uri.queryParameters['tenant'] ??
           uri.queryParameters['tenant_code'] ??
@@ -434,6 +553,13 @@ class _AuthScreenState extends State<AuthScreen> {
     final data = resp.data;
     if (data is Map && data['ok'] == true && data['data'] is Map) {
       final row = Map<String, dynamic>.from(data['data'] as Map);
+      final tenantName = (row['tenant_name'] ?? '').toString().trim();
+      if (mounted) {
+        setState(() {
+          _tenantNameFromInvite = tenantName;
+          _inviteResolveMessage = '';
+        });
+      }
       return _normalizeTenantCode((row['tenant_code'] ?? '').toString());
     }
     return '';
@@ -448,7 +574,10 @@ class _AuthScreenState extends State<AuthScreen> {
       if (!mounted) return;
       setState(() => _tenantCodeFromLink = tenantCode);
     } catch (_) {
-      // Не показываем ошибку при автозаполнении ссылки: явная проверка будет на submit.
+      if (!mounted) return;
+      setState(() {
+        _inviteResolveMessage = 'Ссылка приглашения недействительна';
+      });
     }
   }
 
@@ -902,9 +1031,6 @@ class _AuthScreenState extends State<AuthScreen> {
       final passwordResetEnabled = payload.containsKey('password_reset_enabled')
           ? payload['password_reset_enabled'] == true
           : payload['mail_configured'] == true;
-      final magicLinkEnabled = payload.containsKey('magic_link_enabled')
-          ? payload['magic_link_enabled'] == true
-          : payload['mail_configured'] == true;
       final registrationEmailCodeEnabled =
           payload.containsKey('registration_email_code_enabled')
           ? payload['registration_email_code_enabled'] == true
@@ -912,7 +1038,7 @@ class _AuthScreenState extends State<AuthScreen> {
       if (!mounted) return;
       setState(() {
         _passwordResetEnabled = passwordResetEnabled;
-        _magicLinkEnabled = magicLinkEnabled;
+        _magicLinkEnabled = false;
         _registrationEmailCodeEnabled = registrationEmailCodeEnabled;
         _emailRecoveryStatusLoaded = true;
       });
@@ -1069,12 +1195,32 @@ class _AuthScreenState extends State<AuthScreen> {
       _accessKeyController.removeListener(_accessKeyListener);
     } catch (_) {}
     try {
+      _nameController.removeListener(_nameListener);
+    } catch (_) {}
+    try {
+      _phoneController.removeListener(_phoneListener);
+    } catch (_) {}
+    try {
+      _tenantGroupNameController.removeListener(_tenantGroupNameListener);
+    } catch (_) {}
+    try {
+      _mainChannelTitleController.removeListener(_mainChannelTitleListener);
+    } catch (_) {}
+    try {
+      _creatorSecretController.removeListener(_creatorSecretListener);
+    } catch (_) {}
+    try {
       _otpController.removeListener(_otpListener);
     } catch (_) {}
 
     _emailController.dispose();
     _passwordController.dispose();
     _accessKeyController.dispose();
+    _nameController.dispose();
+    _phoneController.dispose();
+    _tenantGroupNameController.dispose();
+    _mainChannelTitleController.dispose();
+    _creatorSecretController.dispose();
     _otpController.dispose();
     super.dispose();
   }
@@ -1149,23 +1295,17 @@ class _AuthScreenState extends State<AuthScreen> {
           }
         }
 
-        // Email свободен — сохраняем pending данные и переходим на экран ввода имени+телефона
-        _authService.setPendingCredentials(
+        await _authService.register(
           email: email,
           password: password,
           accessKey: accessKey,
+          name: _nameController.text.trim(),
+          phone: _phoneController.text.trim(),
+          secret: _creatorSecretController.text.trim(),
+          groupName: _tenantGroupNameController.text.trim(),
+          mainChannelTitle: _mainChannelTitleController.text.trim(),
           registrationEmailToken: registrationEmailToken,
         );
-        if (!mounted) return;
-
-        setState(() => _loading = false);
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (_) =>
-                PhoneNameScreen(isRegisterFlow: true, registrationEmail: email),
-          ),
-        );
-        return;
       } else {
         // Обычный логин
         await _authService.login(
@@ -1218,12 +1358,41 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Future<void> _loginWithPasskey() async {
+    final email = _emailController.text.trim().isEmpty
+        ? _creatorEmail
+        : _emailController.text.trim();
+    if (email.toLowerCase() != _creatorEmail.toLowerCase()) {
+      setState(() => _message = 'Passkey доступен только создателю');
+      return;
+    }
+    setState(() {
+      _passkeyBusy = true;
+      _message = '';
+      _requiresTwoFactor = false;
+    });
+    try {
+      await _authService.loginWithPasskey(email: email);
+      await _navigateAfterSuccessfulAuth();
+    } on DioException catch (e) {
+      setState(
+        () => _message = _extractServerMessage(
+          e,
+          fallback: 'Не удалось войти по passkey. Войдите по паролю.',
+        ),
+      );
+    } catch (_) {
+      setState(() => _message = 'Passkey недоступен. Войдите по паролю.');
+    } finally {
+      if (mounted) setState(() => _passkeyBusy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isAndroidWebRestricted()) {
       final theme = Theme.of(context);
       final inviteCode = _accessKeyController.text.trim().toUpperCase();
-      final tenantCode = _tenantCodeFromLink.trim().toLowerCase();
       return Scaffold(
         body: SafeArea(
           child: Center(
@@ -1320,18 +1489,9 @@ class _AuthScreenState extends State<AuthScreen> {
                           if (inviteCode.isNotEmpty) ...[
                             const SizedBox(height: 12),
                             SelectableText(
-                              'Код приглашения: $inviteCode',
+                              'Код: $inviteCode',
                               style: theme.textTheme.bodyMedium?.copyWith(
                                 fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ],
-                          if (tenantCode.isNotEmpty) ...[
-                            const SizedBox(height: 6),
-                            SelectableText(
-                              'Группа: $tenantCode',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ],
@@ -1353,6 +1513,15 @@ class _AuthScreenState extends State<AuthScreen> {
                     ),
                   ),
                   if (inviteCode.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _openInstalledAppWithInvite,
+                        icon: const Icon(Icons.open_in_new_rounded),
+                        label: const Text('Открыть приложение с кодом'),
+                      ),
+                    ),
                     const SizedBox(height: 8),
                     SizedBox(
                       width: double.infinity,
@@ -1391,214 +1560,480 @@ class _AuthScreenState extends State<AuthScreen> {
       );
     }
 
+    final currentEmail = _emailController.text.trim().toLowerCase();
+    final isCreatorEmail = currentEmail == _creatorEmail.toLowerCase();
+    final accessCode = _accessKeyController.text.trim();
+    final inviteFromLink =
+        _looksLikeInviteCode(accessCode) &&
+        (_tenantCodeFromLink.trim().isNotEmpty ||
+            _tenantNameFromInvite.trim().isNotEmpty);
+    final looksLikeTenantAccessKey =
+        accessCode.toUpperCase().startsWith('PHX-') && !inviteFromLink;
+    final theme = Theme.of(context);
+    final authBackgroundAsset = theme.brightness == Brightness.dark
+        ? PhoenixAssets.authLoginBackgroundDark
+        : PhoenixAssets.authLoginBackgroundLight;
+
     return Scaffold(
-      appBar: AppBar(title: Text(_isRegister ? 'Регистрация' : 'Вход')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            SubmitOnEnter(
-              enabled: !_loading,
-              onSubmit: () => unawaited(_onSubmitPressed()),
-              child: Form(
-                key: _formKey,
-                child: Column(
-                  children: [
-                    TextFormField(
-                      controller: _emailController,
-                      decoration: withInputLanguageBadge(
-                        const InputDecoration(labelText: 'Email'),
-                        controller: _emailController,
-                      ),
-                      keyboardType: TextInputType.emailAddress,
-                      validator: (v) {
-                        if (v == null || v.isEmpty) return 'Введите email';
-                        if (!v.contains('@')) return 'Неверный формат email';
-                        return null;
-                      },
+      appBar: AppBar(title: const Text('Вход в Феникс')),
+      body: DecoratedBox(
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surface,
+          image: DecorationImage(
+            image: AssetImage(authBackgroundAsset),
+            fit: BoxFit.cover,
+            opacity: theme.brightness == Brightness.dark ? 0.48 : 0.42,
+          ),
+        ),
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 520),
+                child: Container(
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerLow.withValues(
+                      alpha: theme.brightness == Brightness.dark ? 0.9 : 0.86,
                     ),
-                    const SizedBox(height: 12),
-                    TextFormField(
-                      controller: _passwordController,
-                      decoration: withInputLanguageBadge(
-                        InputDecoration(
-                          labelText: 'Пароль',
-                          suffixIcon: IconButton(
-                            tooltip: _showPassword
-                                ? 'Скрыть пароль'
-                                : 'Показать пароль',
-                            onPressed: () {
-                              setState(() => _showPassword = !_showPassword);
-                            },
-                            icon: Icon(
-                              _showPassword
-                                  ? Icons.visibility_off_outlined
-                                  : Icons.visibility_outlined,
-                            ),
-                          ),
-                        ),
-                        controller: _passwordController,
-                      ),
-                      obscureText: !_showPassword,
-                      validator: (v) {
-                        if (v == null || v.isEmpty) return 'Введите пароль';
-                        if (v.length < 8) {
-                          return 'Пароль должен быть не менее 8 символов';
-                        }
-                        return null;
-                      },
-                    ),
-                    if (!_isRegister && _requiresTwoFactor) ...[
-                      const SizedBox(height: 12),
-                      TextFormField(
-                        controller: _otpController,
-                        decoration: withInputLanguageBadge(
-                          const InputDecoration(
-                            labelText: 'Код 2FA',
-                            hintText: '6 цифр или резервный код (ABCD-EFGH)',
-                          ),
-                          controller: _otpController,
-                        ),
-                        keyboardType: TextInputType.text,
-                        validator: (v) {
-                          if (!_requiresTwoFactor) return null;
-                          final value = (v ?? '').trim();
-                          final digitsOnly = value.replaceAll(
-                            RegExp(r'\s+'),
-                            '',
-                          );
-                          final backupNormalized = value
-                              .toUpperCase()
-                              .replaceAll(RegExp(r'[^A-Z0-9]'), '');
-                          if (value.isEmpty) return 'Введите код 2FA';
-                          final isTotp = RegExp(
-                            r'^\d{6}$',
-                          ).hasMatch(digitsOnly);
-                          final isBackup = RegExp(
-                            r'^[A-Z0-9]{8}$',
-                          ).hasMatch(backupNormalized);
-                          if (!isTotp && !isBackup) {
-                            return 'Введите 6 цифр или резервный код ABCD-EFGH';
-                          }
-                          return null;
-                        },
-                      ),
-                      const SizedBox(height: 8),
-                      CheckboxListTile(
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                        value: _trustDeviceFor30Days,
-                        onChanged: (value) {
-                          setState(() => _trustDeviceFor30Days = value == true);
-                        },
-                        title: const Text('Доверять устройству 30 дней'),
-                        subtitle: const Text(
-                          'На этом устройстве не будем спрашивать 2FA-код при следующем входе',
-                        ),
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
+                    boxShadow: [
+                      BoxShadow(
+                        color: theme.colorScheme.shadow.withValues(alpha: 0.10),
+                        blurRadius: 28,
+                        offset: const Offset(0, 14),
                       ),
                     ],
-                    const SizedBox(height: 12),
-                    if (_isRegister) ...[
-                      TextFormField(
-                        controller: _accessKeyController,
-                        decoration: withInputLanguageBadge(
-                          const InputDecoration(
-                            labelText: 'Ключ арендатора или код приглашения',
-                            hintText:
-                                'Арендатор: PHX-.... или сотрудник/клиент: INV-....',
-                          ),
-                          controller: _accessKeyController,
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Image.asset(
+                        PhoenixAssets.appIconAdaptiveForeground,
+                        width: 92,
+                        height: 92,
+                        fit: BoxFit.contain,
+                        filterQuality: FilterQuality.high,
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        'Проект Феникс',
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w900,
                         ),
-                        validator: (v) {
-                          final mail = _emailController.text
-                              .trim()
-                              .toLowerCase();
-                          final isCreator = mail == _creatorEmail.toLowerCase();
-                          if (isCreator) return null;
-                          if (v == null || v.trim().isEmpty) {
-                            return 'Введите ключ арендатора или код приглашения';
-                          }
-                          if (v.trim().length < 6) {
-                            return 'Код слишком короткий';
-                          }
-                          return null;
-                        },
                       ),
-                      const SizedBox(height: 16),
-                    ] else
-                      const SizedBox(height: 16),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        onPressed: _loading ? null : _onSubmitPressed,
-                        child: _loading
-                            ? SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.onPrimary,
+                      const SizedBox(height: 18),
+                      SubmitOnEnter(
+                        enabled: !_loading,
+                        onSubmit: () => unawaited(_onSubmitPressed()),
+                        child: Form(
+                          key: _formKey,
+                          child: Column(
+                            children: [
+                              TextFormField(
+                                controller: _emailController,
+                                decoration: withInputLanguageBadge(
+                                  const InputDecoration(labelText: 'Email'),
+                                  controller: _emailController,
                                 ),
-                              )
-                            : Text(_isRegister ? 'Далее' : 'Войти'),
+                                keyboardType: TextInputType.emailAddress,
+                                validator: (v) {
+                                  if (v == null || v.isEmpty) {
+                                    return 'Введите email';
+                                  }
+                                  if (!v.contains('@')) {
+                                    return 'Неверный формат email';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              const SizedBox(height: 12),
+                              TextFormField(
+                                controller: _passwordController,
+                                decoration: withInputLanguageBadge(
+                                  InputDecoration(
+                                    labelText: 'Пароль',
+                                    suffixIcon: IconButton(
+                                      tooltip: _showPassword
+                                          ? 'Скрыть пароль'
+                                          : 'Показать пароль',
+                                      onPressed: () {
+                                        setState(
+                                          () => _showPassword = !_showPassword,
+                                        );
+                                      },
+                                      icon: Icon(
+                                        _showPassword
+                                            ? Icons.visibility_off_outlined
+                                            : Icons.visibility_outlined,
+                                      ),
+                                    ),
+                                  ),
+                                  controller: _passwordController,
+                                ),
+                                obscureText: !_showPassword,
+                                validator: (v) {
+                                  if (v == null || v.isEmpty) {
+                                    return 'Введите пароль';
+                                  }
+                                  if (v.length < 8) {
+                                    return 'Пароль должен быть не менее 8 символов';
+                                  }
+                                  return null;
+                                },
+                              ),
+                              if (!_isRegister && _requiresTwoFactor) ...[
+                                const SizedBox(height: 12),
+                                TextFormField(
+                                  controller: _otpController,
+                                  decoration: withInputLanguageBadge(
+                                    const InputDecoration(
+                                      labelText: 'Код 2FA',
+                                      hintText:
+                                          '6 цифр или резервный код (ABCD-EFGH)',
+                                    ),
+                                    controller: _otpController,
+                                  ),
+                                  keyboardType: TextInputType.text,
+                                  validator: (v) {
+                                    if (!_requiresTwoFactor) return null;
+                                    final value = (v ?? '').trim();
+                                    final digitsOnly = value.replaceAll(
+                                      RegExp(r'\s+'),
+                                      '',
+                                    );
+                                    final backupNormalized = value
+                                        .toUpperCase()
+                                        .replaceAll(RegExp(r'[^A-Z0-9]'), '');
+                                    if (value.isEmpty) return 'Введите код 2FA';
+                                    final isTotp = RegExp(
+                                      r'^\d{6}$',
+                                    ).hasMatch(digitsOnly);
+                                    final isBackup = RegExp(
+                                      r'^[A-Z0-9]{8}$',
+                                    ).hasMatch(backupNormalized);
+                                    if (!isTotp && !isBackup) {
+                                      return 'Введите 6 цифр или резервный код ABCD-EFGH';
+                                    }
+                                    return null;
+                                  },
+                                ),
+                                const SizedBox(height: 8),
+                                CheckboxListTile(
+                                  dense: true,
+                                  contentPadding: EdgeInsets.zero,
+                                  value: _trustDeviceFor30Days,
+                                  onChanged: (value) {
+                                    setState(
+                                      () =>
+                                          _trustDeviceFor30Days = value == true,
+                                    );
+                                  },
+                                  title: const Text(
+                                    'Доверять устройству 30 дней',
+                                  ),
+                                  subtitle: const Text(
+                                    'На этом устройстве не будем спрашивать 2FA-код при следующем входе',
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 12),
+                              if (_isRegister) ...[
+                                TextFormField(
+                                  controller: _nameController,
+                                  decoration: withInputLanguageBadge(
+                                    const InputDecoration(
+                                      labelText: 'Имя',
+                                      hintText: 'Как вас будут видеть в группе',
+                                    ),
+                                    controller: _nameController,
+                                  ),
+                                  validator: (v) {
+                                    if (!_isRegister) return null;
+                                    if ((v ?? '').trim().length < 2) {
+                                      return 'Введите имя';
+                                    }
+                                    return null;
+                                  },
+                                ),
+                                const SizedBox(height: 12),
+                                TextFormField(
+                                  controller: _phoneController,
+                                  decoration: withInputLanguageBadge(
+                                    const InputDecoration(
+                                      labelText: 'Телефон',
+                                      hintText: '+7...',
+                                    ),
+                                    controller: _phoneController,
+                                  ),
+                                  keyboardType: TextInputType.phone,
+                                  validator: (v) {
+                                    if (!_isRegister) return null;
+                                    final digits = (v ?? '').replaceAll(
+                                      RegExp(r'\D+'),
+                                      '',
+                                    );
+                                    if (digits.length < 10) {
+                                      return 'Введите телефон';
+                                    }
+                                    return null;
+                                  },
+                                ),
+                                const SizedBox(height: 12),
+                                if (inviteFromLink) ...[
+                                  Container(
+                                    width: double.infinity,
+                                    padding: const EdgeInsets.all(14),
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .primaryContainer
+                                          .withValues(alpha: 0.45),
+                                      borderRadius: BorderRadius.circular(16),
+                                      border: Border.all(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.outlineVariant,
+                                      ),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        SelectableText(
+                                          'Код: ${accessCode.toUpperCase()}',
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ] else ...[
+                                  TextFormField(
+                                    controller: _accessKeyController,
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Код группы',
+                                        hintText:
+                                            'INV-.... для клиента или PHX-.... для арендатора',
+                                      ),
+                                      controller: _accessKeyController,
+                                    ),
+                                    validator: (v) {
+                                      final isCreator =
+                                          _emailController.text
+                                              .trim()
+                                              .toLowerCase() ==
+                                          _creatorEmail.toLowerCase();
+                                      if (isCreator) return null;
+                                      if (v == null || v.trim().isEmpty) {
+                                        return 'Введите код группы';
+                                      }
+                                      if (v.trim().length < 6) {
+                                        return 'Код слишком короткий';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                ],
+                                if (_inviteResolveMessage
+                                    .trim()
+                                    .isNotEmpty) ...[
+                                  const SizedBox(height: 8),
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: Text(
+                                      _inviteResolveMessage.trim(),
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.onSurfaceVariant,
+                                          ),
+                                    ),
+                                  ),
+                                ],
+                                if (looksLikeTenantAccessKey) ...[
+                                  const SizedBox(height: 12),
+                                  TextFormField(
+                                    controller: _tenantGroupNameController,
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Название группы',
+                                        hintText: 'Например: Бугурусланка',
+                                      ),
+                                      controller: _tenantGroupNameController,
+                                    ),
+                                    validator: (v) {
+                                      if (!looksLikeTenantAccessKey) {
+                                        return null;
+                                      }
+                                      if ((v ?? '').trim().length < 2) {
+                                        return 'Введите название группы';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                  const SizedBox(height: 12),
+                                  TextFormField(
+                                    controller: _mainChannelTitleController,
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Название основного канала',
+                                        hintText: 'Например: Основной',
+                                      ),
+                                      controller: _mainChannelTitleController,
+                                    ),
+                                    validator: (v) {
+                                      if (!looksLikeTenantAccessKey) {
+                                        return null;
+                                      }
+                                      if ((v ?? '').trim().length < 2) {
+                                        return 'Введите название канала';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                ],
+                                if (isCreatorEmail) ...[
+                                  const SizedBox(height: 12),
+                                  TextFormField(
+                                    controller: _creatorSecretController,
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Секрет создателя',
+                                      ),
+                                      controller: _creatorSecretController,
+                                    ),
+                                    obscureText: true,
+                                    validator: (v) {
+                                      if (!isCreatorEmail) return null;
+                                      if ((v ?? '').trim().isEmpty) {
+                                        return 'Введите секрет создателя';
+                                      }
+                                      return null;
+                                    },
+                                  ),
+                                ],
+                                const SizedBox(height: 16),
+                              ] else
+                                const SizedBox(height: 16),
+                              SizedBox(
+                                width: double.infinity,
+                                child: ElevatedButton(
+                                  onPressed: _loading ? null : _onSubmitPressed,
+                                  child: _loading
+                                      ? SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.onPrimary,
+                                          ),
+                                        )
+                                      : Text(
+                                          _isRegister
+                                              ? 'Зарегистрироваться'
+                                              : 'Войти',
+                                        ),
+                                ),
+                              ),
+                              if (!_isRegister &&
+                                  _passkeySupported &&
+                                  isCreatorEmail) ...[
+                                const SizedBox(height: 8),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: OutlinedButton.icon(
+                                    onPressed: (_loading || _passkeyBusy)
+                                        ? null
+                                        : _loginWithPasskey,
+                                    icon: _passkeyBusy
+                                        ? const SizedBox(
+                                            width: 16,
+                                            height: 16,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : const Icon(Icons.fingerprint_rounded),
+                                    label: const Text('Войти по passkey'),
+                                  ),
+                                ),
+                              ],
+                              if (!_isRegister &&
+                                  _emailRecoveryStatusLoaded &&
+                                  (_passwordResetEnabled ||
+                                      _magicLinkEnabled)) ...[
+                                const SizedBox(height: 8),
+                                Row(
+                                  children: [
+                                    if (_passwordResetEnabled)
+                                      Expanded(
+                                        child: TextButton(
+                                          onPressed: _loading
+                                              ? null
+                                              : () => _requestEmailAction(
+                                                  magicLink: false,
+                                                ),
+                                          child: const Text('Забыли пароль?'),
+                                        ),
+                                      ),
+                                    if (_magicLinkEnabled)
+                                      Expanded(
+                                        child: TextButton(
+                                          onPressed: _loading
+                                              ? null
+                                              : () => _requestEmailAction(
+                                                  magicLink: true,
+                                                ),
+                                          child: const Text('Войти без пароля'),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
                       ),
-                    ),
-                    if (!_isRegister &&
-                        _emailRecoveryStatusLoaded &&
-                        (_passwordResetEnabled || _magicLinkEnabled)) ...[
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 12),
                       Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          if (_passwordResetEnabled)
-                            Expanded(
-                              child: TextButton(
-                                onPressed: _loading
-                                    ? null
-                                    : () =>
-                                          _requestEmailAction(magicLink: false),
-                                child: const Text('Забыли пароль?'),
-                              ),
+                          Text(
+                            _isRegister ? 'Уже есть аккаунт?' : 'Нет аккаунта?',
+                          ),
+                          TextButton(
+                            onPressed: () => setState(() {
+                              _isRegister = !_isRegister;
+                              _message = '';
+                              _requiresTwoFactor = false;
+                              _trustDeviceFor30Days = true;
+                              _otpController.clear();
+                            }),
+                            child: Text(
+                              _isRegister ? 'Войти' : 'Зарегистрироваться',
                             ),
-                          if (_magicLinkEnabled)
-                            Expanded(
-                              child: TextButton(
-                                onPressed: _loading
-                                    ? null
-                                    : () =>
-                                          _requestEmailAction(magicLink: true),
-                                child: const Text('Войти без пароля'),
-                              ),
-                            ),
+                          ),
                         ],
                       ),
+                      const SizedBox(height: 8),
+                      if (_message.isNotEmpty)
+                        Text(
+                          _message,
+                          style: const TextStyle(color: Colors.red),
+                        ),
                     ],
-                  ],
+                  ),
                 ),
               ),
             ),
-            const SizedBox(height: 12),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(_isRegister ? 'Уже есть аккаунт?' : 'Нет аккаунта?'),
-                TextButton(
-                  onPressed: () => setState(() {
-                    _isRegister = !_isRegister;
-                    _message = '';
-                    _requiresTwoFactor = false;
-                    _trustDeviceFor30Days = true;
-                    _otpController.clear();
-                  }),
-                  child: Text(_isRegister ? 'Войти' : 'Зарегистрироваться'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            if (_message.isNotEmpty)
-              Text(_message, style: const TextStyle(color: Colors.red)),
-          ],
+          ),
         ),
       ),
     );

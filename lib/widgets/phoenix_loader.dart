@@ -2,7 +2,9 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-const String _phoenixHeroAsset = 'assets/app_icon_source.png';
+import '../assets/phoenix_assets.dart';
+
+const String _phoenixHeroAsset = PhoenixAssets.appIconLegacy;
 
 class PhoenixLoader extends StatefulWidget {
   final double size;
@@ -134,7 +136,9 @@ class _PhoenixLoaderState extends State<PhoenixLoader>
                       ),
                       boxShadow: [
                         BoxShadow(
-                          color: theme.colorScheme.primary.withValues(alpha: 0.22),
+                          color: theme.colorScheme.primary.withValues(
+                            alpha: 0.22,
+                          ),
                           blurRadius: 12,
                           offset: const Offset(0, 6),
                         ),

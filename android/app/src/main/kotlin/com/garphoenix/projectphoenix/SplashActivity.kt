@@ -54,7 +54,13 @@ class SplashActivity : Activity() {
     if (launchedMain || isFinishing || isDestroyed) return
     launchedMain = true
 
-    startActivity(Intent(this, MainActivity::class.java))
+    val launchIntent = Intent(this, MainActivity::class.java).apply {
+      action = intent?.action
+      data = intent?.data
+      putExtras(intent ?: Intent())
+      addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+    }
+    startActivity(launchIntent)
     overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
     finish()
   }

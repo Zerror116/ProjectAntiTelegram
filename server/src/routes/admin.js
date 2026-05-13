@@ -22,6 +22,7 @@ const {
 } = require("../utils/tenants");
 const {
   provisionIsolatedTenantDatabase,
+  syncTenantShadowTenantState,
 } = require("../utils/tenantDatabases");
 const { logMonitoringEvent } = require("../utils/monitoring");
 const { emitToTenant } = require("../utils/socket");
@@ -76,6 +77,35 @@ function emitTenantSubscriptionUpdate(io, tenantId, row, source = "admin") {
     source,
     at: new Date().toISOString(),
   });
+}
+
+async function syncTenantShadowStateForAdmin(row, source = "admin") {
+  try {
+    return await syncTenantShadowTenantState(row);
+  } catch (err) {
+    console.error(`admin.tenants.${source}.shadowSync error`, err);
+    return {
+      synced: false,
+      reason: "shadow_sync_failed",
+      row_count: 0,
+      error: String(err?.message || err || "unknown_error"),
+    };
+  }
+}
+
+function serializeTenantAdminRow(row, extra = {}) {
+  if (!row || typeof row !== "object") return extra;
+  const {
+    db_url: _dbUrl,
+    db_mode: _dbMode,
+    db_name: _dbName,
+    db_schema: _dbSchema,
+    ...safeRow
+  } = row;
+  return {
+    ...safeRow,
+    ...extra,
+  };
 }
 
 const channelUploadsDir = uploadsPath("channels");
@@ -1124,7 +1154,8 @@ router.post(
              updated_at = now()
          WHERE id = $2
            AND COALESCE(is_deleted, false) = false
-         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, last_payment_confirmed_at`,
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at,
+                   last_payment_confirmed_at, db_mode, db_url, db_name, db_schema`,
         [months, tenantId],
       );
       if (updated.rowCount === 0) {
@@ -1132,6 +1163,10 @@ router.post(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден" });
       }
+      const shadowSync = await syncTenantShadowStateForAdmin(
+        updated.rows[0],
+        "confirmPayment",
+      );
       const io = req.app.get("io");
       emitTenantSubscriptionUpdate(
         io,
@@ -1139,7 +1174,12 @@ router.post(
         updated.rows[0],
         "confirm_payment",
       );
-      return res.json({ ok: true, data: updated.rows[0] });
+      return res.json({
+        ok: true,
+        data: serializeTenantAdminRow(updated.rows[0], {
+          shadow_sync: shadowSync,
+        }),
+      });
     } catch (err) {
       console.error("admin.tenants.confirmPayment error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
@@ -1191,7 +1231,8 @@ router.patch(
              updated_at = now()
          WHERE id = $2
            AND COALESCE(is_deleted, false) = false
-         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at`,
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at,
+                   updated_at, db_mode, db_url, db_name, db_schema`,
         [status, tenantId],
       );
       if (updated.rowCount === 0) {
@@ -1199,6 +1240,10 @@ router.patch(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден" });
       }
+      const shadowSync = await syncTenantShadowStateForAdmin(
+        updated.rows[0],
+        "updateStatus",
+      );
       const io = req.app.get("io");
       emitTenantSubscriptionUpdate(
         io,
@@ -1206,7 +1251,12 @@ router.patch(
         updated.rows[0],
         "status_change",
       );
-      return res.json({ ok: true, data: updated.rows[0] });
+      return res.json({
+        ok: true,
+        data: serializeTenantAdminRow(updated.rows[0], {
+          shadow_sync: shadowSync,
+        }),
+      });
     } catch (err) {
       console.error("admin.tenants.updateStatus error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
@@ -1321,7 +1371,8 @@ router.delete(
              updated_at = now()
          WHERE id = $1
            AND COALESCE(is_deleted, false) = false
-         RETURNING id, code, name, status, access_key_mask, subscription_expires_at, updated_at, is_deleted`,
+         RETURNING id, code, name, status, access_key_mask, subscription_expires_at,
+                   updated_at, is_deleted, db_mode, db_url, db_name, db_schema`,
         [tenantId],
       );
       if (archived.rowCount === 0) {
@@ -1329,9 +1380,18 @@ router.delete(
           .status(404)
           .json({ ok: false, error: "Арендатор не найден или уже удален" });
       }
+      const shadowSync = await syncTenantShadowStateForAdmin(
+        archived.rows[0],
+        "delete",
+      );
       const io = req.app.get("io");
       emitTenantSubscriptionUpdate(io, tenantId, archived.rows[0], "delete");
-      return res.json({ ok: true, data: archived.rows[0] });
+      return res.json({
+        ok: true,
+        data: serializeTenantAdminRow(archived.rows[0], {
+          shadow_sync: shadowSync,
+        }),
+      });
     } catch (err) {
       console.error("admin.tenants.delete error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
@@ -1436,13 +1496,19 @@ function inviteLinkForRequest(req, inviteCode, tenantCode = "") {
   const base = String(process.env.INVITE_LINK_BASE || "").trim();
   const encoded = encodeURIComponent(inviteCode);
   const tenantPart = tenantCode
-    ? `&tenant=${encodeURIComponent(tenantCode)}`
+    ? `?tenant=${encodeURIComponent(tenantCode)}`
     : "";
   if (base) {
-    const glue = base.includes("?") ? "&" : "?";
-    return `${base}${glue}invite=${encoded}${tenantPart}`;
+    const normalizedBase = base.replace(/\/+$/, "");
+    if (/\/join(?:\/|$)/i.test(normalizedBase)) {
+      const glue = normalizedBase.includes("?") ? "&" : "?";
+      return `${normalizedBase}${glue}invite=${encoded}${
+        tenantCode ? `&tenant=${encodeURIComponent(tenantCode)}` : ""
+      }`;
+    }
+    return `${normalizedBase}/join/${encoded}${tenantPart}`;
   }
-  return `${req.protocol}://${req.get("host")}/?invite=${encoded}${tenantPart}`;
+  return `${req.protocol}://${req.get("host")}/join/${encoded}${tenantPart}`;
 }
 
 function isTenantUser(user) {

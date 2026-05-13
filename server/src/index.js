@@ -610,6 +610,14 @@ app.get("/download/android", (req, res) => {
     : '';
   return res.redirect(302, `/api/app/update/download/android${query}`);
 });
+app.get("/join/:inviteCode", (req, res) => {
+  const inviteCode = String(req.params.inviteCode || "").trim();
+  const query = new URLSearchParams();
+  query.set("invite", inviteCode);
+  const tenantCode = String(req.query?.tenant || req.query?.tenant_code || "").trim();
+  if (tenantCode) query.set("tenant", tenantCode);
+  return res.redirect(302, `/?${query.toString()}`);
+});
 app.use("/api/web-push", webPushRoutes);
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/messenger", messengerRoutes);

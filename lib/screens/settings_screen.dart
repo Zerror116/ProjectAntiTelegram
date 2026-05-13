@@ -32,6 +32,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _notifications = true;
   bool _darkMode = false;
   bool _performanceMode = false;
+  String _navIconAnimationMode = 'bounce';
+  String _appBackgroundEffect = 'embers';
+  String _chatBackgroundEffect = 'feathers';
   bool _deletingAccount = false;
   bool _twoFactorEligible = false;
   bool _twoFactorEnabled = false;
@@ -53,6 +56,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final VoidCallback _notificationsListener;
   late final VoidCallback _themeListener;
   late final VoidCallback _performanceModeListener;
+  late final VoidCallback _visualEffectsListener;
 
   bool get _canOpenSupport => true;
 
@@ -81,6 +85,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _notifications = notificationsEnabledNotifier.value;
     _darkMode = themeModeNotifier.value == ThemeMode.dark;
     _performanceMode = performanceModeNotifier.value;
+    _navIconAnimationMode = navIconAnimationModeNotifier.value;
+    _appBackgroundEffect = appBackgroundEffectNotifier.value;
+    _chatBackgroundEffect = chatBackgroundEffectNotifier.value;
     _twoFactorEligible = _isTwoFactorEligibleRole();
 
     _notificationsListener = () {
@@ -95,10 +102,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (!mounted) return;
       setState(() => _performanceMode = performanceModeNotifier.value);
     };
+    _visualEffectsListener = () {
+      if (!mounted) return;
+      setState(() {
+        _navIconAnimationMode = navIconAnimationModeNotifier.value;
+        _appBackgroundEffect = appBackgroundEffectNotifier.value;
+        _chatBackgroundEffect = chatBackgroundEffectNotifier.value;
+      });
+    };
 
     notificationsEnabledNotifier.addListener(_notificationsListener);
     themeModeNotifier.addListener(_themeListener);
     performanceModeNotifier.addListener(_performanceModeListener);
+    navIconAnimationModeNotifier.addListener(_visualEffectsListener);
+    appBackgroundEffectNotifier.addListener(_visualEffectsListener);
+    chatBackgroundEffectNotifier.addListener(_visualEffectsListener);
     if (_twoFactorEligible) {
       _loadTwoFactorStatus();
     }
@@ -117,6 +135,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     notificationsEnabledNotifier.removeListener(_notificationsListener);
     themeModeNotifier.removeListener(_themeListener);
     performanceModeNotifier.removeListener(_performanceModeListener);
+    navIconAnimationModeNotifier.removeListener(_visualEffectsListener);
+    appBackgroundEffectNotifier.removeListener(_visualEffectsListener);
+    chatBackgroundEffectNotifier.removeListener(_visualEffectsListener);
     super.dispose();
   }
 
@@ -149,6 +170,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
           : 'Режим для старых устройств выключен',
       tone: AppNoticeTone.info,
     );
+  }
+
+  Future<void> _setNavIconAnimationMode(String? value) async {
+    if (value == null) return;
+    await setNavIconAnimationMode(value);
+    if (!mounted) return;
+    setState(() => _navIconAnimationMode = navIconAnimationModeNotifier.value);
+  }
+
+  Future<void> _setAppBackgroundEffect(String? value) async {
+    if (value == null) return;
+    await setAppBackgroundEffect(value);
+    if (!mounted) return;
+    setState(() => _appBackgroundEffect = appBackgroundEffectNotifier.value);
+  }
+
+  Future<void> _setChatBackgroundEffect(String? value) async {
+    if (value == null) return;
+    await setChatBackgroundEffect(value);
+    if (!mounted) return;
+    setState(() => _chatBackgroundEffect = chatBackgroundEffectNotifier.value);
   }
 
   Future<void> _showNotificationGuide() async {
@@ -1922,6 +1964,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _buildVisualField({
+    required String label,
+    required String value,
+    required List<DropdownMenuItem<String>> items,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return DropdownButtonFormField<String>(
+      initialValue: value,
+      decoration: InputDecoration(
+        labelText: label,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+      items: items,
+      onChanged: _performanceMode ? null : onChanged,
+    );
+  }
+
   Future<void> _openStorageManager() async {
     await Navigator.push(
       context,
@@ -2167,6 +2226,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       'Меньше анимаций и более лёгкая отрисовка для слабых устройств.',
                     ),
                   ),
+                ),
+                const SizedBox(height: 10),
+                _buildVisualField(
+                  label: 'Анимация иконок навигации',
+                  value: _navIconAnimationMode,
+                  items: const [
+                    DropdownMenuItem(value: 'off', child: Text('Выключено')),
+                    DropdownMenuItem(value: 'bounce', child: Text('Пружина')),
+                    DropdownMenuItem(value: 'glow', child: Text('Свечение')),
+                  ],
+                  onChanged: _setNavIconAnimationMode,
+                ),
+                const SizedBox(height: 10),
+                _buildVisualField(
+                  label: 'Фон вкладок',
+                  value: _appBackgroundEffect,
+                  items: const [
+                    DropdownMenuItem(value: 'off', child: Text('Выключено')),
+                    DropdownMenuItem(
+                      value: 'embers',
+                      child: Text('Искры Феникса'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'network',
+                      child: Text('Техно-сеть'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'constellation',
+                      child: Text('Созвездие'),
+                    ),
+                  ],
+                  onChanged: _setAppBackgroundEffect,
+                ),
+                const SizedBox(height: 10),
+                _buildVisualField(
+                  label: 'Фон внутри чатов',
+                  value: _chatBackgroundEffect,
+                  items: const [
+                    DropdownMenuItem(value: 'off', child: Text('Выключено')),
+                    DropdownMenuItem(
+                      value: 'feathers',
+                      child: Text('Перья и искры'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'constellation',
+                      child: Text('Созвездие'),
+                    ),
+                  ],
+                  onChanged: _setChatBackgroundEffect,
                 ),
                 if (_canOpenThermalPrinter) ...[
                   const SizedBox(height: 10),

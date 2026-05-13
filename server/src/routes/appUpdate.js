@@ -769,6 +769,25 @@ function renderAndroidDownloadUnavailablePage(config) {
 }
 
 function renderAndroidDownloadPage(config) {
+  const inviteCode = cleanString(config.invite_code || config.invite || '');
+  const tenantCode = cleanString(config.tenant_code || config.tenant || '');
+  const appendInviteQuery = (rawUrl) => {
+    if (!rawUrl) return '';
+    try {
+      const url = new URL(rawUrl);
+      if (inviteCode) url.searchParams.set('invite', inviteCode);
+      if (tenantCode) url.searchParams.set('tenant', tenantCode);
+      return url.toString();
+    } catch (_) {
+      return rawUrl;
+    }
+  };
+  const joinUrl = inviteCode
+    ? appendInviteQuery(toAbsolutePublicUrl(`/join/${encodeURIComponent(inviteCode)}`, config.req || null))
+    : '';
+  const appSchemeUrl = inviteCode
+    ? `phoenix://join/${encodeURIComponent(inviteCode)}${tenantCode ? `?tenant=${encodeURIComponent(tenantCode)}` : ''}`
+    : '';
   const changelogSource = Array.isArray(config.changelog_items)
     ? config.changelog_items.join('\n')
     : cleanString(config.changelog);
@@ -786,9 +805,22 @@ function renderAndroidDownloadPage(config) {
       }).format(new Date(config.published_at))
     : 'Не указана';
 
-  const downloadButton = config.download_url
-    ? `<a class=\"cta\" href=\"${escapeHtml(config.download_url)}\">Скачать APK Феникс</a>`
+  const downloadUrl = appendInviteQuery(config.download_url);
+  const downloadButton = downloadUrl
+    ? `<a class=\"cta\" href=\"${escapeHtml(downloadUrl)}\">Скачать APK Феникс</a>`
     : '<div class="muted">APK пока не настроен на сервере.</div>';
+  const inviteBlock = inviteCode
+    ? `<div class="invite-box">
+        <strong>Вы устанавливаете Феникс для группы</strong>
+        <div class="invite-code">${escapeHtml(inviteCode)}</div>
+        <div class="muted">После установки нажмите кнопку ниже. Если Android не передаст код автоматически, скопируйте его вручную.</div>
+        <div class="actions">
+          ${joinUrl ? `<a class="secondary" href="${escapeHtml(joinUrl)}">Открыть приложение с кодом</a>` : ''}
+          ${appSchemeUrl ? `<a class="secondary ghost" href="${escapeHtml(appSchemeUrl)}">Открыть через deep link</a>` : ''}
+          <button class="copy" type="button" onclick="navigator.clipboard && navigator.clipboard.writeText('${escapeHtml(inviteCode)}')">Скопировать код</button>
+        </div>
+      </div>`
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="ru">
@@ -808,6 +840,12 @@ function renderAndroidDownloadPage(config) {
   .meta { border:1px solid rgba(255,255,255,.08); border-radius:18px; padding:14px; background:rgba(255,255,255,.02); }
   .meta strong { display:block; font-size:12px; color:#aeead7; text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
   .cta { display:inline-flex; align-items:center; justify-content:center; min-height:52px; padding:0 20px; border-radius:18px; text-decoration:none; color:#062b21; background:linear-gradient(135deg,#32db7c,#19c7c9); font-weight:800; box-shadow:0 12px 28px rgba(25,199,201,.24); }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+  .secondary, .copy { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:0 14px; border-radius:14px; border:1px solid rgba(255,255,255,.12); color:#fff7ff; background:rgba(255,255,255,.08); text-decoration:none; font-weight:750; }
+  .secondary.ghost { color:#bfe8ff; }
+  .copy { cursor:pointer; font:inherit; }
+  .invite-box { margin:20px 0; padding:16px; border-radius:20px; background:rgba(50,219,124,.10); border:1px solid rgba(50,219,124,.28); }
+  .invite-code { margin:10px 0; font-size:28px; font-weight:900; letter-spacing:.04em; color:#ddfef7; }
   .section { margin-top:22px; }
   .section h2 { margin:0 0 10px; font-size:18px; }
   ul { margin:0; padding-left:20px; color:#cbbfe0; line-height:1.6; }
@@ -824,6 +862,7 @@ function renderAndroidDownloadPage(config) {
       <h1>Феникс для Android</h1>
       <p class="lead">Это официальная страница первой установки APK. Дальнейшие обновления приложение скачивает и показывает уже внутри себя.</p>
       <span class="badge">Официальный файл Феникс</span>
+      ${inviteBlock}
       <div class="grid">
         <div class="meta"><strong>Версия</strong>${escapeHtml(formatPublicVersionLabel(config.latest_version, config.latest_build))}</div>
         <div class="meta"><strong>Размер APK</strong>${escapeHtml(formatBytesRu(config.file_size))}</div>
@@ -849,6 +888,17 @@ function renderAndroidDownloadPage(config) {
       </div>
     </div>
   </div>
+  <script>
+    (function(){
+      var invite = ${JSON.stringify(inviteCode)};
+      var tenant = ${JSON.stringify(tenantCode)};
+      if (!invite) return;
+      try {
+        localStorage.setItem('phoenix.pending_invite', invite);
+        if (tenant) localStorage.setItem('phoenix.pending_tenant', tenant);
+      } catch (_) {}
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -916,7 +966,12 @@ router.get('/android/manifest', async (req, res) => {
 
 router.get('/download/android', async (req, res) => {
   try {
-    const android = await buildAndroidPublicConfig(req);
+    const android = {
+      ...(await buildAndroidPublicConfig(req)),
+      invite_code: cleanString(req.query?.invite || req.query?.code || ''),
+      tenant_code: cleanString(req.query?.tenant || req.query?.tenant_code || ''),
+      req,
+    };
     if (!android.enabled) {
       const statusCode = cleanString(android.source) === 'release_json' ? 503 : 404;
       return res

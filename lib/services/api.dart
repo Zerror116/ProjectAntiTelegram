@@ -27,7 +27,7 @@ class ApiService {
           host == 'localhost' ||
           host == '0.0.0.0' ||
           host == '::1';
-      if (kDebugMode && isLoopback) {
+      if (isLoopback) {
         return _localDebugBaseUrl;
       }
       final portPart = uri.hasPort ? ':${uri.port}' : '';

@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../assets/phoenix_assets.dart';
 import '../main.dart';
 import '../src/utils/chat_api.dart';
 import '../src/utils/messenger_ui_helpers.dart';
@@ -1590,6 +1591,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       title: 'Не удалось загрузить чаты',
                       subtitle: _error,
                       icon: Icons.cloud_off_rounded,
+                      assetPath: PhoenixAssets.emptyStateNetworkError,
                       accentColor: theme.colorScheme.error,
                       action: ElevatedButton.icon(
                         onPressed: _loadChats,
@@ -1607,49 +1609,30 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 ),
                 padding: const EdgeInsets.all(24),
                 children: [
-                  const SizedBox(height: 72),
-                  Icon(
-                    Icons.chat_bubble_outline,
-                    size: 58,
-                    color: theme.colorScheme.primary,
-                  ),
-                  const SizedBox(height: 16),
-                  Center(
-                    child: Text(
-                      'Пока нет доступных чатов',
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
+                  const SizedBox(height: 36),
+                  AppEmptyState(
+                    title: 'Пока нет доступных чатов',
+                    subtitle:
+                        'Когда появятся личные сообщения, support или системные каналы, они появятся здесь.',
+                    icon: Icons.chat_bubble_outline,
+                    assetPath: PhoenixAssets.emptyStateNoChats,
+                    action: Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _openDirectChatDialog,
+                          icon: const Icon(Icons.person_outline),
+                          label: const Text('Личные сообщения'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: _loadChats,
+                          icon: const Icon(Icons.refresh_rounded),
+                          label: const Text('Обновить'),
+                        ),
+                      ],
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Center(
-                    child: Text(
-                      'Когда появятся личные сообщения, support или системные каналы, они появятся здесь.',
-                      textAlign: TextAlign.center,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                        height: 1.35,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  Wrap(
-                    alignment: WrapAlignment.center,
-                    spacing: 10,
-                    runSpacing: 10,
-                    children: [
-                      FilledButton.icon(
-                        onPressed: _openDirectChatDialog,
-                        icon: const Icon(Icons.person_outline),
-                        label: const Text('Личные сообщения'),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: _loadChats,
-                        icon: const Icon(Icons.refresh_rounded),
-                        label: const Text('Обновить'),
-                      ),
-                    ],
                   ),
                 ],
               )
@@ -1670,6 +1653,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                                 subtitle:
                                     'Когда появятся подходящие диалоги, они сразу отобразятся здесь.',
                                 icon: Icons.forum_outlined,
+                                assetPath: PhoenixAssets.emptyStateNoChats,
                                 action: Wrap(
                                   alignment: WrapAlignment.center,
                                   spacing: 10,

@@ -4,9 +4,22 @@ import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
+import androidx.credentials.CreateCredentialResponse
+import androidx.credentials.CreatePublicKeyCredentialRequest
+import androidx.credentials.CreatePublicKeyCredentialResponse
+import androidx.credentials.CredentialManager
+import androidx.credentials.CredentialManagerCallback
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.GetCredentialResponse
+import androidx.credentials.GetPublicKeyCredentialOption
+import androidx.credentials.PublicKeyCredential
+import androidx.credentials.exceptions.CreateCredentialException
+import androidx.credentials.exceptions.GetCredentialException
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -16,14 +29,31 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL_NAME =
             "com.garphoenix.projectphoenix/native_update_installer"
+        private const val DEEP_LINK_CHANNEL_NAME =
+            "com.garphoenix.projectphoenix/deep_links"
+        private const val PASSKEY_CHANNEL_NAME =
+            "com.garphoenix.projectphoenix/passkeys"
         private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 6104
     }
 
     private var pendingNotificationPermissionResult: MethodChannel.Result? = null
+    private var initialDeepLink: String? = null
+    private var latestDeepLink: String? = null
+    private val credentialManager: CredentialManager by lazy {
+        CredentialManager.create(this)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        initialDeepLink = intent?.dataString
+        latestDeepLink = initialDeepLink
         ensureNotificationChannels()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        latestDeepLink = intent.dataString
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -128,6 +158,101 @@ class MainActivity : FlutterActivity() {
 
                 else -> result.notImplemented()
             }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            DEEP_LINK_CHANNEL_NAME,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getInitialLink" -> result.success(initialDeepLink ?: "")
+                "consumeLatestLink" -> {
+                    val value = latestDeepLink ?: ""
+                    latestDeepLink = null
+                    result.success(value)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            PASSKEY_CHANNEL_NAME,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "isAvailable" -> result.success(Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                "create" -> createPasskey(call.arguments as? String, result)
+                "get" -> getPasskey(call.arguments as? String, result)
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun createPasskey(optionsJson: String?, result: MethodChannel.Result) {
+        val requestJson = optionsJson?.trim().orEmpty()
+        if (requestJson.isEmpty()) {
+            result.error("invalid_args", "options json is required", null)
+            return
+        }
+        try {
+            val request = CreatePublicKeyCredentialRequest(requestJson)
+            credentialManager.createCredentialAsync(
+                this,
+                request,
+                CancellationSignal(),
+                ContextCompat.getMainExecutor(this),
+                object : CredentialManagerCallback<CreateCredentialResponse, CreateCredentialException> {
+                    override fun onResult(response: CreateCredentialResponse) {
+                        val publicKeyResponse = response as? CreatePublicKeyCredentialResponse
+                        if (publicKeyResponse == null) {
+                            result.error("passkey_create_failed", "Unexpected passkey response", null)
+                            return
+                        }
+                        result.success(publicKeyResponse.registrationResponseJson)
+                    }
+
+                    override fun onError(e: CreateCredentialException) {
+                        result.error("passkey_create_failed", e.message, null)
+                    }
+                },
+            )
+        } catch (t: Throwable) {
+            result.error("passkey_create_failed", t.message, null)
+        }
+    }
+
+    private fun getPasskey(optionsJson: String?, result: MethodChannel.Result) {
+        val requestJson = optionsJson?.trim().orEmpty()
+        if (requestJson.isEmpty()) {
+            result.error("invalid_args", "options json is required", null)
+            return
+        }
+        try {
+            val request = GetCredentialRequest(
+                listOf(GetPublicKeyCredentialOption(requestJson)),
+            )
+            credentialManager.getCredentialAsync(
+                this,
+                request,
+                CancellationSignal(),
+                ContextCompat.getMainExecutor(this),
+                object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
+                    override fun onResult(response: GetCredentialResponse) {
+                        val publicKeyCredential = response.credential as? PublicKeyCredential
+                        if (publicKeyCredential == null) {
+                            result.error("passkey_get_failed", "Unexpected passkey response", null)
+                            return
+                        }
+                        result.success(publicKeyCredential.authenticationResponseJson)
+                    }
+
+                    override fun onError(e: GetCredentialException) {
+                        result.error("passkey_get_failed", e.message, null)
+                    }
+                },
+            )
+        } catch (t: Throwable) {
+            result.error("passkey_get_failed", t.message, null)
         }
     }
 

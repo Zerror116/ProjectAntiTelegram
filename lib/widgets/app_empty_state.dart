@@ -11,6 +11,8 @@ class AppEmptyState extends StatelessWidget {
     this.compact = false,
     this.accentColor,
     this.badge,
+    this.assetPath,
+    this.assetSize,
   });
 
   final String title;
@@ -21,6 +23,8 @@ class AppEmptyState extends StatelessWidget {
   final bool compact;
   final Color? accentColor;
   final String? badge;
+  final String? assetPath;
+  final double? assetSize;
 
   @override
   Widget build(BuildContext context) {
@@ -88,34 +92,32 @@ class AppEmptyState extends StatelessWidget {
                 ),
                 SizedBox(height: compact ? 12 : 14),
               ],
-              Stack(
-                alignment: Alignment.center,
-                children: [
-                  Container(
-                    width: compact ? 72 : 86,
-                    height: compact ? 72 : 86,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: RadialGradient(
-                        colors: [
-                          accent.withValues(alpha: 0.18),
-                          accent.withValues(alpha: 0.03),
-                        ],
-                      ),
-                    ),
+              if (assetPath != null && assetPath!.trim().isNotEmpty)
+                Semantics(
+                  image: true,
+                  label: title,
+                  child: Image.asset(
+                    assetPath!,
+                    width: assetSize ?? (compact ? 112 : 148),
+                    height: assetSize ?? (compact ? 112 : 148),
+                    fit: BoxFit.contain,
+                    filterQuality: FilterQuality.high,
+                    errorBuilder: (context, error, stackTrace) =>
+                        _EmptyStateIcon(
+                          compact: compact,
+                          accent: accent,
+                          scheme: scheme,
+                          icon: icon,
+                        ),
                   ),
-                  Container(
-                    width: compact ? 56 : 64,
-                    height: compact ? 56 : 64,
-                    decoration: BoxDecoration(
-                      color: scheme.surface,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: scheme.outlineVariant),
-                    ),
-                    child: Icon(icon, size: compact ? 26 : 30, color: accent),
-                  ),
-                ],
-              ),
+                )
+              else
+                _EmptyStateIcon(
+                  compact: compact,
+                  accent: accent,
+                  scheme: scheme,
+                  icon: icon,
+                ),
               SizedBox(height: compact ? 12 : 16),
               Text(
                 title,
@@ -144,6 +146,52 @@ class AppEmptyState extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _EmptyStateIcon extends StatelessWidget {
+  const _EmptyStateIcon({
+    required this.compact,
+    required this.accent,
+    required this.scheme,
+    required this.icon,
+  });
+
+  final bool compact;
+  final Color accent;
+  final ColorScheme scheme;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Container(
+          width: compact ? 72 : 86,
+          height: compact ? 72 : 86,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                accent.withValues(alpha: 0.18),
+                accent.withValues(alpha: 0.03),
+              ],
+            ),
+          ),
+        ),
+        Container(
+          width: compact ? 56 : 64,
+          height: compact ? 56 : 64,
+          decoration: BoxDecoration(
+            color: scheme.surface,
+            shape: BoxShape.circle,
+            border: Border.all(color: scheme.outlineVariant),
+          ),
+          child: Icon(icon, size: compact ? 26 : 30, color: accent),
+        ),
+      ],
     );
   }
 }

@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:share_plus/share_plus.dart';
@@ -32,6 +33,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
   String _contactsError = '';
   String _query = '';
   PendingInviteReferral? _pendingInviteReferral;
+
+  bool get _phonebookImportSupported {
+    if (kIsWeb) return false;
+    return defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+  }
 
   @override
   void initState() {
@@ -167,19 +174,23 @@ class _ContactsScreenState extends State<ContactsScreen> {
         return 'Нет соединения с сервером';
       }
     }
-    return error.toString().trim().isEmpty ? 'Неизвестная ошибка' : error.toString().trim();
+    return error.toString().trim().isEmpty
+        ? 'Неизвестная ошибка'
+        : error.toString().trim();
   }
 
   List<Map<String, dynamic>> _filteredContacts() {
     final query = _query.trim().toLowerCase();
     if (query.isEmpty) return List<Map<String, dynamic>>.from(_contacts);
-    return _contacts.where((peer) {
-      final blobs = <String>[
-        _contactTitle(peer).toLowerCase(),
-        _contactSubtitle(peer).toLowerCase(),
-      ];
-      return blobs.any((value) => value.contains(query));
-    }).toList(growable: false);
+    return _contacts
+        .where((peer) {
+          final blobs = <String>[
+            _contactTitle(peer).toLowerCase(),
+            _contactSubtitle(peer).toLowerCase(),
+          ];
+          return blobs.any((value) => value.contains(query));
+        })
+        .toList(growable: false);
   }
 
   Future<bool> _openDirectForUser(String userId) async {
@@ -202,7 +213,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
           : <String, dynamic>{};
       final chatId = (chat['id'] ?? '').toString().trim();
       if (chatId.isEmpty || !mounted) return false;
-      final chatTitle = (chat['display_title'] ?? '').toString().trim().isNotEmpty
+      final chatTitle =
+          (chat['display_title'] ?? '').toString().trim().isNotEmpty
           ? (chat['display_title'] ?? '').toString().trim()
           : _contactTitle(peer);
       final chatSettings = chat['settings'] is Map
@@ -233,7 +245,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
     final userId = _peerId(peer);
     if (userId.isEmpty) return;
     try {
-      await authService.dio.post('/api/chats/contacts', data: {'user_id': userId});
+      await authService.dio.post(
+        '/api/chats/contacts',
+        data: {'user_id': userId},
+      );
       if (!mounted) return;
       showGlobalAppNotice('Контакт добавлен', tone: AppNoticeTone.success);
       await _loadContacts(force: true);
@@ -288,12 +303,17 @@ class _ContactsScreenState extends State<ContactsScreen> {
     }
     final row = Map<String, dynamic>.from(data['data'] as Map);
     final code = (row['code'] ?? '').toString().trim().toUpperCase();
-    final tenantCode = (row['tenant_code'] ?? '').toString().trim().toLowerCase();
+    final tenantCode = (row['tenant_code'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
     var inviteLink = (row['invite_link'] ?? '').toString().trim();
     if (inviteLink.isEmpty) {
       final qp = <String, String>{if (code.isNotEmpty) 'invite': code};
       if (tenantCode.isNotEmpty) qp['tenant'] = tenantCode;
-      inviteLink = Uri.base.replace(queryParameters: qp, fragment: '').toString();
+      inviteLink = Uri.base
+          .replace(queryParameters: qp, fragment: '')
+          .toString();
     }
     final referrerId = (authService.currentUser?.id ?? '').trim();
     final referrerName = (authService.currentUser?.name ?? '').trim();
@@ -329,11 +349,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
   String _tenantHash(String digitsCore10) {
     final tenantId = (authService.currentUser?.tenantId ?? '').trim();
-    return crypto.sha256.convert(utf8.encode('$tenantId:$digitsCore10')).toString();
+    return crypto.sha256
+        .convert(utf8.encode('$tenantId:$digitsCore10'))
+        .toString();
   }
 
   Future<void> _importPhonebook() async {
     if (_matchingPhonebook) return;
+    if (!_phonebookImportSupported) {
+      showGlobalAppNotice(
+        'Импорт телефонной книги доступен в Android/iPhone приложении. На сайте можно добавлять контакты вручную.',
+        tone: AppNoticeTone.warning,
+      );
+      return;
+    }
     setState(() => _matchingPhonebook = true);
     try {
       final permissionStatus = await FlutterContacts.permissions.request(
@@ -381,7 +410,10 @@ class _ContactsScreenState extends State<ContactsScreen> {
       final invitesRaw = result['invites'] is List
           ? List<Map<String, dynamic>>.from(result['invites'] as List)
           : const <Map<String, dynamic>>[];
-      final contactIds = _contacts.map(_peerId).where((id) => id.isNotEmpty).toSet();
+      final contactIds = _contacts
+          .map(_peerId)
+          .where((id) => id.isNotEmpty)
+          .toSet();
       if (!mounted) return;
       setState(() {
         _phonebookImported = true;
@@ -458,7 +490,9 @@ class _ContactsScreenState extends State<ContactsScreen> {
   Widget _buildPhonebookMatchTile(_PhonebookMatchRow row) {
     final peer = row.peer;
     final userId = _peerId(peer);
-    final title = row.displayName.isNotEmpty ? row.displayName : _contactTitle(peer);
+    final title = row.displayName.isNotEmpty
+        ? row.displayName
+        : _contactTitle(peer);
     final subtitle = _contactSubtitle(peer);
     final inContacts = _isInContacts(peer);
     return ListTile(
@@ -499,11 +533,17 @@ class _ContactsScreenState extends State<ContactsScreen> {
   }
 
   Widget _buildInviteTile(_InviteCandidateRow row) {
-    final title = row.displayName.isNotEmpty ? row.displayName : 'Контакт без имени';
+    final title = row.displayName.isNotEmpty
+        ? row.displayName
+        : 'Контакт без имени';
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: CircleAvatar(
-        child: Text(title.trim().isEmpty ? '?' : title.trim().substring(0, 1).toUpperCase()),
+        child: Text(
+          title.trim().isEmpty
+              ? '?'
+              : title.trim().substring(0, 1).toUpperCase(),
+        ),
       ),
       title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: const Text('Не найден в Фениксе. Можно отправить приглашение.'),
@@ -633,16 +673,22 @@ class _ContactsScreenState extends State<ContactsScreen> {
     final query = _query.trim().toLowerCase();
     final visibleMatches = query.isEmpty
         ? _phonebookMatches
-        : _phonebookMatches.where((row) {
-            final text = '${row.displayName} ${_contactTitle(row.peer)} ${_contactSubtitle(row.peer)}'.toLowerCase();
-            return text.contains(query);
-          }).toList(growable: false);
+        : _phonebookMatches
+              .where((row) {
+                final text =
+                    '${row.displayName} ${_contactTitle(row.peer)} ${_contactSubtitle(row.peer)}'
+                        .toLowerCase();
+                return text.contains(query);
+              })
+              .toList(growable: false);
     final visibleInvites = query.isEmpty
         ? _inviteCandidates
-        : _inviteCandidates.where((row) {
-            final text = row.displayName.toLowerCase();
-            return text.contains(query);
-          }).toList(growable: false);
+        : _inviteCandidates
+              .where((row) {
+                final text = row.displayName.toLowerCase();
+                return text.contains(query);
+              })
+              .toList(growable: false);
 
     return Scaffold(
       appBar: AppBar(
@@ -694,13 +740,17 @@ class _ContactsScreenState extends State<ContactsScreen> {
                   : filteredContacts.isEmpty
                   ? const Text('Контактов пока нет')
                   : Column(
-                      children: filteredContacts.map(_buildContactTile).toList(),
+                      children: filteredContacts
+                          .map(_buildContactTile)
+                          .toList(),
                     ),
             ),
             _buildSectionCard(
               icon: Icons.phone_android_outlined,
               title: 'Контакты телефона',
-              subtitle: _phonebookImported
+              subtitle: !_phonebookImportSupported
+                  ? 'На сайте браузер не даёт доступ к телефонной книге. Используйте Android/iPhone приложение.'
+                  : _phonebookImported
                   ? 'Совпадения из вашей телефонной книги внутри текущей группы.'
                   : 'Нажмите на импорт, чтобы найти людей из телефонной книги в Фениксе.',
               action: FilledButton.icon(
@@ -708,18 +758,27 @@ class _ContactsScreenState extends State<ContactsScreen> {
                 icon: const Icon(Icons.add_rounded),
                 label: const Text('Импорт'),
               ),
-              child: !_phonebookImported && !_matchingPhonebook
-                  ? const Text('Импорт контактов запускается только по явному действию.')
+              child: !_phonebookImportSupported
+                  ? const Text(
+                      'Импорт появится здесь при входе через мобильное приложение.',
+                    )
+                  : !_phonebookImported && !_matchingPhonebook
+                  ? const Text(
+                      'Импорт контактов запускается только по явному действию.',
+                    )
                   : visibleMatches.isEmpty
                   ? const Text('Совпадений пока нет')
                   : Column(
-                      children: visibleMatches.map(_buildPhonebookMatchTile).toList(),
+                      children: visibleMatches
+                          .map(_buildPhonebookMatchTile)
+                          .toList(),
                     ),
             ),
             _buildSectionCard(
               icon: Icons.share_outlined,
               title: 'Пригласить в Феникс',
-              subtitle: 'Контакты из телефонной книги, которых ещё нет в приложении.',
+              subtitle:
+                  'Контакты из телефонной книги, которых ещё нет в приложении.',
               child: visibleInvites.isEmpty
                   ? const Text('Кандидатов для приглашения пока нет')
                   : Column(

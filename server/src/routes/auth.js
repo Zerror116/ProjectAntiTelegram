@@ -5,6 +5,12 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const validator = require('validator');
 const { v4: uuidv4 } = require('uuid');
+const {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} = require('@simplewebauthn/server');
 const db = require('../db'); // предполагается, что db экспортирует функцию query
 const { authMiddleware } = require('../utils/auth');
 const { signJwt, verifyJwt } = require('../utils/jwt');
@@ -92,6 +98,12 @@ const SESSION_TTL_DAYS = Math.max(
 );
 const SESSION_TTL_MS = SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = parseDurationMs(ACCESS_TOKEN_TTL, 24 * 60 * 60 * 1000);
+const PASSKEY_CHALLENGE_TTL_MS = Math.max(
+  60 * 1000,
+  Math.min(Number(process.env.AUTH_PASSKEY_CHALLENGE_TTL_MS || 5 * 60 * 1000) || 5 * 60 * 1000, 15 * 60 * 1000),
+);
+const PASSKEY_RP_NAME = String(process.env.AUTH_PASSKEY_RP_NAME || 'Проект Феникс').trim() || 'Проект Феникс';
+const passkeyChallenges = new Map();
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -334,12 +346,33 @@ function buildInviteLink(req, inviteCode, tenantCode = '') {
   const base = String(process.env.INVITE_LINK_BASE || '').trim();
   const encodedInvite = encodeURIComponent(String(inviteCode || '').trim());
   const encodedTenant = encodeURIComponent(String(tenantCode || '').trim());
-  const tenantPart = encodedTenant ? `&tenant=${encodedTenant}` : '';
+  const tenantPart = encodedTenant ? `?tenant=${encodedTenant}` : '';
   if (base) {
-    const glue = base.includes('?') ? '&' : '?';
-    return `${base}${glue}invite=${encodedInvite}${tenantPart}`;
+    const normalizedBase = base.replace(/\/+$/, '');
+    if (/\/join(?:\/|$)/i.test(normalizedBase)) {
+      const glue = normalizedBase.includes('?') ? '&' : '?';
+      return `${normalizedBase}${glue}invite=${encodedInvite}${encodedTenant ? `&tenant=${encodedTenant}` : ''}`;
+    }
+    return `${normalizedBase}/join/${encodedInvite}${tenantPart}`;
   }
-  return `${req.protocol}://${req.get('host')}/?invite=${encodedInvite}${tenantPart}`;
+  return `${req.protocol}://${req.get('host')}/join/${encodedInvite}${tenantPart}`;
+}
+
+function normalizeInvitePublicError(error, reason = '') {
+  const normalizedReason = String(reason || '').toLowerCase().trim();
+  const normalized = String(error || '').toLowerCase().trim();
+  if (normalizedReason === 'tenant_expired' || normalized.includes('срок подписки')) {
+    return 'Подписка группы закончилась';
+  }
+  if (normalizedReason === 'tenant_blocked' || normalized.includes('приостановлена')) {
+    return 'Группа временно недоступна';
+  }
+  if (normalized.includes('отключ')) return 'Ссылка приглашения недействительна';
+  if (normalized.includes('истек') || normalized.includes('исчерпан')) {
+    return 'Ссылка приглашения недействительна';
+  }
+  if (normalized.includes('не найден')) return 'Код приглашения не найден';
+  return error || 'Ссылка приглашения недействительна';
 }
 
 function normalizeTenantGroupName(raw) {
@@ -1397,6 +1430,24 @@ async function resolveRequestedCreatorTenant(req) {
   return tenant;
 }
 
+async function resolveFreshTenantForAuth(user, tenant) {
+  const tenantCode = db.normalizeTenantCode(
+    tenant?.code || user?.tenant_code || '',
+  );
+  if (tenantCode) {
+    const freshByCode = await db.resolveTenantByCode(tenantCode);
+    if (freshByCode) return freshByCode;
+  }
+
+  const tenantId = String(tenant?.id || user?.tenant_id || '').trim();
+  if (tenantId) {
+    const freshById = await db.resolveTenantById(tenantId);
+    if (freshById) return freshById;
+  }
+
+  return tenant || null;
+}
+
 async function buildSuccessfulAuthResponse({
   req,
   user,
@@ -1410,7 +1461,14 @@ async function buildSuccessfulAuthResponse({
   const creatorScopedTenant = isPlatformCreator
     ? await resolveRequestedCreatorTenant(req)
     : null;
-  const responseTenant = creatorScopedTenant || tenant || null;
+  let responseTenant = creatorScopedTenant || tenant || null;
+  if (!isPlatformCreator) {
+    try {
+      responseTenant = await resolveFreshTenantForAuth(user, responseTenant);
+    } catch (err) {
+      console.error('auth.buildSuccessfulAuthResponse freshTenant error', err);
+    }
+  }
   if (!isPlatformCreator) {
     try {
       await upsertTenantUserIndex({
@@ -1462,11 +1520,11 @@ async function buildSuccessfulAuthResponse({
       role: user.role,
       tenant_id: responseTenant?.id || user.tenant_id || null,
       tenant_code: effectiveTenantCode,
-      tenant_name: user.tenant_name || responseTenant?.name || null,
-      tenant_status: user.tenant_status || responseTenant?.status || null,
+      tenant_name: responseTenant?.name || user.tenant_name || null,
+      tenant_status: responseTenant?.status || user.tenant_status || null,
       subscription_expires_at:
-        user.subscription_expires_at ||
         responseTenant?.subscription_expires_at ||
+        user.subscription_expires_at ||
         null,
       phone_access_state: phoneAccess.state || 'none',
       phone_access: phoneAccess,
@@ -1475,14 +1533,107 @@ async function buildSuccessfulAuthResponse({
       ? {
           id: responseTenant?.id || user.tenant_id,
           code: effectiveTenantCode,
-          name: user.tenant_name || responseTenant?.name || null,
-          status: user.tenant_status || responseTenant?.status || null,
+          name: responseTenant?.name || user.tenant_name || null,
+          status: responseTenant?.status || user.tenant_status || null,
           subscription_expires_at:
-            user.subscription_expires_at ||
             responseTenant?.subscription_expires_at ||
+            user.subscription_expires_at ||
             null,
         }
       : null,
+  };
+}
+
+function resolvePasskeyRp(req) {
+  const configuredOrigin = String(process.env.AUTH_PASSKEY_ORIGIN || '').trim();
+  const fallbackOrigin = `${req.protocol}://${req.get('host')}`;
+  const origin = (configuredOrigin || fallbackOrigin).replace(/\/+$/, '');
+  let hostname = '';
+  try {
+    hostname = new URL(origin).hostname;
+  } catch (_) {
+    hostname = String(req.hostname || req.get('host') || 'localhost')
+      .split(':')[0]
+      .trim();
+  }
+  const rpID =
+    String(process.env.AUTH_PASSKEY_RP_ID || '').trim() ||
+    hostname ||
+    'localhost';
+  return { rpName: PASSKEY_RP_NAME, rpID, origin };
+}
+
+function passkeyChallengeKey(kind, value) {
+  return `${kind}:${String(value || '').trim().toLowerCase()}`;
+}
+
+function setPasskeyChallenge(kind, value, payload) {
+  const key = passkeyChallengeKey(kind, value);
+  passkeyChallenges.set(key, {
+    ...payload,
+    expiresAt: Date.now() + PASSKEY_CHALLENGE_TTL_MS,
+  });
+}
+
+function consumePasskeyChallenge(kind, value) {
+  const key = passkeyChallengeKey(kind, value);
+  const payload = passkeyChallenges.get(key) || null;
+  passkeyChallenges.delete(key);
+  if (!payload || Number(payload.expiresAt || 0) < Date.now()) {
+    return null;
+  }
+  return payload;
+}
+
+function normalizeCredentialTransports(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function isCreatorIdentity(user) {
+  const role = String(user?.base_role || user?.role || '').toLowerCase().trim();
+  return role === 'creator' &&
+    String(user?.email || '').toLowerCase().trim() === CREATOR_EMAIL.toLowerCase();
+}
+
+async function fetchCreatorForPasskeyById(queryable, userId) {
+  if (!userId) return null;
+  const q = await queryable.query(
+    `SELECT id, email, name, role, is_active, block_reason, tenant_id, password_hash
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId],
+  );
+  const user = q.rows[0] || null;
+  return isCreatorIdentity(user) ? user : null;
+}
+
+async function fetchCreatorForPasskeyByEmail(queryable, email) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail || normalizedEmail !== CREATOR_EMAIL.toLowerCase()) {
+    return null;
+  }
+  const q = await queryable.query(
+    `SELECT id, email, name, role, is_active, block_reason, tenant_id, password_hash
+     FROM users
+     WHERE lower(email) = $1
+     LIMIT 1`,
+    [normalizedEmail],
+  );
+  const user = q.rows[0] || null;
+  return isCreatorIdentity(user) ? user : null;
+}
+
+function mapPasskeyRowToCredential(row) {
+  return {
+    id: String(row?.credential_id || ''),
+    publicKey: row?.credential_public_key,
+    counter: Number(row?.counter || 0),
+    transports: normalizeCredentialTransports(row?.transports),
   };
 }
 
@@ -1722,15 +1873,23 @@ router.post('/register/email-code/verify', async (req, res) => {
   }
 });
 
-router.post('/invite/resolve', async (req, res) => {
+async function handleInviteResolve(req, res) {
   try {
     const normalized = normalizeInviteCode(
-      req.body?.invite_code || req.body?.invite || req.body?.code || '',
+      req.body?.invite_code ||
+        req.body?.invite ||
+        req.body?.code ||
+        req.query?.invite_code ||
+        req.query?.invite ||
+        req.query?.code ||
+        req.params?.inviteCode ||
+        '',
     );
     if (!normalized) {
       return res.status(400).json({
         ok: false,
-        error: 'invite_code required',
+        code: 'invite_code_required',
+        error: 'Введите код приглашения',
       });
     }
 
@@ -1740,21 +1899,31 @@ router.post('/invite/resolve', async (req, res) => {
     if (!invite) {
       return res.status(404).json({
         ok: false,
+        code: 'invite_not_found',
         error: 'Код приглашения не найден',
       });
     }
     if (invite.is_active !== true) {
-      return res.status(403).json({ ok: false, error: 'Код приглашения отключен' });
+      return res.status(403).json({
+        ok: false,
+        code: 'invite_disabled',
+        error: 'Ссылка приглашения недействительна',
+      });
     }
     if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
-      return res.status(403).json({ ok: false, error: 'Срок действия кода приглашения истек' });
+      return res.status(403).json({
+        ok: false,
+        code: 'invite_expired',
+        error: 'Ссылка приглашения недействительна',
+      });
     }
     const maxUses = Number(invite.max_uses);
     const usedCount = Number(invite.used_count || 0);
     if (Number.isFinite(maxUses) && maxUses > 0 && usedCount >= maxUses) {
       return res.status(403).json({
         ok: false,
-        error: 'Лимит использований этого кода приглашения исчерпан',
+        code: 'invite_disabled',
+        error: 'Ссылка приглашения недействительна',
       });
     }
 
@@ -1763,7 +1932,11 @@ router.post('/invite/resolve', async (req, res) => {
       subscription_expires_at: invite.subscription_expires_at,
     });
     if (!tenantState.ok) {
-      return res.status(403).json({ ok: false, error: tenantState.error });
+      return res.status(tenantState.reason === 'tenant_expired' ? 402 : 403).json({
+        ok: false,
+        code: tenantState.reason || 'tenant_unavailable',
+        error: normalizeInvitePublicError(tenantState.error, tenantState.reason),
+      });
     }
 
     return res.json({
@@ -1774,13 +1947,23 @@ router.post('/invite/resolve', async (req, res) => {
         tenant_id: invite.tenant_id,
         tenant_code: invite.tenant_code,
         tenant_name: invite.tenant_name,
+        status: 'active',
+        invite_link: buildInviteLink(req, normalized, invite.tenant_code),
       },
     });
   } catch (err) {
     console.error('auth.invite.resolve error', err);
-    return res.status(500).json({ ok: false, error: 'Internal server error' });
+    return res.status(500).json({
+      ok: false,
+      code: 'invite_resolve_failed',
+      error: 'Группа временно недоступна',
+    });
   }
-});
+}
+
+router.get('/invite/resolve', handleInviteResolve);
+router.get('/invite/resolve/:inviteCode', handleInviteResolve);
+router.post('/invite/resolve', handleInviteResolve);
 
 /**
  * POST /api/auth/register
@@ -1805,14 +1988,16 @@ router.post('/register', async (req, res) => {
       main_channel_title,
       registration_email_token,
     } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Введите email и пароль' });
+    }
 
     const normalizedEmail = validator.normalizeEmail(email);
     if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
-      return res.status(400).json({ error: 'Invalid email format' });
+      return res.status(400).json({ error: 'Введите корректный email' });
     }
     if (typeof password !== 'string' || password.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      return res.status(400).json({ error: 'Пароль должен быть не менее 8 символов' });
     }
     if (
       isMailConfigured() &&
@@ -1842,7 +2027,7 @@ router.post('/register', async (req, res) => {
         });
       }
       if (!isValidCreatorSecret(secret)) {
-        return res.status(403).json({ error: 'Invalid secret for this email' });
+        return res.status(403).json({ error: 'Неверный секрет создателя' });
       }
       role = 'creator';
       tenant = await resolveDefaultTenant();
@@ -1861,7 +2046,7 @@ router.post('/register', async (req, res) => {
       if (looksLikeAccessKey) {
         tenant = await resolveTenantByAccessKey(rawAccessKey);
         if (!tenant) {
-          return res.status(403).json({ error: 'Неверный ключ арендатора.' });
+          return res.status(403).json({ error: 'Код группы не найден' });
         }
         if (!tenantGroupName) {
           return res.status(400).json({
@@ -1879,18 +2064,18 @@ router.post('/register', async (req, res) => {
           tenantCodeHint,
         });
         if (!invite) {
-          return res.status(403).json({ error: 'Неверный или устаревший код приглашения.' });
+          return res.status(403).json({ error: 'Код приглашения не найден' });
         }
         if (invite.is_active !== true) {
-          return res.status(403).json({ error: 'Код приглашения отключен.' });
+          return res.status(403).json({ error: 'Ссылка приглашения недействительна' });
         }
         if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
-          return res.status(403).json({ error: 'Срок действия кода приглашения истек.' });
+          return res.status(403).json({ error: 'Ссылка приглашения недействительна' });
         }
         const maxUses = Number(invite.max_uses);
         const usedCount = Number(invite.used_count || 0);
         if (Number.isFinite(maxUses) && maxUses > 0 && usedCount >= maxUses) {
-          return res.status(403).json({ error: 'Лимит использований этого кода приглашения исчерпан.' });
+          return res.status(403).json({ error: 'Ссылка приглашения недействительна' });
         }
         tenant = {
           id: invite.tenant_id,
@@ -1912,11 +2097,13 @@ router.post('/register', async (req, res) => {
         });
       }
 
-      const shouldEnforceTenantSubscription = role !== 'client';
+      const shouldEnforceTenantSubscription = Boolean(tenant?.id);
       if (shouldEnforceTenantSubscription) {
         const tenantState = isTenantActive(tenant);
         if (!tenantState.ok) {
-          return res.status(403).json({ error: tenantState.error });
+          return res.status(tenantState.reason === 'tenant_expired' ? 402 : 403).json({
+            error: normalizeInvitePublicError(tenantState.error, tenantState.reason),
+          });
         }
       }
     }
@@ -1929,7 +2116,11 @@ router.post('/register', async (req, res) => {
         const existing = await client.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
         if (existing.rowCount > 0) {
           await client.query('ROLLBACK');
-          return { ok: false, status: 409, error: 'Email already registered' };
+          return {
+            ok: false,
+            status: 409,
+            error: 'Пользователь уже зарегистрирован, войдите через email и пароль',
+          };
         }
 
         await assertDeviceAccountLimit(
@@ -1942,7 +2133,7 @@ router.post('/register', async (req, res) => {
         const normalizedPhone = normalizePhoneDigits(phone);
         if (phone && normalizedPhone.length < 10) {
           await client.query('ROLLBACK');
-          return { ok: false, status: 400, error: 'Invalid phone format' };
+          return { ok: false, status: 400, error: 'Введите корректный номер телефона' };
         }
         let duplicatePhoneOwner = null;
         if (role === 'client' && tenant?.id && normalizedPhone.length >= 10) {
@@ -2080,7 +2271,7 @@ router.post('/register', async (req, res) => {
     );
     if (!registration?.ok) {
       return res.status(registration?.status || 500).json({
-        error: registration?.error || 'Internal server error',
+        error: registration?.error || 'Ошибка сервера',
       });
     }
 
@@ -2196,7 +2387,7 @@ router.post('/register', async (req, res) => {
     });
   } catch (err) {
     console.error('auth.register error', err);
-    return res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
+    return res.status(err.statusCode || 500).json({ error: err.message || 'Ошибка сервера' });
   }
 });
 
@@ -2315,9 +2506,9 @@ router.post('/login', async (req, res) => {
             userRole === 'worker';
           if (shouldEnforceTenantSubscription) {
             const tenantState = isTenantActive({
-              status: user.tenant_status || tenant?.status,
+              status: tenant?.status || user.tenant_status,
               subscription_expires_at:
-                user.subscription_expires_at || tenant?.subscription_expires_at,
+                tenant?.subscription_expires_at || user.subscription_expires_at,
             });
             if (!tenantState.ok) {
               await client.query('ROLLBACK');
@@ -2825,13 +3016,37 @@ router.post('/magic-link/consume', async (req, res) => {
       String(claimed.user_email || claimed.email || '').trim().toLowerCase() ===
       CREATOR_EMAIL.toLowerCase();
     const userRole = String(claimed.role || '').toLowerCase().trim();
+    let claimedTenant = claimed.user_tenant_id
+      ? {
+          id: claimed.user_tenant_id,
+          code: claimed.tenant_code || null,
+          name: claimed.tenant_name || null,
+          status: claimed.tenant_status || null,
+          subscription_expires_at: claimed.subscription_expires_at || null,
+        }
+      : null;
+    if (!isPlatformCreator && claimedTenant) {
+      try {
+        claimedTenant = await resolveFreshTenantForAuth(
+          {
+            tenant_id: claimed.user_tenant_id || null,
+            tenant_code: claimed.tenant_code || null,
+          },
+          claimedTenant,
+        );
+      } catch (err) {
+        console.error('auth.magicLogin freshTenant error', err);
+      }
+    }
     const shouldEnforceTenantSubscription =
       !isPlatformCreator &&
       (userRole === 'tenant' || userRole === 'admin' || userRole === 'worker');
     if (shouldEnforceTenantSubscription) {
       const tenantState = isTenantActive({
-        status: claimed.tenant_status,
-        subscription_expires_at: claimed.subscription_expires_at,
+        status: claimedTenant?.status || claimed.tenant_status,
+        subscription_expires_at:
+          claimedTenant?.subscription_expires_at ||
+          claimed.subscription_expires_at,
       });
       if (!tenantState.ok) {
         await client.query('ROLLBACK');
@@ -2846,21 +3061,16 @@ router.post('/magic-link/consume', async (req, res) => {
       email: claimed.user_email || claimed.email,
       role: claimed.role,
       tenant_id: claimed.user_tenant_id || null,
-      tenant_code: claimed.tenant_code || null,
-      tenant_name: claimed.tenant_name || null,
-      tenant_status: claimed.tenant_status || null,
-      subscription_expires_at: claimed.subscription_expires_at || null,
+      tenant_code: claimedTenant?.code || claimed.tenant_code || null,
+      tenant_name: claimedTenant?.name || claimed.tenant_name || null,
+      tenant_status: claimedTenant?.status || claimed.tenant_status || null,
+      subscription_expires_at:
+        claimedTenant?.subscription_expires_at ||
+        claimed.subscription_expires_at ||
+        null,
       is_active: claimed.is_active !== false,
     };
-    const tenant = user.tenant_id
-      ? {
-          id: user.tenant_id,
-          code: claimed.tenant_code || null,
-          name: claimed.tenant_name || null,
-          status: claimed.tenant_status || null,
-          subscription_expires_at: claimed.subscription_expires_at || null,
-        }
-      : null;
+    const tenant = user.tenant_id ? claimedTenant : null;
     const session = await createAuthenticatedSession({
       client,
       user,
@@ -3104,6 +3314,362 @@ router.post('/phone-access/requests/:id/decision', authMiddleware, async (req, r
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
   } finally {
     client.release();
+  }
+});
+
+router.post('/passkeys/register/options', authMiddleware, async (req, res) => {
+  try {
+    if (!isCreatorIdentity(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Passkey доступен только создателю',
+      });
+    }
+    const password = String(req.body?.password || '');
+    if (!password) {
+      return res.status(400).json({ ok: false, error: 'Введите пароль' });
+    }
+
+    const user = await db.runWithPlatform(async () =>
+      fetchCreatorForPasskeyById(db, req.user.id),
+    );
+    if (!user || user.is_active === false) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Аккаунт создателя недоступен',
+      });
+    }
+    const passwordOk = await bcrypt.compare(password, user.password_hash || '');
+    if (!passwordOk) {
+      return res.status(401).json({ ok: false, error: 'Неверный пароль' });
+    }
+
+    const credentialsQ = await db.runWithPlatform(async () =>
+      db.query(
+        `SELECT credential_id, transports
+         FROM user_passkeys
+         WHERE user_id = $1
+         ORDER BY created_at DESC`,
+        [user.id],
+      ),
+    );
+    const rp = resolvePasskeyRp(req);
+    const options = await generateRegistrationOptions({
+      rpName: rp.rpName,
+      rpID: rp.rpID,
+      userID: Buffer.from(String(user.id), 'utf8'),
+      userName: user.email,
+      userDisplayName: user.name || user.email,
+      timeout: 60_000,
+      attestationType: 'none',
+      excludeCredentials: credentialsQ.rows.map((row) => ({
+        id: String(row.credential_id || ''),
+        transports: normalizeCredentialTransports(row.transports),
+      })),
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'required',
+      },
+    });
+
+    setPasskeyChallenge('register', user.id, {
+      challenge: options.challenge,
+      userId: user.id,
+      rpID: rp.rpID,
+      origin: rp.origin,
+    });
+
+    return res.json({ ok: true, data: options });
+  } catch (err) {
+    console.error('auth.passkeys.register.options error', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'Не удалось подготовить passkey',
+    });
+  }
+});
+
+router.post('/passkeys/register/verify', authMiddleware, async (req, res) => {
+  try {
+    if (!isCreatorIdentity(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Passkey доступен только создателю',
+      });
+    }
+    const response = req.body?.credential || req.body?.response;
+    if (!response || typeof response !== 'object') {
+      return res.status(400).json({ ok: false, error: 'Нет ответа passkey' });
+    }
+    const challenge = consumePasskeyChallenge('register', req.user.id);
+    if (!challenge) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Сессия passkey устарела. Повторите настройку.',
+      });
+    }
+    const verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge: challenge.challenge,
+      expectedOrigin: challenge.origin,
+      expectedRPID: challenge.rpID,
+      requireUserVerification: true,
+    });
+    if (!verification.verified || !verification.registrationInfo?.credential) {
+      return res.status(400).json({ ok: false, error: 'Passkey не подтверждён' });
+    }
+
+    const info = verification.registrationInfo;
+    const credential = info.credential;
+    await db.runWithPlatform(async () => {
+      await db.query(
+        `INSERT INTO user_passkeys (
+           user_id,
+           credential_id,
+           credential_public_key,
+           counter,
+           transports,
+           device_type,
+           backed_up,
+           label,
+           created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), now())
+         ON CONFLICT (credential_id) DO UPDATE
+           SET credential_public_key = EXCLUDED.credential_public_key,
+               counter = EXCLUDED.counter,
+               transports = EXCLUDED.transports,
+               device_type = EXCLUDED.device_type,
+               backed_up = EXCLUDED.backed_up`,
+        [
+          req.user.id,
+          credential.id,
+          Buffer.from(credential.publicKey),
+          Number(credential.counter || 0),
+          normalizeCredentialTransports(credential.transports),
+          info.credentialDeviceType || null,
+          info.credentialBackedUp === true,
+          String(req.body?.label || '').trim().slice(0, 80),
+        ],
+      );
+    });
+
+    return res.json({
+      ok: true,
+      message: 'Passkey подключён',
+    });
+  } catch (err) {
+    console.error('auth.passkeys.register.verify error', err);
+    return res.status(400).json({
+      ok: false,
+      error: 'Не удалось подключить passkey',
+    });
+  }
+});
+
+router.post('/passkeys/login/options', async (req, res) => {
+  try {
+    const normalizedEmail = validator.normalizeEmail(req.body?.email || '');
+    if (
+      !normalizedEmail ||
+      normalizedEmail.toLowerCase() !== CREATOR_EMAIL.toLowerCase()
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Passkey доступен только создателю',
+      });
+    }
+    const user = await db.runWithPlatform(async () =>
+      fetchCreatorForPasskeyByEmail(db, normalizedEmail),
+    );
+    if (!user || user.is_active === false) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Аккаунт создателя недоступен',
+      });
+    }
+    const credentialsQ = await db.runWithPlatform(async () =>
+      db.query(
+        `SELECT credential_id, transports
+         FROM user_passkeys
+         WHERE user_id = $1
+         ORDER BY created_at DESC`,
+        [user.id],
+      ),
+    );
+    if (credentialsQ.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Passkey ещё не подключён. Войдите по паролю.',
+      });
+    }
+
+    const rp = resolvePasskeyRp(req);
+    const options = await generateAuthenticationOptions({
+      rpID: rp.rpID,
+      timeout: 60_000,
+      userVerification: 'required',
+      allowCredentials: credentialsQ.rows.map((row) => ({
+        id: String(row.credential_id || ''),
+        transports: normalizeCredentialTransports(row.transports),
+      })),
+    });
+
+    setPasskeyChallenge('login', normalizedEmail, {
+      challenge: options.challenge,
+      userId: user.id,
+      email: normalizedEmail,
+      rpID: rp.rpID,
+      origin: rp.origin,
+    });
+
+    return res.json({ ok: true, data: options });
+  } catch (err) {
+    console.error('auth.passkeys.login.options error', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'Не удалось подготовить вход по passkey',
+    });
+  }
+});
+
+router.post('/passkeys/login/verify', async (req, res) => {
+  const normalizedEmail = validator.normalizeEmail(req.body?.email || '');
+  try {
+    if (
+      !normalizedEmail ||
+      normalizedEmail.toLowerCase() !== CREATOR_EMAIL.toLowerCase()
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Passkey доступен только создателю',
+      });
+    }
+    const response = req.body?.credential || req.body?.response;
+    if (!response || typeof response !== 'object') {
+      return res.status(400).json({ ok: false, error: 'Нет ответа passkey' });
+    }
+    const challenge = consumePasskeyChallenge('login', normalizedEmail);
+    if (!challenge) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Сессия passkey устарела. Повторите вход.',
+      });
+    }
+    const credentialId = String(response.id || response.rawId || '').trim();
+    if (!credentialId) {
+      return res.status(400).json({ ok: false, error: 'Passkey не распознан' });
+    }
+
+    const authResult = await db.runWithPlatform(async () => {
+      const credentialQ = await db.query(
+        `SELECT p.id,
+                p.user_id,
+                p.credential_id,
+                p.credential_public_key,
+                p.counter,
+                p.transports,
+                u.id AS auth_user_id,
+                u.email,
+                u.name,
+                u.role,
+                u.is_active,
+                u.block_reason,
+                u.tenant_id
+         FROM user_passkeys p
+         JOIN users u ON u.id = p.user_id
+         WHERE p.credential_id = $1
+           AND lower(u.email) = $2
+         LIMIT 1`,
+        [credentialId, normalizedEmail.toLowerCase()],
+      );
+      const row = credentialQ.rows[0] || null;
+      if (!row || !isCreatorIdentity(row)) {
+        return { ok: false, status: 403, error: 'Passkey доступен только создателю' };
+      }
+      if (row.is_active === false) {
+        return {
+          ok: false,
+          status: 403,
+          error: String(row.block_reason || '').trim() || 'Аккаунт создателя недоступен',
+        };
+      }
+
+      const verification = await verifyAuthenticationResponse({
+        response,
+        expectedChallenge: challenge.challenge,
+        expectedOrigin: challenge.origin,
+        expectedRPID: challenge.rpID,
+        credential: mapPasskeyRowToCredential(row),
+        requireUserVerification: true,
+      });
+      if (!verification.verified) {
+        return { ok: false, status: 401, error: 'Passkey не подтверждён' };
+      }
+
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `UPDATE user_passkeys
+           SET counter = $2,
+               last_used_at = now()
+           WHERE id = $1`,
+          [row.id, Number(verification.authenticationInfo?.newCounter || row.counter || 0)],
+        );
+        const session = await createAuthenticatedSession({
+          client,
+          user: row,
+          tenant: null,
+          req,
+          deviceFingerprint: req.body?.device_fingerprint || null,
+          isPlatformCreator: true,
+        });
+        await client.query('COMMIT');
+        return {
+          ok: true,
+          user: row,
+          ...session,
+        };
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
+
+    if (!authResult.ok) {
+      return res.status(authResult.status || 401).json({
+        ok: false,
+        error: authResult.error || 'Не удалось войти по passkey',
+      });
+    }
+
+    return res.json(
+      await buildSuccessfulAuthResponse({
+        req,
+        user: authResult.user,
+        tenant: null,
+        sessionId: authResult.sessionId,
+        refreshToken: authResult.refreshToken,
+        sessionExpiresAt: authResult.sessionExpiresAt,
+        isPlatformCreator: true,
+        twoFactor: {
+          enabled: false,
+          method: 'passkey',
+          trust_device_applied: false,
+        },
+      }),
+    );
+  } catch (err) {
+    console.error('auth.passkeys.login.verify error', err);
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: 'Не удалось войти по passkey',
+    });
   }
 });
 

@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../assets/phoenix_assets.dart';
 import '../main.dart';
 import '../services/notification_open_tracker_service.dart';
 import '../services/web_notification_service.dart';
@@ -907,6 +908,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                           subtitle: _message,
                           icon: Icons.notifications_off_outlined,
                           compact: true,
+                          assetPath: PhoenixAssets.emptyStateNetworkError,
                           accentColor: theme.colorScheme.error,
                         ),
                       ),
@@ -919,6 +921,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                         subtitle:
                             'Когда появятся сообщения, поддержка или системные уведомления, они останутся здесь даже без push.',
                         icon: Icons.notifications_none_rounded,
+                        assetPath: PhoenixAssets.emptyStateNoNotifications,
                       ),
                     const SizedBox(height: 12),
                     _buildCreatorAnalytics(),

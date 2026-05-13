@@ -125,12 +125,16 @@ function buildInviteLink(req, inviteCode, tenantCode = "") {
   const base = String(process.env.INVITE_LINK_BASE || "").trim();
   const encodedInvite = encodeURIComponent(String(inviteCode || "").trim());
   const encodedTenant = encodeURIComponent(String(tenantCode || "").trim());
-  const tenantPart = encodedTenant ? `&tenant=${encodedTenant}` : "";
+  const tenantPart = encodedTenant ? `?tenant=${encodedTenant}` : "";
   if (base) {
-    const glue = base.includes("?") ? "&" : "?";
-    return `${base}${glue}invite=${encodedInvite}${tenantPart}`;
+    const normalizedBase = base.replace(/\/+$/, "");
+    if (/\/join(?:\/|$)/i.test(normalizedBase)) {
+      const glue = normalizedBase.includes("?") ? "&" : "?";
+      return `${normalizedBase}${glue}invite=${encodedInvite}${encodedTenant ? `&tenant=${encodedTenant}` : ""}`;
+    }
+    return `${normalizedBase}/join/${encodedInvite}${tenantPart}`;
   }
-  return `${req.protocol}://${req.get("host")}/?invite=${encodedInvite}${tenantPart}`;
+  return `${req.protocol}://${req.get("host")}/join/${encodedInvite}${tenantPart}`;
 }
 
 async function resolveTenantCode(tenantId, fallbackCode = "") {
@@ -274,22 +278,38 @@ async function loadUserProfile(userId) {
   };
 }
 
+function applyFreshTenantContext(profile, requestUser) {
+  if (!profile) return profile;
+  return {
+    ...profile,
+    tenant_code: requestUser?.tenant_code || profile.tenant_code || null,
+    tenant_name: requestUser?.tenant_name || profile.tenant_name || null,
+    tenant_status: requestUser?.tenant_status || profile.tenant_status || null,
+    subscription_expires_at:
+      requestUser?.subscription_expires_at ||
+      profile.subscription_expires_at ||
+      null,
+  };
+}
+
 async function loadUserProfileForRequest(user) {
   const normalizedUserId = String(user?.id || "").trim();
   if (!normalizedUserId) return null;
   const scopedProfile = await loadUserProfile(normalizedUserId);
   if (scopedProfile && String(scopedProfile.name || "").trim()) {
-    return scopedProfile;
+    return applyFreshTenantContext(scopedProfile, user);
   }
-  if (user?.is_platform_creator !== true) return scopedProfile || null;
+  if (user?.is_platform_creator !== true) {
+    return applyFreshTenantContext(scopedProfile, user) || null;
+  }
   const platformProfile = await db.runWithPlatform(
     async () => await loadUserProfile(normalizedUserId),
   );
   if (!platformProfile) {
-    return scopedProfile || null;
+    return applyFreshTenantContext(scopedProfile, user) || null;
   }
-  if (!scopedProfile) return platformProfile;
-  return {
+  if (!scopedProfile) return applyFreshTenantContext(platformProfile, user);
+  return applyFreshTenantContext({
     ...scopedProfile,
     email:
       String(scopedProfile.email || "").trim() ||
@@ -303,7 +323,7 @@ async function loadUserProfileForRequest(user) {
       String(scopedProfile.avatar_url || "").trim() ||
       String(platformProfile.avatar_url || "").trim() ||
       null,
-  };
+  }, user);
 }
 
 function toNumber(value) {

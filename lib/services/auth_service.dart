@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../src/utils/device_utils.dart';
 import 'notification_coordinator_service.dart';
 import 'notification_runtime_preference_service.dart';
+import 'passkey_platform.dart';
 
 class User {
   final String id;
@@ -436,9 +437,9 @@ class AuthService {
         }
         final policy =
             await NotificationRuntimePreferenceService.refreshServerPolicy(
-          dio,
-          userId: _currentUser?.id,
-        );
+              dio,
+              userId: _currentUser?.id,
+            );
         await NotificationCoordinatorService.reconcile(
           dio,
           enabled: enabled,
@@ -1390,6 +1391,9 @@ class AuthService {
     String? phone,
     String? accessKey,
     String? secret, // для special creator email
+    String? groupName,
+    String? mainChannelTitle,
+    String? registrationEmailToken,
   }) async {
     debugPrint('✍️ register called with email: $email');
     final fingerprint = await _getDeviceFingerprintSafe();
@@ -1406,6 +1410,13 @@ class AuthService {
         'name': name,
         'phone': phone,
         'secret': secret,
+        if (groupName != null && groupName.trim().isNotEmpty)
+          'group_name': groupName.trim(),
+        if (mainChannelTitle != null && mainChannelTitle.trim().isNotEmpty)
+          'main_channel_title': mainChannelTitle.trim(),
+        if (registrationEmailToken != null &&
+            registrationEmailToken.trim().isNotEmpty)
+          'registration_email_token': registrationEmailToken.trim(),
         'device_fingerprint': fingerprint,
       },
     );
@@ -1420,6 +1431,73 @@ class AuthService {
     debugPrint('✅ register complete');
     return {
       'access': resp.data['token'] ?? resp.data['access'],
+      'user': _currentUser?.toMap(),
+    };
+  }
+
+  Future<bool> isPasskeySupported() async {
+    return PhoenixPasskeyPlatform.isSupported();
+  }
+
+  Future<void> registerCreatorPasskey({
+    required String password,
+    String? label,
+  }) async {
+    final optionsResp = await dio.post(
+      '/api/auth/passkeys/register/options',
+      data: {'password': password.trim()},
+    );
+    final optionsRoot = optionsResp.data is Map
+        ? Map<String, dynamic>.from(optionsResp.data as Map)
+        : const <String, dynamic>{};
+    final options = optionsRoot['data'] is Map
+        ? Map<String, dynamic>.from(optionsRoot['data'] as Map)
+        : const <String, dynamic>{};
+    if (options.isEmpty) {
+      throw Exception('Сервер не вернул настройки passkey');
+    }
+    final credential = await PhoenixPasskeyPlatform.create(options);
+    await dio.post(
+      '/api/auth/passkeys/register/verify',
+      data: {
+        'credential': credential,
+        if (label != null && label.trim().isNotEmpty) 'label': label.trim(),
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> loginWithPasskey({required String email}) async {
+    final normalizedEmail = email.trim();
+    final optionsResp = await dio.post(
+      '/api/auth/passkeys/login/options',
+      data: {'email': normalizedEmail},
+    );
+    final optionsRoot = optionsResp.data is Map
+        ? Map<String, dynamic>.from(optionsResp.data as Map)
+        : const <String, dynamic>{};
+    final options = optionsRoot['data'] is Map
+        ? Map<String, dynamic>.from(optionsRoot['data'] as Map)
+        : const <String, dynamic>{};
+    if (options.isEmpty) {
+      throw Exception('Сервер не вернул настройки passkey');
+    }
+    final credential = await PhoenixPasskeyPlatform.get(options);
+    final fingerprint = await _getDeviceFingerprintSafe();
+    final verifyResp = await dio.post(
+      '/api/auth/passkeys/login/verify',
+      data: {
+        'email': normalizedEmail,
+        'credential': credential,
+        'device_fingerprint': fingerprint,
+      },
+    );
+    await _processAuthResponse(verifyResp);
+    pendingEmail = null;
+    pendingPassword = null;
+    pendingAccessKey = null;
+    pendingRegistrationEmailToken = null;
+    return {
+      'access': verifyResp.data['token'] ?? verifyResp.data['access'],
       'user': _currentUser?.toMap(),
     };
   }

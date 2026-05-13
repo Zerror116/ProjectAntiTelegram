@@ -47,6 +47,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Map<String, dynamic> _stats = const {};
   bool _statsExpanded = false;
   bool _sessionsBusy = false;
+  bool _passkeySupported = false;
+  bool _passkeyBusy = false;
   bool _switchingSession = false;
   bool _addGroupBusy = false;
   bool _creatorTenantsLoading = false;
@@ -68,6 +70,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     super.initState();
     _viewMode = authService.viewRole ?? 'creator';
     _load();
+    _loadPasskeySupport();
   }
 
   @override
@@ -89,6 +92,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
       return e.message ?? 'Ошибка запроса';
     }
     return e.toString();
+  }
+
+  Future<void> _loadPasskeySupport() async {
+    final supported = await authService.isPasskeySupported();
+    if (!mounted) return;
+    setState(() => _passkeySupported = supported);
   }
 
   String? _resolveImageUrl(String? raw) {
@@ -304,32 +313,28 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (data is! Map || data['ok'] != true || data['data'] is! List) {
         return;
       }
-      final rows = List<Map<String, dynamic>>.from(data['data'])
-          .where((row) => row['is_deleted'] != true)
-          .toList();
+      final rows = List<Map<String, dynamic>>.from(
+        data['data'],
+      ).where((row) => row['is_deleted'] != true).toList();
       final currentCreatorTenantCode = _normalizeTenantCode(
         authService.currentUser?.tenantCode,
       );
       final defaultTenantCode = rows
           .map((row) => _normalizeTenantCode(row['code']))
-          .firstWhere(
-            (code) => code == 'default',
-            orElse: () => '',
-          );
+          .firstWhere((code) => code == 'default', orElse: () => '');
       final fallbackSelected = currentCreatorTenantCode.isNotEmpty
           ? currentCreatorTenantCode
           : (defaultTenantCode.isNotEmpty
                 ? defaultTenantCode
-                : (rows.isNotEmpty ? _normalizeTenantCode(rows.first['code']) : ''));
-      final selected =
-          _normalizeTenantCode(
-            (await authService.getCreatorTenantScopeCode()) ?? fallbackSelected,
-          );
-      final hasSelected = selected.isNotEmpty &&
-          rows.any(
-            (row) =>
-                _normalizeTenantCode(row['code']) == selected,
-          );
+                : (rows.isNotEmpty
+                      ? _normalizeTenantCode(rows.first['code'])
+                      : ''));
+      final selected = _normalizeTenantCode(
+        (await authService.getCreatorTenantScopeCode()) ?? fallbackSelected,
+      );
+      final hasSelected =
+          selected.isNotEmpty &&
+          rows.any((row) => _normalizeTenantCode(row['code']) == selected);
       final effectiveSelected = hasSelected ? selected : fallbackSelected;
       if (effectiveSelected.isNotEmpty &&
           effectiveSelected != authService.creatorTenantScopeCode) {
@@ -342,8 +347,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
           tenantId: (target['id'] ?? '').toString().trim(),
           tenantName: (target['name'] ?? '').toString().trim(),
           tenantStatus: (target['status'] ?? '').toString().trim(),
-          subscriptionExpiresAt:
-              (target['subscription_expires_at'] ?? '').toString().trim(),
+          subscriptionExpiresAt: (target['subscription_expires_at'] ?? '')
+              .toString()
+              .trim(),
         );
       }
       if (!mounted) return;
@@ -354,7 +360,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     } catch (e) {
       if (!mounted || silent) return;
       setState(
-        () => _message = 'Ошибка списка групп арендаторов: ${_extractDioMessage(e)}',
+        () => _message =
+            'Ошибка списка групп арендаторов: ${_extractDioMessage(e)}',
       );
     } finally {
       if (mounted) {
@@ -383,8 +390,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
         tenantId: (target['id'] ?? '').toString().trim(),
         tenantName: (target['name'] ?? '').toString().trim(),
         tenantStatus: (target['status'] ?? '').toString().trim(),
-        subscriptionExpiresAt:
-            (target['subscription_expires_at'] ?? '').toString().trim(),
+        subscriptionExpiresAt: (target['subscription_expires_at'] ?? '')
+            .toString()
+            .trim(),
       );
       if (!mounted) return;
       setState(() {
@@ -423,6 +431,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
     String tenant = '';
 
     void extractFromUri(Uri uri) {
+      final segments = uri.pathSegments
+          .map((segment) => Uri.decodeComponent(segment).trim())
+          .where((segment) => segment.isNotEmpty)
+          .toList();
+      final joinIndex = segments.indexWhere(
+        (segment) => segment.toLowerCase() == 'join',
+      );
+      if (invite.isEmpty && joinIndex >= 0 && joinIndex + 1 < segments.length) {
+        invite = segments[joinIndex + 1].trim();
+      }
       if (invite.isEmpty) {
         invite =
             (uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '')
@@ -679,7 +697,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
     });
     try {
       final form = FormData.fromMap({
-        'avatar': MultipartFile.fromBytes(uploadBytes, filename: uploadFileName),
+        'avatar': MultipartFile.fromBytes(
+          uploadBytes,
+          filename: uploadFileName,
+        ),
       });
       final resp = await authService.dio.post(
         '/api/profile/avatar',
@@ -863,12 +884,24 @@ class _ProfileScreenState extends State<ProfileScreen> {
           if (inviteLink.isNotEmpty) {
             try {
               final uri = Uri.parse(inviteLink);
-              code =
-                  (uri.queryParameters['invite'] ??
-                          uri.queryParameters['code'] ??
-                          '')
-                      .trim()
-                      .toUpperCase();
+              final segments = uri.pathSegments
+                  .map((segment) => Uri.decodeComponent(segment).trim())
+                  .where((segment) => segment.isNotEmpty)
+                  .toList();
+              final joinIndex = segments.indexWhere(
+                (segment) => segment.toLowerCase() == 'join',
+              );
+              if (joinIndex >= 0 && joinIndex + 1 < segments.length) {
+                code = segments[joinIndex + 1].trim().toUpperCase();
+              }
+              if (code.isEmpty) {
+                code =
+                    (uri.queryParameters['invite'] ??
+                            uri.queryParameters['code'] ??
+                            '')
+                        .trim()
+                        .toUpperCase();
+              }
             } catch (_) {}
           }
         }
@@ -879,13 +912,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
         }
         if (inviteLink.isEmpty) {
           final base = Uri.base;
-          final qp = <String, String>{'invite': code};
+          final qp = <String, String>{};
           final normalizedTenant = tenantCode.trim();
           if (normalizedTenant.isNotEmpty) {
             qp['tenant'] = normalizedTenant;
           }
           inviteLink = base
-              .replace(queryParameters: qp, fragment: '')
+              .replace(path: '/join/$code', queryParameters: qp, fragment: '')
               .toString();
         }
         await Clipboard.setData(ClipboardData(text: inviteLink));
@@ -924,6 +957,58 @@ class _ProfileScreenState extends State<ProfileScreen> {
     await Clipboard.setData(ClipboardData(text: link));
     if (!mounted) return;
     setState(() => _message = 'Ссылка приглашения скопирована');
+  }
+
+  Future<void> _connectCreatorPasskey() async {
+    if (_passkeyBusy) return;
+    final passwordController = TextEditingController();
+    try {
+      final password = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: const Text('Подключить passkey'),
+            content: TextField(
+              controller: passwordController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'Текущий пароль',
+                helperText: 'Passkey доступен только создателю',
+              ),
+              autofocus: true,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () =>
+                    Navigator.of(dialogContext).pop(passwordController.text),
+                child: const Text('Подключить'),
+              ),
+            ],
+          );
+        },
+      );
+      if (password == null || password.trim().isEmpty) return;
+      setState(() {
+        _passkeyBusy = true;
+        _message = '';
+      });
+      await authService.registerCreatorPasskey(
+        password: password,
+        label: 'Creator device',
+      );
+      if (!mounted) return;
+      setState(() => _message = 'Passkey подключён');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка passkey: ${_extractDioMessage(e)}');
+    } finally {
+      passwordController.dispose();
+      if (mounted) setState(() => _passkeyBusy = false);
+    }
   }
 
   String _normalizedQrInviteData(String raw) {
@@ -1609,6 +1694,50 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   ),
                   const SizedBox(height: 16),
                   _buildStatsSection(effectiveRole),
+                  if (isPlatformCreator) ...[
+                    const SizedBox(height: 16),
+                    _sectionCard(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Passkey создателя',
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            _passkeySupported
+                                ? 'Можно подключить вход по отпечатку, Face ID или системному ключу. Пароль остаётся запасным способом.'
+                                : 'На этом устройстве passkey недоступен. Вход по паролю работает как обычно.',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.tonalIcon(
+                              onPressed: !_passkeySupported || _passkeyBusy
+                                  ? null
+                                  : _connectCreatorPasskey,
+                              icon: _passkeyBusy
+                                  ? const SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.fingerprint_rounded),
+                              label: const Text('Подключить passkey'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   if (canShareInvite) ...[
                     const SizedBox(height: 16),
                     _sectionCard(
@@ -2220,33 +2349,34 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               border: OutlineInputBorder(),
                             ),
                             items: _creatorTenants.map((row) {
-                                final code = (row['code'] ?? '')
-                                    .toString()
-                                    .trim()
-                                    .toLowerCase();
-                                final name = (row['name'] ?? '')
-                                    .toString()
-                                    .trim();
-                                final status = (row['status'] ?? '')
-                                    .toString()
-                                    .trim()
-                                    .toLowerCase();
-                                final statusLabel = switch (status) {
-                                  'active' => 'активна',
-                                  'blocked' => 'заблокирована',
-                                  _ => status,
-                                };
-                                final title = name.isNotEmpty ? name : code;
-                                return DropdownMenuItem<String>(
-                                  value: code,
-                                  child: Text(
-                                    statusLabel.isEmpty
-                                        ? title
-                                        : '$title • $statusLabel',
-                                  ),
-                                );
-                              }).toList(),
-                            onChanged: (_creatorTenantScopeBusy ||
+                              final code = (row['code'] ?? '')
+                                  .toString()
+                                  .trim()
+                                  .toLowerCase();
+                              final name = (row['name'] ?? '')
+                                  .toString()
+                                  .trim();
+                              final status = (row['status'] ?? '')
+                                  .toString()
+                                  .trim()
+                                  .toLowerCase();
+                              final statusLabel = switch (status) {
+                                'active' => 'активна',
+                                'blocked' => 'заблокирована',
+                                _ => status,
+                              };
+                              final title = name.isNotEmpty ? name : code;
+                              return DropdownMenuItem<String>(
+                                value: code,
+                                child: Text(
+                                  statusLabel.isEmpty
+                                      ? title
+                                      : '$title • $statusLabel',
+                                ),
+                              );
+                            }).toList(),
+                            onChanged:
+                                (_creatorTenantScopeBusy ||
                                     _creatorTenantsLoading)
                                 ? null
                                 : (value) => _changeCreatorTenantScope(value),
