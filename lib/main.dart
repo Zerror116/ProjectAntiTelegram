@@ -113,6 +113,8 @@ DateTime? _lastSocketConnectedAt;
 DateTime? _lastSocketDisconnectedAt;
 String _lastSocketDisconnectReason = '';
 String _lastSocketConnectError = '';
+final Map<String, DateTime> _recentRealtimeEventKeys = <String, DateTime>{};
+const Duration _realtimeEventDedupeTtl = Duration(seconds: 45);
 const bool _verboseSocketLogs = bool.fromEnvironment(
   'FENIX_VERBOSE_SOCKET_LOGS',
   defaultValue: false,
@@ -129,6 +131,91 @@ void _socketVerboseLog(String message) {
   if (kDebugMode && _verboseSocketLogs) {
     debugPrint(message);
   }
+}
+
+String _normalizeRealtimeText(Object? value) {
+  return (value ?? '').toString().trim();
+}
+
+Map<String, dynamic>? _realtimePayloadMap(dynamic data) {
+  if (data is Map<String, dynamic>) return data;
+  if (data is Map) return Map<String, dynamic>.from(data);
+  return null;
+}
+
+bool _socketEventTenantMatches(Map<String, dynamic>? data) {
+  if (data == null) return true;
+  final eventTenant = _normalizeRealtimeText(
+    data['tenant_id'] ?? data['tenantId'],
+  );
+  if (eventTenant.isEmpty) return true;
+  final currentTenant = _normalizeRealtimeText(
+    authService.currentUser?.tenantId,
+  );
+  if (currentTenant.isEmpty) return true;
+  return eventTenant == currentTenant;
+}
+
+String _socketEventDedupeKey(String type, Map<String, dynamic>? data) {
+  if (data == null) return '';
+  final eventId = _normalizeRealtimeText(data['event_id'] ?? data['eventId']);
+  if (eventId.isNotEmpty) return 'event:$eventId';
+  final entity = _normalizeRealtimeText(data['entity']);
+  final entityId = _normalizeRealtimeText(
+    data['entity_id'] ?? data['entityId'],
+  );
+  final action = _normalizeRealtimeText(data['action']);
+  final updatedAt = _normalizeRealtimeText(
+    data['updated_at'] ?? data['updatedAt'] ?? data['at'],
+  );
+  if (entity.isNotEmpty &&
+      entityId.isNotEmpty &&
+      action.isNotEmpty &&
+      updatedAt.isNotEmpty) {
+    return '$type:$entity:$entityId:$action:$updatedAt';
+  }
+  final message = data['message'];
+  if (message is Map) {
+    final updatedAt = _normalizeRealtimeText(message['updated_at']);
+    if (updatedAt.isEmpty) return '';
+    final messageId = _normalizeRealtimeText(message['id']);
+    final chatId = _normalizeRealtimeText(
+      data['chatId'] ??
+          data['chat_id'] ??
+          message['chat_id'] ??
+          message['chatId'],
+    );
+    if (messageId.isNotEmpty && chatId.isNotEmpty) {
+      return '$type:$chatId:$messageId:$updatedAt';
+    }
+  }
+  return '';
+}
+
+bool _shouldDispatchSocketEvent(String type, dynamic data) {
+  final payload = _realtimePayloadMap(data);
+  if (!_socketEventTenantMatches(payload)) {
+    _socketVerboseLog('⏭️ Socket event $type ignored: tenant mismatch');
+    return false;
+  }
+  final now = DateTime.now();
+  _recentRealtimeEventKeys.removeWhere(
+    (_, seenAt) => now.difference(seenAt) > _realtimeEventDedupeTtl,
+  );
+  final key = _socketEventDedupeKey(type, payload);
+  if (key.isNotEmpty && _recentRealtimeEventKeys.containsKey(key)) {
+    _socketVerboseLog('⏭️ Socket event $type ignored: duplicate $key');
+    return false;
+  }
+  if (key.isNotEmpty) {
+    _recentRealtimeEventKeys[key] = now;
+  }
+  return true;
+}
+
+void _dispatchSocketEvent(String type, dynamic data) {
+  if (!_shouldDispatchSocketEvent(type, data)) return;
+  chatEventsController.add({'type': type, 'data': data});
 }
 
 Map<String, dynamic> runtimeSocketDiagnosticsSnapshot() {
@@ -4743,43 +4830,38 @@ Future<void> _initSocket() async {
     // Chat created -> notify listeners to reload chats
     socket?.on('chat:created', (data) {
       _socketVerboseLog('📬 Socket event chat:created -> $data');
-      chatEventsController.add({'type': 'chat:created', 'data': data});
+      _dispatchSocketEvent('chat:created', data);
     });
 
     socket?.on('chat:deleted', (data) {
       _socketVerboseLog('📬 Socket event chat:deleted -> $data');
-      chatEventsController.add({'type': 'chat:deleted', 'data': data});
+      _dispatchSocketEvent('chat:deleted', data);
     });
 
     socket?.on('chat:updated', (data) {
       _socketVerboseLog('📬 Socket event chat:updated -> $data');
-      chatEventsController.add({'type': 'chat:updated', 'data': data});
+      _dispatchSocketEvent('chat:updated', data);
     });
 
     socket?.on('chat:direct_request_created', (data) {
       _socketVerboseLog('📬 Socket event chat:direct_request_created -> $data');
-      chatEventsController.add({
-        'type': 'chat:direct_request_created',
-        'data': data,
-      });
+      _dispatchSocketEvent('chat:direct_request_created', data);
     });
 
     socket?.on('chat:direct_request_updated', (data) {
       _socketVerboseLog('📬 Socket event chat:direct_request_updated -> $data');
-      chatEventsController.add({
-        'type': 'chat:direct_request_updated',
-        'data': data,
-      });
+      _dispatchSocketEvent('chat:direct_request_updated', data);
     });
 
     socket?.on('chat:pinned', (data) {
       _socketVerboseLog('📬 Socket event chat:pinned -> $data');
-      chatEventsController.add({'type': 'chat:pinned', 'data': data});
+      _dispatchSocketEvent('chat:pinned', data);
     });
 
     // New message -> notify listeners
     socket?.on('chat:message', (data) {
       _socketVerboseLog('📬 Socket event chat:message -> $data');
+      if (!_shouldDispatchSocketEvent('chat:message', data)) return;
       chatEventsController.add({'type': 'chat:message', 'data': data});
       _scheduleWebPushBadgeSync();
       _maybePlayIncomingMessageSound(data);
@@ -4787,32 +4869,33 @@ Future<void> _initSocket() async {
 
     socket?.on('chat:message:deleted', (data) {
       _socketVerboseLog('📬 Socket event chat:message:deleted -> $data');
+      if (!_shouldDispatchSocketEvent('chat:message:deleted', data)) return;
       chatEventsController.add({'type': 'chat:message:deleted', 'data': data});
       _scheduleWebPushBadgeSync();
     });
 
     socket?.on('chat:cleared', (data) {
       _socketVerboseLog('📬 Socket event chat:cleared -> $data');
-      chatEventsController.add({'type': 'chat:cleared', 'data': data});
+      _dispatchSocketEvent('chat:cleared', data);
       _scheduleWebPushBadgeSync();
     });
 
     socket?.on('chat:message:read', (data) {
       _socketVerboseLog('📬 Socket event chat:message:read -> $data');
-      chatEventsController.add({'type': 'chat:message:read', 'data': data});
+      _dispatchSocketEvent('chat:message:read', data);
       _scheduleWebPushBadgeSync();
     });
 
     socket?.on('chat:typing', (data) {
-      chatEventsController.add({'type': 'chat:typing', 'data': data});
+      _dispatchSocketEvent('chat:typing', data);
     });
 
     socket?.on('chat:recording_voice', (data) {
-      chatEventsController.add({'type': 'chat:recording_voice', 'data': data});
+      _dispatchSocketEvent('chat:recording_voice', data);
     });
 
     socket?.on('chat:recording_video', (data) {
-      chatEventsController.add({'type': 'chat:recording_video', 'data': data});
+      _dispatchSocketEvent('chat:recording_video', data);
     });
 
     socket?.on('notification:new', (data) {
@@ -4879,26 +4962,57 @@ Future<void> _initSocket() async {
 
     socket?.on('cart:updated', (data) {
       _socketVerboseLog('📬 Socket event cart:updated -> $data');
-      chatEventsController.add({'type': 'cart:updated', 'data': data});
+      _dispatchSocketEvent('cart:updated', data);
     });
 
     socket?.on('delivery:updated', (data) {
       _socketVerboseLog('📬 Socket event delivery:updated -> $data');
-      chatEventsController.add({'type': 'delivery:updated', 'data': data});
+      _dispatchSocketEvent('delivery:updated', data);
     });
 
     socket?.on('claims:updated', (data) {
       _socketVerboseLog('📬 Socket event claims:updated -> $data');
-      chatEventsController.add({'type': 'claims:updated', 'data': data});
+      _dispatchSocketEvent('claims:updated', data);
     });
 
     socket?.on('catalog:queue:updated', (data) {
       _socketVerboseLog('📬 Socket event catalog:queue:updated -> $data');
-      chatEventsController.add({'type': 'catalog:queue:updated', 'data': data});
+      _dispatchSocketEvent('catalog:queue:updated', data);
+    });
+
+    socket?.on('reserved:order:updated', (data) {
+      _socketVerboseLog('📬 Socket event reserved:order:updated -> $data');
+      _dispatchSocketEvent('reserved:order:updated', data);
+    });
+
+    socket?.on('channel:updated', (data) {
+      _socketVerboseLog('📬 Socket event channel:updated -> $data');
+      _dispatchSocketEvent('channel:updated', data);
+    });
+
+    socket?.on('channel:members:updated', (data) {
+      _socketVerboseLog('📬 Socket event channel:members:updated -> $data');
+      _dispatchSocketEvent('channel:members:updated', data);
+    });
+
+    socket?.on('channel:media:updated', (data) {
+      _socketVerboseLog('📬 Socket event channel:media:updated -> $data');
+      _dispatchSocketEvent('channel:media:updated', data);
+    });
+
+    socket?.on('notification:updated', (data) {
+      _socketVerboseLog('📬 Socket event notification:updated -> $data');
+      if (!_shouldDispatchSocketEvent('notification:updated', data)) return;
+      chatEventsController.add({'type': 'notification:updated', 'data': data});
+      notificationEventsController.add({
+        'type': 'notification:updated',
+        'data': data,
+      });
     });
 
     socket?.on('support:ticket:queued', (data) {
       _socketVerboseLog('📬 Socket event support:ticket:queued -> $data');
+      if (!_shouldDispatchSocketEvent('support:queue:changed', data)) return;
       chatEventsController.add({'type': 'support:queue:changed', 'data': data});
       if (!_canCurrentUserObserveSupportQueueAlerts()) return;
       final payload = _parseSupportQueueNotice(data);
@@ -4915,13 +5029,14 @@ Future<void> _initSocket() async {
 
     socket?.on('support:ticket:claimed', (data) {
       _socketVerboseLog('📬 Socket event support:ticket:claimed -> $data');
-      chatEventsController.add({'type': 'support:queue:changed', 'data': data});
+      _dispatchSocketEvent('support:queue:changed', data);
       unawaited(_refreshSupportQueueNotices());
     });
 
     // Global message event (optional)
     socket?.on('chat:message:global', (data) {
       _socketVerboseLog('📬 Socket event chat:message:global -> $data');
+      if (!_shouldDispatchSocketEvent('chat:message:global', data)) return;
       chatEventsController.add({'type': 'chat:message:global', 'data': data});
       _scheduleWebPushBadgeSync();
       _maybePlayIncomingMessageSound(data);

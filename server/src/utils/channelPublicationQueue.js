@@ -1148,6 +1148,13 @@ function emitProcessedPublicationResult(result, io = null) {
       emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
         chatId: message.chat_id,
       });
+      emitToTenant(socketIo, result.tenantId || null, 'channel:media:updated', {
+        entity: 'channel_media',
+        entity_id: String(message.chat_id),
+        channel_id: message.chat_id,
+        chatId: message.chat_id,
+        action: 'message_hidden',
+      });
     }
     if (result.emitted.mainMessage) {
       socketIo.to(`chat:${result.emitted.mainMessage.chat_id}`).emit('chat:message', {
@@ -1157,6 +1164,15 @@ function emitProcessedPublicationResult(result, io = null) {
       emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
         chatId: result.emitted.mainMessage.chat_id,
       });
+      emitToTenant(socketIo, result.tenantId || null, 'channel:media:updated', {
+        entity: 'channel_media',
+        entity_id: String(result.emitted.mainMessage.chat_id),
+        channel_id: result.emitted.mainMessage.chat_id,
+        chatId: result.emitted.mainMessage.chat_id,
+        action: 'message_published',
+        message_id: result.emitted.mainMessage.id,
+        queue_id: result.queueItemId || null,
+      });
     }
     for (const archiveMessage of result.emitted.archiveMessages || []) {
       socketIo.to(`chat:${archiveMessage.chat_id}`).emit('chat:message', {
@@ -1165,6 +1181,15 @@ function emitProcessedPublicationResult(result, io = null) {
       });
       emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
         chatId: archiveMessage.chat_id,
+      });
+      emitToTenant(socketIo, result.tenantId || null, 'channel:media:updated', {
+        entity: 'channel_media',
+        entity_id: String(archiveMessage.chat_id),
+        channel_id: archiveMessage.chat_id,
+        chatId: archiveMessage.chat_id,
+        action: 'message_published',
+        message_id: archiveMessage.id,
+        queue_id: result.queueItemId || null,
       });
     }
   }

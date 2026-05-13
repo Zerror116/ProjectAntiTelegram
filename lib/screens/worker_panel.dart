@@ -233,7 +233,17 @@ class _WorkerPanelState extends State<WorkerPanel>
           (_hasVisibleTab('new') || _hasVisibleTab('old'))) {
         _loadChannels();
       }
-      if (type == 'chat:updated' || type == 'catalog:queue:updated') {
+      if ((type == 'channel:updated' ||
+              type == 'channel:members:updated' ||
+              type == 'channel:media:updated' ||
+              type == 'socket:connected') &&
+          (_hasVisibleTab('new') || _hasVisibleTab('old'))) {
+        _loadChannels();
+      }
+      if (type == 'chat:updated' ||
+          type == 'catalog:queue:updated' ||
+          type == 'channel:media:updated' ||
+          type == 'socket:connected') {
         _ownPostsRefreshDebounce?.cancel();
         _ownPostsRefreshDebounce = Timer(
           const Duration(milliseconds: 650),

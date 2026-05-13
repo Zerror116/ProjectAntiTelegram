@@ -218,11 +218,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   Timer? _clientCartUndoTimer;
   Timer? _publishProgressTimer;
   Timer? _pendingPostsRefreshDebounce;
+  Timer? _channelsRefreshDebounce;
   Future<void> Function()? _clientCartPendingCommit;
   VoidCallback? _clientCartPendingRollback;
   String _clientCartPendingLabel = '';
 
   final Map<String, Map<String, dynamic>> _channelOverviews = {};
+  final Map<String, Timer> _channelOverviewRefreshDebounces = {};
   final Set<String> _overviewLoading = <String>{};
   final Set<String> _blacklistBusy = <String>{};
   bool _isDisposed = false;
@@ -247,6 +249,31 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       }
       if (type == 'catalog:queue:updated' && _canViewModerationTab()) {
         _schedulePendingPostsRealtimeRefresh();
+        final channelId = _realtimeChannelIdOf(event['data']);
+        if (channelId.isNotEmpty) {
+          _scheduleChannelOverviewRealtimeRefresh(channelId);
+        }
+        return;
+      }
+      if (type == 'chat:created' || type == 'chat:deleted') {
+        if (_canViewCreateTab() || _canViewChannelsTab()) {
+          _scheduleChannelsRealtimeRefresh();
+        }
+        return;
+      }
+      if (type == 'chat:updated' ||
+          type == 'channel:updated' ||
+          type == 'channel:members:updated' ||
+          type == 'channel:media:updated') {
+        final channelId = _realtimeChannelIdOf(event['data']);
+        if (_canViewCreateTab() || _canViewChannelsTab()) {
+          if (type == 'channel:updated') {
+            _scheduleChannelsRealtimeRefresh();
+          }
+          if (channelId.isNotEmpty) {
+            _scheduleChannelOverviewRealtimeRefresh(channelId);
+          }
+        }
         return;
       }
       if (type == 'claims:updated' && _canViewSupportTab()) {
@@ -290,6 +317,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _clientCartUndoTimer?.cancel();
     _publishProgressTimer?.cancel();
     _pendingPostsRefreshDebounce?.cancel();
+    _channelsRefreshDebounce?.cancel();
+    for (final timer in _channelOverviewRefreshDebounces.values) {
+      timer.cancel();
+    }
+    _channelOverviewRefreshDebounces.clear();
     _clientCartPendingCommit = null;
     _clientCartPendingRollback = null;
     _channelTitleCtrl.dispose();
@@ -1375,11 +1407,56 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   void _schedulePendingPostsRealtimeRefresh() {
     _pendingPostsRefreshDebounce?.cancel();
-    _pendingPostsRefreshDebounce = Timer(
-      const Duration(milliseconds: 250),
+    _pendingPostsRefreshDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted || _isDisposed) return;
+      unawaited(_loadPendingPosts());
+    });
+  }
+
+  String _realtimeChannelIdOf(Object? data) {
+    if (data is! Map) return '';
+    final map = Map<String, dynamic>.from(data);
+    final direct =
+        (map['channel_id'] ??
+                map['channelId'] ??
+                map['chatId'] ??
+                map['chat_id'] ??
+                map['entity_id'] ??
+                '')
+            .toString()
+            .trim();
+    if (direct.isNotEmpty) return direct;
+    final chat = map['chat'];
+    if (chat is Map) {
+      return (chat['id'] ?? chat['chat_id'] ?? '').toString().trim();
+    }
+    final message = map['message'];
+    if (message is Map) {
+      return (message['chat_id'] ?? message['chatId'] ?? '').toString().trim();
+    }
+    return '';
+  }
+
+  void _scheduleChannelsRealtimeRefresh() {
+    _channelsRefreshDebounce?.cancel();
+    _channelsRefreshDebounce = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted || _isDisposed) return;
+      unawaited(_loadChannels());
+    });
+  }
+
+  void _scheduleChannelOverviewRealtimeRefresh(String channelId) {
+    final normalized = channelId.trim();
+    if (normalized.isEmpty || !_channelOverviews.containsKey(normalized)) {
+      return;
+    }
+    _channelOverviewRefreshDebounces[normalized]?.cancel();
+    _channelOverviewRefreshDebounces[normalized] = Timer(
+      const Duration(milliseconds: 400),
       () {
+        _channelOverviewRefreshDebounces.remove(normalized);
         if (!mounted || _isDisposed) return;
-        unawaited(_loadPendingPosts());
+        unawaited(_loadChannelOverview(normalized, force: true, silent: true));
       },
     );
   }
@@ -1530,7 +1607,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       }
     } catch (e) {
       if (!silent && mounted) {
-        setState(() => _message = 'Ошибка FAQ поддержки: ${_extractDioError(e)}');
+        setState(
+          () => _message = 'Ошибка FAQ поддержки: ${_extractDioError(e)}',
+        );
       }
     } finally {
       if (mounted) {
@@ -1579,6 +1658,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         _message = '';
       }
     }
+
     if (mounted) {
       setState(apply);
     } else {
@@ -1592,7 +1672,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _supportTemplateBodyCtrl.text = (template['body'] ?? '').toString();
     _supportTemplateTriggerCtrl.text = triggerRule == '*' ? '*' : triggerRule;
     _supportTemplateTriggerProbeCtrl.clear();
-    _supportTemplatePriorityCtrl.text = (template['priority'] ?? 100).toString();
+    _supportTemplatePriorityCtrl.text = (template['priority'] ?? 100)
+        .toString();
     setState(() {
       _editingSupportTemplateId = (template['id'] ?? '').toString().trim();
       _supportTemplateCategory = (template['category'] ?? 'general')
@@ -1601,7 +1682,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           .toLowerCase();
       _supportTemplateAutoReply = template['auto_reply_enabled'] == true;
       _supportTemplateElseFallback = triggerRule == '*';
-      _message = 'Редактируем шаблон "${(template['title'] ?? 'Шаблон').toString()}"';
+      _message =
+          'Редактируем шаблон "${(template['title'] ?? 'Шаблон').toString()}"';
     });
   }
 
@@ -1672,7 +1754,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _toggleSupportTemplateActive(Map<String, dynamic> template) async {
+  Future<void> _toggleSupportTemplateActive(
+    Map<String, dynamic> template,
+  ) async {
     final templateId = (template['id'] ?? '').toString().trim();
     if (templateId.isEmpty) return;
     final nextActive = !(template['is_active'] == true);
@@ -1694,9 +1778,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       });
     } catch (e) {
       if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка шаблона: ${_extractDioError(e)}',
-      );
+      setState(() => _message = 'Ошибка шаблона: ${_extractDioError(e)}');
     } finally {
       if (mounted) {
         setState(() => _supportTemplateSaving = false);
@@ -1719,6 +1801,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         _message = '';
       }
     }
+
     if (mounted) {
       setState(apply);
     } else {
@@ -1779,15 +1862,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       await _loadSupportFaqEntries(silent: true);
       if (!mounted) return;
       setState(() {
-        _message = editingId.isEmpty
-            ? 'FAQ сохранён'
-            : 'FAQ обновлён';
+        _message = editingId.isEmpty ? 'FAQ сохранён' : 'FAQ обновлён';
       });
     } catch (e) {
       if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка FAQ: ${_extractDioError(e)}',
-      );
+      setState(() => _message = 'Ошибка FAQ: ${_extractDioError(e)}');
     } finally {
       if (mounted) {
         setState(() => _supportFaqSaving = false);
@@ -1819,9 +1898,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       });
     } catch (e) {
       if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка FAQ: ${_extractDioError(e)}',
-      );
+      setState(() => _message = 'Ошибка FAQ: ${_extractDioError(e)}');
     } finally {
       if (mounted) {
         setState(() => _supportFaqSaving = false);
@@ -1848,9 +1925,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       setState(() => _message = 'FAQ удалён');
     } catch (e) {
       if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка удаления FAQ: ${_extractDioError(e)}',
-      );
+      setState(() => _message = 'Ошибка удаления FAQ: ${_extractDioError(e)}');
     } finally {
       if (mounted) {
         setState(() => _supportFaqSaving = false);
@@ -4197,9 +4272,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       setState(() => _message = 'Обращение отмечено как решённое');
     } catch (e) {
       if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка завершения: ${_extractDioError(e)}',
-      );
+      setState(() => _message = 'Ошибка завершения: ${_extractDioError(e)}');
     } finally {
       if (mounted) {
         setState(() => _supportFinishBusyTicketIds.remove(ticketId));
@@ -4687,8 +4760,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       );
       if (result == null || (result['address_text'] ?? '').isEmpty) return;
       addressText = (result['address_text'] ?? '').toString().trim();
-      preferredTimeFrom =
-          (result['preferred_time_from'] ?? '').toString().trim();
+      preferredTimeFrom = (result['preferred_time_from'] ?? '')
+          .toString()
+          .trim();
       preferredTimeTo = (result['preferred_time_to'] ?? '').toString().trim();
       entrance = (result['entrance'] ?? '').toString().trim();
       comment = (result['comment'] ?? '').toString().trim();
@@ -4963,16 +5037,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       builder: (ctx) => DeliveryAddressPickerDialog(
         title: 'Адрес доставки',
         initialAddressText: (payload['address_text'] ?? '').toString(),
-        initialPreferredTimeFrom:
-            (payload['preferred_time_from'] ?? '').toString(),
+        initialPreferredTimeFrom: (payload['preferred_time_from'] ?? '')
+            .toString(),
         initialPreferredTimeTo: (payload['preferred_time_to'] ?? '').toString(),
       ),
     );
     if (addressPayload == null) return;
-    final nextPayload = <String, dynamic>{
-      ...payload,
-      ...addressPayload,
-    };
+    final nextPayload = <String, dynamic>{...payload, ...addressPayload};
 
     setState(() {
       _deliverySaving = true;
@@ -5010,8 +5081,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final center = existing?['center'] is Map
         ? Map<String, dynamic>.from(existing!['center'] as Map)
         : <String, dynamic>{};
-    double lat = _toNullableDouble(center['lat']) ?? _deliveryOriginLat ?? 53.195878;
-    double lng = _toNullableDouble(center['lng']) ?? _deliveryOriginLng ?? 50.100202;
+    double lat =
+        _toNullableDouble(center['lat']) ?? _deliveryOriginLat ?? 53.195878;
+    double lng =
+        _toNullableDouble(center['lng']) ?? _deliveryOriginLng ?? 50.100202;
     bool active = existing?['is_active'] != false;
     final mapController = MapController();
 
@@ -5023,7 +5096,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         final subdomains = _activeMapSubdomains(tileUrl);
         return StatefulBuilder(
           builder: (context, setLocalState) => AlertDialog(
-            title: Text(existing == null ? 'Новая зона доставки' : 'Зона доставки'),
+            title: Text(
+              existing == null ? 'Новая зона доставки' : 'Зона доставки',
+            ),
             content: SizedBox(
               width: 640,
               child: SingleChildScrollView(
@@ -5071,7 +5146,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                       height: 300,
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(18),
-                        border: Border.all(color: theme.colorScheme.outlineVariant),
+                        border: Border.all(
+                          color: theme.colorScheme.outlineVariant,
+                        ),
                       ),
                       clipBehavior: Clip.antiAlias,
                       child: FlutterMap(
@@ -5104,10 +5181,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                             circles: [
                               CircleMarker(
                                 point: LatLng(lat, lng),
-                                radius: double.tryParse(radiusCtrl.text.trim()) ?? 2500,
+                                radius:
+                                    double.tryParse(radiusCtrl.text.trim()) ??
+                                    2500,
                                 useRadiusInMeter: true,
-                                color: theme.colorScheme.primary.withValues(alpha: 0.12),
-                                borderColor: theme.colorScheme.primary.withValues(alpha: 0.52),
+                                color: theme.colorScheme.primary.withValues(
+                                  alpha: 0.12,
+                                ),
+                                borderColor: theme.colorScheme.primary
+                                    .withValues(alpha: 0.52),
                                 borderStrokeWidth: 2,
                               ),
                             ],
@@ -5122,7 +5204,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                   decoration: BoxDecoration(
                                     color: theme.colorScheme.primary,
                                     shape: BoxShape.circle,
-                                    border: Border.all(color: Colors.white, width: 3),
+                                    border: Border.all(
+                                      color: Colors.white,
+                                      width: 3,
+                                    ),
                                   ),
                                   child: const Icon(
                                     Icons.place,
@@ -5161,10 +5246,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                         ? 'zone_${DateTime.now().millisecondsSinceEpoch}'
                         : existing?['id'],
                     'title': title,
-                    'center': {
-                      'lat': lat,
-                      'lng': lng,
-                    },
+                    'center': {'lat': lat, 'lng': lng},
                     'radius_meters': radius,
                     'is_active': active,
                   });
@@ -8015,8 +8097,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   if (_activePublishBatches.isNotEmpty) ...[
                     const SizedBox(height: 10),
                     ..._activePublishBatches.take(3).map((batch) {
-                      final channelTitle =
-                          (batch['channel_title'] ?? 'Канал').toString();
+                      final channelTitle = (batch['channel_title'] ?? 'Канал')
+                          .toString();
                       final batchCurrentTitle =
                           (batch['current_product_title'] ?? '').toString();
                       return Padding(
@@ -8040,7 +8122,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
-              onPressed: (_publishing || _hasActivePublishBatches || !_canPublishProducts())
+              onPressed:
+                  (_publishing ||
+                      _hasActivePublishBatches ||
+                      !_canPublishProducts())
                   ? null
                   : _publishPendingPosts,
               icon: _publishing
@@ -8193,8 +8278,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                     ),
                                     child: Text(
                                       _publicationStatusLabel(p),
-                                      style:
-                                          theme.textTheme.labelLarge?.copyWith(
+                                      style: theme.textTheme.labelLarge
+                                          ?.copyWith(
                                             fontWeight: FontWeight.w700,
                                           ),
                                     ),
@@ -8240,7 +8325,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           runSpacing: 8,
                           children: [
                             FilledButton.tonalIcon(
-                              onPressed: _saving ||
+                              onPressed:
+                                  _saving ||
                                       publishStatus == 'queued' ||
                                       publishStatus == 'publishing'
                                   ? null
@@ -8250,7 +8336,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                             ),
                             if (_canDeletePendingPost())
                               OutlinedButton.icon(
-                                onPressed: _saving ||
+                                onPressed:
+                                    _saving ||
                                         publishStatus == 'queued' ||
                                         publishStatus == 'publishing'
                                     ? null
@@ -8346,20 +8433,22 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final productTitle = (ticket['product_title'] ?? '').toString().trim();
     final claimBusy = _supportClaimBusyTicketIds.contains(ticketId);
     final finishBusy = _supportFinishBusyTicketIds.contains(ticketId);
-    final quickReplyTemplates = _supportTemplates
-        .where((template) => template['is_active'] != false)
-        .toList()
-      ..sort((a, b) {
-        final categoryCompare = _supportCategoryLabel(
-          (a['category'] ?? '').toString(),
-        ).compareTo(
-          _supportCategoryLabel((b['category'] ?? '').toString()),
-        );
-        if (categoryCompare != 0) return categoryCompare;
-        return (a['title'] ?? '').toString().compareTo(
-          (b['title'] ?? '').toString(),
-        );
-      });
+    final quickReplyTemplates =
+        _supportTemplates
+            .where((template) => template['is_active'] != false)
+            .toList()
+          ..sort((a, b) {
+            final categoryCompare =
+                _supportCategoryLabel(
+                  (a['category'] ?? '').toString(),
+                ).compareTo(
+                  _supportCategoryLabel((b['category'] ?? '').toString()),
+                );
+            if (categoryCompare != 0) return categoryCompare;
+            return (a['title'] ?? '').toString().compareTo(
+              (b['title'] ?? '').toString(),
+            );
+          });
     final isTemplateEnabled =
         !archived && !pending && quickReplyTemplates.isNotEmpty;
     final canResolve = !archived && !pending && statusRaw != 'resolved';
@@ -8703,12 +8792,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                       OutlinedButton.icon(
                                         onPressed: supportFinishBusy
                                             ? null
-                                            : () => _resolveSupportTicket(
-                                                {
-                                                  'id': supportTicketId,
-                                                  'chat_id': event['chat_id'],
-                                                },
-                                              ),
+                                            : () => _resolveSupportTicket({
+                                                'id': supportTicketId,
+                                                'chat_id': event['chat_id'],
+                                              }),
                                         icon: const Icon(
                                           Icons.verified_outlined,
                                         ),
@@ -8883,7 +8970,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                       decoration: withInputLanguageBadge(
                         const InputDecoration(
                           labelText: 'Текст ответа',
-                          hintText: 'Напишите понятный готовый ответ для клиента',
+                          hintText:
+                              'Напишите понятный готовый ответ для клиента',
                           border: OutlineInputBorder(),
                         ),
                         controller: _supportTemplateBodyCtrl,
@@ -9130,10 +9218,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                               },
                               itemBuilder: (context) =>
                                   _supportTemplateTokens.map((item) {
-                                    final token =
-                                        (item['token'] ?? '').trim();
-                                    final title =
-                                        (item['title'] ?? token).trim();
+                                    final token = (item['token'] ?? '').trim();
+                                    final title = (item['title'] ?? token)
+                                        .trim();
                                     return PopupMenuItem<String>(
                                       value: token,
                                       child: Text('$title: $token'),
@@ -9259,17 +9346,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                     FilledButton.tonalIcon(
                                       onPressed: _supportTemplateSaving
                                           ? null
-                                          : () => _editSupportTemplate(template),
+                                          : () =>
+                                                _editSupportTemplate(template),
                                       icon: const Icon(Icons.edit_outlined),
                                       label: const Text('Редактировать'),
                                     ),
                                     OutlinedButton.icon(
                                       onPressed: _supportTemplateSaving
                                           ? null
-                                          : () =>
-                                              _toggleSupportTemplateActive(
-                                                template,
-                                              ),
+                                          : () => _toggleSupportTemplateActive(
+                                              template,
+                                            ),
                                       icon: Icon(
                                         isActive
                                             ? Icons.visibility_off_outlined
@@ -9416,8 +9503,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           OutlinedButton.icon(
                             onPressed: _supportFaqSaving
                                 ? null
-                                : () =>
-                                    _resetSupportFaqEditor(clearMessage: true),
+                                : () => _resetSupportFaqEditor(
+                                    clearMessage: true,
+                                  ),
                             icon: const Icon(Icons.close),
                             label: const Text('Сбросить'),
                           ),
@@ -9521,7 +9609,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                     OutlinedButton.icon(
                                       onPressed: _supportFaqSaving
                                           ? null
-                                          : () => _toggleSupportFaqActive(entry),
+                                          : () =>
+                                                _toggleSupportFaqActive(entry),
                                       icon: Icon(
                                         isActive
                                             ? Icons.visibility_off_outlined
@@ -11166,8 +11255,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                         ),
                       ),
                       OutlinedButton.icon(
-                        onPressed:
-                            _deliverySaving ? null : () => _editDeliveryZone(),
+                        onPressed: _deliverySaving
+                            ? null
+                            : () => _editDeliveryZone(),
                         icon: const Icon(Icons.add_location_alt_outlined),
                         label: const Text('Добавить зону'),
                       ),

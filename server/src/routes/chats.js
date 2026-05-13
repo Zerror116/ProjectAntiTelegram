@@ -7456,6 +7456,18 @@ router.post(
        ON CONFLICT (chat_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
         [uuidv4(), chatId, userId, role],
       );
+      const io = req.app.get("io");
+      if (io) {
+        emitToTenant(io, req.user?.tenant_id || null, "channel:members:updated", {
+          entity: "channel_members",
+          entity_id: chatId,
+          channel_id: chatId,
+          chatId,
+          action: "member_upserted",
+          user_id: userId,
+        });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      }
       return res.status(201).json({ ok: true });
     } catch (err) {
       console.error("chats.members.add error", err);
@@ -7475,6 +7487,18 @@ router.delete(
         "DELETE FROM chat_members WHERE chat_id=$1 AND user_id=$2",
         [chatId, userId],
       );
+      const io = req.app.get("io");
+      if (io) {
+        emitToTenant(io, req.user?.tenant_id || null, "channel:members:updated", {
+          entity: "channel_members",
+          entity_id: chatId,
+          channel_id: chatId,
+          chatId,
+          action: "member_removed",
+          user_id: userId,
+        });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      }
       return res.json({ ok: true });
     } catch (err) {
       console.error("chats.members.delete error", err);
@@ -7497,6 +7521,19 @@ router.patch(
         "UPDATE chat_members SET role=$1 WHERE chat_id=$2 AND user_id=$3",
         [role, chatId, userId],
       );
+      const io = req.app.get("io");
+      if (io) {
+        emitToTenant(io, req.user?.tenant_id || null, "channel:members:updated", {
+          entity: "channel_members",
+          entity_id: chatId,
+          channel_id: chatId,
+          chatId,
+          action: "member_role_updated",
+          user_id: userId,
+          role,
+        });
+        emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      }
       return res.json({ ok: true });
     } catch (err) {
       console.error("chats.members.role error", err);

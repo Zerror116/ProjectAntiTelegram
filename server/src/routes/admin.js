@@ -53,6 +53,59 @@ const requireReservationFulfillPermission = requirePermission(
 );
 const PUBLISH_POST_INTERVAL_MS = DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS;
 const SAMARA_TZ = "Europe/Samara";
+
+function emitChannelUpdated(io, tenantId, channelId, payload = {}) {
+  if (!io || !channelId) return;
+  emitToTenant(io, tenantId || null, "channel:updated", {
+    entity: "channel",
+    entity_id: String(channelId),
+    channel_id: String(channelId),
+    chatId: String(channelId),
+    action: payload.action || "updated",
+    ...payload,
+  });
+}
+
+function emitChannelMembersUpdated(io, tenantId, channelId, payload = {}) {
+  if (!io || !channelId) return;
+  emitToTenant(io, tenantId || null, "channel:members:updated", {
+    entity: "channel_members",
+    entity_id: String(channelId),
+    channel_id: String(channelId),
+    chatId: String(channelId),
+    action: payload.action || "updated",
+    ...payload,
+  });
+}
+
+function emitChannelMediaUpdated(io, tenantId, channelId, payload = {}) {
+  if (!io || !channelId) return;
+  emitToTenant(io, tenantId || null, "channel:media:updated", {
+    entity: "channel_media",
+    entity_id: String(channelId),
+    channel_id: String(channelId),
+    chatId: String(channelId),
+    action: payload.action || "updated",
+    ...payload,
+  });
+}
+
+function emitReservedOrderUpdated(io, tenantId, reservedChannelId, payload = {}) {
+  if (!io || !reservedChannelId) return;
+  emitToTenant(io, tenantId || null, "reserved:order:updated", {
+    entity: "reserved_order",
+    entity_id:
+      payload.message_id ||
+      payload.messageId ||
+      payload.reservation_id ||
+      payload.cart_item_id ||
+      String(reservedChannelId),
+    channel_id: String(reservedChannelId),
+    chatId: String(reservedChannelId),
+    action: payload.action || "updated",
+    ...payload,
+  });
+}
 const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$/;
 
 function buildIsolatedProvisionWarning(err) {
@@ -2089,6 +2142,11 @@ router.post(
       if (io) {
         emitToTenant(io, req.user?.tenant_id || null, "chat:created", {
           chatId: channel.id,
+          chat: channel,
+        });
+        emitChannelUpdated(io, req.user?.tenant_id || null, channel.id, {
+          action: "created",
+          chat: channel,
         });
       }
 
@@ -2180,6 +2238,9 @@ router.delete(
           if (io) {
             emitToTenant(io, req.user?.tenant_id || null, "chat:deleted", {
               chatId: id,
+            });
+            emitChannelUpdated(io, req.user?.tenant_id || null, id, {
+              action: "deleted",
             });
           }
 
@@ -2311,6 +2372,10 @@ router.patch(
       const io = req.app.get("io");
       if (io) {
         emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+          chat: updated.rows[0],
+        });
+        emitChannelUpdated(io, req.user?.tenant_id || null, id, {
+          action: "updated",
           chat: updated.rows[0],
         });
       }
@@ -2684,6 +2749,14 @@ router.post(
         emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
           chat: updated.rows[0],
         });
+        emitChannelUpdated(io, req.user?.tenant_id || null, id, {
+          action: "blacklist_added",
+          chat: updated.rows[0],
+        });
+        emitChannelMembersUpdated(io, req.user?.tenant_id || null, id, {
+          action: "blacklist_added",
+          user_id: userId,
+        });
       }
 
       return res.json({
@@ -2770,6 +2843,14 @@ router.delete(
         emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
           chat: updated.rows[0],
         });
+        emitChannelUpdated(io, req.user?.tenant_id || null, id, {
+          action: "blacklist_removed",
+          chat: updated.rows[0],
+        });
+        emitChannelMembersUpdated(io, req.user?.tenant_id || null, id, {
+          action: "blacklist_removed",
+          user_id: userId,
+        });
       }
 
       return res.json({
@@ -2844,6 +2925,13 @@ router.post(
         emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
           chat: updated,
         });
+        emitChannelUpdated(io, req.user?.tenant_id || null, id, {
+          action: "avatar_updated",
+          chat: updated,
+        });
+        emitChannelMediaUpdated(io, req.user?.tenant_id || null, id, {
+          action: "avatar_updated",
+        });
       }
 
       return res.json({ ok: true, data: updated });
@@ -2896,6 +2984,13 @@ router.delete(
       if (io) {
         emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
           chat: updated,
+        });
+        emitChannelUpdated(io, req.user?.tenant_id || null, id, {
+          action: "avatar_removed",
+          chat: updated,
+        });
+        emitChannelMediaUpdated(io, req.user?.tenant_id || null, id, {
+          action: "avatar_removed",
         });
       }
 
@@ -3477,6 +3572,15 @@ router.post(
             emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
               chatId: reservedChannel.id,
             });
+            emitReservedOrderUpdated(io, req.user?.tenant_id || null, reservedChannel.id, {
+              action: "dispatched",
+              message_id: item.message_id,
+              reservation_id: item.reservation_id,
+              cart_item_id: item.cart_item_id,
+              user_id: item.user_id,
+              shelf_number: item.shelf_number,
+              shelf_label: item.shelf_label,
+            });
           }
         }
       }
@@ -3648,6 +3752,13 @@ router.post(
           io.to(`chat:${reservedChannel.id}`).emit("chat:message", {
             chatId: reservedChannel.id,
             message: decryptMessageRow(message),
+          });
+          emitReservedOrderUpdated(io, req.user?.tenant_id || null, reservedChannel.id, {
+            action: "shelf_changed",
+            message_id: message.id,
+            user_id: userIdText,
+            shelf_number: shelfNumber,
+            shelf_label: shelfLabel,
           });
         }
         if (updatedReservedMessages.rowCount > 0) {
@@ -3894,6 +4005,16 @@ router.post(
               });
               emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
                 chatId: reservedChannel.id,
+              });
+              emitReservedOrderUpdated(io, req.user?.tenant_id || null, reservedChannel.id, {
+                action: "oversize_after_processed",
+                message_id: message.id,
+                reservation_id: item.id,
+                cart_item_id: targetCartItemId || null,
+                user_id: item.user_id,
+                shelf_number: existingShelfNumber,
+                shelf_label: existingShelfLabel,
+                processing_mode: "oversize",
               });
             }
             io.to(`user:${item.user_id}`).emit("cart:updated", {
@@ -4160,6 +4281,16 @@ router.post(
           });
           emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
             chatId: reservedChannel.id,
+          });
+          emitReservedOrderUpdated(io, req.user?.tenant_id || null, reservedChannel.id, {
+            action: "processed",
+            message_id: message.id,
+            reservation_id: item.id,
+            cart_item_id: targetCartItemId || null,
+            user_id: item.user_id,
+            shelf_number: finalShelfNumber,
+            shelf_label: finalShelfLabel,
+            processing_mode: processingMode,
           });
         }
         io.to(`user:${item.user_id}`).emit("cart:updated", {

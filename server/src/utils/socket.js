@@ -18,21 +18,66 @@ function userRoom(rawUserId) {
   return userId ? `user:${userId}` : null;
 }
 
+let realtimeEventSeq = 0;
+
+function inferEntityFromEventName(eventName) {
+  const head = String(eventName || "").split(":")[0].trim();
+  return head || "realtime";
+}
+
+function normalizeRealtimePayload(eventName, rawTenantId, payload = {}) {
+  const tenantId = normalizeTenantId(rawTenantId);
+  const source =
+    payload && typeof payload === "object" && !Array.isArray(payload)
+      ? payload
+      : { payload };
+  const now = new Date().toISOString();
+  const updatedAt = source.updated_at || source.updatedAt || source.at || now;
+  const entityId =
+    source.entity_id ||
+    source.entityId ||
+    source.chatId ||
+    source.chat_id ||
+    source.channel_id ||
+    source.channelId ||
+    source.queue_id ||
+    source.queueId ||
+    source.messageId ||
+    source.message_id ||
+    null;
+  realtimeEventSeq = (realtimeEventSeq + 1) % Number.MAX_SAFE_INTEGER;
+  return {
+    ...source,
+    event_id:
+      source.event_id ||
+      source.eventId ||
+      `${Date.now().toString(36)}-${realtimeEventSeq.toString(36)}`,
+    type: source.type || eventName,
+    tenant_id: source.tenant_id || source.tenantId || tenantId,
+    entity: source.entity || inferEntityFromEventName(eventName),
+    entity_id: entityId == null ? null : String(entityId),
+    action: source.action || "updated",
+    updated_at: updatedAt,
+  };
+}
+
 function emitToTenant(io, rawTenantId, eventName, payload) {
   if (!io || !eventName) return;
   const room = tenantRoom(rawTenantId);
-  if (room) {
-    io.to(room).emit(eventName, payload);
+  if (!room) {
+    console.warn("[realtime] skipped tenant event without tenant scope", {
+      eventName,
+    });
     return;
   }
-  io.emit(eventName, payload);
+  io.to(room).emit(eventName, normalizeRealtimePayload(eventName, rawTenantId, payload));
 }
 
 function emitToUser(io, rawUserId, eventName, payload) {
   if (!io || !eventName) return;
   const room = userRoom(rawUserId);
   if (!room) return;
-  io.to(room).emit(eventName, payload);
+  io.to(room).emit(eventName, normalizeRealtimePayload(eventName, payload?.tenant_id || payload?.tenantId || null, payload));
 }
 
 function emitToUsers(io, rawUserIds, eventName, payloadFactory) {
@@ -55,6 +100,7 @@ module.exports = {
   normalizeUserId,
   tenantRoom,
   userRoom,
+  normalizeRealtimePayload,
   emitToTenant,
   emitToUser,
   emitToUsers,

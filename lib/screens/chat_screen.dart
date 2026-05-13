@@ -2553,7 +2553,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void _markMessageAppearing(String messageId) {
     if (messageId.isEmpty) return;
     setState(() => _appearingMessageIds.add(messageId));
-    Future.delayed(const Duration(milliseconds: 420), () {
+    Future.delayed(const Duration(milliseconds: 780), () {
       if (!mounted) return;
       setState(() => _appearingMessageIds.remove(messageId));
     });
@@ -11133,6 +11133,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _supportFeedbackBusyTicketIds.contains(supportTicketId);
     final isAppearing =
         messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
+    final isChannelChat =
+        (widget.chatType ?? '').toLowerCase().trim() == 'channel';
+    final useChannelPostAppearance = isChannelChat && isAppearing;
 
     final bubbleColor = hasBuy || isReservedOrder
         ? Colors.transparent
@@ -12095,6 +12098,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final animatedItem = reducedMotion
         ? bubbleRow
+        : useChannelPostAppearance
+        ? _ChannelPostRevealHighlight(child: bubbleRow)
         : TweenAnimationBuilder<double>(
             tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
             duration: const Duration(milliseconds: 380),
@@ -12865,6 +12870,210 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: _buildVideoRecordingBar(Theme.of(context)),
               ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ChannelPostRevealHighlight extends StatelessWidget {
+  const _ChannelPostRevealHighlight({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 720),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        final reveal = Curves.easeOutCubic.transform(
+          value.clamp(0.0, 1.0).toDouble(),
+        );
+        final glowPhase = value < 0.55
+            ? value / 0.55
+            : 1 - ((value - 0.55) / 0.45);
+        final glow = Curves.easeOut.transform(
+          glowPhase.clamp(0.0, 1.0).toDouble(),
+        );
+        return ClipRect(
+          child: Align(
+            alignment: Alignment.bottomCenter,
+            heightFactor: math.max(0.04, reveal),
+            child: Opacity(
+              opacity: (0.22 + reveal * 0.78).clamp(0.0, 1.0).toDouble(),
+              child: Transform.translate(
+                offset: Offset(0, 30 * (1 - reveal)),
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(28),
+                            boxShadow: [
+                              BoxShadow(
+                                color: scheme.primary.withValues(
+                                  alpha: 0.16 * glow,
+                                ),
+                                blurRadius: 34 * glow,
+                                spreadRadius: 2 * glow,
+                                offset: Offset(0, 14 * glow),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    child!,
+                    Positioned(
+                      left: 38,
+                      right: 38,
+                      bottom: 3,
+                      child: IgnorePointer(
+                        child: Opacity(
+                          opacity: glow,
+                          child: Container(
+                            height: 2.5,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(999),
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.transparent,
+                                  scheme.primary.withValues(alpha: 0.56),
+                                  scheme.tertiary.withValues(alpha: 0.44),
+                                  Colors.transparent,
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      child: child,
+    );
+  }
+}
+
+class _StickyDateTimelineCapsule extends StatelessWidget {
+  const _StickyDateTimelineCapsule({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        (MediaQuery.maybeOf(context)?.disableAnimations == true);
+    final duration = reducedMotion
+        ? Duration.zero
+        : const Duration(milliseconds: 220);
+
+    return AnimatedSize(
+      duration: duration,
+      curve: Curves.easeOutCubic,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(999),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              scheme.surfaceContainerHighest.withValues(alpha: 0.94),
+              scheme.surfaceContainerHigh.withValues(alpha: 0.88),
+            ],
+          ),
+          border: Border.all(
+            color: scheme.primary.withValues(
+              alpha: theme.brightness == Brightness.dark ? 0.32 : 0.24,
+            ),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: scheme.shadow.withValues(alpha: 0.12),
+              blurRadius: 18,
+              offset: const Offset(0, 8),
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(999),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 7, 12, 7),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: scheme.primary,
+                    boxShadow: [
+                      BoxShadow(
+                        color: scheme.primary.withValues(alpha: 0.28),
+                        blurRadius: 8,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                AnimatedSwitcher(
+                  duration: duration,
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, animation) {
+                    final offsetAnimation = Tween<Offset>(
+                      begin: const Offset(0, 0.35),
+                      end: Offset.zero,
+                    ).animate(animation);
+                    return FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: offsetAnimation,
+                        child: child,
+                      ),
+                    );
+                  },
+                  child: Text(
+                    label,
+                    key: ValueKey(label),
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      color: scheme.onSurface,
+                      fontWeight: FontWeight.w800,
+                      fontFeatures: const [ui.FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  width: 34,
+                  height: 2,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(999),
+                    gradient: LinearGradient(
+                      colors: [
+                        scheme.primary.withValues(alpha: 0.52),
+                        scheme.primary.withValues(alpha: 0.05),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );

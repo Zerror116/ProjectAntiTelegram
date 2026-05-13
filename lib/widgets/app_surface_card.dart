@@ -36,7 +36,9 @@ class AppSurfaceCard extends StatelessWidget {
         ? scheme.primary.withValues(alpha: 0.10)
         : scheme.primary.withValues(alpha: 0.04);
 
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
       margin: margin,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(radius),
