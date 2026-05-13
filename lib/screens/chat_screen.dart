@@ -12974,107 +12974,186 @@ class _StickyDateTimelineCapsule extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final dark = theme.brightness == Brightness.dark;
     final reducedMotion =
         performanceModeNotifier.value ||
         (MediaQuery.maybeOf(context)?.disableAnimations == true);
     final duration = reducedMotion
         ? Duration.zero
-        : const Duration(milliseconds: 220);
+        : const Duration(milliseconds: 260);
 
     return AnimatedSize(
       duration: duration,
       curve: Curves.easeOutCubic,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(999),
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              scheme.surfaceContainerHighest.withValues(alpha: 0.94),
-              scheme.surfaceContainerHigh.withValues(alpha: 0.88),
-            ],
-          ),
-          border: Border.all(
-            color: scheme.primary.withValues(
-              alpha: theme.brightness == Brightness.dark ? 0.32 : 0.24,
-            ),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: scheme.shadow.withValues(alpha: 0.12),
-              blurRadius: 18,
-              offset: const Offset(0, 8),
-            ),
-          ],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(999),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 7, 12, 7),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 7,
-                  height: 7,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: scheme.primary,
-                    boxShadow: [
-                      BoxShadow(
-                        color: scheme.primary.withValues(alpha: 0.28),
-                        blurRadius: 8,
-                      ),
+      child: Stack(
+        clipBehavior: Clip.none,
+        alignment: Alignment.center,
+        children: [
+          Positioned(
+            top: -12,
+            bottom: -12,
+            child: AnimatedSwitcher(
+              duration: duration,
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              child: Container(
+                key: ValueKey('timeline-$label'),
+                width: 3,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(999),
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.transparent,
+                      scheme.primary.withValues(alpha: dark ? 0.40 : 0.30),
+                      scheme.tertiary.withValues(alpha: dark ? 0.34 : 0.24),
+                      Colors.transparent,
                     ],
                   ),
-                ),
-                const SizedBox(width: 8),
-                AnimatedSwitcher(
-                  duration: duration,
-                  switchInCurve: Curves.easeOutCubic,
-                  switchOutCurve: Curves.easeInCubic,
-                  transitionBuilder: (child, animation) {
-                    final offsetAnimation = Tween<Offset>(
-                      begin: const Offset(0, 0.35),
-                      end: Offset.zero,
-                    ).animate(animation);
-                    return FadeTransition(
-                      opacity: animation,
-                      child: SlideTransition(
-                        position: offsetAnimation,
-                        child: child,
+                  boxShadow: [
+                    BoxShadow(
+                      color: scheme.primary.withValues(
+                        alpha: dark ? 0.20 : 0.12,
                       ),
-                    );
-                  },
-                  child: Text(
-                    label,
-                    key: ValueKey(label),
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      color: scheme.onSurface,
-                      fontWeight: FontWeight.w800,
-                      fontFeatures: const [ui.FontFeature.tabularFigures()],
+                      blurRadius: 10,
                     ),
-                  ),
+                  ],
                 ),
-                const SizedBox(width: 8),
-                Container(
-                  width: 34,
-                  height: 2,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(999),
-                    gradient: LinearGradient(
-                      colors: [
-                        scheme.primary.withValues(alpha: 0.52),
-                        scheme.primary.withValues(alpha: 0.05),
-                      ],
+              ),
+            ),
+          ),
+          DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(999),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Color.alphaBlend(
+                    scheme.primary.withValues(alpha: dark ? 0.18 : 0.08),
+                    scheme.surfaceContainerHighest.withValues(
+                      alpha: dark ? 0.90 : 0.96,
                     ),
                   ),
+                  scheme.surfaceContainerHigh.withValues(
+                    alpha: dark ? 0.86 : 0.92,
+                  ),
+                ],
+              ),
+              border: Border.all(
+                color: scheme.primary.withValues(alpha: dark ? 0.38 : 0.24),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: scheme.shadow.withValues(alpha: dark ? 0.28 : 0.12),
+                  blurRadius: 18,
+                  offset: const Offset(0, 8),
+                ),
+                BoxShadow(
+                  color: scheme.primary.withValues(alpha: dark ? 0.12 : 0.07),
+                  blurRadius: 24,
                 ),
               ],
             ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 7, 14, 7),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          AnimatedSwitcher(
+                            duration: duration,
+                            switchInCurve: Curves.easeOutCubic,
+                            switchOutCurve: Curves.easeInCubic,
+                            child: Container(
+                              key: ValueKey('ring-$label'),
+                              width: 18,
+                              height: 18,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: scheme.primary.withValues(
+                                  alpha: dark ? 0.16 : 0.10,
+                                ),
+                              ),
+                            ),
+                          ),
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: scheme.primary,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: scheme.primary.withValues(alpha: 0.36),
+                                  blurRadius: 9,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    AnimatedSwitcher(
+                      duration: duration,
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) {
+                        final offsetAnimation = Tween<Offset>(
+                          begin: const Offset(0, 0.35),
+                          end: Offset.zero,
+                        ).animate(animation);
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(
+                            position: offsetAnimation,
+                            child: child,
+                          ),
+                        );
+                      },
+                      child: Text(
+                        label,
+                        key: ValueKey(label),
+                        style: theme.textTheme.labelLarge?.copyWith(
+                          color: scheme.onSurface,
+                          fontWeight: FontWeight.w800,
+                          fontFeatures: const [ui.FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    AnimatedSwitcher(
+                      duration: duration,
+                      child: Container(
+                        key: ValueKey('tail-$label'),
+                        width: 20,
+                        height: 3,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(999),
+                          gradient: LinearGradient(
+                            colors: [
+                              scheme.primary.withValues(alpha: 0.48),
+                              scheme.primary.withValues(alpha: 0.03),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
-        ),
+        ],
       ),
     );
   }
