@@ -113,6 +113,7 @@ class _ChatScreenState extends State<ChatScreen> {
       <String, String>{};
   static final Map<String, double> _inMemoryScrollAnchorOffsets =
       <String, double>{};
+  static const Duration _composerRecordHoldDelay = Duration(milliseconds: 520);
   static final RegExp _uuidPattern = RegExp(
     r'^[0-9a-fA-F]{8}-'
     r'[0-9a-fA-F]{4}-'
@@ -127,7 +128,9 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollController = ScrollController();
   final GlobalKey _messagesViewportKey = GlobalKey();
   final ImagePicker _imagePicker = ImagePicker();
-  final AudioRecorder _voiceRecorder = AudioRecorder();
+  AudioRecorder? _voiceRecorderInstance;
+  AudioRecorder get _voiceRecorder =>
+      _voiceRecorderInstance ??= AudioRecorder();
   final AudioPlayer _voicePlayer = AudioPlayer();
   final Connectivity _connectivity = Connectivity();
   late final ChatCaptureProfile _captureProfile;
@@ -1500,10 +1503,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
     unawaited(_voicePlayer.stop());
     unawaited(_voicePlayer.dispose());
-    if (_voiceRecording) {
-      unawaited(_voiceRecorder.stop());
+    final voiceRecorder = _voiceRecorderInstance;
+    if (_voiceRecording && voiceRecorder != null) {
+      unawaited(voiceRecorder.stop());
     }
-    unawaited(_voiceRecorder.dispose());
+    if (voiceRecorder != null) {
+      unawaited(voiceRecorder.dispose());
+    }
     if (_videoCameraController != null) {
       if (_videoCameraController!.value.isRecordingVideo) {
         unawaited(_videoCameraController!.stopVideoRecording());
@@ -6466,14 +6472,20 @@ class _ChatScreenState extends State<ChatScreen> {
           ? _ComposerMediaMode.camera
           : _ComposerMediaMode.voice;
     });
-    if (_composerMediaMode == _ComposerMediaMode.camera && !kIsWeb) {
-      unawaited(_ensureVideoCameraReady());
-    }
   }
 
   void _cancelComposerMediaHoldTimer() {
     _composerMediaHoldTimer?.cancel();
     _composerMediaHoldTimer = null;
+  }
+
+  void _handleTextSendPressed() {
+    _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
+    _composerHoldActionTriggered = false;
+    _cancelComposerMediaHoldTimer();
+    if (_anyComposerRecording || _anyRecorderStarting) return;
+    unawaited(_send());
   }
 
   Future<void> _runComposerHoldAction() async {
@@ -6527,22 +6539,11 @@ class _ChatScreenState extends State<ChatScreen> {
     required TapDownDetails details,
   }) {
     if (disabled) return;
-    if (kIsWeb &&
-        _composerMediaMode == _ComposerMediaMode.voice &&
-        _webVoiceConfigsFuture == null) {
-      // Warm up encoder support detection once to avoid a long delay on first hold.
-      unawaited(_resolveWebVoiceRecordConfigs());
-    }
-    if (_composerMediaMode == _ComposerMediaMode.camera &&
-        _videoCameraController == null &&
-        !kIsWeb) {
-      unawaited(_ensureVideoCameraReady());
-    }
     _composerMediaPressActive = true;
     _composerPressStartGlobal = details.globalPosition;
     _composerHoldActionTriggered = false;
     _cancelComposerMediaHoldTimer();
-    _composerMediaHoldTimer = Timer(const Duration(milliseconds: 160), () {
+    _composerMediaHoldTimer = Timer(_composerRecordHoldDelay, () {
       unawaited(_runComposerHoldAction());
     });
   }
@@ -13364,9 +13365,14 @@ class _ChatScreenState extends State<ChatScreen> {
                                         ),
                                       )
                                     : const Icon(Icons.send_rounded),
-                                onPressed: !canCompose || _mediaUploading
+                                onPressed:
+                                    !canCompose ||
+                                        _mediaUploading ||
+                                        _voiceSending ||
+                                        _anyComposerRecording ||
+                                        _anyRecorderStarting
                                     ? null
-                                    : _send,
+                                    : _handleTextSendPressed,
                               )
                             else
                               Builder(

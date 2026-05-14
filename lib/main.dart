@@ -101,6 +101,14 @@ String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
 String? _activePhoneAccessDialogRequestId;
 final AudioPlayer _appSoundPlayer = AudioPlayer();
+final AudioContext _appUiSoundAudioContext = AudioContext(
+  android: const AudioContextAndroid(
+    contentType: AndroidContentType.sonification,
+    usageType: AndroidUsageType.assistanceSonification,
+    audioFocus: AndroidAudioFocus.none,
+  ),
+  iOS: AudioContextIOS(category: AVAudioSessionCategory.ambient),
+);
 bool _appSoundPlayerPrepared = false;
 bool _socketInitInProgress = false;
 String? _socketBoundUserId;
@@ -1308,6 +1316,7 @@ Future<void> _prepareAppSoundPlayer() async {
   if (_appSoundPlayerPrepared) return;
   _appSoundPlayerPrepared = true;
   try {
+    await _appSoundPlayer.setAudioContext(_appUiSoundAudioContext);
     try {
       await _appSoundPlayer.setPlayerMode(PlayerMode.lowLatency);
     } catch (_) {}
