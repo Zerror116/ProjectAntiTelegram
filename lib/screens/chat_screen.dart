@@ -3506,9 +3506,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _readSyncPending = true;
       return;
     }
-    if (!_initialViewportReady && !flushOnExit) return;
-    if (_messages.isEmpty) return;
     final readWholeChat = _shouldReadWholeOpenChat();
+    if (!_initialViewportReady && !flushOnExit && !readWholeChat) return;
+    if (_messages.isEmpty) return;
     final visibleUntilMessageId = readWholeChat
         ? ''
         : ((_isNearBottom()
@@ -3958,11 +3958,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool _isDirectMessageChat() {
-    if ((widget.chatType ?? '').toLowerCase().trim() != 'private') return false;
     if (_isSupportTicketChat()) return false;
     final settings = _effectiveChatSettings();
     final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
     if (kind == 'direct_message') return true;
+    if ((widget.chatType ?? '').toLowerCase().trim() != 'private') return false;
     return kind.isEmpty;
   }
 
@@ -4232,6 +4232,9 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       if (loadedSuccessfully) {
         _applyInitialViewportAfterLoad();
+        if (_shouldReadWholeOpenChat()) {
+          _scheduleReadSync();
+        }
       } else {
         _markInitialViewportReady();
       }

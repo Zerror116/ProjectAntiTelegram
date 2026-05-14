@@ -856,19 +856,23 @@ async function canUserAccessChat(user, chatId) {
   return memberQ.rowCount > 0;
 }
 
-async function canEmitChatActivity(user, chatId) {
+async function resolveChatActivityContext(user, chatId) {
   const userId = user?.id;
   const tenantId = user?.tenant_id || null;
-  if (!userId || !chatId) return false;
+  if (!userId || !chatId) return null;
   const chatQ = await db.query(
-    `SELECT id, type, settings
-     FROM chats
-     WHERE id = $1
-       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
-     LIMIT 1`,
+    `SELECT c.id,
+            c.type,
+            c.settings,
+            c.tenant_id,
+            cm.user_id
+       FROM chats c
+       LEFT JOIN chat_members cm ON cm.chat_id = c.id
+      WHERE c.id = $1
+        AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)`,
     [chatId, tenantId],
   );
-  if (chatQ.rowCount === 0) return false;
+  if (chatQ.rowCount === 0) return null;
   const chat = chatQ.rows[0];
   const settings =
     chat.settings &&
@@ -877,10 +881,22 @@ async function canEmitChatActivity(user, chatId) {
       ? chat.settings
       : {};
   const kind = String(settings.kind || "").toLowerCase().trim();
-  if (chat.type !== "private") return false;
-  if (kind !== "direct_message") return false;
-  if (settings.saved_messages === true) return false;
-  return canUserAccessChat(user, chatId);
+  if (chat.type !== "private") return null;
+  if (kind !== "direct_message") return null;
+  if (settings.saved_messages === true) return null;
+  const allowed = await canUserAccessChat(user, chatId);
+  if (!allowed) return null;
+  const memberUserIds = [
+    ...new Set(
+      chatQ.rows
+        .map((row) => String(row.user_id || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  return {
+    tenantId: String(chat.tenant_id || tenantId || "").trim() || null,
+    memberUserIds,
+  };
 }
 
 // ===================================
@@ -1114,8 +1130,11 @@ async function canEmitChatActivity(user, chatId) {
                   : {};
               const chatId = String(map.chat_id || map.chatId || "").trim();
               if (!chatId || !uid) return;
-              const allowed = await canEmitChatActivity(socket.user, chatId);
-              if (!allowed) return;
+              const activityContext = await resolveChatActivityContext(
+                socket.user,
+                chatId,
+              );
+              if (!activityContext) return;
               const hasActive = Object.prototype.hasOwnProperty.call(map, "active");
               const active = hasActive
                 ? !(
@@ -1128,15 +1147,25 @@ async function canEmitChatActivity(user, chatId) {
               const ttlMs = Number.isFinite(requestedTtlMs)
                 ? Math.max(800, Math.min(12000, Math.round(requestedTtlMs)))
                 : 4500;
-              socket.to(`chat:${chatId}`).emit(eventName, {
+              const sentAt = new Date().toISOString();
+              const eventPayload = {
+                event_id: `${eventName}:${chatId}:${uid}:${active ? "1" : "0"}:${Date.now()}`,
                 chat_id: chatId,
                 chatId,
+                tenant_id: activityContext.tenantId,
                 user_id: uid,
                 userId: uid,
                 active,
                 ttl_ms: ttlMs,
-                sent_at: new Date().toISOString(),
-              });
+                sent_at: sentAt,
+              };
+              for (const memberUserId of activityContext.memberUserIds) {
+                if (!memberUserId || memberUserId === String(uid)) continue;
+                io.to(`user:${memberUserId}`).emit(eventName, eventPayload);
+              }
+              // Keep the chat room as a fallback for already joined screens. The
+              // shared event_id makes duplicate delivery harmless on the client.
+              socket.to(`chat:${chatId}`).emit(eventName, eventPayload);
             });
           } catch (err) {
             console.error(`Socket ${sid} ${eventName} error:`, err);
