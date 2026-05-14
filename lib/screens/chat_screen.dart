@@ -115,6 +115,9 @@ class _ChatScreenState extends State<ChatScreen> {
   static final Map<String, double> _inMemoryScrollAnchorOffsets =
       <String, double>{};
   static const Duration _composerRecordHoldDelay = Duration(milliseconds: 520);
+  static const int _typingActiveTtlMs = 10000;
+  static const Duration _typingKeepAliveInterval = Duration(milliseconds: 3200);
+  static const Duration _typingEmitThrottle = Duration(milliseconds: 2200);
   static final RegExp _uuidPattern = RegExp(
     r'^[0-9a-fA-F]{8}-'
     r'[0-9a-fA-F]{4}-'
@@ -898,22 +901,37 @@ class _ChatScreenState extends State<ChatScreen> {
     String eventName, {
     bool? active,
     int ttlMs = 4500,
+    bool httpFallback = false,
   }) async {
     if (!_isDirectMessageChat()) return;
     if (_directRequestStatus() == 'declined') return;
+    final eventId =
+        '$eventName:${widget.chatId}:${_myUserId()}:${active == false ? 0 : 1}:${DateTime.now().millisecondsSinceEpoch}';
+    final payload = <String, dynamic>{
+      'chat_id': widget.chatId,
+      'ttl_ms': ttlMs,
+      'event_id': eventId,
+    };
+    if (active != null) {
+      payload['active'] = active;
+    }
     try {
-      final eventId =
-          '$eventName:${widget.chatId}:${_myUserId()}:${active == false ? 0 : 1}:${DateTime.now().millisecondsSinceEpoch}';
-      final payload = <String, dynamic>{
-        'chat_id': widget.chatId,
-        'ttl_ms': ttlMs,
-        'event_id': eventId,
-      };
-      if (active != null) {
-        payload['active'] = active;
-      }
       socket?.emit(eventName, payload);
     } catch (_) {}
+    if (!httpFallback) return;
+    try {
+      await authService.dio.post(
+        '/api/chats/${widget.chatId}/activity',
+        data: <String, dynamic>{...payload, 'type': eventName},
+        options: Options(
+          connectTimeout: const Duration(seconds: 3),
+          sendTimeout: const Duration(seconds: 3),
+          receiveTimeout: const Duration(seconds: 4),
+        ),
+      );
+    } catch (_) {
+      // Socket is still the primary realtime path; HTTP is only a keepalive backup.
+    }
   }
 
   Future<void> _hydratePersistentOutboxMessages() async {
@@ -1403,17 +1421,24 @@ class _ChatScreenState extends State<ChatScreen> {
     _scheduleTypingKeepAlive();
     final now = DateTime.now();
     final last = _lastTypingEmitAt;
-    if (last != null && now.difference(last).inMilliseconds < 1800) {
+    if (last != null && now.difference(last) < _typingEmitThrottle) {
       return;
     }
     _lastTypingEmitAt = now;
     _localTypingActiveSent = true;
-    unawaited(_emitChatActivity('chat:typing', active: true));
+    unawaited(
+      _emitChatActivity(
+        'chat:typing',
+        active: true,
+        ttlMs: _typingActiveTtlMs,
+        httpFallback: true,
+      ),
+    );
   }
 
   void _scheduleTypingKeepAlive() {
     _localTypingIdleTimer?.cancel();
-    _localTypingIdleTimer = Timer(const Duration(milliseconds: 2600), () {
+    _localTypingIdleTimer = Timer(_typingKeepAliveInterval, () {
       if (!mounted) return;
       if (_controller.text.trim().isEmpty || !_canCompose()) {
         _maybeEmitTypingInactive();
@@ -1428,7 +1453,14 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_localTypingActiveSent) return;
     _localTypingActiveSent = false;
     _lastTypingEmitAt = null;
-    unawaited(_emitChatActivity('chat:typing', active: false));
+    unawaited(
+      _emitChatActivity(
+        'chat:typing',
+        active: false,
+        ttlMs: 1000,
+        httpFallback: true,
+      ),
+    );
   }
 
   Future<void> _loadContactCard() async {
