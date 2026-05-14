@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import '../services/sticker_print_service.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 import '../widgets/sticker_preview_card.dart';
 
 class PrinterTestScreen extends StatefulWidget {
@@ -195,6 +196,48 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
     );
   }
 
+  Widget _buildQueueStatusCard(BuildContext context) {
+    final theme = Theme.of(context);
+    final busy = _printingRegular || _printingOversize;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          children: [
+            PhoenixProgressRingIcon(
+              icon: busy
+                  ? Icons.print_rounded
+                  : Icons.check_circle_outline_rounded,
+              showSpinner: busy,
+              progress: busy ? null : 1,
+              size: 42,
+              color: busy ? theme.colorScheme.primary : const Color(0xFF19A36B),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    busy ? 'Очередь печати активна' : 'Очередь печати готова',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  PhoenixStepperStrip(
+                    steps: const ['Превью', 'Диалог', 'Печать'],
+                    activeIndex: busy ? 1 : 0,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildRegularPrintCard(BuildContext context) {
     return Card(
       child: Padding(
@@ -333,6 +376,8 @@ class _PrinterTestScreenState extends State<PrinterTestScreen> {
           padding: const EdgeInsets.all(16),
           children: [
             _buildInfoCard(context),
+            const SizedBox(height: 12),
+            _buildQueueStatusCard(context),
             const SizedBox(height: 12),
             _buildRegularPrintCard(context),
             const SizedBox(height: 12),

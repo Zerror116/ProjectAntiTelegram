@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import '../widgets/input_language_badge.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 import '../widgets/submit_on_enter.dart';
 
 class BugReportScreen extends StatefulWidget {
@@ -162,6 +163,13 @@ class _BugReportScreenState extends State<BugReportScreen> {
                   onSelected: (_) => _applyTemplate(template),
                 );
               }).toList(),
+            ),
+            const SizedBox(height: 12),
+            const PhoenixDashedDropZone(
+              icon: Icons.upload_file_outlined,
+              title: 'Скриншоты и детали',
+              subtitle:
+                  'Вставьте ссылку или описание вложения в текст ниже, чтобы администратор быстрее увидел контекст.',
             ),
             const SizedBox(height: 12),
             SubmitOnEnter(

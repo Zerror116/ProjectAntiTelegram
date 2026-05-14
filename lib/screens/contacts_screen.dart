@@ -11,6 +11,7 @@ import 'package:share_plus/share_plus.dart';
 import '../main.dart';
 import '../services/invite_referral_service.dart';
 import '../widgets/app_avatar.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 import 'chat_screen.dart';
 
 class ContactsScreen extends StatefulWidget {
@@ -121,6 +122,20 @@ class _ContactsScreenState extends State<ContactsScreen> {
       if (role.isNotEmpty) 'Роль: $role',
     ];
     return parts.join(' • ');
+  }
+
+  bool _isPresenceActive(Map<String, dynamic> peer) {
+    final rawOnline = peer['is_online'] ?? peer['online'] ?? peer['active'];
+    if (rawOnline is bool) return rawOnline;
+    final normalized = '${rawOnline ?? ''}'.toLowerCase().trim();
+    if (normalized == 'true' || normalized == '1' || normalized == 'yes') {
+      return true;
+    }
+    final lastSeenRaw = (peer['last_seen_at'] ?? peer['last_activity_at'] ?? '')
+        .toString();
+    final lastSeen = DateTime.tryParse(lastSeenRaw);
+    if (lastSeen == null) return false;
+    return DateTime.now().difference(lastSeen.toLocal()).inMinutes <= 10;
   }
 
   Future<void> _loadContacts({bool force = false}) async {
@@ -464,15 +479,19 @@ class _ContactsScreenState extends State<ContactsScreen> {
     final userId = _peerId(peer);
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      leading: AppAvatar(
-        title: title,
-        imageUrl: (peer['avatar_url'] ?? '').toString().trim().isEmpty
-            ? null
-            : (peer['avatar_url'] ?? '').toString().trim(),
-        focusX: double.tryParse('${peer['avatar_focus_x'] ?? 0}') ?? 0,
-        focusY: double.tryParse('${peer['avatar_focus_y'] ?? 0}') ?? 0,
-        zoom: double.tryParse('${peer['avatar_zoom'] ?? 1}') ?? 1,
-        radius: 20,
+      leading: PhoenixPresenceHalo(
+        active: _isPresenceActive(peer),
+        size: 46,
+        child: AppAvatar(
+          title: title,
+          imageUrl: (peer['avatar_url'] ?? '').toString().trim().isEmpty
+              ? null
+              : (peer['avatar_url'] ?? '').toString().trim(),
+          focusX: double.tryParse('${peer['avatar_focus_x'] ?? 0}') ?? 0,
+          focusY: double.tryParse('${peer['avatar_focus_y'] ?? 0}') ?? 0,
+          zoom: double.tryParse('${peer['avatar_zoom'] ?? 1}') ?? 1,
+          radius: 20,
+        ),
       ),
       title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: subtitle.isEmpty
@@ -497,15 +516,19 @@ class _ContactsScreenState extends State<ContactsScreen> {
     final inContacts = _isInContacts(peer);
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      leading: AppAvatar(
-        title: title,
-        imageUrl: (peer['avatar_url'] ?? '').toString().trim().isEmpty
-            ? null
-            : (peer['avatar_url'] ?? '').toString().trim(),
-        focusX: double.tryParse('${peer['avatar_focus_x'] ?? 0}') ?? 0,
-        focusY: double.tryParse('${peer['avatar_focus_y'] ?? 0}') ?? 0,
-        zoom: double.tryParse('${peer['avatar_zoom'] ?? 1}') ?? 1,
-        radius: 20,
+      leading: PhoenixPresenceHalo(
+        active: _isPresenceActive(peer),
+        size: 46,
+        child: AppAvatar(
+          title: title,
+          imageUrl: (peer['avatar_url'] ?? '').toString().trim().isEmpty
+              ? null
+              : (peer['avatar_url'] ?? '').toString().trim(),
+          focusX: double.tryParse('${peer['avatar_focus_x'] ?? 0}') ?? 0,
+          focusY: double.tryParse('${peer['avatar_focus_y'] ?? 0}') ?? 0,
+          zoom: double.tryParse('${peer['avatar_zoom'] ?? 1}') ?? 1,
+          radius: 20,
+        ),
       ),
       title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: Text(

@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 import '../main.dart';
 import '../widgets/input_language_badge.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 
 class CreateChatScreen extends StatefulWidget {
   const CreateChatScreen({super.key});
@@ -14,6 +15,12 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
   String _type = 'public';
   bool _loading = false;
   String _error = '';
+
+  int get _flowStep {
+    if (_titleCtrl.text.trim().isEmpty) return 0;
+    if (_loading) return 2;
+    return 1;
+  }
 
   @override
   void dispose() {
@@ -83,9 +90,16 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            PhoenixStepperStrip(
+              steps: const ['Название', 'Тип', 'Создание'],
+              activeIndex: _flowStep,
+            ),
+            const SizedBox(height: 16),
             TextField(
               controller: _titleCtrl,
+              onChanged: (_) => setState(() {}),
               decoration: withInputLanguageBadge(
                 const InputDecoration(
                   labelText: 'Название чата',
@@ -97,20 +111,75 @@ class _CreateChatScreenState extends State<CreateChatScreen> {
               onSubmitted: (_) => _create(),
             ),
             const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              key: ValueKey<String>('chat-type-$_type'),
-              initialValue: _type,
-              items: const [
-                DropdownMenuItem(value: 'public', child: Text('Публичный')),
-                DropdownMenuItem(value: 'private', child: Text('Приватный')),
-              ],
-              onChanged: (v) {
-                if (v == null) return;
-                setState(() => _type = v);
-              },
-              decoration: const InputDecoration(
-                labelText: 'Тип чата',
-                border: OutlineInputBorder(),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              child: Container(
+                key: ValueKey<String>(_type),
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: Theme.of(context).colorScheme.outlineVariant,
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Тип чата',
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        ChoiceChip(
+                          label: const Text('Публичный'),
+                          selected: _type == 'public',
+                          avatar: const Icon(Icons.tag_rounded, size: 18),
+                          onSelected: (_) => setState(() => _type = 'public'),
+                        ),
+                        ChoiceChip(
+                          label: const Text('Приватный'),
+                          selected: _type == 'private',
+                          avatar: const Icon(Icons.lock_outline, size: 18),
+                          onSelected: (_) => setState(() => _type = 'private'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Icon(
+                          _type == 'public'
+                              ? Icons.groups_outlined
+                              : Icons.person_add_alt_1_outlined,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _type == 'public'
+                                ? 'Участники увидят общий чат в списке доступных.'
+                                : 'Участников можно будет добавить точечно после создания.',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
+                                ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
             if (_error.isNotEmpty) ...[

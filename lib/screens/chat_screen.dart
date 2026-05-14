@@ -50,6 +50,7 @@ import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_ambient_background.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 import '../widgets/phoenix_visual_effects.dart';
 import '../widgets/submit_on_enter.dart';
 
@@ -209,6 +210,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _reconnectReplayTimer;
   Timer? _searchDebounceTimer;
   Timer? _remoteActivityTimer;
+  Timer? _remoteActivityPollTimer;
   Timer? _localTypingIdleTimer;
   Timer? _directMessageLiveSyncTimer;
   Timer? _persistentOutboxRetryTimer;
@@ -216,6 +218,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _readSyncInFlight = false;
   bool _readSyncPending = false;
   bool _directMessageLiveSyncInFlight = false;
+  bool _remoteActivityPollInFlight = false;
   int _bottomSettlePassesRemaining = 0;
   VoidCallback? _bottomSettleOnComplete;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
@@ -790,6 +793,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _chatTitle = nextTitle;
       }
     });
+    _startRemoteActivityPolling();
+    _startDirectMessageLiveSync();
   }
 
   void _setRemoteActivityLabel(String value, {int ttlMs = 4500}) {
@@ -870,6 +875,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _remoteTypingTimers.remove(normalized)?.cancel();
     final expiresAt = DateTime.now().add(Duration(milliseconds: ttlMs));
+    final shouldScroll = _isNearBottom();
     if (!mounted) {
       _remoteTypingExpiresAt[normalized] = expiresAt;
     } else {
@@ -878,6 +884,12 @@ class _ChatScreenState extends State<ChatScreen> {
     _remoteTypingTimers[normalized] = Timer(Duration(milliseconds: ttlMs), () {
       _clearRemoteTypingUser(normalized);
     });
+    if (shouldScroll) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _scrollToBottom(animated: true);
+      });
+    }
   }
 
   Future<void> _emitChatActivity(
@@ -1527,8 +1539,9 @@ class _ChatScreenState extends State<ChatScreen> {
     await _reconcilePersistentOutbox();
     await _loadMessages();
     unawaited(_flushPersistentOutbox());
-    _startDirectMessageLiveSync();
     await _loadContactCard();
+    _startDirectMessageLiveSync();
+    _startRemoteActivityPolling();
   }
 
   @override
@@ -1553,6 +1566,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _reconnectReplayTimer?.cancel();
     _searchDebounceTimer?.cancel();
     _remoteActivityTimer?.cancel();
+    _remoteActivityPollTimer?.cancel();
     _localTypingIdleTimer?.cancel();
     _directMessageLiveSyncTimer?.cancel();
     _persistentOutboxRetryTimer?.cancel();
@@ -2847,6 +2861,55 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  void _startRemoteActivityPolling() {
+    _remoteActivityPollTimer?.cancel();
+    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    unawaited(_pollRemoteChatActivity());
+    _remoteActivityPollTimer = Timer.periodic(
+      const Duration(milliseconds: 1200),
+      (_) => unawaited(_pollRemoteChatActivity()),
+    );
+  }
+
+  Future<void> _pollRemoteChatActivity() async {
+    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if (_remoteActivityPollInFlight || !mounted) return;
+    _remoteActivityPollInFlight = true;
+    try {
+      final resp = await authService.dio.get(
+        '/api/chats/${widget.chatId}/activity',
+        options: Options(
+          connectTimeout: const Duration(seconds: 3),
+          sendTimeout: const Duration(seconds: 3),
+          receiveTimeout: const Duration(seconds: 4),
+        ),
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true) return;
+      final raw = data['data'];
+      final activities = raw is List ? raw : const [];
+      for (final item in activities) {
+        if (item is! Map) continue;
+        final type = (item['type'] ?? '').toString().trim();
+        if (type != 'chat:typing') continue;
+        final userId = (item['user_id'] ?? item['userId'] ?? '')
+            .toString()
+            .trim();
+        if (userId.isEmpty || userId == _myUserId()) continue;
+        final ttl = _socketTtlMs(
+          item['ttl_ms'] ?? item['ttlMs'],
+          fallback: 1600,
+        );
+        _applyRemoteTypingEvent(userId, active: true, ttlMs: ttl);
+        _setRemoteActivityLabel('Печатает...', ttlMs: ttl);
+      }
+    } catch (_) {
+      // Socket remains the primary path; polling is a narrow fallback for open DMs.
+    } finally {
+      _remoteActivityPollInFlight = false;
+    }
+  }
+
   Future<void> _syncLatestDirectMessages({bool forceLatest = false}) async {
     if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
     if (_directMessageLiveSyncInFlight || _messagesLoadInFlight || _loading) {
@@ -4039,9 +4102,24 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_isSupportTicketChat()) return false;
     final settings = _effectiveChatSettings();
     final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
+    final savedMessages =
+        settings['saved_messages'] == true || kind == 'saved_messages';
+    if (savedMessages) return false;
     if (kind == 'direct_message') return true;
-    if ((widget.chatType ?? '').toLowerCase().trim() != 'private') return false;
-    return kind.isEmpty;
+    if (kind.isNotEmpty) return false;
+    final type = (widget.chatType ?? '').toLowerCase().trim();
+    if (type == 'private') return true;
+    final visibility = (settings['visibility'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    if (type.isEmpty && visibility == 'private') return true;
+    final peer = _contactCard?['peer'];
+    return peer is Map &&
+        (peer['id'] ?? peer['contact_user_id'] ?? '')
+            .toString()
+            .trim()
+            .isNotEmpty;
   }
 
   bool _canCompose() {
@@ -9498,61 +9576,145 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       await showModalBottomSheet<void>(
         context: context,
-        showDragHandle: true,
-        builder: (ctx) => SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'История правок',
-                  style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
+        backgroundColor: Colors.transparent,
+        isScrollControlled: true,
+        builder: (ctx) {
+          final sheetTheme = Theme.of(ctx);
+          return SafeArea(
+            child: PhoenixSlideFadeIn(
+              beginOffset: const Offset(0, 26),
+              duration: const Duration(milliseconds: 220),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                child: Container(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.sizeOf(ctx).height * 0.64,
+                  ),
+                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+                  decoration: BoxDecoration(
+                    color: sheetTheme.colorScheme.surface.withValues(
+                      alpha: 0.96,
+                    ),
+                    borderRadius: BorderRadius.circular(26),
+                    border: Border.all(
+                      color: sheetTheme.colorScheme.outlineVariant,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.16),
+                        blurRadius: 28,
+                        offset: const Offset(0, -8),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 42,
+                          height: 5,
+                          decoration: BoxDecoration(
+                            color: sheetTheme.colorScheme.onSurfaceVariant
+                                .withValues(alpha: 0.22),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.history_rounded,
+                            color: sheetTheme.colorScheme.primary,
+                          ),
+                          const SizedBox(width: 10),
+                          Text(
+                            'История правок',
+                            style: sheetTheme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (rows.isEmpty)
+                        const Text('История пока пуста')
+                      else
+                        Flexible(
+                          child: ListView.separated(
+                            shrinkWrap: true,
+                            itemCount: rows.length,
+                            separatorBuilder: (_, _) =>
+                                const Divider(height: 18),
+                            itemBuilder: (_, index) {
+                              final row = rows[index];
+                              final previousText = (row['previous_text'] ?? '')
+                                  .toString()
+                                  .trim();
+                              final editedByName =
+                                  (row['edited_by_name'] ?? 'Система')
+                                      .toString()
+                                      .trim();
+                              final editedAt = formatDateTimeValue(
+                                row['edited_at'],
+                              );
+                              return PhoenixSlideFadeIn(
+                                beginOffset: const Offset(0, 10),
+                                duration: Duration(
+                                  milliseconds: 180 + index * 35,
+                                ),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Container(
+                                      width: 7,
+                                      height: 7,
+                                      margin: const EdgeInsets.only(top: 7),
+                                      decoration: BoxDecoration(
+                                        color: sheetTheme.colorScheme.primary
+                                            .withValues(alpha: 0.78),
+                                        shape: BoxShape.circle,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            '$editedByName • $editedAt',
+                                            style: sheetTheme
+                                                .textTheme
+                                                .labelMedium
+                                                ?.copyWith(
+                                                  fontWeight: FontWeight.w800,
+                                                ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            previousText.isEmpty
+                                                ? 'Без текста'
+                                                : previousText,
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 12),
-                if (rows.isEmpty)
-                  const Text('История пока пуста')
-                else
-                  Flexible(
-                    child: ListView.separated(
-                      shrinkWrap: true,
-                      itemCount: rows.length,
-                      separatorBuilder: (_, _) => const Divider(height: 18),
-                      itemBuilder: (_, index) {
-                        final row = rows[index];
-                        final previousText = (row['previous_text'] ?? '')
-                            .toString()
-                            .trim();
-                        final editedByName =
-                            (row['edited_by_name'] ?? 'Система')
-                                .toString()
-                                .trim();
-                        final editedAt = formatDateTimeValue(row['edited_at']);
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '$editedByName • $editedAt',
-                              style: Theme.of(ctx).textTheme.labelMedium,
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              previousText.isEmpty
-                                  ? 'Без текста'
-                                  : previousText,
-                            ),
-                          ],
-                        );
-                      },
-                    ),
-                  ),
-              ],
+              ),
             ),
-          ),
-        ),
+          );
+        },
       );
     } catch (e) {
       if (!mounted) return;
@@ -9672,13 +9834,23 @@ class _ChatScreenState extends State<ChatScreen> {
             decoration: BoxDecoration(
               color: chipBackground,
               borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: chipForeground.withValues(alpha: 0.14)),
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 IconTheme(
                   data: IconThemeData(color: chipForeground, size: 14),
-                  child: chipChild,
+                  child: status == 'uploading'
+                      ? PhoenixProgressRingIcon(
+                          icon: Icons.cloud_upload_outlined,
+                          progress: progress,
+                          size: 18,
+                          iconSize: 10,
+                          color: chipForeground,
+                          backgroundColor: Colors.transparent,
+                        )
+                      : chipChild,
                 ),
                 const SizedBox(width: 6),
                 Text(
@@ -11087,6 +11259,16 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
                     ),
                     const SizedBox(width: 10),
+                    SizedBox(
+                      width: 74,
+                      child: PhoenixLiveWaveform(
+                        height: 22,
+                        barCount: 16,
+                        color: Colors.white,
+                        enabled: !performanceModeNotifier.value,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
                     Expanded(
                       child: ClipRect(
                         child: Transform.translate(
@@ -11975,6 +12157,38 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Widget _buildDeliveryOfferStateRail(ThemeData theme, String status) {
+    final normalized = status.trim().toLowerCase();
+    final activeIndex = normalized == 'accepted'
+        ? 2
+        : normalized == 'declined'
+        ? 1
+        : 1;
+    final steps = normalized == 'declined'
+        ? const ['Предложено', 'Отказ']
+        : const ['Предложено', 'Ожидаем', 'Подтверждено'];
+    final accent = normalized == 'accepted'
+        ? const Color(0xFF19A36B)
+        : normalized == 'declined'
+        ? theme.colorScheme.error
+        : theme.colorScheme.primary;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: accent.withValues(alpha: 0.18)),
+      ),
+      child: Theme(
+        data: theme.copyWith(
+          colorScheme: theme.colorScheme.copyWith(primary: accent),
+        ),
+        child: PhoenixStepperStrip(steps: steps, activeIndex: activeIndex),
+      ),
+    );
+  }
+
   Widget _buildMessageItem(Map<String, dynamic> message) {
     final theme = Theme.of(context);
     final reducedMotion =
@@ -12341,6 +12555,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 _replyPreviewSenderNameOf(metaMap).isNotEmpty)
               _buildReplyPreviewBubble(theme, metaMap, fromMe: fromMe),
             if (isDeliveryOffer) ...[
+              _buildDeliveryOfferStateRail(theme, offerStatus),
+              const SizedBox(height: 10),
               Text(
                 offerDeliveryLabel,
                 style: TextStyle(
@@ -12958,32 +13174,36 @@ class _ChatScreenState extends State<ChatScreen> {
                         borderRadius: BorderRadius.circular(999),
                         onTap: () =>
                             _toggleMessageReaction(messageId, entry.key),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: mine
-                                ? theme.colorScheme.secondaryContainer
-                                : theme.colorScheme.surfaceContainerLow,
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(
-                              color: mine
-                                  ? theme.colorScheme.secondary
-                                  : theme.colorScheme.outlineVariant,
+                        child: PhoenixMicroburst(
+                          enabled: mine && !reducedMotion,
+                          color: theme.colorScheme.secondary,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
                             ),
-                          ),
-                          child: Text(
-                            '${entry.key} ${entry.value}',
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: mine
-                                  ? FontWeight.w700
-                                  : FontWeight.w600,
+                            decoration: BoxDecoration(
                               color: mine
-                                  ? theme.colorScheme.onSecondaryContainer
-                                  : theme.colorScheme.onSurfaceVariant,
+                                  ? theme.colorScheme.secondaryContainer
+                                  : theme.colorScheme.surfaceContainerLow,
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: mine
+                                    ? theme.colorScheme.secondary
+                                    : theme.colorScheme.outlineVariant,
+                              ),
+                            ),
+                            child: Text(
+                              '${entry.key} ${entry.value}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: mine
+                                    ? FontWeight.w700
+                                    : FontWeight.w600,
+                                color: mine
+                                    ? theme.colorScheme.onSecondaryContainer
+                                    : theme.colorScheme.onSurfaceVariant,
+                              ),
                             ),
                           ),
                         ),
@@ -13446,73 +13666,96 @@ class _ChatScreenState extends State<ChatScreen> {
                   if ((_replyToMessageId ?? '').trim().isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
-                        decoration: BoxDecoration(
-                          color: Theme.of(
-                            context,
-                          ).colorScheme.surfaceContainerHigh,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(
-                            color: Theme.of(context).colorScheme.outlineVariant,
+                      child: PhoenixSlideFadeIn(
+                        key: ValueKey<String>(_replyToMessageId ?? ''),
+                        beginOffset: const Offset(0, 14),
+                        duration: const Duration(milliseconds: 240),
+                        child: PhoenixOneShotHighlight(
+                          borderRadius: BorderRadius.circular(16),
+                          color: Theme.of(context).colorScheme.primary,
+                          child: Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
+                            decoration: BoxDecoration(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.surfaceContainerHigh,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.outlineVariant,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 4,
+                                  height: 38,
+                                  decoration: BoxDecoration(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.primary,
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Icon(
+                                  Icons.subdirectory_arrow_right_rounded,
+                                  size: 18,
+                                  color: Theme.of(context).colorScheme.primary,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        (_replyPreviewSenderName ?? '')
+                                                .trim()
+                                                .isEmpty
+                                            ? 'Ответ'
+                                            : (_replyPreviewSenderName ?? '')
+                                                  .trim(),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.primary,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        (_replyPreviewText ?? '').trim().isEmpty
+                                            ? 'Сообщение'
+                                            : (_replyPreviewText ?? '').trim(),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'Отменить ответ',
+                                  onPressed: _clearReplyComposer,
+                                  icon: const Icon(
+                                    Icons.close_rounded,
+                                    size: 18,
+                                  ),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              ],
+                            ),
                           ),
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 4,
-                              height: 36,
-                              decoration: BoxDecoration(
-                                color: Theme.of(context).colorScheme.primary,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    (_replyPreviewSenderName ?? '')
-                                            .trim()
-                                            .isEmpty
-                                        ? 'Ответ'
-                                        : (_replyPreviewSenderName ?? '')
-                                              .trim(),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.primary,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    (_replyPreviewText ?? '').trim().isEmpty
-                                        ? 'Сообщение'
-                                        : (_replyPreviewText ?? '').trim(),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            IconButton(
-                              tooltip: 'Отменить ответ',
-                              onPressed: _clearReplyComposer,
-                              icon: const Icon(Icons.close_rounded, size: 18),
-                              visualDensity: VisualDensity.compact,
-                            ),
-                          ],
                         ),
                       ),
                     ),
@@ -13528,12 +13771,14 @@ class _ChatScreenState extends State<ChatScreen> {
                             IconButton(
                               tooltip: 'Вложение',
                               icon: _mediaUploading
-                                  ? const SizedBox(
-                                      width: 18,
-                                      height: 18,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
+                                  ? PhoenixProgressRingIcon(
+                                      icon: Icons.cloud_upload_outlined,
+                                      showSpinner: true,
+                                      size: 34,
+                                      iconSize: 16,
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.primary,
                                     )
                                   : const Icon(Icons.attach_file_rounded),
                               onPressed:
@@ -13617,155 +13862,174 @@ class _ChatScreenState extends State<ChatScreen> {
                                   ? _openComposerEmojiPicker
                                   : null,
                             ),
-                            if (_hasDraftText)
-                              IconButton(
-                                icon: _voiceSending
-                                    ? const SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                        ),
-                                      )
-                                    : const Icon(Icons.send_rounded),
-                                onPressed:
-                                    !canCompose ||
-                                        _mediaUploading ||
-                                        _voiceSending ||
-                                        _anyComposerRecording ||
-                                        _anyRecorderStarting
-                                    ? null
-                                    : _handleTextSendPressed,
-                              )
-                            else
-                              Builder(
-                                builder: (context) {
-                                  final disabled =
-                                      !canCompose ||
-                                      _mediaUploading ||
-                                      _voiceSending ||
-                                      _anyRecorderStarting;
-                                  final activeColor = Theme.of(
-                                    context,
-                                  ).colorScheme.primary;
-                                  final icon = _voiceRecording
-                                      ? Icons.stop_circle_outlined
-                                      : (_composerMediaMode ==
-                                                _ComposerMediaMode.camera
-                                            ? Icons
-                                                  .radio_button_unchecked_rounded
-                                            : Icons.mic_rounded);
-                                  final isArmed =
-                                      _anyComposerRecording ||
-                                      _anyRecorderStarting;
-                                  final buttonBaseColor = _voiceRecording
-                                      ? Theme.of(context).colorScheme.error
-                                      : _videoRecording
-                                      ? const Color(0xFF2F80FF)
-                                      : activeColor;
-                                  return GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTapDown: (details) =>
-                                        _handleComposerMediaTapDown(
-                                          disabled: disabled,
-                                          context: context,
-                                          canCompose: canCompose,
-                                          details: details,
-                                        ),
-                                    onTapUp: (_) => unawaited(
-                                      _handleComposerMediaTapUp(
-                                        disabled: disabled,
-                                        context: context,
-                                        canCompose: canCompose,
+                            PhoenixMorphSwitcher(
+                              child: _hasDraftText
+                                  ? IconButton(
+                                      key: const ValueKey<String>(
+                                        'composer-send',
                                       ),
-                                    ),
-                                    onTapCancel: _handleComposerMediaTapCancel,
-                                    onPanUpdate: _handleComposerMediaPanUpdate,
-                                    onPanEnd: (_) =>
-                                        _handleComposerMediaPanEnd(),
-                                    onPanCancel: _handleComposerMediaPanCancel,
-                                    child: TweenAnimationBuilder<double>(
-                                      duration: const Duration(
-                                        milliseconds: 180,
+                                      icon: _voiceSending
+                                          ? const SizedBox(
+                                              width: 18,
+                                              height: 18,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(Icons.send_rounded),
+                                      onPressed:
+                                          !canCompose ||
+                                              _mediaUploading ||
+                                              _voiceSending ||
+                                              _anyComposerRecording ||
+                                              _anyRecorderStarting
+                                          ? null
+                                          : _handleTextSendPressed,
+                                    )
+                                  : Builder(
+                                      key: const ValueKey<String>(
+                                        'composer-record',
                                       ),
-                                      tween: Tween<double>(
-                                        begin: 1,
-                                        end: isArmed ? 1.08 : 1.0,
-                                      ),
-                                      curve: Curves.easeOutBack,
-                                      builder: (ctx, scale, child) =>
-                                          Transform.scale(
-                                            scale: scale,
-                                            child: child,
-                                          ),
-                                      child: AnimatedContainer(
-                                        duration: const Duration(
-                                          milliseconds: 180,
-                                        ),
-                                        width: 46,
-                                        height: 46,
-                                        alignment: Alignment.center,
-                                        decoration: BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          gradient: disabled
-                                              ? null
-                                              : LinearGradient(
-                                                  begin: Alignment.topLeft,
-                                                  end: Alignment.bottomRight,
-                                                  colors: [
-                                                    buttonBaseColor.withValues(
-                                                      alpha: 0.9,
-                                                    ),
-                                                    buttonBaseColor.withValues(
-                                                      alpha: 0.72,
-                                                    ),
-                                                  ],
-                                                ),
-                                          color: disabled
-                                              ? Theme.of(context)
-                                                    .colorScheme
-                                                    .surfaceContainerHigh
-                                              : null,
-                                          boxShadow: disabled
-                                              ? null
-                                              : [
-                                                  BoxShadow(
-                                                    color: buttonBaseColor
-                                                        .withValues(
-                                                          alpha: 0.30,
-                                                        ),
-                                                    blurRadius: 14,
-                                                    offset: const Offset(0, 5),
-                                                  ),
-                                                ],
-                                        ),
-                                        child:
+                                      builder: (context) {
+                                        final disabled =
+                                            !canCompose ||
+                                            _mediaUploading ||
                                             _voiceSending ||
-                                                _anyRecorderStarting
-                                            ? const SizedBox(
-                                                width: 18,
-                                                height: 18,
-                                                child: CircularProgressIndicator(
-                                                  strokeWidth: 2.2,
-                                                  valueColor:
-                                                      AlwaysStoppedAnimation<
-                                                        Color
-                                                      >(Colors.white),
+                                            _anyRecorderStarting;
+                                        final activeColor = Theme.of(
+                                          context,
+                                        ).colorScheme.primary;
+                                        final icon = _voiceRecording
+                                            ? Icons.stop_circle_outlined
+                                            : (_composerMediaMode ==
+                                                      _ComposerMediaMode.camera
+                                                  ? Icons
+                                                        .radio_button_unchecked_rounded
+                                                  : Icons.mic_rounded);
+                                        final isArmed =
+                                            _anyComposerRecording ||
+                                            _anyRecorderStarting;
+                                        final buttonBaseColor = _voiceRecording
+                                            ? Theme.of(
+                                                context,
+                                              ).colorScheme.error
+                                            : _videoRecording
+                                            ? const Color(0xFF2F80FF)
+                                            : activeColor;
+                                        return GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          onTapDown: (details) =>
+                                              _handleComposerMediaTapDown(
+                                                disabled: disabled,
+                                                context: context,
+                                                canCompose: canCompose,
+                                                details: details,
+                                              ),
+                                          onTapUp: (_) => unawaited(
+                                            _handleComposerMediaTapUp(
+                                              disabled: disabled,
+                                              context: context,
+                                              canCompose: canCompose,
+                                            ),
+                                          ),
+                                          onTapCancel:
+                                              _handleComposerMediaTapCancel,
+                                          onPanUpdate:
+                                              _handleComposerMediaPanUpdate,
+                                          onPanEnd: (_) =>
+                                              _handleComposerMediaPanEnd(),
+                                          onPanCancel:
+                                              _handleComposerMediaPanCancel,
+                                          child: TweenAnimationBuilder<double>(
+                                            duration: const Duration(
+                                              milliseconds: 180,
+                                            ),
+                                            tween: Tween<double>(
+                                              begin: 1,
+                                              end: isArmed ? 1.08 : 1.0,
+                                            ),
+                                            curve: Curves.easeOutBack,
+                                            builder: (ctx, scale, child) =>
+                                                Transform.scale(
+                                                  scale: scale,
+                                                  child: child,
                                                 ),
-                                              )
-                                            : Icon(
-                                                icon,
+                                            child: AnimatedContainer(
+                                              duration: const Duration(
+                                                milliseconds: 180,
+                                              ),
+                                              width: 46,
+                                              height: 46,
+                                              alignment: Alignment.center,
+                                              decoration: BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                gradient: disabled
+                                                    ? null
+                                                    : LinearGradient(
+                                                        begin:
+                                                            Alignment.topLeft,
+                                                        end: Alignment
+                                                            .bottomRight,
+                                                        colors: [
+                                                          buttonBaseColor
+                                                              .withValues(
+                                                                alpha: 0.9,
+                                                              ),
+                                                          buttonBaseColor
+                                                              .withValues(
+                                                                alpha: 0.72,
+                                                              ),
+                                                        ],
+                                                      ),
                                                 color: disabled
                                                     ? Theme.of(context)
                                                           .colorScheme
-                                                          .onSurfaceVariant
-                                                    : Colors.white,
+                                                          .surfaceContainerHigh
+                                                    : null,
+                                                boxShadow: disabled
+                                                    ? null
+                                                    : [
+                                                        BoxShadow(
+                                                          color: buttonBaseColor
+                                                              .withValues(
+                                                                alpha: 0.30,
+                                                              ),
+                                                          blurRadius: 14,
+                                                          offset: const Offset(
+                                                            0,
+                                                            5,
+                                                          ),
+                                                        ),
+                                                      ],
                                               ),
-                                      ),
+                                              child:
+                                                  _voiceSending ||
+                                                      _anyRecorderStarting
+                                                  ? const SizedBox(
+                                                      width: 18,
+                                                      height: 18,
+                                                      child: CircularProgressIndicator(
+                                                        strokeWidth: 2.2,
+                                                        valueColor:
+                                                            AlwaysStoppedAnimation<
+                                                              Color
+                                                            >(Colors.white),
+                                                      ),
+                                                    )
+                                                  : Icon(
+                                                      icon,
+                                                      color: disabled
+                                                          ? Theme.of(context)
+                                                                .colorScheme
+                                                                .onSurfaceVariant
+                                                          : Colors.white,
+                                                    ),
+                                            ),
+                                          ),
+                                        );
+                                      },
                                     ),
-                                  );
-                                },
-                              ),
+                            ),
                           ],
                         ),
                       ),

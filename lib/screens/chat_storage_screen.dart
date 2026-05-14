@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../services/chat_outbox_service.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 
 class ChatStorageScreen extends StatefulWidget {
   const ChatStorageScreen({
@@ -55,7 +56,11 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
         if (item.status == 'error' || item.status == 'failed_permanent') {
           failedCount += 1;
         }
-        chatWeights.update(item.chatId, (value) => value + 1, ifAbsent: () => 1);
+        chatWeights.update(
+          item.chatId,
+          (value) => value + 1,
+          ifAbsent: () => 1,
+        );
       }
       final heaviestChats = chatWeights.entries.toList()
         ..sort((a, b) => b.value.compareTo(a.value));
@@ -86,7 +91,9 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
       value /= 1024;
       unit += 1;
     }
-    final normalized = unit == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(1);
+    final normalized = unit == 0
+        ? value.toStringAsFixed(0)
+        : value.toStringAsFixed(1);
     return '$normalized ${units[unit]}';
   }
 
@@ -101,7 +108,11 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
     }
   }
 
-  Widget _valueTile({required IconData icon, required String label, required String value}) {
+  Widget _valueTile({
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
     final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.all(14),
@@ -126,7 +137,9 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
                 const SizedBox(height: 4),
                 Text(
                   value,
-                  style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ],
             ),
@@ -136,7 +149,12 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
     );
   }
 
-  Widget _actionTile({required IconData icon, required String title, required String subtitle, required VoidCallback? onTap}) {
+  Widget _actionTile({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback? onTap,
+  }) {
     final theme = Theme.of(context);
     return Container(
       margin: const EdgeInsets.only(top: 10),
@@ -150,6 +168,93 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
         subtitle: Text(subtitle),
         trailing: const Icon(Icons.chevron_right_rounded),
         onTap: onTap,
+      ),
+    );
+  }
+
+  Widget _cleanupMeter() {
+    final theme = Theme.of(context);
+    final queueLoad = (_stats.outboxDraftCount / 24).clamp(0.0, 1.0);
+    final errorLoad = (_stats.failedUploadsCount / 8).clamp(0.0, 1.0);
+    final cacheLoad = (_stats.imageCacheBytes / (96 * 1024 * 1024)).clamp(
+      0.0,
+      1.0,
+    );
+    Widget row(String label, double value, Color color) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                Text(
+                  '${(value * 100).round()}%',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: TweenAnimationBuilder<double>(
+                tween: Tween<double>(begin: 0, end: value),
+                duration: const Duration(milliseconds: 520),
+                curve: Curves.easeOutCubic,
+                builder: (context, current, _) {
+                  return LinearProgressIndicator(
+                    value: current,
+                    minHeight: 8,
+                    backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                    valueColor: AlwaysStoppedAnimation<Color>(color),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          PhoenixProgressRingIcon(
+            icon: Icons.cleaning_services_outlined,
+            progress: (queueLoad + errorLoad + cacheLoad) / 3,
+            size: 44,
+            color: theme.colorScheme.primary,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              children: [
+                row('Outbox', queueLoad, theme.colorScheme.primary),
+                row('Ошибки', errorLoad, theme.colorScheme.error),
+                row('Кэш медиа', cacheLoad, theme.colorScheme.tertiary),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -175,7 +280,9 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
               children: [
                 Text(
                   'Локальные медиа и очередь сообщений',
-                  style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
                 const SizedBox(height: 6),
                 Text(
@@ -185,10 +292,12 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
+                _cleanupMeter(),
                 _valueTile(
                   icon: Icons.schedule_send_outlined,
                   label: 'Черновики outbox',
-                  value: '${_stats.outboxDraftCount} • ${_formatBytes(_stats.outboxDraftBytes)}',
+                  value:
+                      '${_stats.outboxDraftCount} • ${_formatBytes(_stats.outboxDraftBytes)}',
                 ),
                 const SizedBox(height: 10),
                 _valueTile(
@@ -200,13 +309,16 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
                 _valueTile(
                   icon: Icons.image_outlined,
                   label: 'Кэш изображений',
-                  value: '${_formatBytes(_stats.imageCacheBytes)} • активных ${_stats.liveImageCount}',
+                  value:
+                      '${_formatBytes(_stats.imageCacheBytes)} • активных ${_stats.liveImageCount}',
                 ),
                 if (_stats.heaviestChats.isNotEmpty) ...[
                   const SizedBox(height: 18),
                   Text(
                     'Самые тяжёлые чаты',
-                    style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   ..._stats.heaviestChats.map(
@@ -223,26 +335,38 @@ class _ChatStorageScreenState extends State<ChatStorageScreen> {
                 _actionTile(
                   icon: Icons.cleaning_services_outlined,
                   title: 'Очистить кэш изображений',
-                  subtitle: 'Сбросить локальный image cache и освободить память.',
-                  onTap: _busy ? null : () => _runAction(widget.onClearVisualCache),
+                  subtitle:
+                      'Сбросить локальный image cache и освободить память.',
+                  onTap: _busy
+                      ? null
+                      : () => _runAction(widget.onClearVisualCache),
                 ),
                 _actionTile(
                   icon: Icons.delete_sweep_outlined,
                   title: 'Удалить failed uploads',
-                  subtitle: 'Очистить безнадёжно сломанные и неотправленные элементы очереди.',
-                  onTap: _busy ? null : () => _runAction(chatOutboxService.clearFailed),
+                  subtitle:
+                      'Очистить безнадёжно сломанные и неотправленные элементы очереди.',
+                  onTap: _busy
+                      ? null
+                      : () => _runAction(chatOutboxService.clearFailed),
                 ),
                 _actionTile(
                   icon: Icons.layers_clear_outlined,
                   title: 'Очистить весь outbox',
-                  subtitle: 'Удалить все локальные черновики и очередь медиа на этом устройстве.',
-                  onTap: _busy ? null : () => _runAction(chatOutboxService.clearAll),
+                  subtitle:
+                      'Удалить все локальные черновики и очередь медиа на этом устройстве.',
+                  onTap: _busy
+                      ? null
+                      : () => _runAction(chatOutboxService.clearAll),
                 ),
                 _actionTile(
                   icon: Icons.phonelink_erase_outlined,
                   title: 'Очистить сохранённые входы',
-                  subtitle: 'Удалить локально сохранённые группы и входы с устройства.',
-                  onTap: _busy ? null : () => _runAction(widget.onClearSavedSessions),
+                  subtitle:
+                      'Удалить локально сохранённые группы и входы с устройства.',
+                  onTap: _busy
+                      ? null
+                      : () => _runAction(widget.onClearSavedSessions),
                 ),
               ],
             ),

@@ -13,6 +13,7 @@ import '../src/utils/notification_navigation.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/app_skeleton.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 import 'notification_preferences_screen.dart';
 import 'pwa_guide_screen.dart';
 
@@ -702,6 +703,46 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
     );
   }
 
+  Widget _buildTriageSweepBanner() {
+    if (!_markAllBusy) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.primaryContainer.withValues(alpha: 0.46),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: theme.colorScheme.primary.withValues(alpha: 0.22),
+          ),
+        ),
+        child: Row(
+          children: [
+            PhoenixProgressRingIcon(
+              icon: Icons.done_all_rounded,
+              showSpinner: true,
+              size: 34,
+              iconSize: 16,
+              color: theme.colorScheme.primary,
+              backgroundColor: theme.colorScheme.surface,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Аккуратно отмечаем уведомления прочитанными',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_isCreatorBase) {
@@ -870,6 +911,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                               ],
                             ),
                             const SizedBox(height: 10),
+                            _buildTriageSweepBanner(),
                             _buildCategoryFilterBar(),
                           ],
                         ),

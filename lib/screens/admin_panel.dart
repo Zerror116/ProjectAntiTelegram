@@ -75,11 +75,13 @@ class _AdminTabSpec {
   const _AdminTabSpec({
     required this.id,
     required this.label,
+    required this.icon,
     required this.builder,
   });
 
   final String id;
   final String label;
+  final IconData icon;
   final Widget Function() builder;
 }
 
@@ -512,42 +514,49 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         _AdminTabSpec(
           id: 'client_carts',
           label: 'Корзины',
+          icon: Icons.shopping_cart_outlined,
           builder: _buildClientCartsTab,
         ),
       if (_canViewModerationTab())
         _AdminTabSpec(
           id: 'moderation',
           label: 'Модерация',
+          icon: Icons.fact_check_outlined,
           builder: _buildModerationTab,
         ),
       if (_canViewCreateTab())
         _AdminTabSpec(
           id: 'create',
           label: 'Создание',
+          icon: Icons.add_box_outlined,
           builder: _buildCreateTab,
         ),
       if (_canViewChannelsTab())
         _AdminTabSpec(
           id: 'channels',
           label: 'Каналы',
+          icon: Icons.campaign_outlined,
           builder: _buildSettingsTab,
         ),
       if (_canViewPromotionsTab())
         _AdminTabSpec(
           id: 'promotions',
           label: 'Промо',
+          icon: Icons.local_offer_outlined,
           builder: _buildPromotionsTab,
         ),
       if (_canViewDeliveryTab())
         _AdminTabSpec(
           id: 'delivery',
           label: 'Доставка',
+          icon: Icons.local_shipping_outlined,
           builder: _buildDeliveryTab,
         ),
       if (_canViewSupportTab())
         _AdminTabSpec(
           id: 'support',
           label: 'Поддержка',
+          icon: Icons.support_agent_outlined,
           builder: _buildSupportTab,
         ),
     ];
@@ -556,6 +565,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       _AdminTabSpec(
         id: 'no_access',
         label: 'Доступ',
+        icon: Icons.lock_outline,
         builder: _buildNoAccessTab,
       ),
     ];
@@ -11842,7 +11852,20 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       _rebuildVisibleTabs(force: true, notify: false);
     }
     final controller = _tabController;
-    final tabs = _visibleTabs.map((tab) => Tab(text: tab.label)).toList();
+    final tabs = _visibleTabs
+        .map(
+          (tab) => Tab(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(tab.icon, size: 18),
+                const SizedBox(width: 6),
+                Text(tab.label),
+              ],
+            ),
+          ),
+        )
+        .toList();
     final tabViews = _visibleTabs.map((tab) => tab.builder()).toList();
     if (controller == null || tabs.isEmpty || tabViews.isEmpty) {
       return Scaffold(
@@ -11858,6 +11881,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           controller: controller,
           tabs: tabs,
           isScrollable: compact,
+          tabAlignment: compact ? TabAlignment.start : null,
+          labelPadding: EdgeInsets.symmetric(horizontal: compact ? 10 : 14),
+          indicatorSize: TabBarIndicatorSize.tab,
         ),
       ),
       body: SafeArea(

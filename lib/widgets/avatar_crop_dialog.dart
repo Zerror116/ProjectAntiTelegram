@@ -4,6 +4,7 @@ import 'package:crop_your_image/crop_your_image.dart';
 import 'package:flutter/material.dart';
 
 import 'phoenix_crop_core.dart';
+import 'phoenix_micro_interactions.dart';
 
 class AvatarCropResult {
   const AvatarCropResult({
@@ -149,11 +150,24 @@ class _AvatarCropDialogState extends State<_AvatarCropDialog> {
                         ),
                       ),
                       const SizedBox(height: 10),
-                      PhoenixAvatarLivePreview(
-                        imageBytes: widget.prepared.bytes,
-                        cropRect: _cropRect,
-                        imageRect: _imageRect,
-                        size: 92,
+                      PhoenixLiftOnHover(
+                        child: PhoenixAvatarLivePreview(
+                          imageBytes: widget.prepared.bytes,
+                          cropRect: _cropRect,
+                          imageRect: _imageRect,
+                          size: 92,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        alignment: WrapAlignment.center,
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          _focusPreviewChip(theme, '48'),
+                          _focusPreviewChip(theme, '32'),
+                          _focusPreviewChip(theme, '24'),
+                        ],
                       ),
                     ],
                   ),
@@ -191,6 +205,24 @@ class _AvatarCropDialogState extends State<_AvatarCropDialog> {
               : const Text('Готово'),
         ),
       ],
+    );
+  }
+
+  Widget _focusPreviewChip(ThemeData theme, String sizeLabel) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Text(
+        '$sizeLabel px',
+        style: theme.textTheme.labelSmall?.copyWith(
+          fontWeight: FontWeight.w800,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
     );
   }
 }

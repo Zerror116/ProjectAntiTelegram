@@ -106,6 +106,7 @@ const CHAT_UPLOAD_SESSION_TTL_HOURS = Math.max(
 const ATTACHMENT_QUALITY_MODES = new Set(["standard", "hd", "file"]);
 const ATTACHMENT_TYPES = new Set(["image", "voice", "video", "file"]);
 const ATTACHMENT_PROCESSING_STATES = new Set(["processing", "ready", "failed"]);
+const chatActivityState = new Map();
 const CHAT_STATE_UUID_FIELDS = new Set([
   "last_read_message_id",
   "last_seen_message_id",
@@ -443,6 +444,87 @@ function isDirectChatActivityContext(context) {
     return false;
   }
   return kind === "direct_message" || kind === "";
+}
+
+function pruneChatActivityState(chatId = null) {
+  const now = Date.now();
+  const chatIds = chatId ? [chatId] : Array.from(chatActivityState.keys());
+  for (const currentChatId of chatIds) {
+    const entries = chatActivityState.get(currentChatId);
+    if (!entries) continue;
+    for (const [key, activity] of entries.entries()) {
+      if (!activity || Number(activity.expiresAtMs || 0) <= now) {
+        entries.delete(key);
+      }
+    }
+    if (entries.size === 0) {
+      chatActivityState.delete(currentChatId);
+    }
+  }
+}
+
+function rememberChatActivity({
+  chatId,
+  userId,
+  eventName,
+  active,
+  ttlMs,
+  tenantId,
+  eventId,
+  sentAt,
+}) {
+  const normalizedChatId = String(chatId || "").trim();
+  const normalizedUserId = String(userId || "").trim();
+  const normalizedEventName = normalizeChatActivityEvent(eventName);
+  if (!normalizedChatId || !normalizedUserId || !normalizedEventName) return;
+  pruneChatActivityState(normalizedChatId);
+  const entries = chatActivityState.get(normalizedChatId) || new Map();
+  const key = `${normalizedEventName}:${normalizedUserId}`;
+  if (!active) {
+    entries.delete(key);
+  } else {
+    const safeTtlMs = parseChatActivityTtlMs(ttlMs);
+    const now = Date.now();
+    entries.set(key, {
+      eventName: normalizedEventName,
+      userId: normalizedUserId,
+      tenantId: tenantId || null,
+      eventId: eventId || null,
+      sentAt: sentAt || new Date(now).toISOString(),
+      ttlMs: safeTtlMs,
+      expiresAtMs: now + safeTtlMs,
+    });
+  }
+  if (entries.size > 0) {
+    chatActivityState.set(normalizedChatId, entries);
+  } else {
+    chatActivityState.delete(normalizedChatId);
+  }
+}
+
+function activeChatActivities(chatId, { excludeUserId = "" } = {}) {
+  const normalizedChatId = String(chatId || "").trim();
+  if (!normalizedChatId) return [];
+  pruneChatActivityState(normalizedChatId);
+  const entries = chatActivityState.get(normalizedChatId);
+  if (!entries) return [];
+  const excluded = String(excludeUserId || "").trim();
+  const now = Date.now();
+  return Array.from(entries.values())
+    .filter((activity) => {
+      const userId = String(activity.userId || "").trim();
+      return userId && userId !== excluded && activity.expiresAtMs > now;
+    })
+    .map((activity) => ({
+      type: activity.eventName,
+      user_id: activity.userId,
+      userId: activity.userId,
+      tenant_id: activity.tenantId || null,
+      event_id: activity.eventId || null,
+      sent_at: activity.sentAt || null,
+      ttl_ms: Math.max(800, activity.expiresAtMs - now),
+      expires_at: new Date(activity.expiresAtMs).toISOString(),
+    }));
 }
 
 function normalizeRole(role) {
@@ -3815,6 +3897,17 @@ router.post("/:chatId/activity", requireAuth, async (req, res) => {
       source: "http_activity_fallback",
     };
 
+    rememberChatActivity({
+      chatId,
+      userId,
+      eventName,
+      active,
+      ttlMs,
+      tenantId: tenantId || null,
+      eventId,
+      sentAt,
+    });
+
     const memberQ = await db.query(
       `SELECT user_id
        FROM chat_members
@@ -3844,6 +3937,42 @@ router.post("/:chatId/activity", requireAuth, async (req, res) => {
       ok: false,
       error: "Server error",
       error_code: "chat_activity_failed",
+    });
+  }
+});
+
+router.get("/:chatId/activity", requireAuth, async (req, res) => {
+  try {
+    const userId = String(req.user.id || "").trim();
+    const role = req.user.role;
+    const { chatId } = req.params;
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+    if (!isDirectChatActivityContext(context)) {
+      return res.json({ ok: true, data: [] });
+    }
+
+    const activities = activeChatActivities(chatId, { excludeUserId: userId });
+    return res.json({
+      ok: true,
+      data: activities,
+      typing_user_ids: activities
+        .filter((activity) => activity.type === "chat:typing")
+        .map((activity) => activity.user_id),
+    });
+  } catch (err) {
+    console.error("chats.activity.get error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+      error_code: "chat_activity_load_failed",
     });
   }
 });

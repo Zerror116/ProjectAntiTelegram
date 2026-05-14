@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../widgets/phoenix_micro_interactions.dart';
+
 class PwaGuideScreen extends StatelessWidget {
   const PwaGuideScreen({super.key});
 
@@ -12,6 +14,11 @@ class PwaGuideScreen extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            const PhoenixStepperStrip(
+              steps: ['Safari', 'Поделиться', 'Домой'],
+              activeIndex: 2,
+            ),
+            const SizedBox(height: 14),
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(14),
@@ -25,9 +32,24 @@ class PwaGuideScreen extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 10),
-                    const Text('1. Откройте ссылку приложения в Safari.'),
-                    const Text('2. Нажмите Поделиться → На экран «Домой».'),
-                    const Text('3. Подтвердите добавление ярлыка.'),
+                    _installStep(
+                      context,
+                      1,
+                      Icons.public_rounded,
+                      'Откройте ссылку приложения в Safari.',
+                    ),
+                    _installStep(
+                      context,
+                      2,
+                      Icons.ios_share_rounded,
+                      'Нажмите Поделиться → На экран «Домой».',
+                    ),
+                    _installStep(
+                      context,
+                      3,
+                      Icons.add_to_home_screen_outlined,
+                      'Подтвердите добавление ярлыка.',
+                    ),
                     const SizedBox(height: 10),
                     const Text(
                       'После этого приложение открывается как отдельный экран без браузерных вкладок.',
@@ -89,6 +111,39 @@ class PwaGuideScreen extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _installStep(
+    BuildContext context,
+    int index,
+    IconData icon,
+    String text,
+  ) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          PhoenixProgressRingIcon(
+            icon: icon,
+            progress: 1,
+            size: 34,
+            iconSize: 16,
+            color: theme.colorScheme.primary,
+            backgroundColor: theme.colorScheme.surfaceContainerLow,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              '$index. $text',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

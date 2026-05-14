@@ -103,10 +103,7 @@ class _DeliveryAddressPickerDialogState
   }
 
   Future<void> _loadInitialData() async {
-    await Future.wait<void>([
-      _loadSavedAddresses(),
-      _loadZones(),
-    ]);
+    await Future.wait<void>([_loadSavedAddresses(), _loadZones()]);
     if (_addressCtrl.text.trim().length >= 3) {
       await _loadSuggestions(_addressCtrl.text.trim(), immediate: true);
     }
@@ -238,10 +235,7 @@ class _DeliveryAddressPickerDialogState
     try {
       final resp = await authService.dio.post(
         '/api/delivery/address/reverse',
-        data: {
-          'lat': _selectedLat,
-          'lng': _selectedLng,
-        },
+        data: {'lat': _selectedLat, 'lng': _selectedLng},
       );
       final data = resp.data;
       final payload = data is Map && data['ok'] == true && data['data'] is Map
@@ -292,10 +286,7 @@ class _DeliveryAddressPickerDialogState
       }
       _selectedLat = lat ?? _selectedLat;
       _selectedLng = lng ?? _selectedLng;
-      _selectedProviderData = {
-        ...?_selectedProviderData,
-        ...data,
-      };
+      _selectedProviderData = {...?_selectedProviderData, ...data};
       _suggestions = <Map<String, dynamic>>[];
       _validationMessage = '';
       _confirmSelection = false;
@@ -311,7 +302,8 @@ class _DeliveryAddressPickerDialogState
     final addressText = _addressCtrl.text.trim();
     if (addressText.isEmpty && (_selectedLat == null || _selectedLng == null)) {
       setState(() {
-        _validationMessage = 'Выбери адрес из подсказок или отметь точку на карте.';
+        _validationMessage =
+            'Выбери адрес из подсказок или отметь точку на карте.';
       });
       return;
     }
@@ -412,25 +404,28 @@ class _DeliveryAddressPickerDialogState
   }
 
   List<CircleMarker> _buildZoneCircles() {
-    return _zones.map((zone) {
-      final center = zone['center'] is Map
-          ? Map<String, dynamic>.from(zone['center'])
-          : <String, dynamic>{};
-      final lat = center['lat'];
-      final lng = center['lng'];
-      final radius = zone['radius_meters'];
-      if (lat is! num || lng is! num || radius is! num) {
-        return null;
-      }
-      return CircleMarker(
-        point: LatLng(lat.toDouble(), lng.toDouble()),
-        radius: radius.toDouble(),
-        useRadiusInMeter: true,
-        color: Colors.green.withValues(alpha: 0.12),
-        borderColor: Colors.green.withValues(alpha: 0.55),
-        borderStrokeWidth: 2,
-      );
-    }).whereType<CircleMarker>().toList();
+    return _zones
+        .map((zone) {
+          final center = zone['center'] is Map
+              ? Map<String, dynamic>.from(zone['center'])
+              : <String, dynamic>{};
+          final lat = center['lat'];
+          final lng = center['lng'];
+          final radius = zone['radius_meters'];
+          if (lat is! num || lng is! num || radius is! num) {
+            return null;
+          }
+          return CircleMarker(
+            point: LatLng(lat.toDouble(), lng.toDouble()),
+            radius: radius.toDouble(),
+            useRadiusInMeter: true,
+            color: Colors.green.withValues(alpha: 0.12),
+            borderColor: Colors.green.withValues(alpha: 0.55),
+            borderStrokeWidth: 2,
+          );
+        })
+        .whereType<CircleMarker>()
+        .toList();
   }
 
   Widget _buildSavedAddresses() {
@@ -460,7 +455,9 @@ class _DeliveryAddressPickerDialogState
           label: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 220),
             child: Text(
-              entrance.isNotEmpty ? '$title: $entrance' : (subtitle.isNotEmpty ? subtitle : title),
+              entrance.isNotEmpty
+                  ? '$title: $entrance'
+                  : (subtitle.isNotEmpty ? subtitle : title),
               overflow: TextOverflow.ellipsis,
             ),
           ),
@@ -495,11 +492,12 @@ class _DeliveryAddressPickerDialogState
           final label = (item['label'] ?? item['address_text'] ?? 'Адрес')
               .toString()
               .trim();
-          final street = (item['address_structured'] is Map
-                  ? Map<String, dynamic>.from(item['address_structured'])
-                  : <String, dynamic>{})['street']
-              ?.toString()
-              .trim();
+          final street =
+              (item['address_structured'] is Map
+                      ? Map<String, dynamic>.from(item['address_structured'])
+                      : <String, dynamic>{})['street']
+                  ?.toString()
+                  .trim();
           return ListTile(
             dense: true,
             leading: const Icon(Icons.location_searching_outlined),
@@ -515,10 +513,9 @@ class _DeliveryAddressPickerDialogState
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final selectedPoint =
-        _selectedLat != null && _selectedLng != null
-            ? LatLng(_selectedLat!, _selectedLng!)
-            : null;
+    final selectedPoint = _selectedLat != null && _selectedLng != null
+        ? LatLng(_selectedLat!, _selectedLng!)
+        : null;
     final markers = <Marker>[
       if (selectedPoint != null)
         Marker(
@@ -531,10 +528,7 @@ class _DeliveryAddressPickerDialogState
               shape: BoxShape.circle,
               border: Border.all(color: Colors.white, width: 3),
               boxShadow: const [
-                BoxShadow(
-                  blurRadius: 16,
-                  color: Colors.black26,
-                ),
+                BoxShadow(blurRadius: 16, color: Colors.black26),
               ],
             ),
             child: const Icon(Icons.place, color: Colors.white),
@@ -543,6 +537,17 @@ class _DeliveryAddressPickerDialogState
     ];
 
     final circles = _buildZoneCircles();
+    final routeTrace = selectedPoint == null
+        ? const <Polyline>[]
+        : <Polyline>[
+            Polyline(
+              points: [_currentCenter(), selectedPoint],
+              strokeWidth: 4,
+              color: theme.colorScheme.primary.withValues(alpha: 0.56),
+              borderStrokeWidth: 8,
+              borderColor: theme.colorScheme.surface.withValues(alpha: 0.72),
+            ),
+          ];
 
     return AlertDialog(
       title: Text(widget.title),
@@ -626,6 +631,8 @@ class _DeliveryAddressPickerDialogState
                       ],
                     ),
                     if (circles.isNotEmpty) CircleLayer(circles: circles),
+                    if (routeTrace.isNotEmpty)
+                      PolylineLayer(polylines: routeTrace),
                     MarkerLayer(markers: markers),
                   ],
                 ),

@@ -14,6 +14,7 @@ import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/avatar_crop_dialog.dart';
 import '../widgets/input_language_badge.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
 import 'creator_keys_screen.dart';
@@ -1257,8 +1258,28 @@ class _ProfileScreenState extends State<ProfileScreen> {
     return <String, dynamic>{};
   }
 
+  ({double value, String suffix, int decimals})? _countUpSpec(String raw) {
+    final normalized = raw.trim().replaceAll(',', '.');
+    final match = RegExp(r'^(-?\d+(?:\.\d+)?)\s*(.*)$').firstMatch(normalized);
+    if (match == null) return null;
+    final number = double.tryParse(match.group(1) ?? '');
+    if (number == null) return null;
+    final suffix = (match.group(2) ?? '').trim();
+    if (suffix.isNotEmpty && suffix != '₽') return null;
+    final decimals = normalized.contains('.') ? 2 : 0;
+    return (
+      value: number,
+      suffix: suffix.isEmpty ? '' : ' $suffix',
+      decimals: decimals,
+    );
+  }
+
   Widget _statsMetricRow(String label, String value) {
     final theme = Theme.of(context);
+    final countUp = _countUpSpec(value);
+    final valueStyle = theme.textTheme.titleSmall?.copyWith(
+      fontWeight: FontWeight.w800,
+    );
     return Row(
       children: [
         Expanded(
@@ -1276,14 +1297,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
             child: FittedBox(
               fit: BoxFit.scaleDown,
               alignment: Alignment.centerRight,
-              child: Text(
-                value,
-                maxLines: 1,
-                textAlign: TextAlign.right,
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
+              child: countUp == null
+                  ? Text(
+                      value,
+                      maxLines: 1,
+                      textAlign: TextAlign.right,
+                      style: valueStyle,
+                    )
+                  : PhoenixCountUpText(
+                      value: countUp.value,
+                      textAlign: TextAlign.right,
+                      style: valueStyle,
+                      format: (current) =>
+                          '${current.toStringAsFixed(countUp.decimals)}${countUp.suffix}',
+                    ),
             ),
           ),
         ),

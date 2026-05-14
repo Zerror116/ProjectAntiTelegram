@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import '../widgets/phoenix_micro_interactions.dart';
 
 class PhoneAccessPendingScreen extends StatefulWidget {
   const PhoneAccessPendingScreen({super.key});
@@ -110,6 +111,11 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
         : waiting
         ? 'Ожидание разрешения'
         : 'Проверка доступа';
+    final timelineIndex = rejected
+        ? 2
+        : waiting
+        ? 1
+        : 0;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Подтверждение номера')),
@@ -130,6 +136,11 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
                       style: theme.textTheme.titleLarge?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),
+                    ),
+                    const SizedBox(height: 14),
+                    PhoenixStepperStrip(
+                      steps: const ['Запрос', 'Ожидание', 'Решение'],
+                      activeIndex: timelineIndex,
                     ),
                     const SizedBox(height: 12),
                     Text(_message),
