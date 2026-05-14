@@ -401,6 +401,50 @@ function normalizeSettings(raw) {
   return raw;
 }
 
+function normalizeChatActivityEvent(raw) {
+  const value = String(raw || "chat:typing")
+    .trim()
+    .toLowerCase();
+  return value === "chat:typing" ||
+    value === "chat:recording_voice" ||
+    value === "chat:recording_video"
+    ? value
+    : "";
+}
+
+function parseChatActivityActive(raw) {
+  if (raw === false) return false;
+  const value = String(raw ?? "true")
+    .trim()
+    .toLowerCase();
+  return !(value === "false" || value === "0" || value === "no");
+}
+
+function parseChatActivityTtlMs(raw, fallback = 4500) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(800, Math.min(12000, Math.round(value)));
+}
+
+function isDirectChatActivityContext(context) {
+  if (!context || context.chat?.type !== "private") return false;
+  const settings = normalizeSettings(context.settings);
+  const kind = String(settings.kind || "")
+    .trim()
+    .toLowerCase();
+  if (settings.saved_messages === true || kind === "saved_messages") {
+    return false;
+  }
+  if (
+    kind === "support_ticket" ||
+    kind === "reserved_orders" ||
+    kind === "bug_reports"
+  ) {
+    return false;
+  }
+  return kind === "direct_message" || kind === "";
+}
+
 function normalizeRole(role) {
   const normalized = String(role || "client")
     .toLowerCase()
@@ -3718,6 +3762,88 @@ router.patch("/:chatId/state", requireAuth, async (req, res) => {
       ok: false,
       error: "Server error",
       error_code: "chat_state_patch_failed",
+    });
+  }
+});
+
+router.post("/:chatId/activity", requireAuth, async (req, res) => {
+  try {
+    const userId = String(req.user.id || "").trim();
+    const role = req.user.role;
+    const { chatId } = req.params;
+    const eventName = normalizeChatActivityEvent(
+      req.body?.type || req.body?.event || "chat:typing",
+    );
+    if (!eventName) {
+      return res.status(400).json({
+        ok: false,
+        error: "Некорректный тип активности",
+        error_code: "invalid_chat_activity_type",
+      });
+    }
+
+    const context = await getChatAccessContext(chatId, userId, req.user.tenant_id);
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
+    if (!isDirectChatActivityContext(context)) {
+      return res.json({ ok: true, delivered: false, reason: "not_direct_chat" });
+    }
+
+    const active = parseChatActivityActive(req.body?.active);
+    const ttlMs = parseChatActivityTtlMs(req.body?.ttl_ms ?? req.body?.ttlMs);
+    const sentAt = new Date().toISOString();
+    const eventId =
+      String(req.body?.event_id || req.body?.eventId || "").trim() ||
+      `${eventName}:${chatId}:${userId}:${active ? "1" : "0"}:${Date.now()}`;
+    const tenantId = String(context.chat.tenant_id || req.user.tenant_id || "")
+      .trim();
+    const payload = {
+      event_id: eventId,
+      chat_id: chatId,
+      chatId,
+      tenant_id: tenantId || null,
+      user_id: userId,
+      userId,
+      active,
+      ttl_ms: ttlMs,
+      sent_at: sentAt,
+      source: "http_activity_fallback",
+    };
+
+    const memberQ = await db.query(
+      `SELECT user_id
+       FROM chat_members
+       WHERE chat_id = $1`,
+      [chatId],
+    );
+    const io = req.app.get("io");
+    let delivered = 0;
+    if (io) {
+      const emittedUserIds = new Set();
+      for (const row of memberQ.rows) {
+        const memberUserId = String(row.user_id || "").trim();
+        if (!memberUserId || memberUserId === userId || emittedUserIds.has(memberUserId)) {
+          continue;
+        }
+        emittedUserIds.add(memberUserId);
+        emitToUser(io, memberUserId, eventName, payload);
+        delivered += 1;
+      }
+      io.to(`chat:${chatId}`).emit(eventName, payload);
+    }
+
+    return res.json({ ok: true, delivered });
+  } catch (err) {
+    console.error("chats.activity.post error", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+      error_code: "chat_activity_failed",
     });
   }
 });

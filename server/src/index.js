@@ -1152,7 +1152,9 @@ async function resolveChatActivityContext(user, chatId) {
                 : 4500;
               const sentAt = new Date().toISOString();
               const eventPayload = {
-                event_id: `${eventName}:${chatId}:${uid}:${active ? "1" : "0"}:${Date.now()}`,
+                event_id:
+                  String(map.event_id || map.eventId || "").trim() ||
+                  `${eventName}:${chatId}:${uid}:${active ? "1" : "0"}:${Date.now()}`,
                 chat_id: chatId,
                 chatId,
                 tenant_id: activityContext.tenantId,

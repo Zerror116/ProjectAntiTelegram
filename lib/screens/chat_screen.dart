@@ -279,16 +279,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   static const List<String> _quickReactions = <String>[
     '👍',
-    '🎉',
-    '❤️',
-    '👎',
     '🔥',
-    '🥰',
-    '👏',
+    '✅',
+    '❤️',
     '😂',
-    '😎',
+    '🙏',
+    '🎉',
     '🤝',
-    '😢',
   ];
   static const List<String> _composerEmojiPalette = <String>[
     '🙂',
@@ -315,6 +312,18 @@ class _ChatScreenState extends State<ChatScreen> {
     '🤝',
     '👀',
     '⭐',
+    '📦',
+    '🚚',
+    '📍',
+    '🧾',
+    '💬',
+    '📞',
+    '💸',
+    '📈',
+    '🔒',
+    '⚠️',
+    '⏳',
+    '🛠️',
   ];
   static const Map<String, List<String>> _reactionEmojiCategories =
       <String, List<String>>{
@@ -879,15 +888,38 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_isDirectMessageChat()) return;
     if (_directRequestStatus() == 'declined') return;
     try {
+      final eventId =
+          '$eventName:${widget.chatId}:${_myUserId()}:${active == false ? 0 : 1}:${DateTime.now().millisecondsSinceEpoch}';
       final payload = <String, dynamic>{
         'chat_id': widget.chatId,
         'ttl_ms': ttlMs,
+        'event_id': eventId,
       };
       if (active != null) {
         payload['active'] = active;
       }
       socket?.emit(eventName, payload);
+      unawaited(_postChatActivityFallback(eventName, payload));
     } catch (_) {}
+  }
+
+  Future<void> _postChatActivityFallback(
+    String eventName,
+    Map<String, dynamic> payload,
+  ) async {
+    try {
+      await authService.dio.post(
+        '/api/chats/${widget.chatId}/activity',
+        data: {'type': eventName, ...payload},
+        options: Options(
+          connectTimeout: const Duration(seconds: 3),
+          sendTimeout: const Duration(seconds: 3),
+          receiveTimeout: const Duration(seconds: 4),
+        ),
+      );
+    } catch (_) {
+      // Socket remains the primary path; activity fallback is best-effort.
+    }
   }
 
   Future<void> _hydratePersistentOutboxMessages() async {
@@ -5821,6 +5853,73 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  List<MapEntry<String, List<String>>> _composerEmojiCategories() {
+    return <MapEntry<String, List<String>>>[
+      if (_recentComposerEmojis.isNotEmpty)
+        MapEntry<String, List<String>>(
+          'Недавние',
+          List<String>.from(_recentComposerEmojis),
+        ),
+      MapEntry<String, List<String>>('Частые', _composerPickerEmojis()),
+      ..._reactionEmojiCategories.entries,
+    ];
+  }
+
+  String _emojiCategoryLabel(String label) {
+    switch (label) {
+      case 'Недавние':
+        return '⏱';
+      case 'Частые':
+        return '🙂';
+      case 'Лица':
+        return '😀';
+      case 'Жесты':
+        return '👍';
+      case 'Сердца':
+        return '❤️';
+      case 'Работа':
+        return '📦';
+      case 'Праздник':
+        return '🎉';
+      default:
+        return label;
+    }
+  }
+
+  Widget _emojiPickerTile(
+    BuildContext context,
+    String emoji, {
+    required VoidCallback onTap,
+    bool selected = false,
+    double fontSize = 27,
+  }) {
+    final theme = Theme.of(context);
+    return Material(
+      color: selected
+          ? theme.colorScheme.primaryContainer.withValues(alpha: 0.82)
+          : theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.58),
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: selected
+                  ? theme.colorScheme.primary.withValues(alpha: 0.58)
+                  : Colors.transparent,
+            ),
+          ),
+          child: Center(
+            child: Text(emoji, style: TextStyle(fontSize: fontSize)),
+          ),
+        ),
+      ),
+    );
+  }
+
   void _insertComposerEmoji(String emoji) {
     final value = _controller.value;
     final normalized = emoji.trim();
@@ -5845,90 +5944,148 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _openComposerEmojiPicker() async {
     if (!_canCompose() || _voiceRecording) return;
+    final categories = _composerEmojiCategories()
+        .where((entry) => entry.value.isNotEmpty)
+        .toList(growable: false);
+    if (categories.isEmpty) return;
     final selected = await showModalBottomSheet<String>(
       context: context,
-      showDragHandle: true,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
       builder: (ctx) {
         final theme = Theme.of(ctx);
-        final options = _composerPickerEmojis();
-        final recent = _recentComposerEmojis;
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Эмодзи',
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
+        final height = min(MediaQuery.sizeOf(ctx).height * 0.58, 430.0);
+        return DefaultTabController(
+          length: categories.length,
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: EdgeInsets.only(
+                left: 10,
+                right: 10,
+                bottom: 10 + MediaQuery.viewInsetsOf(ctx).bottom,
+              ),
+              child: Container(
+                height: height,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface.withValues(alpha: 0.98),
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(28),
+                    bottom: Radius.circular(18),
                   ),
-                ),
-                if (recent.isNotEmpty) ...[
-                  const SizedBox(height: 10),
-                  Text(
-                    'Недавние',
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.18),
+                      blurRadius: 28,
+                      offset: const Offset(0, -8),
                     ),
-                  ),
-                  const SizedBox(height: 6),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: recent
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    const SizedBox(height: 8),
+                    Container(
+                      width: 44,
+                      height: 5,
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.onSurfaceVariant.withValues(
+                          alpha: 0.22,
+                        ),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 6),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'Эмодзи',
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            'Unicode',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    TabBar(
+                      isScrollable: true,
+                      tabAlignment: TabAlignment.start,
+                      dividerHeight: 0,
+                      labelPadding: const EdgeInsets.symmetric(horizontal: 5),
+                      indicator: BoxDecoration(
+                        color: theme.colorScheme.primaryContainer.withValues(
+                          alpha: 0.62,
+                        ),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      tabs: categories
                           .map(
-                            (emoji) => Padding(
-                              padding: const EdgeInsets.only(right: 6),
-                              child: InkWell(
-                                borderRadius: BorderRadius.circular(999),
-                                onTap: () => Navigator.of(ctx).pop(emoji),
-                                child: Ink(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 8,
-                                  ),
-                                  child: Text(
-                                    emoji,
-                                    style: const TextStyle(fontSize: 26),
-                                  ),
+                            (entry) => Tab(
+                              height: 38,
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                ),
+                                child: Text(
+                                  _emojiCategoryLabel(entry.key),
+                                  style: const TextStyle(fontSize: 18),
                                 ),
                               ),
                             ),
                           )
-                          .toList(),
+                          .toList(growable: false),
                     ),
-                  ),
-                ],
-                const SizedBox(height: 10),
-                Flexible(
-                  child: GridView.builder(
-                    shrinkWrap: true,
-                    itemCount: options.length,
-                    gridDelegate:
-                        const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 7,
-                          mainAxisSpacing: 6,
-                          crossAxisSpacing: 6,
-                          childAspectRatio: 1,
-                        ),
-                    itemBuilder: (context, index) {
-                      final emoji = options[index];
-                      return InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: () => Navigator.of(ctx).pop(emoji),
-                        child: Center(
-                          child: Text(
-                            emoji,
-                            style: const TextStyle(fontSize: 24),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: TabBarView(
+                        children: categories
+                            .map((entry) {
+                              final emojis = entry.value;
+                              return GridView.builder(
+                                padding: const EdgeInsets.fromLTRB(
+                                  14,
+                                  2,
+                                  14,
+                                  14,
+                                ),
+                                itemCount: emojis.length,
+                                gridDelegate:
+                                    const SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: 7,
+                                      mainAxisSpacing: 8,
+                                      crossAxisSpacing: 8,
+                                      childAspectRatio: 1,
+                                    ),
+                                itemBuilder: (context, index) {
+                                  final emoji = emojis[index];
+                                  final selected =
+                                      _recentComposerEmojis.isNotEmpty &&
+                                      _recentComposerEmojis.first == emoji;
+                                  return _emojiPickerTile(
+                                    context,
+                                    emoji,
+                                    selected: selected,
+                                    onTap: () => Navigator.of(ctx).pop(emoji),
+                                  );
+                                },
+                              );
+                            })
+                            .toList(growable: false),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
         );
@@ -10051,9 +10208,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
     Widget buildActionPanel(BuildContext ctx, {required bool desktop}) {
       final theme = Theme.of(ctx);
+      final maxPanelHeight =
+          MediaQuery.sizeOf(ctx).height * (desktop ? 0.82 : 0.72);
+      final maxActionListHeight = math.max(
+        96.0,
+        maxPanelHeight - (reactionChoices.isNotEmpty ? 118.0 : 34.0),
+      );
       final topBarColor = theme.brightness == Brightness.dark
-          ? const Color(0xFF1A2638).withValues(alpha: 0.82)
-          : theme.colorScheme.primaryContainer.withValues(alpha: 0.86);
+          ? const Color(0xFF172235).withValues(alpha: 0.92)
+          : theme.colorScheme.primaryContainer.withValues(alpha: 0.74);
       final surfaceColor = theme.colorScheme.surface.withValues(alpha: 0.84);
 
       Widget glass({required Widget child, EdgeInsetsGeometry? padding}) {
@@ -10113,6 +10276,77 @@ class _ChatScreenState extends State<ChatScreen> {
                   alpha: 0.22,
                 ),
                 borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
+        );
+      }
+
+      Widget reactionOption(String emoji, {required bool mine}) {
+        final selectedColor = theme.colorScheme.primary.withValues(alpha: 0.18);
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3),
+          child: TweenAnimationBuilder<double>(
+            tween: Tween<double>(begin: 0, end: mine ? 1 : 0),
+            duration: const Duration(milliseconds: 210),
+            curve: Curves.easeOutBack,
+            builder: (context, value, child) {
+              return Transform.scale(scale: 1 + value * 0.08, child: child);
+            },
+            child: InkWell(
+              borderRadius: BorderRadius.circular(999),
+              onTap: () => Navigator.of(ctx).pop('react:$emoji'),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 160),
+                width: 42,
+                height: 42,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: mine ? selectedColor : Colors.transparent,
+                  border: Border.all(
+                    color: mine
+                        ? theme.colorScheme.primary.withValues(alpha: 0.42)
+                        : Colors.transparent,
+                  ),
+                  boxShadow: mine
+                      ? [
+                          BoxShadow(
+                            color: theme.colorScheme.primary.withValues(
+                              alpha: 0.16,
+                            ),
+                            blurRadius: 16,
+                            spreadRadius: 3,
+                          ),
+                        ]
+                      : null,
+                ),
+                child: Text(emoji, style: const TextStyle(fontSize: 28)),
+              ),
+            ),
+          ),
+        );
+      }
+
+      Widget moreReactionOption() {
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: () => Navigator.of(ctx).pop('react:more'),
+            child: Container(
+              width: 42,
+              height: 42,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: theme.colorScheme.surface.withValues(alpha: 0.86),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              ),
+              child: Icon(
+                Icons.add_reaction_outlined,
+                size: 23,
+                color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
           ),
@@ -10185,98 +10419,73 @@ class _ChatScreenState extends State<ChatScreen> {
       return ConstrainedBox(
         constraints: BoxConstraints(
           maxWidth: desktop ? 460 : double.infinity,
-          maxHeight: MediaQuery.sizeOf(ctx).height * (desktop ? 0.82 : 0.72),
+          maxHeight: maxPanelHeight,
         ),
         child: Column(
-          mainAxisSize: hasMenuItems ? MainAxisSize.max : MainAxisSize.min,
+          mainAxisSize: MainAxisSize.min,
           children: [
             sheetHandle(),
-            if (reactionChoices.isNotEmpty)
-              glass(
-                child: Container(
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    color: topBarColor,
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    child: Row(
-                      children:
-                          reactionChoices.map((emoji) {
-                            final mine =
-                                currentUserId.isNotEmpty &&
-                                reactionByUser[currentUserId] == emoji;
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 3,
-                              ),
-                              child: InkWell(
-                                borderRadius: BorderRadius.circular(999),
-                                onTap: () =>
-                                    Navigator.of(ctx).pop('react:$emoji'),
-                                child: Ink(
-                                  padding: const EdgeInsets.all(7),
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: mine
-                                        ? theme.colorScheme.primary.withValues(
-                                            alpha: 0.22,
-                                          )
-                                        : Colors.transparent,
-                                  ),
-                                  child: Text(
-                                    emoji,
-                                    style: const TextStyle(fontSize: 30),
-                                  ),
-                                ),
-                              ),
-                            );
-                          }).toList()..add(
-                            Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 3,
-                              ),
-                              child: InkWell(
-                                borderRadius: BorderRadius.circular(999),
-                                onTap: () =>
-                                    Navigator.of(ctx).pop('react:more'),
-                                child: Ink(
-                                  padding: const EdgeInsets.all(7),
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: theme.colorScheme.surface,
-                                  ),
-                                  child: Icon(
-                                    Icons.add_reaction_outlined,
-                                    size: 24,
-                                    color: theme.colorScheme.onSurfaceVariant,
-                                  ),
-                                ),
+            glass(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (reactionChoices.isNotEmpty)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(8, 7, 8, 8),
+                      decoration: BoxDecoration(
+                        color: topBarColor,
+                        borderRadius: BorderRadius.only(
+                          topLeft: const Radius.circular(24),
+                          topRight: const Radius.circular(24),
+                          bottomLeft: Radius.circular(hasMenuItems ? 18 : 24),
+                          bottomRight: Radius.circular(hasMenuItems ? 18 : 24),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.only(left: 6, bottom: 5),
+                            child: Text(
+                              'Реакция',
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w800,
                               ),
                             ),
                           ),
+                          SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              children: [
+                                ...reactionChoices.map((emoji) {
+                                  final mine =
+                                      currentUserId.isNotEmpty &&
+                                      reactionByUser[currentUserId] == emoji;
+                                  return reactionOption(emoji, mine: mine);
+                                }),
+                                moreReactionOption(),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                ),
-              ),
-            if (hasMenuItems) ...[
-              if (reactionChoices.isNotEmpty) const SizedBox(height: 8),
-              Flexible(
-                child: glass(
-                  child: SingleChildScrollView(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: actionWidgets,
+                  if (hasMenuItems)
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: maxActionListHeight,
+                      ),
+                      child: ListView(
+                        padding: EdgeInsets.zero,
+                        shrinkWrap: true,
+                        children: actionWidgets,
+                      ),
                     ),
-                  ),
-                ),
+                ],
               ),
-            ],
+            ),
           ],
         ),
       );
@@ -13341,6 +13550,9 @@ class _ChatScreenState extends State<ChatScreen> {
                                 margin: const EdgeInsets.symmetric(
                                   horizontal: 4,
                                 ),
+                                constraints: const BoxConstraints(
+                                  minHeight: 44,
+                                ),
                                 padding: const EdgeInsets.symmetric(
                                   horizontal: 10,
                                 ),
@@ -13379,7 +13591,18 @@ class _ChatScreenState extends State<ChatScreen> {
                                             ? 'Сообщение...'
                                             : 'Отправка сообщений недоступна',
                                         border: InputBorder.none,
+                                        enabledBorder: InputBorder.none,
+                                        focusedBorder: InputBorder.none,
+                                        disabledBorder: InputBorder.none,
+                                        errorBorder: InputBorder.none,
+                                        focusedErrorBorder: InputBorder.none,
+                                        filled: false,
+                                        fillColor: Colors.transparent,
                                         isDense: true,
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                              vertical: 10,
+                                            ),
                                       ),
                                       controller: _controller,
                                     ),
