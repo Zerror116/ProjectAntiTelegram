@@ -161,6 +161,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
   bool _persistentOutboxFlushInFlight = false;
+  bool _persistentOutboxFlushPending = false;
+  bool _persistentOutboxPendingIncludeErrored = false;
   bool _showScrollToBottomButton = false;
   bool _initialViewportApplied = false;
   bool _initialViewportReady = false;
@@ -209,6 +211,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _remoteActivityTimer;
   Timer? _localTypingIdleTimer;
   Timer? _directMessageLiveSyncTimer;
+  Timer? _persistentOutboxRetryTimer;
   bool _readFlushOnExitInFlight = false;
   bool _readSyncInFlight = false;
   bool _readSyncPending = false;
@@ -1138,7 +1141,12 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _flushPersistentOutbox({bool includeErrored = false}) async {
-    if (_persistentOutboxFlushInFlight) return;
+    if (_persistentOutboxFlushInFlight) {
+      _persistentOutboxFlushPending = true;
+      _persistentOutboxPendingIncludeErrored =
+          _persistentOutboxPendingIncludeErrored || includeErrored;
+      return;
+    }
     _persistentOutboxFlushInFlight = true;
     try {
       final currentUserId = _myUserId();
@@ -1312,6 +1320,9 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           );
+          if (isRetryable) {
+            _schedulePersistentOutboxRetry(retryCount: retryCount);
+          }
         }
         if (mounted) {
           setState(() {
@@ -1325,7 +1336,35 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } finally {
       _persistentOutboxFlushInFlight = false;
+      if (_persistentOutboxFlushPending) {
+        final rerunIncludeErrored = _persistentOutboxPendingIncludeErrored;
+        _persistentOutboxFlushPending = false;
+        _persistentOutboxPendingIncludeErrored = false;
+        Future<void>.microtask(() {
+          if (!mounted) return;
+          unawaited(
+            _flushPersistentOutbox(includeErrored: rerunIncludeErrored),
+          );
+        });
+      }
     }
+  }
+
+  void _schedulePersistentOutboxRetry({int retryCount = 0}) {
+    if (!mounted) return;
+    final safeRetryCount = retryCount.clamp(0, 5).toInt();
+    final delayMs = switch (safeRetryCount) {
+      <= 1 => 900,
+      2 => 1800,
+      3 => 3200,
+      4 => 5200,
+      _ => 8000,
+    };
+    _persistentOutboxRetryTimer?.cancel();
+    _persistentOutboxRetryTimer = Timer(Duration(milliseconds: delayMs), () {
+      if (!mounted) return;
+      unawaited(_flushPersistentOutbox());
+    });
   }
 
   void _maybeEmitTypingActivity() {
@@ -1484,6 +1523,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _remoteActivityTimer?.cancel();
     _localTypingIdleTimer?.cancel();
     _directMessageLiveSyncTimer?.cancel();
+    _persistentOutboxRetryTimer?.cancel();
     _draftRestoredHintTimer?.cancel();
     _scrollRestoredHintTimer?.cancel();
     _searchHitHighlightTimer?.cancel();

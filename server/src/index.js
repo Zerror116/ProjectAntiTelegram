@@ -882,8 +882,11 @@ async function resolveChatActivityContext(user, chatId) {
       : {};
   const kind = String(settings.kind || "").toLowerCase().trim();
   if (chat.type !== "private") return null;
-  if (kind !== "direct_message") return null;
   if (settings.saved_messages === true) return null;
+  // Legacy direct chats were created before settings.kind was consistently set.
+  // Treat empty kind as a regular private DM, but keep all explicit non-DM
+  // private service chats (support/reserved/etc.) out of typing/activity relay.
+  if (kind && kind !== "direct_message") return null;
   const allowed = await canUserAccessChat(user, chatId);
   if (!allowed) return null;
   const memberUserIds = [
