@@ -43,6 +43,7 @@ const {
   sha256File,
 } = require("../utils/chatMediaPipeline");
 const { uploadsRoot, uploadsPath } = require("../utils/storagePaths");
+const chatActivityStateService = require("../services/chatActivityState");
 
 const chatImageUploadsDir = uploadsPath("chat_media", "images");
 const chatVoiceUploadsDir = uploadsPath("chat_media", "voice");
@@ -3897,7 +3898,7 @@ router.post("/:chatId/activity", requireAuth, async (req, res) => {
       source: "http_activity_fallback",
     };
 
-    rememberChatActivity({
+    chatActivityStateService.rememberChatActivity({
       chatId,
       userId,
       eventName,
@@ -3959,7 +3960,9 @@ router.get("/:chatId/activity", requireAuth, async (req, res) => {
       return res.json({ ok: true, data: [] });
     }
 
-    const activities = activeChatActivities(chatId, { excludeUserId: userId });
+    const activities = chatActivityStateService.activeChatActivities(chatId, {
+      excludeUserId: userId,
+    });
     return res.json({
       ok: true,
       data: activities,

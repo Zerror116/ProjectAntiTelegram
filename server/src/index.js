@@ -78,6 +78,7 @@ const {
 } = require("./utils/messageEncryptionBackfill");
 const { logMonitoringEvent } = require("./utils/monitoring");
 const realtimeDiagnostics = require("./utils/realtimeDiagnostics");
+const chatActivityStateService = require("./services/chatActivityState");
 const { tenantRoom } = require("./utils/socket");
 const {
   rewriteSignedUploadsInPayload,
@@ -1164,6 +1165,16 @@ async function resolveChatActivityContext(user, chatId) {
                 ttl_ms: ttlMs,
                 sent_at: sentAt,
               };
+              chatActivityStateService.rememberChatActivity({
+                chatId,
+                userId: uid,
+                eventName,
+                active,
+                ttlMs,
+                tenantId: activityContext.tenantId,
+                eventId: eventPayload.event_id,
+                sentAt,
+              });
               for (const memberUserId of activityContext.memberUserIds) {
                 if (!memberUserId || memberUserId === String(uid)) continue;
                 io.to(`user:${memberUserId}`).emit(eventName, eventPayload);

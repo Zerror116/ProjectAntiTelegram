@@ -491,8 +491,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _hasDraftText = _controller.text.trim().isNotEmpty;
     _controller.addListener(() {
       final nextHasDraft = _controller.text.trim().isNotEmpty;
-      if (nextHasDraft != _hasDraftText && mounted) {
-        setState(() => _hasDraftText = nextHasDraft);
+      if (nextHasDraft != _hasDraftText) {
+        _hasDraftText = nextHasDraft;
       }
       if (!_applyingServerDraft) {
         if (nextHasDraft) {
@@ -911,27 +911,7 @@ class _ChatScreenState extends State<ChatScreen> {
         payload['active'] = active;
       }
       socket?.emit(eventName, payload);
-      unawaited(_postChatActivityFallback(eventName, payload));
     } catch (_) {}
-  }
-
-  Future<void> _postChatActivityFallback(
-    String eventName,
-    Map<String, dynamic> payload,
-  ) async {
-    try {
-      await authService.dio.post(
-        '/api/chats/${widget.chatId}/activity',
-        data: {'type': eventName, ...payload},
-        options: Options(
-          connectTimeout: const Duration(seconds: 3),
-          sendTimeout: const Duration(seconds: 3),
-          receiveTimeout: const Duration(seconds: 4),
-        ),
-      );
-    } catch (_) {
-      // Socket remains the primary path; activity fallback is best-effort.
-    }
   }
 
   Future<void> _hydratePersistentOutboxMessages() async {
@@ -13862,173 +13842,187 @@ class _ChatScreenState extends State<ChatScreen> {
                                   ? _openComposerEmojiPicker
                                   : null,
                             ),
-                            PhoenixMorphSwitcher(
-                              child: _hasDraftText
-                                  ? IconButton(
-                                      key: const ValueKey<String>(
-                                        'composer-send',
-                                      ),
-                                      icon: _voiceSending
-                                          ? const SizedBox(
-                                              width: 18,
-                                              height: 18,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                              ),
-                                            )
-                                          : const Icon(Icons.send_rounded),
-                                      onPressed:
-                                          !canCompose ||
-                                              _mediaUploading ||
-                                              _voiceSending ||
-                                              _anyComposerRecording ||
-                                              _anyRecorderStarting
-                                          ? null
-                                          : _handleTextSendPressed,
-                                    )
-                                  : Builder(
-                                      key: const ValueKey<String>(
-                                        'composer-record',
-                                      ),
-                                      builder: (context) {
-                                        final disabled =
-                                            !canCompose ||
-                                            _mediaUploading ||
-                                            _voiceSending ||
-                                            _anyRecorderStarting;
-                                        final activeColor = Theme.of(
-                                          context,
-                                        ).colorScheme.primary;
-                                        final icon = _voiceRecording
-                                            ? Icons.stop_circle_outlined
-                                            : (_composerMediaMode ==
-                                                      _ComposerMediaMode.camera
-                                                  ? Icons
-                                                        .radio_button_unchecked_rounded
-                                                  : Icons.mic_rounded);
-                                        final isArmed =
-                                            _anyComposerRecording ||
-                                            _anyRecorderStarting;
-                                        final buttonBaseColor = _voiceRecording
-                                            ? Theme.of(
-                                                context,
-                                              ).colorScheme.error
-                                            : _videoRecording
-                                            ? const Color(0xFF2F80FF)
-                                            : activeColor;
-                                        return GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTapDown: (details) =>
-                                              _handleComposerMediaTapDown(
-                                                disabled: disabled,
-                                                context: context,
-                                                canCompose: canCompose,
-                                                details: details,
-                                              ),
-                                          onTapUp: (_) => unawaited(
-                                            _handleComposerMediaTapUp(
-                                              disabled: disabled,
-                                              context: context,
-                                              canCompose: canCompose,
-                                            ),
+                            ValueListenableBuilder<TextEditingValue>(
+                              valueListenable: _controller,
+                              builder: (context, value, _) {
+                                final hasDraftText = value.text
+                                    .trim()
+                                    .isNotEmpty;
+                                return PhoenixMorphSwitcher(
+                                  child: hasDraftText
+                                      ? IconButton(
+                                          key: const ValueKey<String>(
+                                            'composer-send',
                                           ),
-                                          onTapCancel:
-                                              _handleComposerMediaTapCancel,
-                                          onPanUpdate:
-                                              _handleComposerMediaPanUpdate,
-                                          onPanEnd: (_) =>
-                                              _handleComposerMediaPanEnd(),
-                                          onPanCancel:
-                                              _handleComposerMediaPanCancel,
-                                          child: TweenAnimationBuilder<double>(
-                                            duration: const Duration(
-                                              milliseconds: 180,
-                                            ),
-                                            tween: Tween<double>(
-                                              begin: 1,
-                                              end: isArmed ? 1.08 : 1.0,
-                                            ),
-                                            curve: Curves.easeOutBack,
-                                            builder: (ctx, scale, child) =>
-                                                Transform.scale(
-                                                  scale: scale,
-                                                  child: child,
-                                                ),
-                                            child: AnimatedContainer(
-                                              duration: const Duration(
-                                                milliseconds: 180,
-                                              ),
-                                              width: 46,
-                                              height: 46,
-                                              alignment: Alignment.center,
-                                              decoration: BoxDecoration(
-                                                shape: BoxShape.circle,
-                                                gradient: disabled
-                                                    ? null
-                                                    : LinearGradient(
-                                                        begin:
-                                                            Alignment.topLeft,
-                                                        end: Alignment
-                                                            .bottomRight,
-                                                        colors: [
-                                                          buttonBaseColor
-                                                              .withValues(
-                                                                alpha: 0.9,
-                                                              ),
-                                                          buttonBaseColor
-                                                              .withValues(
-                                                                alpha: 0.72,
-                                                              ),
-                                                        ],
+                                          icon: _voiceSending
+                                              ? const SizedBox(
+                                                  width: 18,
+                                                  height: 18,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2,
                                                       ),
-                                                color: disabled
-                                                    ? Theme.of(context)
-                                                          .colorScheme
-                                                          .surfaceContainerHigh
-                                                    : null,
-                                                boxShadow: disabled
-                                                    ? null
-                                                    : [
-                                                        BoxShadow(
-                                                          color: buttonBaseColor
-                                                              .withValues(
-                                                                alpha: 0.30,
-                                                              ),
-                                                          blurRadius: 14,
-                                                          offset: const Offset(
-                                                            0,
-                                                            5,
-                                                          ),
-                                                        ),
-                                                      ],
-                                              ),
-                                              child:
+                                                )
+                                              : const Icon(Icons.send_rounded),
+                                          onPressed:
+                                              !canCompose ||
+                                                  _mediaUploading ||
                                                   _voiceSending ||
-                                                      _anyRecorderStarting
-                                                  ? const SizedBox(
-                                                      width: 18,
-                                                      height: 18,
-                                                      child: CircularProgressIndicator(
-                                                        strokeWidth: 2.2,
-                                                        valueColor:
-                                                            AlwaysStoppedAnimation<
-                                                              Color
-                                                            >(Colors.white),
-                                                      ),
-                                                    )
-                                                  : Icon(
-                                                      icon,
-                                                      color: disabled
-                                                          ? Theme.of(context)
-                                                                .colorScheme
-                                                                .onSurfaceVariant
-                                                          : Colors.white,
-                                                    ),
-                                            ),
+                                                  _anyComposerRecording ||
+                                                  _anyRecorderStarting
+                                              ? null
+                                              : _handleTextSendPressed,
+                                        )
+                                      : Builder(
+                                          key: const ValueKey<String>(
+                                            'composer-record',
                                           ),
-                                        );
-                                      },
-                                    ),
+                                          builder: (context) {
+                                            final disabled =
+                                                !canCompose ||
+                                                _mediaUploading ||
+                                                _voiceSending ||
+                                                _anyRecorderStarting;
+                                            final activeColor = Theme.of(
+                                              context,
+                                            ).colorScheme.primary;
+                                            final icon = _voiceRecording
+                                                ? Icons.stop_circle_outlined
+                                                : (_composerMediaMode ==
+                                                          _ComposerMediaMode
+                                                              .camera
+                                                      ? Icons
+                                                            .radio_button_unchecked_rounded
+                                                      : Icons.mic_rounded);
+                                            final isArmed =
+                                                _anyComposerRecording ||
+                                                _anyRecorderStarting;
+                                            final buttonBaseColor =
+                                                _voiceRecording
+                                                ? Theme.of(
+                                                    context,
+                                                  ).colorScheme.error
+                                                : _videoRecording
+                                                ? const Color(0xFF2F80FF)
+                                                : activeColor;
+                                            return GestureDetector(
+                                              behavior: HitTestBehavior.opaque,
+                                              onTapDown: (details) =>
+                                                  _handleComposerMediaTapDown(
+                                                    disabled: disabled,
+                                                    context: context,
+                                                    canCompose: canCompose,
+                                                    details: details,
+                                                  ),
+                                              onTapUp: (_) => unawaited(
+                                                _handleComposerMediaTapUp(
+                                                  disabled: disabled,
+                                                  context: context,
+                                                  canCompose: canCompose,
+                                                ),
+                                              ),
+                                              onTapCancel:
+                                                  _handleComposerMediaTapCancel,
+                                              onPanUpdate:
+                                                  _handleComposerMediaPanUpdate,
+                                              onPanEnd: (_) =>
+                                                  _handleComposerMediaPanEnd(),
+                                              onPanCancel:
+                                                  _handleComposerMediaPanCancel,
+                                              child: TweenAnimationBuilder<double>(
+                                                duration: const Duration(
+                                                  milliseconds: 180,
+                                                ),
+                                                tween: Tween<double>(
+                                                  begin: 1,
+                                                  end: isArmed ? 1.08 : 1.0,
+                                                ),
+                                                curve: Curves.easeOutBack,
+                                                builder: (ctx, scale, child) =>
+                                                    Transform.scale(
+                                                      scale: scale,
+                                                      child: child,
+                                                    ),
+                                                child: AnimatedContainer(
+                                                  duration: const Duration(
+                                                    milliseconds: 180,
+                                                  ),
+                                                  width: 46,
+                                                  height: 46,
+                                                  alignment: Alignment.center,
+                                                  decoration: BoxDecoration(
+                                                    shape: BoxShape.circle,
+                                                    gradient: disabled
+                                                        ? null
+                                                        : LinearGradient(
+                                                            begin: Alignment
+                                                                .topLeft,
+                                                            end: Alignment
+                                                                .bottomRight,
+                                                            colors: [
+                                                              buttonBaseColor
+                                                                  .withValues(
+                                                                    alpha: 0.9,
+                                                                  ),
+                                                              buttonBaseColor
+                                                                  .withValues(
+                                                                    alpha: 0.72,
+                                                                  ),
+                                                            ],
+                                                          ),
+                                                    color: disabled
+                                                        ? Theme.of(context)
+                                                              .colorScheme
+                                                              .surfaceContainerHigh
+                                                        : null,
+                                                    boxShadow: disabled
+                                                        ? null
+                                                        : [
+                                                            BoxShadow(
+                                                              color: buttonBaseColor
+                                                                  .withValues(
+                                                                    alpha: 0.30,
+                                                                  ),
+                                                              blurRadius: 14,
+                                                              offset:
+                                                                  const Offset(
+                                                                    0,
+                                                                    5,
+                                                                  ),
+                                                            ),
+                                                          ],
+                                                  ),
+                                                  child:
+                                                      _voiceSending ||
+                                                          _anyRecorderStarting
+                                                      ? const SizedBox(
+                                                          width: 18,
+                                                          height: 18,
+                                                          child: CircularProgressIndicator(
+                                                            strokeWidth: 2.2,
+                                                            valueColor:
+                                                                AlwaysStoppedAnimation<
+                                                                  Color
+                                                                >(Colors.white),
+                                                          ),
+                                                        )
+                                                      : Icon(
+                                                          icon,
+                                                          color: disabled
+                                                              ? Theme.of(
+                                                                      context,
+                                                                    )
+                                                                    .colorScheme
+                                                                    .onSurfaceVariant
+                                                              : Colors.white,
+                                                        ),
+                                                ),
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                );
+                              },
                             ),
                           ],
                         ),
