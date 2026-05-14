@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'adaptive_network_image.dart';
+import 'phoenix_visual_effects.dart';
 
 class ChatMediaViewerEntry {
   const ChatMediaViewerEntry({
@@ -30,14 +31,18 @@ Future<void> showChatMediaViewer(
       opaque: false,
       barrierColor: Colors.black.withValues(alpha: 0.94),
       pageBuilder: (context, animation, secondaryAnimation) =>
-          _ChatMediaViewerScreen(
-        entries: entries,
-        initialIndex: safeIndex,
-      ),
+          _ChatMediaViewerScreen(entries: entries, initialIndex: safeIndex),
       transitionsBuilder: (context, animation, secondaryAnimation, child) {
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+        );
         return FadeTransition(
-          opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
-          child: child,
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.985, end: 1).animate(curved),
+            child: child,
+          ),
         );
       },
     ),
@@ -205,7 +210,8 @@ class _ChatMediaViewerScreenState extends State<_ChatMediaViewerScreen> {
                               ),
                               foregroundColor: Colors.white,
                             ),
-                            onPressed: _currentIndex >= widget.entries.length - 1
+                            onPressed:
+                                _currentIndex >= widget.entries.length - 1
                                 ? null
                                 : () => _jumpTo(_currentIndex + 1),
                             icon: const Icon(Icons.chevron_right_rounded),
@@ -221,82 +227,87 @@ class _ChatMediaViewerScreenState extends State<_ChatMediaViewerScreen> {
               left: 16,
               right: 16,
               bottom: 14,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (entry.caption.trim().isNotEmpty)
-                    Container(
-                      margin: const EdgeInsets.only(bottom: 10),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 12,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.34),
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.10),
+              child: PhoenixSlideFadeIn(
+                key: ValueKey('media-bottom-${entry.id}'),
+                beginOffset: const Offset(0, 34),
+                duration: const Duration(milliseconds: 260),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (entry.caption.trim().isNotEmpty)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 12,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.34),
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.10),
+                          ),
+                        ),
+                        child: Text(
+                          entry.caption.trim(),
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ),
-                      child: Text(
-                        entry.caption.trim(),
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                  if (widget.entries.length > 1)
-                    SizedBox(
-                      height: 74,
-                      child: ListView.separated(
-                        scrollDirection: Axis.horizontal,
-                        itemCount: widget.entries.length,
-                        separatorBuilder: (_, _) => const SizedBox(width: 8),
-                        itemBuilder: (context, index) {
-                          final thumb = widget.entries[index];
-                          final selected = index == _currentIndex;
-                          return InkWell(
-                            borderRadius: BorderRadius.circular(14),
-                            onTap: () => _jumpTo(index),
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 180),
-                              width: 74,
-                              padding: const EdgeInsets.all(2),
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(
-                                  color: selected
-                                      ? Colors.white
-                                      : Colors.white.withValues(alpha: 0.18),
-                                  width: selected ? 2 : 1,
+                    if (widget.entries.length > 1)
+                      SizedBox(
+                        height: 74,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: widget.entries.length,
+                          separatorBuilder: (_, _) => const SizedBox(width: 8),
+                          itemBuilder: (context, index) {
+                            final thumb = widget.entries[index];
+                            final selected = index == _currentIndex;
+                            return InkWell(
+                              borderRadius: BorderRadius.circular(14),
+                              onTap: () => _jumpTo(index),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 180),
+                                width: 74,
+                                padding: const EdgeInsets.all(2),
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: selected
+                                        ? Colors.white
+                                        : Colors.white.withValues(alpha: 0.18),
+                                    width: selected ? 2 : 1,
+                                  ),
                                 ),
-                              ),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: AdaptiveNetworkImage(
-                                  thumb.imageUrl,
-                                  width: 70,
-                                  height: 70,
-                                  fit: BoxFit.cover,
-                                  errorBuilder:
-                                      (context, error, stackTrace) =>
-                                          ColoredBox(
-                                    color: Colors.white12,
-                                    child: const Icon(
-                                      Icons.broken_image_outlined,
-                                      color: Colors.white54,
-                                    ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(12),
+                                  child: AdaptiveNetworkImage(
+                                    thumb.imageUrl,
+                                    width: 70,
+                                    height: 70,
+                                    fit: BoxFit.cover,
+                                    errorBuilder:
+                                        (context, error, stackTrace) =>
+                                            ColoredBox(
+                                              color: Colors.white12,
+                                              child: const Icon(
+                                                Icons.broken_image_outlined,
+                                                color: Colors.white54,
+                                              ),
+                                            ),
                                   ),
                                 ),
                               ),
-                            ),
-                          );
-                        },
+                            );
+                          },
+                        ),
                       ),
-                    ),
-                ],
+                  ],
+                ),
               ),
             ),
           ],
@@ -325,20 +336,23 @@ class _ZoomableMediaPage extends StatelessWidget {
         child: InteractiveViewer(
           minScale: 0.8,
           maxScale: 4.5,
-          child: AdaptiveNetworkImage(
-            entry.imageUrl,
-            fit: BoxFit.contain,
-            errorBuilder: (context, error, stackTrace) => Container(
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(24),
-              ),
-              padding: const EdgeInsets.all(32),
-              child: const Icon(
-                Icons.broken_image_outlined,
-                color: Colors.white70,
-                size: 44,
+          child: Hero(
+            tag: 'chat-media-${entry.id}',
+            child: AdaptiveNetworkImage(
+              entry.imageUrl,
+              fit: BoxFit.contain,
+              errorBuilder: (context, error, stackTrace) => Container(
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                padding: const EdgeInsets.all(32),
+                child: const Icon(
+                  Icons.broken_image_outlined,
+                  color: Colors.white70,
+                  size: 44,
+                ),
               ),
             ),
           ),

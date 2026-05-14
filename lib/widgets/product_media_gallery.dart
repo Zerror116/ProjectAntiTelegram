@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 
 import 'adaptive_network_image.dart';
+import 'phoenix_visual_effects.dart';
 
 class ProductMediaGallery extends StatefulWidget {
   const ProductMediaGallery({
@@ -268,16 +269,21 @@ class _ProductMediaGalleryState extends State<ProductMediaGallery> {
       ],
     );
 
-    return Container(
-      constraints: BoxConstraints(minHeight: min(widget.height, 140)),
-      height: widget.height,
-      decoration: widget.showFrame
-          ? BoxDecoration(
-              borderRadius: BorderRadius.circular(widget.borderRadius),
-              border: Border.all(color: theme.colorScheme.outlineVariant),
-            )
-          : null,
-      child: gallery,
+    return PhoenixReadyBlink(
+      key: ValueKey('product-gallery-${items.length}-${items.first.coverUrl}'),
+      borderRadius: BorderRadius.all(Radius.circular(widget.borderRadius)),
+      duration: const Duration(milliseconds: 560),
+      child: Container(
+        constraints: BoxConstraints(minHeight: min(widget.height, 140)),
+        height: widget.height,
+        decoration: widget.showFrame
+            ? BoxDecoration(
+                borderRadius: BorderRadius.circular(widget.borderRadius),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
+              )
+            : null,
+        child: gallery,
+      ),
     );
   }
 }

@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import '../main.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
+import '../widgets/adaptive_network_image.dart';
+import '../widgets/phoenix_visual_effects.dart';
 
 class _PromotionDestinationOption {
   const _PromotionDestinationOption({
@@ -86,7 +88,8 @@ class _AdminPromotionCenterScreenState
     _PromotionDestinationOption(
       id: 'none',
       label: 'Без перехода',
-      description: 'Акция просто покажется без дополнительного открытия экрана.',
+      description:
+          'Акция просто покажется без дополнительного открытия экрана.',
       deepLink: '',
     ),
   ];
@@ -126,15 +129,26 @@ class _AdminPromotionCenterScreenState
   @override
   void initState() {
     super.initState();
+    _titleCtrl.addListener(_refreshPromotionPreview);
+    _bodyCtrl.addListener(_refreshPromotionPreview);
+    _customLinkCtrl.addListener(_refreshPromotionPreview);
     _loadCampaigns();
   }
 
   @override
   void dispose() {
+    _titleCtrl.removeListener(_refreshPromotionPreview);
+    _bodyCtrl.removeListener(_refreshPromotionPreview);
+    _customLinkCtrl.removeListener(_refreshPromotionPreview);
     _titleCtrl.dispose();
     _bodyCtrl.dispose();
     _customLinkCtrl.dispose();
     super.dispose();
+  }
+
+  void _refreshPromotionPreview() {
+    if (!mounted) return;
+    setState(() {});
   }
 
   String _extractDioMessage(Object error) {
@@ -427,9 +441,9 @@ class _AdminPromotionCenterScreenState
             Expanded(
               child: Text(
                 'Картинка для акции',
-                style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                ),
+                style: Theme.of(
+                  context,
+                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
               ),
             ),
             TextButton.icon(
@@ -490,6 +504,96 @@ class _AdminPromotionCenterScreenState
     );
   }
 
+  Widget _buildPromotionPreview() {
+    final theme = Theme.of(context);
+    final title = _titleCtrl.text.trim().isEmpty
+        ? 'Заголовок акции'
+        : _titleCtrl.text.trim();
+    final body = _bodyCtrl.text.trim().isEmpty
+        ? 'Текст промо-рассылки будет выглядеть примерно так.'
+        : _bodyCtrl.text.trim();
+    final deepLink = _resolvedDeepLink;
+    final imageUrl = _uploadedImageUrl.trim().isEmpty
+        ? null
+        : resolveMediaUrl(
+            _uploadedImageUrl.trim(),
+            apiBaseUrl: authService.dio.options.baseUrl,
+          );
+    return PhoenixOneShotHighlight(
+      key: ValueKey('promo-preview-$title-$body-$deepLink-$imageUrl'),
+      enabled: !performanceModeNotifier.value,
+      borderRadius: const BorderRadius.all(Radius.circular(18)),
+      duration: const Duration(milliseconds: 520),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: SizedBox(
+                width: 62,
+                height: 62,
+                child: imageUrl == null
+                    ? ColoredBox(
+                        color: theme.colorScheme.primaryContainer,
+                        child: Icon(
+                          Icons.campaign_outlined,
+                          color: theme.colorScheme.primary,
+                        ),
+                      )
+                    : AdaptiveNetworkImage(
+                        imageUrl,
+                        width: 62,
+                        height: 62,
+                        fit: BoxFit.cover,
+                      ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    body,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Chip(
+                    avatar: const Icon(Icons.open_in_new_rounded, size: 15),
+                    label: Text(deepLink.isEmpty ? 'Без перехода' : deepLink),
+                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildComposer() {
     return Card(
       child: Padding(
@@ -532,6 +636,8 @@ class _AdminPromotionCenterScreenState
             _buildDestinationPicker(),
             const SizedBox(height: 12),
             _buildImagePicker(),
+            const SizedBox(height: 12),
+            _buildPromotionPreview(),
             const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _sending ? null : _sendPromotion,

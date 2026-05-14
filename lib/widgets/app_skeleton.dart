@@ -23,6 +23,8 @@ class AppSkeleton extends StatefulWidget {
 class _AppSkeletonState extends State<AppSkeleton>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
+  int _loops = 0;
+  bool _motionDisabled = false;
 
   @override
   void initState() {
@@ -30,7 +32,33 @@ class _AppSkeletonState extends State<AppSkeleton>
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1280),
-    )..repeat();
+    )..addStatusListener(_handleStatus);
+    _controller.forward();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final disabled = MediaQuery.maybeOf(context)?.disableAnimations == true;
+    if (disabled != _motionDisabled) {
+      _motionDisabled = disabled;
+      if (disabled) {
+        _controller.stop();
+        _controller.value = 0.5;
+      } else if (_loops < 2 && !_controller.isAnimating) {
+        _controller.forward(from: 0);
+      }
+    }
+  }
+
+  void _handleStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed || _motionDisabled) return;
+    _loops += 1;
+    if (_loops < 2) {
+      _controller.forward(from: 0);
+    } else {
+      _controller.value = 0.5;
+    }
   }
 
   @override

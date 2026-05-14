@@ -14,6 +14,7 @@ import '../utils/date_time_utils.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/phoenix_visual_effects.dart';
 
 class CartScreen extends StatefulWidget {
   const CartScreen({super.key});
@@ -40,6 +41,10 @@ class _CartScreenState extends State<CartScreen> {
   Timer? _reloadDebounceTimer;
   bool _claimSubmitting = false;
   final Set<String> _claimDecisionBusyIds = <String>{};
+  final Set<String> _recentlyChangedItemIds = <String>{};
+  final Map<String, String> _lastItemSignatures = <String, String>{};
+  Timer? _cartHighlightTimer;
+  bool _summaryRecentlyChanged = false;
 
   @override
   void initState() {
@@ -61,10 +66,15 @@ class _CartScreenState extends State<CartScreen> {
   void dispose() {
     _eventsSub?.cancel();
     _reloadDebounceTimer?.cancel();
+    _cartHighlightTimer?.cancel();
     super.dispose();
   }
 
   void _applyPayload(Map<String, dynamic> payload) {
+    final previousTotal = _total;
+    final previousProcessed = _processed;
+    final previousClaimsTotal = _claimsTotal;
+    final previousSignatures = Map<String, String>.from(_lastItemSignatures);
     _items = payload['items'] is List
         ? List<Map<String, dynamic>>.from(payload['items'])
         : [];
@@ -86,6 +96,55 @@ class _CartScreenState extends State<CartScreen> {
     _claimsTotal = (payload['claims_total'] is num)
         ? (payload['claims_total'] as num).toDouble()
         : double.tryParse('${payload['claims_total'] ?? 0}') ?? 0;
+    final nextSignatures = <String, String>{};
+    final changedIds = <String>{};
+    for (final item in _items) {
+      final id = (item['id'] ?? '').toString().trim();
+      if (id.isEmpty) continue;
+      final signature = _cartItemVisualSignature(item);
+      nextSignatures[id] = signature;
+      if (previousSignatures.isNotEmpty &&
+          previousSignatures[id] != null &&
+          previousSignatures[id] != signature) {
+        changedIds.add(id);
+      }
+    }
+    _lastItemSignatures
+      ..clear()
+      ..addAll(nextSignatures);
+    final summaryChanged =
+        previousSignatures.isNotEmpty &&
+        (previousTotal != _total ||
+            previousProcessed != _processed ||
+            previousClaimsTotal != _claimsTotal);
+    if (changedIds.isNotEmpty || summaryChanged) {
+      _recentlyChangedItemIds
+        ..clear()
+        ..addAll(changedIds);
+      _summaryRecentlyChanged = summaryChanged;
+      _cartHighlightTimer?.cancel();
+      _cartHighlightTimer = Timer(const Duration(milliseconds: 950), () {
+        if (!mounted) {
+          _recentlyChangedItemIds.clear();
+          _summaryRecentlyChanged = false;
+          return;
+        }
+        setState(() {
+          _recentlyChangedItemIds.clear();
+          _summaryRecentlyChanged = false;
+        });
+      });
+    }
+  }
+
+  String _cartItemVisualSignature(Map<String, dynamic> item) {
+    return [
+      item['status'],
+      item['quantity'],
+      item['price'],
+      item['line_total'],
+      item['delivery_date'],
+    ].map((value) => (value ?? '').toString()).join('|');
   }
 
   void _scheduleReload({Duration delay = const Duration(milliseconds: 350)}) {
@@ -720,7 +779,7 @@ class _CartScreenState extends State<CartScreen> {
     final secondaryColor = reducedVisuals
         ? theme.colorScheme.onSurfaceVariant
         : theme.colorScheme.onPrimary.withValues(alpha: 0.82);
-    return Container(
+    final summaryCard = Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -857,6 +916,12 @@ class _CartScreenState extends State<CartScreen> {
         ],
       ),
     );
+    return PhoenixOneShotHighlight(
+      key: ValueKey('cart-summary-$_summaryRecentlyChanged'),
+      enabled: _summaryRecentlyChanged && !reducedVisuals,
+      borderRadius: const BorderRadius.all(Radius.circular(18)),
+      child: summaryCard,
+    );
   }
 
   Widget _buildImage(String? imageUrl) {
@@ -914,7 +979,12 @@ class _CartScreenState extends State<CartScreen> {
     final imageUrl = _resolveImageUrl((item['image_url'] ?? '').toString());
     final statusColor = _statusColor(statusRaw);
     final canCancel = _canCancel(statusRaw);
-    return Card(
+    final itemId = (item['id'] ?? '').toString().trim();
+    final recentlyChanged = _recentlyChangedItemIds.contains(itemId);
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    final card = Card(
       margin: const EdgeInsets.only(bottom: 12),
       color: theme.colorScheme.surfaceContainerLow,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -996,6 +1066,19 @@ class _CartScreenState extends State<CartScreen> {
             ),
           ],
         ),
+      ),
+    );
+    return PhoenixOneShotHighlight(
+      key: ValueKey('cart-item-$itemId-$recentlyChanged'),
+      enabled: recentlyChanged && !reducedMotion,
+      color: statusColor,
+      borderRadius: const BorderRadius.all(Radius.circular(16)),
+      child: AnimatedScale(
+        duration: reducedMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 180),
+        scale: recentlyChanged ? 1.01 : 1,
+        child: card,
       ),
     );
   }

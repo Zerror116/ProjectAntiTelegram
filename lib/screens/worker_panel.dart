@@ -17,6 +17,7 @@ import '../widgets/app_skeleton.dart';
 import '../widgets/app_surface_card.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/phoenix_visual_effects.dart';
 import '../widgets/product_media_gallery.dart';
 import '../widgets/product_photo_crop_dialog.dart';
 
@@ -2007,28 +2008,38 @@ class _WorkerPanelState extends State<WorkerPanel>
         ),
         const SizedBox(height: 10),
         if (localBytes != null && localBytes.isNotEmpty)
-          ClipRRect(
-            borderRadius: BorderRadius.circular(22),
-            child: SizedBox(
-              height: 236,
-              child: Image.memory(
-                localBytes,
-                width: double.infinity,
-                fit: BoxFit.cover,
-                filterQuality: FilterQuality.high,
+          PhoenixReadyBlink(
+            key: ValueKey('worker-photo-bytes-${localBytes.length}'),
+            enabled: !performanceModeNotifier.value,
+            borderRadius: const BorderRadius.all(Radius.circular(22)),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(22),
+              child: SizedBox(
+                height: 236,
+                child: Image.memory(
+                  localBytes,
+                  width: double.infinity,
+                  fit: BoxFit.cover,
+                  filterQuality: FilterQuality.high,
+                ),
               ),
             ),
           )
         else if (localPath != null && localPath.isNotEmpty && !kIsWeb)
-          ClipRRect(
-            borderRadius: BorderRadius.circular(22),
-            child: SizedBox(
-              height: 236,
-              width: double.infinity,
-              child: Image(
-                image: FileImage(File(localPath)),
-                fit: BoxFit.cover,
-                filterQuality: FilterQuality.high,
+          PhoenixReadyBlink(
+            key: ValueKey('worker-photo-path-$localPath'),
+            enabled: !performanceModeNotifier.value,
+            borderRadius: const BorderRadius.all(Radius.circular(22)),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(22),
+              child: SizedBox(
+                height: 236,
+                width: double.infinity,
+                child: Image(
+                  image: FileImage(File(localPath)),
+                  fit: BoxFit.cover,
+                  filterQuality: FilterQuality.high,
+                ),
               ),
             ),
           )

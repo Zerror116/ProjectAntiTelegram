@@ -2118,10 +2118,44 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
 
   const io = req.app.get("io");
   if (io) {
-    io.to(`chat:${chatId}`).emit("chat:message", {
-      chatId,
-      message: broadcastMessage,
-    });
+    const payload = { chatId, message: broadcastMessage };
+    let emittedToDirectMembers = false;
+    try {
+      const memberQ = await db.query(
+        `SELECT c.type,
+                c.settings,
+                cm.user_id
+           FROM chats c
+           JOIN chat_members cm ON cm.chat_id = c.id
+          WHERE c.id = $1`,
+        [chatId],
+      );
+      const firstRow = memberQ.rows[0] || {};
+      const settings =
+        firstRow.settings &&
+        typeof firstRow.settings === "object" &&
+        !Array.isArray(firstRow.settings)
+          ? firstRow.settings
+          : {};
+      const isDirectMessage =
+        String(firstRow.type || "").trim().toLowerCase() === "private" &&
+        String(settings.kind || "").trim().toLowerCase() === "direct_message";
+      if (isDirectMessage && memberQ.rowCount > 0) {
+        const emittedUserIds = new Set();
+        for (const row of memberQ.rows) {
+          const memberUserId = String(row.user_id || "").trim();
+          if (!memberUserId || emittedUserIds.has(memberUserId)) continue;
+          emittedUserIds.add(memberUserId);
+          io.to(`user:${memberUserId}`).emit("chat:message", payload);
+        }
+        emittedToDirectMembers = true;
+      }
+    } catch (emitErr) {
+      console.error("direct chat user-room emit failed:", emitErr);
+    }
+    if (!emittedToDirectMembers) {
+      io.to(`chat:${chatId}`).emit("chat:message", payload);
+    }
     emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
   }
 
@@ -4333,8 +4367,11 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         for (const [senderId, senderMessageIds] of bySender.entries()) {
           io.to(`user:${senderId}`).emit("chat:message:read", {
             chatId,
+            chat_id: chatId,
             readerId: String(userId),
+            reader_id: String(userId),
             messageIds: senderMessageIds,
+            message_ids: senderMessageIds,
           });
         }
       }
@@ -4343,7 +4380,9 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
       });
       io.to(`user:${userId}`).emit("chat:message:read", {
         chatId,
+        chat_id: chatId,
         readerId: String(userId),
+        reader_id: String(userId),
         unread_count: chatUnreadCount,
         badge_count: badgeCount,
       });

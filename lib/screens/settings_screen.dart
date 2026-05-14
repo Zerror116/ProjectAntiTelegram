@@ -193,6 +193,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _chatBackgroundEffect = chatBackgroundEffectNotifier.value);
   }
 
+  String _activeVisualPreset() {
+    if (_performanceMode ||
+        (_navIconAnimationMode == 'off' &&
+            _appBackgroundEffect == 'off' &&
+            _chatBackgroundEffect == 'off')) {
+      return 'economy';
+    }
+    if (_navIconAnimationMode == 'glow' &&
+        _appBackgroundEffect == 'embers' &&
+        _chatBackgroundEffect == 'feathers') {
+      return 'beauty';
+    }
+    return 'calm';
+  }
+
+  Future<void> _applyVisualPreset(String value) async {
+    switch (value) {
+      case 'economy':
+        await setPerformanceModeEnabled(true);
+        await setNavIconAnimationMode('off');
+        await setAppBackgroundEffect('off');
+        await setChatBackgroundEffect('off');
+        break;
+      case 'beauty':
+        await setPerformanceModeEnabled(false);
+        await setNavIconAnimationMode('glow');
+        await setAppBackgroundEffect('embers');
+        await setChatBackgroundEffect('feathers');
+        break;
+      case 'calm':
+      default:
+        await setPerformanceModeEnabled(false);
+        await setNavIconAnimationMode('bounce');
+        await setAppBackgroundEffect('network');
+        await setChatBackgroundEffect('constellation');
+        break;
+    }
+    if (!mounted) return;
+    setState(() {
+      _performanceMode = performanceModeNotifier.value;
+      _navIconAnimationMode = navIconAnimationModeNotifier.value;
+      _appBackgroundEffect = appBackgroundEffectNotifier.value;
+      _chatBackgroundEffect = chatBackgroundEffectNotifier.value;
+    });
+    showAppNotice(context, 'Визуальный профиль применён');
+  }
+
   Future<void> _showNotificationGuide() async {
     if (kIsWeb) {
       await showWebNotificationHelpSheet(
@@ -2225,6 +2272,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     subtitle: const Text(
                       'Меньше анимаций и более лёгкая отрисовка для слабых устройств.',
                     ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Визуальный профиль',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(
+                            value: 'economy',
+                            label: Text('Экономно'),
+                            icon: Icon(Icons.battery_saver_outlined),
+                          ),
+                          ButtonSegment(
+                            value: 'calm',
+                            label: Text('Спокойно'),
+                            icon: Icon(Icons.auto_awesome_motion_outlined),
+                          ),
+                          ButtonSegment(
+                            value: 'beauty',
+                            label: Text('Красиво'),
+                            icon: Icon(Icons.auto_awesome_outlined),
+                          ),
+                        ],
+                        selected: {_activeVisualPreset()},
+                        onSelectionChanged: (selection) =>
+                            _applyVisualPreset(selection.first),
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 10),

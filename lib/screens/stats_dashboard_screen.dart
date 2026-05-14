@@ -315,8 +315,8 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
         final borderColor = isToday
             ? theme.colorScheme.primary
             : worked
-                ? const Color(0x6622C55E)
-                : theme.colorScheme.outlineVariant;
+            ? const Color(0x6622C55E)
+            : theme.colorScheme.outlineVariant;
         final iconColor = worked
             ? const Color(0xFF1F9D55)
             : theme.colorScheme.outline;
@@ -402,6 +402,9 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
           ? _toInt(day['posts_count'])
           : maxValue,
     );
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
 
     return Column(
       children: days.map((day) {
@@ -429,7 +432,9 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
               Icon(
                 worked ? Icons.check_circle_rounded : Icons.cancel_rounded,
                 size: 16,
-                color: worked ? const Color(0xFF1F9D55) : theme.colorScheme.outline,
+                color: worked
+                    ? const Color(0xFF1F9D55)
+                    : theme.colorScheme.outline,
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -441,8 +446,18 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                         height: 12,
                         color: theme.colorScheme.surfaceContainerHighest,
                       ),
-                      FractionallySizedBox(
-                        widthFactor: ratio,
+                      TweenAnimationBuilder<double>(
+                        tween: Tween<double>(begin: 0, end: ratio),
+                        duration: reducedMotion
+                            ? Duration.zero
+                            : const Duration(milliseconds: 520),
+                        curve: Curves.easeOutCubic,
+                        builder: (context, value, child) {
+                          return FractionallySizedBox(
+                            widthFactor: value,
+                            child: child,
+                          );
+                        },
                         child: Container(
                           height: 12,
                           decoration: BoxDecoration(
@@ -486,14 +501,23 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     final workerId = (worker['worker_id'] ?? '').toString();
     final isExpanded = _expandedWorkerIds.contains(workerId);
     final currentWeekDays = _asMapList(worker['days_current_week']);
-    final detailDays = _detailDaysForMode(worker, _currentModeForWorker(workerId));
+    final detailDays = _detailDaysForMode(
+      worker,
+      _currentModeForWorker(workerId),
+    );
     final statusColor = _workerStatusColor(theme, worker);
-    final todayAmount = _formatMoney(worker['posted_amount_today'], compact: true);
+    final todayAmount = _formatMoney(
+      worker['posted_amount_today'],
+      compact: true,
+    );
     final todayPosts = _toInt(worker['posts_today']);
     final todayRevisions = _toInt(worker['revisions_today']);
     final weekPosts = _toInt(worker['posts_current_week']);
     final weekRevisions = _toInt(worker['revisions_current_week']);
-    final weekAmount = _formatMoney(worker['posted_amount_current_week'], compact: true);
+    final weekAmount = _formatMoney(
+      worker['posted_amount_current_week'],
+      compact: true,
+    );
     final workedDays = _toInt(worker['days_worked_current_week']);
     final downtime = _asMap(worker['post_downtime']);
     final workerName = (worker['worker_name'] ?? 'Работник').toString().trim();
@@ -646,17 +670,21 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     final summary = _asMap(_extended['summary']);
     final workers = _asMapList(_extended['workers'])
       ..sort((a, b) {
-        final activeCompare = (b['active_today'] == true ? 1 : 0)
-            .compareTo(a['active_today'] == true ? 1 : 0);
+        final activeCompare = (b['active_today'] == true ? 1 : 0).compareTo(
+          a['active_today'] == true ? 1 : 0,
+        );
         if (activeCompare != 0) return activeCompare;
-        final amountCompare = _toDouble(b['posted_amount_today'])
-            .compareTo(_toDouble(a['posted_amount_today']));
+        final amountCompare = _toDouble(
+          b['posted_amount_today'],
+        ).compareTo(_toDouble(a['posted_amount_today']));
         if (amountCompare != 0) return amountCompare;
-        final todayPostsCompare = _toInt(b['posts_today'])
-            .compareTo(_toInt(a['posts_today']));
+        final todayPostsCompare = _toInt(
+          b['posts_today'],
+        ).compareTo(_toInt(a['posts_today']));
         if (todayPostsCompare != 0) return todayPostsCompare;
-        final weekCompare = _toInt(b['posts_current_week'])
-            .compareTo(_toInt(a['posts_current_week']));
+        final weekCompare = _toInt(
+          b['posts_current_week'],
+        ).compareTo(_toInt(a['posts_current_week']));
         if (weekCompare != 0) return weekCompare;
         return (a['worker_name'] ?? '').toString().compareTo(
           (b['worker_name'] ?? '').toString(),
@@ -686,7 +714,10 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
               ),
               _summaryCard(
                 label: 'Выложили сегодня',
-                value: _formatMoney(summary['posted_amount_today'], compact: true),
+                value: _formatMoney(
+                  summary['posted_amount_today'],
+                  compact: true,
+                ),
                 icon: Icons.sell_rounded,
               ),
               _summaryCard(
@@ -835,28 +866,25 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
               ),
             )
           : _loading
-              ? const Center(child: CircularProgressIndicator())
-              : _error.isNotEmpty && _extended.isEmpty
-                  ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(18),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              _error,
-                              textAlign: TextAlign.center,
-                            ),
-                            const SizedBox(height: 10),
-                            FilledButton(
-                              onPressed: () => _load(),
-                              child: const Text('Повторить'),
-                            ),
-                          ],
-                        ),
-                      ),
-                    )
-                  : _buildContent(),
+          ? const Center(child: CircularProgressIndicator())
+          : _error.isNotEmpty && _extended.isEmpty
+          ? Center(
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(_error, textAlign: TextAlign.center),
+                    const SizedBox(height: 10),
+                    FilledButton(
+                      onPressed: () => _load(),
+                      child: const Text('Повторить'),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : _buildContent(),
     );
   }
 }

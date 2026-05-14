@@ -50,6 +50,7 @@ import '../widgets/inline_video_note_orb.dart';
 import '../widgets/input_language_badge.dart';
 import '../widgets/phoenix_ambient_background.dart';
 import '../widgets/phoenix_loader.dart';
+import '../widgets/phoenix_visual_effects.dart';
 import '../widgets/submit_on_enter.dart';
 
 class _ChatUploadFile {
@@ -134,6 +135,8 @@ class _ChatScreenState extends State<ChatScreen> {
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _incomingQueue = [];
   final Set<String> _appearingMessageIds = {};
+  final Map<String, DateTime> _remoteTypingExpiresAt = {};
+  final Map<String, Timer> _remoteTypingTimers = {};
 
   bool _loading = true;
   bool _buyLoading = false;
@@ -201,7 +204,12 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _reconnectReplayTimer;
   Timer? _searchDebounceTimer;
   Timer? _remoteActivityTimer;
+  Timer? _localTypingIdleTimer;
+  Timer? _directMessageLiveSyncTimer;
   bool _readFlushOnExitInFlight = false;
+  bool _readSyncInFlight = false;
+  bool _readSyncPending = false;
+  bool _directMessageLiveSyncInFlight = false;
   int _bottomSettlePassesRemaining = 0;
   VoidCallback? _bottomSettleOnComplete;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
@@ -250,11 +258,18 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _replyPreviewText;
   String? _replyPreviewSenderName;
   bool _applyingServerDraft = false;
+  bool _draftRestoredHintVisible = false;
+  bool _scrollRestoredHintVisible = false;
   String _remoteActivityLabel = '';
+  String? _highlightedSearchMessageId;
   DateTime? _lastTypingEmitAt;
+  bool _localTypingActiveSent = false;
   MessengerPreferences _messengerPrefs = MessengerPreferences.defaults;
   List<ConnectivityResult> _connectivityResults = const <ConnectivityResult>[];
   final Set<String> _manualMediaLoads = <String>{};
+  Timer? _draftRestoredHintTimer;
+  Timer? _scrollRestoredHintTimer;
+  Timer? _searchHitHighlightTimer;
 
   static const List<String> _quickReactions = <String>[
     '👍',
@@ -461,8 +476,12 @@ class _ChatScreenState extends State<ChatScreen> {
       if (nextHasDraft != _hasDraftText && mounted) {
         setState(() => _hasDraftText = nextHasDraft);
       }
-      if (!_applyingServerDraft && nextHasDraft) {
-        _maybeEmitTypingActivity();
+      if (!_applyingServerDraft) {
+        if (nextHasDraft) {
+          _maybeEmitTypingActivity();
+        } else {
+          _maybeEmitTypingInactive();
+        }
       }
       _scheduleDraftSync();
     });
@@ -470,6 +489,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _inputFocusNode.addListener(() {
       if (_inputFocusNode.hasFocus) {
         _scrollToBottom(animated: true);
+      } else {
+        _maybeEmitTypingInactive();
       }
     });
     _scrollController.addListener(_handleScroll);
@@ -502,7 +523,11 @@ class _ChatScreenState extends State<ChatScreen> {
         final msg = data['message'] ?? data;
         final chatId = data['chatId'] ?? msg['chat_id'] ?? msg['chatId'];
         if (chatId != null && chatId.toString() == widget.chatId) {
-          _enqueueIncomingMessage(Map<String, dynamic>.from(msg));
+          final message = Map<String, dynamic>.from(msg);
+          _clearRemoteTypingUser(
+            (message['sender_id'] ?? message['senderId'] ?? '').toString(),
+          );
+          _enqueueIncomingMessage(message);
         }
         return;
       }
@@ -578,28 +603,59 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       if (type == 'chat:message:read' && data is Map) {
-        final chatId = data['chatId']?.toString() ?? '';
+        final chatId = (data['chatId'] ?? data['chat_id'] ?? '').toString();
         if (chatId != widget.chatId) return;
-        final readerId = data['readerId']?.toString() ?? '';
-        final messageIds = (data['messageIds'] is List)
-            ? (data['messageIds'] as List)
+        final readerId = (data['readerId'] ?? data['reader_id'] ?? '')
+            .toString();
+        final currentUserId = authService.currentUser?.id ?? '';
+        final isReadByMe = readerId.isNotEmpty && readerId == currentUserId;
+        final hasUnreadCount = data.containsKey('unread_count');
+        final unreadCount = hasUnreadCount
+            ? (int.tryParse('${data['unread_count'] ?? 0}') ?? 0)
+            : null;
+        final rawMessageIds = data['messageIds'] ?? data['message_ids'];
+        final messageIds = (rawMessageIds is List)
+            ? rawMessageIds
                   .map((e) => e?.toString() ?? '')
                   .where((e) => e.isNotEmpty)
                   .toSet()
             : <String>{};
-        if (messageIds.isEmpty) return;
-        _applyReadState(
-          messageIds,
-          readByMe: readerId == authService.currentUser?.id,
-          readByOthers: readerId != authService.currentUser?.id,
-        );
+        if (messageIds.isNotEmpty) {
+          _applyReadState(
+            messageIds,
+            readByMe: isReadByMe,
+            readByOthers: !isReadByMe,
+          );
+        }
+        if (isReadByMe && unreadCount != null) {
+          if (mounted) {
+            setState(() {
+              _unreadCount = unreadCount;
+              if (unreadCount <= 0) {
+                _firstUnreadMessageId = null;
+              }
+              _jumpedToFirstUnread = false;
+            });
+          } else {
+            _unreadCount = unreadCount;
+            if (unreadCount <= 0) {
+              _firstUnreadMessageId = null;
+            }
+            _jumpedToFirstUnread = false;
+          }
+        }
         return;
       }
       if (type == 'chat:typing' && data is Map) {
         final chatId = (data['chat_id'] ?? data['chatId'] ?? '').toString();
         final userId = (data['user_id'] ?? data['userId'] ?? '').toString();
         if (chatId == widget.chatId && userId != _myUserId()) {
-          _setRemoteActivityLabel('Печатает...');
+          final active = _socketBool(data['active'], fallback: true);
+          final ttlMs = _socketTtlMs(data['ttl_ms'] ?? data['ttlMs']);
+          _applyRemoteTypingEvent(userId, active: active, ttlMs: ttlMs);
+          if (active) {
+            _setRemoteActivityLabel('Печатает...', ttlMs: ttlMs);
+          }
         }
         return;
       }
@@ -623,6 +679,8 @@ class _ChatScreenState extends State<ChatScreen> {
         unawaited(_joinRoom());
         unawaited(_reconcilePersistentOutbox());
         unawaited(_flushPersistentOutbox());
+        unawaited(_syncLatestDirectMessages(forceLatest: true));
+        _startDirectMessageLiveSync();
         _reconnectReplayTimer?.cancel();
         _reconnectReplayTimer = Timer(const Duration(milliseconds: 220), () {
           unawaited(_replayMissedMessagesAfterReconnect());
@@ -733,11 +791,96 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _emitChatActivity(String eventName) async {
+  bool _socketBool(dynamic raw, {required bool fallback}) {
+    if (raw == null) return fallback;
+    if (raw is bool) return raw;
+    final text = raw.toString().trim().toLowerCase();
+    if (text == 'true' || text == '1' || text == 'yes') return true;
+    if (text == 'false' || text == '0' || text == 'no') return false;
+    return fallback;
+  }
+
+  int _socketTtlMs(dynamic raw, {int fallback = 4500}) {
+    final parsed = raw is num
+        ? raw.toInt()
+        : int.tryParse((raw ?? '').toString().trim());
+    if (parsed == null || parsed <= 0) return fallback;
+    return parsed.clamp(800, 12000).toInt();
+  }
+
+  List<String> _activeRemoteTypingUserIds() {
+    if (_remoteTypingExpiresAt.isEmpty) return const <String>[];
+    final now = DateTime.now();
+    return _remoteTypingExpiresAt.entries
+        .where((entry) => entry.value.isAfter(now))
+        .map((entry) => entry.key)
+        .where((id) => id.trim().isNotEmpty)
+        .toList(growable: false);
+  }
+
+  void _clearRemoteTypingUser(String userId) {
+    final normalized = userId.trim();
+    if (normalized.isEmpty || !_remoteTypingExpiresAt.containsKey(normalized)) {
+      return;
+    }
+    _remoteTypingTimers.remove(normalized)?.cancel();
+    if (!mounted) {
+      _remoteTypingExpiresAt.remove(normalized);
+      if (_activeRemoteTypingUserIds().isEmpty) {
+        _remoteActivityTimer?.cancel();
+        _remoteActivityLabel = '';
+      }
+      return;
+    }
+    setState(() {
+      _remoteTypingExpiresAt.remove(normalized);
+      if (_activeRemoteTypingUserIds().isEmpty) {
+        _remoteActivityTimer?.cancel();
+        _remoteActivityLabel = '';
+      }
+    });
+  }
+
+  void _applyRemoteTypingEvent(
+    String userId, {
+    required bool active,
+    required int ttlMs,
+  }) {
+    final normalized = userId.trim();
+    if (normalized.isEmpty) return;
+    if (!active) {
+      _clearRemoteTypingUser(normalized);
+      return;
+    }
+
+    _remoteTypingTimers.remove(normalized)?.cancel();
+    final expiresAt = DateTime.now().add(Duration(milliseconds: ttlMs));
+    if (!mounted) {
+      _remoteTypingExpiresAt[normalized] = expiresAt;
+    } else {
+      setState(() => _remoteTypingExpiresAt[normalized] = expiresAt);
+    }
+    _remoteTypingTimers[normalized] = Timer(Duration(milliseconds: ttlMs), () {
+      _clearRemoteTypingUser(normalized);
+    });
+  }
+
+  Future<void> _emitChatActivity(
+    String eventName, {
+    bool? active,
+    int ttlMs = 4500,
+  }) async {
     if (!_isDirectMessageChat()) return;
     if (_directRequestStatus() == 'declined') return;
     try {
-      socket?.emit(eventName, {'chat_id': widget.chatId});
+      final payload = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'ttl_ms': ttlMs,
+      };
+      if (active != null) {
+        payload['active'] = active;
+      }
+      socket?.emit(eventName, payload);
     } catch (_) {}
   }
 
@@ -765,6 +908,9 @@ class _ChatScreenState extends State<ChatScreen> {
         };
         meta['local_only'] = true;
         meta['delivery_status'] = normalizedStatus;
+        meta['message_send_state'] = normalizedStatus == 'error'
+            ? 'failed'
+            : 'local_pending';
         if ((item.errorMessage ?? '').trim().isNotEmpty) {
           meta['error_message'] = item.errorMessage!.trim();
         }
@@ -947,6 +1093,7 @@ class _ChatScreenState extends State<ChatScreen> {
             transform: (current) {
               final meta = _metaMapOf(current['meta']);
               meta['delivery_status'] = 'error';
+              meta['message_send_state'] = 'failed';
               meta['error_message'] = 'Сервер отклонил файл';
               return {...current, 'meta': meta};
             },
@@ -1123,6 +1270,9 @@ class _ChatScreenState extends State<ChatScreen> {
             transform: (current) {
               final nextMeta = _metaMapOf(current['meta']);
               nextMeta['delivery_status'] = nextStatus;
+              nextMeta['message_send_state'] = nextStatus == 'error'
+                  ? 'failed'
+                  : 'local_pending';
               nextMeta['error_message'] = errorMessage;
               nextMeta.remove('local_upload_progress');
               return {...current, 'meta': nextMeta};
@@ -1179,13 +1329,26 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_isDirectMessageChat()) return;
     if (!_canCompose()) return;
     if (_controller.text.trim().isEmpty) return;
+    _localTypingIdleTimer?.cancel();
+    _localTypingIdleTimer = Timer(const Duration(milliseconds: 3800), () {
+      _maybeEmitTypingInactive();
+    });
     final now = DateTime.now();
     final last = _lastTypingEmitAt;
     if (last != null && now.difference(last).inMilliseconds < 1800) {
       return;
     }
     _lastTypingEmitAt = now;
-    unawaited(_emitChatActivity('chat:typing'));
+    _localTypingActiveSent = true;
+    unawaited(_emitChatActivity('chat:typing', active: true));
+  }
+
+  void _maybeEmitTypingInactive() {
+    _localTypingIdleTimer?.cancel();
+    if (!_localTypingActiveSent) return;
+    _localTypingActiveSent = false;
+    _lastTypingEmitAt = null;
+    unawaited(_emitChatActivity('chat:typing', active: false));
   }
 
   Future<void> _loadContactCard() async {
@@ -1290,6 +1453,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _reconcilePersistentOutbox();
     await _loadMessages();
     unawaited(_flushPersistentOutbox());
+    _startDirectMessageLiveSync();
     await _loadContactCard();
   }
 
@@ -1315,6 +1479,17 @@ class _ChatScreenState extends State<ChatScreen> {
     _reconnectReplayTimer?.cancel();
     _searchDebounceTimer?.cancel();
     _remoteActivityTimer?.cancel();
+    _localTypingIdleTimer?.cancel();
+    _directMessageLiveSyncTimer?.cancel();
+    _draftRestoredHintTimer?.cancel();
+    _scrollRestoredHintTimer?.cancel();
+    _searchHitHighlightTimer?.cancel();
+    for (final timer in _remoteTypingTimers.values) {
+      timer.cancel();
+    }
+    _remoteTypingTimers.clear();
+    _remoteTypingExpiresAt.clear();
+    _maybeEmitTypingInactive();
     _chatSub?.cancel();
     _connectivitySub?.cancel();
     _voicePositionSub?.cancel();
@@ -1537,6 +1712,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _savedScrollAnchorOffset = serverAnchorOffset ?? 0;
         _inMemoryScrollAnchorMessageIds[widget.chatId] = serverAnchorId;
         _inMemoryScrollAnchorOffsets[widget.chatId] = serverAnchorOffset ?? 0;
+        _scheduleScrollRestoredHint();
       }
     }
 
@@ -1550,8 +1726,102 @@ class _ChatScreenState extends State<ChatScreen> {
         );
         _applyingServerDraft = false;
         _hasDraftText = serverDraft.trim().isNotEmpty;
+        _scheduleDraftRestoredHint();
       }
     }
+  }
+
+  void _scheduleDraftRestoredHint() {
+    _draftRestoredHintTimer?.cancel();
+    _draftRestoredHintVisible = true;
+    _draftRestoredHintTimer = Timer(const Duration(milliseconds: 1800), () {
+      if (!mounted) {
+        _draftRestoredHintVisible = false;
+        return;
+      }
+      setState(() => _draftRestoredHintVisible = false);
+    });
+  }
+
+  void _scheduleScrollRestoredHint() {
+    _scrollRestoredHintTimer?.cancel();
+    _scrollRestoredHintVisible = true;
+    _scrollRestoredHintTimer = Timer(const Duration(milliseconds: 1800), () {
+      if (!mounted) {
+        _scrollRestoredHintVisible = false;
+        return;
+      }
+      setState(() => _scrollRestoredHintVisible = false);
+    });
+  }
+
+  void _markSearchHitHighlighted(String messageId) {
+    final normalized = messageId.trim();
+    if (normalized.isEmpty) return;
+    _searchHitHighlightTimer?.cancel();
+    if (mounted) {
+      setState(() => _highlightedSearchMessageId = normalized);
+    } else {
+      _highlightedSearchMessageId = normalized;
+    }
+    _searchHitHighlightTimer = Timer(const Duration(milliseconds: 1050), () {
+      if (!mounted) {
+        _highlightedSearchMessageId = null;
+        return;
+      }
+      setState(() {
+        if (_highlightedSearchMessageId == normalized) {
+          _highlightedSearchMessageId = null;
+        }
+      });
+    });
+  }
+
+  Widget _buildEphemeralChatHint({
+    required IconData icon,
+    required String label,
+    required Color color,
+  }) {
+    final theme = Theme.of(context);
+    return PhoenixSlideFadeIn(
+      beginOffset: const Offset(0, 12),
+      child: Center(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Color.alphaBlend(
+              color.withValues(alpha: 0.10),
+              theme.colorScheme.surfaceContainerHigh,
+            ),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: color.withValues(alpha: 0.24)),
+            boxShadow: [
+              BoxShadow(
+                color: color.withValues(alpha: 0.12),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: color),
+                const SizedBox(width: 7),
+                Text(
+                  label,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: theme.colorScheme.onSurface,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _loadServerChatState({bool restoreDraft = true}) async {
@@ -2171,7 +2441,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || _initialViewportReady) return;
     _initialViewportFailsafeTimer?.cancel();
     setState(() => _initialViewportReady = true);
-    if (_unreadCount > 0) {
+    if (_unreadCount > 0 || _shouldReadWholeOpenChat()) {
       _scheduleReadSync();
     }
   }
@@ -2354,10 +2624,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final meta = _metaMapOf(normalized['meta']);
     final fromMe = _isOwnMessage(normalized);
     final localOnly = meta['local_only'] == true;
-    if (fromMe && !localOnly) {
+    if (fromMe && localOnly) {
+      final status = (meta['delivery_status'] ?? '').toString().trim();
+      meta['message_send_state'] = status == 'error'
+          ? 'failed'
+          : 'local_pending';
+    } else if (fromMe && !localOnly) {
       meta['delivery_status'] = normalized['read_by_others'] == true
           ? 'read'
           : 'sent';
+      meta['message_send_state'] = 'server_confirmed';
     }
     normalized['meta'] = meta;
     return normalized;
@@ -2472,6 +2748,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (inserted && msgId != null && msgId.isNotEmpty) {
       _markMessageAppearing(msgId);
     }
+    _refreshLoadedMessageBounds();
     _recomputeSearchResults();
 
     if (!localOnly && clientMsgId.trim().isNotEmpty) {
@@ -2480,6 +2757,102 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (autoScroll) {
       _scrollToBottom(animated: true);
+    }
+  }
+
+  void _startDirectMessageLiveSync() {
+    _directMessageLiveSyncTimer?.cancel();
+    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    _directMessageLiveSyncTimer = Timer.periodic(
+      const Duration(milliseconds: 2400),
+      (_) => unawaited(_syncLatestDirectMessages()),
+    );
+  }
+
+  Future<void> _syncLatestDirectMessages({bool forceLatest = false}) async {
+    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if (_directMessageLiveSyncInFlight || _messagesLoadInFlight || _loading) {
+      return;
+    }
+    if (!mounted) return;
+
+    final newestCreatedAt = _newestLoadedCreatedAt;
+    final newestMessageId = _newestLoadedMessageId;
+    final canUseAfterCursor =
+        !forceLatest &&
+        newestCreatedAt != null &&
+        newestCreatedAt.trim().isNotEmpty &&
+        newestMessageId != null &&
+        newestMessageId.trim().isNotEmpty;
+    if (!canUseAfterCursor && _messages.isNotEmpty && !forceLatest) {
+      return;
+    }
+
+    _directMessageLiveSyncInFlight = true;
+    try {
+      final query = <String, dynamic>{
+        'limit': canUseAfterCursor ? 40 : (kIsWeb ? 60 : 80),
+        if (kIsWeb) 'view': 'summary',
+        if (canUseAfterCursor) 'after_created_at': newestCreatedAt,
+        if (canUseAfterCursor) 'after_id': newestMessageId,
+      };
+      final resp = await authService.dio.get(
+        '/api/chats/${widget.chatId}/messages',
+        queryParameters: query,
+        options: Options(
+          connectTimeout: const Duration(seconds: 8),
+          sendTimeout: const Duration(seconds: 8),
+          receiveTimeout: const Duration(seconds: 12),
+        ),
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! List) return;
+
+      final pageMessages = List<Map<String, dynamic>>.from(data['data'])
+        ..sort(_compareByCreatedAt);
+      final state = _chatStateMapOf(data['state']);
+      final shouldScroll = _isNearBottom();
+      final incomingFromOthers = pageMessages.any((message) {
+        final normalized = _normalizeMessage(
+          Map<String, dynamic>.from(message),
+        );
+        return !_isOwnMessage(normalized);
+      });
+
+      if (pageMessages.isNotEmpty) {
+        for (final message in pageMessages) {
+          _upsertMessage(Map<String, dynamic>.from(message), autoScroll: false);
+        }
+        if (shouldScroll) {
+          _scrollToBottom(animated: true);
+        }
+      }
+
+      if (state.isNotEmpty && mounted) {
+        setState(() {
+          _applyServerChatState(
+            state,
+            restoreDraft: false,
+            restoreScroll: false,
+          );
+        });
+      }
+      if (incomingFromOthers) {
+        _scheduleReadSync();
+      }
+    } catch (e, st) {
+      unawaited(
+        MonitoringService.captureError(
+          e,
+          st,
+          subsystem: 'chat',
+          code: 'direct_message_live_sync_failed',
+          level: _isTransientMessageLoadError(e) ? 'warn' : 'error',
+          details: <String, dynamic>{'chat_id': widget.chatId},
+        ),
+      );
+    } finally {
+      _directMessageLiveSyncInFlight = false;
     }
   }
 
@@ -2624,6 +2997,13 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  bool _shouldReadWholeOpenChat() {
+    return _isDirectMessageChat() ||
+        _isSupportTicketChat() ||
+        _isReservedOrdersChat() ||
+        _isBugReportsChat();
+  }
+
   bool _canPinMessages() {
     final role = authService.effectiveRole.toLowerCase().trim();
     return role == 'admin' || role == 'tenant' || role == 'creator';
@@ -2731,86 +3111,105 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildActivePinPreview(ThemeData theme) {
     if (_activePin == null) return const SizedBox.shrink();
     final subtitle = _pinPreviewSubtitle();
+    final pinKey = (_activePin?['message_id'] ?? '').toString();
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
     return GestureDetector(
       onTap: _jumpToPinnedMessage,
-      child: Container(
-        width: double.infinity,
-        margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainerHigh,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: theme.colorScheme.outlineVariant),
-        ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              width: 34,
-              height: 34,
-              decoration: BoxDecoration(
-                color: theme.colorScheme.primaryContainer,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              alignment: Alignment.center,
-              child: Icon(
-                Icons.push_pin_rounded,
-                size: 18,
-                color: theme.colorScheme.primary,
-              ),
+      child: PhoenixSlideFadeIn(
+        key: ValueKey('active-pin-$pinKey'),
+        enabled: !reducedMotion,
+        beginOffset: const Offset(0, -14),
+        duration: const Duration(milliseconds: 260),
+        child: Container(
+          width: double.infinity,
+          margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+          padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHigh,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: theme.colorScheme.primary.withValues(alpha: 0.22),
             ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Закреплённое сообщение',
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      fontWeight: FontWeight.w800,
-                      color: theme.colorScheme.primary,
+            boxShadow: [
+              BoxShadow(
+                color: theme.colorScheme.primary.withValues(alpha: 0.07),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                alignment: Alignment.center,
+                child: Icon(
+                  Icons.push_pin_rounded,
+                  size: 18,
+                  color: theme.colorScheme.primary,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Закреплённое сообщение',
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: theme.colorScheme.primary,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _pinPreviewText(),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  if (subtitle.isNotEmpty) ...[
                     const SizedBox(height: 4),
                     Text(
-                      subtitle,
-                      maxLines: 1,
+                      _pinPreviewText(),
+                      maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                      style: theme.textTheme.bodyMedium?.copyWith(
                         fontWeight: FontWeight.w600,
                       ),
                     ),
+                    if (subtitle.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
                   ],
+                ),
+              ),
+              Column(
+                children: [
+                  if (_canPinMessages())
+                    IconButton(
+                      tooltip: 'Открепить',
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: _unpinMessage,
+                    ),
+                  Icon(
+                    Icons.arrow_outward_rounded,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 ],
               ),
-            ),
-            Column(
-              children: [
-                if (_canPinMessages())
-                  IconButton(
-                    tooltip: 'Открепить',
-                    icon: const Icon(Icons.close, size: 18),
-                    onPressed: _unpinMessage,
-                  ),
-                Icon(
-                  Icons.arrow_outward_rounded,
-                  size: 16,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-              ],
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -3103,11 +3502,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _markChatAsRead({bool flushOnExit = false}) async {
-    final reservedOrdersChat = _isReservedOrdersChat();
-    final bugReportsChat = _isBugReportsChat();
+    if (_readSyncInFlight) {
+      _readSyncPending = true;
+      return;
+    }
     if (!_initialViewportReady && !flushOnExit) return;
     if (_messages.isEmpty) return;
-    final visibleUntilMessageId = (reservedOrdersChat || bugReportsChat)
+    final readWholeChat = _shouldReadWholeOpenChat();
+    final visibleUntilMessageId = readWholeChat
         ? ''
         : ((_isNearBottom()
                       ? _newestLoadedMessageId
@@ -3115,14 +3517,13 @@ class _ChatScreenState extends State<ChatScreen> {
                   _newestLoadedMessageId ??
                   '')
               .trim();
-    if (!reservedOrdersChat &&
-        !bugReportsChat &&
-        visibleUntilMessageId.isEmpty) {
+    if (!readWholeChat && visibleUntilMessageId.isEmpty) {
       return;
     }
-    final payload = (reservedOrdersChat || bugReportsChat)
+    final payload = readWholeChat
         ? const <String, dynamic>{}
         : <String, dynamic>{'visible_until_message_id': visibleUntilMessageId};
+    _readSyncInFlight = true;
     try {
       final resp = await authService.dio.post(
         '/api/chats/${widget.chatId}/read',
@@ -3155,20 +3556,61 @@ class _ChatScreenState extends State<ChatScreen> {
         }
         chatEventsController.add({
           'type': 'chat:message:read',
-          'data': {'chatId': widget.chatId, 'unread_count': unreadCount},
+          'data': {
+            'chatId': widget.chatId,
+            'chat_id': widget.chatId,
+            'unread_count': unreadCount,
+          },
         });
         if (unreadCount > 0) {
           unawaited(_loadServerChatState());
         }
       }
-    } catch (_) {}
+    } catch (e, st) {
+      debugPrint('markChatAsRead failed: $e');
+      unawaited(
+        MonitoringService.captureError(
+          e,
+          st,
+          subsystem: 'chat',
+          code: 'chat_mark_read_failed',
+          level: 'warn',
+          details: <String, dynamic>{
+            'chat_id': widget.chatId,
+            'read_whole_chat': readWholeChat,
+            'flush_on_exit': flushOnExit,
+          },
+        ),
+      );
+    } finally {
+      _readSyncInFlight = false;
+      if (_readSyncPending) {
+        _readSyncPending = false;
+        if (mounted) {
+          _scheduleReadSync();
+        }
+      }
+    }
   }
 
   void _enqueueIncomingMessage(Map<String, dynamic> msg) {
+    _clearRemoteTypingUser(
+      (msg['sender_id'] ?? msg['senderId'] ?? '').toString(),
+    );
     if (_isHiddenForAll(msg)) {
       final messageId = msg['id']?.toString() ?? '';
       if (messageId.isNotEmpty) {
         _removeMessageLocally(messageId);
+      }
+      return;
+    }
+
+    if (_isDirectMessageChat()) {
+      final fromMe = _isOwnMessage(msg);
+      final shouldScroll = _isNearBottom() || fromMe;
+      _upsertMessage(msg, autoScroll: shouldScroll);
+      if (!fromMe) {
+        _scheduleReadSync();
       }
       return;
     }
@@ -3371,7 +3813,12 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
     ];
 
-    return Container(
+    final bannerKey =
+        '$statusRaw|$assigneeName|${_supportTicketWaitingCustomer()}';
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    final content = Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
@@ -3404,6 +3851,19 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
         ],
+      ),
+    );
+    return PhoenixSlideFadeIn(
+      key: ValueKey('support-handoff-$bannerKey'),
+      enabled: !reducedMotion,
+      beginOffset: const Offset(0, -10),
+      duration: const Duration(milliseconds: 260),
+      child: PhoenixOneShotHighlight(
+        enabled: !reducedMotion,
+        color: foreground,
+        borderRadius: const BorderRadius.all(Radius.circular(12)),
+        duration: const Duration(milliseconds: 720),
+        child: content,
       ),
     );
   }
@@ -6655,6 +7115,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'attachment_type': attachmentType,
       'local_only': true,
       'delivery_status': 'queued',
+      'message_send_state': 'local_pending',
       'retry_payload': retryPayload,
       ...replyPayload,
       if (attachmentType == 'image' && previewUrl != null)
@@ -6725,6 +7186,7 @@ class _ChatScreenState extends State<ChatScreen> {
       ...meta,
       'local_only': true,
       'delivery_status': 'queued',
+      'message_send_state': 'local_pending',
       'retry_payload': retryPayload,
     };
     queuedMeta.remove('error_message');
@@ -6762,7 +7224,8 @@ class _ChatScreenState extends State<ChatScreen> {
       'read_by_others': false,
       'read_count': 0,
       'meta': {
-        'delivery_status': 'queued',
+        'delivery_status': 'sending',
+        'message_send_state': 'local_pending',
         'local_only': true,
         'retry_payload': _buildTextRetryPayload(
           text: text,
@@ -6773,6 +7236,7 @@ class _ChatScreenState extends State<ChatScreen> {
     };
     _controller.clear();
     _clearReplyComposer();
+    _maybeEmitTypingInactive();
     _upsertMessage(optimisticMessage, autoScroll: true);
     await _persistOutboxItem(
       message: optimisticMessage,
@@ -6780,7 +7244,7 @@ class _ChatScreenState extends State<ChatScreen> {
         text: text,
         replyPayload: replyPayload,
       ),
-      status: 'queued',
+      status: 'sending',
     );
     unawaited(_flushPersistentOutbox());
   }
@@ -7962,6 +8426,7 @@ class _ChatScreenState extends State<ChatScreen> {
       final moved = await _approximateScrollToMessageId(messageId);
       if (moved) {
         _handleScroll();
+        _markSearchHitHighlighted(messageId);
       }
       return;
     }
@@ -7974,6 +8439,7 @@ class _ChatScreenState extends State<ChatScreen> {
       curve: Curves.easeOutCubic,
     );
     _handleScroll();
+    _markSearchHitHighlighted(messageId);
   }
 
   void _moveSearchResult(int delta) {
@@ -7984,6 +8450,71 @@ class _ChatScreenState extends State<ChatScreen> {
     final normalized = next < 0 ? next + length : next;
     setState(() => _searchResultIndex = normalized);
     unawaited(_jumpToSearchResult(normalized));
+  }
+
+  bool _shouldShowTypingIndicator() {
+    return _isDirectMessageChat() &&
+        !_isReservedOrdersChat() &&
+        _activeRemoteTypingUserIds().isNotEmpty;
+  }
+
+  Widget _buildTypingIndicatorPlaceholder(
+    ThemeData theme, {
+    required int userCount,
+  }) {
+    final label = userCount > 1 ? 'Печатают...' : 'Печатает...';
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    return PhoenixSlideFadeIn(
+      enabled: !reducedMotion,
+      beginOffset: const Offset(0, 12),
+      duration: const Duration(milliseconds: 260),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest.withValues(
+                alpha: 0.78,
+              ),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: theme.colorScheme.primary.withValues(alpha: 0.18),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.06),
+                  blurRadius: 18,
+                  offset: const Offset(0, 8),
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _TypingDots(
+                    color: theme.colorScheme.primary,
+                    enabled: !reducedMotion,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    label,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   List<Map<String, dynamic>> _buildTimeline(
@@ -8048,6 +8579,12 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       items.add({'type': 'message', 'data': message});
     }
+    if (_shouldShowTypingIndicator()) {
+      items.add({
+        'type': 'typing_indicator',
+        'user_count': _activeRemoteTypingUserIds().length,
+      });
+    }
     return items;
   }
 
@@ -8059,6 +8596,13 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       if (type == 'unread_divider') {
         return _buildUnreadDivider();
+      }
+      if (type == 'typing_indicator') {
+        final userCount = int.tryParse('${row['user_count'] ?? 1}') ?? 1;
+        return _buildTypingIndicatorPlaceholder(
+          Theme.of(context),
+          userCount: userCount,
+        );
       }
       final rawData = row['data'];
       if (rawData is! Map) {
@@ -8149,37 +8693,56 @@ class _ChatScreenState extends State<ChatScreen> {
         ? 'Непрочитанные • $_unreadCount'
         : 'Непрочитанные';
     final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-      child: Row(
-        children: [
-          Expanded(
-            child: Divider(
-              color: theme.colorScheme.primary.withValues(alpha: 0.35),
-            ),
-          ),
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 10),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.primaryContainer,
-              borderRadius: BorderRadius.circular(999),
-            ),
-            child: Text(
-              unreadLabel,
-              style: TextStyle(
-                color: theme.colorScheme.onPrimaryContainer,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    return PhoenixSlideFadeIn(
+      enabled: !reducedMotion,
+      beginOffset: const Offset(0, 10),
+      child: PhoenixOneShotHighlight(
+        enabled: !reducedMotion,
+        color: theme.colorScheme.primary,
+        borderRadius: const BorderRadius.all(Radius.circular(999)),
+        duration: const Duration(milliseconds: 780),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+          child: Row(
+            children: [
+              Expanded(
+                child: Divider(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.35),
+                ),
               ),
-            ),
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(
+                    color: theme.colorScheme.primary.withValues(alpha: 0.22),
+                  ),
+                ),
+                child: Text(
+                  unreadLabel,
+                  style: TextStyle(
+                    color: theme.colorScheme.onPrimaryContainer,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Divider(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.35),
+                ),
+              ),
+            ],
           ),
-          Expanded(
-            child: Divider(
-              color: theme.colorScheme.primary.withValues(alpha: 0.35),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -9472,9 +10035,43 @@ class _ChatScreenState extends State<ChatScreen> {
         return ListTile(
           dense: true,
           visualDensity: const VisualDensity(vertical: -1),
-          leading: Icon(icon, color: color),
-          title: Text(title, style: TextStyle(color: color)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          leading: Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: (color ?? theme.colorScheme.primary).withValues(
+                alpha: 0.10,
+              ),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, size: 19, color: color),
+          ),
+          title: Text(
+            title,
+            style: TextStyle(color: color, fontWeight: FontWeight.w700),
+          ),
           onTap: () => Navigator.of(ctx).pop(value),
+        );
+      }
+
+      Widget sheetHandle() {
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Center(
+            child: Container(
+              width: 42,
+              height: 5,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.onSurfaceVariant.withValues(
+                  alpha: 0.22,
+                ),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
         );
       }
 
@@ -9549,6 +10146,7 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Column(
           mainAxisSize: hasMenuItems ? MainAxisSize.max : MainAxisSize.min,
           children: [
+            sheetHandle(),
             if (reactionChoices.isNotEmpty)
               glass(
                 child: Container(
@@ -9666,9 +10264,13 @@ class _ChatScreenState extends State<ChatScreen> {
             isScrollControlled: true,
             backgroundColor: Colors.transparent,
             builder: (ctx) => SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                child: buildActionPanel(ctx, desktop: false),
+              child: PhoenixSlideFadeIn(
+                beginOffset: const Offset(0, 36),
+                duration: const Duration(milliseconds: 220),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  child: buildActionPanel(ctx, desktop: false),
+                ),
               ),
             ),
           );
@@ -11007,6 +11609,119 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Widget _buildPendingMessageShell(
+    ThemeData theme, {
+    required Map<String, dynamic> message,
+    required Widget child,
+  }) {
+    final meta = _metaMapOf(message['meta']);
+    final state = (meta['message_send_state'] ?? '').toString().trim();
+    final deliveryStatus = (meta['delivery_status'] ?? '').toString().trim();
+    final pending = state == 'local_pending' || deliveryStatus == 'sending';
+    final failed = state == 'failed' || deliveryStatus == 'error';
+    if (!pending && !failed) return child;
+    final uploading = deliveryStatus == 'uploading';
+    final progressRaw = meta['local_upload_progress'];
+    final parsedProgress = progressRaw is num
+        ? progressRaw.toDouble()
+        : double.tryParse((progressRaw ?? '').toString());
+    final progress = parsedProgress?.clamp(0.0, 1.0).toDouble();
+    final accent = failed ? theme.colorScheme.error : theme.colorScheme.primary;
+    final label = failed
+        ? 'Не отправлено'
+        : uploading
+        ? 'Загрузка${progress == null ? '' : ' ${(progress * 100).round()}%'}'
+        : deliveryStatus == 'queued'
+        ? 'В очереди'
+        : 'Отправка';
+    final fromMe = _isOwnMessage(message);
+
+    return AnimatedOpacity(
+      duration: const Duration(milliseconds: 160),
+      curve: Curves.easeOutCubic,
+      opacity: failed ? 0.82 : 0.9,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: fromMe
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
+        children: [
+          child,
+          const SizedBox(height: 5),
+          Container(
+            width: 118,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: BoxDecoration(
+              color: accent.withValues(alpha: 0.10),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: accent.withValues(alpha: 0.18)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (failed)
+                  Icon(Icons.error_outline_rounded, size: 14, color: accent)
+                else
+                  SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      value: progress,
+                      color: accent,
+                    ),
+                  ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: accent,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _wrapNewMessageAppearance({
+    required Widget child,
+    required bool reducedMotion,
+    required bool useChannelPostAppearance,
+    required bool isAppearing,
+    required bool fromMe,
+  }) {
+    // Visual extension point: replace this wrapper to change message entrance motion.
+    if (reducedMotion) return child;
+    if (useChannelPostAppearance) {
+      return _ChannelPostRevealHighlight(child: child);
+    }
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
+      duration: const Duration(milliseconds: 380),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, animatedChild) {
+        final dx = fromMe ? 18 * (1 - value) : -28 * (1 - value);
+        final dy = 10 * (1 - value);
+        return Opacity(
+          opacity: value.clamp(0, 1),
+          child: Transform.translate(
+            offset: Offset(dx, dy),
+            child: animatedChild,
+          ),
+        );
+      },
+      child: child,
+    );
+  }
+
   Widget _buildMessageItem(Map<String, dynamic> message) {
     final theme = Theme.of(context);
     final reducedMotion =
@@ -11253,6 +11968,10 @@ class _ChatScreenState extends State<ChatScreen> {
         knownHeight:
             _positiveMediaDimension(metaMap['image_height']) ??
             cachedSize?.height,
+        heroTag: _mediaViewerEntryIdForMessage(
+          message,
+          fallbackImageUrl: imageUrl,
+        ),
         onTap: () => _openImagePreviewForMessage(message, imageUrl),
         onFramePainted: _onMediaFramePainted,
       );
@@ -12080,7 +12799,13 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             const SizedBox(width: 10),
           ],
-          Flexible(child: bubble),
+          Flexible(
+            child: _buildPendingMessageShell(
+              theme,
+              message: message,
+              child: bubble,
+            ),
+          ),
           if (fromMe && showAvatar) ...[
             const SizedBox(width: 10),
             AppAvatar(
@@ -12096,32 +12821,31 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
 
-    final animatedItem = reducedMotion
-        ? bubbleRow
-        : useChannelPostAppearance
-        ? _ChannelPostRevealHighlight(child: bubbleRow)
-        : TweenAnimationBuilder<double>(
-            tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
-            duration: const Duration(milliseconds: 380),
-            curve: Curves.easeOutCubic,
-            builder: (context, value, child) {
-              final dx = fromMe ? 18 * (1 - value) : -28 * (1 - value);
-              final dy = 10 * (1 - value);
-              return Opacity(
-                opacity: value.clamp(0, 1),
-                child: Transform.translate(
-                  offset: Offset(dx, dy),
-                  child: child,
-                ),
-              );
-            },
-            child: bubbleRow,
-          );
+    final animatedItem = _wrapNewMessageAppearance(
+      child: bubbleRow,
+      reducedMotion: reducedMotion,
+      useChannelPostAppearance: useChannelPostAppearance,
+      isAppearing: isAppearing,
+      fromMe: fromMe,
+    );
+    final highlightedItem =
+        hasMessageId && _highlightedSearchMessageId == messageId
+        ? PhoenixOneShotHighlight(
+            key: ValueKey('search-hit-$messageId'),
+            enabled: !reducedMotion,
+            color: theme.colorScheme.tertiary,
+            borderRadius: const BorderRadius.all(Radius.circular(28)),
+            child: animatedItem,
+          )
+        : animatedItem;
 
     if (hasMessageId) {
-      return KeyedSubtree(key: _messageKeyFor(messageId), child: animatedItem);
+      return KeyedSubtree(
+        key: _messageKeyFor(messageId),
+        child: highlightedItem,
+      );
     }
-    return animatedItem;
+    return highlightedItem;
   }
 
   @override
@@ -12423,10 +13147,34 @@ class _ChatScreenState extends State<ChatScreen> {
                                   ),
                                 ),
                               ),
+                            if (_scrollRestoredHintVisible)
+                              Positioned(
+                                top: (_stickyDateLabel ?? '').trim().isNotEmpty
+                                    ? 54
+                                    : 12,
+                                left: 0,
+                                right: 0,
+                                child: IgnorePointer(
+                                  child: _buildEphemeralChatHint(
+                                    icon: Icons.my_location_rounded,
+                                    label: 'Вернулись к месту чтения',
+                                    color: theme.colorScheme.primary,
+                                  ),
+                                ),
+                              ),
                           ],
                         ),
                 ),
                 if (!_searchMode) ...[
+                  if (_draftRestoredHintVisible)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                      child: _buildEphemeralChatHint(
+                        icon: Icons.edit_note_rounded,
+                        label: 'Черновик восстановлен',
+                        color: theme.colorScheme.tertiary,
+                      ),
+                    ),
                   if (blockedReason != null &&
                       !_voiceRecording &&
                       !_voiceStartInProgress &&
@@ -12961,6 +13709,78 @@ class _ChannelPostRevealHighlight extends StatelessWidget {
         );
       },
       child: child,
+    );
+  }
+}
+
+class _TypingDots extends StatefulWidget {
+  const _TypingDots({required this.color, required this.enabled});
+
+  final Color color;
+  final bool enabled;
+
+  @override
+  State<_TypingDots> createState() => _TypingDotsState();
+}
+
+class _TypingDotsState extends State<_TypingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 980),
+    );
+    if (widget.enabled) _controller.repeat();
+  }
+
+  @override
+  void didUpdateWidget(_TypingDots oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.enabled && !_controller.isAnimating) {
+      _controller.repeat();
+    } else if (!widget.enabled && _controller.isAnimating) {
+      _controller.stop();
+      _controller.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (index) {
+            final phase = (index * 0.18 + _controller.value) % 1.0;
+            final lift = widget.enabled
+                ? math.sin(phase * math.pi * 2).clamp(0.0, 1.0).toDouble()
+                : 0.0;
+            return Transform.translate(
+              offset: Offset(0, -3 * lift),
+              child: Container(
+                width: 5,
+                height: 5,
+                margin: EdgeInsets.only(right: index == 2 ? 0 : 4),
+                decoration: BoxDecoration(
+                  color: widget.color.withValues(alpha: 0.46 + lift * 0.38),
+                  shape: BoxShape.circle,
+                ),
+              ),
+            );
+          }),
+        );
+      },
     );
   }
 }

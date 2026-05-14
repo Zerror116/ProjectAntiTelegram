@@ -63,6 +63,7 @@ class ChatMessageImage extends StatefulWidget {
     this.borderRadius = 18,
     this.expandToMaxWidth = false,
     this.onFramePainted,
+    this.heroTag,
   });
 
   final String imageUrl;
@@ -75,6 +76,7 @@ class ChatMessageImage extends StatefulWidget {
   final double borderRadius;
   final bool expandToMaxWidth;
   final VoidCallback? onFramePainted;
+  final String? heroTag;
 
   @override
   State<ChatMessageImage> createState() => _ChatMessageImageState();
@@ -140,7 +142,8 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
     final stream = imageProvider.resolve(const ImageConfiguration());
     late final ImageStreamListener listener;
     void detachCurrentListener() {
-      if (identical(_imageStream, stream) && identical(_imageStreamListener, listener)) {
+      if (identical(_imageStream, stream) &&
+          identical(_imageStreamListener, listener)) {
         _imageStream = null;
         _imageStreamListener = null;
       }
@@ -148,6 +151,7 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
         stream.removeListener(listener);
       } catch (_) {}
     }
+
     listener = ImageStreamListener(
       (info, _) {
         final size = Size(
@@ -231,83 +235,87 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
       ),
     );
 
-    return GestureDetector(
-      onTap: widget.onTap,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(widget.borderRadius),
-        child: SizedBox(
-          width: geometry.boxWidth,
-          height: geometry.boxHeight,
-          child: RepaintBoundary(
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                ColoredBox(color: theme.colorScheme.surfaceContainerHighest),
-                if (geometry.usesBackdrop) ...[
-                  Positioned.fill(
-                    child: ImageFiltered(
-                      imageFilter: ui.ImageFilter.blur(sigmaX: 22, sigmaY: 22),
-                      child: Transform.scale(
-                        scale: 1.08,
-                        child: AdaptiveNetworkImage(
-                          widget.imageUrl,
-                          width: geometry.boxWidth,
-                          height: geometry.boxHeight,
-                          fit: BoxFit.cover,
-                          alignment: Alignment.center,
-                          maxScaleForDecode: 0.65,
-                        ),
+    final image = ClipRRect(
+      borderRadius: BorderRadius.circular(widget.borderRadius),
+      child: SizedBox(
+        width: geometry.boxWidth,
+        height: geometry.boxHeight,
+        child: RepaintBoundary(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              ColoredBox(color: theme.colorScheme.surfaceContainerHighest),
+              if (geometry.usesBackdrop) ...[
+                Positioned.fill(
+                  child: ImageFiltered(
+                    imageFilter: ui.ImageFilter.blur(sigmaX: 22, sigmaY: 22),
+                    child: Transform.scale(
+                      scale: 1.08,
+                      child: AdaptiveNetworkImage(
+                        widget.imageUrl,
+                        width: geometry.boxWidth,
+                        height: geometry.boxHeight,
+                        fit: BoxFit.cover,
+                        alignment: Alignment.center,
+                        maxScaleForDecode: 0.65,
                       ),
                     ),
                   ),
-                  Positioned.fill(
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [
-                            theme.colorScheme.surface.withValues(alpha: 0.10),
-                            theme.colorScheme.surface.withValues(alpha: 0.22),
-                          ],
-                        ),
+                ),
+                Positioned.fill(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          theme.colorScheme.surface.withValues(alpha: 0.10),
+                          theme.colorScheme.surface.withValues(alpha: 0.22),
+                        ],
                       ),
-                    ),
-                  ),
-                ],
-                Center(
-                  child: SizedBox(
-                    width: geometry.contentWidth,
-                    height: geometry.contentHeight,
-                    child: AdaptiveNetworkImage(
-                      widget.imageUrl,
-                      width: geometry.contentWidth,
-                      height: geometry.contentHeight,
-                      fit: BoxFit.contain,
-                      alignment: Alignment.center,
-                      frameBuilder: (context, child, frame, sync) {
-                        if (sync || frame != null) {
-                          WidgetsBinding.instance.addPostFrameCallback((_) {
-                            _markImageRendered();
-                          });
-                        }
-                        return child;
-                      },
-                      loadingBuilder: (context, child, progress) {
-                        if (_hasRenderedImage) return child;
-                        if (progress == null) return child;
-                        return buildPlaceholder(loading: true);
-                      },
-                      errorBuilder: (context, error, stackTrace) =>
-                          buildPlaceholder(),
                     ),
                   ),
                 ),
               ],
-            ),
+              Center(
+                child: SizedBox(
+                  width: geometry.contentWidth,
+                  height: geometry.contentHeight,
+                  child: AdaptiveNetworkImage(
+                    widget.imageUrl,
+                    width: geometry.contentWidth,
+                    height: geometry.contentHeight,
+                    fit: BoxFit.contain,
+                    alignment: Alignment.center,
+                    frameBuilder: (context, child, frame, sync) {
+                      if (sync || frame != null) {
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          _markImageRendered();
+                        });
+                      }
+                      return child;
+                    },
+                    loadingBuilder: (context, child, progress) {
+                      if (_hasRenderedImage) return child;
+                      if (progress == null) return child;
+                      return buildPlaceholder(loading: true);
+                    },
+                    errorBuilder: (context, error, stackTrace) =>
+                        buildPlaceholder(),
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ),
+    );
+    final heroTag = widget.heroTag?.trim();
+    return GestureDetector(
+      onTap: widget.onTap,
+      child: heroTag == null || heroTag.isEmpty
+          ? image
+          : Hero(tag: 'chat-media-$heroTag', child: image),
     );
   }
 }

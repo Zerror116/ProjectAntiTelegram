@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import '../services/notification_device_service.dart';
+import '../widgets/phoenix_visual_effects.dart';
 
 class MonitoringScreen extends StatefulWidget {
   const MonitoringScreen({super.key});
@@ -87,13 +88,17 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
 
   Future<void> _resolveEvent(String eventId) async {
     try {
-      await authService.dio.patch('/api/admin/ops/monitoring/events/$eventId/resolve');
+      await authService.dio.patch(
+        '/api/admin/ops/monitoring/events/$eventId/resolve',
+      );
       if (!mounted) return;
       setState(() {
         _events = _events
-            .map((event) => event['id'] == eventId
-                ? <String, dynamic>{...event, 'resolved': true}
-                : event)
+            .map(
+              (event) => event['id'] == eventId
+                  ? <String, dynamic>{...event, 'resolved': true}
+                  : event,
+            )
             .toList(growable: false);
       });
     } catch (e) {
@@ -143,29 +148,44 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
 
   Widget _metricChip(String label, String value, {Color? tone}) {
     final theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: tone?.withValues(alpha: 0.14) ?? theme.colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            value,
-            style: theme.textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w900,
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    return PhoenixOneShotHighlight(
+      key: ValueKey('monitoring-chip-$label-$value'),
+      enabled: !reducedMotion,
+      color: tone ?? theme.colorScheme.primary,
+      borderRadius: const BorderRadius.all(Radius.circular(16)),
+      duration: const Duration(milliseconds: 560),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color:
+              tone?.withValues(alpha: 0.14) ??
+              theme.colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(16),
+          border: tone == null
+              ? null
+              : Border.all(color: tone.withValues(alpha: 0.22)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              value,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w900,
+              ),
             ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
+            const SizedBox(height: 2),
+            Text(
+              label,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -211,16 +231,23 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
           _kv('Базовая роль', user?.role ?? '—'),
           _kv('Эффективная роль', authService.effectiveRole),
           _kv('View role', authService.viewRole ?? '—'),
-          _kv('Tenant code', authService.creatorTenantScopeCode ?? user?.tenantCode ?? '—'),
+          _kv(
+            'Tenant code',
+            authService.creatorTenantScopeCode ?? user?.tenantCode ?? '—',
+          ),
           _kv('Tenant name', user?.tenantName ?? '—'),
-          _kv('Сессия', authService.isSessionDegraded
-              ? 'degraded: ${authService.sessionDegradedReason ?? 'unknown'}'
-              : 'normal'),
+          _kv(
+            'Сессия',
+            authService.isSessionDegraded
+                ? 'degraded: ${authService.sessionDegradedReason ?? 'unknown'}'
+                : 'normal',
+          ),
           _kv('Socket', jsonEncode(socketDiag)),
           _kv('Device endpoint', jsonEncode(endpointDiag)),
         ],
       ),
-      subtitle: 'Creator-only диагностика текущего scope, сокета и device endpoint.',
+      subtitle:
+          'Creator-only диагностика текущего scope, сокета и device endpoint.',
     );
   }
 
@@ -239,9 +266,15 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
           _metricChip('Ошибка 7д', '${_toInt(monitoring['error'])}'),
           _metricChip('Critical 7д', '${_toInt(monitoring['critical'])}'),
           _metricChip('Pending посты', '${_toInt(queue['pending_posts'])}'),
-          _metricChip('Активные блоки', '${_toInt(antifraud['active_blocks'])}'),
+          _metricChip(
+            'Активные блоки',
+            '${_toInt(antifraud['active_blocks'])}',
+          ),
           _metricChip('DB latency', '${_toInt(database['latency_ms'])} ms'),
-          _metricChip('Push endpoints', '${_toInt(push['active_endpoint_count'])}'),
+          _metricChip(
+            'Push endpoints',
+            '${_toInt(push['active_endpoint_count'])}',
+          ),
         ],
       ),
     );
@@ -259,12 +292,27 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
             spacing: 10,
             runSpacing: 10,
             children: [
-              _metricChip('Соединения', '${_toInt(snapshot['active_connections'])}'),
-              _metricChip('Recovered', '${_toInt(snapshot['recovered_connections'])}'),
-              _metricChip('Unrecovered', '${_toInt(snapshot['unrecovered_connections'])}'),
+              _metricChip(
+                'Соединения',
+                '${_toInt(snapshot['active_connections'])}',
+              ),
+              _metricChip(
+                'Recovered',
+                '${_toInt(snapshot['recovered_connections'])}',
+              ),
+              _metricChip(
+                'Unrecovered',
+                '${_toInt(snapshot['unrecovered_connections'])}',
+              ),
               _metricChip('Join denied', '${_toInt(snapshot['join_denied'])}'),
-              _metricChip('Replay fallback', '${_toInt(snapshot['replay_fallback_count'])}'),
-              _metricChip('Outbox fail', '${_toInt(snapshot['outbox_retry_failures'])}'),
+              _metricChip(
+                'Replay fallback',
+                '${_toInt(snapshot['replay_fallback_count'])}',
+              ),
+              _metricChip(
+                'Outbox fail',
+                '${_toInt(snapshot['outbox_retry_failures'])}',
+              ),
             ],
           ),
           if (disconnects.isNotEmpty) ...[
@@ -288,41 +336,52 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
     return _section(
       'Релизы и smoke',
       Column(
-        children: latest.take(6).map((row) {
-          final status = (row['status'] ?? '').toString();
-          final color = switch (status) {
-            'pass' => Colors.green,
-            'warn' => Colors.orange,
-            'fail' => Colors.red,
-            _ => Colors.blueGrey,
-          };
-          return Container(
-            margin: const EdgeInsets.only(bottom: 10),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: color.withValues(alpha: 0.24)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  (row['title'] ?? 'Release check').toString(),
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w800,
+        children: latest
+            .take(6)
+            .map((row) {
+              final status = (row['status'] ?? '').toString();
+              final color = switch (status) {
+                'pass' => Colors.green,
+                'warn' => Colors.orange,
+                'fail' => Colors.red,
+                _ => Colors.blueGrey,
+              };
+              return PhoenixOneShotHighlight(
+                key: ValueKey('release-${row['id'] ?? row['title']}-$status'),
+                color: color,
+                borderRadius: const BorderRadius.all(Radius.circular(16)),
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: color.withValues(alpha: 0.24)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        (row['title'] ?? 'Release check').toString(),
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _kv('Scope', (row['scope'] ?? '—').toString()),
+                      _kv('Status', status),
+                      _kv(
+                        'Version',
+                        '${row['version_name'] ?? '—'}+${row['build_number'] ?? '—'}',
+                      ),
+                      _kv('Target', (row['target'] ?? '—').toString()),
+                      _kv('Summary', (row['summary'] ?? '—').toString()),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 6),
-                _kv('Scope', (row['scope'] ?? '—').toString()),
-                _kv('Status', status),
-                _kv('Version', '${row['version_name'] ?? '—'}+${row['build_number'] ?? '—'}'),
-                _kv('Target', (row['target'] ?? '—').toString()),
-                _kv('Summary', (row['summary'] ?? '—').toString()),
-              ],
-            ),
-          );
-        }).toList(growable: false),
+              );
+            })
+            .toList(growable: false),
       ),
     );
   }
@@ -332,71 +391,76 @@ class _MonitoringScreenState extends State<MonitoringScreen> {
     return _section(
       'События',
       Column(
-        children: _events.map((event) {
-          final id = (event['id'] ?? '').toString();
-          final level = (event['level'] ?? 'info').toString();
-          final expanded = _expandedEventIds.contains(id);
-          final details = event['details'];
-          final color = switch (level) {
-            'critical' => theme.colorScheme.error,
-            'error' => theme.colorScheme.error,
-            'warn' => Colors.orange,
-            _ => theme.colorScheme.primary,
-          };
-          return Container(
-            margin: const EdgeInsets.only(bottom: 10),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerLowest,
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: theme.colorScheme.outlineVariant),
-            ),
-            child: Column(
-              children: [
-                ListTile(
-                  onTap: () {
-                    setState(() {
-                      if (expanded) {
-                        _expandedEventIds.remove(id);
-                      } else {
-                        _expandedEventIds.add(id);
-                      }
-                    });
-                  },
-                  title: Text((event['message'] ?? 'Событие').toString()),
-                  subtitle: Text(
-                    '${event['subsystem'] ?? 'general'} • ${event['code'] ?? '—'} • ${event['created_at'] ?? ''}',
-                  ),
-                  leading: CircleAvatar(
-                    backgroundColor: color.withValues(alpha: 0.16),
-                    child: Icon(Icons.bug_report_outlined, color: color),
-                  ),
-                  trailing: Wrap(
-                    spacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      if (event['resolved'] != true)
-                        TextButton(
-                          onPressed: () => _resolveEvent(id),
-                          child: const Text('Resolve'),
-                        ),
-                      Icon(expanded ? Icons.expand_less : Icons.expand_more),
-                    ],
-                  ),
+        children: _events
+            .map((event) {
+              final id = (event['id'] ?? '').toString();
+              final level = (event['level'] ?? 'info').toString();
+              final expanded = _expandedEventIds.contains(id);
+              final details = event['details'];
+              final color = switch (level) {
+                'critical' => theme.colorScheme.error,
+                'error' => theme.colorScheme.error,
+                'warn' => Colors.orange,
+                _ => theme.colorScheme.primary,
+              };
+              return Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerLowest,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
                 ),
-                if (expanded)
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                    child: SelectableText(
-                      const JsonEncoder.withIndent('  ').convert(details),
-                      style: theme.textTheme.bodySmall,
+                child: Column(
+                  children: [
+                    ListTile(
+                      onTap: () {
+                        setState(() {
+                          if (expanded) {
+                            _expandedEventIds.remove(id);
+                          } else {
+                            _expandedEventIds.add(id);
+                          }
+                        });
+                      },
+                      title: Text((event['message'] ?? 'Событие').toString()),
+                      subtitle: Text(
+                        '${event['subsystem'] ?? 'general'} • ${event['code'] ?? '—'} • ${event['created_at'] ?? ''}',
+                      ),
+                      leading: CircleAvatar(
+                        backgroundColor: color.withValues(alpha: 0.16),
+                        child: Icon(Icons.bug_report_outlined, color: color),
+                      ),
+                      trailing: Wrap(
+                        spacing: 8,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          if (event['resolved'] != true)
+                            TextButton(
+                              onPressed: () => _resolveEvent(id),
+                              child: const Text('Resolve'),
+                            ),
+                          Icon(
+                            expanded ? Icons.expand_less : Icons.expand_more,
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-              ],
-            ),
-          );
-        }).toList(growable: false),
+                    if (expanded)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                        child: SelectableText(
+                          const JsonEncoder.withIndent('  ').convert(details),
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            })
+            .toList(growable: false),
       ),
-      subtitle: 'Показываются уже очищенные structured events без токенов и содержимого ЛС.',
+      subtitle:
+          'Показываются уже очищенные structured events без токенов и содержимого ЛС.',
     );
   }
 

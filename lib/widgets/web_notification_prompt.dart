@@ -160,6 +160,18 @@ class WebNotificationPromptCard extends StatelessWidget {
       isAndroidWeb: _isAndroidWeb,
       isStandalone: isStandalone,
     );
+    final stepIndex = switch (permissionState) {
+      WebNotificationPermissionState.granted => 2,
+      WebNotificationPermissionState.defaultState => loading ? 1 : 0,
+      WebNotificationPermissionState.denied => 0,
+      WebNotificationPermissionState.unsupported => 0,
+    };
+    final tone = switch (permissionState) {
+      WebNotificationPermissionState.granted => colorScheme.tertiary,
+      WebNotificationPermissionState.denied => colorScheme.error,
+      WebNotificationPermissionState.unsupported => colorScheme.outline,
+      WebNotificationPermissionState.defaultState => colorScheme.primary,
+    };
 
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -232,6 +244,32 @@ class WebNotificationPromptCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 14),
+            Row(
+              children: [
+                _NotificationFlowStep(
+                  label: 'Разрешение',
+                  active: stepIndex >= 0,
+                  done: stepIndex > 0,
+                  color: tone,
+                ),
+                _NotificationFlowLine(active: stepIndex > 0, color: tone),
+                _NotificationFlowStep(
+                  label: 'Привязка',
+                  active: stepIndex >= 1,
+                  done: stepIndex > 1,
+                  color: tone,
+                ),
+                _NotificationFlowLine(active: stepIndex > 1, color: tone),
+                _NotificationFlowStep(
+                  label: 'Готово',
+                  active: stepIndex >= 2,
+                  done:
+                      permissionState == WebNotificationPermissionState.granted,
+                  color: tone,
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
             Wrap(
               spacing: 10,
               runSpacing: 10,
@@ -268,6 +306,83 @@ class WebNotificationPromptCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _NotificationFlowLine extends StatelessWidget {
+  const _NotificationFlowLine({required this.active, required this.color});
+
+  final bool active;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 220),
+        height: 2,
+        margin: const EdgeInsets.symmetric(horizontal: 6),
+        decoration: BoxDecoration(
+          color: active
+              ? color.withValues(alpha: 0.70)
+              : Theme.of(context).colorScheme.outlineVariant,
+          borderRadius: BorderRadius.circular(999),
+        ),
+      ),
+    );
+  }
+}
+
+class _NotificationFlowStep extends StatelessWidget {
+  const _NotificationFlowStep({
+    required this.label,
+    required this.active,
+    required this.done,
+    required this.color,
+  });
+
+  final String label;
+  final bool active;
+  final bool done;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 220),
+          width: 26,
+          height: 26,
+          decoration: BoxDecoration(
+            color: active
+                ? color.withValues(alpha: done ? 0.22 : 0.13)
+                : theme.colorScheme.surface,
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: active ? color : theme.colorScheme.outlineVariant,
+            ),
+          ),
+          child: Icon(
+            done ? Icons.check_rounded : Icons.circle,
+            size: done ? 16 : 7,
+            color: active ? color : theme.colorScheme.outline,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: theme.textTheme.labelSmall?.copyWith(
+            color: active
+                ? theme.colorScheme.onSurface
+                : theme.colorScheme.outline,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ],
     );
   }
 }

@@ -65,6 +65,38 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
+function buildPublicationChatMessagePayload(message, { action = 'message_published', queueId = null } = {}) {
+  if (!message || typeof message !== 'object') return null;
+  const chatId = String(message.chat_id || message.chatId || '').trim();
+  const messageId = String(message.id || '').trim();
+  if (!chatId || !messageId) return null;
+  const updatedAt = message.updated_at || message.created_at || new Date().toISOString();
+  return {
+    event_id: `chat-message:${messageId}:${action}`,
+    entity: 'chat_message',
+    entity_id: messageId,
+    action,
+    updated_at: updatedAt,
+    chatId,
+    chat_id: chatId,
+    message_id: messageId,
+    queue_id: queueId || null,
+    message,
+  };
+}
+
+function emitPublicationChatMessage(socketIo, tenantId, message, options = {}) {
+  const payload = buildPublicationChatMessagePayload(message, options);
+  if (!socketIo || !payload) return;
+
+  // Primary path: sockets that explicitly joined the currently opened chat.
+  socketIo.to(`chat:${payload.chat_id}`).emit('chat:message', payload);
+
+  // Fallback path: channel publication can happen while the UI is already open.
+  // Tenant-scoped delivery prevents "post exists after refresh, but not live" gaps.
+  emitToTenant(socketIo, tenantId || null, 'chat:message', payload);
+}
+
 function archivedProductMessageText({
   product,
   sourceChannelTitle,
@@ -1141,9 +1173,9 @@ function emitProcessedPublicationResult(result, io = null) {
   if (!socketIo || !result?.processed) return;
   if (result.kind === 'published') {
     for (const message of result.emitted.hiddenRevisionMessages || []) {
-      socketIo.to(`chat:${message.chat_id}`).emit('chat:message', {
-        chatId: message.chat_id,
-        message,
+      emitPublicationChatMessage(socketIo, result.tenantId || null, message, {
+        action: 'message_hidden',
+        queueId: result.queueItemId || null,
       });
       emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
         chatId: message.chat_id,
@@ -1157,9 +1189,9 @@ function emitProcessedPublicationResult(result, io = null) {
       });
     }
     if (result.emitted.mainMessage) {
-      socketIo.to(`chat:${result.emitted.mainMessage.chat_id}`).emit('chat:message', {
-        chatId: result.emitted.mainMessage.chat_id,
-        message: result.emitted.mainMessage,
+      emitPublicationChatMessage(socketIo, result.tenantId || null, result.emitted.mainMessage, {
+        action: 'message_published',
+        queueId: result.queueItemId || null,
       });
       emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
         chatId: result.emitted.mainMessage.chat_id,
@@ -1175,9 +1207,9 @@ function emitProcessedPublicationResult(result, io = null) {
       });
     }
     for (const archiveMessage of result.emitted.archiveMessages || []) {
-      socketIo.to(`chat:${archiveMessage.chat_id}`).emit('chat:message', {
-        chatId: archiveMessage.chat_id,
-        message: archiveMessage,
+      emitPublicationChatMessage(socketIo, result.tenantId || null, archiveMessage, {
+        action: 'message_published',
+        queueId: result.queueItemId || null,
       });
       emitToTenant(socketIo, result.tenantId || null, 'chat:updated', {
         chatId: archiveMessage.chat_id,

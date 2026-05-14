@@ -14,6 +14,7 @@ import '../utils/date_time_utils.dart';
 import '../widgets/app_avatar.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/app_skeleton.dart';
+import '../widgets/phoenix_visual_effects.dart';
 import 'chat_screen.dart';
 
 class ChatsScreen extends StatefulWidget {
@@ -34,6 +35,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
   bool _loadedOnce = false;
   bool _rulesPromptInProgress = false;
   String _activeFolder = 'primary';
+  final Set<String> _recentlyUpdatedChatIds = <String>{};
+  final Map<String, Timer> _recentlyUpdatedChatTimers = <String, Timer>{};
 
   String _chatIdOf(Map<String, dynamic> chat) => (chat['id'] ?? '').toString();
 
@@ -211,6 +214,28 @@ class _ChatsScreenState extends State<ChatsScreen> {
       }
       _sortChats();
     });
+    _markChatRowRecentlyUpdated(chatId);
+  }
+
+  void _markChatRowRecentlyUpdated(String chatId) {
+    if (chatId.trim().isEmpty) return;
+    _recentlyUpdatedChatTimers.remove(chatId)?.cancel();
+    if (mounted) {
+      setState(() => _recentlyUpdatedChatIds.add(chatId));
+    } else {
+      _recentlyUpdatedChatIds.add(chatId);
+    }
+    _recentlyUpdatedChatTimers[chatId] = Timer(
+      const Duration(milliseconds: 920),
+      () {
+        _recentlyUpdatedChatTimers.remove(chatId);
+        if (!mounted) {
+          _recentlyUpdatedChatIds.remove(chatId);
+          return;
+        }
+        setState(() => _recentlyUpdatedChatIds.remove(chatId));
+      },
+    );
   }
 
   void _scheduleChatsRefresh({Duration delay = const Duration(seconds: 1)}) {
@@ -672,31 +697,95 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final specs = _folderSpecs();
     final activeFolder = _effectiveActiveFolder();
     final chatsSnapshot = List<Map<String, dynamic>>.from(_chats);
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
+    final activeIndex = math.max(
+      0,
+      specs.indexWhere((spec) => spec.id == activeFolder),
+    );
+    final alignmentX = specs.length <= 1
+        ? 0.0
+        : -1.0 + (2.0 * activeIndex / (specs.length - 1));
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    final counts = <String, int>{
+      for (final spec in specs)
+        spec.id: switch (spec.id) {
+          'direct' => chatsSnapshot.where(_isDirectListChat).length,
+          'work' => chatsSnapshot.where(_isWorkChat).length,
+          _ =>
+            chatsSnapshot
+                .where((chat) => !_isDirectListChat(chat) && !_isWorkChat(chat))
+                .length,
+        },
+    };
+    return Padding(
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
-      child: Row(
-        children: specs.map((spec) {
-          final selected = spec.id == activeFolder;
-          final count = switch (spec.id) {
-            'direct' => chatsSnapshot.where(_isDirectListChat).length,
-            'work' => chatsSnapshot.where(_isWorkChat).length,
-            _ =>
-              chatsSnapshot
-                  .where(
-                    (chat) => !_isDirectListChat(chat) && !_isWorkChat(chat),
-                  )
-                  .length,
-          };
-          return Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: ChoiceChip(
-              selected: selected,
-              label: Text('${spec.label} $count'),
-              onSelected: (_) => setState(() => _activeFolder = spec.id),
+      child: Container(
+        height: 48,
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest.withValues(
+            alpha: 0.72,
+          ),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Stack(
+          children: [
+            AnimatedAlign(
+              duration: reducedMotion
+                  ? Duration.zero
+                  : const Duration(milliseconds: 240),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment(alignmentX, 0),
+              child: FractionallySizedBox(
+                widthFactor: specs.isEmpty ? 1 : 1 / specs.length,
+                heightFactor: 1,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.primary,
+                    borderRadius: BorderRadius.circular(999),
+                    boxShadow: [
+                      BoxShadow(
+                        color: theme.colorScheme.primary.withValues(
+                          alpha: 0.22,
+                        ),
+                        blurRadius: 18,
+                        offset: const Offset(0, 8),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
-          );
-        }).toList(),
+            Row(
+              children: specs.map((spec) {
+                final selected = spec.id == activeFolder;
+                final count = counts[spec.id] ?? 0;
+                return Expanded(
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(999),
+                    onTap: () => setState(() => _activeFolder = spec.id),
+                    child: Center(
+                      child: AnimatedDefaultTextStyle(
+                        duration: reducedMotion
+                            ? Duration.zero
+                            : const Duration(milliseconds: 160),
+                        style: theme.textTheme.labelLarge!.copyWith(
+                          color: selected
+                              ? theme.colorScheme.onPrimary
+                              : theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w900,
+                        ),
+                        child: Text('${spec.label} $count'),
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1257,7 +1346,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
       if (type == 'chat:message:read') {
         if (data is Map) {
-          final chatId = (data['chatId'] ?? '').toString().trim();
+          final chatId = (data['chatId'] ?? data['chat_id'] ?? '')
+              .toString()
+              .trim();
           final hasUnreadCount = data.containsKey('unread_count');
           final unreadCount = hasUnreadCount
               ? (int.tryParse('${data['unread_count'] ?? 0}') ?? 0)
@@ -1285,6 +1376,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
   void dispose() {
     _chatEventsSub?.cancel();
     _refreshDebounceTimer?.cancel();
+    for (final timer in _recentlyUpdatedChatTimers.values) {
+      timer.cancel();
+    }
+    _recentlyUpdatedChatTimers.clear();
     super.dispose();
   }
 
@@ -1409,146 +1504,182 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final unreadCount = int.tryParse('${chat['unread_count'] ?? 0}') ?? 0;
     final badge = _buildChatBadge(chat, theme);
     final metaChips = _buildChatMetaChips(chat, theme);
+    final chatId = _chatIdOf(chat);
+    final recentlyUpdated = _recentlyUpdatedChatIds.contains(chatId);
+    final reducedMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(22),
-        child: InkWell(
+      child: PhoenixOneShotHighlight(
+        key: ValueKey('chat-update-$chatId-$recentlyUpdated'),
+        enabled: recentlyUpdated && !reducedMotion,
+        borderRadius: const BorderRadius.all(Radius.circular(22)),
+        child: Material(
+          color: Colors.transparent,
           borderRadius: BorderRadius.circular(22),
-          onTap: () => _openChat(chat),
-          onLongPress: () => _openChatActionsMenu(chat),
-          onSecondaryTapDown: (details) => _openChatActionsMenu(
-            chat,
-            globalPosition: details.globalPosition,
-          ),
-          child: Ink(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  theme.colorScheme.surface,
-                  theme.colorScheme.surfaceContainerLowest,
-                ],
-              ),
+          child: AnimatedScale(
+            duration: reducedMotion
+                ? Duration.zero
+                : const Duration(milliseconds: 180),
+            scale: recentlyUpdated ? 1.006 : 1,
+            curve: Curves.easeOutCubic,
+            child: InkWell(
               borderRadius: BorderRadius.circular(22),
-              border: Border.all(color: theme.colorScheme.outlineVariant),
-              boxShadow: [
-                BoxShadow(
-                  color: theme.colorScheme.shadow.withValues(alpha: 0.04),
-                  blurRadius: 18,
-                  offset: const Offset(0, 8),
+              onTap: () => _openChat(chat),
+              onLongPress: () => _openChatActionsMenu(chat),
+              onSecondaryTapDown: (details) => _openChatActionsMenu(
+                chat,
+                globalPosition: details.globalPosition,
+              ),
+              child: Ink(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 14,
                 ),
-              ],
-            ),
-            child: Row(
-              children: [
-                _buildPreviewableAvatar(
-                  title: title,
-                  imageUrl: avatarUrl,
-                  focusX: avatarFocusX,
-                  focusY: avatarFocusY,
-                  zoom: avatarZoom,
-                  radius: 26,
-                  fallbackIcon: Icons.forum_outlined,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      theme.colorScheme.surface,
+                      theme.colorScheme.surfaceContainerLowest,
+                    ],
+                  ),
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                  boxShadow: [
+                    BoxShadow(
+                      color: theme.colorScheme.shadow.withValues(alpha: 0.04),
+                      blurRadius: 18,
+                      offset: const Offset(0, 8),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
+                child: Row(
+                  children: [
+                    _buildPreviewableAvatar(
+                      title: title,
+                      imageUrl: avatarUrl,
+                      focusX: avatarFocusX,
+                      focusY: avatarFocusY,
+                      zoom: avatarZoom,
+                      radius: 26,
+                      fallbackIcon: Icons.forum_outlined,
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                badge,
-                                const SizedBox(height: 8),
-                                Text(
-                                  title,
-                                  maxLines: 1,
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    badge,
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: theme.textTheme.titleMedium
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  if (time.isNotEmpty)
+                                    Text(
+                                      time,
+                                      style: theme.textTheme.labelMedium
+                                          ?.copyWith(
+                                            color: theme
+                                                .colorScheme
+                                                .onSurfaceVariant,
+                                            fontWeight: unreadCount > 0
+                                                ? FontWeight.w700
+                                                : FontWeight.w500,
+                                          ),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                          if (metaChips.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 6,
+                              children: metaChips,
+                            ),
+                          ],
+                          const SizedBox(height: 10),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  preview,
+                                  maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.titleMedium?.copyWith(
-                                    fontWeight: FontWeight.w700,
+                                  style: theme.textTheme.bodyMedium?.copyWith(
+                                    height: 1.25,
+                                    color: unreadCount > 0
+                                        ? theme.colorScheme.onSurface
+                                        : theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                              if (unreadCount > 0) ...[
+                                const SizedBox(width: 10),
+                                AnimatedScale(
+                                  duration: reducedMotion
+                                      ? Duration.zero
+                                      : const Duration(milliseconds: 220),
+                                  curve: Curves.easeOutBack,
+                                  scale: recentlyUpdated ? 1.14 : 1,
+                                  child: Container(
+                                    constraints: const BoxConstraints(
+                                      minWidth: 22,
+                                      minHeight: 22,
+                                    ),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7,
+                                      vertical: 3,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: theme.colorScheme.primary,
+                                      borderRadius: BorderRadius.circular(999),
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      unreadCount > 99 ? '99+' : '$unreadCount',
+                                      style: theme.textTheme.labelSmall
+                                          ?.copyWith(
+                                            color: theme.colorScheme.onPrimary,
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                    ),
                                   ),
                                 ),
                               ],
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            children: [
-                              if (time.isNotEmpty)
-                                Text(
-                                  time,
-                                  style: theme.textTheme.labelMedium?.copyWith(
-                                    color: theme.colorScheme.onSurfaceVariant,
-                                    fontWeight: unreadCount > 0
-                                        ? FontWeight.w700
-                                        : FontWeight.w500,
-                                  ),
-                                ),
                             ],
                           ),
                         ],
                       ),
-                      if (metaChips.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Wrap(spacing: 6, runSpacing: 6, children: metaChips),
-                      ],
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              preview,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                height: 1.25,
-                                color: unreadCount > 0
-                                    ? theme.colorScheme.onSurface
-                                    : theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ),
-                          if (unreadCount > 0) ...[
-                            const SizedBox(width: 10),
-                            Container(
-                              constraints: const BoxConstraints(
-                                minWidth: 22,
-                                minHeight: 22,
-                              ),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: theme.colorScheme.primary,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              alignment: Alignment.center,
-                              child: Text(
-                                unreadCount > 99 ? '99+' : '$unreadCount',
-                                style: theme.textTheme.labelSmall?.copyWith(
-                                  color: theme.colorScheme.onPrimary,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ],
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
         ),

@@ -1116,12 +1116,25 @@ async function canEmitChatActivity(user, chatId) {
               if (!chatId || !uid) return;
               const allowed = await canEmitChatActivity(socket.user, chatId);
               if (!allowed) return;
+              const hasActive = Object.prototype.hasOwnProperty.call(map, "active");
+              const active = hasActive
+                ? !(
+                    map.active === false ||
+                    String(map.active || "").trim().toLowerCase() === "false" ||
+                    String(map.active || "").trim() === "0"
+                  )
+                : true;
+              const requestedTtlMs = Number(map.ttl_ms || map.ttlMs || 4500);
+              const ttlMs = Number.isFinite(requestedTtlMs)
+                ? Math.max(800, Math.min(12000, Math.round(requestedTtlMs)))
+                : 4500;
               socket.to(`chat:${chatId}`).emit(eventName, {
                 chat_id: chatId,
                 chatId,
                 user_id: uid,
                 userId: uid,
-                ttl_ms: 4500,
+                active,
+                ttl_ms: ttlMs,
                 sent_at: new Date().toISOString(),
               });
             });
