@@ -507,8 +507,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _inputFocusNode.addListener(() {
       if (_inputFocusNode.hasFocus) {
         _scrollToBottom(animated: true);
-      } else {
+      } else if (_controller.text.trim().isEmpty) {
         _maybeEmitTypingInactive();
+      } else {
+        _maybeEmitTypingActivity();
       }
     });
     _scrollController.addListener(_handleScroll);
@@ -1394,11 +1396,11 @@ class _ChatScreenState extends State<ChatScreen> {
   void _maybeEmitTypingActivity() {
     if (!_isDirectMessageChat()) return;
     if (!_canCompose()) return;
-    if (_controller.text.trim().isEmpty) return;
-    _localTypingIdleTimer?.cancel();
-    _localTypingIdleTimer = Timer(const Duration(milliseconds: 3800), () {
+    if (_controller.text.trim().isEmpty) {
       _maybeEmitTypingInactive();
-    });
+      return;
+    }
+    _scheduleTypingKeepAlive();
     final now = DateTime.now();
     final last = _lastTypingEmitAt;
     if (last != null && now.difference(last).inMilliseconds < 1800) {
@@ -1407,6 +1409,18 @@ class _ChatScreenState extends State<ChatScreen> {
     _lastTypingEmitAt = now;
     _localTypingActiveSent = true;
     unawaited(_emitChatActivity('chat:typing', active: true));
+  }
+
+  void _scheduleTypingKeepAlive() {
+    _localTypingIdleTimer?.cancel();
+    _localTypingIdleTimer = Timer(const Duration(milliseconds: 2600), () {
+      if (!mounted) return;
+      if (_controller.text.trim().isEmpty || !_canCompose()) {
+        _maybeEmitTypingInactive();
+        return;
+      }
+      _maybeEmitTypingActivity();
+    });
   }
 
   void _maybeEmitTypingInactive() {
