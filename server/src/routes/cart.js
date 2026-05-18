@@ -17,6 +17,7 @@ const { resolveSharedCartOwnerId } = require('../utils/phoneAccess');
 const { uploadsPath } = require('../utils/storagePaths');
 const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
 const { toOriginalPublicMediaUrl } = require('../utils/mediaAssets');
+const { insertAdminSystemMessage } = require('../utils/systemChannels');
 
 const requireReservationFulfillPermission = requirePermission('reservation.fulfill');
 const requireDeliveryManagePermission = requirePermission('delivery.manage');
@@ -82,6 +83,26 @@ function normalizeNullableText(raw, { max = 1000 } = {}) {
   const text = String(raw ?? '').trim();
   if (!text) return null;
   return text.slice(0, max);
+}
+
+function formatCartSystemShelf(raw) {
+  const shelf = String(raw ?? '').trim();
+  return shelf || 'не назначена';
+}
+
+function buildCartDismantledSystemText({
+  customerName,
+  phoneLabel,
+  shelfLabel,
+  removedUnits,
+}) {
+  return [
+    'Корзина расформирована.',
+    `Клиент: ${String(customerName || 'Клиент').trim() || 'Клиент'}`,
+    `Телефон: ${String(phoneLabel || 'номер не указан').trim() || 'номер не указан'}`,
+    `Полка: ${formatCartSystemShelf(shelfLabel)}`,
+    `Возвращено товаров: ${Number(removedUnits || 0)}`,
+  ].join('\n');
 }
 
 function emitCartUpdated(req, userId, payload = {}, extraUserIds = []) {
@@ -1863,6 +1884,29 @@ router.post(
         req.user?.tenant_id || null,
       );
       const cartOwnerId = String(effectiveOwnerId || '').trim() || userId;
+      const ownerInfoQ = await client.query(
+        `SELECT u.id,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+                COALESCE(NULLIF(BTRIM(ph.phone), ''), '') AS customer_phone,
+                us.shelf_number
+         FROM users u
+         LEFT JOIN LATERAL (
+           SELECT phone
+           FROM phones
+           WHERE user_id = u.id
+           ORDER BY created_at DESC NULLS LAST
+           LIMIT 1
+         ) ph ON true
+         LEFT JOIN user_shelves us ON us.user_id = u.id
+         WHERE u.id = $1
+         LIMIT 1`,
+        [cartOwnerId],
+      );
+      const ownerInfo = ownerInfoQ.rows[0] || {};
+      const ownerPhoneDigits = String(ownerInfo.customer_phone || '').replace(/\D/g, '');
+      const ownerPhoneLabel = ownerPhoneDigits.length >= 4
+        ? `••••${ownerPhoneDigits.slice(-4)}`
+        : 'номер не указан';
 
       await client.query('BEGIN');
       const cartIdsQ = await client.query(
@@ -1905,10 +1949,49 @@ router.post(
         }
       }
 
+      let systemNotice = null;
+      if (removedCount > 0 && req.user?.tenant_id) {
+        const result = await insertAdminSystemMessage(client, {
+          tenantId: req.user?.tenant_id || null,
+          createdBy: req.user?.id || null,
+          text: buildCartDismantledSystemText({
+            customerName: ownerInfo.customer_name,
+            phoneLabel: ownerPhoneLabel,
+            shelfLabel: ownerInfo.shelf_number,
+            removedUnits,
+          }),
+          meta: {
+            kind: 'cart_retention_dismantled',
+            action: 'dismantled_cart',
+            cart_owner_id: cartOwnerId,
+            requested_user_id: userId,
+            shelf_number: ownerInfo.shelf_number == null
+              ? null
+              : String(ownerInfo.shelf_number),
+            customer_name: ownerInfo.customer_name || null,
+            customer_phone_label: ownerPhoneLabel,
+            removed_items: removedCount,
+            removed_units: removedUnits,
+          },
+        });
+        if (result?.message?.id) {
+          systemNotice = result;
+        }
+      }
+
       await client.query('COMMIT');
 
       const io = req.app.get('io');
       if (io) {
+        if (systemNotice?.chat?.id && systemNotice?.message?.id) {
+          io.to(`chat:${systemNotice.chat.id}`).emit('chat:message', {
+            chatId: systemNotice.chat.id,
+            message: systemNotice.message,
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: systemNotice.chat.id,
+          });
+        }
         for (const message of updatedCatalogMessages) {
           io.to(`chat:${message.chat_id}`).emit('chat:message', {
             chatId: message.chat_id,

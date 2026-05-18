@@ -726,9 +726,9 @@ bool _canCurrentUserClaimSupportQueueAlerts() {
   final user = authService.currentUser;
   if (user == null) return false;
   final baseRole = user.role.toLowerCase().trim();
-  if (baseRole == 'creator') return false;
   final role = authService.effectiveRole.toLowerCase().trim();
-  if (role == 'creator' || role == 'client') return false;
+  if (baseRole == 'creator' || role == 'creator') return true;
+  if (role == 'client') return false;
   if (role == 'admin' || role == 'tenant') return true;
   if (role == 'worker') {
     return authService.hasPermission('chat.write.support');
@@ -1534,6 +1534,15 @@ Future<void> _probePendingPhoneAccessRequests() async {
   try {
     final user = authService.currentUser;
     if (user == null) {
+      phoneAccessOwnerRequestNotifier.value = null;
+      return;
+    }
+    final role = authService.effectiveRole.toLowerCase().trim();
+    final baseRole = user.role.toLowerCase().trim();
+    if (role != 'creator' &&
+        role != 'tenant' &&
+        role != 'admin' &&
+        baseRole != 'creator') {
       phoneAccessOwnerRequestNotifier.value = null;
       return;
     }
@@ -3190,8 +3199,6 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                       ),
                                                     ),
                                                     IconButton(
-                                                      tooltip:
-                                                          'Скрыть до следующего входа в Чаты',
                                                       onPressed: () =>
                                                           _dismissSupportQueueNotice(
                                                             notice.ticketId,
@@ -4811,6 +4818,10 @@ Future<void> _initSocket() async {
       debugPrint('📡 Socket disconnected: $reason');
       _lastSocketDisconnectedAt = DateTime.now();
       _lastSocketDisconnectReason = '$reason';
+      chatEventsController.add({
+        'type': 'socket:disconnected',
+        'data': {'reason': '$reason'},
+      });
       unawaited(
         MonitoringService.captureEvent(
           subsystem: 'realtime',
@@ -4825,6 +4836,10 @@ Future<void> _initSocket() async {
     socket?.on('connect_error', (err) {
       debugPrint('❌ Socket connect_error: $err');
       _lastSocketConnectError = '$err';
+      chatEventsController.add({
+        'type': 'socket:connect_error',
+        'data': {'error': '$err'},
+      });
       unawaited(
         MonitoringService.captureEvent(
           subsystem: 'realtime',
@@ -5387,7 +5402,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   void _restartSubscriptionProbe() {
     _subscriptionProbeTimer?.cancel();
     _subscriptionProbeTimer = Timer.periodic(
-      const Duration(seconds: 10),
+      const Duration(seconds: 45),
       (_) => unawaited(_probeSubscriptionState()),
     );
     unawaited(_probeSubscriptionState());
@@ -5396,7 +5411,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   void _restartPhoneAccessProbe() {
     _phoneAccessProbeTimer?.cancel();
     _phoneAccessProbeTimer = Timer.periodic(
-      const Duration(seconds: 8),
+      const Duration(seconds: 45),
       (_) => unawaited(_probePhoneAccessOwnerRequests()),
     );
     unawaited(_probePhoneAccessOwnerRequests());
@@ -5405,7 +5420,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   void _restartOfflinePurchaseProbe() {
     _offlinePurchaseProbeTimer?.cancel();
     _offlinePurchaseProbeTimer = Timer.periodic(
-      const Duration(seconds: 7),
+      const Duration(seconds: 30),
       (_) => unawaited(_probeOfflinePurchaseQueue()),
     );
     unawaited(_probeOfflinePurchaseQueue());
@@ -5685,6 +5700,15 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     if (!mounted || _phoneAccessProbeBusy) return;
     final user = authService.currentUser;
     if (user == null) return;
+    final role = authService.effectiveRole.toLowerCase().trim();
+    final baseRole = user.role.toLowerCase().trim();
+    if (role != 'creator' &&
+        role != 'tenant' &&
+        role != 'admin' &&
+        baseRole != 'creator') {
+      phoneAccessOwnerRequestNotifier.value = null;
+      return;
+    }
     _phoneAccessProbeBusy = true;
     try {
       await _probePendingPhoneAccessRequests();

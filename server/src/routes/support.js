@@ -174,7 +174,7 @@ async function ensureSupportStaffAccess(req, res, next) {
     }
 
     const role = normalizeRole(req.user.role);
-    if (role === "admin" || role === "tenant") {
+    if (role === "admin" || role === "tenant" || role === "creator") {
       return next();
     }
 
@@ -1514,7 +1514,9 @@ router.post(
 
       const ticket = ticketRes.rows[0];
       const requesterId = String(req.user.id || "").trim();
+      const requesterRole = normalizeRole(req.user.role);
       const isAssignee = String(ticket.assignee_id || "").trim() === requesterId;
+      const canForceResolve = isAdminTierRole(requesterRole);
 
       if (ticket.status === "resolved") {
         await client.query("ROLLBACK");
@@ -1543,7 +1545,7 @@ router.post(
         });
       }
 
-      if (!isAssignee) {
+      if (!isAssignee && !canForceResolve) {
         await client.query("ROLLBACK");
         return res.status(403).json({
           ok: false,
@@ -1558,9 +1560,11 @@ router.post(
              resolved_at = now(),
              archived_at = NULL,
              archive_reason = NULL,
+             assignee_id = COALESCE(assignee_id, $1::uuid),
+             assigned_role = COALESCE(NULLIF(assigned_role, ''), $3),
              updated_at = now()
          WHERE id = $2`,
-        [req.user.id || null, ticket.id],
+        [req.user.id || null, ticket.id, requesterRole || "admin"],
       );
 
       const promptMessage = await insertSupportMessage(client, {
@@ -1584,6 +1588,18 @@ router.post(
           promptMessage.chat_id,
           promptMessage.id,
         );
+      }
+      const io = req.app.get("io");
+      if (io) {
+        const payload = await hydrateSupportQueueTicket(db, ticket.id);
+        if (payload) {
+          emitToTenant(
+            io,
+            req.user.tenant_id || null,
+            "support:ticket:resolved",
+            payload,
+          );
+        }
       }
 
       return res.json({
@@ -1785,8 +1801,7 @@ router.post(
       const requesterRole = normalizeRole(req.user.role);
       const isAssignee =
         String(ticket.assignee_id || "").trim() === requesterId;
-      const canForceArchive =
-        forceArchive && requesterRole !== "creator";
+      const canForceArchive = forceArchive && isAdminTierRole(requesterRole);
       if (ticket.status === "archived") {
         await client.query("ROLLBACK");
         return res.json({

@@ -740,17 +740,27 @@ function canReadChat(context, userRole, permissions = {}) {
   }
 
   if (isSupportTicketChatContext(context)) {
-    if (!context.hasMembers) return false;
+    if (!context.hasMembers && !String(context.supportTicket?.customerId || "").trim()) {
+      return false;
+    }
     if (context.isMember) return true;
     const status = String(context.supportTicket?.status || "")
       .toLowerCase()
       .trim();
-    if (status !== "archived") return false;
-    if (role === "admin" || role === "tenant" || role === "creator") {
-      return true;
+    if (status === "archived") {
+      if (role === "admin" || role === "tenant" || role === "creator") {
+        return true;
+      }
+      if (role === "worker") {
+        return hasPermission(permissions, "chat.write.support");
+      }
+      return false;
     }
-    if (role === "worker") {
-      return hasPermission(permissions, "chat.write.support");
+    if (
+      !String(context.supportTicket?.assigneeId || "").trim() &&
+      canModerateSupportTicket(role, permissions)
+    ) {
+      return true;
     }
     return false;
   }
@@ -814,14 +824,20 @@ function canPostChat(context, userRole, permissions = {}) {
   }
 
   if (isSupportTicketChatContext(context)) {
-    if (!context.hasMembers) return false;
+    if (!context.hasMembers && !String(context.supportTicket?.customerId || "").trim()) {
+      return false;
+    }
     const status = String(context.supportTicket?.status || "")
       .toLowerCase()
       .trim();
     if (status === "archived") {
       return false;
     }
-    return context.isMember;
+    if (context.isMember) return true;
+    return (
+      !String(context.supportTicket?.assigneeId || "").trim() &&
+      canModerateSupportTicket(role, permissions)
+    );
   }
   if (context.chat.type === "private" && context.directRequestStatus) {
     const status = context.directRequestStatus.status;
@@ -872,6 +888,14 @@ function isStaffRole(role) {
     normalized === "tenant" ||
     normalized === "creator"
   );
+}
+
+function canModerateSupportTicket(role, permissions = {}) {
+  const normalized = normalizeRole(role);
+  if (normalized === "admin" || normalized === "tenant" || normalized === "creator") {
+    return true;
+  }
+  return normalized === "worker" && hasPermission(permissions, "chat.write.support");
 }
 
 function supportTicketIdFromSettings(settings) {
@@ -1578,6 +1602,18 @@ function extractChatMediaRef(rawUrl) {
   return null;
 }
 
+function storageFilenameFromMediaUrl(rawUrl) {
+  const ref = extractChatMediaRef(rawUrl);
+  if (ref?.filename) return ref.filename;
+  const clean = String(rawUrl || "").trim().split(/[?#]/)[0];
+  const filename = path.basename(clean);
+  if (!filename || filename === "." || filename === clean) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(filename) || filename.startsWith(".")) {
+    return null;
+  }
+  return filename;
+}
+
 function signChatMediaAccess(pathValue, expUnixSeconds, secret) {
   return crypto
     .createHmac("sha256", String(secret || CHAT_MEDIA_KEYRING.currentSecret || ""))
@@ -2009,6 +2045,7 @@ async function upsertMessageAttachments({
          sort_order,
          media_group_id,
          storage_url,
+         storage_filename,
          file_name,
          mime_type,
          file_size,
@@ -2021,6 +2058,7 @@ async function upsertMessageAttachments({
          processing_state,
          checksum_sha256,
          preview_image_url,
+         preview_filename,
          preview_width,
          preview_height,
          waveform_peaks,
@@ -2030,7 +2068,7 @@ async function upsertMessageAttachments({
          created_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::jsonb, $22::jsonb, $23, now()
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23::jsonb, $24::jsonb, $25, $26, now()
        )`,
       [
         uuidv4(),
@@ -2039,6 +2077,7 @@ async function upsertMessageAttachments({
         Number(attachment.sort_order ?? index) || 0,
         attachment.media_group_id || null,
         storageUrl,
+        storageFilenameFromMediaUrl(storageUrl),
         attachment.file_name || null,
         attachment.mime_type || null,
         attachment.file_size == null ? null : Number(attachment.file_size),
@@ -2053,6 +2092,7 @@ async function upsertMessageAttachments({
         normalizeAttachmentProcessingState(attachment.processing_state),
         attachment.checksum_sha256 || null,
         attachment.preview_image_url || null,
+        storageFilenameFromMediaUrl(attachment.preview_image_url),
         attachment.preview_width == null
           ? null
           : Number(attachment.preview_width),
@@ -2745,6 +2785,7 @@ async function syncSupportTicketOnMessage({
         return { promptMessageId: null, autoReplyMessageId: null };
       }
 
+      const shouldClaimTicket = !ticket.assignee_id && senderIdText.length > 0;
       await client.query(
         `UPDATE support_tickets
          SET assignee_id = COALESCE(assignee_id, $1::uuid),
@@ -2766,6 +2807,29 @@ async function syncSupportTicketOnMessage({
           ticket.id,
         ],
       );
+
+      if (shouldClaimTicket) {
+        await client.query(
+          `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+           VALUES ($1, $2, $3, now(), 'moderator')
+           ON CONFLICT (chat_id, user_id)
+           DO UPDATE SET role = 'moderator'`,
+          [uuidv4(), chatId, senderIdText],
+        );
+        await client.query(
+          `INSERT INTO user_chat_preferences (user_id, chat_id, hidden, pinned, created_at, updated_at)
+           SELECT member.user_id, $1::uuid, false, false, now(), now()
+           FROM (
+             SELECT $2::uuid AS user_id
+             UNION
+             SELECT $3::uuid AS user_id
+           ) AS member
+           WHERE member.user_id IS NOT NULL
+           ON CONFLICT (user_id, chat_id)
+           DO UPDATE SET hidden = false, updated_at = now()`,
+          [chatId, ticket.customer_id || null, senderIdText],
+        );
+      }
     }
 
     await client.query("COMMIT");
@@ -3336,6 +3400,9 @@ async function listChatsHandler(req, res) {
               c.type,
               c.settings,
               CASE
+                WHEN COALESCE(c.settings->>'system_key', '') = 'admin_system'
+                  OR COALESCE(c.settings->>'kind', '') = 'admin_system'
+                  THEN COALESCE(NULLIF(BTRIM(c.title), ''), 'Система')
                 WHEN c.type = 'private'
                   THEN COALESCE(
                     NULLIF(BTRIM(peer.peer_display_name), ''),
@@ -3511,6 +3578,9 @@ async function listChatsHandler(req, res) {
               c.type,
               c.settings,
               CASE
+                WHEN COALESCE(c.settings->>'system_key', '') = 'admin_system'
+                  OR COALESCE(c.settings->>'kind', '') = 'admin_system'
+                  THEN COALESCE(NULLIF(BTRIM(c.title), ''), 'Система')
                 WHEN c.type = 'private'
                   THEN COALESCE(
                     NULLIF(BTRIM(peer.peer_display_name), ''),
@@ -4093,20 +4163,36 @@ router.get("/media/:kind/:filename", async (req, res) => {
       return res.status(403).json({ ok: false, error: "Invalid media token" });
     }
 
-    const mediaField = kind === "image"
-      ? "image_url"
-      : kind === "voice"
-      ? "voice_url"
-      : "video_url";
     const refQ = await db.query(
       `SELECT 1
-       FROM messages m
-       WHERE COALESCE(m.meta->>$1, '') LIKE $2
+       FROM message_attachments ma
+       WHERE (
+          ma.attachment_type = $1
+          AND ma.storage_filename = $2
+       )
+       OR (
+          $1 = 'image'
+          AND ma.preview_filename = $2
+       )
        LIMIT 1`,
-      [mediaField, `%${canonicalPath}%`],
+      [kind, filename],
     );
     if (refQ.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "Media reference not found" });
+      const mediaField = kind === "image"
+        ? "image_url"
+        : kind === "voice"
+        ? "voice_url"
+        : "video_url";
+      const legacyRefQ = await db.query(
+        `SELECT 1
+         FROM messages m
+         WHERE COALESCE(m.meta->>$1, '') LIKE $2
+         LIMIT 1`,
+        [mediaField, `%${canonicalPath}%`],
+      );
+      if (legacyRefQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Media reference not found" });
+      }
     }
 
     const baseDir = kind === "image"
@@ -4128,6 +4214,18 @@ router.get("/media/:kind/:filename", async (req, res) => {
 
     res.setHeader("Cache-Control", "private, max-age=60");
     res.setHeader("X-Content-Type-Options", "nosniff");
+    const ext = path.extname(filename).toLowerCase();
+    if (kind === "voice") {
+      if (ext === ".m4a" || ext === ".mp4") res.type("audio/mp4");
+      else if (ext === ".mp3") res.type("audio/mpeg");
+      else if (ext === ".wav") res.type("audio/wav");
+      else if (ext === ".ogg") res.type("audio/ogg");
+      else if (ext === ".webm") res.type("audio/webm");
+    } else if (kind === "video") {
+      if (ext === ".mov") res.type("video/quicktime");
+      else if (ext === ".mp4" || ext === ".m4v") res.type("video/mp4");
+      else if (ext === ".webm") res.type("video/webm");
+    }
     return res.sendFile(absoluteFilePath);
   } catch (err) {
     console.error("chats.media error", err);
@@ -5307,7 +5405,7 @@ router.post("/:chatId/outbox/reconcile", requireAuth, async (req, res) => {
       `SELECT id, client_msg_id
        FROM messages
        WHERE chat_id = $1
-         AND client_msg_id = ANY($2::text[])`,
+         AND client_msg_id::text = ANY($2::text[])`,
       [chatId, clientMsgIds],
     );
     const sessionsQ = await db.query(
@@ -5713,6 +5811,46 @@ router.post(
             }
           : {}),
       };
+      const attachmentRecord = {
+        attachment_type: attachmentType,
+        sort_order: 0,
+        storage_url: mediaUrl,
+        file_name: String(
+          uploadedFile.originalname || uploadedFile.filename || "",
+        ).trim() || null,
+        mime_type: String(uploadedFile.mimetype || "").trim() || null,
+        file_size:
+          processedAttachment.file_size == null
+            ? uploadedFile.size == null
+              ? null
+              : Number(uploadedFile.size)
+            : Number(processedAttachment.file_size),
+        width: normalizedWidth,
+        height: normalizedHeight,
+        aspect_ratio:
+          imageAspectRatio ||
+          (normalizedWidth && normalizedHeight
+            ? Number((normalizedWidth / normalizedHeight).toFixed(4))
+            : null),
+        duration_ms: normalizedDurationMs > 0 ? normalizedDurationMs : null,
+        preprocess_tag: imagePreprocess || null,
+        quality_mode: req.body?.quality_mode,
+        processing_state: processedAttachment.processing_state,
+        checksum_sha256: processedAttachment.checksum_sha256,
+        preview_image_url: processedAttachment.preview_image_url,
+        preview_width: processedAttachment.preview_width,
+        preview_height: processedAttachment.preview_height,
+        waveform_peaks: processedAttachment.waveform_peaks,
+        extra_meta: processedAttachment.extra_meta,
+        is_video_note:
+          attachmentType === "video" &&
+          (req.body?.is_video_note == true ||
+            String(req.body?.is_video_note || "").trim() == "true"),
+        is_listen_once:
+          attachmentType === "voice" &&
+          (req.body?.listen_once == true ||
+            String(req.body?.listen_once || "").trim() == "true"),
+      };
 
       if (clientMsgId) {
         const existing = await db.query(
@@ -5723,11 +5861,39 @@ router.post(
           [clientMsgId],
         );
         if (existing.rowCount > 0) {
+          const existingMessageId = existing.rows[0].id;
+          const existingAttachment = await db.query(
+            `SELECT 1
+             FROM message_attachments
+             WHERE message_id = $1 AND attachment_type = $2
+             LIMIT 1`,
+            [existingMessageId, attachmentType],
+          );
+          if (existingAttachment.rowCount === 0) {
+            await db.query(
+              `UPDATE messages
+               SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb
+               WHERE id = $1`,
+              [existingMessageId, JSON.stringify(meta)],
+            );
+            await upsertMessageAttachments({
+              messageId: existingMessageId,
+              attachments: [attachmentRecord],
+            });
+            await syncMessageSearchDocumentFromMessageId(existingMessageId);
+            const repairedMessage = await finalizeCreatedMessage(
+              req,
+              chatId,
+              existingMessageId,
+              userId,
+            );
+            return res.status(201).json({ ok: true, data: repairedMessage });
+          }
           removeUploadedFiles(uploadedFiles);
           const responseMessage = await finalizeCreatedMessage(
             req,
             chatId,
-            existing.rows[0].id,
+            existingMessageId,
             userId,
           );
           return res.status(201).json({ ok: true, data: responseMessage });
@@ -5750,51 +5916,10 @@ router.post(
           error: "Не удалось создать сообщение",
         });
       }
-      await upsertMessageAttachments({
-        messageId,
-        attachments: [
-          {
-            attachment_type: attachmentType,
-            sort_order: 0,
-            storage_url: mediaUrl,
-            file_name: String(
-              uploadedFile.originalname || uploadedFile.filename || "",
-            ).trim() || null,
-            mime_type: String(uploadedFile.mimetype || "").trim() || null,
-            file_size:
-              processedAttachment.file_size == null
-                ? uploadedFile.size == null
-                  ? null
-                  : Number(uploadedFile.size)
-                : Number(processedAttachment.file_size),
-            width: normalizedWidth,
-            height: normalizedHeight,
-            aspect_ratio:
-              imageAspectRatio ||
-              (normalizedWidth && normalizedHeight
-                ? Number((normalizedWidth / normalizedHeight).toFixed(4))
-                : null),
-            duration_ms: normalizedDurationMs > 0 ? normalizedDurationMs : null,
-            preprocess_tag: imagePreprocess || null,
-            quality_mode: req.body?.quality_mode,
-            processing_state: processedAttachment.processing_state,
-            checksum_sha256: processedAttachment.checksum_sha256,
-            preview_image_url: processedAttachment.preview_image_url,
-            preview_width: processedAttachment.preview_width,
-            preview_height: processedAttachment.preview_height,
-            waveform_peaks: processedAttachment.waveform_peaks,
-            extra_meta: processedAttachment.extra_meta,
-            is_video_note:
-              attachmentType === "video" &&
-              (req.body?.is_video_note == true ||
-                String(req.body?.is_video_note || "").trim() == "true"),
-            is_listen_once:
-              attachmentType === "voice" &&
-              (req.body?.listen_once == true ||
-                String(req.body?.listen_once || "").trim() == "true"),
-          },
-        ],
-      });
+	      await upsertMessageAttachments({
+	        messageId,
+	        attachments: [attachmentRecord],
+	      });
       await syncMessageSearchDocumentFromMessageId(messageId);
       const qualityResolution = resolveAttachmentQualityMode(
         req.body?.quality_mode,

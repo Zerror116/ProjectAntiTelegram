@@ -46,6 +46,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   StreamSubscription? _authSub;
   List<_WorkerTabSpec> _visibleTabs = const <_WorkerTabSpec>[];
   StreamSubscription? _chatEventsSub;
+  Timer? _channelsRefreshDebounce;
   Timer? _ownPostsRefreshDebounce;
 
   final _titleCtrl = TextEditingController();
@@ -227,19 +228,19 @@ class _WorkerPanelState extends State<WorkerPanel>
   void initState() {
     super.initState();
     _rebuildVisibleTabs(force: true, notify: false);
-    _loadVisibleTabData();
+    _loadActiveTabData();
     _chatEventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
       if ((type == 'chat:created' || type == 'chat:deleted') &&
-          (_hasVisibleTab('new') || _hasVisibleTab('old'))) {
-        _loadChannels();
+          (_isActiveTab('new') || _isActiveTab('old'))) {
+        _scheduleChannelsRefresh();
       }
       if ((type == 'channel:updated' ||
               type == 'channel:members:updated' ||
               type == 'channel:media:updated' ||
               type == 'socket:connected') &&
-          (_hasVisibleTab('new') || _hasVisibleTab('old'))) {
-        _loadChannels();
+          (_isActiveTab('new') || _isActiveTab('old'))) {
+        _scheduleChannelsRefresh();
       }
       if (type == 'chat:updated' ||
           type == 'catalog:queue:updated' ||
@@ -249,10 +250,10 @@ class _WorkerPanelState extends State<WorkerPanel>
         _ownPostsRefreshDebounce = Timer(
           const Duration(milliseconds: 650),
           () async {
-            if (_hasVisibleTab('own')) {
+            if (_isActiveTab('own')) {
               await _loadOwnQueuedPosts();
             }
-            if (_hasVisibleTab('revision')) {
+            if (_isActiveTab('revision')) {
               await _loadRevisionPosts();
             }
           },
@@ -262,7 +263,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _authSub = authService.authStream.listen((_) {
       final changed = _rebuildVisibleTabs();
       if (changed) {
-        _loadVisibleTabData();
+        _loadActiveTabData();
       }
     });
   }
@@ -271,6 +272,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   void dispose() {
     _chatEventsSub?.cancel();
     _authSub?.cancel();
+    _channelsRefreshDebounce?.cancel();
     _ownPostsRefreshDebounce?.cancel();
     _tabController?.dispose();
     _titleCtrl.dispose();
@@ -386,14 +388,35 @@ class _WorkerPanelState extends State<WorkerPanel>
       vsync: this,
       initialIndex: initialIndex,
     );
+    _tabController?.addListener(_handleActiveTabChanged);
     if (notify && mounted) {
       setState(() {});
     }
     return true;
   }
 
-  bool _hasVisibleTab(String id) {
-    return _visibleTabs.any((tab) => tab.id == id);
+  String? _activeTabId() {
+    final controller = _tabController;
+    if (controller == null || _visibleTabs.isEmpty) return null;
+    final index = controller.index.clamp(0, _visibleTabs.length - 1);
+    return _visibleTabs[index].id;
+  }
+
+  bool _isActiveTab(String id) => _activeTabId() == id;
+
+  void _handleActiveTabChanged() {
+    final controller = _tabController;
+    if (controller == null || controller.indexIsChanging) return;
+    _loadActiveTabData();
+  }
+
+  void _scheduleChannelsRefresh() {
+    _channelsRefreshDebounce?.cancel();
+    _channelsRefreshDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (_isActiveTab('new') || _isActiveTab('old')) {
+        _loadChannels();
+      }
+    });
   }
 
   void _animateToTab(String id) {
@@ -404,15 +427,15 @@ class _WorkerPanelState extends State<WorkerPanel>
     controller.animateTo(index);
   }
 
-  void _loadVisibleTabData() {
-    if (_hasVisibleTab('new') || _hasVisibleTab('old')) {
-      _loadChannels();
-    }
-    if (_hasVisibleTab('own')) {
-      _loadOwnQueuedPosts();
-    }
-    if (_hasVisibleTab('revision')) {
-      _loadRevisionShelves();
+  void _loadActiveTabData() {
+    switch (_activeTabId()) {
+      case 'new':
+      case 'old':
+        _loadChannels();
+      case 'own':
+        _loadOwnQueuedPosts();
+      case 'revision':
+        _loadRevisionShelves();
     }
   }
 

@@ -216,11 +216,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final Map<String, String> _roleSelectionByUserId = {};
   final Set<String> _supportClaimBusyTicketIds = <String>{};
   final Set<String> _supportFinishBusyTicketIds = <String>{};
+  final Set<String> _cartRetentionBusyIds = <String>{};
   Timer? _supportDraftSaveTimer;
   Timer? _clientCartUndoTimer;
   Timer? _publishProgressTimer;
   Timer? _pendingPostsRefreshDebounce;
   Timer? _channelsRefreshDebounce;
+  Timer? _deliveryRefreshDebounce;
+  Timer? _supportRefreshDebounce;
+  Timer? _claimsRefreshDebounce;
   Future<void> Function()? _clientCartPendingCommit;
   VoidCallback? _clientCartPendingRollback;
   String _clientCartPendingLabel = '';
@@ -230,6 +234,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final Set<String> _overviewLoading = <String>{};
   final Set<String> _blacklistBusy = <String>{};
   bool _isDisposed = false;
+  final Set<String> _loadedTabs = <String>{};
 
   @override
   void initState() {
@@ -237,16 +242,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _bindSupportTemplateDraftAutosave();
     unawaited(_restoreSupportTemplateDraft());
     _rebuildVisibleTabs(force: true, notify: false);
-    _reloadAll();
+    unawaited(_loadActiveTabData(silent: false));
     _eventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
       if (type == 'delivery:updated' && _canViewDeliveryTab()) {
-        unawaited(_loadDeliveryDashboard());
+        _scheduleDeliveryRealtimeRefresh();
         return;
       }
       if (type == 'support:queue:changed' && _canViewSupportTab()) {
-        unawaited(_loadSupportTickets(silent: true));
-        unawaited(_loadSupportNotificationCenter(silent: true));
+        _scheduleSupportRealtimeRefresh();
         return;
       }
       if (type == 'catalog:queue:updated' && _canViewModerationTab()) {
@@ -279,9 +283,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         return;
       }
       if (type == 'claims:updated' && _canViewSupportTab()) {
-        unawaited(_loadReturnsWorkflow(silent: true));
-        unawaited(_loadSupportNotificationCenter(silent: true));
-        unawaited(_loadReturnsAnalytics(silent: true));
+        _scheduleClaimsRealtimeRefresh();
         final data = event['data'];
         if (mounted && data is Map) {
           final status = (data['status'] ?? '').toString().trim();
@@ -320,6 +322,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _publishProgressTimer?.cancel();
     _pendingPostsRefreshDebounce?.cancel();
     _channelsRefreshDebounce?.cancel();
+    _deliveryRefreshDebounce?.cancel();
+    _supportRefreshDebounce?.cancel();
+    _claimsRefreshDebounce?.cancel();
     for (final timer in _channelOverviewRefreshDebounces.values) {
       timer.cancel();
     }
@@ -491,7 +496,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   }
 
   bool _canForceCloseSupportTicket() {
-    if (_isCreatorBase()) return false;
+    if (_isCreatorBase()) return true;
     final role = authService.effectiveRole;
     if (role == 'admin' || role == 'tenant') return true;
     return _hasPermission('chat.write.support');
@@ -595,6 +600,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _tabController = null;
     previousController?.dispose();
     _visibleTabs = nextTabs;
+    _loadedTabs.clear();
 
     final mappedIndex = oldId == null
         ? 0
@@ -606,6 +612,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       vsync: this,
       initialIndex: initialIndex,
     );
+    _tabController?.addListener(_handleActiveTabChanged);
 
     if (notify && mounted) {
       setState(() {});
@@ -619,6 +626,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final nextIndex = _visibleTabs.indexWhere((tab) => tab.id == tabId);
     if (nextIndex < 0) return;
     controller.animateTo(nextIndex);
+  }
+
+  void _handleActiveTabChanged() {
+    final controller = _tabController;
+    if (controller == null || controller.indexIsChanging) return;
+    unawaited(_loadActiveTabData(silent: true));
   }
 
   int _toInt(dynamic value, {int fallback = 0}) {
@@ -897,7 +910,52 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _reloadAll() async {
+  String _activeTabId() {
+    final controller = _tabController;
+    if (controller == null || _visibleTabs.isEmpty) return '';
+    final index = controller.index.clamp(0, _visibleTabs.length - 1).toInt();
+    return _visibleTabs[index].id;
+  }
+
+  Future<void> _loadActiveTabData({
+    bool silent = true,
+    bool force = false,
+  }) async {
+    final tabId = _activeTabId();
+    if (tabId.isEmpty) return;
+    if (!force && _loadedTabs.contains(tabId)) return;
+    _loadedTabs.add(tabId);
+    switch (tabId) {
+      case 'client_carts':
+        return;
+      case 'moderation':
+        await _loadPendingPosts();
+        return;
+      case 'create':
+      case 'channels':
+        await _loadChannels();
+        return;
+      case 'delivery':
+        await _loadDeliveryDashboard();
+        return;
+      case 'support':
+        await _loadSupportTickets(silent: silent);
+        await _loadSupportTemplates(silent: true);
+        await _loadSupportFaqEntries(silent: true);
+        await _loadReturnsWorkflow(silent: true);
+        await _loadSupportNotificationCenter(silent: true);
+        await _loadReturnsAnalytics(silent: true);
+        return;
+      default:
+        return;
+    }
+  }
+
+  Future<void> _reloadAll({bool forceAll = false}) async {
+    if (!forceAll) {
+      await _loadActiveTabData(silent: false, force: true);
+      return;
+    }
     final canLoadChannels = _canViewCreateTab() || _canViewChannelsTab();
     if (canLoadChannels) {
       await _loadChannels();
@@ -1455,6 +1513,36 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     });
   }
 
+  void _scheduleDeliveryRealtimeRefresh() {
+    _deliveryRefreshDebounce?.cancel();
+    _deliveryRefreshDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (!mounted || _isDisposed) return;
+      if (_activeTabId() != 'delivery') return;
+      unawaited(_loadDeliveryDashboard());
+    });
+  }
+
+  void _scheduleSupportRealtimeRefresh() {
+    _supportRefreshDebounce?.cancel();
+    _supportRefreshDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (!mounted || _isDisposed) return;
+      if (_activeTabId() != 'support') return;
+      unawaited(_loadSupportTickets(silent: true));
+      unawaited(_loadSupportNotificationCenter(silent: true));
+    });
+  }
+
+  void _scheduleClaimsRealtimeRefresh() {
+    _claimsRefreshDebounce?.cancel();
+    _claimsRefreshDebounce = Timer(const Duration(milliseconds: 650), () {
+      if (!mounted || _isDisposed) return;
+      if (_activeTabId() != 'support') return;
+      unawaited(_loadReturnsWorkflow(silent: true));
+      unawaited(_loadSupportNotificationCenter(silent: true));
+      unawaited(_loadReturnsAnalytics(silent: true));
+    });
+  }
+
   void _scheduleChannelOverviewRealtimeRefresh(String channelId) {
     final normalized = channelId.trim();
     if (normalized.isEmpty || !_channelOverviews.containsKey(normalized)) {
@@ -1481,7 +1569,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       return;
     }
     if (_publishProgressTimer != null) return;
-    _publishProgressTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+    _publishProgressTimer = Timer.periodic(const Duration(seconds: 8), (_) {
       if (!mounted || _isDisposed) return;
       unawaited(_loadPendingPosts());
     });
@@ -3319,6 +3407,80 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         await _loadSelectedClientCart(userId);
       },
     );
+  }
+
+  String _cartRetentionUserIdOf(Map<String, dynamic> event) {
+    final direct = (event['cart_owner_id'] ?? event['user_id'] ?? '')
+        .toString()
+        .trim();
+    if (direct.isNotEmpty) return direct;
+    final id = (event['id'] ?? '').toString().trim();
+    const prefix = 'cart-retention:';
+    if (id.startsWith(prefix)) return id.substring(prefix.length).trim();
+    return '';
+  }
+
+  Future<void> _dismantleCartRetentionItem(Map<String, dynamic> event) async {
+    final userId = _cartRetentionUserIdOf(event);
+    final eventId = (event['id'] ?? 'cart-retention:$userId').toString().trim();
+    if (userId.isEmpty || _cartRetentionBusyIds.contains(eventId)) return;
+
+    final title = (event['title'] ?? 'Расформировать корзину').toString();
+    final subtitle = (event['subtitle'] ?? '').toString();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Расформировать корзину'),
+        content: Text(
+          [
+            title,
+            if (subtitle.trim().isNotEmpty) subtitle.trim(),
+            '',
+            'Все товары из корзины клиента вернутся в доступные остатки.',
+          ].join('\n'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Расформировать'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() {
+      _cartRetentionBusyIds.add(eventId);
+      _message = '';
+    });
+    try {
+      await authService.dio.post('/api/cart/admin/clients/$userId/cart/clear');
+      await _loadSupportNotificationCenter(silent: true);
+      final selectedId = (_selectedClientCartUser?['id'] ?? '')
+          .toString()
+          .trim();
+      if (selectedId == userId) {
+        await _loadSelectedClientCart(userId);
+      }
+      if (_clientCartSearchCtrl.text.trim().isNotEmpty) {
+        await _searchClientCartsByPhone();
+      }
+      if (!mounted) return;
+      setState(() => _message = 'Корзина расформирована');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _message = 'Ошибка расформировки: ${_extractDioError(e)}');
+    } finally {
+      if (mounted) {
+        setState(() => _cartRetentionBusyIds.remove(eventId));
+      } else {
+        _cartRetentionBusyIds.remove(eventId);
+      }
+    }
   }
 
   Future<void> _blockSelectedClient() async {
@@ -8734,6 +8896,16 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           .toString();
                       final eventType = (event['type'] ?? '').toString().trim();
                       final isSupportEvent = eventType == 'support_ticket';
+                      final isCartRetentionEvent =
+                          eventType == 'cart_retention';
+                      final cartRetentionUserId = isCartRetentionEvent
+                          ? _cartRetentionUserIdOf(event)
+                          : '';
+                      final cartRetentionBusy = _cartRetentionBusyIds.contains(
+                        (event['id'] ?? 'cart-retention:$cartRetentionUserId')
+                            .toString()
+                            .trim(),
+                      );
                       final supportStatus = (event['status'] ?? '')
                           .toString()
                           .trim()
@@ -8854,6 +9026,41 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                               : 'Закрыть сразу',
                                         ),
                                       ),
+                                  ],
+                                ),
+                              ),
+                            if (isCartRetentionEvent)
+                              Padding(
+                                padding: const EdgeInsets.only(left: 4),
+                                child: Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    FilledButton.tonalIcon(
+                                      onPressed:
+                                          cartRetentionUserId.isEmpty ||
+                                              cartRetentionBusy
+                                          ? null
+                                          : () => _dismantleCartRetentionItem(
+                                              event,
+                                            ),
+                                      icon: cartRetentionBusy
+                                          ? const SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(
+                                              Icons.playlist_remove_outlined,
+                                            ),
+                                      label: Text(
+                                        cartRetentionBusy
+                                            ? 'Расформировываем...'
+                                            : 'Расформировать',
+                                      ),
+                                    ),
                                   ],
                                 ),
                               ),

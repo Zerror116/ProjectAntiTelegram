@@ -39,10 +39,9 @@ class ChatCaptureCapabilityService {
         case TargetPlatform.macOS:
           return const ChatCaptureProfile(
             platformKey: 'macos',
-            cameraSupported: false,
-            videoNoteCaptureSupported: false,
-            videoNoteFallbackReason:
-                'На macOS видеокружок недоступен. Используйте отправку обычного видео.',
+            cameraSupported: true,
+            videoNoteCaptureSupported: true,
+            videoNoteFallbackReason: '',
           );
         case TargetPlatform.windows:
           return const ChatCaptureProfile(
@@ -50,7 +49,7 @@ class ChatCaptureCapabilityService {
             cameraSupported: false,
             videoNoteCaptureSupported: false,
             videoNoteFallbackReason:
-                'На Windows видеокружок недоступен. Используйте отправку обычного видео.',
+                'Видеокружки в Windows-приложении пока недоступны. Используйте веб-версию или отправку обычного видео.',
           );
         case TargetPlatform.linux:
           return const ChatCaptureProfile(
@@ -58,7 +57,7 @@ class ChatCaptureCapabilityService {
             cameraSupported: false,
             videoNoteCaptureSupported: false,
             videoNoteFallbackReason:
-                'На Linux видеокружок недоступен. Используйте отправку обычного видео.',
+                'Видеокружки в Linux-приложении пока недоступны. Используйте веб-версию или отправку обычного видео.',
           );
         case TargetPlatform.fuchsia:
           return const ChatCaptureProfile(
@@ -66,18 +65,20 @@ class ChatCaptureCapabilityService {
             cameraSupported: false,
             videoNoteCaptureSupported: false,
             videoNoteFallbackReason:
-                'На этой платформе видеокружок недоступен. Используйте отправку обычного видео.',
+                'Видеокружки на этой платформе пока недоступны. Используйте веб-версию или отправку обычного видео.',
           );
       }
     }
 
     final agent = currentUserAgent().toLowerCase();
-    final isIosWeb = agent.contains('iphone') ||
+    final isIosWeb =
+        agent.contains('iphone') ||
         agent.contains('ipad') ||
         agent.contains('ipod') ||
         (defaultTargetPlatform == TargetPlatform.iOS);
     final isFirefox = agent.contains('firefox') || agent.contains('fxios');
-    final isChromium = agent.contains('chrome') ||
+    final isChromium =
+        agent.contains('chrome') ||
         agent.contains('chromium') ||
         agent.contains('crios') ||
         agent.contains('edg') ||
@@ -90,9 +91,8 @@ class ChatCaptureCapabilityService {
       return const ChatCaptureProfile(
         platformKey: 'web_ios',
         cameraSupported: true,
-        videoNoteCaptureSupported: false,
-        videoNoteFallbackReason:
-            'Видеокружки на iPhone и iPad в браузере нестабильны. Используйте отправку обычного видео.',
+        videoNoteCaptureSupported: true,
+        videoNoteFallbackReason: '',
       );
     }
 
@@ -100,9 +100,8 @@ class ChatCaptureCapabilityService {
       return const ChatCaptureProfile(
         platformKey: 'web_safari',
         cameraSupported: true,
-        videoNoteCaptureSupported: false,
-        videoNoteFallbackReason:
-            'Видеокружки в Safari нестабильны. Используйте отправку обычного видео.',
+        videoNoteCaptureSupported: true,
+        videoNoteFallbackReason: '',
       );
     }
 
@@ -110,9 +109,8 @@ class ChatCaptureCapabilityService {
       return const ChatCaptureProfile(
         platformKey: 'web_firefox',
         cameraSupported: true,
-        videoNoteCaptureSupported: false,
-        videoNoteFallbackReason:
-            'Видеокружки в Firefox пока отключены ради стабильности. Используйте отправку обычного видео.',
+        videoNoteCaptureSupported: true,
+        videoNoteFallbackReason: '',
       );
     }
 
@@ -128,9 +126,8 @@ class ChatCaptureCapabilityService {
     return const ChatCaptureProfile(
       platformKey: 'web_unknown',
       cameraSupported: true,
-      videoNoteCaptureSupported: false,
-      videoNoteFallbackReason:
-          'Видеокружки в этом браузере отключены ради стабильности. Используйте отправку обычного видео.',
+      videoNoteCaptureSupported: true,
+      videoNoteFallbackReason: '',
     );
   }
 }

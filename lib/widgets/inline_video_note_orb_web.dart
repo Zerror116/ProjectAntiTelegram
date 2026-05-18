@@ -3,7 +3,6 @@
 import 'dart:async';
 import 'dart:html' as html;
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/material.dart';
@@ -14,13 +13,11 @@ class InlineVideoNoteOrb extends StatefulWidget {
     required this.videoUrl,
     required this.durationMs,
     required this.accentColor,
-    required this.footerText,
   });
 
   final String videoUrl;
   final int durationMs;
   final Color accentColor;
-  final String footerText;
 
   @override
   State<InlineVideoNoteOrb> createState() => _InlineVideoNoteOrbState();
@@ -41,9 +38,7 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
   StreamSubscription<html.Event>? _errorSub;
   StreamSubscription<html.Event>? _canPlaySub;
 
-  Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
-  bool _isReady = false;
   bool _isPlaying = false;
   bool _hasFinished = false;
   bool _hasError = false;
@@ -118,7 +113,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
       }
       if (mounted) {
         setState(() {
-          _isReady = true;
           _hasError = false;
         });
       }
@@ -127,7 +121,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
     _canPlaySub = _videoElement.onCanPlay.listen((_) {
       if (mounted) {
         setState(() {
-          _isReady = true;
           _hasError = false;
         });
       }
@@ -137,13 +130,9 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
     });
 
     _timeUpdateSub = _videoElement.onTimeUpdate.listen((_) {
-      final seconds = _videoElement.currentTime;
       final total = _videoElement.duration;
       if (total.isFinite && total > 0) {
         _duration = Duration(milliseconds: (total * 1000).round());
-      }
-      if (seconds.isFinite && seconds >= 0) {
-        _position = Duration(milliseconds: (seconds * 1000).round());
       }
       if (mounted) {
         setState(() {});
@@ -155,7 +144,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
       setState(() {
         _isPlaying = true;
         _hasFinished = false;
-        _isReady = true;
         _hasError = false;
       });
     });
@@ -172,9 +160,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
       setState(() {
         _isPlaying = false;
         _hasFinished = true;
-        if (_duration > Duration.zero) {
-          _position = _duration;
-        }
       });
     });
 
@@ -182,7 +167,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
       if (!mounted) return;
       setState(() {
         _isPlaying = false;
-        _isReady = false;
         _hasError = true;
       });
     });
@@ -193,7 +177,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
     try {
       if (_hasFinished) {
         _videoElement.currentTime = 0;
-        _position = Duration.zero;
         _hasFinished = false;
       }
       await _videoElement.play();
@@ -224,8 +207,6 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
       if (mounted) {
         setState(() {
           _hasError = false;
-          _isReady = false;
-          _position = Duration.zero;
         });
       }
       return;
@@ -254,11 +235,9 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
     if (oldWidget.videoUrl == widget.videoUrl) return;
     _videoElement.src = widget.videoUrl;
     _videoElement.load();
-    _position = Duration.zero;
     _duration = widget.durationMs > 0
         ? Duration(milliseconds: widget.durationMs)
         : Duration.zero;
-    _isReady = false;
     _isPlaying = false;
     _hasFinished = false;
     _hasError = false;
@@ -287,239 +266,122 @@ class _InlineVideoNoteOrbState extends State<InlineVideoNoteOrb> {
   @override
   Widget build(BuildContext context) {
     final totalDuration = _duration;
-    final progress = totalDuration.inMilliseconds > 0
-        ? (_position.inMilliseconds / totalDuration.inMilliseconds)
-              .clamp(0.0, 1.0)
-              .toDouble()
-        : 0.0;
     final durationLabel = totalDuration <= Duration.zero
         ? '0:00'
-        : (!_hasFinished &&
-              !_isPlaying &&
-              _position <= const Duration(milliseconds: 160))
-        ? _formatDuration(totalDuration)
-        : '${_formatDuration(_position)} / ${_formatDuration(totalDuration)}';
+        : _formatDuration(totalDuration);
 
-    IconData actionIcon;
-    if (_hasError) {
-      actionIcon = Icons.refresh_rounded;
-    } else if (_isPlaying) {
-      actionIcon = Icons.pause_rounded;
-    } else if (_hasFinished) {
-      actionIcon = Icons.replay_rounded;
-    } else {
-      actionIcon = Icons.play_arrow_rounded;
+    Widget durationBadge() {
+      return IgnorePointer(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.58),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.18),
+                blurRadius: 12,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          child: Text(
+            durationLabel,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ),
+      );
     }
 
-    final footerLabel = _hasError
-        ? 'Нажмите, чтобы попробовать снова'
-        : _isPlaying
-        ? 'Нажмите для паузы'
-        : _isReady
-        ? widget.footerText
-        : 'Подготавливаем воспроизведение';
-
-    return Container(
-      width: 196,
-      height: 196,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            widget.accentColor.withValues(alpha: 0.82),
-            const Color(0xFF1C2631),
-          ],
-        ),
-        border: Border.all(
-          color: Colors.white.withValues(alpha: 0.12),
-          width: 1.2,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.18),
-            blurRadius: 16,
-            offset: const Offset(0, 10),
-          ),
-        ],
-      ),
+    return SizedBox(
+      width: 250,
+      height: 222,
       child: Stack(
+        clipBehavior: Clip.none,
         children: [
-            Positioned.fill(
-              child: ClipOval(
-                child: ColoredBox(
-                  color: const Color(0xFF11161D),
-                  child: HtmlElementView(viewType: _viewType),
-                ),
-              ),
-            ),
-            Positioned.fill(
-              child: IgnorePointer(
-                child: ClipOval(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [
-                          Colors.black.withValues(alpha: 0.06),
-                          Colors.transparent,
-                          Colors.black.withValues(alpha: 0.32),
-                        ],
-                        stops: const [0, 0.56, 1],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
           Positioned(
-              left: 12,
-              top: 12,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.32),
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      _isPlaying
-                          ? Icons.equalizer_rounded
-                          : Icons.videocam_rounded,
-                      size: 14,
-                      color: Colors.white,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      _isPlaying ? 'видео' : 'кружок',
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.94),
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
+            left: 0,
+            top: 0,
+            width: 212,
+            height: 212,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: SweepGradient(
+                  startAngle: -math.pi * 0.62,
+                  endAngle: math.pi * 1.38,
+                  colors: [
+                    const Color(0xFF3B82FF),
+                    const Color(0xFF20D6E9),
+                    const Color(0xFFFF8848),
+                    widget.accentColor,
+                    const Color(0xFF3B82FF),
                   ],
                 ),
-              ),
-            ),
-          Positioned(
-              left: 16,
-              right: 16,
-              bottom: 18,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(999),
-                    child: LinearProgressIndicator(
-                      value: progress,
-                      minHeight: 4,
-                      backgroundColor: Colors.white.withValues(alpha: 0.18),
-                      valueColor: const AlwaysStoppedAnimation<Color>(
-                        Colors.white,
-                      ),
-                    ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF3B82FF).withValues(alpha: 0.18),
+                    blurRadius: 24,
+                    offset: const Offset(0, 10),
                   ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          footerLabel,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.86),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.42),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          durationLabel,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                            fontFeatures: [ui.FontFeature.tabularFigures()],
-                          ),
-                        ),
-                      ),
-                    ],
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.24),
+                    blurRadius: 24,
+                    offset: const Offset(0, 14),
                   ),
                 ],
               ),
-            ),
-          Center(
-              child: Container(
-                width: 74,
-                height: 74,
+              child: DecoratedBox(
                 decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.20),
                   shape: BoxShape.circle,
+                  color: const Color(0xFF0F131B),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.12),
+                  ),
                 ),
                 child: Stack(
-                  alignment: Alignment.center,
                   children: [
-                    SizedBox(
-                      width: 74,
-                      height: 74,
-                      child: CircularProgressIndicator(
-                        value: !_isReady && !_hasError ? null : progress,
-                        strokeWidth: 3.2,
-                        backgroundColor: Colors.white.withValues(alpha: 0.14),
-                        valueColor: const AlwaysStoppedAnimation<Color>(
-                          Colors.white,
+                    Positioned.fill(
+                      child: ClipOval(
+                        child: ColoredBox(
+                          color: const Color(0xFF11161D),
+                          child: HtmlElementView(viewType: _viewType),
                         ),
                       ),
                     ),
-                    Container(
-                      width: 60,
-                      height: 60,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.92),
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            blurRadius: 10,
-                            offset: const Offset(0, 6),
-                          ),
-                        ],
-                      ),
-                      child: (!_isReady && !_hasError)
-                          ? Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2.4,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                  widget.accentColor,
-                                ),
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: ClipOval(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [
+                                  Colors.black.withValues(alpha: 0.04),
+                                  Colors.transparent,
+                                  Colors.black.withValues(alpha: 0.18),
+                                ],
+                                stops: const [0, 0.60, 1],
                               ),
-                            )
-                          : Icon(actionIcon, color: widget.accentColor, size: 34),
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                   ],
                 ),
               ),
+            ),
           ),
+          Positioned(right: 0, bottom: 0, child: durationBadge()),
         ],
       ),
     );

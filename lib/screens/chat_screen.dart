@@ -26,11 +26,14 @@ import '../assets/phoenix_assets.dart';
 import '../main.dart';
 import '../services/chat_capture_capability_service.dart';
 import '../services/chat_outbox_service.dart';
+import '../services/chat_recent_gallery_service.dart';
 import '../services/messenger_preferences_service.dart';
 import '../services/monitoring_service.dart';
+import '../services/native_video_note_capture_service.dart';
 import '../services/sticker_print_service.dart';
 import '../services/web_image_cache_service.dart';
 import '../services/web_media_capture_permission_service.dart';
+import '../services/web_video_note_capture_service.dart';
 import '../src/utils/chat_api.dart';
 import '../src/utils/chat_image_preprocessor.dart';
 import '../src/utils/media_url.dart';
@@ -80,6 +83,8 @@ class _ChatUploadFile {
 
 enum _ComposerMediaMode { voice, camera }
 
+enum _RecordingActionVisualPhase { idle, dragging, lockedHover, cancellingDust }
+
 enum _ImageSendMode { standard, hd, file }
 
 class ChatScreen extends StatefulWidget {
@@ -100,7 +105,8 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen>
+    with SingleTickerProviderStateMixin {
   static const String _chatScrollOffsetKeyPrefix = 'chat_scroll_offset_v2:';
   static const String _chatScrollFractionKeyPrefix = 'chat_scroll_fraction_v1:';
   static const String _chatScrollAnchorMessageIdKeyPrefix =
@@ -114,10 +120,19 @@ class _ChatScreenState extends State<ChatScreen> {
       <String, String>{};
   static final Map<String, double> _inMemoryScrollAnchorOffsets =
       <String, double>{};
-  static const Duration _composerRecordHoldDelay = Duration(milliseconds: 520);
+  static const Duration _composerRecordHoldDelay = Duration(seconds: 1);
+  static const Duration _recordingCancelDustDuration = Duration(
+    milliseconds: 560,
+  );
   static const int _typingActiveTtlMs = 10000;
   static const Duration _typingKeepAliveInterval = Duration(milliseconds: 3200);
   static const Duration _typingEmitThrottle = Duration(milliseconds: 2200);
+  static const Duration _directMessageFallbackSyncInterval = Duration(
+    seconds: 7,
+  );
+  static const Duration _remoteActivityFallbackPollInterval = Duration(
+    seconds: 8,
+  );
   static final RegExp _uuidPattern = RegExp(
     r'^[0-9a-fA-F]{8}-'
     r'[0-9a-fA-F]{4}-'
@@ -132,6 +147,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollController = ScrollController();
   final GlobalKey _messagesViewportKey = GlobalKey();
   final ImagePicker _imagePicker = ImagePicker();
+  late final AnimationController _recordingHoverController;
   AudioRecorder? _voiceRecorderInstance;
   AudioRecorder get _voiceRecorder =>
       _voiceRecorderInstance ??= AudioRecorder();
@@ -155,6 +171,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _voiceSending = false;
   bool _voiceRecordingLocked = false;
   bool _videoRecording = false;
+  bool _nativeVideoNoteRecording = false;
+  bool _webVideoNoteRecording = false;
   bool _videoRecordingLocked = false;
   _ComposerMediaMode _composerMediaMode = _ComposerMediaMode.voice;
   bool _composerMediaPressActive = false;
@@ -194,9 +212,13 @@ class _ChatScreenState extends State<ChatScreen> {
   cam.CameraController? _videoCameraController;
   Future<bool>? _videoCameraReadyFuture;
   vp.VideoPlayerController? _inlineVideoNoteController;
+  Uint8List? _nativeVideoPreviewFrame;
   Object? _lastVideoCameraError;
+  DateTime? _attachmentCameraVideoStartedAt;
+  bool _attachmentNativeVideoRecording = false;
   String? _activeVideoNoteMessageId;
   bool _inlineVideoNoteInitializing = false;
+  final Map<String, Duration> _videoNoteDurationCache = <String, Duration>{};
 
   StreamSubscription? _chatSub;
   Timer? _incomingTimer;
@@ -229,6 +251,7 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<Duration>? _voiceDurationSub;
   StreamSubscription<PlayerState>? _voiceStateSub;
   StreamSubscription<void>? _voiceCompleteSub;
+  StreamSubscription<Uint8List>? _nativeVideoPreviewSub;
   DateTime? _voiceRecordingStartedAt;
   DateTime? _videoRecordingStartedAt;
   Offset? _composerPressStartGlobal;
@@ -236,6 +259,12 @@ class _ChatScreenState extends State<ChatScreen> {
   double _recordingDragDy = 0;
   double _videoRecordingDragDx = 0;
   double _videoRecordingDragDy = 0;
+  _RecordingActionVisualPhase _voiceRecordingVisualPhase =
+      _RecordingActionVisualPhase.idle;
+  _RecordingActionVisualPhase _videoRecordingVisualPhase =
+      _RecordingActionVisualPhase.idle;
+  Timer? _voiceRecordingCancelVisualTimer;
+  Timer? _videoRecordingCancelVisualTimer;
   bool _microphonePermissionAsked = false;
   bool _microphonePermissionGranted = false;
   bool _microphonePermissionDenied = false;
@@ -443,6 +472,10 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _recordingHoverController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1700),
+    )..repeat(reverse: true);
     _captureProfile = ChatCaptureCapabilityService.current;
     _chatSettings = widget.chatSettings == null
         ? <String, dynamic>{}
@@ -703,11 +736,19 @@ class _ChatScreenState extends State<ChatScreen> {
         unawaited(_reconcilePersistentOutbox());
         unawaited(_flushPersistentOutbox());
         unawaited(_syncLatestDirectMessages(forceLatest: true));
-        _startDirectMessageLiveSync();
+        _directMessageLiveSyncTimer?.cancel();
+        _directMessageLiveSyncTimer = null;
+        _remoteActivityPollTimer?.cancel();
+        _remoteActivityPollTimer = null;
         _reconnectReplayTimer?.cancel();
         _reconnectReplayTimer = Timer(const Duration(milliseconds: 220), () {
           unawaited(_replayMissedMessagesAfterReconnect());
         });
+        return;
+      }
+      if (type == 'socket:disconnected' || type == 'socket:connect_error') {
+        _startDirectMessageLiveSync();
+        _startRemoteActivityPolling();
         return;
       }
       if (type == 'chat:pinned' && data is Map) {
@@ -731,6 +772,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Map<String, dynamic> _effectiveChatSettings() => _chatSettings;
 
   String _myUserId() => authService.currentUser?.id.trim() ?? '';
+
+  bool get _isRealtimeSocketConnected => socket?.connected == true;
 
   String _outboxTenantCode() {
     final scoped = authService.creatorTenantScopeCode?.trim() ?? '';
@@ -918,7 +961,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       socket?.emit(eventName, payload);
     } catch (_) {}
-    if (!httpFallback) return;
+    if (!httpFallback || _isRealtimeSocketConnected) return;
     try {
       await authService.dio.post(
         '/api/chats/${widget.chatId}/activity',
@@ -1075,6 +1118,18 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  String _dioErrorCode(Object error) {
+    if (error is! DioException) return '';
+    final data = error.response?.data;
+    if (data is Map) {
+      return (data['error_code'] ?? data['code'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+    }
+    return '';
+  }
+
   bool _isRetryableOutboxError(Object error) {
     if (error is DioException) {
       if (error.type == DioExceptionType.connectionError ||
@@ -1084,8 +1139,14 @@ class _ChatScreenState extends State<ChatScreen> {
         return true;
       }
       final statusCode = error.response?.statusCode ?? 0;
+      final errorCode = _dioErrorCode(error);
       if (statusCode >= 500) return true;
-      if (statusCode == 408 || statusCode == 409 || statusCode == 429) {
+      if (statusCode == 409) {
+        return errorCode == 'chat_upload_offset_mismatch' ||
+            errorCode == 'chat_upload_incomplete' ||
+            errorCode == 'chat_upload_session_not_ready';
+      }
+      if (statusCode == 408 || statusCode == 429) {
         return true;
       }
       return false;
@@ -1185,6 +1246,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _flushPersistentOutbox({bool includeErrored = false}) async {
+    if (!mounted) return;
     if (_persistentOutboxFlushInFlight) {
       _persistentOutboxFlushPending = true;
       _persistentOutboxPendingIncludeErrored =
@@ -1198,7 +1260,9 @@ class _ChatScreenState extends State<ChatScreen> {
         chatId: widget.chatId,
         tenantCode: _outboxTenantCode(),
       );
+      if (!mounted) return;
       for (final item in items) {
+        if (!mounted) break;
         if (currentUserId.isNotEmpty && item.userId != currentUserId) continue;
         final normalizedStatus = item.status.trim().toLowerCase();
         if (!(normalizedStatus == 'queued' ||
@@ -1262,6 +1326,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ...replyPayload,
               },
             );
+            if (!mounted) return;
             if (resp.statusCode == 200 || resp.statusCode == 201) {
               final data = resp.data;
               if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -1296,6 +1361,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   (retryPayload['listen_once'] ?? false) == true ||
                   (retryPayload['listen_once'] ?? '').toString() == 'true',
             );
+            if (!mounted) return;
           } else {
             continue;
           }
@@ -1317,7 +1383,7 @@ class _ChatScreenState extends State<ChatScreen> {
           );
         } catch (e, st) {
           final retryCount = item.retryCount + 1;
-          final isRetryable = _isRetryableOutboxError(e);
+          final isRetryable = retryCount <= 3 && _isRetryableOutboxError(e);
           final nextStatus = isRetryable ? 'queued' : 'error';
           final errorMessage = _extractDioError(e);
           _patchMessageLocally(
@@ -1582,6 +1648,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _readDebounceTimer?.cancel();
     _voiceRecordingTimer?.cancel();
     _videoRecordingTimer?.cancel();
+    _voiceRecordingCancelVisualTimer?.cancel();
+    _videoRecordingCancelVisualTimer?.cancel();
     _offlineQueueRefreshTimer?.cancel();
     _composerMediaHoldTimer?.cancel();
     _bottomAnchorTimer?.cancel();
@@ -1611,6 +1679,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _voiceDurationSub?.cancel();
     _voiceStateSub?.cancel();
     _voiceCompleteSub?.cancel();
+    _stopNativeVideoPreviewStream();
     _leaveRoom();
 
     unawaited(_voicePlayer.stop());
@@ -1636,6 +1705,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollController.removeListener(_handleScroll);
     unawaited(_persistCurrentScrollOffset());
     _scrollController.dispose();
+    _recordingHoverController.dispose();
     _messageItemKeys.clear();
     super.dispose();
   }
@@ -2814,6 +2884,7 @@ class _ChatScreenState extends State<ChatScreen> {
     required String clientMsgId,
     Map<String, dynamic> Function(Map<String, dynamic> message)? transform,
   }) {
+    if (!mounted) return;
     final normalizedClientMsgId = clientMsgId.trim();
     if (normalizedClientMsgId.isEmpty) return;
     final index = _messageIndexInList(
@@ -2827,6 +2898,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _upsertMessage(Map<String, dynamic> msg, {bool autoScroll = false}) {
+    if (!mounted) return;
     final normalized = _normalizeMessage(msg);
     final msgId = normalized['id']?.toString();
     final clientMsgId = normalized['client_msg_id']?.toString() ?? '';
@@ -2881,8 +2953,12 @@ class _ChatScreenState extends State<ChatScreen> {
   void _startDirectMessageLiveSync() {
     _directMessageLiveSyncTimer?.cancel();
     if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if (_isRealtimeSocketConnected) {
+      _directMessageLiveSyncTimer = null;
+      return;
+    }
     _directMessageLiveSyncTimer = Timer.periodic(
-      const Duration(milliseconds: 2400),
+      _directMessageFallbackSyncInterval,
       (_) => unawaited(_syncLatestDirectMessages()),
     );
   }
@@ -2890,15 +2966,20 @@ class _ChatScreenState extends State<ChatScreen> {
   void _startRemoteActivityPolling() {
     _remoteActivityPollTimer?.cancel();
     if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
-    unawaited(_pollRemoteChatActivity());
+    if (_isRealtimeSocketConnected) {
+      _remoteActivityPollTimer = null;
+      return;
+    }
     _remoteActivityPollTimer = Timer.periodic(
-      const Duration(milliseconds: 1200),
+      _remoteActivityFallbackPollInterval,
       (_) => unawaited(_pollRemoteChatActivity()),
     );
+    unawaited(_pollRemoteChatActivity());
   }
 
   Future<void> _pollRemoteChatActivity() async {
     if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if (_isRealtimeSocketConnected) return;
     if (_remoteActivityPollInFlight || !mounted) return;
     _remoteActivityPollInFlight = true;
     try {
@@ -2938,6 +3019,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _syncLatestDirectMessages({bool forceLatest = false}) async {
     if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if (_isRealtimeSocketConnected && !forceLatest) return;
     if (_directMessageLiveSyncInFlight || _messagesLoadInFlight || _loading) {
       return;
     }
@@ -3159,7 +3241,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _scheduleReadSync() {
     _readDebounceTimer?.cancel();
-    _readDebounceTimer = Timer(const Duration(milliseconds: 220), () {
+    _readDebounceTimer = Timer(const Duration(milliseconds: 800), () {
       unawaited(_markChatAsRead());
     });
   }
@@ -5093,6 +5175,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.contains('unsupported') || text.contains('notsupported')) {
       return 'браузер не поддерживает запись камеры';
     }
+    if (text.contains('missingplugin') ||
+        text.contains('no implementation found')) {
+      return 'камера недоступна в этой сборке приложения';
+    }
     return 'попробуйте перезагрузить страницу и повторить';
   }
 
@@ -5400,25 +5486,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Future<_ChatUploadFile?> _pickFileUpload() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.any,
-      allowMultiple: false,
-      withData: kIsWeb,
-    );
-    final picked = result?.files.single;
-    if (picked == null) return null;
-    final bytes = picked.bytes;
-    return _ChatUploadFile(
-      filename: picked.name.isNotEmpty ? picked.name : 'document.bin',
-      path: (picked.path ?? '').trim().isNotEmpty ? picked.path!.trim() : null,
-      bytes: bytes == null || bytes.isEmpty ? null : bytes,
-      mimeType: _guessMimeTypeFromFilename(picked.name),
-      fileSize: picked.size,
-      qualityMode: 'file',
-    );
-  }
-
   Future<_ChatUploadFile?> _pickVideoUpload({ImageSource? source}) async {
     final shouldUsePicker =
         kIsWeb ||
@@ -5490,6 +5557,14 @@ class _ChatScreenState extends State<ChatScreen> {
     if (totalBytes >= 20 * 1024 * 1024) return 1024 * 1024;
     if (totalBytes >= 5 * 1024 * 1024) return 768 * 1024;
     return 512 * 1024;
+  }
+
+  int _nonNegativeIntOf(dynamic value) {
+    final parsed = value is num
+        ? value.toInt()
+        : int.tryParse((value ?? '').toString().trim());
+    if (parsed == null || parsed < 0) return 0;
+    return parsed;
   }
 
   Future<Map<String, dynamic>> _createUploadSession({
@@ -5581,6 +5656,67 @@ class _ChatScreenState extends State<ChatScreen> {
     throw Exception('Не удалось опубликовать медиа-сообщение');
   }
 
+  bool _shouldFallbackToLegacyMediaUpload(Object error) {
+    if (error is StateError &&
+        error.toString().contains('предыдущую загрузку')) {
+      return true;
+    }
+    if (error is DioException) {
+      final statusCode = error.response?.statusCode ?? 0;
+      if (statusCode == 409) return true;
+      if (statusCode >= 500) return true;
+    }
+    return false;
+  }
+
+  Future<void> _postLegacyMediaMessage({
+    required _ChatUploadFile upload,
+    required Uint8List bytes,
+    required String attachmentType,
+    required String clientMsgId,
+    required String caption,
+    required Map<String, dynamic> replyPayload,
+    int? durationMs,
+    bool isVideoNote = false,
+    bool listenOnce = false,
+  }) async {
+    final fieldName = switch (attachmentType) {
+      'image' => 'image',
+      'voice' => 'voice',
+      'video' => 'video',
+      'file' => 'file',
+      _ => 'file',
+    };
+    final form = FormData.fromMap({
+      'client_msg_id': clientMsgId,
+      if (caption.trim().isNotEmpty) 'text': caption.trim(),
+      if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
+      if (isVideoNote) 'is_video_note': 'true',
+      if (listenOnce) 'listen_once': 'true',
+      if ((upload.qualityMode ?? '').trim().isNotEmpty)
+        'quality_mode': upload.qualityMode!.trim(),
+      if (upload.width != null) 'image_width': upload.width,
+      if (upload.height != null) 'image_height': upload.height,
+      if ((upload.preprocessTag ?? '').trim().isNotEmpty)
+        'image_preprocess': upload.preprocessTag!.trim(),
+      ...replyPayload,
+      fieldName: MultipartFile.fromBytes(bytes, filename: upload.filename),
+    });
+    final response = await authService.dio.post(
+      '/api/chats/${widget.chatId}/messages/media',
+      data: form,
+    );
+    final data = response.data;
+    if (data is Map && data['ok'] == true && data['data'] is Map) {
+      _upsertMessage(
+        Map<String, dynamic>.from(data['data'] as Map),
+        autoScroll: true,
+      );
+      return;
+    }
+    throw Exception('Не удалось отправить медиа-сообщение');
+  }
+
   Future<void> _postMediaMessage({
     required _ChatUploadFile upload,
     required String attachmentType,
@@ -5592,51 +5728,123 @@ class _ChatScreenState extends State<ChatScreen> {
     bool listenOnce = false,
   }) async {
     final bytes = await _readUploadBytes(upload);
-    final session = await _createUploadSession(
-      upload: upload,
-      attachmentType: attachmentType,
-      clientMsgId: clientMsgId,
-      bytes: bytes,
-      durationMs: durationMs,
-      isVideoNote: isVideoNote,
-      listenOnce: listenOnce,
-    );
-    final sessionId = (session['id'] ?? '').toString().trim();
-    if (sessionId.isEmpty) {
-      throw Exception('Сервер не вернул upload session id');
-    }
-    final chunkSize = _uploadChunkSizeForBytes(bytes.length);
-    var offset = 0;
-    while (offset < bytes.length) {
-      final end = math.min(bytes.length, offset + chunkSize);
-      final chunk = Uint8List.sublistView(bytes, offset, end);
-      await _appendUploadChunk(
-        sessionId: sessionId,
-        bytes: chunk,
-        offset: offset,
-      );
-      offset = end;
-      final progress = (offset / bytes.length).clamp(0.0, 1.0).toDouble();
-      _patchMessageLocally(
+    if (attachmentType == 'voice' || isVideoNote) {
+      // Voice notes and round videos are short, interactive messages. Keeping
+      // them on the simple multipart path avoids resumable-session drift where
+      // a message can point at a file that was never finalized.
+      await _postLegacyMediaMessage(
+        upload: upload,
+        bytes: bytes,
         clientMsgId: clientMsgId,
-        transform: (current) {
-          final nextMeta = _metaMapOf(current['meta']);
-          nextMeta['delivery_status'] = progress >= 0.995
-              ? 'sending'
-              : 'uploading';
-          nextMeta['local_upload_progress'] = progress;
-          nextMeta.remove('error_message');
-          return {...current, 'meta': nextMeta};
-        },
+        attachmentType: attachmentType,
+        caption: caption,
+        replyPayload: replyPayload,
+        durationMs: durationMs,
+        isVideoNote: isVideoNote,
+        listenOnce: listenOnce,
+      );
+      return;
+    }
+    try {
+      final session = await _createUploadSession(
+        upload: upload,
+        attachmentType: attachmentType,
+        clientMsgId: clientMsgId,
+        bytes: bytes,
+        durationMs: durationMs,
+        isVideoNote: isVideoNote,
+        listenOnce: listenOnce,
+      );
+      final sessionId = (session['id'] ?? '').toString().trim();
+      if (sessionId.isEmpty) {
+        throw Exception('Сервер не вернул upload session id');
+      }
+      final sessionStatus = (session['status'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (sessionStatus == 'failed' || sessionStatus == 'failed_permanent') {
+        throw StateError('Сервер отклонил предыдущую загрузку файла');
+      }
+      final sessionStorageUrl = (session['storage_url'] ?? '')
+          .toString()
+          .trim();
+      if (sessionStatus == 'committed' ||
+          (sessionStorageUrl.isNotEmpty &&
+              (sessionStatus == 'ready' || sessionStatus == 'processing'))) {
+        final message = await _commitUploadSession(
+          sessionId: sessionId,
+          caption: caption,
+          replyPayload: replyPayload,
+        );
+        _upsertMessage(message, autoScroll: true);
+        return;
+      }
+      final chunkSize = _uploadChunkSizeForBytes(bytes.length);
+      final uploadedBytes = _nonNegativeIntOf(session['uploaded_bytes']);
+      if (uploadedBytes > bytes.length) {
+        throw StateError('Upload session size mismatch');
+      }
+      var offset = uploadedBytes;
+      if (offset > 0) {
+        final progress = (offset / bytes.length).clamp(0.0, 1.0).toDouble();
+        _patchMessageLocally(
+          clientMsgId: clientMsgId,
+          transform: (current) {
+            final nextMeta = _metaMapOf(current['meta']);
+            nextMeta['delivery_status'] = progress >= 0.995
+                ? 'sending'
+                : 'uploading';
+            nextMeta['local_upload_progress'] = progress;
+            nextMeta.remove('error_message');
+            return {...current, 'meta': nextMeta};
+          },
+        );
+      }
+      while (offset < bytes.length) {
+        final end = math.min(bytes.length, offset + chunkSize);
+        final chunk = Uint8List.sublistView(bytes, offset, end);
+        await _appendUploadChunk(
+          sessionId: sessionId,
+          bytes: chunk,
+          offset: offset,
+        );
+        offset = end;
+        final progress = (offset / bytes.length).clamp(0.0, 1.0).toDouble();
+        _patchMessageLocally(
+          clientMsgId: clientMsgId,
+          transform: (current) {
+            final nextMeta = _metaMapOf(current['meta']);
+            nextMeta['delivery_status'] = progress >= 0.995
+                ? 'sending'
+                : 'uploading';
+            nextMeta['local_upload_progress'] = progress;
+            nextMeta.remove('error_message');
+            return {...current, 'meta': nextMeta};
+          },
+        );
+      }
+      await _completeUploadSession(sessionId);
+      final message = await _commitUploadSession(
+        sessionId: sessionId,
+        caption: caption,
+        replyPayload: replyPayload,
+      );
+      _upsertMessage(message, autoScroll: true);
+    } catch (e) {
+      if (!_shouldFallbackToLegacyMediaUpload(e)) rethrow;
+      await _postLegacyMediaMessage(
+        upload: upload,
+        bytes: bytes,
+        clientMsgId: clientMsgId,
+        attachmentType: attachmentType,
+        caption: caption,
+        replyPayload: replyPayload,
+        durationMs: durationMs,
+        isVideoNote: isVideoNote,
+        listenOnce: listenOnce,
       );
     }
-    await _completeUploadSession(sessionId);
-    final message = await _commitUploadSession(
-      sessionId: sessionId,
-      caption: caption,
-      replyPayload: replyPayload,
-    );
-    _upsertMessage(message, autoScroll: true);
   }
 
   Future<void> _sendMediaMessage({
@@ -5680,8 +5888,13 @@ class _ChatScreenState extends State<ChatScreen> {
     unawaited(_flushPersistentOutbox());
   }
 
+  // ignore: unused_element
   Future<void> _pickAndSendImage(ImageSource source) async {
-    if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
+    if (!_canCompose() ||
+        _mediaUploading ||
+        _voiceSending ||
+        _voiceRecording ||
+        _videoRecording) {
       return;
     }
     try {
@@ -5711,26 +5924,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _pickAndSendFile() async {
-    if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
-      return;
-    }
-    try {
-      final upload = await _pickFileUpload();
-      if (upload == null) return;
-      await _sendMediaMessage(upload: upload, attachmentType: 'file');
-    } catch (e) {
-      if (!mounted) return;
-      showAppNotice(
-        context,
-        'Не удалось выбрать файл',
-        tone: AppNoticeTone.error,
-        duration: const Duration(seconds: 2),
-      );
-      debugPrint('pickAndSendFile error: $e');
-    }
-  }
-
+  // ignore: unused_element
   Future<void> _pickAndSendVideo({ImageSource? source}) async {
     if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
@@ -5751,66 +5945,318 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<List<ChatRecentGalleryItem>> _loadAttachmentRecentGallery() async {
+    if (_preferFilePickerForImages) {
+      return const <ChatRecentGalleryItem>[];
+    }
+    try {
+      return await ChatRecentGalleryService.loadRecent(limit: 72);
+    } catch (e) {
+      debugPrint('loadAttachmentRecentGallery error: $e');
+      return const <ChatRecentGalleryItem>[];
+    }
+  }
+
+  Future<List<_AttachmentPickedUpload>>
+  _pickAttachmentImagesFromDevice() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: true,
+      withData: true,
+    );
+    final files = result?.files ?? const <PlatformFile>[];
+    final uploads = <_AttachmentPickedUpload>[];
+    for (final picked in files) {
+      final bytes = picked.bytes;
+      if ((bytes == null || bytes.isEmpty) &&
+          (picked.path ?? '').trim().isEmpty) {
+        continue;
+      }
+      final filename = picked.name.trim().isNotEmpty
+          ? picked.name.trim()
+          : 'image-${DateTime.now().millisecondsSinceEpoch}.jpg';
+      uploads.add(
+        _AttachmentPickedUpload(
+          id: 'device-${picked.identifier ?? filename}-${uploads.length}',
+          kind: 'image',
+          upload: _ChatUploadFile(
+            filename: filename,
+            path: (picked.path ?? '').trim().isNotEmpty
+                ? picked.path!.trim()
+                : null,
+            bytes: bytes == null || bytes.isEmpty ? null : bytes,
+            mimeType: _guessMimeTypeFromFilename(filename),
+            fileSize: picked.size,
+          ),
+          previewBytes: bytes,
+        ),
+      );
+    }
+    return uploads;
+  }
+
+  Future<_AttachmentPickedUpload?> _attachmentUploadFromRecent(
+    ChatRecentGalleryItem item,
+  ) async {
+    try {
+      final source = await ChatRecentGalleryService.loadUpload(item);
+      if (source == null) return null;
+      final kind = source.kind == 'video' ? 'video' : 'image';
+      return _AttachmentPickedUpload(
+        id: 'recent-${item.id}',
+        kind: kind,
+        upload: _ChatUploadFile(
+          filename: source.filename,
+          path: source.path,
+          bytes: source.bytes,
+          mimeType:
+              source.mimeType ?? _guessMimeTypeFromFilename(source.filename),
+          fileSize: source.fileSize,
+          qualityMode: kind == 'video'
+              ? await _recommendedMediaQualityMode()
+              : null,
+        ),
+        previewBytes: item.thumbnailBytes,
+      );
+    } catch (e) {
+      debugPrint('attachmentUploadFromRecent error: $e');
+      return null;
+    }
+  }
+
+  Future<bool> _startAttachmentCameraPreview() async {
+    if (NativeVideoNoteCaptureService.shouldUseNativeCapture) {
+      try {
+        final supported = await NativeVideoNoteCaptureService.isSupported();
+        if (!supported) return false;
+        await NativeVideoNoteCaptureService.startPreview();
+        return true;
+      } catch (e) {
+        debugPrint('startAttachmentCameraPreview error: $e');
+        return false;
+      }
+    }
+    return _ensureVideoCameraReady();
+  }
+
+  Future<void> _stopAttachmentCameraPreview() async {
+    if (!NativeVideoNoteCaptureService.shouldUseNativeCapture) return;
+    try {
+      await NativeVideoNoteCaptureService.stopPreview();
+    } catch (e) {
+      debugPrint('stopAttachmentCameraPreview error: $e');
+    }
+  }
+
+  bool get _attachmentCameraPreviewAvailable {
+    final controller = _videoCameraController;
+    return controller != null && controller.value.isInitialized;
+  }
+
+  Future<_AttachmentPickedUpload?> _captureAttachmentCameraPhoto() async {
+    if (NativeVideoNoteCaptureService.shouldUseNativeCapture) {
+      final bytes = await NativeVideoNoteCaptureService.capturePhoto();
+      if (bytes == null || bytes.isEmpty) return null;
+      final filename = 'camera-${DateTime.now().millisecondsSinceEpoch}.jpg';
+      return _AttachmentPickedUpload(
+        id: 'camera-photo-${DateTime.now().microsecondsSinceEpoch}',
+        kind: 'image',
+        upload: _ChatUploadFile(
+          filename: filename,
+          bytes: bytes,
+          mimeType: 'image/jpeg',
+          fileSize: bytes.length,
+        ),
+        previewBytes: bytes,
+      );
+    }
+    final ready = await _ensureVideoCameraReady();
+    final controller = _videoCameraController;
+    if (!ready || controller == null || !controller.value.isInitialized) {
+      throw StateError(_cameraErrorHint(_lastVideoCameraError));
+    }
+    final xfile = await controller.takePicture();
+    final filename = xfile.name.trim().isNotEmpty
+        ? xfile.name.trim()
+        : 'camera-${DateTime.now().millisecondsSinceEpoch}.jpg';
+    final bytes = kIsWeb ? await xfile.readAsBytes() : null;
+    return _AttachmentPickedUpload(
+      id: 'camera-photo-${DateTime.now().microsecondsSinceEpoch}',
+      kind: 'image',
+      upload: _ChatUploadFile(
+        filename: filename,
+        path: kIsWeb ? null : xfile.path,
+        bytes: bytes == null || bytes.isEmpty ? null : bytes,
+        mimeType: (xfile.mimeType ?? '').trim().isNotEmpty == true
+            ? xfile.mimeType!.trim()
+            : _guessMimeTypeFromFilename(filename),
+        fileSize: bytes?.length,
+      ),
+      previewBytes: bytes,
+    );
+  }
+
+  Future<_AttachmentPickedUpload?>
+  _toggleAttachmentCameraVideoRecording() async {
+    if (NativeVideoNoteCaptureService.shouldUseNativeCapture) {
+      if (_attachmentNativeVideoRecording) {
+        final startedAt = _attachmentCameraVideoStartedAt;
+        final result = await NativeVideoNoteCaptureService.stop();
+        _attachmentNativeVideoRecording = false;
+        _attachmentCameraVideoStartedAt = null;
+        final durationMs = result.durationMs > 0
+            ? result.durationMs
+            : DateTime.now()
+                  .difference(startedAt ?? DateTime.now())
+                  .inMilliseconds;
+        return _AttachmentPickedUpload(
+          id: 'camera-video-${DateTime.now().microsecondsSinceEpoch}',
+          kind: 'video',
+          upload: _ChatUploadFile(
+            filename: result.filename.isNotEmpty
+                ? result.filename
+                : result.path.split('/').last,
+            path: result.path,
+            mimeType: result.mimeType,
+            qualityMode: await _recommendedMediaQualityMode(),
+          ),
+          durationMs: durationMs,
+        );
+      }
+      await NativeVideoNoteCaptureService.start();
+      _attachmentNativeVideoRecording = true;
+      _attachmentCameraVideoStartedAt = DateTime.now();
+      return null;
+    }
+
+    final ready = await _ensureVideoCameraReady();
+    final controller = _videoCameraController;
+    if (!ready || controller == null || !controller.value.isInitialized) {
+      throw StateError(_cameraErrorHint(_lastVideoCameraError));
+    }
+    if (controller.value.isRecordingVideo) {
+      final startedAt = _attachmentCameraVideoStartedAt;
+      final xfile = await controller.stopVideoRecording();
+      _attachmentCameraVideoStartedAt = null;
+      final durationMs = DateTime.now()
+          .difference(startedAt ?? DateTime.now())
+          .inMilliseconds;
+      final mimeType = (xfile.mimeType ?? '').trim();
+      Uint8List? bytes;
+      if (kIsWeb) {
+        bytes =
+            await _readWebBlobBytes(xfile.path) ?? await xfile.readAsBytes();
+      }
+      final filename = xfile.name.trim().isNotEmpty
+          ? xfile.name.trim()
+          : 'camera-video-${DateTime.now().millisecondsSinceEpoch}.${_videoExtensionForMime(mimeType)}';
+      return _AttachmentPickedUpload(
+        id: 'camera-video-${DateTime.now().microsecondsSinceEpoch}',
+        kind: 'video',
+        upload: _ChatUploadFile(
+          filename: filename,
+          path: kIsWeb ? null : xfile.path,
+          bytes: bytes == null || bytes.isEmpty ? null : bytes,
+          mimeType: mimeType.isNotEmpty
+              ? mimeType
+              : _guessMimeTypeFromFilename(filename),
+          fileSize: bytes?.length,
+          qualityMode: await _recommendedMediaQualityMode(),
+        ),
+        durationMs: durationMs,
+      );
+    }
+    try {
+      await controller.prepareForVideoRecording();
+    } catch (_) {}
+    await controller.startVideoRecording();
+    _attachmentCameraVideoStartedAt = DateTime.now();
+    return null;
+  }
+
+  Future<void> _cancelAttachmentCameraVideoRecording() async {
+    try {
+      if (_attachmentNativeVideoRecording) {
+        await NativeVideoNoteCaptureService.cancel();
+        _attachmentNativeVideoRecording = false;
+        _attachmentCameraVideoStartedAt = null;
+        return;
+      }
+      final controller = _videoCameraController;
+      if (controller?.value.isRecordingVideo == true) {
+        await controller!.stopVideoRecording();
+      }
+    } catch (e) {
+      debugPrint('cancelAttachmentCameraVideoRecording error: $e');
+    } finally {
+      _attachmentCameraVideoStartedAt = null;
+    }
+  }
+
+  Future<void> _sendAttachmentGallerySelection(
+    _AttachmentGallerySelection selection,
+  ) async {
+    if (!_canCompose() || selection.items.isEmpty) return;
+    final images = selection.items
+        .where((item) => item.kind == 'image')
+        .toList(growable: false);
+    _ImageSendMode? imageMode;
+    if (images.isNotEmpty) {
+      final recommendedMode = await _recommendedImageSendMode();
+      imageMode = await _promptImageSendMode(recommendedMode);
+      if (imageMode == null) return;
+    }
+
+    for (final item in selection.items) {
+      if (item.kind == 'video') {
+        await _sendMediaMessage(
+          upload: item.upload,
+          attachmentType: 'video',
+          durationMs: item.durationMs,
+        );
+        continue;
+      }
+
+      final mode = imageMode ?? _ImageSendMode.standard;
+      final upload = await _prepareImageUploadForMode(item.upload, mode);
+      if (upload == null) continue;
+      await _sendMediaMessage(
+        upload: upload,
+        attachmentType: mode == _ImageSendMode.file ? 'file' : 'image',
+      );
+    }
+  }
+
   Future<void> _openAttachmentSheet() async {
     if (!_canCompose() || _mediaUploading || _voiceSending || _voiceRecording) {
       return;
     }
-    void launchAttachmentAction(Future<void> Function() action) {
-      Navigator.of(context).pop();
-      if (kIsWeb) {
-        unawaited(action());
-        return;
-      }
-      Future<void>.delayed(const Duration(milliseconds: 120), action);
-    }
-
-    await showModalBottomSheet<void>(
+    final selection = await showModalBottomSheet<_AttachmentGallerySelection>(
       context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (_cameraSupported && !kIsWeb)
-              ListTile(
-                leading: const Icon(Icons.photo_camera_outlined),
-                title: const Text('Сделать фото'),
-                onTap: () => launchAttachmentAction(
-                  () => _pickAndSendImage(ImageSource.camera),
-                ),
-              ),
-            ListTile(
-              leading: const Icon(Icons.photo_library_outlined),
-              title: Text(
-                _preferFilePickerForImages
-                    ? 'Выбрать фото с устройства'
-                    : 'Выбрать из галереи',
-              ),
-              onTap: () => launchAttachmentAction(
-                () => _pickAndSendImage(ImageSource.gallery),
-              ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.videocam_outlined),
-              title: const Text('Выбрать видео'),
-              onTap: () => launchAttachmentAction(_pickAndSendVideo),
-            ),
-            if (_cameraSupported && !kIsWeb)
-              ListTile(
-                leading: const Icon(Icons.video_call_outlined),
-                title: const Text('Снять видео'),
-                onTap: () => launchAttachmentAction(
-                  () => _pickAndSendVideo(source: ImageSource.camera),
-                ),
-              ),
-            ListTile(
-              leading: const Icon(Icons.attach_file_rounded),
-              title: const Text('Документ или файл'),
-              onTap: () => launchAttachmentAction(_pickAndSendFile),
-            ),
-          ],
-        ),
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width),
+      builder: (sheetContext) => _ChatAttachmentGallerySheet(
+        title: 'Недавние',
+        desktopMode: _preferFilePickerForImages,
+        nativeMacCameraMode:
+            NativeVideoNoteCaptureService.shouldUseNativeCapture,
+        loadRecent: _loadAttachmentRecentGallery,
+        loadRecentUpload: _attachmentUploadFromRecent,
+        pickFromDevice: _pickAttachmentImagesFromDevice,
+        startCamera: _startAttachmentCameraPreview,
+        cameraController: () => _videoCameraController,
+        cameraPreviewAvailable: () => _attachmentCameraPreviewAvailable,
+        cameraHint: () => _cameraErrorHint(_lastVideoCameraError),
+        capturePhoto: _captureAttachmentCameraPhoto,
+        toggleRecordVideo: _toggleAttachmentCameraVideoRecording,
+        cancelRecordVideo: _cancelAttachmentCameraVideoRecording,
+        stopCamera: _stopAttachmentCameraPreview,
       ),
     );
+    if (selection == null || selection.items.isEmpty) return;
+    await _sendAttachmentGallerySelection(selection);
   }
 
   String _formatDurationLabel(Duration duration) {
@@ -6261,6 +6707,7 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() {
         _voiceRecording = true;
         _voiceRecordingLocked = false;
+        _voiceRecordingVisualPhase = _RecordingActionVisualPhase.dragging;
         _recordingSeconds = 0;
         _recordingDragDx = 0;
         _recordingDragDy = 0;
@@ -6424,6 +6871,163 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  void _resetVideoRecordingState() {
+    _videoRecordingCancelVisualTimer?.cancel();
+    _videoRecordingCancelVisualTimer = null;
+    _videoRecordingTimer?.cancel();
+    _videoRecordingTimer = null;
+    _videoRecordingStartedAt = null;
+    _stopNativeVideoPreviewStream();
+    if (!mounted) {
+      _videoRecording = false;
+      _nativeVideoNoteRecording = false;
+      _webVideoNoteRecording = false;
+      _videoRecordingLocked = false;
+      _videoRecordingVisualPhase = _RecordingActionVisualPhase.idle;
+      _videoRecordingSeconds = 0;
+      _videoRecordingDragDx = 0;
+      _videoRecordingDragDy = 0;
+      return;
+    }
+    setState(() {
+      _videoRecording = false;
+      _nativeVideoNoteRecording = false;
+      _webVideoNoteRecording = false;
+      _videoRecordingLocked = false;
+      _videoRecordingVisualPhase = _RecordingActionVisualPhase.idle;
+      _videoRecordingSeconds = 0;
+      _videoRecordingDragDx = 0;
+      _videoRecordingDragDy = 0;
+    });
+  }
+
+  void _startVideoRecordingTicker() {
+    _videoRecordingTimer?.cancel();
+    _videoRecordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() => _videoRecordingSeconds += 1);
+      unawaited(_emitChatActivity('chat:recording_video'));
+    });
+  }
+
+  Future<void> _startNativeVideoCircleRecording({
+    bool autoStopIfNotPressed = true,
+  }) async {
+    _videoStartInProgress = true;
+    try {
+      final supported = await NativeVideoNoteCaptureService.isSupported();
+      if (!supported) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Видеокружки недоступны в этой сборке приложения',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+        return;
+      }
+      _startNativeVideoPreviewStream();
+      await NativeVideoNoteCaptureService.start();
+      _videoRecordingTimer?.cancel();
+      if (!mounted) return;
+      setState(() {
+        _videoRecording = true;
+        _nativeVideoNoteRecording = true;
+        _videoRecordingLocked = false;
+        _videoRecordingVisualPhase = _RecordingActionVisualPhase.dragging;
+        _videoRecordingSeconds = 0;
+        _videoRecordingDragDx = 0;
+        _videoRecordingDragDy = 0;
+      });
+      _videoRecordingStartedAt = DateTime.now();
+      unawaited(_emitChatActivity('chat:recording_video'));
+      _startVideoRecordingTicker();
+      if (autoStopIfNotPressed && !_composerMediaPressActive) {
+        await _stopVideoCircleRecordingAndSend();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось начать видеозапись: ${_cameraErrorHint(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+      debugPrint('startNativeVideoCircleRecording error: $e');
+      _stopNativeVideoPreviewStream();
+    } finally {
+      _videoStartInProgress = false;
+    }
+  }
+
+  void _startNativeVideoPreviewStream() {
+    _nativeVideoPreviewSub?.cancel();
+    _nativeVideoPreviewFrame = null;
+    _nativeVideoPreviewSub = NativeVideoNoteCaptureService.previewFrames.listen(
+      (frame) {
+        if (!mounted || !_nativeVideoNoteRecording) return;
+        setState(() => _nativeVideoPreviewFrame = frame);
+      },
+      onError: (Object error) {
+        debugPrint('native video preview error: $error');
+      },
+    );
+  }
+
+  void _stopNativeVideoPreviewStream() {
+    _nativeVideoPreviewSub?.cancel();
+    _nativeVideoPreviewSub = null;
+    _nativeVideoPreviewFrame = null;
+  }
+
+  Future<void> _startWebVideoCircleRecording({
+    bool autoStopIfNotPressed = true,
+  }) async {
+    _videoStartInProgress = true;
+    try {
+      if (!WebVideoNoteCaptureService.isSupported) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Видеокружки недоступны в этом браузере',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+        return;
+      }
+      await WebVideoNoteCaptureService.start();
+      _videoRecordingTimer?.cancel();
+      if (!mounted) return;
+      setState(() {
+        _videoRecording = true;
+        _nativeVideoNoteRecording = false;
+        _webVideoNoteRecording = true;
+        _videoRecordingLocked = false;
+        _videoRecordingVisualPhase = _RecordingActionVisualPhase.dragging;
+        _videoRecordingSeconds = 0;
+        _videoRecordingDragDx = 0;
+        _videoRecordingDragDy = 0;
+      });
+      _videoRecordingStartedAt = DateTime.now();
+      unawaited(_emitChatActivity('chat:recording_video'));
+      _startVideoRecordingTicker();
+      if (autoStopIfNotPressed && !_composerMediaPressActive) {
+        await _stopVideoCircleRecordingAndSend();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Не удалось начать видеозапись: ${_cameraErrorHint(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 2),
+      );
+      debugPrint('startWebVideoCircleRecording error: $e');
+    } finally {
+      _videoStartInProgress = false;
+    }
+  }
+
   Future<void> _startVideoCircleRecording({
     bool autoStopIfNotPressed = true,
   }) async {
@@ -6435,6 +7039,18 @@ class _ChatScreenState extends State<ChatScreen> {
         _videoStartInProgress) {
       return;
     }
+    if (kIsWeb) {
+      await _startWebVideoCircleRecording(
+        autoStopIfNotPressed: autoStopIfNotPressed,
+      );
+      return;
+    }
+    if (NativeVideoNoteCaptureService.shouldUseNativeCapture) {
+      await _startNativeVideoCircleRecording(
+        autoStopIfNotPressed: autoStopIfNotPressed,
+      );
+      return;
+    }
     if (!_captureProfile.videoNoteCaptureSupported) {
       if (mounted) {
         showAppNotice(
@@ -6444,7 +7060,6 @@ class _ChatScreenState extends State<ChatScreen> {
           duration: const Duration(seconds: 3),
         );
       }
-      await _pickAndSendVideo();
       return;
     }
     _videoStartInProgress = true;
@@ -6504,18 +7119,16 @@ class _ChatScreenState extends State<ChatScreen> {
       _videoRecordingTimer?.cancel();
       setState(() {
         _videoRecording = true;
+        _nativeVideoNoteRecording = false;
         _videoRecordingLocked = false;
+        _videoRecordingVisualPhase = _RecordingActionVisualPhase.dragging;
         _videoRecordingSeconds = 0;
         _videoRecordingDragDx = 0;
         _videoRecordingDragDy = 0;
       });
       _videoRecordingStartedAt = DateTime.now();
       unawaited(_emitChatActivity('chat:recording_video'));
-      _videoRecordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (!mounted) return;
-        setState(() => _videoRecordingSeconds += 1);
-        unawaited(_emitChatActivity('chat:recording_video'));
-      });
+      _startVideoRecordingTicker();
       if (autoStopIfNotPressed && !_composerMediaPressActive) {
         await _stopVideoCircleRecordingAndSend();
       }
@@ -6534,22 +7147,84 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _stopVideoCircleRecordingAndSend() async {
-    if (!_videoRecording || _videoCameraController == null) return;
+    if (!_videoRecording) return;
     final startedAt = _videoRecordingStartedAt;
     final durationMs = startedAt == null
         ? _videoRecordingSeconds * 1000
         : DateTime.now().difference(startedAt).inMilliseconds;
-    _videoRecordingTimer?.cancel();
-    _videoRecordingTimer = null;
-    _videoRecordingStartedAt = null;
-    setState(() {
-      _videoRecording = false;
-      _videoRecordingLocked = false;
-      _videoRecordingSeconds = 0;
-      _videoRecordingDragDx = 0;
-      _videoRecordingDragDy = 0;
-    });
+    final nativeRecording = _nativeVideoNoteRecording;
+    final webRecording = _webVideoNoteRecording;
+    _resetVideoRecordingState();
     try {
+      if (nativeRecording) {
+        final result = await NativeVideoNoteCaptureService.stop();
+        final effectiveDurationMs = result.durationMs > 0
+            ? result.durationMs
+            : durationMs;
+        if (effectiveDurationMs < 1000) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Видеосообщение отменено (меньше 1 секунды)',
+            tone: AppNoticeTone.info,
+            duration: const Duration(milliseconds: 900),
+          );
+          return;
+        }
+        await _sendMediaMessage(
+          upload: _ChatUploadFile(
+            filename: result.filename.isNotEmpty
+                ? result.filename
+                : result.path.split('/').last,
+            path: result.path,
+            mimeType: result.mimeType,
+          ),
+          attachmentType: 'video',
+          durationMs: effectiveDurationMs,
+          isVideoNote: true,
+        );
+        return;
+      }
+      if (webRecording) {
+        final result = await WebVideoNoteCaptureService.stop();
+        final effectiveDurationMs = result.durationMs > 0
+            ? result.durationMs
+            : durationMs;
+        if (effectiveDurationMs < 1000) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Видеосообщение отменено (меньше 1 секунды)',
+            tone: AppNoticeTone.info,
+            duration: const Duration(milliseconds: 900),
+          );
+          return;
+        }
+        if (result.bytes.isEmpty) {
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Не удалось прочитать видеосообщение',
+            tone: AppNoticeTone.error,
+            duration: const Duration(seconds: 2),
+          );
+          return;
+        }
+        await _sendMediaMessage(
+          upload: _ChatUploadFile(
+            filename: result.filename.isNotEmpty
+                ? result.filename
+                : 'video-note-${DateTime.now().millisecondsSinceEpoch}.${_videoExtensionForMime(result.mimeType)}',
+            bytes: result.bytes,
+            mimeType: result.mimeType,
+          ),
+          attachmentType: 'video',
+          durationMs: effectiveDurationMs,
+          isVideoNote: true,
+        );
+        return;
+      }
+      if (_videoCameraController == null) return;
       final xfile = await _videoCameraController!.stopVideoRecording();
       if (durationMs < 1000) {
         if (!mounted) return;
@@ -6616,22 +7291,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }) async {
     if (!_videoRecording && !_videoStartInProgress) {
       _videoRecordingLocked = false;
+      _videoRecordingVisualPhase = _RecordingActionVisualPhase.idle;
       _videoRecordingDragDx = 0;
       _videoRecordingDragDy = 0;
       return;
     }
-    _videoRecordingTimer?.cancel();
-    _videoRecordingTimer = null;
-    _videoRecordingStartedAt = null;
-    setState(() {
-      _videoRecording = false;
-      _videoRecordingLocked = false;
-      _videoRecordingSeconds = 0;
-      _videoRecordingDragDx = 0;
-      _videoRecordingDragDy = 0;
-    });
+    final nativeRecording = _nativeVideoNoteRecording;
+    final webRecording = _webVideoNoteRecording;
+    _resetVideoRecordingState();
     try {
-      if (_videoCameraController?.value.isRecordingVideo == true) {
+      if (nativeRecording) {
+        await NativeVideoNoteCaptureService.cancel();
+      } else if (webRecording) {
+        await WebVideoNoteCaptureService.cancel();
+      } else if (_videoCameraController?.value.isRecordingVideo == true) {
         await _videoCameraController!.stopVideoRecording();
       }
     } catch (_) {}
@@ -6646,6 +7319,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _stopVoiceRecordingAndSend() async {
     if (!_voiceRecording) return;
+    _voiceRecordingCancelVisualTimer?.cancel();
+    _voiceRecordingCancelVisualTimer = null;
     final startedAt = _voiceRecordingStartedAt;
     final durationMs = startedAt == null
         ? _recordingSeconds * 1000
@@ -6656,6 +7331,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _voiceRecording = false;
       _voiceRecordingLocked = false;
+      _voiceRecordingVisualPhase = _RecordingActionVisualPhase.idle;
       _recordingSeconds = 0;
       _recordingDragDx = 0;
       _recordingDragDy = 0;
@@ -6729,8 +7405,11 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _cancelVoiceRecording({
     String notice = 'Голосовое отменено',
   }) async {
+    _voiceRecordingCancelVisualTimer?.cancel();
+    _voiceRecordingCancelVisualTimer = null;
     if (!_voiceRecording && !_voiceStartInProgress) {
       _voiceRecordingLocked = false;
+      _voiceRecordingVisualPhase = _RecordingActionVisualPhase.idle;
       _recordingDragDx = 0;
       _recordingDragDy = 0;
       return;
@@ -6741,6 +7420,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _voiceRecording = false;
       _voiceRecordingLocked = false;
+      _voiceRecordingVisualPhase = _RecordingActionVisualPhase.idle;
       _recordingSeconds = 0;
       _recordingDragDx = 0;
       _recordingDragDy = 0;
@@ -6757,22 +7437,78 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  void _beginVoiceRecordingCancelDust({String notice = 'Голосовое отменено'}) {
+    if (_voiceRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust) {
+      return;
+    }
+    _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
+    _cancelComposerMediaHoldTimer();
+    if (mounted) {
+      setState(() {
+        _voiceRecordingLocked = false;
+        _voiceRecordingVisualPhase = _RecordingActionVisualPhase.cancellingDust;
+        _recordingDragDx = _recordingDragDx.clamp(-118.0, -88.0).toDouble();
+        _recordingDragDy = _recordingDragDy.clamp(-42.0, 42.0).toDouble();
+      });
+    }
+    _voiceRecordingCancelVisualTimer?.cancel();
+    _voiceRecordingCancelVisualTimer = Timer(_recordingCancelDustDuration, () {
+      _voiceRecordingCancelVisualTimer = null;
+      unawaited(_cancelVoiceRecording(notice: notice));
+    });
+  }
+
+  void _beginVideoRecordingCancelDust({
+    String notice = 'Видеосообщение отменено',
+  }) {
+    if (_videoRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust) {
+      return;
+    }
+    _composerMediaPressActive = false;
+    _composerPressStartGlobal = null;
+    _cancelComposerMediaHoldTimer();
+    if (mounted) {
+      setState(() {
+        _videoRecordingLocked = false;
+        _videoRecordingVisualPhase = _RecordingActionVisualPhase.cancellingDust;
+        _videoRecordingDragDx = _videoRecordingDragDx
+            .clamp(-118.0, -88.0)
+            .toDouble();
+        _videoRecordingDragDy = _videoRecordingDragDy
+            .clamp(-42.0, 42.0)
+            .toDouble();
+      });
+    }
+    _videoRecordingCancelVisualTimer?.cancel();
+    _videoRecordingCancelVisualTimer = Timer(_recordingCancelDustDuration, () {
+      _videoRecordingCancelVisualTimer = null;
+      unawaited(_cancelVideoCircleRecording(notice: notice));
+    });
+  }
+
   String _buildWebVoiceFilename() {
     return 'voice-${DateTime.now().millisecondsSinceEpoch}.$_activeVoiceUploadExtension';
   }
 
   void _toggleComposerMediaMode() {
-    if (!_cameraSupported) {
-      if (_composerMediaMode != _ComposerMediaMode.voice) {
-        setState(() => _composerMediaMode = _ComposerMediaMode.voice);
-      }
-      return;
-    }
     setState(() {
       _composerMediaMode = _composerMediaMode == _ComposerMediaMode.voice
           ? _ComposerMediaMode.camera
           : _ComposerMediaMode.voice;
     });
+    if (_composerMediaMode == _ComposerMediaMode.camera &&
+        !_captureProfile.videoNoteCaptureSupported &&
+        mounted) {
+      showAppNotice(
+        context,
+        _captureProfile.videoNoteFallbackReason,
+        tone: AppNoticeTone.info,
+        duration: const Duration(seconds: 2),
+      );
+    }
   }
 
   void _cancelComposerMediaHoldTimer() {
@@ -6784,6 +7520,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _composerMediaPressActive = false;
     _composerPressStartGlobal = null;
     _composerHoldActionTriggered = false;
+    _voiceRecordingCancelVisualTimer?.cancel();
+    _voiceRecordingCancelVisualTimer = null;
+    _videoRecordingCancelVisualTimer?.cancel();
+    _videoRecordingCancelVisualTimer = null;
     _cancelComposerMediaHoldTimer();
     if (_anyComposerRecording || _anyRecorderStarting) return;
     unawaited(_send());
@@ -6812,20 +7552,6 @@ class _ChatScreenState extends State<ChatScreen> {
           tone: AppNoticeTone.warning,
           duration: const Duration(seconds: 2),
         );
-      }
-      return;
-    }
-    final isDesktopWeb =
-        kIsWeb &&
-        defaultTargetPlatform != TargetPlatform.android &&
-        defaultTargetPlatform != TargetPlatform.iOS;
-    if (!_cameraSupported &&
-        _composerMediaMode == _ComposerMediaMode.voice &&
-        isDesktopWeb) {
-      if (_voiceRecording) {
-        unawaited(_stopVoiceRecordingAndSend());
-      } else {
-        unawaited(_startVoiceRecording(autoStopIfNotPressed: false));
       }
       return;
     }
@@ -6859,6 +7585,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
 
+    if (_voiceRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust ||
+        _videoRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust) {
+      return;
+    }
+
     if (holdTriggered) {
       if (_composerMediaMode == _ComposerMediaMode.camera) {
         if (_videoRecording && !_videoRecordingLocked) {
@@ -6878,47 +7611,91 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _handleComposerMediaTapCancel() {
-    if (_composerHoldActionTriggered ||
-        _anyComposerRecording ||
-        _anyRecorderStarting) {
-      return;
-    }
     _composerMediaPressActive = false;
     _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
   }
 
-  void _handleComposerMediaPanUpdate(DragUpdateDetails details) {
-    if (!_composerMediaPressActive) return;
-    final start = _composerPressStartGlobal;
-    if (start == null) return;
-    final dx = details.globalPosition.dx - start.dx;
-    final dy = details.globalPosition.dy - start.dy;
-    if (_voiceRecording && mounted) {
+  void _handleRecordingPointerStart(Offset globalPosition) {
+    if (!_voiceRecording && !_videoRecording) return;
+    if (_voiceRecordingLocked || _videoRecordingLocked) return;
+    if (_voiceRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust ||
+        _videoRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust) {
+      return;
+    }
+    _composerMediaPressActive = true;
+    _composerHoldActionTriggered = true;
+    _composerPressStartGlobal = globalPosition;
+    _cancelComposerMediaHoldTimer();
+  }
+
+  void _handleRecordingPointerMove(Offset globalPosition) {
+    if (!_voiceRecording && !_videoRecording) return;
+    if (_voiceRecordingLocked || _videoRecordingLocked) return;
+    final voiceCancelling =
+        _voiceRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust;
+    final videoCancelling =
+        _videoRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust;
+    if (voiceCancelling || videoCancelling) return;
+    if (!_composerMediaPressActive) {
+      _handleRecordingPointerStart(globalPosition);
+    }
+    final start = _composerPressStartGlobal ?? globalPosition;
+    _composerPressStartGlobal ??= start;
+    _applyComposerMediaDragDelta(
+      globalPosition.dx - start.dx,
+      globalPosition.dy - start.dy,
+    );
+  }
+
+  void _applyComposerMediaDragDelta(double dx, double dy) {
+    final voiceCancelling =
+        _voiceRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust;
+    final videoCancelling =
+        _videoRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust;
+    if (_voiceRecording &&
+        !_voiceRecordingLocked &&
+        !voiceCancelling &&
+        mounted) {
       setState(() {
         _recordingDragDx = dx;
         _recordingDragDy = dy;
+        _voiceRecordingVisualPhase = _RecordingActionVisualPhase.dragging;
       });
     }
-    if (_videoRecording && mounted) {
+    if (_videoRecording &&
+        !_videoRecordingLocked &&
+        !videoCancelling &&
+        mounted) {
       setState(() {
         _videoRecordingDragDx = dx;
         _videoRecordingDragDy = dy;
+        _videoRecordingVisualPhase = _RecordingActionVisualPhase.dragging;
       });
     }
-    if (_voiceRecording && !_voiceRecordingLocked) {
+    if (_voiceRecording && !_voiceRecordingLocked && !voiceCancelling) {
       if (dx <= -88) {
-        unawaited(
-          _cancelVoiceRecording(notice: 'Голосовое отменено (свайп влево)'),
+        _beginVoiceRecordingCancelDust(
+          notice: 'Голосовое отменено (свайп влево)',
         );
-        _composerMediaPressActive = false;
-        _cancelComposerMediaHoldTimer();
         return;
       }
       if (dy <= -72) {
         setState(() {
           _voiceRecordingLocked = true;
+          _voiceRecordingVisualPhase = _RecordingActionVisualPhase.lockedHover;
+          _recordingDragDx = 0;
+          _recordingDragDy = -96;
         });
+        _composerMediaPressActive = false;
+        _composerPressStartGlobal = null;
+        _cancelComposerMediaHoldTimer();
         showAppNotice(
           context,
           'Запись зафиксирована',
@@ -6928,21 +7705,23 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       return;
     }
-    if (_videoRecording && !_videoRecordingLocked) {
+    if (_videoRecording && !_videoRecordingLocked && !videoCancelling) {
       if (dx <= -88) {
-        unawaited(
-          _cancelVideoCircleRecording(
-            notice: 'Видеосообщение отменено (свайп влево)',
-          ),
+        _beginVideoRecordingCancelDust(
+          notice: 'Видеосообщение отменено (свайп влево)',
         );
-        _composerMediaPressActive = false;
-        _cancelComposerMediaHoldTimer();
         return;
       }
       if (dy <= -72) {
         setState(() {
           _videoRecordingLocked = true;
+          _videoRecordingVisualPhase = _RecordingActionVisualPhase.lockedHover;
+          _videoRecordingDragDx = 0;
+          _videoRecordingDragDy = -96;
         });
+        _composerMediaPressActive = false;
+        _composerPressStartGlobal = null;
+        _cancelComposerMediaHoldTimer();
         showAppNotice(
           context,
           'Видеозапись зафиксирована',
@@ -6958,6 +7737,12 @@ class _ChatScreenState extends State<ChatScreen> {
     _composerMediaPressActive = false;
     _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
+    if (_voiceRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust ||
+        _videoRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust) {
+      return;
+    }
     if (!holdTriggered) return;
     if (_composerMediaMode == _ComposerMediaMode.voice &&
         _voiceRecording &&
@@ -6977,6 +7762,12 @@ class _ChatScreenState extends State<ChatScreen> {
     _composerMediaPressActive = false;
     _composerPressStartGlobal = null;
     _cancelComposerMediaHoldTimer();
+    if (_voiceRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust ||
+        _videoRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust) {
+      return;
+    }
     if (!holdTriggered) return;
     if (_composerMediaMode == _ComposerMediaMode.camera) {
       unawaited(_cancelVideoCircleRecording());
@@ -7005,7 +7796,10 @@ class _ChatScreenState extends State<ChatScreen> {
         _activeVoicePosition = Duration.zero;
         _activeVoiceDuration = Duration.zero;
       });
-      await _voicePlayer.play(UrlSource(voiceUrl));
+      await _ensureVoiceSourceAvailable(voiceUrl);
+      await _voicePlayer.play(
+        UrlSource(voiceUrl, mimeType: _voiceMimeTypeForUrl(voiceUrl)),
+      );
     } catch (e) {
       if (!mounted) return;
       showAppNotice(
@@ -7015,6 +7809,42 @@ class _ChatScreenState extends State<ChatScreen> {
         duration: const Duration(seconds: 2),
       );
       debugPrint('toggleVoicePlayback error: $e');
+    }
+  }
+
+  String? _voiceMimeTypeForUrl(String url) {
+    final normalized = url.split('?').first.toLowerCase();
+    if (normalized.endsWith('.m4a') || normalized.endsWith('.mp4')) {
+      return 'audio/mp4';
+    }
+    if (normalized.endsWith('.mp3')) return 'audio/mpeg';
+    if (normalized.endsWith('.wav')) return 'audio/wav';
+    if (normalized.endsWith('.ogg')) return 'audio/ogg';
+    if (normalized.endsWith('.webm')) return 'audio/webm';
+    return null;
+  }
+
+  Future<void> _ensureVoiceSourceAvailable(String voiceUrl) async {
+    final normalized = voiceUrl.trim().toLowerCase();
+    if (normalized.startsWith('blob:') || normalized.startsWith('data:')) {
+      return;
+    }
+    final uri = Uri.tryParse(voiceUrl);
+    if (uri == null || !uri.hasScheme) return;
+    final response = await authService.dio.headUri(
+      uri,
+      options: Options(
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 400,
+      ),
+    );
+    final contentType = (response.headers.value('content-type') ?? '')
+        .trim()
+        .toLowerCase();
+    if (contentType.isNotEmpty &&
+        !contentType.startsWith('audio/') &&
+        !contentType.contains('octet-stream')) {
+      throw StateError('Voice source is not audio: $contentType');
     }
   }
 
@@ -7196,6 +8026,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  // ignore: unused_element
   Future<void> _openExpandedVideoNote(
     Map<String, dynamic> message,
     Map<String, dynamic> meta,
@@ -9148,6 +9979,27 @@ class _ChatScreenState extends State<ChatScreen> {
     return (meta['attachment_type'] ?? '').toString().trim().toLowerCase();
   }
 
+  bool _isVideoNoteMeta(Map<String, dynamic> meta) {
+    final raw = meta['is_video_note'];
+    return raw == true || raw.toString().trim().toLowerCase() == 'true';
+  }
+
+  bool _isSingleEmojiText(String raw) {
+    final text = raw.trim();
+    if (text.isEmpty || RegExp(r'\s').hasMatch(text)) return false;
+    final emojiPattern = RegExp(
+      r'^(?:'
+      r'[\u{1F1E6}-\u{1F1FF}]{2}|'
+      r'(?:[\u{2600}-\u{27BF}]|[\u{1F300}-\u{1FAFF}])'
+      r'(?:\uFE0F|[\u{1F3FB}-\u{1F3FF}])?'
+      r'(?:\u200D(?:[\u{2600}-\u{27BF}]|[\u{1F300}-\u{1FAFF}])'
+      r'(?:\uFE0F|[\u{1F3FB}-\u{1F3FF}])?)*'
+      r')$',
+      unicode: true,
+    );
+    return emojiPattern.hasMatch(text);
+  }
+
   String _captionTextOf(
     Map<String, dynamic> message,
     Map<String, dynamic> meta,
@@ -9209,6 +10061,60 @@ class _ChatScreenState extends State<ChatScreen> {
       TextSpan(style: style, children: spans),
       maxLines: maxLines,
       overflow: overflow,
+    );
+  }
+
+  Widget _buildSingleEmojiMedallion(
+    ThemeData theme,
+    String emoji, {
+    required bool fromMe,
+  }) {
+    final media = MediaQuery.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final size = min(
+      media.size.width * 0.38,
+      184.0,
+    ).clamp(128.0, 184.0).toDouble();
+    final accent = fromMe ? theme.colorScheme.primary : const Color(0xFF20D6E9);
+    final warmAccent = const Color(0xFFFF8848);
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      width: size,
+      height: size,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(size * 0.24),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            accent.withValues(alpha: isDark ? 0.20 : 0.12),
+            warmAccent.withValues(alpha: isDark ? 0.11 : 0.08),
+            theme.colorScheme.surfaceContainerHighest.withValues(
+              alpha: isDark ? 0.92 : 0.96,
+            ),
+          ],
+        ),
+        border: Border.all(color: accent.withValues(alpha: 0.32), width: 1.2),
+        boxShadow: [
+          BoxShadow(
+            color: accent.withValues(alpha: isDark ? 0.22 : 0.12),
+            blurRadius: 28,
+            offset: const Offset(0, 14),
+          ),
+          BoxShadow(
+            color: Colors.black.withValues(alpha: isDark ? 0.24 : 0.08),
+            blurRadius: 18,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Text(
+        emoji,
+        textAlign: TextAlign.center,
+        style: TextStyle(fontSize: size * 0.54, height: 1),
+      ),
     );
   }
 
@@ -10931,9 +11837,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildVoiceAttachment(
     ThemeData theme,
     Map<String, dynamic> message,
-    Map<String, dynamic> meta, {
-    required Color textColor,
-  }) {
+    Map<String, dynamic> meta,
+  ) {
     final messageId = message['id']?.toString().trim() ?? '';
     final voiceUrl = _voiceUrlOf(meta);
     final durationMs = _voiceDurationMsOf(meta);
@@ -10957,108 +11862,88 @@ class _ChatScreenState extends State<ChatScreen> {
       messageId,
       progress,
     );
-    final shellColor = Color.alphaBlend(
-      theme.colorScheme.primary.withValues(alpha: 0.10),
-      theme.colorScheme.surface,
-    );
+    final isDark = theme.brightness == Brightness.dark;
+    final shellColor = isDark
+        ? const Color(0xFF1D1C2A).withValues(alpha: 0.96)
+        : Color.alphaBlend(
+            theme.colorScheme.primary.withValues(alpha: 0.08),
+            theme.colorScheme.surface,
+          );
+    final voiceTextColor = isDark
+        ? Colors.white.withValues(alpha: 0.88)
+        : theme.colorScheme.onSurface;
 
-    return Container(
-      padding: const EdgeInsets.fromLTRB(8, 8, 10, 8),
-      decoration: BoxDecoration(
-        color: shellColor,
-        borderRadius: BorderRadius.circular(22),
-        border: Border.all(
-          color: theme.colorScheme.primary.withValues(alpha: 0.14),
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minWidth: 250, maxWidth: 520),
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 60),
+        padding: const EdgeInsets.fromLTRB(9, 9, 13, 9),
+        decoration: BoxDecoration(
+          color: shellColor,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(
+            color: theme.colorScheme.primary.withValues(alpha: 0.26),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: theme.colorScheme.primary.withValues(alpha: 0.10),
+              blurRadius: 18,
+              offset: const Offset(0, 8),
+            ),
+            BoxShadow(
+              color: Colors.black.withValues(alpha: isDark ? 0.22 : 0.06),
+              blurRadius: 20,
+              offset: const Offset(0, 10),
+            ),
+          ],
         ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.06),
-            blurRadius: 12,
-            offset: const Offset(0, 6),
-          ),
-        ],
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(999),
-            onTap: voiceUrl == null
-                ? null
-                : () => _toggleVoicePlayback(messageId, voiceUrl),
-            child: Ink(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    theme.colorScheme.primary.withValues(alpha: 0.85),
-                    theme.colorScheme.primary.withValues(alpha: 0.65),
-                  ],
-                ),
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: theme.colorScheme.primary.withValues(alpha: 0.24),
-                    blurRadius: 10,
-                    offset: const Offset(0, 4),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            InkWell(
+              borderRadius: BorderRadius.circular(999),
+              onTap: voiceUrl == null
+                  ? null
+                  : () => _toggleVoicePlayback(messageId, voiceUrl),
+              child: Ink(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFF3B82FF), Color(0xFF20D6E9)],
                   ),
-                ],
-              ),
-              child: Icon(
-                isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                color: Colors.white,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                waveform,
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Text(
-                      isActive && currentPosition > Duration.zero
-                          ? _formatDurationLabel(currentPosition)
-                          : _formatDurationLabel(totalDuration),
-                      style: TextStyle(
-                        color: textColor,
-                        fontWeight: FontWeight.w700,
-                        fontFeatures: const [ui.FontFeature.tabularFigures()],
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.primary.withValues(
-                          alpha: 0.12,
-                        ),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Text(
-                        'голосовое',
-                        style: TextStyle(
-                          color: textColor.withValues(alpha: 0.72),
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF3B82FF).withValues(alpha: 0.26),
+                      blurRadius: 12,
+                      offset: const Offset(0, 5),
                     ),
                   ],
                 ),
-              ],
+                child: Icon(
+                  isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                  color: Colors.white,
+                ),
+              ),
             ),
-          ),
-        ],
+            const SizedBox(width: 12),
+            Expanded(child: waveform),
+            const SizedBox(width: 12),
+            Text(
+              isActive && currentPosition > Duration.zero
+                  ? _formatDurationLabel(currentPosition)
+                  : _formatDurationLabel(totalDuration),
+              style: TextStyle(
+                color: voiceTextColor,
+                fontWeight: FontWeight.w800,
+                fontFeatures: const [ui.FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -11170,10 +12055,33 @@ class _ChatScreenState extends State<ChatScreen> {
               ]
             : null,
       ),
-      child: Icon(
-        icon,
-        color: filled ? Colors.white : color,
-        size: size * 0.42,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 220),
+        reverseDuration: const Duration(milliseconds: 170),
+        switchInCurve: Curves.easeOutBack,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) {
+          final curved = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+          );
+          return FadeTransition(
+            opacity: curved,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.72, end: 1).animate(curved),
+              child: RotationTransition(
+                turns: Tween<double>(begin: -0.08, end: 0).animate(curved),
+                child: child,
+              ),
+            ),
+          );
+        },
+        child: Icon(
+          icon,
+          key: ValueKey<int>(icon.codePoint),
+          color: filled ? Colors.white : color,
+          size: size * 0.42,
+        ),
       ),
     );
     if (onTap == null) return bubble;
@@ -11182,6 +12090,286 @@ class _ChatScreenState extends State<ChatScreen> {
       onTap: onTap,
       child: bubble,
     );
+  }
+
+  Widget _buildComposerMediaFlipIcon({
+    required bool videoMode,
+    required Color color,
+    required double size,
+  }) {
+    final reduceMotion = MediaQuery.maybeOf(context)?.disableAnimations == true;
+    final iconSize = size * 0.42;
+    Widget iconStack(double t) {
+      final micOpacity = (1 - t).clamp(0.0, 1.0);
+      final videoOpacity = t.clamp(0.0, 1.0);
+      return SizedBox(
+        width: size,
+        height: size,
+        child: Transform.rotate(
+          angle: math.pi * t,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Opacity(
+                opacity: micOpacity,
+                child: Transform.translate(
+                  offset: Offset(0, -18 * t),
+                  child: Transform.rotate(
+                    angle: -math.pi * t,
+                    child: Icon(
+                      Icons.mic_rounded,
+                      color: color,
+                      size: iconSize,
+                    ),
+                  ),
+                ),
+              ),
+              Opacity(
+                opacity: videoOpacity,
+                child: Transform.translate(
+                  offset: Offset(0, 18 * (1 - t)),
+                  child: Transform.rotate(
+                    angle: -math.pi * t,
+                    child: Icon(
+                      Icons.radio_button_unchecked_rounded,
+                      color: color,
+                      size: iconSize,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (reduceMotion) {
+      return Icon(
+        videoMode ? Icons.radio_button_unchecked_rounded : Icons.mic_rounded,
+        color: color,
+        size: iconSize,
+      );
+    }
+    return TweenAnimationBuilder<double>(
+      duration: const Duration(milliseconds: 340),
+      curve: Curves.easeOutCubic,
+      tween: Tween<double>(end: videoMode ? 1 : 0),
+      builder: (context, t, _) {
+        return iconStack(t);
+      },
+    );
+  }
+
+  Widget _buildElasticRecordingAction({
+    required Widget child,
+    required double dragDx,
+    required double dragDy,
+    required double lockProgress,
+    required double cancelProgress,
+    required bool locked,
+    required Color color,
+    required _RecordingActionVisualPhase visualPhase,
+    required Animation<double> hoverAnimation,
+  }) {
+    final reduceMotion =
+        performanceModeNotifier.value ||
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
+    final activeProgress = max(
+      lockProgress,
+      cancelProgress,
+    ).clamp(0.0, 1.0).toDouble();
+    final isDusting = visualPhase == _RecordingActionVisualPhase.cancellingDust;
+    final isLockedHover =
+        locked || visualPhase == _RecordingActionVisualPhase.lockedHover;
+    final isCancelling = isDusting || cancelProgress > lockProgress;
+    final glowColor = isCancelling
+        ? const Color(0xFFFF4D5B)
+        : locked
+        ? const Color(0xFF35D399)
+        : color;
+    final easedDx = dragDx.clamp(-88.0, 0.0).toDouble();
+    final easedDy = dragDy.clamp(-116.0, 0.0).toDouble();
+
+    List<Widget> dustParticles(double progress) {
+      if (reduceMotion) return const <Widget>[];
+      const vectors = <Offset>[
+        Offset(-1.00, -0.42),
+        Offset(-0.88, 0.10),
+        Offset(-0.74, 0.52),
+        Offset(-0.50, -0.70),
+        Offset(-0.28, 0.72),
+        Offset(0.08, -0.52),
+        Offset(0.22, 0.34),
+      ];
+      return List<Widget>.generate(vectors.length, (index) {
+        final vector = vectors[index];
+        final delay = index * 0.035;
+        final t = ((progress - delay) / (1 - delay)).clamp(0.0, 1.0).toDouble();
+        final size = 3.0 + (index % 3) * 1.4;
+        final distance = 18 + index * 2.2 + t * 46;
+        final opacity = ((1 - t) * (0.86 - index * 0.052)).clamp(0.0, 1.0);
+        return Positioned(
+          left: 27 + vector.dx * distance - size / 2,
+          top: 27 + vector.dy * distance * 0.72 - size / 2,
+          child: Opacity(
+            opacity: opacity,
+            child: Transform.scale(
+              scale: 0.72 + t * 0.44,
+              child: Container(
+                width: size,
+                height: size,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color:
+                      Color.lerp(glowColor, Colors.white, 0.22) ?? Colors.white,
+                  boxShadow: [
+                    BoxShadow(
+                      color: glowColor.withValues(alpha: 0.22),
+                      blurRadius: 8,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      });
+    }
+
+    Widget buildFrame(double hoverValue, double dustProgress) {
+      final expandedHitArea = isLockedHover || isDusting;
+      final hitWidth = expandedHitArea ? 104.0 : 54.0;
+      final hitHeight = expandedHitArea ? 146.0 : 54.0;
+      final hoverOffset = reduceMotion || !isLockedHover
+          ? Offset.zero
+          : Offset(
+              math.sin(hoverValue * math.pi * 2) * 5.0,
+              math.cos(hoverValue * math.pi * 2) * 2.4,
+            );
+      final dragOffset = Offset(easedDx * 0.46, easedDy * 0.66);
+      final baseOffset = isDusting
+          ? Offset(
+              dragOffset.dx - dustProgress * 88,
+              dragOffset.dy * 0.42 - dustProgress * 8,
+            )
+          : isLockedHover
+          ? const Offset(0, -78)
+          : dragOffset;
+      final opacity = isDusting
+          ? (1 - dustProgress * 0.96).clamp(0.0, 1.0).toDouble()
+          : 1.0;
+      final scale = isDusting
+          ? (1 - dustProgress * 0.30).clamp(0.68, 1.0).toDouble()
+          : isLockedHover
+          ? 1.04
+          : 1.0;
+      final glowSize = isLockedHover
+          ? 88.0 + math.sin(hoverValue * math.pi * 2) * 4.0
+          : 54.0 + activeProgress * 36.0;
+      final glowOpacity = reduceMotion
+          ? 0.0
+          : isDusting
+          ? (1 - dustProgress) * 0.46
+          : isLockedHover
+          ? 0.44
+          : activeProgress * 0.52;
+      final slideDuration = isDusting
+          ? Duration.zero
+          : reduceMotion
+          ? Duration.zero
+          : isLockedHover
+          ? const Duration(milliseconds: 260)
+          : Duration.zero;
+
+      return AnimatedSize(
+        duration: reduceMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 190),
+        curve: Curves.easeOutCubic,
+        alignment: Alignment.bottomCenter,
+        child: SizedBox(
+          width: hitWidth,
+          height: hitHeight,
+          child: Stack(
+            clipBehavior: Clip.none,
+            alignment: Alignment.bottomCenter,
+            children: [
+              AnimatedSlide(
+                duration: slideDuration,
+                curve: Curves.easeOutCubic,
+                offset: Offset(
+                  (baseOffset.dx + hoverOffset.dx * 0.2) / 54,
+                  (baseOffset.dy + hoverOffset.dy * 0.2) / 54,
+                ),
+                child: IgnorePointer(
+                  child: Opacity(
+                    opacity: glowOpacity.clamp(0.0, 1.0).toDouble(),
+                    child: Container(
+                      width: glowSize,
+                      height: glowSize,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            glowColor.withValues(alpha: 0.28),
+                            glowColor.withValues(alpha: 0.08),
+                            Colors.transparent,
+                          ],
+                          stops: const [0, 0.48, 1],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              if (isDusting)
+                Transform.translate(
+                  offset: baseOffset,
+                  child: SizedBox(
+                    width: 54,
+                    height: 54,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: dustParticles(dustProgress),
+                    ),
+                  ),
+                ),
+              AnimatedSlide(
+                duration: slideDuration,
+                curve: Curves.easeOutCubic,
+                offset: Offset(baseOffset.dx / 54, baseOffset.dy / 54),
+                child: Transform.translate(
+                  offset: hoverOffset,
+                  child: Opacity(
+                    opacity: opacity,
+                    child: Transform.scale(scale: scale, child: child),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (isDusting) {
+      return TweenAnimationBuilder<double>(
+        key: const ValueKey<String>('recording-cancel-dust'),
+        duration: reduceMotion ? Duration.zero : _recordingCancelDustDuration,
+        curve: Curves.easeOutCubic,
+        tween: Tween<double>(begin: 0, end: 1),
+        builder: (context, dustProgress, _) =>
+            buildFrame(hoverAnimation.value, dustProgress),
+      );
+    }
+    if (isLockedHover) {
+      return AnimatedBuilder(
+        animation: hoverAnimation,
+        builder: (context, _) => buildFrame(hoverAnimation.value, 0),
+      );
+    }
+    return buildFrame(hoverAnimation.value, 0);
   }
 
   Widget _buildRecordingHintChip({
@@ -11233,7 +12421,14 @@ class _ChatScreenState extends State<ChatScreen> {
     final barColor = const Color(0xFF12181F).withValues(alpha: 0.97);
     final cancelProgress = _normalizedProgress(-_recordingDragDx, 96);
     final lockProgress = _normalizedProgress(-_recordingDragDy, 76);
-    final cancelTextShift = (_recordingDragDx.clamp(-54, 0)).toDouble();
+    final isCancellingDust =
+        _voiceRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust;
+    final slideCancelText =
+        !_voiceRecordingLocked && cancelProgress > lockProgress;
+    final cancelTextShift = _voiceRecordingLocked
+        ? 0.0
+        : (slideCancelText ? _recordingDragDx.clamp(-54, 0).toDouble() : 0.0);
     return SafeArea(
       top: false,
       child: Padding(
@@ -11241,118 +12436,129 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Row(
           children: [
             Expanded(
-              child: Container(
-                height: 52,
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                decoration: BoxDecoration(
-                  color: barColor,
-                  borderRadius: BorderRadius.circular(26),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.24),
-                      blurRadius: 18,
-                      offset: const Offset(0, 8),
+              child: IgnorePointer(
+                ignoring: isCancellingDust,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 140),
+                  curve: Curves.easeOutCubic,
+                  opacity: isCancellingDust ? 0 : 1,
+                  child: Container(
+                    height: 52,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    decoration: BoxDecoration(
+                      color: barColor,
+                      borderRadius: BorderRadius.circular(26),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.24),
+                          blurRadius: 18,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 10,
-                      height: 10,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFFF4D5B),
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: const Color(
-                              0xFFFF4D5B,
-                            ).withValues(alpha: 0.4),
-                            blurRadius: 8,
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      _formatDurationLabel(
-                        Duration(seconds: _recordingSeconds),
-                      ),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontFeatures: [ui.FontFeature.tabularFigures()],
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    SizedBox(
-                      width: 74,
-                      child: PhoenixLiveWaveform(
-                        height: 22,
-                        barCount: 16,
-                        color: Colors.white,
-                        enabled: !performanceModeNotifier.value,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: ClipRect(
-                        child: Transform.translate(
-                          offset: Offset(cancelTextShift, 0),
-                          child: Row(
-                            children: [
-                              AnimatedOpacity(
-                                duration: const Duration(milliseconds: 90),
-                                opacity: _voiceRecordingLocked
-                                    ? 0
-                                    : (1 - cancelProgress * 0.82).clamp(
-                                        0.18,
-                                        1.0,
-                                      ),
-                                child: Icon(
-                                  Icons.chevron_left_rounded,
-                                  color: Colors.white.withValues(alpha: 0.55),
-                                ),
-                              ),
-                              const SizedBox(width: 4),
-                              Expanded(
-                                child: Text(
-                                  _voiceRecordingLocked
-                                      ? 'Запись зафиксирована'
-                                      : 'Влево — отмена',
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(
-                                      alpha: _voiceRecordingLocked
-                                          ? 0.92
-                                          : (0.72 + cancelProgress * 0.16)
-                                                .clamp(0.0, 1.0),
-                                    ),
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 10,
+                          height: 10,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFF4D5B),
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(
+                                  0xFFFF4D5B,
+                                ).withValues(alpha: 0.4),
+                                blurRadius: 8,
                               ),
                             ],
                           ),
                         ),
-                      ),
-                    ),
-                    if (_voiceRecordingLocked)
-                      Container(
-                        margin: const EdgeInsets.only(left: 8),
-                        child: TextButton(
-                          onPressed: () => unawaited(_cancelVoiceRecording()),
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 6,
+                        const SizedBox(width: 10),
+                        Text(
+                          _formatDurationLabel(
+                            Duration(seconds: _recordingSeconds),
+                          ),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            fontFeatures: [ui.FontFeature.tabularFigures()],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        SizedBox(
+                          width: 74,
+                          child: PhoenixLiveWaveform(
+                            height: 22,
+                            barCount: 16,
+                            color: Colors.white,
+                            enabled: !performanceModeNotifier.value,
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: ClipRect(
+                            child: Transform.translate(
+                              offset: Offset(cancelTextShift, 0),
+                              child: Row(
+                                children: [
+                                  AnimatedOpacity(
+                                    duration: const Duration(milliseconds: 90),
+                                    opacity: _voiceRecordingLocked
+                                        ? 0
+                                        : (1 - cancelProgress * 0.82).clamp(
+                                            0.18,
+                                            1.0,
+                                          ),
+                                    child: Icon(
+                                      Icons.chevron_left_rounded,
+                                      color: Colors.white.withValues(
+                                        alpha: 0.55,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Expanded(
+                                    child: Text(
+                                      _voiceRecordingLocked
+                                          ? 'Запись зафиксирована'
+                                          : 'Влево — отмена',
+                                      style: TextStyle(
+                                        color: Colors.white.withValues(
+                                          alpha: _voiceRecordingLocked
+                                              ? 0.92
+                                              : (0.72 + cancelProgress * 0.16)
+                                                    .clamp(0.0, 1.0),
+                                        ),
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
-                          child: const Text('Отмена'),
                         ),
-                      ),
-                  ],
+                        if (_voiceRecordingLocked)
+                          Container(
+                            margin: const EdgeInsets.only(left: 8),
+                            child: TextButton(
+                              onPressed: () =>
+                                  unawaited(_cancelVoiceRecording()),
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
+                                ),
+                              ),
+                              child: const Text('Отмена'),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -11360,7 +12566,7 @@ class _ChatScreenState extends State<ChatScreen> {
             Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (!_voiceRecordingLocked)
+                if (!_voiceRecordingLocked && !isCancellingDust)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 8),
                     child: _buildRecordingHintChip(
@@ -11369,14 +12575,33 @@ class _ChatScreenState extends State<ChatScreen> {
                       progress: max(lockProgress, 0.20),
                     ),
                   ),
-                _buildComposerActionBubble(
-                  icon: _voiceRecordingLocked
-                      ? Icons.arrow_upward_rounded
-                      : Icons.mic_rounded,
-                  onTap: _voiceRecordingLocked
-                      ? () => unawaited(_stopVoiceRecordingAndSend())
-                      : null,
-                  color: const Color(0xFF2F80FF),
+                Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: (event) =>
+                      _handleRecordingPointerStart(event.position),
+                  onPointerMove: (event) =>
+                      _handleRecordingPointerMove(event.position),
+                  onPointerUp: (_) => _handleComposerMediaPanEnd(),
+                  onPointerCancel: (_) => _handleComposerMediaPanCancel(),
+                  child: _buildElasticRecordingAction(
+                    dragDx: _recordingDragDx,
+                    dragDy: _recordingDragDy,
+                    lockProgress: lockProgress,
+                    cancelProgress: cancelProgress,
+                    locked: _voiceRecordingLocked,
+                    color: const Color(0xFF2F80FF),
+                    visualPhase: _voiceRecordingVisualPhase,
+                    hoverAnimation: _recordingHoverController,
+                    child: _buildComposerActionBubble(
+                      icon: _voiceRecordingLocked
+                          ? Icons.arrow_upward_rounded
+                          : Icons.mic_rounded,
+                      onTap: _voiceRecordingLocked
+                          ? () => unawaited(_stopVoiceRecordingAndSend())
+                          : null,
+                      color: const Color(0xFF2F80FF),
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -11414,6 +12639,64 @@ class _ChatScreenState extends State<ChatScreen> {
               child: preview,
             ),
           ),
+        ),
+      );
+    } else if (_webVideoNoteRecording) {
+      child = ClipOval(
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: WebVideoNoteCaptureService.previewWidget(
+            key: ValueKey(
+              'web-video-note-preview-${_videoRecordingStartedAt?.millisecondsSinceEpoch ?? 0}',
+            ),
+          ),
+        ),
+      );
+    } else if (_nativeVideoNoteRecording && _nativeVideoPreviewFrame != null) {
+      child = ClipOval(
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: RepaintBoundary(
+            child: Transform(
+              alignment: Alignment.center,
+              transform: Matrix4.diagonal3Values(-1, 1, 1),
+              child: Image.memory(
+                _nativeVideoPreviewFrame!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                filterQuality: FilterQuality.low,
+              ),
+            ),
+          ),
+        ),
+      );
+    } else if (_nativeVideoNoteRecording || _webVideoNoteRecording) {
+      child = Container(
+        width: size,
+        height: size,
+        decoration: const BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF3C2A68), Color(0xFF241631)],
+          ),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.videocam_rounded, color: Colors.white, size: 42),
+            const SizedBox(height: 10),
+            Text(
+              'Запись',
+              style: theme.textTheme.titleMedium?.copyWith(
+                color: Colors.white,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
         ),
       );
     } else {
@@ -11461,119 +12744,146 @@ class _ChatScreenState extends State<ChatScreen> {
     final barColor = const Color(0xFF12181F).withValues(alpha: 0.94);
     final cancelProgress = _normalizedProgress(-_videoRecordingDragDx, 96);
     final lockProgress = _normalizedProgress(-_videoRecordingDragDy, 76);
-    final cancelTextShift = (_videoRecordingDragDx.clamp(-54, 0)).toDouble();
+    final isCancellingDust =
+        _videoRecordingVisualPhase ==
+        _RecordingActionVisualPhase.cancellingDust;
+    final slideCancelText =
+        !_videoRecordingLocked && cancelProgress > lockProgress;
+    final cancelTextShift = _videoRecordingLocked
+        ? 0.0
+        : (slideCancelText
+              ? _videoRecordingDragDx.clamp(-54, 0).toDouble()
+              : 0.0);
     return SafeArea(
       top: false,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
         child: Row(
           children: [
-            _buildComposerActionBubble(
-              icon: Icons.cameraswitch_rounded,
-              onTap: _videoRecording
-                  ? null
-                  : () => unawaited(_switchVideoCameraLens()),
-              color: Colors.white,
-              size: 44,
-              filled: false,
+            IgnorePointer(
+              ignoring: isCancellingDust,
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 140),
+                curve: Curves.easeOutCubic,
+                opacity: isCancellingDust ? 0 : 1,
+                child: _buildComposerActionBubble(
+                  icon: Icons.cameraswitch_rounded,
+                  onTap: _videoRecording
+                      ? null
+                      : () => unawaited(_switchVideoCameraLens()),
+                  color: Colors.white,
+                  size: 44,
+                  filled: false,
+                ),
+              ),
             ),
             const SizedBox(width: 8),
             Expanded(
-              child: Container(
-                height: 52,
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                decoration: BoxDecoration(
-                  color: barColor,
-                  borderRadius: BorderRadius.circular(26),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.24),
-                      blurRadius: 18,
-                      offset: const Offset(0, 8),
+              child: IgnorePointer(
+                ignoring: isCancellingDust,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 140),
+                  curve: Curves.easeOutCubic,
+                  opacity: isCancellingDust ? 0 : 1,
+                  child: Container(
+                    height: 52,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    decoration: BoxDecoration(
+                      color: barColor,
+                      borderRadius: BorderRadius.circular(26),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.24),
+                          blurRadius: 18,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 10,
-                      height: 10,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFFF4D5B),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      _formatDurationLabel(
-                        Duration(seconds: _videoRecordingSeconds),
-                      ),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontFeatures: [ui.FontFeature.tabularFigures()],
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: ClipRect(
-                        child: Transform.translate(
-                          offset: Offset(cancelTextShift, 0),
-                          child: Row(
-                            children: [
-                              AnimatedOpacity(
-                                duration: const Duration(milliseconds: 90),
-                                opacity: _videoRecordingLocked
-                                    ? 0
-                                    : (1 - cancelProgress * 0.82).clamp(
-                                        0.18,
-                                        1.0,
-                                      ),
-                                child: Icon(
-                                  Icons.chevron_left_rounded,
-                                  color: Colors.white.withValues(alpha: 0.55),
-                                ),
-                              ),
-                              const SizedBox(width: 4),
-                              Expanded(
-                                child: Text(
-                                  _videoRecordingLocked
-                                      ? 'Видеозапись зафиксирована'
-                                      : 'Влево — отмена',
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(
-                                      alpha: _videoRecordingLocked
-                                          ? 0.92
-                                          : (0.72 + cancelProgress * 0.16)
-                                                .clamp(0.0, 1.0),
-                                    ),
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 10,
+                          height: 10,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFF4D5B),
+                            shape: BoxShape.circle,
                           ),
                         ),
-                      ),
-                    ),
-                    if (_videoRecordingLocked)
-                      Container(
-                        margin: const EdgeInsets.only(left: 8),
-                        child: TextButton(
-                          onPressed: () =>
-                              unawaited(_cancelVideoCircleRecording()),
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 6,
+                        const SizedBox(width: 10),
+                        Text(
+                          _formatDurationLabel(
+                            Duration(seconds: _videoRecordingSeconds),
+                          ),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            fontFeatures: [ui.FontFeature.tabularFigures()],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: ClipRect(
+                            child: Transform.translate(
+                              offset: Offset(cancelTextShift, 0),
+                              child: Row(
+                                children: [
+                                  AnimatedOpacity(
+                                    duration: const Duration(milliseconds: 90),
+                                    opacity: _videoRecordingLocked
+                                        ? 0
+                                        : (1 - cancelProgress * 0.82).clamp(
+                                            0.18,
+                                            1.0,
+                                          ),
+                                    child: Icon(
+                                      Icons.chevron_left_rounded,
+                                      color: Colors.white.withValues(
+                                        alpha: 0.55,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Expanded(
+                                    child: Text(
+                                      _videoRecordingLocked
+                                          ? 'Видеозапись зафиксирована'
+                                          : 'Влево — отмена',
+                                      style: TextStyle(
+                                        color: Colors.white.withValues(
+                                          alpha: _videoRecordingLocked
+                                              ? 0.92
+                                              : (0.72 + cancelProgress * 0.16)
+                                                    .clamp(0.0, 1.0),
+                                        ),
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
-                          child: const Text('Отмена'),
                         ),
-                      ),
-                  ],
+                        if (_videoRecordingLocked)
+                          Container(
+                            margin: const EdgeInsets.only(left: 8),
+                            child: TextButton(
+                              onPressed: () =>
+                                  unawaited(_cancelVideoCircleRecording()),
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
+                                ),
+                              ),
+                              child: const Text('Отмена'),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -11581,7 +12891,7 @@ class _ChatScreenState extends State<ChatScreen> {
             Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (!_videoRecordingLocked)
+                if (!_videoRecordingLocked && !isCancellingDust)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 8),
                     child: _buildRecordingHintChip(
@@ -11590,10 +12900,30 @@ class _ChatScreenState extends State<ChatScreen> {
                       progress: max(lockProgress, 0.20),
                     ),
                   ),
-                _buildComposerActionBubble(
-                  icon: Icons.arrow_upward_rounded,
-                  onTap: () => unawaited(_stopVideoCircleRecordingAndSend()),
-                  color: const Color(0xFF2F80FF),
+                Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: (event) =>
+                      _handleRecordingPointerStart(event.position),
+                  onPointerMove: (event) =>
+                      _handleRecordingPointerMove(event.position),
+                  onPointerUp: (_) => _handleComposerMediaPanEnd(),
+                  onPointerCancel: (_) => _handleComposerMediaPanCancel(),
+                  child: _buildElasticRecordingAction(
+                    dragDx: _videoRecordingDragDx,
+                    dragDy: _videoRecordingDragDy,
+                    lockProgress: lockProgress,
+                    cancelProgress: cancelProgress,
+                    locked: _videoRecordingLocked,
+                    color: const Color(0xFF2F80FF),
+                    visualPhase: _videoRecordingVisualPhase,
+                    hoverAnimation: _recordingHoverController,
+                    child: _buildComposerActionBubble(
+                      icon: Icons.arrow_upward_rounded,
+                      onTap: () =>
+                          unawaited(_stopVideoCircleRecordingAndSend()),
+                      color: const Color(0xFF2F80FF),
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -11606,9 +12936,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildVideoNoteAttachment(
     ThemeData theme,
     Map<String, dynamic> message,
-    Map<String, dynamic> meta, {
-    required Color textColor,
-  }) {
+    Map<String, dynamic> meta,
+  ) {
     final videoUrl = _videoUrlOf(meta);
     final previewImageUrl = _videoPreviewImageUrlOf(meta);
     final durationMs = _videoDurationMsOf(meta);
@@ -11619,16 +12948,19 @@ class _ChatScreenState extends State<ChatScreen> {
       fallbackToken: videoUrl ?? previewImageUrl ?? messageId,
     );
     final accent = theme.colorScheme.primary;
-    final seed = messageId.isEmpty ? meta.toString() : messageId;
-    final bars = _voiceWaveHeights(seed, 18);
     final isActive = _activeVideoNoteMessageId == messageId;
     final useInlineWebVideo = kIsWeb && videoUrl != null;
     final controller = isActive ? _inlineVideoNoteController : null;
-    final shellGradient = LinearGradient(
-      begin: Alignment.topLeft,
-      end: Alignment.bottomRight,
-      colors: [accent.withValues(alpha: 0.82), const Color(0xFF1C2631)],
-    );
+    final videoDurationCacheKey = videoUrl?.trim();
+    final cachedVideoDuration =
+        videoDurationCacheKey == null || videoDurationCacheKey.isEmpty
+        ? null
+        : _videoNoteDurationCache[videoDurationCacheKey];
+    const orbSize = 196.0;
+    const ringPadding = 8.0;
+    const ringSize = orbSize + ringPadding * 2;
+    const orbLayoutWidth = ringSize + 38;
+    const orbLayoutHeight = ringSize + 10;
 
     if (!canAutoLoadVideo) {
       return SizedBox(
@@ -11649,226 +12981,191 @@ class _ChatScreenState extends State<ChatScreen> {
 
     Widget buildVideoOrb({
       required Widget content,
-      required String badgeLabel,
-      required String footerLabel,
       required String durationLabel,
-      required IconData actionIcon,
-      required double actionProgress,
-      bool showSpinner = false,
-      bool isPlaying = false,
     }) {
-      return Container(
-        width: 196,
-        height: 196,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          gradient: shellGradient,
-          border: Border.all(
-            color: Colors.white.withValues(alpha: 0.12),
-            width: 1.2,
+      Widget durationBadge() {
+        return IgnorePointer(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.58),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.18),
+                  blurRadius: 12,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Text(
+              durationLabel,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+                fontFeatures: [ui.FontFeature.tabularFigures()],
+              ),
+            ),
           ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.18),
-              blurRadius: 16,
-              offset: const Offset(0, 10),
-            ),
-          ],
-        ),
+        );
+      }
+
+      return SizedBox(
+        width: orbLayoutWidth,
+        height: orbLayoutHeight,
         child: Stack(
+          clipBehavior: Clip.none,
           children: [
-            Positioned.fill(
-              child: ClipOval(
-                child: ColoredBox(
-                  color: const Color(0xFF11161D),
-                  child: content,
-                ),
-              ),
-            ),
-            Positioned.fill(
-              child: IgnorePointer(
-                child: ClipOval(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [
-                          Colors.black.withValues(alpha: 0.06),
-                          Colors.transparent,
-                          Colors.black.withValues(alpha: 0.30),
-                        ],
-                        stops: const [0, 0.56, 1],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
             Positioned(
-              left: 12,
-              top: 12,
+              left: 0,
+              top: 0,
+              width: ringSize,
+              height: ringSize,
               child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 6,
-                ),
+                padding: const EdgeInsets.all(ringPadding),
                 decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.32),
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      isPlaying
-                          ? Icons.equalizer_rounded
-                          : Icons.videocam_rounded,
-                      size: 14,
-                      color: Colors.white,
+                  shape: BoxShape.circle,
+                  gradient: SweepGradient(
+                    startAngle: -math.pi * 0.62,
+                    endAngle: math.pi * 1.38,
+                    colors: const [
+                      Color(0xFFFF6B1A),
+                      Color(0xFFFFA53D),
+                      Color(0xFFFFC36A),
+                      Color(0xFFFF7A2F),
+                      Color(0xFFFF6B1A),
+                    ],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFFFF8A2A).withValues(alpha: 0.22),
+                      blurRadius: 24,
+                      offset: const Offset(0, 10),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      badgeLabel,
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.94),
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                      ),
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.24),
+                      blurRadius: 24,
+                      offset: const Offset(0, 14),
                     ),
                   ],
                 ),
-              ),
-            ),
-            Positioned(
-              left: 16,
-              right: 16,
-              bottom: 18,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(999),
-                    child: LinearProgressIndicator(
-                      value: actionProgress.clamp(0.0, 1.0),
-                      minHeight: 4,
-                      backgroundColor: Colors.white.withValues(alpha: 0.18),
-                      valueColor: const AlwaysStoppedAnimation<Color>(
-                        Colors.white,
-                      ),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0xFF0F131B),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.12),
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  Row(
+                  child: Stack(
                     children: [
-                      Expanded(
-                        child: Text(
-                          footerLabel,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.86),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
+                      Positioned.fill(
+                        child: ClipOval(
+                          child: ColoredBox(
+                            color: const Color(0xFF11161D),
+                            child: content,
                           ),
                         ),
                       ),
-                      const SizedBox(width: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.42),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          durationLabel,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                            fontFeatures: [ui.FontFeature.tabularFigures()],
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: ClipOval(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [
+                                    Colors.black.withValues(alpha: 0.04),
+                                    Colors.transparent,
+                                    Colors.black.withValues(alpha: 0.18),
+                                  ],
+                                  stops: const [0, 0.60, 1],
+                                ),
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ],
                   ),
-                ],
-              ),
-            ),
-            Center(
-              child: Container(
-                width: 74,
-                height: 74,
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.20),
-                  shape: BoxShape.circle,
-                ),
-                child: Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    SizedBox(
-                      width: 74,
-                      height: 74,
-                      child: CircularProgressIndicator(
-                        value: showSpinner
-                            ? null
-                            : actionProgress.clamp(0.0, 1.0),
-                        strokeWidth: 3.2,
-                        backgroundColor: Colors.white.withValues(alpha: 0.14),
-                        valueColor: const AlwaysStoppedAnimation<Color>(
-                          Colors.white,
-                        ),
-                      ),
-                    ),
-                    Container(
-                      width: 60,
-                      height: 60,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.92),
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            blurRadius: 10,
-                            offset: const Offset(0, 6),
-                          ),
-                        ],
-                      ),
-                      child: showSpinner
-                          ? Padding(
-                              padding: const EdgeInsets.all(16),
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2.4,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                  accent,
-                                ),
-                              ),
-                            )
-                          : Icon(actionIcon, color: accent, size: 34),
-                    ),
-                  ],
                 ),
               ),
             ),
+            Positioned(right: 0, bottom: 0, child: durationBadge()),
           ],
         ),
       );
     }
 
+    Duration displayDuration() {
+      if (cachedVideoDuration != null && cachedVideoDuration > Duration.zero) {
+        return cachedVideoDuration;
+      }
+      return Duration(milliseconds: durationMs > 0 ? durationMs : 0);
+    }
+
+    String staticDurationLabel() {
+      final duration = displayDuration();
+      return duration > Duration.zero
+          ? _formatDurationLabel(duration)
+          : '00:00';
+    }
+
+    void cacheResolvedDuration(Duration duration) {
+      final key = videoDurationCacheKey;
+      if (key == null || key.isEmpty || duration <= Duration.zero) return;
+      final previous = _videoNoteDurationCache[key];
+      if (previous != null &&
+          (previous.inMilliseconds - duration.inMilliseconds).abs() < 250) {
+        return;
+      }
+      if (!mounted) return;
+      setState(() => _videoNoteDurationCache[key] = duration);
+    }
+
+    Widget fallbackVideoPoster() {
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: RadialGradient(
+            center: const Alignment(-0.18, -0.34),
+            radius: 0.92,
+            colors: [
+              accent.withValues(alpha: 0.28),
+              const Color(0xFF1E2732),
+              const Color(0xFF0C1118),
+            ],
+            stops: const [0.0, 0.52, 1.0],
+          ),
+        ),
+      );
+    }
+
     Widget inactiveVideoBackdrop() {
+      final videoPoster = videoUrl == null || kIsWeb
+          ? fallbackVideoPoster()
+          : _VideoNotePoster(
+              key: ValueKey('video-note-poster-$videoUrl'),
+              videoUrl: videoUrl,
+              fallback: fallbackVideoPoster(),
+              onDurationResolved: cacheResolvedDuration,
+            );
       return Stack(
         children: [
+          Positioned.fill(child: fallbackVideoPoster()),
           if (previewImageUrl != null)
             Positioned.fill(
               child: AdaptiveNetworkImage(
                 previewImageUrl,
                 fit: BoxFit.cover,
                 gaplessPlayback: true,
+                errorBuilder: (context, error, stackTrace) => videoPoster,
               ),
-            ),
+            )
+          else if (videoUrl != null && !kIsWeb)
+            Positioned.fill(child: videoPoster),
           Positioned.fill(
             child: ClipOval(
               child: DecoratedBox(
@@ -11877,63 +13174,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     center: const Alignment(-0.25, -0.35),
                     radius: 1.0,
                     colors: [
-                      Colors.white.withValues(alpha: 0.22),
+                      Colors.white.withValues(alpha: 0.18),
                       Colors.transparent,
                     ],
                   ),
-                ),
-              ),
-            ),
-          ),
-          Positioned(
-            left: 18,
-            right: 18,
-            bottom: 58,
-            child: SizedBox(
-              height: 24,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: List.generate(bars.length, (index) {
-                  return Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 1),
-                      child: Container(
-                        height: 6 + bars[index],
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(
-                            alpha: index.isEven ? 0.58 : 0.40,
-                          ),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                      ),
-                    ),
-                  );
-                }),
-              ),
-            ),
-          ),
-          Positioned(
-            right: 16,
-            bottom: 54,
-            child: Container(
-              width: 34,
-              height: 34,
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.34),
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
-              ),
-              child: IconButton(
-                padding: EdgeInsets.zero,
-                visualDensity: VisualDensity.compact,
-                tooltip: 'Открыть',
-                onPressed: videoUrl == null
-                    ? null
-                    : () => unawaited(_openExpandedVideoNote(message, meta)),
-                icon: const Icon(
-                  Icons.open_in_full_rounded,
-                  size: 18,
-                  color: Colors.white,
                 ),
               ),
             ),
@@ -11948,7 +13192,6 @@ class _ChatScreenState extends State<ChatScreen> {
           videoUrl: videoUrl,
           durationMs: durationMs,
           accentColor: accent,
-          footerText: 'Нажмите, чтобы продолжить',
         );
       }
 
@@ -11956,14 +13199,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (activeController == null) {
         return buildVideoOrb(
           content: inactiveVideoBackdrop(),
-          badgeLabel: 'загрузка',
-          footerLabel: 'Подготавливаем воспроизведение',
-          durationLabel: durationMs > 0
-              ? _formatDurationLabel(Duration(milliseconds: durationMs))
-              : '00:00',
-          actionIcon: Icons.hourglass_top_rounded,
-          actionProgress: 0,
-          showSpinner: true,
+          durationLabel: staticDurationLabel(),
         );
       }
       return ValueListenableBuilder<vp.VideoPlayerValue>(
@@ -11973,21 +13209,7 @@ class _ChatScreenState extends State<ChatScreen> {
           final totalDuration = initialized && value.duration > Duration.zero
               ? value.duration
               : Duration(milliseconds: durationMs > 0 ? durationMs : 0);
-          final position = initialized ? value.position : Duration.zero;
-          final progress = totalDuration.inMilliseconds > 0
-              ? (position.inMilliseconds / totalDuration.inMilliseconds)
-                    .clamp(0.0, 1.0)
-                    .toDouble()
-              : 0.0;
-          final hasFinished =
-              totalDuration > Duration.zero &&
-              position >= totalDuration - const Duration(milliseconds: 180) &&
-              !value.isPlaying;
-          final playIcon = value.isPlaying
-              ? Icons.pause_rounded
-              : hasFinished
-              ? Icons.replay_rounded
-              : Icons.play_arrow_rounded;
+          final shownDuration = displayDuration();
 
           Widget content;
           if (initialized) {
@@ -12010,19 +13232,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
           return buildVideoOrb(
             content: content,
-            badgeLabel: value.isPlaying ? 'видео' : 'кружок',
-            footerLabel: value.isPlaying
-                ? 'Нажмите для паузы'
-                : initialized
-                ? 'Нажмите для воспроизведения'
-                : 'Подготавливаем воспроизведение',
-            durationLabel: totalDuration > Duration.zero
-                ? '${_formatDurationLabel(position)} / ${_formatDurationLabel(totalDuration)}'
-                : '00:00',
-            actionIcon: playIcon,
-            actionProgress: progress,
-            showSpinner: !initialized || _inlineVideoNoteInitializing,
-            isPlaying: value.isPlaying,
+            durationLabel: shownDuration > Duration.zero
+                ? _formatDurationLabel(shownDuration)
+                : totalDuration > Duration.zero
+                ? _formatDurationLabel(totalDuration)
+                : staticDurationLabel(),
           );
         },
       );
@@ -12039,7 +13253,7 @@ class _ChatScreenState extends State<ChatScreen> {
           : () =>
                 unawaited(_toggleInlineVideoNotePlayback(messageId, videoUrl)),
       child: SizedBox(
-        width: 196,
+        width: useInlineWebVideo ? 250 : orbLayoutWidth,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -12048,21 +13262,12 @@ class _ChatScreenState extends State<ChatScreen> {
                     videoUrl: videoUrl,
                     durationMs: durationMs,
                     accentColor: accent,
-                    footerText: 'Нажмите для воспроизведения',
                   )
                 : isActive
                 ? activeVideoOrb()
                 : buildVideoOrb(
                     content: inactiveVideoBackdrop(),
-                    badgeLabel: 'кружок',
-                    footerLabel: 'Нажмите для воспроизведения',
-                    durationLabel: durationMs > 0
-                        ? _formatDurationLabel(
-                            Duration(milliseconds: durationMs),
-                          )
-                        : '00:00',
-                    actionIcon: Icons.play_arrow_rounded,
-                    actionProgress: 0,
+                    durationLabel: staticDurationLabel(),
                   ),
           ],
         ),
@@ -12268,6 +13473,27 @@ class _ChatScreenState extends State<ChatScreen> {
         attachmentType == 'file';
     final imageUrl = _resolveImageUrl(metaMap['image_url']?.toString());
     final captionText = _captionTextOf(message, metaMap);
+    final isVideoNoteMessage = isVideoMessage && _isVideoNoteMeta(metaMap);
+    final isStandaloneImageMessage = isImageMessage && captionText.isEmpty;
+    final isStandaloneVideoNote =
+        isVideoMessage && (isVideoNoteMessage || captionText.isEmpty);
+    final isStandaloneVoiceMessage = isVoiceMessage && captionText.isEmpty;
+    final isSingleEmojiTextMessage =
+        !isDeleted &&
+        !hasBuy &&
+        !isReservedOrder &&
+        !isDeliveryOffer &&
+        !isSupportFeedback &&
+        !isImageMessage &&
+        !isVoiceMessage &&
+        !isVideoMessage &&
+        !isFileMessage &&
+        _isSingleEmojiText(text);
+    final isStandaloneMediaMessage =
+        isStandaloneImageMessage ||
+        isStandaloneVideoNote ||
+        isStandaloneVoiceMessage ||
+        isSingleEmojiTextMessage;
     final catalogTexts = _extractCatalogTexts(text);
     final catalogSnapshot = _productCardSnapshotOf(metaMap);
     final productDescriptionText =
@@ -12345,14 +13571,15 @@ class _ChatScreenState extends State<ChatScreen> {
         (widget.chatType ?? '').toLowerCase().trim() == 'channel';
     final useChannelPostAppearance = isChannelChat && isAppearing;
 
-    final bubbleColor = hasBuy || isReservedOrder
+    final bubbleColor = hasBuy || isReservedOrder || isStandaloneMediaMessage
         ? Colors.transparent
         : isDeliveryOffer
         ? theme.colorScheme.surfaceContainerHigh
         : (fromMe
               ? theme.colorScheme.primaryContainer
               : theme.colorScheme.surfaceContainerHighest);
-    final textColor = (!hasBuy && !isReservedOrder && fromMe)
+    final textColor =
+        (!hasBuy && !isReservedOrder && !isStandaloneMediaMessage && fromMe)
         ? theme.colorScheme.onPrimaryContainer
         : theme.colorScheme.onSurface;
 
@@ -12412,9 +13639,10 @@ class _ChatScreenState extends State<ChatScreen> {
       isCompactMedia ? media.size.height * 0.36 : media.size.height * 0.46,
       440.0,
     ).clamp(220.0, 440.0);
-    final showChatIdentity = !hasBuy && !isReservedOrder;
+    final showChatIdentity =
+        !hasBuy && !isReservedOrder && !isStandaloneMediaMessage;
     final timeLabel = _formatMessageTime(message['created_at']);
-    final deliveryStatus = fromMe && showChatIdentity
+    final deliveryStatus = fromMe && !hasBuy && !isReservedOrder
         ? _deliveryStatusOf(message)
         : '';
 
@@ -12534,9 +13762,17 @@ class _ChatScreenState extends State<ChatScreen> {
             : const Duration(milliseconds: 220),
         curve: Curves.easeOut,
         constraints: BoxConstraints(
-          maxWidth: maxBubbleWidth > 620 ? 620 : maxBubbleWidth,
+          maxWidth: isStandaloneVideoNote
+              ? 258
+              : isStandaloneImageMessage
+              ? defaultImageWidth
+              : isStandaloneVoiceMessage
+              ? (maxBubbleWidth > 560 ? 560 : maxBubbleWidth)
+              : isSingleEmojiTextMessage
+              ? min(maxBubbleWidth, 190.0)
+              : (maxBubbleWidth > 620 ? 620 : maxBubbleWidth),
         ),
-        padding: hasBuy || isReservedOrder
+        padding: hasBuy || isReservedOrder || isStandaloneMediaMessage
             ? EdgeInsets.zero
             : const EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -12547,7 +13783,13 @@ class _ChatScreenState extends State<ChatScreen> {
                 : Colors.transparent,
           ),
           borderRadius: BorderRadius.circular(
-            hasBuy || isReservedOrder ? 24 : 18,
+            isStandaloneVideoNote
+                ? 999
+                : isStandaloneMediaMessage
+                ? 18
+                : hasBuy || isReservedOrder
+                ? 24
+                : 18,
           ),
           boxShadow: hasBuy || isReservedOrder
               ? [
@@ -13103,12 +14345,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ] else ...[
               if (isVoiceMessage) ...[
-                _buildVoiceAttachment(
-                  theme,
-                  message,
-                  metaMap,
-                  textColor: textColor,
-                ),
+                _buildVoiceAttachment(theme, message, metaMap),
                 if (captionText.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   _buildHighlightedText(
@@ -13130,12 +14367,8 @@ class _ChatScreenState extends State<ChatScreen> {
                   alignment: fromMe
                       ? Alignment.centerRight
                       : Alignment.centerLeft,
-                  child: _buildVideoNoteAttachment(
-                    theme,
-                    message,
-                    metaMap,
-                    textColor: textColor,
-                  ),
+                  widthFactor: isStandaloneVideoNote ? 1 : null,
+                  child: _buildVideoNoteAttachment(theme, message, metaMap),
                 ),
                 if (captionText.isNotEmpty) ...[
                   const SizedBox(height: 10),
@@ -13150,7 +14383,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   if (captionText.isNotEmpty || isPlainMessage)
                     const SizedBox(height: 10),
                 ],
-                if (isPlainMessage || captionText.isNotEmpty)
+                if (isSingleEmojiTextMessage)
+                  _buildSingleEmojiMedallion(theme, text.trim(), fromMe: fromMe)
+                else if (isPlainMessage || captionText.isNotEmpty)
                   _buildHighlightedText(
                     isPlainMessage ? text : captionText,
                     style: TextStyle(
@@ -13250,7 +14485,11 @@ class _ChatScreenState extends State<ChatScreen> {
                       Text(
                         timeLabel,
                         style: TextStyle(
-                          color: fromMe
+                          color: isStandaloneMediaMessage
+                              ? theme.colorScheme.onSurfaceVariant.withValues(
+                                  alpha: 0.82,
+                                )
+                              : fromMe
                               ? theme.colorScheme.onPrimaryContainer.withValues(
                                   alpha: reducedMotion ? 0.92 : 0.76,
                                 )
@@ -13367,6 +14606,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final visibleMessages = _visibleMessages();
     final timeline = _buildTimeline(visibleMessages);
     final recordingOverlayActive = _voiceRecording || _videoRecording;
+    final recordingCancelDismissing =
+        _voiceRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust ||
+        _videoRecordingVisualPhase ==
+            _RecordingActionVisualPhase.cancellingDust;
+    final composerHiddenByRecording =
+        recordingOverlayActive && !recordingCancelDismissing;
     final media = MediaQuery.of(context);
     final scrollButtonBottom =
         media.viewInsets.bottom +
@@ -13785,287 +15031,310 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ),
                     ),
-                  AnimatedOpacity(
-                    duration: const Duration(milliseconds: 140),
-                    opacity: recordingOverlayActive ? 0 : 1,
-                    child: SafeArea(
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            IconButton(
-                              tooltip: 'Вложение',
-                              icon: _mediaUploading
-                                  ? PhoenixProgressRingIcon(
-                                      icon: Icons.cloud_upload_outlined,
-                                      showSpinner: true,
-                                      size: 34,
-                                      iconSize: 16,
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.primary,
-                                    )
-                                  : const Icon(Icons.attach_file_rounded),
-                              onPressed:
-                                  canCompose &&
-                                      !_mediaUploading &&
-                                      !_voiceSending &&
-                                      !_anyComposerRecording &&
-                                      !_anyRecorderStarting
-                                  ? _openAttachmentSheet
-                                  : null,
-                            ),
-                            Expanded(
-                              child: Container(
-                                margin: const EdgeInsets.symmetric(
-                                  horizontal: 4,
-                                ),
-                                constraints: const BoxConstraints(
-                                  minHeight: 44,
-                                ),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 10,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Theme.of(
-                                    context,
-                                  ).colorScheme.surfaceContainerLow,
-                                  borderRadius: BorderRadius.circular(20),
-                                  border: Border.all(
+                  IgnorePointer(
+                    ignoring:
+                        composerHiddenByRecording && !_composerMediaPressActive,
+                    child: AnimatedOpacity(
+                      duration: const Duration(milliseconds: 170),
+                      curve: Curves.easeOutCubic,
+                      opacity: composerHiddenByRecording ? 0 : 1,
+                      child: SafeArea(
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              IconButton(
+                                tooltip: 'Вложение',
+                                icon: _mediaUploading
+                                    ? PhoenixProgressRingIcon(
+                                        icon: Icons.cloud_upload_outlined,
+                                        showSpinner: true,
+                                        size: 34,
+                                        iconSize: 16,
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                      )
+                                    : const Icon(Icons.attach_file_rounded),
+                                onPressed:
+                                    canCompose &&
+                                        !_mediaUploading &&
+                                        !_voiceSending &&
+                                        !_anyComposerRecording &&
+                                        !_anyRecorderStarting
+                                    ? _openAttachmentSheet
+                                    : null,
+                              ),
+                              Expanded(
+                                child: Container(
+                                  margin: const EdgeInsets.symmetric(
+                                    horizontal: 4,
+                                  ),
+                                  constraints: const BoxConstraints(
+                                    minHeight: 44,
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                  ),
+                                  decoration: BoxDecoration(
                                     color: Theme.of(
                                       context,
-                                    ).colorScheme.outlineVariant,
+                                    ).colorScheme.surfaceContainerLow,
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.outlineVariant,
+                                    ),
                                   ),
-                                ),
-                                child: SubmitOnEnter(
-                                  controller: _controller,
-                                  enabled:
-                                      allowEnterShortcut &&
-                                      canCompose &&
-                                      !_anyComposerRecording,
-                                  onSubmit: _send,
-                                  child: TextField(
-                                    focusNode: _inputFocusNode,
+                                  child: SubmitOnEnter(
                                     controller: _controller,
                                     enabled:
-                                        canCompose && !_anyComposerRecording,
-                                    minLines: 1,
-                                    maxLines: 6,
-                                    keyboardType: TextInputType.multiline,
-                                    textInputAction: TextInputAction.newline,
-                                    decoration: InputDecoration(
-                                      hintText: _anyComposerRecording
-                                          ? 'Говорите... отпустите кнопку для отправки'
-                                          : canCompose
-                                          ? 'Сообщение...'
-                                          : 'Отправка сообщений недоступна',
-                                      border: InputBorder.none,
-                                      enabledBorder: InputBorder.none,
-                                      focusedBorder: InputBorder.none,
-                                      disabledBorder: InputBorder.none,
-                                      errorBorder: InputBorder.none,
-                                      focusedErrorBorder: InputBorder.none,
-                                      filled: false,
-                                      fillColor: Colors.transparent,
-                                      isDense: true,
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                            vertical: 10,
-                                          ),
+                                        allowEnterShortcut &&
+                                        canCompose &&
+                                        !_anyComposerRecording,
+                                    onSubmit: _send,
+                                    child: TextField(
+                                      focusNode: _inputFocusNode,
+                                      controller: _controller,
+                                      enabled:
+                                          canCompose && !_anyComposerRecording,
+                                      minLines: 1,
+                                      maxLines: 6,
+                                      keyboardType: TextInputType.multiline,
+                                      textInputAction: TextInputAction.newline,
+                                      decoration: InputDecoration(
+                                        hintText: _anyComposerRecording
+                                            ? 'Говорите... отпустите кнопку для отправки'
+                                            : canCompose
+                                            ? 'Сообщение...'
+                                            : 'Отправка сообщений недоступна',
+                                        border: InputBorder.none,
+                                        enabledBorder: InputBorder.none,
+                                        focusedBorder: InputBorder.none,
+                                        disabledBorder: InputBorder.none,
+                                        errorBorder: InputBorder.none,
+                                        focusedErrorBorder: InputBorder.none,
+                                        filled: false,
+                                        fillColor: Colors.transparent,
+                                        isDense: true,
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                              vertical: 10,
+                                            ),
+                                      ),
                                     ),
                                   ),
                                 ),
                               ),
-                            ),
-                            IconButton(
-                              tooltip: 'Эмодзи',
-                              icon: const Icon(Icons.emoji_emotions_outlined),
-                              onPressed: canCompose && !_anyComposerRecording
-                                  ? _openComposerEmojiPicker
-                                  : null,
-                            ),
-                            ValueListenableBuilder<TextEditingValue>(
-                              valueListenable: _controller,
-                              builder: (context, value, _) {
-                                final hasDraftText = value.text
-                                    .trim()
-                                    .isNotEmpty;
-                                return hasDraftText
-                                    ? IconButton(
-                                        key: const ValueKey<String>(
-                                          'composer-send',
-                                        ),
-                                        icon: _voiceSending
-                                            ? const SizedBox(
-                                                width: 18,
-                                                height: 18,
-                                                child:
-                                                    CircularProgressIndicator(
-                                                      strokeWidth: 2,
-                                                    ),
-                                              )
-                                            : const Icon(Icons.send_rounded),
-                                        onPressed:
-                                            !canCompose ||
+                              IconButton(
+                                tooltip: 'Эмодзи',
+                                icon: const Icon(Icons.emoji_emotions_outlined),
+                                onPressed: canCompose && !_anyComposerRecording
+                                    ? _openComposerEmojiPicker
+                                    : null,
+                              ),
+                              ValueListenableBuilder<TextEditingValue>(
+                                valueListenable: _controller,
+                                builder: (context, value, _) {
+                                  final hasDraftText = value.text
+                                      .trim()
+                                      .isNotEmpty;
+                                  return hasDraftText
+                                      ? IconButton(
+                                          key: const ValueKey<String>(
+                                            'composer-send',
+                                          ),
+                                          icon: _voiceSending
+                                              ? const SizedBox(
+                                                  width: 18,
+                                                  height: 18,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                      ),
+                                                )
+                                              : const Icon(Icons.send_rounded),
+                                          onPressed:
+                                              !canCompose ||
+                                                  _mediaUploading ||
+                                                  _voiceSending ||
+                                                  _anyComposerRecording ||
+                                                  _anyRecorderStarting
+                                              ? null
+                                              : _handleTextSendPressed,
+                                        )
+                                      : Builder(
+                                          key: const ValueKey<String>(
+                                            'composer-record',
+                                          ),
+                                          builder: (context) {
+                                            final disabled =
+                                                !canCompose ||
                                                 _mediaUploading ||
                                                 _voiceSending ||
                                                 _anyComposerRecording ||
-                                                _anyRecorderStarting
-                                            ? null
-                                            : _handleTextSendPressed,
-                                      )
-                                    : Builder(
-                                        key: const ValueKey<String>(
-                                          'composer-record',
-                                        ),
-                                        builder: (context) {
-                                          final disabled =
-                                              !canCompose ||
-                                              _mediaUploading ||
-                                              _voiceSending ||
-                                              _anyRecorderStarting;
-                                          final activeColor = Theme.of(
-                                            context,
-                                          ).colorScheme.primary;
-                                          final icon = _voiceRecording
-                                              ? Icons.stop_circle_outlined
-                                              : (_composerMediaMode ==
-                                                        _ComposerMediaMode
-                                                            .camera
-                                                    ? Icons
-                                                          .radio_button_unchecked_rounded
-                                                    : Icons.mic_rounded);
-                                          final isArmed =
-                                              _anyComposerRecording ||
-                                              _anyRecorderStarting;
-                                          final buttonBaseColor =
-                                              _voiceRecording
-                                              ? Theme.of(
-                                                  context,
-                                                ).colorScheme.error
-                                              : _videoRecording
-                                              ? const Color(0xFF2F80FF)
-                                              : activeColor;
-                                          return GestureDetector(
-                                            behavior: HitTestBehavior.opaque,
-                                            onTapDown: (details) =>
-                                                _handleComposerMediaTapDown(
+                                                _anyRecorderStarting;
+                                            final activeColor = Theme.of(
+                                              context,
+                                            ).colorScheme.primary;
+                                            final icon = _voiceRecording
+                                                ? Icons.stop_circle_outlined
+                                                : (_composerMediaMode ==
+                                                          _ComposerMediaMode
+                                                              .camera
+                                                      ? Icons
+                                                            .radio_button_unchecked_rounded
+                                                      : Icons.mic_rounded);
+                                            final isArmed =
+                                                _anyComposerRecording ||
+                                                _anyRecorderStarting;
+                                            final isVideoMode =
+                                                _composerMediaMode ==
+                                                _ComposerMediaMode.camera;
+                                            final buttonBaseColor =
+                                                _voiceRecording
+                                                ? Theme.of(
+                                                    context,
+                                                  ).colorScheme.error
+                                                : (_videoRecording ||
+                                                      isVideoMode)
+                                                ? const Color(0xFF2F80FF)
+                                                : activeColor;
+                                            final iconColor = disabled
+                                                ? Theme.of(
+                                                    context,
+                                                  ).colorScheme.onSurfaceVariant
+                                                : Colors.white;
+                                            return Listener(
+                                              behavior: HitTestBehavior.opaque,
+                                              onPointerDown: (event) =>
+                                                  _handleComposerMediaTapDown(
+                                                    disabled: disabled,
+                                                    context: context,
+                                                    canCompose: canCompose,
+                                                    details: TapDownDetails(
+                                                      globalPosition:
+                                                          event.position,
+                                                    ),
+                                                  ),
+                                              onPointerMove: (event) {
+                                                if (_anyComposerRecording &&
+                                                    !_voiceRecordingLocked &&
+                                                    !_videoRecordingLocked) {
+                                                  _handleRecordingPointerMove(
+                                                    event.position,
+                                                  );
+                                                }
+                                              },
+                                              onPointerUp: (_) => unawaited(
+                                                _handleComposerMediaTapUp(
                                                   disabled: disabled,
                                                   context: context,
                                                   canCompose: canCompose,
-                                                  details: details,
                                                 ),
-                                            onTapUp: (_) => unawaited(
-                                              _handleComposerMediaTapUp(
-                                                disabled: disabled,
-                                                context: context,
-                                                canCompose: canCompose,
                                               ),
-                                            ),
-                                            onTapCancel:
-                                                _handleComposerMediaTapCancel,
-                                            onPanUpdate:
-                                                _handleComposerMediaPanUpdate,
-                                            onPanEnd: (_) =>
-                                                _handleComposerMediaPanEnd(),
-                                            onPanCancel:
-                                                _handleComposerMediaPanCancel,
-                                            child: TweenAnimationBuilder<double>(
-                                              duration: const Duration(
-                                                milliseconds: 180,
-                                              ),
-                                              tween: Tween<double>(
-                                                begin: 1,
-                                                end: isArmed ? 1.08 : 1.0,
-                                              ),
-                                              curve: Curves.easeOutBack,
-                                              builder: (ctx, scale, child) =>
-                                                  Transform.scale(
-                                                    scale: scale,
-                                                    child: child,
-                                                  ),
-                                              child: AnimatedContainer(
+                                              onPointerCancel: (_) =>
+                                                  _handleComposerMediaTapCancel(),
+                                              child: TweenAnimationBuilder<double>(
                                                 duration: const Duration(
                                                   milliseconds: 180,
                                                 ),
-                                                width: 46,
-                                                height: 46,
-                                                alignment: Alignment.center,
-                                                decoration: BoxDecoration(
-                                                  shape: BoxShape.circle,
-                                                  gradient: disabled
-                                                      ? null
-                                                      : LinearGradient(
-                                                          begin:
-                                                              Alignment.topLeft,
-                                                          end: Alignment
-                                                              .bottomRight,
-                                                          colors: [
-                                                            buttonBaseColor
-                                                                .withValues(
-                                                                  alpha: 0.9,
-                                                                ),
-                                                            buttonBaseColor
-                                                                .withValues(
-                                                                  alpha: 0.72,
-                                                                ),
-                                                          ],
-                                                        ),
-                                                  color: disabled
-                                                      ? Theme.of(context)
-                                                            .colorScheme
-                                                            .surfaceContainerHigh
-                                                      : null,
-                                                  boxShadow: disabled
-                                                      ? null
-                                                      : [
-                                                          BoxShadow(
-                                                            color:
-                                                                buttonBaseColor
-                                                                    .withValues(
-                                                                      alpha:
-                                                                          0.30,
-                                                                    ),
-                                                            blurRadius: 14,
-                                                            offset:
-                                                                const Offset(
-                                                                  0,
-                                                                  5,
-                                                                ),
-                                                          ),
-                                                        ],
+                                                tween: Tween<double>(
+                                                  begin: 1,
+                                                  end: isArmed ? 1.08 : 1.0,
                                                 ),
-                                                child:
-                                                    _voiceSending ||
-                                                        _anyRecorderStarting
-                                                    ? const SizedBox(
-                                                        width: 18,
-                                                        height: 18,
-                                                        child: CircularProgressIndicator(
-                                                          strokeWidth: 2.2,
-                                                          valueColor:
-                                                              AlwaysStoppedAnimation<
-                                                                Color
-                                                              >(Colors.white),
+                                                curve: Curves.easeOutBack,
+                                                builder: (ctx, scale, child) =>
+                                                    Transform.scale(
+                                                      scale: scale,
+                                                      child: child,
+                                                    ),
+                                                child: AnimatedContainer(
+                                                  duration: const Duration(
+                                                    milliseconds: 180,
+                                                  ),
+                                                  width: 46,
+                                                  height: 46,
+                                                  alignment: Alignment.center,
+                                                  decoration: BoxDecoration(
+                                                    shape: BoxShape.circle,
+                                                    gradient: disabled
+                                                        ? null
+                                                        : LinearGradient(
+                                                            begin: Alignment
+                                                                .topLeft,
+                                                            end: Alignment
+                                                                .bottomRight,
+                                                            colors: [
+                                                              buttonBaseColor
+                                                                  .withValues(
+                                                                    alpha: 0.9,
+                                                                  ),
+                                                              buttonBaseColor
+                                                                  .withValues(
+                                                                    alpha: 0.72,
+                                                                  ),
+                                                            ],
+                                                          ),
+                                                    color: disabled
+                                                        ? Theme.of(context)
+                                                              .colorScheme
+                                                              .surfaceContainerHigh
+                                                        : null,
+                                                    boxShadow: disabled
+                                                        ? null
+                                                        : [
+                                                            BoxShadow(
+                                                              color: buttonBaseColor
+                                                                  .withValues(
+                                                                    alpha: 0.30,
+                                                                  ),
+                                                              blurRadius: 14,
+                                                              offset:
+                                                                  const Offset(
+                                                                    0,
+                                                                    5,
+                                                                  ),
+                                                            ),
+                                                          ],
+                                                  ),
+                                                  child:
+                                                      _voiceSending ||
+                                                          _anyRecorderStarting
+                                                      ? const SizedBox(
+                                                          width: 18,
+                                                          height: 18,
+                                                          child: CircularProgressIndicator(
+                                                            strokeWidth: 2.2,
+                                                            valueColor:
+                                                                AlwaysStoppedAnimation<
+                                                                  Color
+                                                                >(Colors.white),
+                                                          ),
+                                                        )
+                                                      : (_voiceRecording ||
+                                                            _videoRecording)
+                                                      ? Icon(
+                                                          icon,
+                                                          color: iconColor,
+                                                        )
+                                                      : _buildComposerMediaFlipIcon(
+                                                          videoMode:
+                                                              isVideoMode,
+                                                          color: iconColor,
+                                                          size: 46,
                                                         ),
-                                                      )
-                                                    : Icon(
-                                                        icon,
-                                                        color: disabled
-                                                            ? Theme.of(context)
-                                                                  .colorScheme
-                                                                  .onSurfaceVariant
-                                                            : Colors.white,
-                                                      ),
+                                                ),
                                               ),
-                                            ),
-                                          );
-                                        },
-                                      );
-                              },
-                            ),
-                          ],
+                                            );
+                                          },
+                                        );
+                                },
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -14834,6 +16103,1399 @@ class _ExpandedVideoNoteViewerState extends State<_ExpandedVideoNoteViewer> {
                 ),
               ],
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _VideoNotePoster extends StatefulWidget {
+  const _VideoNotePoster({
+    super.key,
+    required this.videoUrl,
+    required this.fallback,
+    this.onDurationResolved,
+  });
+
+  final String videoUrl;
+  final Widget fallback;
+  final ValueChanged<Duration>? onDurationResolved;
+
+  @override
+  State<_VideoNotePoster> createState() => _VideoNotePosterState();
+}
+
+class _VideoNotePosterState extends State<_VideoNotePoster> {
+  vp.VideoPlayerController? _controller;
+  bool _ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_initialize());
+  }
+
+  @override
+  void didUpdateWidget(covariant _VideoNotePoster oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.videoUrl == widget.videoUrl) return;
+    unawaited(_controller?.dispose());
+    _controller = null;
+    _ready = false;
+    unawaited(_initialize());
+  }
+
+  @override
+  void dispose() {
+    unawaited(_controller?.dispose());
+    super.dispose();
+  }
+
+  Future<void> _initialize() async {
+    final requestedUrl = widget.videoUrl.trim();
+    final uri = Uri.tryParse(requestedUrl);
+    if (uri == null || !uri.hasScheme) return;
+    final controller = vp.VideoPlayerController.networkUrl(
+      uri,
+      videoPlayerOptions: vp.VideoPlayerOptions(mixWithOthers: true),
+    );
+    try {
+      await controller.initialize();
+      await controller.pause();
+      await controller.seekTo(Duration.zero);
+      if (!mounted || widget.videoUrl.trim() != requestedUrl) {
+        await controller.dispose();
+        return;
+      }
+      setState(() {
+        _controller = controller;
+        _ready = true;
+      });
+      final duration = controller.value.duration;
+      if (duration > Duration.zero) {
+        widget.onDurationResolved?.call(duration);
+      }
+    } catch (_) {
+      await controller.dispose();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _controller;
+    if (!_ready || controller == null || !controller.value.isInitialized) {
+      return widget.fallback;
+    }
+    final size = controller.value.size;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        widget.fallback,
+        FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: size.width > 0 ? size.width : 320,
+            height: size.height > 0 ? size.height : 320,
+            child: vp.VideoPlayer(controller),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _AttachmentPickedUpload {
+  const _AttachmentPickedUpload({
+    required this.id,
+    required this.kind,
+    required this.upload,
+    this.previewBytes,
+    this.durationMs,
+  });
+
+  final String id;
+  final String kind;
+  final _ChatUploadFile upload;
+  final Uint8List? previewBytes;
+  final int? durationMs;
+}
+
+class _AttachmentGallerySelection {
+  const _AttachmentGallerySelection({required this.items});
+
+  final List<_AttachmentPickedUpload> items;
+}
+
+class _ChatAttachmentGallerySheet extends StatefulWidget {
+  const _ChatAttachmentGallerySheet({
+    required this.title,
+    required this.desktopMode,
+    required this.nativeMacCameraMode,
+    required this.loadRecent,
+    required this.loadRecentUpload,
+    required this.pickFromDevice,
+    required this.startCamera,
+    required this.cameraController,
+    required this.cameraPreviewAvailable,
+    required this.cameraHint,
+    required this.capturePhoto,
+    required this.toggleRecordVideo,
+    required this.cancelRecordVideo,
+    required this.stopCamera,
+  });
+
+  final String title;
+  final bool desktopMode;
+  final bool nativeMacCameraMode;
+  final Future<List<ChatRecentGalleryItem>> Function() loadRecent;
+  final Future<_AttachmentPickedUpload?> Function(ChatRecentGalleryItem)
+  loadRecentUpload;
+  final Future<List<_AttachmentPickedUpload>> Function() pickFromDevice;
+  final Future<bool> Function() startCamera;
+  final cam.CameraController? Function() cameraController;
+  final bool Function() cameraPreviewAvailable;
+  final String Function() cameraHint;
+  final Future<_AttachmentPickedUpload?> Function() capturePhoto;
+  final Future<_AttachmentPickedUpload?> Function() toggleRecordVideo;
+  final Future<void> Function() cancelRecordVideo;
+  final Future<void> Function() stopCamera;
+
+  @override
+  State<_ChatAttachmentGallerySheet> createState() =>
+      _ChatAttachmentGallerySheetState();
+}
+
+class _ChatAttachmentGallerySheetState
+    extends State<_ChatAttachmentGallerySheet> {
+  final Set<String> _selectedPickedIds = <String>{};
+  final Set<String> _selectedRecentIds = <String>{};
+  final List<_AttachmentPickedUpload> _picked = <_AttachmentPickedUpload>[];
+  List<ChatRecentGalleryItem> _recent = const <ChatRecentGalleryItem>[];
+  bool _loadingRecent = true;
+  bool _cameraStarting = true;
+  bool _cameraReady = false;
+  bool _busy = false;
+  bool _recording = false;
+  int _recordingSeconds = 0;
+  Timer? _recordingTimer;
+  StreamSubscription<Uint8List>? _nativePreviewSub;
+  Uint8List? _nativePreviewFrame;
+
+  int get _selectedCount =>
+      _selectedPickedIds.length + _selectedRecentIds.length;
+
+  String _formatSheetDuration(Duration duration) {
+    final totalSeconds = duration.inSeconds;
+    final minutes = totalSeconds ~/ 60;
+    final seconds = totalSeconds % 60;
+    final mm = minutes < 10 ? '0$minutes' : '$minutes';
+    final ss = seconds < 10 ? '0$seconds' : '$seconds';
+    return '$mm:$ss';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.nativeMacCameraMode) {
+      _startNativePreviewFrames();
+    }
+    unawaited(_loadRecent());
+    unawaited(_startCamera());
+  }
+
+  @override
+  void dispose() {
+    _recordingTimer?.cancel();
+    _nativePreviewSub?.cancel();
+    unawaited(_disposeCameraSession());
+    super.dispose();
+  }
+
+  Future<void> _disposeCameraSession() async {
+    try {
+      await widget.cancelRecordVideo();
+    } finally {
+      await widget.stopCamera();
+    }
+  }
+
+  void _startNativePreviewFrames() {
+    _nativePreviewSub?.cancel();
+    _nativePreviewSub = NativeVideoNoteCaptureService.previewFrames.listen(
+      (frame) {
+        if (!mounted) return;
+        setState(() => _nativePreviewFrame = frame);
+      },
+      onError: (Object error) {
+        debugPrint('attachment native preview error: $error');
+      },
+    );
+  }
+
+  Future<void> _loadRecent() async {
+    try {
+      final recent = await widget.loadRecent();
+      if (!mounted) return;
+      setState(() {
+        _recent = recent;
+        _loadingRecent = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _loadingRecent = false);
+    }
+  }
+
+  Future<void> _startCamera() async {
+    setState(() {
+      _cameraStarting = true;
+      _cameraReady = false;
+    });
+    try {
+      final ready = await widget.startCamera();
+      if (!mounted) return;
+      setState(() {
+        _cameraReady = ready;
+        _cameraStarting = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _cameraReady = false;
+        _cameraStarting = false;
+      });
+    }
+  }
+
+  void _showSheetNotice(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(text),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _pickFromDevice() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final uploads = await widget.pickFromDevice();
+      if (!mounted) return;
+      setState(() {
+        _picked.insertAll(0, uploads);
+        for (final upload in uploads) {
+          _selectedPickedIds.add(upload.id);
+        }
+      });
+      if (uploads.isEmpty) {
+        _showSheetNotice('Фото не выбрано');
+      }
+    } catch (_) {
+      _showSheetNotice('Не удалось выбрать фото');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _capturePhoto() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final upload = await widget.capturePhoto();
+      if (!mounted) return;
+      if (upload != null) {
+        setState(() {
+          _picked.insert(0, upload);
+          _selectedPickedIds.add(upload.id);
+        });
+      }
+    } catch (_) {
+      _showSheetNotice('Не удалось сделать фото');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final upload = await widget.toggleRecordVideo();
+      if (!mounted) return;
+      if (_recording) {
+        _recordingTimer?.cancel();
+        _recordingTimer = null;
+        setState(() {
+          _recording = false;
+          _recordingSeconds = 0;
+          if (upload != null) {
+            _picked.insert(0, upload);
+            _selectedPickedIds.add(upload.id);
+          }
+        });
+      } else {
+        setState(() {
+          _recording = true;
+          _recordingSeconds = 0;
+        });
+        _recordingTimer?.cancel();
+        _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+          if (!mounted) return;
+          setState(() => _recordingSeconds += 1);
+        });
+      }
+    } catch (_) {
+      _showSheetNotice('Не удалось записать видео');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _sendSelected() async {
+    if (_selectedCount == 0 || _busy) {
+      _showSheetNotice('Выберите фото или видео');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      if (_recording) {
+        final upload = await widget.toggleRecordVideo();
+        _recordingTimer?.cancel();
+        _recordingTimer = null;
+        _recording = false;
+        if (upload != null) {
+          _picked.insert(0, upload);
+          _selectedPickedIds.add(upload.id);
+        }
+      }
+
+      final items = <_AttachmentPickedUpload>[];
+      for (final upload in _picked) {
+        if (_selectedPickedIds.contains(upload.id)) {
+          items.add(upload);
+        }
+      }
+      for (final item in _recent) {
+        if (!_selectedRecentIds.contains(item.id)) continue;
+        final upload = await widget.loadRecentUpload(item);
+        if (upload != null) items.add(upload);
+      }
+      if (!mounted) return;
+      Navigator.of(context).pop(_AttachmentGallerySelection(items: items));
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      _showSheetNotice('Не удалось подготовить медиа');
+    }
+  }
+
+  void _togglePicked(String id) {
+    setState(() {
+      if (!_selectedPickedIds.remove(id)) {
+        _selectedPickedIds.add(id);
+      }
+    });
+  }
+
+  void _toggleRecent(String id) {
+    setState(() {
+      if (!_selectedRecentIds.remove(id)) {
+        _selectedRecentIds.add(id);
+      }
+    });
+  }
+
+  int _selectionOrder(String id) {
+    final ordered = <String>[..._selectedPickedIds, ..._selectedRecentIds];
+    final index = ordered.indexOf(id);
+    return index < 0 ? 0 : index + 1;
+  }
+
+  Widget _buildCameraPreview() {
+    if (widget.nativeMacCameraMode && _nativePreviewFrame != null) {
+      return RepaintBoundary(
+        child: Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.diagonal3Values(-1, 1, 1),
+          child: Image.memory(
+            _nativePreviewFrame!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.low,
+          ),
+        ),
+      );
+    }
+    final controller = widget.cameraController();
+    if (controller == null || !controller.value.isInitialized) {
+      return const SizedBox.shrink();
+    }
+    final previewSize = controller.value.previewSize;
+    Widget preview = cam.CameraPreview(controller);
+    if (controller.description.lensDirection == cam.CameraLensDirection.front) {
+      preview = Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.diagonal3Values(-1, 1, 1),
+        child: preview,
+      );
+    }
+    return FittedBox(
+      fit: BoxFit.cover,
+      child: SizedBox(
+        width: previewSize?.height ?? 320,
+        height: previewSize?.width ?? 320,
+        child: preview,
+      ),
+    );
+  }
+
+  Widget _buildCameraTile(ThemeData theme, {double borderRadius = 2}) {
+    final nativePreviewReady =
+        widget.nativeMacCameraMode && _nativePreviewFrame != null;
+    final previewReady = widget.cameraPreviewAvailable() || nativePreviewReady;
+    final enabledForVideo = _cameraReady || previewReady;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(borderRadius),
+      child: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF101827), Color(0xFF1B2440)],
+          ),
+        ),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (previewReady) _buildCameraPreview(),
+            if (!previewReady)
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  gradient: RadialGradient(
+                    center: const Alignment(0, -0.35),
+                    radius: 0.95,
+                    colors: [
+                      theme.colorScheme.primary.withValues(alpha: 0.30),
+                      const Color(0xFF121827),
+                    ],
+                  ),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    if (_cameraStarting)
+                      const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    else
+                      Icon(
+                        widget.nativeMacCameraMode
+                            ? Icons.laptop_mac_rounded
+                            : Icons.photo_camera_outlined,
+                        color: Colors.white,
+                        size: 34,
+                      ),
+                    const SizedBox(height: 8),
+                    Text(
+                      _cameraStarting
+                          ? 'Запуск камеры'
+                          : widget.nativeMacCameraMode && _cameraReady
+                          ? 'Камера Mac'
+                          : _cameraReady
+                          ? 'Камера готова'
+                          : widget.cameraHint(),
+                      textAlign: TextAlign.center,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 11,
+                        height: 1.15,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            Positioned(
+              top: 8,
+              left: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.48),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: Text(
+                  _recording
+                      ? _formatSheetDuration(
+                          Duration(seconds: _recordingSeconds),
+                        )
+                      : 'LIVE',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w900,
+                    fontFeatures: [ui.FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: 8,
+              right: 8,
+              bottom: 8,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  _RoundCameraAction(
+                    icon: Icons.radio_button_unchecked_rounded,
+                    onPressed: previewReady && !_recording && !_busy
+                        ? _capturePhoto
+                        : null,
+                  ),
+                  const SizedBox(width: 10),
+                  _RoundCameraAction(
+                    recording: _recording,
+                    icon: _recording
+                        ? Icons.stop_rounded
+                        : Icons.fiber_manual_record_rounded,
+                    onPressed: enabledForVideo && !_busy
+                        ? _toggleRecording
+                        : null,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPickedTile(_AttachmentPickedUpload item, ThemeData theme) {
+    final selected = _selectedPickedIds.contains(item.id);
+    return _AttachmentMediaTile(
+      selected: selected,
+      selectionOrder: _selectionOrder(item.id),
+      kind: item.kind,
+      previewBytes: item.previewBytes,
+      label: item.kind == 'video' ? 'Видео' : 'Фото',
+      onTap: () => _togglePicked(item.id),
+    );
+  }
+
+  Widget _buildRecentTile(ChatRecentGalleryItem item, ThemeData theme) {
+    final selected = _selectedRecentIds.contains(item.id);
+    return _AttachmentMediaTile(
+      selected: selected,
+      selectionOrder: _selectionOrder(item.id),
+      kind: item.kind,
+      previewBytes: item.thumbnailBytes,
+      label: item.kind == 'video' ? 'Видео' : '',
+      onTap: () => _toggleRecent(item.id),
+    );
+  }
+
+  Widget _buildEmptyRecent(ThemeData theme) {
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 30, 18, 110),
+        child: Column(
+          children: [
+            Icon(
+              widget.desktopMode
+                  ? Icons.folder_open_rounded
+                  : Icons.photo_library_outlined,
+              size: 42,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              widget.desktopMode
+                  ? 'На desktop браузер и приложение не могут показать “Недавние” без выбора пользователя.'
+                  : 'Нет доступа к недавним медиа',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              onPressed: _busy ? null : _pickFromDevice,
+              icon: const Icon(Icons.add_photo_alternate_outlined),
+              label: const Text('Выбрать фото'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyRecentPanel(ThemeData theme) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 18, 18, 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              widget.desktopMode
+                  ? Icons.folder_open_rounded
+                  : Icons.photo_library_outlined,
+              size: 42,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              widget.desktopMode
+                  ? 'Выберите фото с устройства, чтобы заполнить desktop-галерею.'
+                  : 'Нет доступа к недавним медиа',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              onPressed: _busy ? null : _pickFromDevice,
+              icon: const Icon(Icons.add_photo_alternate_outlined),
+              label: const Text('Выбрать фото'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGalleryGrid(
+    ThemeData theme, {
+    required int columns,
+    required bool includeCamera,
+    required EdgeInsets padding,
+  }) {
+    final mediaCount = _picked.length + (_loadingRecent ? 9 : _recent.length);
+    if (!includeCamera && !_loadingRecent && mediaCount == 0) {
+      return _buildEmptyRecentPanel(theme);
+    }
+    return GridView.builder(
+      padding: padding,
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: columns,
+        mainAxisSpacing: 2,
+        crossAxisSpacing: 2,
+      ),
+      itemCount: (includeCamera ? 1 : 0) + mediaCount,
+      itemBuilder: (context, index) {
+        if (includeCamera && index == 0) return _buildCameraTile(theme);
+        final mediaIndex = index - (includeCamera ? 1 : 0);
+        if (mediaIndex < _picked.length) {
+          return _buildPickedTile(_picked[mediaIndex], theme);
+        }
+        final recentIndex = mediaIndex - _picked.length;
+        if (_loadingRecent) {
+          return const _AttachmentSkeletonTile();
+        }
+        return _buildRecentTile(_recent[recentIndex], theme);
+      },
+    );
+  }
+
+  Widget _buildDesktopCameraPanel(ThemeData theme, {required bool compact}) {
+    return Container(
+      padding: EdgeInsets.all(compact ? 10 : 14),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLow.withValues(alpha: 0.78),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.78),
+        ),
+      ),
+      child: compact
+          ? Row(
+              children: [
+                SizedBox(
+                  width: 150,
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Камера',
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Запускается сразу при открытии скрепки.',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(child: _buildCameraTile(theme, borderRadius: 18)),
+              ],
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Камера',
+                  style: theme.textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Запускается сразу при открытии скрепки.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Expanded(child: _buildCameraTile(theme, borderRadius: 22)),
+              ],
+            ),
+    );
+  }
+
+  Widget _buildDesktopGalleryPanel(ThemeData theme, {required int columns}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerLowest.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.62),
+        ),
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 12, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'Недавние',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      Text(
+                        widget.desktopMode
+                            ? 'Выбранные локальные фото появятся здесь'
+                            : 'Фото и видео с устройства',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                FilledButton.tonalIcon(
+                  onPressed: _busy ? null : _pickFromDevice,
+                  icon: const Icon(Icons.add_photo_alternate_outlined),
+                  label: const Text('Фото'),
+                ),
+              ],
+            ),
+          ),
+          Divider(
+            height: 1,
+            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.7),
+          ),
+          Expanded(
+            child: _buildGalleryGrid(
+              theme,
+              columns: columns,
+              includeCamera: false,
+              padding: const EdgeInsets.fromLTRB(8, 8, 8, 118),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDesktopMediaBody(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 0, 14, 0),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 760;
+          if (compact) {
+            final galleryColumns = constraints.maxWidth >= 560 ? 4 : 3;
+            final cameraHeight = min(260.0, constraints.maxHeight * 0.38);
+            return Column(
+              children: [
+                SizedBox(
+                  height: cameraHeight,
+                  child: _buildDesktopCameraPanel(theme, compact: true),
+                ),
+                const SizedBox(height: 10),
+                Expanded(
+                  child: _buildDesktopGalleryPanel(
+                    theme,
+                    columns: galleryColumns,
+                  ),
+                ),
+              ],
+            );
+          }
+          final cameraWidth = min(
+            360.0,
+            max(280.0, constraints.maxWidth * 0.32),
+          );
+          final galleryColumns = constraints.maxWidth >= 1000
+              ? 5
+              : constraints.maxWidth >= 860
+              ? 4
+              : 3;
+          return Row(
+            children: [
+              SizedBox(
+                width: cameraWidth,
+                child: _buildDesktopCameraPanel(theme, compact: false),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _buildDesktopGalleryPanel(
+                  theme,
+                  columns: galleryColumns,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildMobileMediaBody(ThemeData theme) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = constraints.maxWidth >= 680
+            ? 5
+            : constraints.maxWidth >= 520
+            ? 4
+            : 3;
+        final count = 1 + _picked.length + _recent.length;
+        if (!_loadingRecent && count == 1) {
+          return CustomScrollView(
+            slivers: [
+              SliverPadding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                sliver: SliverGrid(
+                  delegate: SliverChildListDelegate([_buildCameraTile(theme)]),
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: columns,
+                    mainAxisSpacing: 2,
+                    crossAxisSpacing: 2,
+                  ),
+                ),
+              ),
+              _buildEmptyRecent(theme),
+            ],
+          );
+        }
+        return _buildGalleryGrid(
+          theme,
+          columns: columns,
+          includeCamera: true,
+          padding: const EdgeInsets.fromLTRB(8, 0, 8, 118),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final size = MediaQuery.sizeOf(context);
+    final useDesktopLayout = widget.desktopMode && size.width >= 760;
+    final maxWidth = useDesktopLayout
+        ? min(size.width - 32, 1280.0)
+        : (size.width >= 760 ? 760.0 : size.width);
+    final height = useDesktopLayout
+        ? min(size.height * 0.78, 860.0)
+        : min(size.height * 0.78, 680.0);
+    final surface = theme.colorScheme.surface.withValues(alpha: 0.98);
+
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: height),
+        child: Material(
+          color: Colors.transparent,
+          child: ClipRRect(
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+            child: Container(
+              height: height,
+              decoration: BoxDecoration(
+                color: surface,
+                border: Border.all(
+                  color: theme.colorScheme.outlineVariant.withValues(
+                    alpha: 0.8,
+                  ),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.26),
+                    blurRadius: 40,
+                    offset: const Offset(0, -18),
+                  ),
+                ],
+              ),
+              child: Stack(
+                children: [
+                  Column(
+                    children: [
+                      const SizedBox(height: 10),
+                      Container(
+                        width: 52,
+                        height: 5,
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.onSurfaceVariant.withValues(
+                            alpha: 0.30,
+                          ),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+                        child: Row(
+                          children: [
+                            IconButton.filledTonal(
+                              onPressed: () => Navigator.of(context).pop(),
+                              icon: const Icon(Icons.close_rounded),
+                            ),
+                            Expanded(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    widget.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    textAlign: TextAlign.center,
+                                    style: theme.textTheme.headlineSmall
+                                        ?.copyWith(fontWeight: FontWeight.w900),
+                                  ),
+                                  Text(
+                                    widget.desktopMode
+                                        ? 'MacBook / desktop режим'
+                                        : 'Галерея',
+                                    style: theme.textTheme.labelMedium
+                                        ?.copyWith(
+                                          color: theme
+                                              .colorScheme
+                                              .onSurfaceVariant,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton.filledTonal(
+                              onPressed: _busy ? null : _pickFromDevice,
+                              tooltip: 'Выбрать фото',
+                              icon: _busy
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(
+                                      Icons.add_photo_alternate_outlined,
+                                    ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Expanded(
+                        child: useDesktopLayout
+                            ? _buildDesktopMediaBody(theme)
+                            : _buildMobileMediaBody(theme),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+                        decoration: BoxDecoration(
+                          color: surface.withValues(alpha: 0.92),
+                          border: Border(
+                            top: BorderSide(
+                              color: theme.colorScheme.outlineVariant
+                                  .withValues(alpha: 0.7),
+                            ),
+                          ),
+                        ),
+                        child: SafeArea(
+                          top: false,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 18,
+                                  vertical: 11,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: theme.colorScheme.primary.withValues(
+                                    alpha: 0.14,
+                                  ),
+                                  borderRadius: BorderRadius.circular(18),
+                                  border: Border.all(
+                                    color: theme.colorScheme.primary.withValues(
+                                      alpha: 0.22,
+                                    ),
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.photo_library_outlined,
+                                      color: theme.colorScheme.primary,
+                                    ),
+                                    const SizedBox(width: 9),
+                                    Text(
+                                      'Галерея',
+                                      style: TextStyle(
+                                        color: theme.colorScheme.primary,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  Positioned(
+                    left: 14,
+                    right: 14,
+                    bottom: 84,
+                    child: IgnorePointer(
+                      ignoring: _selectedCount == 0,
+                      child: AnimatedSlide(
+                        duration: const Duration(milliseconds: 180),
+                        offset: _selectedCount > 0
+                            ? Offset.zero
+                            : const Offset(0, 0.35),
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 180),
+                          opacity: _selectedCount > 0 ? 1 : 0,
+                          child: Container(
+                            padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.inverseSurface
+                                  .withValues(alpha: 0.92),
+                              borderRadius: BorderRadius.circular(22),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.26),
+                                  blurRadius: 24,
+                                  offset: const Offset(0, 12),
+                                ),
+                              ],
+                            ),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        'Выбрано $_selectedCount',
+                                        style: TextStyle(
+                                          color: theme
+                                              .colorScheme
+                                              .onInverseSurface,
+                                          fontWeight: FontWeight.w900,
+                                        ),
+                                      ),
+                                      Text(
+                                        'Будет отправлено в чат',
+                                        style: TextStyle(
+                                          color: theme
+                                              .colorScheme
+                                              .onInverseSurface
+                                              .withValues(alpha: 0.70),
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                FilledButton.icon(
+                                  onPressed: _busy ? null : _sendSelected,
+                                  icon: _busy
+                                      ? const SizedBox(
+                                          width: 16,
+                                          height: 16,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            valueColor:
+                                                AlwaysStoppedAnimation<Color>(
+                                                  Colors.white,
+                                                ),
+                                          ),
+                                        )
+                                      : const Icon(Icons.send_rounded),
+                                  label: const Text('Отправить'),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RoundCameraAction extends StatelessWidget {
+  const _RoundCameraAction({
+    required this.icon,
+    required this.onPressed,
+    this.recording = false,
+  });
+
+  final IconData icon;
+  final VoidCallback? onPressed;
+  final bool recording;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.42),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onPressed,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: Colors.white.withValues(
+                alpha: onPressed == null ? 0.35 : 0.9,
+              ),
+              width: 2,
+            ),
+          ),
+          child: Icon(
+            icon,
+            color: recording ? const Color(0xFFFF4D43) : Colors.white,
+            size: recording ? 22 : 20,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _AttachmentMediaTile extends StatelessWidget {
+  const _AttachmentMediaTile({
+    required this.selected,
+    required this.selectionOrder,
+    required this.kind,
+    required this.previewBytes,
+    required this.label,
+    required this.onTap,
+  });
+
+  final bool selected;
+  final int selectionOrder;
+  final String kind;
+  final Uint8List? previewBytes;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    Widget preview;
+    if (previewBytes != null && previewBytes!.isNotEmpty) {
+      preview = Image.memory(
+        previewBytes!,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+      );
+    } else {
+      preview = Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF22325C), Color(0xFF22D3EE)],
+          ),
+        ),
+        child: Icon(
+          kind == 'video' ? Icons.videocam_outlined : Icons.image_outlined,
+          color: Colors.white,
+          size: 30,
+        ),
+      );
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(2),
+      child: Material(
+        color: theme.colorScheme.surfaceContainerHighest,
+        child: InkWell(
+          onTap: onTap,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              preview,
+              if (kind == 'video')
+                Positioned(
+                  left: 7,
+                  top: 7,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.48),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: const Text(
+                      'VIDEO',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                ),
+              if (label.trim().isNotEmpty && kind != 'video')
+                Positioned(
+                  left: 7,
+                  bottom: 7,
+                  child: Text(
+                    label,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w900,
+                      shadows: [Shadow(blurRadius: 6)],
+                    ),
+                  ),
+                ),
+              Positioned(
+                top: 7,
+                right: 7,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 170),
+                  width: 28,
+                  height: 28,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: selected
+                        ? const LinearGradient(
+                            colors: [Color(0xFF3B82F6), Color(0xFF22D3EE)],
+                          )
+                        : null,
+                    color: selected
+                        ? null
+                        : Colors.black.withValues(alpha: 0.18),
+                    border: Border.all(
+                      color: selected ? Colors.transparent : Colors.white,
+                      width: 2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.22),
+                        blurRadius: 10,
+                      ),
+                    ],
+                  ),
+                  child: selected
+                      ? Text(
+                          '$selectionOrder',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _AttachmentSkeletonTile extends StatelessWidget {
+  const _AttachmentSkeletonTile();
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.surfaceContainerHighest;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(2),
+      child: DecoratedBox(
+        decoration: BoxDecoration(color: color),
+        child: Center(
+          child: SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Theme.of(
+                context,
+              ).colorScheme.primary.withValues(alpha: 0.7),
+            ),
           ),
         ),
       ),

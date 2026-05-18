@@ -134,6 +134,24 @@ function shelfLabel(raw) {
   return String(Math.trunc(shelf));
 }
 
+function buildCartRetentionNoticeText(item) {
+  const customerName = String(item.customer_name || 'Клиент').trim() || 'Клиент';
+  const phone = String(item.customer_phone_label || 'номер не указан').trim();
+  const shelf = String(item.shelf_label || 'не назначена').trim();
+  const itemsCount = Number(item.items_count || 0);
+  const amount = toMoney(item.amount);
+  const daysHeld = Number(item.days_held || CART_RETENTION_WARNING_DAYS);
+  return [
+    'Нужно расформировать корзину.',
+    `Клиент: ${customerName}`,
+    `Телефон: ${phone}`,
+    `Полка: ${shelf}`,
+    `Товаров: ${itemsCount}`,
+    `Сумма: ${amount.toFixed(2)} ₽`,
+    `В ожидании: ${Math.max(0, Math.trunc(daysHeld))} дн.`,
+  ].join('\n');
+}
+
 function tenantFilterSql(alias = 'u', tenantParamIndex = 1) {
   return `($${tenantParamIndex}::uuid IS NULL OR ${alias}.tenant_id = $${tenantParamIndex}::uuid)`;
 }
@@ -2789,8 +2807,12 @@ router.get(
       const tailLabel = tail ? `••••${tail}` : 'номер не указан';
       const shelf = shelfLabel(row.shelf_number);
       const total = toMoney(row.total_sum);
+      const ownerId = String(row.user_id || '').trim();
+      const oldestKey = oldestCreatedAt && !Number.isNaN(oldestCreatedAt.getTime())
+        ? oldestCreatedAt.toISOString()
+        : String(row.oldest_created_at || '');
       return {
-        id: `cart-retention:${String(row.user_id || '')}`,
+        id: `cart-retention:${ownerId}`,
         type: 'cart_retention',
         type_label: 'Корзины',
         status: 'stale',
@@ -2798,6 +2820,14 @@ router.get(
         priority: mapOpsEventPriority({ type: 'cart_retention', status: 'stale' }),
         title: `Расформировать корзину: ${String(row.customer_name || 'Клиент')}`,
         subtitle: `Телефон ${tailLabel} · Полка ${shelf} · ${daysHeld} дн.`,
+        user_id: ownerId,
+        cart_owner_id: ownerId,
+        shelf_number: row.shelf_number == null ? null : String(row.shelf_number),
+        shelf_label: shelf,
+        customer_phone_label: tailLabel,
+        days_held: daysHeld,
+        items_count: Number(row.items_count || 0),
+        retention_key: `cart-retention:${tenantId || 'global'}:${ownerId}:${oldestKey}`,
         customer_name: String(row.customer_name || ''),
         related_name: `Полка ${shelf}`,
         claim_type: null,
@@ -2808,6 +2838,7 @@ router.get(
         event_at: row.latest_updated_at || row.oldest_created_at || null,
       };
     });
+
     const items = [...baseItems, ...retentionItems]
       .sort((a, b) => {
         const aTs = new Date(a.event_at || 0).getTime();

@@ -6,13 +6,11 @@ class InlineVideoNoteOrb extends StatelessWidget {
     required this.videoUrl,
     required this.durationMs,
     required this.accentColor,
-    required this.footerText,
   });
 
   final String videoUrl;
   final int durationMs;
   final Color accentColor;
-  final String footerText;
 
   @override
   Widget build(BuildContext context) {

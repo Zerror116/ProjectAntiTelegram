@@ -30,6 +30,12 @@
 	<string>MainMenu</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Приложению нужен доступ к микрофону, чтобы отправлять голосовые сообщения в чатах.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Приложению нужен доступ к камере, чтобы записывать видеокружки в чатах.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Приложению нужен доступ к галерее, чтобы выбирать фото и видео для отправки в чатах.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Приложению нужен доступ к галерее, чтобы сохранять подготовленные медиафайлы.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 

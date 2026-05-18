@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require("uuid");
+const { encryptMessageText, decryptMessageRow } = require("./messageCrypto");
 
 function normalizeSettings(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
@@ -467,6 +468,167 @@ async function ensurePostsArchiveChannel(client, createdBy, tenantId = null) {
   return { channel: inserted.rows[0], created: true };
 }
 
+async function findAdminSystemChat(client, tenantId = null) {
+  return client.query(
+    `SELECT id, title, type, created_by, settings, created_at, updated_at
+     FROM chats
+     WHERE type <> 'channel'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+       AND (
+         COALESCE(settings->>'system_key', '') = 'admin_system'
+         OR COALESCE(settings->>'kind', '') = 'admin_system'
+         OR LOWER(TRIM(title)) = 'система'
+       )
+     ORDER BY
+       CASE WHEN COALESCE(settings->>'system_key', '') = 'admin_system' THEN 0 ELSE 1 END,
+       updated_at DESC NULLS LAST,
+       created_at DESC
+     LIMIT 1`,
+    [tenantId || null],
+  );
+}
+
+async function ensureAdminSystemChat(client, createdBy, tenantId = null) {
+  const systemQ = await findAdminSystemChat(client, tenantId);
+  const baseSettings = {
+    kind: "admin_system",
+    system_key: "admin_system",
+    tenant_id: tenantId || null,
+    visibility: "private",
+    admin_only: true,
+    worker_can_post: false,
+    is_post_channel: false,
+    description: "Системные уведомления для администраторов",
+  };
+
+  if (systemQ.rowCount > 0) {
+    const current = systemQ.rows[0];
+    const currentSettings = normalizeSettings(current.settings);
+    const nextSettings = mergeJson(currentSettings, baseSettings);
+    const updated = await client.query(
+      `UPDATE chats
+       SET title = $1,
+           settings = $2::jsonb,
+           tenant_id = $4,
+           updated_at = now()
+       WHERE id = $3
+       RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+      [
+        current.title || "Система",
+        JSON.stringify(nextSettings),
+        current.id,
+        tenantId || null,
+      ],
+    );
+
+    await ensureStaffMembers(client, updated.rows[0].id, tenantId, {
+      removeNonStaff: true,
+      includeWorkers: false,
+    });
+    if (createdBy) {
+      await client.query(
+        `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+         VALUES ($1, $2, $3, now(), 'owner')
+         ON CONFLICT (chat_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+        [uuidv4(), updated.rows[0].id, createdBy],
+      );
+    }
+    return { chat: updated.rows[0], created: false };
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, 'Система', 'private', $2, $3, $4::jsonb, now(), now())
+     RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+    [uuidv4(), createdBy || null, tenantId || null, JSON.stringify(baseSettings)],
+  );
+
+  await ensureStaffMembers(client, inserted.rows[0].id, tenantId, {
+    removeNonStaff: true,
+    includeWorkers: false,
+  });
+  if (createdBy) {
+    await client.query(
+      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+       VALUES ($1, $2, $3, now(), 'owner')
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [uuidv4(), inserted.rows[0].id, createdBy],
+    );
+  }
+  return { chat: inserted.rows[0], created: true };
+}
+
+async function insertAdminSystemMessage(
+  client,
+  {
+    tenantId = null,
+    createdBy = null,
+    text,
+    meta = {},
+    dedupeKey = "",
+  } = {},
+) {
+  const plainText = String(text || "").trim();
+  if (!plainText) return { chat: null, message: null, duplicate: false };
+
+  const { chat } = await ensureAdminSystemChat(client, createdBy, tenantId);
+  if (!chat?.id) return { chat: null, message: null, duplicate: false };
+
+  const normalizedDedupeKey = String(dedupeKey || "").trim();
+  if (normalizedDedupeKey) {
+    const existingQ = await client.query(
+      `SELECT id
+       FROM messages
+       WHERE chat_id = $1
+         AND COALESCE(meta->>'dedupe_key', '') = $2
+       LIMIT 1`,
+      [chat.id, normalizedDedupeKey],
+    );
+    if (existingQ.rowCount > 0) {
+      return { chat, message: null, duplicate: true };
+    }
+  }
+
+  const nextMeta = {
+    ...(meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {}),
+    kind:
+      meta && typeof meta === "object" && !Array.isArray(meta) && meta.kind
+        ? meta.kind
+        : "system_notice",
+    ...(normalizedDedupeKey ? { dedupe_key: normalizedDedupeKey } : {}),
+  };
+  const inserted = await client.query(
+    `INSERT INTO messages (id, chat_id, sender_id, text, meta, created_at)
+     VALUES ($1, $2, NULL, $3, $4::jsonb, now())
+     RETURNING id,
+               chat_id,
+               sender_id,
+               text,
+               meta,
+               created_at,
+               false AS from_me,
+               false AS is_read_by_me,
+               false AS read_by_others,
+               0::int AS read_count,
+               'Система'::text AS sender_name,
+               NULL::text AS sender_email,
+               NULL::text AS sender_avatar_url,
+               0::float8 AS sender_avatar_focus_x,
+               0::float8 AS sender_avatar_focus_y,
+               1::float8 AS sender_avatar_zoom`,
+    [uuidv4(), chat.id, encryptMessageText(plainText), JSON.stringify(nextMeta)],
+  );
+  await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+    chat.id,
+  ]);
+
+  return {
+    chat,
+    message: decryptMessageRow(inserted.rows[0] || null),
+    duplicate: false,
+  };
+}
+
 async function ensureSystemChannels(client, createdBy, tenantId = null) {
   const main = await ensureMainChannel(client, createdBy, tenantId);
   const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
@@ -504,5 +666,7 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
 module.exports = {
   ensureSystemChannels,
   ensureStaffMembers,
+  ensureAdminSystemChat,
+  insertAdminSystemMessage,
   normalizeSettings,
 };
