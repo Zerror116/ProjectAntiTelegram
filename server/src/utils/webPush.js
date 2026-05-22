@@ -375,6 +375,30 @@ async function loadUserSummary(userId) {
   return q.rows[0] || null;
 }
 
+async function loadChatPushContext(chatId) {
+  const normalizedChatId = String(chatId || "").trim();
+  if (!normalizedChatId) return null;
+  const q = await db.query(
+    `SELECT id, title, type, tenant_id, settings
+       FROM chats
+      WHERE id = $1
+      LIMIT 1`,
+    [normalizedChatId],
+  );
+  return q.rows[0] || null;
+}
+
+function shouldSuppressPerMessagePushForChat(chat) {
+  if (!chat) return false;
+  const type = String(chat.type || "").trim().toLowerCase();
+  const settings =
+    chat.settings && typeof chat.settings === "object" && !Array.isArray(chat.settings)
+      ? chat.settings
+      : {};
+  const systemKey = String(settings.system_key || "").trim().toLowerCase();
+  return type === "channel" && systemKey === "main_channel";
+}
+
 async function queueChatMessageWebPushForRooms({ rooms = [], payload = {} }) {
   const normalizedRooms = Array.isArray(rooms) ? rooms : [];
   if (!normalizedRooms.length) return;
@@ -385,6 +409,10 @@ async function queueChatMessageWebPushForRooms({ rooms = [], payload = {} }) {
 
   const chatId = String(payload.chatId || message.chat_id || "").trim();
   const senderId = String(message.sender_id || "").trim();
+  const chatContext = await loadChatPushContext(chatId);
+  if (shouldSuppressPerMessagePushForChat(chatContext)) {
+    return;
+  }
 
   const explicitUserIds = normalizedRooms
     .map((room) => {
@@ -416,10 +444,14 @@ async function queueChatMessageWebPushForRooms({ rooms = [], payload = {} }) {
         channel: "mixed",
         title: senderName,
         body: preview,
-        deepLink: chatId ? `/chat?chatId=${encodeURIComponent(chatId)}` : "/",
+        deepLink: chatId ? `/chats?chatId=${encodeURIComponent(chatId)}` : "/",
         payload: {
+          category: "chat",
           chat_id: chatId || null,
+          tenant_id: recipient.tenant_id || chatContext?.tenant_id || null,
           message_id: String(message.id || "").trim() || null,
+          source_type: "chat_message",
+          source_id: String(message.id || "").trim() || null,
         },
         dedupeKey: chatId
           ? `chat:${chatId}:${recipientUserId}`

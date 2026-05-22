@@ -115,10 +115,16 @@ class AppSkeletonCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final compact = height <= 136;
+    final padding = compact ? 10.0 : 14.0;
+    final availableHeight = math.max(0.0, height - (padding * 2));
+    final imageSize = compact
+        ? math.max(48.0, math.min(72.0, availableHeight))
+        : math.max(64.0, math.min(92.0, availableHeight));
     return Container(
       height: height,
       margin: margin,
-      padding: const EdgeInsets.all(14),
+      padding: EdgeInsets.all(padding),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(radius),
@@ -128,28 +134,34 @@ class AppSkeletonCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           if (showImage) ...[
-            const AppSkeleton(width: 92, height: 92, radius: 18),
+            AppSkeleton(width: imageSize, height: imageSize, radius: 18),
             const SizedBox(width: 12),
           ],
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
-                AppSkeleton(width: 140, height: 16, radius: 10),
-                SizedBox(height: 10),
-                AppSkeleton(height: 12, radius: 10),
-                SizedBox(height: 8),
-                AppSkeleton(width: 180, height: 12, radius: 10),
-                Spacer(),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    AppSkeleton(width: 80, height: 28, radius: 14),
-                    AppSkeleton(width: 92, height: 28, radius: 14),
-                    AppSkeleton(width: 74, height: 28, radius: 14),
-                  ],
+              children: [
+                AppSkeleton(width: 140, height: compact ? 14 : 16, radius: 10),
+                SizedBox(height: compact ? 8 : 10),
+                AppSkeleton(height: compact ? 10 : 12, radius: 10),
+                SizedBox(height: compact ? 6 : 8),
+                AppSkeleton(
+                  width: compact ? 150 : 180,
+                  height: compact ? 10 : 12,
+                  radius: 10,
                 ),
+                if (!compact) ...[
+                  const Spacer(),
+                  const Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      AppSkeleton(width: 80, height: 28, radius: 14),
+                      AppSkeleton(width: 92, height: 28, radius: 14),
+                      AppSkeleton(width: 74, height: 28, radius: 14),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),

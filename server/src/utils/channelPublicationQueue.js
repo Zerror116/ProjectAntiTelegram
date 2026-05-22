@@ -1,7 +1,7 @@
 const { v4: uuidv4 } = require('uuid');
 
 const db = require('../db');
-const { ensureSystemChannels } = require('./systemChannels');
+const { ensureSystemChannels, insertAdminSystemMessage } = require('./systemChannels');
 const { encryptMessageText, decryptMessageRow } = require('./messageCrypto');
 const { emitToTenant } = require('./socket');
 const { emitCatalogQueueUpdated } = require('./catalogQueueSocket');
@@ -11,6 +11,7 @@ const { upsertProductCardSnapshot } = require('./productCardSnapshots');
 const { logMonitoringEvent } = require('./monitoring');
 const { upsertMessageSearchDocument } = require('./chatSearchIndex');
 const { normalizeCatalogTitle } = require('./catalogTitle');
+const { createNotificationInboxItem } = require('./notifications');
 
 const DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS = Math.max(
   1000,
@@ -589,6 +590,7 @@ async function enqueueChannelPublicationBatches({
       batch_id: batchId,
       channel_id: group.channel_id,
       channel_title: group.channel_title,
+      tenant_id: group.tenant_id || null,
       interval_ms: Math.max(1000, Number(intervalMs || DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS)),
       total_count: group.items.length,
       published_count: 0,
@@ -604,6 +606,87 @@ async function enqueueChannelPublicationBatches({
     batches,
     already_running_channels: alreadyRunningChannels,
   };
+}
+
+async function notifyChannelPublicationBatchStarted({
+  tenantId = null,
+  batch,
+} = {}) {
+  const normalizedTenantId =
+    String(batch?.tenant_id || tenantId || '').trim() || null;
+  const batchId = String(batch?.batch_id || '').trim();
+  const channelId = String(batch?.channel_id || '').trim();
+  if (!batchId || !channelId) return 0;
+
+  const usersQ = await db.query(
+    `SELECT id, email, name, role, tenant_id
+       FROM users
+      WHERE role = 'client'
+        AND (
+          ($1::uuid IS NULL AND tenant_id IS NULL)
+          OR tenant_id = $1::uuid
+        )`,
+    [normalizedTenantId],
+  );
+
+  const totalCount = Math.max(0, Number(batch?.total_count || 0) || 0);
+  const channelTitle =
+    String(batch?.channel_title || '').trim() || 'Основной канал';
+  let created = 0;
+  for (const user of usersQ.rows) {
+    await createNotificationInboxItem({
+      user,
+      category: 'chat',
+      priority: 'normal',
+      channel: 'mixed',
+      title: channelTitle,
+      body: totalCount > 0
+        ? `Идёт выкладка товаров в ${channelTitle}: ${totalCount} шт.`
+        : `Идёт выкладка товаров в ${channelTitle}.`,
+      deepLink: `/chats?chatId=${encodeURIComponent(channelId)}`,
+      payload: {
+        category: 'chat',
+        tenant_id: normalizedTenantId,
+        channel_id: channelId,
+        chat_id: channelId,
+        batch_id: batchId,
+        total_count: totalCount,
+        source_type: 'channel_publish_batch',
+        source_id: batchId,
+      },
+      dedupeKey: `channel_publish_batch:${normalizedTenantId || 'global'}:${batchId}`,
+      collapseKey: `channel:${channelId}:publish`,
+      ttlSeconds: 60 * 60 * 8,
+      sourceType: 'channel_publish_batch',
+      sourceId: batchId,
+      inboxVisibility: 'delivery_only',
+      forceShow: false,
+      isActionable: true,
+      emit: true,
+      attemptPush: true,
+    });
+    created += 1;
+  }
+  return created;
+}
+
+async function notifyChannelPublicationBatchesStarted({
+  tenantId = null,
+  batches = [],
+} = {}) {
+  let created = 0;
+  for (const batch of Array.isArray(batches) ? batches : []) {
+    try {
+      created += await notifyChannelPublicationBatchStarted({ tenantId, batch });
+    } catch (err) {
+      console.error('notifyChannelPublicationBatchStarted error', {
+        batchId: batch?.batch_id || null,
+        channelId: batch?.channel_id || null,
+        message: err?.message || err,
+      });
+    }
+  }
+  return created;
 }
 
 async function recoverStalePublicationItems(client, batchId) {
@@ -1162,8 +1245,11 @@ async function processBatchItem(client, batch) {
       kind: 'failed',
       tenantId: batch.tenant_id || null,
       channelId: row.channel_id,
+      batchId: batch.id,
       error: normalized,
       queueItemId: row.id,
+      productId: row.product_id,
+      productTitle: row.title || null,
     };
   }
 }
@@ -1231,6 +1317,31 @@ function emitProcessedPublicationResult(result, io = null) {
     archive_channel_id: result.archiveChannelId || null,
     queue_id: result.queueItemId || null,
   });
+  if (result.kind === 'failed') {
+    void insertAdminSystemMessage(db, {
+      tenantId: result.tenantId || null,
+      text: [
+        'Ошибка публикации товара.',
+        `Товар: ${String(result.productTitle || 'Без названия').trim()}`,
+        `Причина: ${String(result.error?.message || result.error?.code || 'Неизвестная ошибка').trim()}`,
+        'Действие: открыть админку модерации.',
+      ].join('\n'),
+      meta: {
+        kind: 'channel_publication_error',
+        action: 'open_admin_moderation',
+        tenant_id: result.tenantId || null,
+        batch_id: result.batchId || null,
+        queue_item_id: result.queueItemId || null,
+        product_id: result.productId || null,
+        channel_id: result.channelId || null,
+        error_code: result.error?.code || null,
+        error_message: result.error?.message || null,
+      },
+      dedupeKey: `channel-publication-error:${result.batchId || 'batch'}:${result.queueItemId || 'item'}`,
+    }).catch((err) => {
+      console.error('channelPublicationQueue.systemMessage error', err?.message || err);
+    });
+  }
 }
 
 async function processNextChannelPublicationStepForScope(scope, { io = null } = {}) {
@@ -1325,6 +1436,7 @@ function kickChannelPublicationProcessor(io = null) {
 module.exports = {
   DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
   enqueueChannelPublicationBatches,
+  notifyChannelPublicationBatchesStarted,
   listActivePublicationBatches,
   buildPublicationSummary,
   getChannelPublicationBatch,

@@ -1920,17 +1920,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
     required String subtitle,
     VoidCallback? onTap,
     Widget? trailing,
+    bool softCapsule = false,
   }) {
     final theme = Theme.of(context);
+    final radius = BorderRadius.circular(softCapsule ? 999 : 18);
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(18),
+        color: softCapsule
+            ? Color.lerp(
+                theme.colorScheme.surfaceContainerLow,
+                theme.colorScheme.primary,
+                theme.brightness == Brightness.dark ? 0.08 : 0.04,
+              )
+            : theme.colorScheme.surfaceContainerLow,
+        borderRadius: radius,
+        border: softCapsule
+            ? Border.all(
+                color: theme.colorScheme.primary.withValues(alpha: 0.14),
+              )
+            : null,
       ),
       child: ListTile(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        leading: Icon(icon, color: theme.colorScheme.primary),
+        contentPadding: softCapsule
+            ? const EdgeInsets.symmetric(horizontal: 14, vertical: 4)
+            : null,
+        shape: RoundedRectangleBorder(borderRadius: radius),
+        leading: softCapsule
+            ? Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.13),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: theme.colorScheme.primary, size: 20),
+              )
+            : Icon(icon, color: theme.colorScheme.primary),
         title: Text(title),
         subtitle: Text(subtitle),
         trailing: trailing ?? const Icon(Icons.chevron_right_rounded, size: 20),
@@ -2194,15 +2220,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _buildSectionCard(
               icon: Icons.notifications_active_outlined,
               title: 'Уведомления',
-              subtitle:
-                  'Личные сообщения, поддержка, акции, системные разрешения и центр уведомлений.',
+              subtitle: _isClientBaseRole
+                  ? 'Личные сообщения, поддержка, акции и системные разрешения.'
+                  : 'Личные сообщения, поддержка, акции, системные разрешения и служебная диагностика.',
               children: [
                 Container(
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerLow,
-                    borderRadius: BorderRadius.circular(18),
+                    color: Color.lerp(
+                      theme.colorScheme.surfaceContainerLow,
+                      theme.colorScheme.primary,
+                      theme.brightness == Brightness.dark ? 0.08 : 0.04,
+                    ),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: theme.colorScheme.primary.withValues(alpha: 0.14),
+                    ),
                   ),
                   child: SwitchListTile.adaptive(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 4,
+                    ),
+                    shape: const StadiumBorder(),
                     value: _notifications,
                     onChanged: _toggleNotifications,
                     title: const Text('Уведомления на этом устройстве'),
@@ -2221,6 +2260,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ? 'Личные сообщения, поддержка, акции, обновления и другие категории.'
                       : 'Категории уведомлений, каналы доставки и более точные настройки.',
                   onTap: _openNotificationPreferences,
+                  softCapsule: true,
                 ),
                 _buildActionTile(
                   icon: Icons.help_outline_rounded,
@@ -2228,6 +2268,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   subtitle:
                       'Короткая инструкция для телефона, браузера и системных настроек.',
                   onTap: _showNotificationGuide,
+                  softCapsule: true,
                 ),
                 if (_canOpenNotificationCenter)
                   _buildActionTile(
@@ -2236,6 +2277,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     subtitle:
                         'История уведомлений, счётчики и быстрые переходы по важным действиям.',
                     onTap: _openNotificationCenter,
+                    softCapsule: true,
                   ),
               ],
             ),

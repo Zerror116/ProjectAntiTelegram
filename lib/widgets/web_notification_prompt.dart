@@ -24,7 +24,7 @@ String describeWebNotificationState({
       if (isIosWeb && !isStandalone) {
         return 'Чтобы получать уведомления на iPhone, добавьте сайт на экран «Домой», откройте ярлык и подтвердите доступ.';
       }
-      return 'Включите системные уведомления, чтобы новые сообщения приходили со звуком и появлялись в центре уведомлений.';
+      return 'Включите системные уведомления, чтобы новые сообщения приходили со звуком и появлялись в системной шторке.';
     case WebNotificationPermissionState.unsupported:
       if (isIosWeb && !isStandalone) {
         return 'На iPhone уведомления для сайта доступны после добавления ярлыка на экран «Домой».';
@@ -65,7 +65,7 @@ Future<void> showWebNotificationHelpSheet(
     ] else if (isIosWeb) ...[
       '1. Откройте Настройки iPhone -> Уведомления.',
       '2. Найдите ярлык «Проект Феникс».',
-      '3. Включите «Допуск уведомлений», звук и показ в Центре уведомлений.',
+      '3. Включите «Допуск уведомлений», звук и показ в системных уведомлениях.',
       '4. Вернитесь в приложение и проверьте тестовое уведомление.',
     ] else if (isAndroidWeb) ...[
       '1. Откройте сайт в Chrome или через установленный ярлык.',
@@ -75,7 +75,7 @@ Future<void> showWebNotificationHelpSheet(
     ] else ...[
       '1. Откройте настройки сайта в браузере.',
       '2. Разрешите уведомления для garphoenix.com.',
-      '3. Включите звук и показ уведомлений в центре уведомлений браузера/системы.',
+      '3. Включите звук и показ уведомлений в браузере или системе.',
     ],
   ];
 
@@ -177,19 +177,19 @@ class WebNotificationPromptCard extends StatelessWidget {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: [
-            colorScheme.primaryContainer.withValues(alpha: 0.92),
-            colorScheme.surfaceContainerHighest.withValues(alpha: 0.98),
+            colorScheme.primaryContainer.withValues(alpha: 0.38),
+            colorScheme.surfaceContainerHighest.withValues(alpha: 0.96),
           ],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: colorScheme.primary.withValues(alpha: 0.18)),
+        borderRadius: BorderRadius.circular(32),
+        border: Border.all(color: tone.withValues(alpha: 0.22)),
         boxShadow: [
           BoxShadow(
-            color: colorScheme.primary.withValues(alpha: 0.10),
-            blurRadius: 24,
-            offset: const Offset(0, 14),
+            color: tone.withValues(alpha: 0.10),
+            blurRadius: 26,
+            offset: const Offset(0, 12),
           ),
         ],
       ),
@@ -205,13 +205,11 @@ class WebNotificationPromptCard extends StatelessWidget {
                   width: 42,
                   height: 42,
                   decoration: BoxDecoration(
-                    color: colorScheme.primary.withValues(alpha: 0.14),
-                    borderRadius: BorderRadius.circular(14),
+                    color: tone.withValues(alpha: 0.14),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: tone.withValues(alpha: 0.22)),
                   ),
-                  child: Icon(
-                    Icons.notifications_active_outlined,
-                    color: colorScheme.primary,
-                  ),
+                  child: Icon(Icons.notifications_active_outlined, color: tone),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -275,6 +273,13 @@ class WebNotificationPromptCard extends StatelessWidget {
               runSpacing: 10,
               children: [
                 FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    shape: const StadiumBorder(),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                  ),
                   onPressed: loading ? null : onPrimaryPressed,
                   icon: loading
                       ? const SizedBox(
@@ -297,6 +302,13 @@ class WebNotificationPromptCard extends StatelessWidget {
                   ),
                 ),
                 OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    shape: const StadiumBorder(),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                  ),
                   onPressed: onGuidePressed,
                   icon: const Icon(Icons.tips_and_updates_outlined),
                   label: const Text('Инструкция'),
@@ -360,10 +372,12 @@ class _NotificationFlowStep extends StatelessWidget {
           decoration: BoxDecoration(
             color: active
                 ? color.withValues(alpha: done ? 0.22 : 0.13)
-                : theme.colorScheme.surface,
+                : theme.colorScheme.surfaceContainerHighest,
             shape: BoxShape.circle,
             border: Border.all(
-              color: active ? color : theme.colorScheme.outlineVariant,
+              color: active
+                  ? color.withValues(alpha: 0.86)
+                  : theme.colorScheme.outlineVariant,
             ),
           ),
           child: Icon(

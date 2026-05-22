@@ -1,5 +1,6 @@
 const { v4: uuidv4 } = require("uuid");
 const { encryptMessageText, decryptMessageRow } = require("./messageCrypto");
+const { emitToTenant } = require("./socket");
 
 function normalizeSettings(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
@@ -177,7 +178,11 @@ async function ensureStaffMembers(
     `SELECT id, role
      FROM users
      WHERE role = ANY($1::text[])
-       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)`,
+       AND (
+         $2::uuid IS NULL
+         OR tenant_id = $2::uuid
+         OR (role = 'creator' AND tenant_id IS NULL)
+       )`,
     [allowedRoles, tenantId || null],
   );
 
@@ -621,10 +626,35 @@ async function insertAdminSystemMessage(
   await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
     chat.id,
   ]);
+  const message = decryptMessageRow(inserted.rows[0] || null);
+  const io = global.__projectPhoenixSocketIo || null;
+  if (io && message?.id) {
+    const payload = {
+      event_id: `chat-message:${message.id}:system_notice`,
+      entity: "chat_message",
+      entity_id: String(message.id),
+      action: "system_notice",
+      updated_at: message.created_at || new Date().toISOString(),
+      chatId: String(chat.id),
+      chat_id: String(chat.id),
+      message_id: String(message.id),
+      message,
+    };
+    io.to(`chat:${chat.id}`).emit("chat:message", payload);
+    emitToTenant(io, tenantId || null, "chat:message", payload);
+    emitToTenant(io, tenantId || null, "chat:updated", {
+      chatId: String(chat.id),
+      chat_id: String(chat.id),
+      title: "Система",
+      type: "private",
+      settings: normalizeSettings(chat.settings),
+      updated_at: payload.updated_at,
+    });
+  }
 
   return {
     chat,
-    message: decryptMessageRow(inserted.rows[0] || null),
+    message,
     duplicate: false,
   };
 }
@@ -633,6 +663,7 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
   const main = await ensureMainChannel(client, createdBy, tenantId);
   const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
   const postsArchive = await ensurePostsArchiveChannel(client, createdBy, tenantId);
+  const adminSystem = await ensureAdminSystemChat(client, createdBy, tenantId);
   await consolidateSystemDuplicates(
     client,
     tenantId,
@@ -655,10 +686,12 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
     mainChannel: main.channel,
     reservedChannel: reserved.channel,
     postsArchiveChannel: postsArchive.channel,
+    adminSystemChat: adminSystem.chat,
     created: {
       main: main.created,
       reserved: reserved.created,
       posts_archive: postsArchive.created,
+      admin_system: adminSystem.created,
     },
   };
 }

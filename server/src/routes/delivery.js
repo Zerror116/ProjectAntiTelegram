@@ -2867,6 +2867,35 @@ function normalizePhone(value) {
   return String(value || "").replace(/\D+/g, "");
 }
 
+function normalizePhoneCore(value) {
+  const digits = normalizePhone(value);
+  if (digits.length >= 10) return digits.slice(-10);
+  return digits;
+}
+
+function parseManualProcessingPhones(raw) {
+  const source = Array.isArray(raw)
+    ? raw
+    : String(raw || "")
+        .split(/[\s,;]+/g)
+        .map((item) => item.trim());
+  const seen = new Set();
+  const entries = [];
+  for (const value of source) {
+    const rawPhone = String(value || "").trim();
+    if (!rawPhone) continue;
+    const phoneCore = normalizePhoneCore(rawPhone);
+    if (phoneCore.length !== 10 || seen.has(phoneCore)) continue;
+    seen.add(phoneCore);
+    entries.push({
+      ord: entries.length,
+      raw_phone: rawPhone,
+      phone_core: phoneCore,
+    });
+  }
+  return entries;
+}
+
 async function findUserByPhone(queryable, phone, tenantId = null) {
   const normalized = normalizePhone(phone);
   if (!normalized) return null;
@@ -2888,6 +2917,237 @@ async function collectEligibleCustomerForUser(queryable, userId, tenantId = null
   const customers = await collectEligibleCustomers(queryable, tenantId);
   return customers.find((entry) => String(entry.user_id) === String(userId)) || null;
 }
+
+router.post(
+  "/manual-processing-by-phones",
+  requireAuth,
+  requireRole("admin", "creator"),
+  requireDeliveryManagePermission,
+  async (req, res) => {
+    const phoneEntries = parseManualProcessingPhones(
+      req.body?.phones_text ?? req.body?.phones ?? req.body?.phone_numbers,
+    );
+    if (phoneEntries.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Введите хотя бы один полный номер телефона",
+      });
+    }
+
+    const tenantId = req.user?.tenant_id || null;
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const processedByQ = await client.query(
+        `SELECT name, email
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [req.user.id],
+      );
+      const processedByName =
+        String(processedByQ.rows[0]?.name || "").trim() ||
+        String(processedByQ.rows[0]?.email || "").trim() ||
+        "Администратор";
+
+      const clientsQ = await client.query(
+        `WITH input AS (
+           SELECT *
+           FROM jsonb_to_recordset($1::jsonb)
+             AS x(ord int, raw_phone text, phone_core text)
+         )
+         SELECT i.ord,
+                i.raw_phone,
+                i.phone_core,
+                u.id::text AS user_id,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS client_name,
+                u.email,
+                ph.phone AS stored_phone
+         FROM input i
+         LEFT JOIN LATERAL (
+           SELECT p.user_id, p.phone
+           FROM phones p
+           JOIN users pu ON pu.id = p.user_id
+           WHERE RIGHT(regexp_replace(COALESCE(p.phone, ''), '[^0-9]+', '', 'g'), 10) = i.phone_core
+             AND ($2::uuid IS NULL OR pu.tenant_id = $2::uuid)
+             AND lower(COALESCE(pu.role, 'client')) = 'client'
+           ORDER BY p.verified_at DESC NULLS LAST, p.created_at DESC NULLS LAST
+           LIMIT 1
+         ) ph ON true
+         LEFT JOIN users u ON u.id = ph.user_id
+         ORDER BY i.ord ASC`,
+        [JSON.stringify(phoneEntries), tenantId],
+      );
+
+      const matchedUserIds = Array.from(
+        new Set(
+          clientsQ.rows
+            .map((row) => String(row.user_id || "").trim())
+            .filter(Boolean),
+        ),
+      );
+
+      let itemRows = [];
+      if (matchedUserIds.length > 0) {
+        const itemsQ = await client.query(
+          `SELECT c.id::text AS cart_item_id,
+                  c.user_id::text AS user_id,
+                  c.product_id::text AS product_id,
+                  c.quantity,
+                  c.status,
+                  p.product_code,
+                  p.shelf_number AS product_shelf_number,
+                  p.title AS product_title,
+                  p.description AS product_description,
+                  p.image_url AS product_image_url,
+                  p.price AS product_price
+           FROM cart_items c
+           JOIN products p ON p.id = c.product_id
+           JOIN users u ON u.id = c.user_id
+           WHERE c.user_id = ANY($1::uuid[])
+             AND c.status = ANY($2::text[])
+             AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
+           ORDER BY c.user_id ASC, c.updated_at DESC, c.created_at DESC
+           FOR UPDATE OF c`,
+          [matchedUserIds, ["pending_processing", "pending"], tenantId],
+        );
+        itemRows = itemsQ.rows;
+      }
+
+      const cartItemIds = itemRows
+        .map((row) => String(row.cart_item_id || "").trim())
+        .filter(Boolean);
+
+      let updatedMessages = [];
+      if (cartItemIds.length > 0) {
+        await client.query(
+          `UPDATE cart_items
+           SET status = 'processed',
+               processing_mode = 'manual',
+               updated_at = now()
+           WHERE id = ANY($1::uuid[])`,
+          [cartItemIds],
+        );
+
+        await client.query(
+          `UPDATE reservations
+           SET is_fulfilled = true,
+               is_sent = true,
+               fulfilled_by_id = $2,
+               fulfilled_at = now(),
+               updated_at = now()
+           WHERE cart_item_id = ANY($1::uuid[])`,
+          [cartItemIds, req.user.id],
+        );
+
+        const updatedMessagesQ = await client.query(
+          `UPDATE messages
+           SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                 'placed', true,
+                 'status', 'processed',
+                 'processing_mode', 'manual',
+                 'manual_processing', true,
+                 'is_oversize', false,
+                 'shelf_number', NULL::int,
+                 'shelf_label', 'ручное',
+                 'processed_by_id', $2::text,
+                 'processed_by_name', $3::text
+               )
+           WHERE COALESCE(meta->>'kind', '') = 'reserved_order_item'
+             AND COALESCE(meta->>'cart_item_id', '') = ANY($1::text[])
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [cartItemIds, String(req.user.id), processedByName],
+        );
+        updatedMessages = updatedMessagesQ.rows;
+      }
+
+      const itemsByUserId = new Map();
+      for (const row of itemRows) {
+        const userId = String(row.user_id || "");
+        if (!itemsByUserId.has(userId)) itemsByUserId.set(userId, []);
+        itemsByUserId.get(userId).push({
+          cart_item_id: row.cart_item_id,
+          product_id: row.product_id,
+          product_code: row.product_code == null ? null : Number(row.product_code),
+          product_shelf_number:
+            row.product_shelf_number == null
+              ? null
+              : Number(row.product_shelf_number) || null,
+          title: row.product_title,
+          description: row.product_description,
+          image_url: row.product_image_url,
+          price: row.product_price,
+          quantity: Number(row.quantity) || 1,
+          previous_status: row.status,
+          status: "processed",
+          processing_mode: "manual",
+          shelf_label: "ручное",
+        });
+      }
+
+      const responseClients = clientsQ.rows.map((row) => {
+        const userId = String(row.user_id || "").trim();
+        const products = userId ? itemsByUserId.get(userId) || [] : [];
+        return {
+          raw_phone: row.raw_phone,
+          phone_core: row.phone_core,
+          found: Boolean(userId),
+          user_id: userId || null,
+          client_name: row.client_name || null,
+          email: row.email || null,
+          phone: row.stored_phone || row.raw_phone,
+          processed_count: products.length,
+          products,
+        };
+      });
+
+      await client.query("COMMIT");
+
+      const io = req.app.get("io");
+      if (io) {
+        const affectedUserIds = Array.from(
+          new Set(itemRows.map((row) => String(row.user_id || "")).filter(Boolean)),
+        );
+        for (const userId of affectedUserIds) {
+          emitCartUpdated(io, userId, {
+            status: "processed",
+            processing_mode: "manual",
+            shelf_label: "ручное",
+            reason: "manual_phone_processing",
+          });
+        }
+        for (const message of updatedMessages) {
+          io.to(`chat:${message.chat_id}`).emit("chat:message", {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, tenantId, "chat:updated", {
+            chatId: message.chat_id,
+          });
+        }
+        emitDeliveryUpdated(io, "manual-phone-processing", tenantId);
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          requested_count: phoneEntries.length,
+          matched_clients: responseClients.filter((item) => item.found).length,
+          processed_count: cartItemIds.length,
+          clients: responseClients,
+          not_found: responseClients.filter((item) => !item.found),
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("delivery.manualProcessingByPhones error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 router.get(
   "/dashboard",

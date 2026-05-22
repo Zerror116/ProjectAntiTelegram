@@ -1049,7 +1049,9 @@ async function resolveChatActivityContext(user, chatId) {
         socket.join(`user:${uid}`);
         console.log(`Socket ${sid} joined user:${uid}`);
       }
-      const scopedTenantRoom = tenantRoom(socket.user?.tenant_id || null);
+      const scopedTenantRoom = tenantRoom(
+        socket.tenantScope?.id || socket.user?.tenant_id || null,
+      );
       if (scopedTenantRoom) {
         socket.join(scopedTenantRoom);
         console.log(`Socket ${sid} joined ${scopedTenantRoom}`);

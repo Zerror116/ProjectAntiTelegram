@@ -94,6 +94,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final _channelDescriptionCtrl = TextEditingController();
   final _deliveryThresholdCtrl = TextEditingController();
   final _deliveryOriginCtrl = TextEditingController();
+  final _deliveryManualPhonesCtrl = TextEditingController();
   final _courierNamesCtrl = TextEditingController();
   final _tenantNameCtrl = TextEditingController();
   final _tenantNotesCtrl = TextEditingController();
@@ -127,6 +128,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _avatarUpdating = false;
   bool _deliveryLoading = false;
   bool _deliverySaving = false;
+  bool _deliveryManualPhonesBusy = false;
   bool _supportLoading = false;
   bool _supportArchiveBusy = false;
   bool _supportTemplatesLoading = false;
@@ -194,6 +196,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   List<Map<String, dynamic>> _tenants = [];
   List<Map<String, dynamic>> _tenantInvites = [];
   Map<String, dynamic>? _deliveryActiveBatch;
+  Map<String, dynamic>? _deliveryManualPhonesResult;
   Map<String, dynamic>? _financeData;
   Map<String, dynamic>? _rolesDraft;
   Map<String, dynamic>? _diagnosticsData;
@@ -335,6 +338,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _channelDescriptionCtrl.dispose();
     _deliveryThresholdCtrl.dispose();
     _deliveryOriginCtrl.dispose();
+    _deliveryManualPhonesCtrl.dispose();
     _courierNamesCtrl.dispose();
     _tenantNameCtrl.dispose();
     _tenantNotesCtrl.dispose();
@@ -4190,6 +4194,263 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
+  Future<void> _processDeliveryManualPhones() async {
+    final rawPhones = _deliveryManualPhonesCtrl.text.trim();
+    if (rawPhones.isEmpty) {
+      showAppNotice(
+        context,
+        'Введите номера клиентов',
+        tone: AppNoticeTone.warning,
+        duration: const Duration(seconds: 2),
+      );
+      return;
+    }
+
+    setState(() {
+      _deliveryManualPhonesBusy = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.post(
+        '/api/admin/delivery/manual-processing-by-phones',
+        data: {'phones_text': rawPhones},
+      );
+      final data = resp.data;
+      final payload = data is Map && data['ok'] == true && data['data'] is Map
+          ? Map<String, dynamic>.from(data['data'])
+          : <String, dynamic>{};
+      if (!mounted) return;
+      setState(() {
+        _deliveryManualPhonesResult = payload;
+        _message =
+            'Ручная обработка: обработано ${_toInt(payload['processed_count'])} товаров';
+      });
+      unawaited(_loadDeliveryDashboard());
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка ручной обработки: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _deliveryManualPhonesBusy = false);
+      }
+    }
+  }
+
+  Widget _buildDeliveryManualPhonesCard() {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Ручная выгрузка клиентов по номерам',
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Вставьте полные номера клиентов, каждый с новой строки. Все найденные необработанные товары будут отмечены как обработанные вручную.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _deliveryManualPhonesCtrl,
+              minLines: 5,
+              maxLines: 10,
+              keyboardType: TextInputType.multiline,
+              decoration: withInputLanguageBadge(
+                const InputDecoration(
+                  labelText: 'Номера клиентов',
+                  hintText: '89325429858\n89228000795\n89879804451',
+                  border: OutlineInputBorder(),
+                ),
+                controller: _deliveryManualPhonesCtrl,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                FilledButton.icon(
+                  onPressed: _deliveryManualPhonesBusy
+                      ? null
+                      : _processDeliveryManualPhones,
+                  icon: _deliveryManualPhonesBusy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.fact_check_outlined),
+                  label: Text(
+                    _deliveryManualPhonesBusy
+                        ? 'Обработка...'
+                        : 'Обработать по номерам',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton.icon(
+                  onPressed: _deliveryManualPhonesBusy
+                      ? null
+                      : () {
+                          setState(() {
+                            _deliveryManualPhonesCtrl.clear();
+                            _deliveryManualPhonesResult = null;
+                          });
+                        },
+                  icon: const Icon(Icons.clear_outlined),
+                  label: const Text('Очистить'),
+                ),
+              ],
+            ),
+            _buildDeliveryManualPhonesResult(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeliveryManualPhonesResult() {
+    final result = _deliveryManualPhonesResult;
+    if (result == null || result.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final clients = _asMapList(result['clients']);
+    if (clients.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 16),
+        Text(
+          'Результат',
+          style: theme.textTheme.titleSmall?.copyWith(
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 8),
+        ...clients.map((client) {
+          final products = _asMapList(client['products']);
+          final found = client['found'] == true;
+          final phone = (client['phone'] ?? client['raw_phone'] ?? '')
+              .toString()
+              .trim();
+          final clientName = (client['client_name'] ?? 'Клиент').toString();
+          return Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest.withValues(
+                alpha: 0.45,
+              ),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: theme.colorScheme.outlineVariant),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      found ? Icons.person_outline : Icons.person_off_outlined,
+                      color: found
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.error,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        found ? '$clientName • $phone' : 'Не найден • $phone',
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                    Chip(
+                      label: Text(
+                        found
+                            ? 'Обработано: ${products.length}'
+                            : 'Нет клиента',
+                      ),
+                    ),
+                  ],
+                ),
+                if (found && products.isEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Необработанных товаров у клиента нет.',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ] else if (products.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  ...products.map(_buildDeliveryManualPhoneProductTile),
+                ],
+              ],
+            ),
+          );
+        }),
+      ],
+    );
+  }
+
+  Widget _buildDeliveryManualPhoneProductTile(Map<String, dynamic> product) {
+    final theme = Theme.of(context);
+    final imageUrl = _resolveImageUrl((product['image_url'] ?? '').toString());
+    final productCode = product['product_code'];
+    final shelfNumber = product['product_shelf_number'];
+    final title = (product['title'] ?? 'Товар').toString();
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: SizedBox(
+              width: 62,
+              height: 62,
+              child: imageUrl == null
+                  ? Container(
+                      color: theme.colorScheme.surfaceContainerHighest,
+                      child: Icon(
+                        Icons.image_not_supported_outlined,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    )
+                  : AdaptiveNetworkImage(imageUrl, fit: BoxFit.cover),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    Chip(label: Text('ID товара: ${productCode ?? '—'}')),
+                    Chip(label: Text('Полка: ${shelfNumber ?? '—'}')),
+                    const Chip(label: Text('Ручное')),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   String _supportCategoryLabel(String raw) {
     switch (raw.trim().toLowerCase()) {
       case 'product':
@@ -7044,73 +7305,192 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _openClientsDialog(String channelId, String channelTitle) async {
-    final overview = await _loadChannelOverview(channelId, force: true);
-    if (!mounted || overview == null) return;
-
-    final clients = _asMapList(overview['clients']);
-    final stats = _asMap(overview['stats']);
-
-    await showDialog<void>(
+  Future<Map<String, dynamic>?> _editChannelClientName(
+    String channelId,
+    Map<String, dynamic> client,
+  ) async {
+    final userId = (client['user_id'] ?? '').toString().trim();
+    if (userId.isEmpty) return null;
+    final nameCtrl = TextEditingController(
+      text: _displayName(client, fallback: 'Клиент'),
+    );
+    final nextName = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Клиенты канала "$channelTitle"'),
-        content: SizedBox(
-          width: 560,
-          height: 420,
-          child: clients.isEmpty
-              ? const Center(child: Text('Клиенты не найдены'))
-              : Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Всего клиентов: ${_toInt(stats['clients_total'])}',
-                      style: const TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 8),
-                    Expanded(
-                      child: ListView.separated(
-                        itemCount: clients.length,
-                        separatorBuilder: (context, index) =>
-                            const Divider(height: 1),
-                        itemBuilder: (context, index) {
-                          final c = clients[index];
-                          final blocked = c['is_blacklisted'] == true;
-                          final phone = (c['phone'] ?? '').toString().trim();
-                          return ListTile(
-                            dense: true,
-                            leading: CircleAvatar(
-                              child: Text(
-                                _displayName(
-                                  c,
-                                  fallback: 'Клиент',
-                                )[0].toUpperCase(),
-                              ),
-                            ),
-                            title: Text(_displayName(c, fallback: 'Клиент')),
-                            subtitle: Text(
-                              [
-                                (c['email'] ?? '').toString(),
-                                if (phone.isNotEmpty) 'Тел: $phone',
-                              ].where((v) => v.trim().isNotEmpty).join('\n'),
-                            ),
-                            isThreeLine: phone.isNotEmpty,
-                            trailing: blocked
-                                ? const Icon(Icons.block, color: Colors.red)
-                                : null,
-                          );
-                        },
-                      ),
-                    ),
-                  ],
-                ),
+        title: const Text('Изменить имя клиента'),
+        content: TextField(
+          controller: nameCtrl,
+          autofocus: true,
+          decoration: withInputLanguageBadge(
+            const InputDecoration(
+              labelText: 'Имя клиента',
+              border: OutlineInputBorder(),
+            ),
+            controller: nameCtrl,
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Закрыть'),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(nameCtrl.text.trim()),
+            child: const Text('Сохранить'),
           ),
         ],
+      ),
+    );
+    nameCtrl.dispose();
+    if (nextName == null) return null;
+    final normalizedName = nextName.trim();
+    if (normalizedName.length < 2) {
+      if (mounted) {
+        showAppNotice(
+          context,
+          'Имя должно содержать минимум 2 символа',
+          tone: AppNoticeTone.warning,
+          duration: const Duration(seconds: 2),
+        );
+      }
+      return null;
+    }
+
+    try {
+      final resp = await authService.dio.patch(
+        '/api/admin/channels/$channelId/clients/$userId/name',
+        data: {'name': normalizedName},
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! Map) {
+        return null;
+      }
+      final updated = Map<String, dynamic>.from(data['data']);
+      final overview = _channelOverviews[channelId];
+      if (overview != null) {
+        final clients = _asMapList(overview['clients']);
+        final index = clients.indexWhere(
+          (item) => (item['user_id'] ?? '').toString() == userId,
+        );
+        if (index >= 0) {
+          clients[index] = {...clients[index], ...updated};
+          setState(() {
+            _channelOverviews[channelId] = {...overview, 'clients': clients};
+          });
+        }
+      }
+      if (mounted) {
+        setState(() => _message = 'Имя клиента изменено');
+      }
+      return updated;
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка изменения имени: ${_extractDioError(e)}',
+        );
+      }
+      return null;
+    }
+  }
+
+  Future<void> _openClientsDialog(String channelId, String channelTitle) async {
+    final overview = await _loadChannelOverview(channelId, force: true);
+    if (!mounted || overview == null) return;
+
+    var clients = _asMapList(overview['clients']);
+    final stats = _asMap(overview['stats']);
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('Клиенты канала "$channelTitle"'),
+          content: SizedBox(
+            width: 620,
+            height: 460,
+            child: clients.isEmpty
+                ? const Center(child: Text('Клиенты не найдены'))
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Всего клиентов: ${_toInt(stats['clients_total'])}',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: ListView.separated(
+                          itemCount: clients.length,
+                          separatorBuilder: (context, index) =>
+                              const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final c = clients[index];
+                            final blocked = c['is_blacklisted'] == true;
+                            final phone = (c['phone'] ?? '').toString().trim();
+                            final city = (c['client_city'] ?? '')
+                                .toString()
+                                .trim();
+                            final displayName = _displayName(
+                              c,
+                              fallback: 'Клиент',
+                            );
+                            return ListTile(
+                              dense: true,
+                              leading: CircleAvatar(
+                                child: Text(displayName[0].toUpperCase()),
+                              ),
+                              title: Text(displayName),
+                              subtitle: Text(
+                                [
+                                  (c['email'] ?? '').toString(),
+                                  if (phone.isNotEmpty) 'Тел: $phone',
+                                  if (city.isNotEmpty) 'Город: $city',
+                                ].where((v) => v.trim().isNotEmpty).join('\n'),
+                              ),
+                              isThreeLine: phone.isNotEmpty || city.isNotEmpty,
+                              trailing: Wrap(
+                                spacing: 4,
+                                children: [
+                                  if (blocked)
+                                    const Icon(Icons.block, color: Colors.red),
+                                  IconButton(
+                                    tooltip: 'Изменить имя',
+                                    onPressed: () async {
+                                      final updated =
+                                          await _editChannelClientName(
+                                            channelId,
+                                            c,
+                                          );
+                                      if (updated == null) return;
+                                      setDialogState(() {
+                                        clients =
+                                            List<Map<String, dynamic>>.from(
+                                              clients,
+                                            );
+                                        clients[index] = {
+                                          ...clients[index],
+                                          ...updated,
+                                        };
+                                      });
+                                    },
+                                    icon: const Icon(Icons.edit_outlined),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Закрыть'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -11456,6 +11836,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               controller: _deliveryOriginCtrl,
             ),
           ),
+          const SizedBox(height: 12),
+          _buildDeliveryManualPhonesCard(),
           const SizedBox(height: 12),
           Card(
             child: Padding(

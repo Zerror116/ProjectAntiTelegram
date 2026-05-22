@@ -33,6 +33,7 @@ const ENDPOINT_PERMISSION_STATES = new Set([
   "denied",
   "provisional",
 ]);
+const INBOX_VISIBILITIES = new Set(["default", "delivery_only", "system"]);
 const DEVICE_PROFILES = new Set([
   "standard",
   "constrained",
@@ -119,6 +120,19 @@ function normalizePermissionState(raw, fallback = "unknown") {
 function normalizeDeviceProfile(raw, fallback = "standard") {
   const value = String(raw || "").toLowerCase().trim();
   return DEVICE_PROFILES.has(value) ? value : fallback;
+}
+
+function normalizeInboxVisibility(raw, fallback = "default") {
+  const value = String(raw || "").toLowerCase().trim();
+  return INBOX_VISIBILITIES.has(value) ? value : fallback;
+}
+
+function resolveInboxVisibilityForUser(user, requestedVisibility = "default") {
+  const normalized = normalizeInboxVisibility(requestedVisibility, "default");
+  if (isClientRole(user?.role) && normalized === "default") {
+    return "delivery_only";
+  }
+  return normalized;
 }
 
 function normalizeJsonMap(raw, fallback = {}) {
@@ -1039,11 +1053,12 @@ async function computeNotificationInboxBadgeCount(
   const badgePrefs = preferences.badge_preferences;
   const inboxQ = await db.query(
     `SELECT category, COUNT(*)::int AS count
-       FROM notification_inbox_items
+      FROM notification_inbox_items
       WHERE user_id = $1
         AND status = 'unread'
         AND (expires_at IS NULL OR expires_at > now())
         AND category <> 'chat'
+        AND COALESCE(inbox_visibility, 'default') = 'default'
       GROUP BY category`,
     [userId],
   );
@@ -1135,6 +1150,7 @@ function buildSocketPayload(
     title: String(item.title || "").trim(),
     body: String(item.body || "").trim(),
     deep_link: String(item.deep_link || "").trim() || null,
+    inbox_visibility: normalizeInboxVisibility(item.inbox_visibility, "default"),
     media,
     payload,
     inbox_item_id: String(item.id || "").trim(),
@@ -1399,7 +1415,14 @@ async function createNotificationInboxItem({
   const normalizedTtl = normalizeInteger(ttlSeconds, 3600, 60, 60 * 60 * 24 * 30);
   const expiresAt = new Date(Date.now() + normalizedTtl * 1000).toISOString();
   const mediaJson = JSON.stringify(normalizeJsonMap(media));
-  const payloadJson = JSON.stringify(normalizeJsonMap(payload));
+  const effectiveInboxVisibility = resolveInboxVisibilityForUser(
+    user,
+    inboxVisibility,
+  );
+  const payloadJson = JSON.stringify({
+    ...normalizeJsonMap(payload),
+    ...(normalizedDeepLink ? { deep_link: normalizedDeepLink } : {}),
+  });
 
   let row = null;
   if (normalizedDedupeKey) {
@@ -1428,13 +1451,14 @@ async function createNotificationInboxItem({
               source_type = $9,
               source_id = NULLIF($10, ''),
               campaign_id = $11,
-              force_show = $12,
-              is_actionable = $13,
-              expires_at = $14::timestamptz,
+              inbox_visibility = $12,
+              force_show = $13,
+              is_actionable = $14,
+              expires_at = $15::timestamptz,
               updated_at = now(),
               status = CASE WHEN status = 'dismissed' THEN status ELSE 'unread' END,
               read_at = CASE WHEN status = 'dismissed' THEN read_at ELSE NULL END
-        WHERE id = $15
+        WHERE id = $16
         RETURNING *`,
       [
         normalizedTitle,
@@ -1448,6 +1472,7 @@ async function createNotificationInboxItem({
         String(sourceType || "generic").trim() || "generic",
         String(sourceId || "").trim(),
         campaignId,
+        effectiveInboxVisibility,
         forceShow === true,
         isActionable === true,
         expiresAt,
@@ -1502,7 +1527,7 @@ async function createNotificationInboxItem({
         String(sourceType || "generic").trim() || "generic",
         String(sourceId || "").trim(),
         campaignId,
-        String(inboxVisibility || "default").trim() || "default",
+        effectiveInboxVisibility,
         forceShow === true,
         isActionable === true,
         expiresAt,
@@ -1575,6 +1600,7 @@ async function listNotificationInbox({ userId, limit = 60, unreadOnly = false, c
       WHERE user_id = $1
         AND ($2::boolean = false OR status = 'unread')
         AND ($3::text = '' OR category = $3::text)
+        AND COALESCE(inbox_visibility, 'default') = 'default'
         AND (expires_at IS NULL OR expires_at > now() OR status <> 'unread')
       ORDER BY created_at DESC
       LIMIT $4`,
@@ -1686,7 +1712,8 @@ async function markAllNotificationInboxItemsRead({ userId }) {
             read_at = COALESCE(read_at, now()),
             updated_at = now()
       WHERE user_id = $1
-        AND status = 'unread'`,
+        AND status = 'unread'
+        AND COALESCE(inbox_visibility, 'default') = 'default'`,
     [userId],
   );
   const badgeCount = await computeNotificationBadgeCount(userId);

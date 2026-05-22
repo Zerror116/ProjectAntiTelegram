@@ -424,6 +424,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (controller == null) return;
     final index = _visibleTabs.indexWhere((tab) => tab.id == id);
     if (index < 0) return;
+    if (controller.index == index && !controller.indexIsChanging) return;
     controller.animateTo(index);
   }
 

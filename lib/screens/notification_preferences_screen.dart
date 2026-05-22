@@ -342,6 +342,37 @@ class _NotificationPreferencesScreenState
     );
   }
 
+  BoxDecoration _softCapsuleDecoration({
+    required bool enabled,
+    Color? accent,
+    double radius = 30,
+  }) {
+    final theme = Theme.of(context);
+    final tone = accent ?? theme.colorScheme.primary;
+    return BoxDecoration(
+      color: Color.lerp(
+        theme.colorScheme.surfaceContainerLow,
+        tone,
+        enabled ? (theme.brightness == Brightness.dark ? 0.07 : 0.035) : 0.0,
+      ),
+      borderRadius: BorderRadius.circular(radius),
+      border: Border.all(
+        color: enabled
+            ? tone.withValues(alpha: 0.14)
+            : theme.colorScheme.outlineVariant.withValues(alpha: 0.72),
+      ),
+      boxShadow: enabled
+          ? [
+              BoxShadow(
+                color: tone.withValues(alpha: 0.06),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
+              ),
+            ]
+          : null,
+    );
+  }
+
   Widget _buildSwitchCard({
     required String title,
     required bool value,
@@ -350,8 +381,18 @@ class _NotificationPreferencesScreenState
     bool enabled = true,
     Widget? trailing,
   }) {
-    return Card(
+    final theme = Theme.of(context);
+    final accent = value
+        ? theme.colorScheme.primary
+        : theme.colorScheme.outline;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: _softCapsuleDecoration(enabled: enabled, accent: accent),
       child: SwitchListTile.adaptive(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
         value: value,
         onChanged: enabled ? onChanged : null,
         title: Text(title),
@@ -363,9 +404,28 @@ class _NotificationPreferencesScreenState
 
   Widget _buildLockedCard({required String title, required String subtitle}) {
     final theme = Theme.of(context);
-    return Card(
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: _softCapsuleDecoration(
+        enabled: true,
+        accent: theme.colorScheme.tertiary,
+      ),
       child: ListTile(
-        leading: const Icon(Icons.lock_outline_rounded),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+        leading: Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: theme.colorScheme.tertiary.withValues(alpha: 0.13),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            Icons.lock_outline_rounded,
+            color: theme.colorScheme.tertiary,
+            size: 20,
+          ),
+        ),
         title: Text(title),
         subtitle: Text(subtitle),
         trailing: Text(
@@ -381,7 +441,13 @@ class _NotificationPreferencesScreenState
 
   Widget _buildInfoCard(String text) {
     final theme = Theme.of(context);
-    return Card(
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: _softCapsuleDecoration(
+        enabled: true,
+        accent: theme.colorScheme.secondary,
+        radius: 24,
+      ),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Text(
@@ -487,7 +553,9 @@ class _NotificationPreferencesScreenState
   }
 
   Widget _buildChannelsSection() {
-    return Card(
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: _softCapsuleDecoration(enabled: true, radius: 26),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(

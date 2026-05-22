@@ -30,6 +30,28 @@ class AuthScreen extends StatefulWidget {
 class _AuthScreenState extends State<AuthScreen> {
   static const String _creatorEmail = 'zerotwo02166@gmail.com';
   static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
+  static const Map<String, List<String>> _clientInviteCities = {
+    'INV-W8V6-UZCA': [
+      'Алексеевка',
+      'Бобровка',
+      'Георгиевка',
+      'Горный',
+      'Елшняги',
+      'Кинель-север',
+      'Кинель-юг',
+      'Кинельский',
+      'Комсомолец',
+      'Лебедь',
+      'Луговой',
+      'Новый бяун',
+      'Новый сарбай',
+      'Отрадный',
+      'Самара',
+      'Сухая Самарка',
+      'Усть-Кинельский',
+    ],
+    'INV-TS5W-RZ5L': ['Борское', 'Богатое', 'Бузулук', 'Петровка', 'Виловатое'],
+  };
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -60,6 +82,7 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _showPassword = false;
   bool _passkeySupported = false;
   bool _passkeyBusy = false;
+  String _selectedClientCity = '';
 
   late final AuthService _authService;
 
@@ -533,6 +556,10 @@ class _AuthScreenState extends State<AuthScreen> {
 
   String _normalizeInviteCode(String raw) {
     return raw.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9-]'), '').trim();
+  }
+
+  List<String> _clientCitiesForInvite(String raw) {
+    return _clientInviteCities[_normalizeInviteCode(raw)] ?? const [];
   }
 
   bool _looksLikeInviteCode(String raw) {
@@ -1301,6 +1328,9 @@ class _AuthScreenState extends State<AuthScreen> {
           accessKey: accessKey,
           name: _nameController.text.trim(),
           phone: _phoneController.text.trim(),
+          clientCity: _clientCitiesForInvite(accessKey).isNotEmpty
+              ? _selectedClientCity.trim()
+              : null,
           secret: _creatorSecretController.text.trim(),
           groupName: _tenantGroupNameController.text.trim(),
           mainChannelTitle: _mainChannelTitleController.text.trim(),
@@ -1567,6 +1597,9 @@ class _AuthScreenState extends State<AuthScreen> {
         _looksLikeInviteCode(accessCode) &&
         (_tenantCodeFromLink.trim().isNotEmpty ||
             _tenantNameFromInvite.trim().isNotEmpty);
+    final clientCityOptions = _clientCitiesForInvite(accessCode);
+    final requiresClientCity =
+        _isRegister && !isCreatorEmail && clientCityOptions.isNotEmpty;
     final looksLikeTenantAccessKey =
         accessCode.toUpperCase().startsWith('PHX-') && !inviteFromLink;
     final theme = Theme.of(context);
@@ -1853,6 +1886,44 @@ class _AuthScreenState extends State<AuthScreen> {
                                             ).colorScheme.onSurfaceVariant,
                                           ),
                                     ),
+                                  ),
+                                ],
+                                if (requiresClientCity) ...[
+                                  const SizedBox(height: 12),
+                                  DropdownButtonFormField<String>(
+                                    initialValue:
+                                        clientCityOptions.contains(
+                                          _selectedClientCity,
+                                        )
+                                        ? _selectedClientCity
+                                        : null,
+                                    isExpanded: true,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Город',
+                                      hintText: 'Выберите город',
+                                    ),
+                                    items: clientCityOptions
+                                        .map(
+                                          (city) => DropdownMenuItem<String>(
+                                            value: city,
+                                            child: Text(city),
+                                          ),
+                                        )
+                                        .toList(),
+                                    onChanged: (value) {
+                                      setState(
+                                        () => _selectedClientCity =
+                                            (value ?? '').trim(),
+                                      );
+                                    },
+                                    validator: (value) {
+                                      if (!requiresClientCity) return null;
+                                      final city = (value ?? '').trim();
+                                      if (!clientCityOptions.contains(city)) {
+                                        return 'Выберите город';
+                                      }
+                                      return null;
+                                    },
                                   ),
                                 ],
                                 if (looksLikeTenantAccessKey) ...[

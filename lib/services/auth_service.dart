@@ -1390,6 +1390,7 @@ class AuthService {
     String? name,
     String? phone,
     String? accessKey,
+    String? clientCity,
     String? secret, // для special creator email
     String? groupName,
     String? mainChannelTitle,
@@ -1409,6 +1410,8 @@ class AuthService {
           'tenant_code': tenantCode.trim(),
         'name': name,
         'phone': phone,
+        if (clientCity != null && clientCity.trim().isNotEmpty)
+          'client_city': clientCity.trim(),
         'secret': secret,
         if (groupName != null && groupName.trim().isNotEmpty)
           'group_name': groupName.trim(),

@@ -40,6 +40,7 @@ const { normalizeCatalogTitle } = require("../utils/catalogTitle");
 const {
   DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
   enqueueChannelPublicationBatches,
+  notifyChannelPublicationBatchesStarted,
   listActivePublicationBatches,
   buildPublicationSummary,
   getChannelPublicationBatch,
@@ -2457,6 +2458,7 @@ router.get(
                 COALESCE(NULLIF(TRIM(u.name), ''), split_part(u.email, '@', 1), 'Пользователь') AS name,
                 u.email,
                 u.role,
+                u.client_city,
                 ph.phone,
                 cm.role AS chat_role,
                 cm.joined_at
@@ -2476,6 +2478,7 @@ router.get(
           `SELECT u.id::text AS user_id,
                   COALESCE(NULLIF(TRIM(u.name), ''), split_part(u.email, '@', 1), 'Клиент') AS name,
                   u.email,
+                  u.client_city,
                   ph.phone,
                   true AS is_member
            FROM chat_members cm
@@ -2492,6 +2495,7 @@ router.get(
           `SELECT u.id::text AS user_id,
                   COALESCE(NULLIF(TRIM(u.name), ''), split_part(u.email, '@', 1), 'Клиент') AS name,
                   u.email,
+                  u.client_city,
                   ph.phone,
                   EXISTS (
                     SELECT 1 FROM chat_members cm
@@ -2633,6 +2637,76 @@ router.get(
       });
     } catch (err) {
       console.error("admin.channels.overview error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+// Изменить имя клиента из списка клиентов канала
+router.patch(
+  "/channels/:id/clients/:userId/name",
+  requireAuth,
+  requireRole("admin", "creator"),
+  async (req, res) => {
+    const { id, userId } = req.params;
+    const nextName = String(req.body?.name || "").trim();
+    if (!isUuidLike(id) || !isUuidLike(userId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный id" });
+    }
+    if (nextName.length < 2 || nextName.length > 80) {
+      return res.status(400).json({
+        ok: false,
+        error: "Имя должно содержать от 2 до 80 символов",
+      });
+    }
+
+    try {
+      const channelQ = await db.query(
+        `SELECT id
+         FROM chats
+         WHERE id = $1
+           AND type = 'channel'
+           AND tenant_id = $2
+         LIMIT 1`,
+        [id, req.user.tenant_id],
+      );
+      if (channelQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Канал не найден" });
+      }
+
+      const updatedQ = await db.query(
+        `UPDATE users
+         SET name = $1,
+             updated_at = now()
+         WHERE id = $2
+           AND tenant_id = $3
+           AND role = 'client'
+         RETURNING id::text AS user_id, name, email, client_city`,
+        [nextName, userId, req.user.tenant_id],
+      );
+      if (updatedQ.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Клиент не найден" });
+      }
+
+      const phoneQ = await db.query(
+        `SELECT phone
+         FROM phones
+         WHERE user_id = $1
+         LIMIT 1`,
+        [userId],
+      );
+      const data = {
+        ...updatedQ.rows[0],
+        phone: phoneQ.rows[0]?.phone || null,
+      };
+      emitChannelMembersUpdated(req.app.get("io"), req.user?.tenant_id || null, id, {
+        action: "client_name_updated",
+        user_id: userId,
+        name: nextName,
+      });
+      return res.json({ ok: true, data });
+    } catch (err) {
+      console.error("admin.channels.clientName.update error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     }
   },
@@ -4395,6 +4469,17 @@ router.post(
         channel_id: channelId,
         queue_ids: queueIds,
         batch_ids: batches.map((item) => item.batch_id).filter(Boolean),
+      });
+      setImmediate(() => {
+        void notifyChannelPublicationBatchesStarted({
+          tenantId: req.user.tenant_id || null,
+          batches,
+        }).catch((notifyErr) => {
+          console.error(
+            "admin.channels.publish_pending batch notification error",
+            notifyErr,
+          );
+        });
       });
       kickChannelPublicationProcessor(req.app.get("io"));
 

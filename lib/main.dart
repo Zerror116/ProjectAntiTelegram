@@ -160,6 +160,12 @@ bool _socketEventTenantMatches(Map<String, dynamic>? data) {
   final currentTenant = _normalizeRealtimeText(
     authService.currentUser?.tenantId,
   );
+  final currentRole = _normalizeRealtimeText(authService.currentUser?.role)
+      .toLowerCase();
+  final creatorTenantScope = _normalizeRealtimeText(
+    authService.creatorTenantScopeCode,
+  );
+  if (currentRole == 'creator' && creatorTenantScope.isNotEmpty) return true;
   if (currentTenant.isEmpty) return true;
   return eventTenant == currentTenant;
 }
@@ -2945,103 +2951,214 @@ class _GlobalNoticeHost extends StatelessWidget {
         ValueListenableBuilder<_AppNoticePayload?>(
           valueListenable: _appNoticeNotifier,
           builder: (context, notice, _) {
-            if (notice == null) return const SizedBox.shrink();
-            final visuals = _noticeVisuals(context, notice.tone);
             final top = MediaQuery.paddingOf(context).top + 8;
             return Positioned(
               top: top,
               left: 12,
               right: 12,
-              child: IgnorePointer(
-                ignoring: false,
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 760),
-                    child: Material(
-                      color: Colors.transparent,
-                      elevation: 8,
-                      borderRadius: BorderRadius.circular(22),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(22),
-                        onTap: () => _appNoticeNotifier.value = null,
-                        child: Container(
-                          padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
-                          decoration: BoxDecoration(
-                            color: theme.colorScheme.surfaceContainerHigh,
-                            borderRadius: BorderRadius.circular(22),
-                            border: Border.all(
-                              color: theme.colorScheme.outlineVariant,
-                            ),
-                            boxShadow: [
-                              BoxShadow(
-                                color: theme.colorScheme.shadow.withValues(
-                                  alpha: 0.16,
-                                ),
-                                blurRadius: 28,
-                                offset: const Offset(0, 12),
-                              ),
-                            ],
-                          ),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Container(
-                                width: 34,
-                                height: 34,
-                                decoration: BoxDecoration(
-                                  color: visuals.accent.withValues(alpha: 0.12),
-                                  shape: BoxShape.circle,
-                                ),
-                                alignment: Alignment.center,
-                                child: Icon(
-                                  visuals.icon,
-                                  color: visuals.accent,
-                                  size: 18,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    if (notice.title != null)
-                                      Text(
-                                        notice.title!,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: theme.textTheme.labelLarge
-                                            ?.copyWith(
-                                              color:
-                                                  theme.colorScheme.onSurface,
-                                              fontWeight: FontWeight.w800,
-                                            ),
-                                      ),
-                                    Text(
-                                      notice.message,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: theme.textTheme.bodyMedium
-                                          ?.copyWith(
-                                            color: theme.colorScheme.onSurface,
-                                            fontWeight: FontWeight.w700,
-                                          ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              IconButton(
-                                onPressed: () =>
-                                    _appNoticeNotifier.value = null,
-                                icon: const Icon(Icons.close_rounded, size: 18),
-                                visualDensity: VisualDensity.compact,
-                              ),
-                            ],
-                          ),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 112),
+                child: IgnorePointer(
+                  ignoring: notice == null,
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 260),
+                    reverseDuration: const Duration(milliseconds: 180),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    layoutBuilder: (currentChild, previousChildren) {
+                      return Stack(
+                        alignment: Alignment.topCenter,
+                        clipBehavior: Clip.none,
+                        children: [...previousChildren, ?currentChild],
+                      );
+                    },
+                    transitionBuilder: (child, animation) {
+                      final offset = Tween<Offset>(
+                        begin: const Offset(0, -0.16),
+                        end: Offset.zero,
+                      ).animate(animation);
+                      final scale = Tween<double>(
+                        begin: 0.985,
+                        end: 1,
+                      ).animate(animation);
+                      return FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: offset,
+                          child: ScaleTransition(scale: scale, child: child),
                         ),
-                      ),
-                    ),
+                      );
+                    },
+                    child: notice == null
+                        ? const SizedBox.shrink(key: ValueKey('empty-notice'))
+                        : Align(
+                            key: ValueKey(notice.id),
+                            alignment: Alignment.topCenter,
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(
+                                maxWidth: 640,
+                                maxHeight: 104,
+                              ),
+                              child: Builder(
+                                builder: (context) {
+                                  final visuals = _noticeVisuals(
+                                    context,
+                                    notice.tone,
+                                  );
+                                  final surface = Color.lerp(
+                                    theme.colorScheme.surfaceContainerHigh,
+                                    visuals.accent,
+                                    theme.brightness == Brightness.dark
+                                        ? 0.08
+                                        : 0.04,
+                                  )!;
+                                  return Material(
+                                    color: Colors.transparent,
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(999),
+                                      onTap: () =>
+                                          _appNoticeNotifier.value = null,
+                                      child: Container(
+                                        constraints: const BoxConstraints(
+                                          minHeight: 56,
+                                          maxHeight: 104,
+                                        ),
+                                        padding: const EdgeInsets.fromLTRB(
+                                          8,
+                                          7,
+                                          6,
+                                          7,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: surface,
+                                          borderRadius: BorderRadius.circular(
+                                            999,
+                                          ),
+                                          border: Border.all(
+                                            color: visuals.accent.withValues(
+                                              alpha: 0.24,
+                                            ),
+                                          ),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: visuals.accent.withValues(
+                                                alpha: 0.12,
+                                              ),
+                                              blurRadius: 26,
+                                              offset: const Offset(0, 12),
+                                            ),
+                                            BoxShadow(
+                                              color: theme.colorScheme.shadow
+                                                  .withValues(alpha: 0.14),
+                                              blurRadius: 24,
+                                              offset: const Offset(0, 10),
+                                            ),
+                                          ],
+                                        ),
+                                        child: Row(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.center,
+                                          children: [
+                                            Container(
+                                              width: 42,
+                                              height: 42,
+                                              decoration: BoxDecoration(
+                                                color: visuals.accent
+                                                    .withValues(alpha: 0.14),
+                                                shape: BoxShape.circle,
+                                                border: Border.all(
+                                                  color: visuals.accent
+                                                      .withValues(alpha: 0.24),
+                                                ),
+                                              ),
+                                              alignment: Alignment.center,
+                                              child: Icon(
+                                                visuals.icon,
+                                                color: visuals.accent,
+                                                size: 20,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 12),
+                                            Expanded(
+                                              child: Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  if (notice.title != null)
+                                                    Text(
+                                                      notice.title!,
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: theme
+                                                          .textTheme
+                                                          .labelLarge
+                                                          ?.copyWith(
+                                                            color: theme
+                                                                .colorScheme
+                                                                .onSurface,
+                                                            fontWeight:
+                                                                FontWeight.w900,
+                                                          ),
+                                                    ),
+                                                  Text(
+                                                    notice.message,
+                                                    maxLines: 2,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: theme
+                                                        .textTheme
+                                                        .bodyMedium
+                                                        ?.copyWith(
+                                                          color: theme
+                                                              .colorScheme
+                                                              .onSurface,
+                                                          fontWeight:
+                                                              FontWeight.w700,
+                                                          height: 1.18,
+                                                        ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                            const SizedBox(width: 6),
+                                            SizedBox.square(
+                                              dimension: 36,
+                                              child: IconButton.filledTonal(
+                                                onPressed: () =>
+                                                    _appNoticeNotifier.value =
+                                                        null,
+                                                icon: const Icon(
+                                                  Icons.close_rounded,
+                                                  size: 18,
+                                                ),
+                                                style: IconButton.styleFrom(
+                                                  fixedSize: const Size.square(
+                                                    36,
+                                                  ),
+                                                  minimumSize:
+                                                      const Size.square(36),
+                                                  maximumSize:
+                                                      const Size.square(36),
+                                                  padding: EdgeInsets.zero,
+                                                  tapTargetSize:
+                                                      MaterialTapTargetSize
+                                                          .shrinkWrap,
+                                                ),
+                                                visualDensity:
+                                                    VisualDensity.compact,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
                   ),
                 ),
               ),
@@ -3198,16 +3315,39 @@ class _GlobalNoticeHost extends StatelessWidget {
                                                         ],
                                                       ),
                                                     ),
-                                                    IconButton(
-                                                      onPressed: () =>
-                                                          _dismissSupportQueueNotice(
-                                                            notice.ticketId,
-                                                          ),
-                                                      icon: const Icon(
-                                                        Icons.close_rounded,
+                                                    SizedBox.square(
+                                                      dimension: 36,
+                                                      child: IconButton(
+                                                        onPressed: () =>
+                                                            _dismissSupportQueueNotice(
+                                                              notice.ticketId,
+                                                            ),
+                                                        icon: const Icon(
+                                                          Icons.close_rounded,
+                                                        ),
+                                                        style: IconButton.styleFrom(
+                                                          fixedSize:
+                                                              const Size.square(
+                                                                36,
+                                                              ),
+                                                          minimumSize:
+                                                              const Size.square(
+                                                                36,
+                                                              ),
+                                                          maximumSize:
+                                                              const Size.square(
+                                                                36,
+                                                              ),
+                                                          padding:
+                                                              EdgeInsets.zero,
+                                                          tapTargetSize:
+                                                              MaterialTapTargetSize
+                                                                  .shrinkWrap,
+                                                        ),
+                                                        visualDensity:
+                                                            VisualDensity
+                                                                .compact,
                                                       ),
-                                                      visualDensity:
-                                                          VisualDensity.compact,
                                                     ),
                                                   ],
                                                 ),
@@ -3752,6 +3892,42 @@ String _notificationDeepLink(Map<String, dynamic> payload) {
   return (nested['deep_link'] ?? nested['url'] ?? '/').toString().trim();
 }
 
+String _notificationTargetChatId(Map<String, dynamic> payload) {
+  final nested = _notificationMetaPayload(payload);
+  final direct =
+      (payload['chat_id'] ??
+              payload['chatId'] ??
+              payload['channel_id'] ??
+              payload['channelId'] ??
+              nested['chat_id'] ??
+              nested['chatId'] ??
+              nested['channel_id'] ??
+              nested['channelId'] ??
+              '')
+          .toString()
+          .trim();
+  if (direct.isNotEmpty) return direct;
+  final deepLink = _notificationDeepLink(payload);
+  if (deepLink.isEmpty) return '';
+  try {
+    final uri = Uri.parse(deepLink);
+    return (uri.queryParameters['chatId'] ??
+            uri.queryParameters['chat_id'] ??
+            '')
+        .trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+bool _isNotificationDestinationAlreadyOpen(Map<String, dynamic> payload) {
+  final chatId = _notificationTargetChatId(payload);
+  if (chatId.isNotEmpty && activeChatIdNotifier.value == chatId) {
+    return true;
+  }
+  return false;
+}
+
 String _notificationPresentationKey(Map<String, dynamic> payload) {
   final inboxItemId = (payload['inbox_item_id'] ?? '').toString().trim();
   if (inboxItemId.isNotEmpty) return 'inbox:$inboxItemId';
@@ -3802,6 +3978,7 @@ void _rememberNotificationPresentation(Map<String, dynamic> payload) {
       DateTime.now();
 }
 
+// ignore: unused_element
 bool _shouldSuppressUpdateFullscreen(Map<String, dynamic> payload) {
   final token = _notificationUpdateToken(payload);
   if (token == null || token.isEmpty) return false;
@@ -3848,6 +4025,7 @@ String? _notificationImageUrl(Map<String, dynamic> payload) {
   return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
 }
 
+// ignore: unused_element
 Future<void> _showFullscreenNotificationDialog(
   Map<String, dynamic> payload,
 ) async {
@@ -4107,22 +4285,6 @@ Future<void> _handleIncomingNotificationPayload(
   final appVisible = !kIsWeb || !WebNotificationService.isDocumentHidden;
 
   if (_isClientBaseNotificationUser()) {
-    final shouldShowPromoFullscreen =
-        category == 'promo' && (fromTap || runtimePolicy.showWhenActive);
-    final shouldShowUpdateFullscreen =
-        category == 'updates' &&
-        (fromTap || map['force_show'] == true) &&
-        !_shouldSuppressUpdateFullscreen(map) &&
-        (fromTap || runtimePolicy.showWhenActive);
-
-    if (shouldShowPromoFullscreen || shouldShowUpdateFullscreen) {
-      await _showFullscreenNotificationDialog({
-        ...map,
-        if (deepLink.isNotEmpty) 'deep_link': deepLink,
-      });
-      return;
-    }
-
     if (fromTap && context != null && context.mounted && deepLink.isNotEmpty) {
       final opened = await openNotificationDeepLink(
         context,
@@ -4135,8 +4297,17 @@ Future<void> _handleIncomingNotificationPayload(
       return;
     }
 
-    if (!fromTap && appVisible && !runtimePolicy.showWhenActive) {
+    if (!fromTap && appVisible && _isNotificationDestinationAlreadyOpen(map)) {
       return;
+    }
+
+    if (!fromTap && appVisible) {
+      showGlobalAppNotice(
+        _notificationBody(map),
+        title: _notificationTitle(map),
+        tone: _notificationToneForCategory(category),
+        duration: const Duration(seconds: 5),
+      );
     }
 
     if (!fromTap && category == 'security' && runtimePolicy.soundEnabled) {

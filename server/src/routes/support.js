@@ -10,6 +10,7 @@ const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
 const { resolvePermissionSet, hasPermission } = require("../utils/flexibleRoles");
 const { createNotificationInboxItem } = require("../utils/notifications");
+const { insertAdminSystemMessage } = require("../utils/systemChannels");
 const {
   buildSupportTicketStatusLabel,
   buildSupportTicketStatusHint,
@@ -314,7 +315,7 @@ async function hydrateSupportQueueTicket(queryable, ticketId) {
 
 async function emitSupportQueueTicketEvent(req, tenantId, eventName, ticketId) {
   const io = req.app.get("io");
-  if (!io || !eventName || !ticketId) return;
+  if (!eventName || !ticketId) return;
   const payload = await hydrateSupportQueueTicket(db, ticketId);
   if (!payload) return;
   await createSupportInboxNotifications({
@@ -322,7 +323,34 @@ async function emitSupportQueueTicketEvent(req, tenantId, eventName, ticketId) {
     ticket: payload,
     eventName,
   });
-  emitToTenant(io, tenantId || null, eventName, payload);
+  if (eventName === "support:ticket:queued") {
+    const customerName =
+      String(payload.customer_name || "Клиент").trim() || "Клиент";
+    const subject =
+      String(payload.subject || "Новый вопрос в поддержку").trim() ||
+      "Новый вопрос в поддержку";
+    await insertAdminSystemMessage(db, {
+      tenantId: tenantId || null,
+      createdBy: req.user?.id || null,
+      text: [
+        "Новая заявка поддержки.",
+        `Клиент: ${customerName}`,
+        `Тема: ${subject}`,
+        "Действие: открыть чат поддержки.",
+      ].join("\n"),
+      meta: {
+        kind: "support_ticket",
+        action: "open_support_chat",
+        tenant_id: tenantId || null,
+        ticket_id: payload.id,
+        chat_id: payload.chat_id,
+        customer_name: customerName,
+        subject,
+      },
+      dedupeKey: `support-ticket:${payload.id}`,
+    });
+  }
+  if (io) emitToTenant(io, tenantId || null, eventName, payload);
 }
 
 async function listSupportNotificationRecipients(tenantId, { bugReportsOnly = false } = {}) {
@@ -387,7 +415,7 @@ async function createSupportInboxNotifications({ tenantId, ticket, eventName }) 
       channel: "mixed",
       title,
       body,
-      deepLink: `/chat?chatId=${ticket.chat_id}`,
+      deepLink: `/chats?chatId=${ticket.chat_id}`,
       payload: {
         ticket_id: ticket.id,
         chat_id: ticket.chat_id,
@@ -435,7 +463,7 @@ async function createBugReportInboxNotifications({
       channel: "mixed",
       title: "Новый bug-report",
       body: preview.isEmpty ? `Отправитель: ${reporterLabel}` : `${reporterLabel}: ${preview}`,
-      deepLink: `/chat?chatId=${channelId}`,
+      deepLink: `/chats?chatId=${channelId}`,
       payload: {
         kind: "bug_report",
         chat_id: channelId,

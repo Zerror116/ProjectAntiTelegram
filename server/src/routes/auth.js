@@ -104,6 +104,34 @@ const PASSKEY_CHALLENGE_TTL_MS = Math.max(
 );
 const PASSKEY_RP_NAME = String(process.env.AUTH_PASSKEY_RP_NAME || 'Проект Феникс').trim() || 'Проект Феникс';
 const passkeyChallenges = new Map();
+const CLIENT_INVITE_CITY_OPTIONS = Object.freeze({
+  [normalizeInviteCode('INV-W8V6-UZCA')]: Object.freeze([
+    'Алексеевка',
+    'Бобровка',
+    'Георгиевка',
+    'Горный',
+    'Елшняги',
+    'Кинель-север',
+    'Кинель-юг',
+    'Кинельский',
+    'Комсомолец',
+    'Лебедь',
+    'Луговой',
+    'Новый бяун',
+    'Новый сарбай',
+    'Отрадный',
+    'Самара',
+    'Сухая Самарка',
+    'Усть-Кинельский',
+  ]),
+  [normalizeInviteCode('INV-TS5W-RZ5L')]: Object.freeze([
+    'Борское',
+    'Богатое',
+    'Бузулук',
+    'Петровка',
+    'Виловатое',
+  ]),
+});
 
 if (
   process.env.NODE_ENV === 'production' &&
@@ -139,6 +167,12 @@ function parseDurationMs(raw, fallbackMs) {
     default:
       return fallbackMs;
   }
+}
+
+function normalizeClientCityForInvite(inviteCode, raw) {
+  const options = CLIENT_INVITE_CITY_OPTIONS[normalizeInviteCode(inviteCode)] || [];
+  const value = String(raw || '').replace(/\s+/g, ' ').trim();
+  return options.includes(value) ? value : '';
 }
 
 function buildAccessExpiry(now = Date.now()) {
@@ -1986,6 +2020,7 @@ router.post('/register', async (req, res) => {
       invite_code,
       group_name,
       main_channel_title,
+      client_city,
       registration_email_token,
     } = req.body || {};
     if (!email || !password) {
@@ -2015,6 +2050,7 @@ router.post('/register', async (req, res) => {
     let role = 'client';
     let tenant = null;
     let invite = null;
+    let clientCity = null;
     const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase();
     const tenantGroupName = normalizeTenantGroupName(group_name);
     const tenantMainChannelTitle = normalizeMainChannelTitle(main_channel_title);
@@ -2088,6 +2124,12 @@ router.post('/register', async (req, res) => {
           db_name: invite.db_name || null,
           db_schema: invite.db_schema || null,
         };
+        if (CLIENT_INVITE_CITY_OPTIONS[rawInviteCode]) {
+          clientCity = normalizeClientCityForInvite(rawInviteCode, client_city);
+          if (!clientCity) {
+            return res.status(400).json({ error: 'Выберите город из списка' });
+          }
+        }
         // Приглашения всегда регистрируют клиента.
         role = 'client';
       } else {
@@ -2145,15 +2187,16 @@ router.post('/register', async (req, res) => {
 
         const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
         const insertUser = await client.query(
-          `INSERT INTO users (email, password_hash, name, role, tenant_id, created_at)
-           VALUES ($1, $2, $3, $4, $5, now())
-           RETURNING id, email, name, role, tenant_id`,
+          `INSERT INTO users (email, password_hash, name, role, tenant_id, client_city, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, now())
+           RETURNING id, email, name, role, tenant_id, client_city`,
           [
             normalizedEmail,
             password_hash,
             name || null,
             role,
             tenant?.id || null,
+            role === 'client' ? clientCity : null,
           ],
         );
         const user = insertUser.rows[0];
@@ -2373,6 +2416,7 @@ router.post('/register', async (req, res) => {
         tenant_id: registration.user.tenant_id || null,
         tenant_code: tenant?.code || null,
         tenant_name: tenant?.name || null,
+        client_city: registration.user.client_city || null,
         phone_access_state: phoneAccess.state || 'none',
         phone_access: phoneAccess,
       },

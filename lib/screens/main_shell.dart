@@ -653,11 +653,78 @@ class _MainShellState extends State<MainShell> {
         return ValueListenableBuilder<bool>(
           valueListenable: performanceModeNotifier,
           builder: (context, performanceMode, _) {
-            return PhoenixAnimatedNavIcon(
+            final icon = PhoenixAnimatedNavIcon(
               icon: destination.icon,
               selected: selected,
               mode: performanceMode ? 'off' : mode,
               pulse: _navTapPulse,
+            );
+            if (destination.id != 'chats') {
+              return icon;
+            }
+            return ValueListenableBuilder<int>(
+              valueListenable: notificationBadgeCountNotifier,
+              builder: (context, count, _) {
+                final normalized = count.clamp(0, 99);
+                return Stack(
+                  clipBehavior: Clip.none,
+                  alignment: Alignment.center,
+                  children: [
+                    icon,
+                    if (normalized > 0)
+                      Positioned(
+                        right: -12,
+                        top: -9,
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          transitionBuilder: (child, animation) {
+                            return ScaleTransition(
+                              scale: CurvedAnimation(
+                                parent: animation,
+                                curve: Curves.easeOutBack,
+                              ),
+                              child: FadeTransition(
+                                opacity: animation,
+                                child: child,
+                              ),
+                            );
+                          },
+                          child: Container(
+                            key: ValueKey(normalized),
+                            constraints: const BoxConstraints(minWidth: 22),
+                            height: 20,
+                            padding: const EdgeInsets.symmetric(horizontal: 7),
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: Theme.of(context).colorScheme.error,
+                              borderRadius: BorderRadius.circular(999),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.error.withValues(alpha: 0.28),
+                                  blurRadius: 14,
+                                  offset: const Offset(0, 6),
+                                ),
+                              ],
+                            ),
+                            child: Text(
+                              normalized > 98 ? '99+' : '$normalized',
+                              style: Theme.of(context).textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onError,
+                                    fontWeight: FontWeight.w900,
+                                    height: 1,
+                                  ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
             );
           },
         );

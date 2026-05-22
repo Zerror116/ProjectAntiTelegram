@@ -17,7 +17,10 @@ const {
 } = require('../utils/monitoring');
 const { emitToTenant } = require('../utils/socket');
 const realtimeDiagnostics = require('../utils/realtimeDiagnostics');
-const { ensureSystemChannels } = require('../utils/systemChannels');
+const {
+  ensureSystemChannels,
+  insertAdminSystemMessage,
+} = require('../utils/systemChannels');
 const {
   renderSupportTemplateBody,
   normalizeTriggerRule,
@@ -2846,6 +2849,34 @@ router.get(
         return bTs - aTs;
       })
       .slice(0, limit);
+
+    for (const item of retentionItems.slice(0, limit)) {
+      try {
+        await insertAdminSystemMessage(db, {
+          tenantId,
+          createdBy: req.user?.id || null,
+          text: buildCartRetentionNoticeText(item),
+          meta: {
+            kind: 'cart_retention',
+            action: 'open_cart_disband',
+            tenant_id: tenantId,
+            cart_owner_id: item.cart_owner_id || item.user_id || null,
+            customer_name: item.customer_name || null,
+            shelf_number: item.shelf_number || null,
+            shelf_label: item.shelf_label || null,
+            items_count: item.items_count || 0,
+            amount: item.amount || 0,
+            retention_key: item.retention_key || null,
+          },
+          dedupeKey: item.retention_key || item.id,
+        });
+      } catch (systemMessageError) {
+        console.error('ops.notifications.center system cart notice error', {
+          id: item.id,
+          message: systemMessageError?.message || systemMessageError,
+        });
+      }
+    }
 
     await insertAuditFromReq(req, {
       action: 'ops.notifications.center.view',
