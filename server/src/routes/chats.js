@@ -43,6 +43,8 @@ const {
   sha256File,
 } = require("../utils/chatMediaPipeline");
 const { uploadsRoot, uploadsPath } = require("../utils/storagePaths");
+const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
+const { ensureDiscussionsChat } = require("../utils/systemChannels");
 const chatActivityStateService = require("../services/chatActivityState");
 
 const chatImageUploadsDir = uploadsPath("chat_media", "images");
@@ -50,11 +52,13 @@ const chatVoiceUploadsDir = uploadsPath("chat_media", "voice");
 const chatVideoUploadsDir = uploadsPath("chat_media", "video");
 const chatFileUploadsDir = uploadsPath("chat_media", "files");
 const chatUploadSessionTempDir = uploadsPath("chat_media", "sessions");
+const chatAvatarUploadsDir = uploadsPath("chat_avatars");
 fs.mkdirSync(chatImageUploadsDir, { recursive: true });
 fs.mkdirSync(chatVoiceUploadsDir, { recursive: true });
 fs.mkdirSync(chatVideoUploadsDir, { recursive: true });
 fs.mkdirSync(chatFileUploadsDir, { recursive: true });
 fs.mkdirSync(chatUploadSessionTempDir, { recursive: true });
+fs.mkdirSync(chatAvatarUploadsDir, { recursive: true });
 
 const CHAT_MEDIA_TOKEN_TTL_SECONDS = Math.max(
   60,
@@ -79,6 +83,75 @@ const CHAT_MEDIA_KEYRING = buildSecretKeyring({
   requiredInProduction: true,
   devFallbackSecret: "dev-chat-media-secret",
 });
+
+const discussionAvatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, chatAvatarUploadsDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || "").toLowerCase();
+      const safeExt = ext && ext.length <= 10 ? ext : ".jpg";
+      cb(null, `${Date.now()}-${uuidv4()}${safeExt}`);
+    },
+  }),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || "").toLowerCase().trim();
+    const ext = path.extname(String(file.originalname || "")).toLowerCase();
+    const allowedExt = new Set([
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".webp",
+      ".bmp",
+      ".heic",
+      ".heif",
+    ]);
+    if (mime.startsWith("image/") || (mime === "application/octet-stream" && allowedExt.has(ext))) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error("Можно загружать только изображения"));
+  },
+});
+
+function uploadDiscussionAvatar(req, res, next) {
+  discussionAvatarUpload.single("avatar")(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Размер фото не должен превышать 8MB" });
+    }
+    return res
+      .status(400)
+      .json({ ok: false, error: err.message || "Некорректный файл" });
+  });
+}
+
+function toDiscussionAvatarUrl(req, file) {
+  if (!file || !file.filename) return null;
+  return `${req.protocol}://${req.get("host")}/uploads/chat_avatars/${file.filename}`;
+}
+
+function removeUploadedFile(file) {
+  if (!file || !file.path) return;
+  fs.unlink(file.path, () => {});
+}
+
+function removeDiscussionAvatarByUrl(raw) {
+  const url = String(raw || "").trim();
+  if (!url) return;
+  const marker = "/uploads/chat_avatars/";
+  const idx = url.indexOf(marker);
+  if (idx === -1) return;
+  const filename = url.slice(idx + marker.length).split(/[?#]/)[0].trim();
+  if (!filename) return;
+  const fullPath = path.resolve(chatAvatarUploadsDir, filename);
+  const base = path.resolve(chatAvatarUploadsDir);
+  if (fullPath !== base && !fullPath.startsWith(`${base}${path.sep}`)) return;
+  fs.unlink(fullPath, () => {});
+}
 
 const CHAT_MEDIA_MARKERS = Object.freeze({
   image: "/uploads/chat_media/images/",
@@ -444,7 +517,7 @@ function isDirectChatActivityContext(context) {
   ) {
     return false;
   }
-  return kind === "direct_message" || kind === "";
+  return kind === "direct_message" || kind === "discussions" || kind === "";
 }
 
 function pruneChatActivityState(chatId = null) {
@@ -629,6 +702,23 @@ function isAdminSystemChatRow(chat, settings) {
     .toLowerCase()
     .trim();
   return kind === "admin_system" || systemKey === "admin_system" || title === "система";
+}
+
+function isDiscussionsChatRow(chat, settings) {
+  const kind = String(settings?.kind || "")
+    .toLowerCase()
+    .trim();
+  const systemKey = String(settings?.system_key || "")
+    .toLowerCase()
+    .trim();
+  const title = String(chat?.title || chat?.display_title || "")
+    .toLowerCase()
+    .trim();
+  return kind === "discussions" || systemKey === "discussions" || title === "обсуждения";
+}
+
+function canManageDiscussionsChat(user) {
+  return String(user?.role || "").toLowerCase().trim() === "creator";
 }
 
 async function getChatAccessContext(chatId, userId, tenantId = null) {
@@ -3412,6 +3502,7 @@ async function listChatsHandler(req, res) {
     const userId = req.user.id;
     const tenantId = req.user.tenant_id || null;
     const userIdText = String(userId);
+    const rawRole = String(req.user.role || "").toLowerCase().trim();
     const role = normalizeRole(req.user.role);
     const workerOrHigher =
       role === "worker" || role === "admin" || role === "tenant" || role === "creator";
@@ -3420,6 +3511,9 @@ async function listChatsHandler(req, res) {
     const bugReportViewer = canAccessBugReportsChannel(req.user.role);
 
     await ensureSavedMessagesChat(db.pool, req.user);
+    if (rawRole === "tenant" || rawRole === "creator") {
+      await ensureDiscussionsChat(db.pool, req.user.id, tenantId);
+    }
 
     const publicAndChannelQ = await db.query(
       `SELECT c.id,
@@ -3430,6 +3524,9 @@ async function listChatsHandler(req, res) {
                 WHEN COALESCE(c.settings->>'system_key', '') = 'admin_system'
                   OR COALESCE(c.settings->>'kind', '') = 'admin_system'
                   THEN COALESCE(NULLIF(BTRIM(c.title), ''), 'Система')
+                WHEN COALESCE(c.settings->>'system_key', '') = 'discussions'
+                  OR COALESCE(c.settings->>'kind', '') = 'discussions'
+                  THEN COALESCE(NULLIF(BTRIM(c.title), ''), 'Обсуждения')
                 WHEN c.type = 'private'
                   THEN COALESCE(
                     NULLIF(BTRIM(peer.peer_display_name), ''),
@@ -3608,6 +3705,9 @@ async function listChatsHandler(req, res) {
                 WHEN COALESCE(c.settings->>'system_key', '') = 'admin_system'
                   OR COALESCE(c.settings->>'kind', '') = 'admin_system'
                   THEN COALESCE(NULLIF(BTRIM(c.title), ''), 'Система')
+                WHEN COALESCE(c.settings->>'system_key', '') = 'discussions'
+                  OR COALESCE(c.settings->>'kind', '') = 'discussions'
+                  THEN COALESCE(NULLIF(BTRIM(c.title), ''), 'Обсуждения')
                 WHEN c.type = 'private'
                   THEN COALESCE(
                     NULLIF(BTRIM(peer.peer_display_name), ''),
@@ -3774,6 +3874,24 @@ async function listChatsHandler(req, res) {
           system_key: "admin_system",
           visibility: "private",
           admin_only: true,
+        };
+      }
+      if (isDiscussionsChatRow(chat, settings)) {
+        chat.display_title = String(chat.title || "").trim() || "Обсуждения";
+        chat.peer_user_id = null;
+        chat.peer_display_name = null;
+        chat.peer_name = null;
+        chat.peer_phone = null;
+        chat.peer_avatar_url = null;
+        chat.peer_avatar_focus_x = 0;
+        chat.peer_avatar_focus_y = 0;
+        chat.peer_avatar_zoom = 1;
+        chat.settings = {
+          ...settings,
+          kind: "discussions",
+          system_key: "discussions",
+          visibility: "private",
+          creator_managed: true,
         };
       }
       if (isSavedMessagesChatRow(chat)) {
@@ -4099,6 +4217,355 @@ router.get("/:chatId/activity", requireAuth, async (req, res) => {
     });
   }
 });
+
+async function loadDiscussionChatForManagement(req, chatId) {
+  const chatQ = await db.query(
+    `SELECT id, title, type, created_by, tenant_id, settings, created_at, updated_at
+     FROM chats
+     WHERE id = $1
+       AND type = 'private'
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+     LIMIT 1`,
+    [chatId, req.user?.tenant_id || null],
+  );
+  if (chatQ.rowCount === 0) return null;
+  const chat = chatQ.rows[0];
+  const settings = normalizeSettings(chat.settings);
+  if (!isDiscussionsChatRow(chat, settings)) return null;
+  chat.settings = {
+    ...settings,
+    kind: "discussions",
+    system_key: "discussions",
+    visibility: "private",
+    creator_managed: true,
+  };
+  return chat;
+}
+
+async function loadDiscussionMembersAndCandidates(chat) {
+  const tenantId = chat.tenant_id || null;
+  const membersQ = await db.query(
+    `SELECT u.id AS user_id,
+            u.name,
+            u.email,
+            u.role AS user_role,
+            p.phone,
+            cm.role AS chat_role,
+            cm.joined_at,
+            u.avatar_url,
+            COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+            COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+            COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+     FROM chat_members cm
+     JOIN users u ON u.id = cm.user_id
+     LEFT JOIN phones p ON p.user_id = u.id
+     WHERE cm.chat_id = $1
+     ORDER BY
+       CASE WHEN u.role = 'creator' THEN 0 WHEN u.role = 'tenant' THEN 1 ELSE 2 END,
+       cm.joined_at ASC`,
+    [chat.id],
+  );
+  const candidatesQ = await db.query(
+    `SELECT u.id AS user_id,
+            u.name,
+            u.email,
+            u.role AS user_role,
+            p.phone,
+            u.avatar_url,
+            COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
+            COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
+            COALESCE(u.avatar_zoom, 1) AS avatar_zoom
+     FROM users u
+     LEFT JOIN phones p ON p.user_id = u.id
+     WHERE u.is_active IS DISTINCT FROM false
+       AND (
+         $1::uuid IS NULL
+         OR u.tenant_id = $1::uuid
+         OR u.role = 'creator'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM chat_members cm
+         WHERE cm.chat_id = $2 AND cm.user_id = u.id
+       )
+     ORDER BY
+       CASE WHEN u.role = 'creator' THEN 0 WHEN u.role = 'tenant' THEN 1 ELSE 2 END,
+       COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), p.phone, '') ASC
+     LIMIT 250`,
+    [tenantId, chat.id],
+  );
+  return {
+    members: membersQ.rows.map((row) => ({
+      ...row,
+      can_remove: !["creator", "tenant"].includes(
+        String(row.user_role || "").toLowerCase().trim(),
+      ),
+    })),
+    candidates: candidatesQ.rows,
+  };
+}
+
+function emitDiscussionChatUpdated(req, chat, action = "updated", extra = {}) {
+  const io = req.app.get("io");
+  if (!io || !chat?.id) return;
+  const payload = {
+    chatId: String(chat.id),
+    chat_id: String(chat.id),
+    action,
+    chat,
+    ...extra,
+  };
+  emitToTenant(io, req.user?.tenant_id || chat.tenant_id || null, "chat:updated", payload);
+}
+
+router.get("/:chatId/discussion-settings", requireAuth, async (req, res) => {
+  try {
+    if (!canManageDiscussionsChat(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Настройки обсуждений доступны только создателю",
+      });
+    }
+    const chat = await loadDiscussionChatForManagement(req, req.params.chatId);
+    if (!chat) {
+      return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
+    }
+    const lists = await loadDiscussionMembersAndCandidates(chat);
+    return res.json({ ok: true, data: { chat, ...lists } });
+  } catch (err) {
+    console.error("chats.discussions.settings.get error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.patch("/:chatId/discussion-settings", requireAuth, async (req, res) => {
+  try {
+    if (!canManageDiscussionsChat(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Настройки обсуждений доступны только создателю",
+      });
+    }
+    const chat = await loadDiscussionChatForManagement(req, req.params.chatId);
+    if (!chat) {
+      return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
+    }
+    const nextTitle = String(req.body?.title || "").trim();
+    if (!nextTitle) {
+      return res.status(400).json({ ok: false, error: "Название обязательно" });
+    }
+    if (nextTitle.length > 80) {
+      return res.status(400).json({
+        ok: false,
+        error: "Название не должно быть длиннее 80 символов",
+      });
+    }
+    const updated = await db.query(
+      `UPDATE chats
+       SET title = $1,
+           settings = $2::jsonb,
+           updated_at = now()
+       WHERE id = $3
+       RETURNING id, title, type, created_by, tenant_id, settings, created_at, updated_at`,
+      [nextTitle, JSON.stringify(chat.settings), chat.id],
+    );
+    const updatedChat = updated.rows[0];
+    emitDiscussionChatUpdated(req, updatedChat, "settings_updated");
+    return res.json({ ok: true, data: updatedChat });
+  } catch (err) {
+    console.error("chats.discussions.settings.patch error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.post(
+  "/:chatId/discussion-settings/avatar",
+  requireAuth,
+  uploadDiscussionAvatar,
+  async (req, res) => {
+    try {
+      if (!canManageDiscussionsChat(req.user)) {
+        removeUploadedFile(req.file);
+        return res.status(403).json({
+          ok: false,
+          error: "Настройки обсуждений доступны только создателю",
+        });
+      }
+      const chat = await loadDiscussionChatForManagement(req, req.params.chatId);
+      if (!chat) {
+        removeUploadedFile(req.file);
+        return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
+      }
+      const uploadedUrl = toDiscussionAvatarUrl(req, req.file);
+      if (!uploadedUrl) {
+        return res.status(400).json({ ok: false, error: "Файл аватарки обязателен" });
+      }
+      const previousAvatar = String(chat.settings.avatar_url || "").trim();
+      const nextSettings = { ...chat.settings, avatar_url: uploadedUrl };
+      const updated = await db.query(
+        `UPDATE chats
+         SET settings = $1::jsonb,
+             updated_at = now()
+         WHERE id = $2
+         RETURNING id, title, type, created_by, tenant_id, settings, created_at, updated_at`,
+        [JSON.stringify(nextSettings), chat.id],
+      );
+      await registerPublicImageUpload({
+        queryable: db,
+        ownerKind: "discussion_chat_avatar",
+        ownerId: chat.id,
+        rawUrl: uploadedUrl,
+      });
+      if (previousAvatar && previousAvatar !== uploadedUrl) {
+        removeDiscussionAvatarByUrl(previousAvatar);
+      }
+      const updatedChat = updated.rows[0];
+      emitDiscussionChatUpdated(req, updatedChat, "avatar_updated");
+      return res.json({ ok: true, data: updatedChat });
+    } catch (err) {
+      removeUploadedFile(req.file);
+      console.error("chats.discussions.avatar.post error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.delete("/:chatId/discussion-settings/avatar", requireAuth, async (req, res) => {
+  try {
+    if (!canManageDiscussionsChat(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Настройки обсуждений доступны только создателю",
+      });
+    }
+    const chat = await loadDiscussionChatForManagement(req, req.params.chatId);
+    if (!chat) {
+      return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
+    }
+    const previousAvatar = String(chat.settings.avatar_url || "").trim();
+    const nextSettings = { ...chat.settings, avatar_url: "" };
+    const updated = await db.query(
+      `UPDATE chats
+       SET settings = $1::jsonb,
+           updated_at = now()
+       WHERE id = $2
+       RETURNING id, title, type, created_by, tenant_id, settings, created_at, updated_at`,
+      [JSON.stringify(nextSettings), chat.id],
+    );
+    if (previousAvatar) {
+      removeDiscussionAvatarByUrl(previousAvatar);
+    }
+    const updatedChat = updated.rows[0];
+    emitDiscussionChatUpdated(req, updatedChat, "avatar_removed");
+    return res.json({ ok: true, data: updatedChat });
+  } catch (err) {
+    console.error("chats.discussions.avatar.delete error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.post("/:chatId/discussion-settings/members", requireAuth, async (req, res) => {
+  try {
+    if (!canManageDiscussionsChat(req.user)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Участников обсуждений может менять только создатель",
+      });
+    }
+    const chat = await loadDiscussionChatForManagement(req, req.params.chatId);
+    if (!chat) {
+      return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
+    }
+    const userId = String(req.body?.user_id || req.body?.userId || "").trim();
+    if (!uuidValidate(userId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный пользователь" });
+    }
+    const userQ = await db.query(
+      `SELECT id, role
+       FROM users
+       WHERE id = $1
+         AND (
+           $2::uuid IS NULL
+           OR tenant_id = $2::uuid
+           OR role = 'creator'
+         )
+       LIMIT 1`,
+      [userId, chat.tenant_id || null],
+    );
+    if (userQ.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Пользователь не найден" });
+    }
+    await db.query(
+      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+       VALUES ($1, $2, $3, now(), 'member')
+       ON CONFLICT (chat_id, user_id) DO UPDATE SET role = chat_members.role`,
+      [uuidv4(), chat.id, userId],
+    );
+    emitDiscussionChatUpdated(req, chat, "member_added", { user_id: userId });
+    const lists = await loadDiscussionMembersAndCandidates(chat);
+    return res.status(201).json({ ok: true, data: lists });
+  } catch (err) {
+    console.error("chats.discussions.members.post error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.delete(
+  "/:chatId/discussion-settings/members/:userId",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (!canManageDiscussionsChat(req.user)) {
+        return res.status(403).json({
+          ok: false,
+          error: "Участников обсуждений может менять только создатель",
+        });
+      }
+      const chat = await loadDiscussionChatForManagement(req, req.params.chatId);
+      if (!chat) {
+        return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
+      }
+      const userId = String(req.params.userId || "").trim();
+      if (!uuidValidate(userId)) {
+        return res.status(400).json({ ok: false, error: "Некорректный пользователь" });
+      }
+      const memberQ = await db.query(
+        `SELECT u.role
+         FROM chat_members cm
+         JOIN users u ON u.id = cm.user_id
+         WHERE cm.chat_id = $1 AND cm.user_id = $2
+         LIMIT 1`,
+        [chat.id, userId],
+      );
+      if (memberQ.rowCount === 0) {
+        return res.json({ ok: true, data: await loadDiscussionMembersAndCandidates(chat) });
+      }
+      const userRole = String(memberQ.rows[0].role || "").toLowerCase().trim();
+      if (userRole === "creator" || userRole === "tenant") {
+        return res.status(403).json({
+          ok: false,
+          error: "Создателя и арендатора нельзя убрать из обсуждений",
+        });
+      }
+      await db.query("DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2", [
+        chat.id,
+        userId,
+      ]);
+      emitDiscussionChatUpdated(req, chat, "member_removed", { user_id: userId });
+      const io = req.app.get("io");
+      if (io) {
+        emitToUser(io, userId, "chat:deleted", {
+          chatId: String(chat.id),
+          chat_id: String(chat.id),
+          reason: "discussion_access_revoked",
+        });
+      }
+      return res.json({ ok: true, data: await loadDiscussionMembersAndCandidates(chat) });
+    } catch (err) {
+      console.error("chats.discussions.members.delete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
 
 /**
  * GET /api/chats/:chatId/messages
@@ -7899,8 +8366,25 @@ router.get("/:chatId/contact-card", requireAuth, async (req, res) => {
 router.get("/:chatId/members", requireAuth, async (req, res) => {
   try {
     const { chatId } = req.params;
+    const context = await getChatAccessContext(
+      chatId,
+      req.user.id,
+      req.user.tenant_id,
+    );
+    if (!context) {
+      return res.status(404).json({ ok: false, error: "Chat not found" });
+    }
+    const permissionSet = await resolvePermissionSet(req.user, db);
+    if (!canReadChat(context, req.user.role, permissionSet.permissions)) {
+      return res.status(403).json({ ok: false, error: "Нет доступа к чату" });
+    }
     const q = await db.query(
-      `SELECT u.id as user_id, u.email, cm.role, cm.joined_at
+      `SELECT u.id as user_id,
+              u.email,
+              u.name,
+              u.role AS user_role,
+              cm.role,
+              cm.joined_at
        FROM users u
        JOIN chat_members cm ON cm.user_id = u.id
        WHERE cm.chat_id = $1

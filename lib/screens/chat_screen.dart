@@ -894,6 +894,111 @@ class _ChatScreenState extends State<ChatScreen>
 
   Map<String, dynamic> _effectiveChatSettings() => _chatSettings;
 
+  bool _isDiscussionsChat() {
+    final settings = _effectiveChatSettings();
+    final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
+    final systemKey = (settings['system_key'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    return kind == 'discussions' ||
+        systemKey == 'discussions' ||
+        _chatTitle.toLowerCase().trim() == 'обсуждения';
+  }
+
+  bool _canManageDiscussionsChat() {
+    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    return _isDiscussionsChat() && role == 'creator';
+  }
+
+  String? _chatAvatarUrl() {
+    final settings = _effectiveChatSettings();
+    return _resolveImageUrl((settings['avatar_url'] ?? '').toString());
+  }
+
+  double _chatAvatarFocus(String key, double fallback) {
+    final value = double.tryParse('${_effectiveChatSettings()[key] ?? ''}');
+    if (value == null || !value.isFinite) return fallback;
+    return value.clamp(-1.0, 1.0).toDouble();
+  }
+
+  double _chatAvatarZoom() {
+    final value = double.tryParse(
+      '${_effectiveChatSettings()['avatar_zoom'] ?? ''}',
+    );
+    if (value == null || !value.isFinite) return 1.0;
+    return value.clamp(1.0, 4.0).toDouble();
+  }
+
+  Future<void> _openDiscussionsSettings() async {
+    if (!_isDiscussionsChat()) return;
+    final updated = await showModalBottomSheet<Map<String, dynamic>>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => _DiscussionChatSettingsSheet(
+        chatId: widget.chatId,
+        title: _chatTitle,
+        settings: _effectiveChatSettings(),
+        canManage: _canManageDiscussionsChat(),
+      ),
+    );
+    if (updated == null || !mounted) return;
+    _applyIncomingChatSnapshot(updated);
+  }
+
+  Widget _buildAppBarTitle(ThemeData theme) {
+    final titleColumn = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(_chatTitle),
+        if (_remoteActivityLabel.isNotEmpty)
+          Text(
+            _remoteActivityLabel,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.primary,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+      ],
+    );
+
+    if (!_isDiscussionsChat()) return titleColumn;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(28),
+      onTap: _openDiscussionsSettings,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AppAvatar(
+              title: _chatTitle,
+              imageUrl: _chatAvatarUrl(),
+              focusX: _chatAvatarFocus('avatar_focus_x', 0),
+              focusY: _chatAvatarFocus('avatar_focus_y', 0),
+              zoom: _chatAvatarZoom(),
+              radius: 18,
+              fallbackIcon: Icons.forum_outlined,
+            ),
+            const SizedBox(width: 10),
+            Flexible(child: titleColumn),
+            if (_canManageDiscussionsChat()) ...[
+              const SizedBox(width: 6),
+              Icon(
+                Icons.settings_outlined,
+                size: 16,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   void _channelLiveLog(String label, [Map<String, dynamic>? details]) {
     if (!kDebugMode || !_channelLiveDebugLogs) return;
     final payload = <String, dynamic>{
@@ -1096,7 +1201,7 @@ class _ChatScreenState extends State<ChatScreen>
     int ttlMs = 4500,
     bool httpFallback = false,
   }) async {
-    if (!_isDirectMessageChat()) return;
+    if (!_isDirectMessageChat() && !_isDiscussionsChat()) return;
     if (_directRequestStatus() == 'declined') return;
     final eventId =
         '$eventName:${widget.chatId}:${_myUserId()}:${active == false ? 0 : 1}:${DateTime.now().millisecondsSinceEpoch}';
@@ -1628,7 +1733,7 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   void _maybeEmitTypingActivity() {
-    if (!_isDirectMessageChat()) return;
+    if (!_isDirectMessageChat() && !_isDiscussionsChat()) return;
     if (!_canCompose()) return;
     if (_controller.text.trim().isEmpty) {
       _maybeEmitTypingInactive();
@@ -3168,7 +3273,10 @@ class _ChatScreenState extends State<ChatScreen>
 
   void _startDirectMessageLiveSync() {
     _directMessageLiveSyncTimer?.cancel();
-    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if ((!_isDirectMessageChat() && !_isDiscussionsChat()) ||
+        _isReservedOrdersChat()) {
+      return;
+    }
     if (_isRealtimeSocketConnected) {
       _directMessageLiveSyncTimer = null;
       return;
@@ -3181,7 +3289,10 @@ class _ChatScreenState extends State<ChatScreen>
 
   void _startRemoteActivityPolling() {
     _remoteActivityPollTimer?.cancel();
-    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if ((!_isDirectMessageChat() && !_isDiscussionsChat()) ||
+        _isReservedOrdersChat()) {
+      return;
+    }
     if (_isRealtimeSocketConnected) {
       _remoteActivityPollTimer = null;
       return;
@@ -3314,7 +3425,10 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Future<void> _pollRemoteChatActivity() async {
-    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if ((!_isDirectMessageChat() && !_isDiscussionsChat()) ||
+        _isReservedOrdersChat()) {
+      return;
+    }
     if (_isRealtimeSocketConnected) return;
     if (_remoteActivityPollInFlight || !mounted) return;
     _remoteActivityPollInFlight = true;
@@ -3354,7 +3468,10 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Future<void> _syncLatestDirectMessages({bool forceLatest = false}) async {
-    if (!_isDirectMessageChat() || _isReservedOrdersChat()) return;
+    if ((!_isDirectMessageChat() && !_isDiscussionsChat()) ||
+        _isReservedOrdersChat()) {
+      return;
+    }
     if (_isRealtimeSocketConnected && !forceLatest) return;
     if (_directMessageLiveSyncInFlight || _messagesLoadInFlight || _loading) {
       return;
@@ -15463,21 +15580,7 @@ class _ChatScreenState extends State<ChatScreen>
                     controller: _searchController,
                   ),
                 )
-              : Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(_chatTitle),
-                    if (_remoteActivityLabel.isNotEmpty)
-                      Text(
-                        _remoteActivityLabel,
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: theme.colorScheme.primary,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                  ],
-                ),
+              : _buildAppBarTitle(theme),
           actions: [
             if (_searchMode && _searchQuery.isNotEmpty)
               Center(
@@ -18327,6 +18430,536 @@ class _AttachmentSkeletonTile extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _DiscussionChatSettingsSheet extends StatefulWidget {
+  const _DiscussionChatSettingsSheet({
+    required this.chatId,
+    required this.title,
+    required this.settings,
+    required this.canManage,
+  });
+
+  final String chatId;
+  final String title;
+  final Map<String, dynamic> settings;
+  final bool canManage;
+
+  @override
+  State<_DiscussionChatSettingsSheet> createState() =>
+      _DiscussionChatSettingsSheetState();
+}
+
+class _DiscussionChatSettingsSheetState
+    extends State<_DiscussionChatSettingsSheet> {
+  late final TextEditingController _titleController;
+  bool _loading = false;
+  bool _saving = false;
+  String _error = '';
+  Map<String, dynamic>? _chat;
+  List<Map<String, dynamic>> _members = const [];
+  List<Map<String, dynamic>> _candidates = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _titleController = TextEditingController(text: widget.title);
+    _chat = <String, dynamic>{
+      'id': widget.chatId,
+      'title': widget.title,
+      'type': 'private',
+      'settings': widget.settings,
+    };
+    if (widget.canManage) {
+      unawaited(_loadSettings());
+    }
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    super.dispose();
+  }
+
+  String _extractError(Object error) {
+    if (error is DioException) {
+      final data = error.response?.data;
+      if (data is Map && data['error'] != null) {
+        return data['error'].toString();
+      }
+      if (error.message != null && error.message!.trim().isNotEmpty) {
+        return error.message!;
+      }
+    }
+    return error.toString();
+  }
+
+  Map<String, dynamic> _settingsOf(Map<String, dynamic>? chat) {
+    final raw = chat?['settings'];
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return widget.settings;
+  }
+
+  String? _avatarUrl() {
+    final raw = (_settingsOf(_chat)['avatar_url'] ?? '').toString().trim();
+    return resolveMediaUrl(raw, apiBaseUrl: authService.dio.options.baseUrl);
+  }
+
+  double _avatarFocus(String key, double fallback) {
+    final value = double.tryParse('${_settingsOf(_chat)[key] ?? ''}');
+    if (value == null || !value.isFinite) return fallback;
+    return value.clamp(-1.0, 1.0).toDouble();
+  }
+
+  double _avatarZoom() {
+    final value = double.tryParse('${_settingsOf(_chat)['avatar_zoom'] ?? ''}');
+    if (value == null || !value.isFinite) return 1.0;
+    return value.clamp(1.0, 4.0).toDouble();
+  }
+
+  String _displayName(Map<String, dynamic> user) {
+    return (user['name'] ?? '').toString().trim().isNotEmpty
+        ? user['name'].toString().trim()
+        : (user['email'] ?? '').toString().trim().isNotEmpty
+        ? user['email'].toString().trim()
+        : (user['phone'] ?? '').toString().trim().isNotEmpty
+        ? user['phone'].toString().trim()
+        : 'Пользователь';
+  }
+
+  Future<void> _loadSettings() async {
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+    try {
+      final response = await authService.dio.get(
+        '/api/chats/${widget.chatId}/discussion-settings',
+      );
+      final data = response.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final payload = Map<String, dynamic>.from(data['data'] as Map);
+        final chatRaw = payload['chat'];
+        setState(() {
+          _chat = chatRaw is Map
+              ? Map<String, dynamic>.from(chatRaw)
+              : _chat;
+          _members = (payload['members'] is List)
+              ? List<Map<String, dynamic>>.from(
+                  (payload['members'] as List).map(
+                    (item) => Map<String, dynamic>.from(item as Map),
+                  ),
+                )
+              : const [];
+          _candidates = (payload['candidates'] is List)
+              ? List<Map<String, dynamic>>.from(
+                  (payload['candidates'] as List).map(
+                    (item) => Map<String, dynamic>.from(item as Map),
+                  ),
+                )
+              : const [];
+          _titleController.text =
+              (_chat?['title'] ?? widget.title).toString().trim();
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = _extractError(e));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _saveTitle() async {
+    final title = _titleController.text.trim();
+    if (title.isEmpty) {
+      setState(() => _error = 'Название обязательно');
+      return;
+    }
+    setState(() {
+      _saving = true;
+      _error = '';
+    });
+    try {
+      final response = await authService.dio.patch(
+        '/api/chats/${widget.chatId}/discussion-settings',
+        data: {'title': title},
+      );
+      final data = response.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final chat = Map<String, dynamic>.from(data['data'] as Map);
+        setState(() => _chat = chat);
+        Navigator.of(context).pop(chat);
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = _extractError(e));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _uploadAvatar() async {
+    setState(() {
+      _saving = true;
+      _error = '';
+    });
+    try {
+      final picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        imageQuality: 88,
+      );
+      if (picked == null) {
+        if (mounted) setState(() => _saving = false);
+        return;
+      }
+      final multipart = kIsWeb
+          ? MultipartFile.fromBytes(
+              await picked.readAsBytes(),
+              filename: picked.name,
+            )
+          : await MultipartFile.fromFile(picked.path, filename: picked.name);
+      final response = await authService.dio.post(
+        '/api/chats/${widget.chatId}/discussion-settings/avatar',
+        data: FormData.fromMap({'avatar': multipart}),
+      );
+      final data = response.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        setState(() => _chat = Map<String, dynamic>.from(data['data'] as Map));
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = _extractError(e));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _removeAvatar() async {
+    setState(() {
+      _saving = true;
+      _error = '';
+    });
+    try {
+      final response = await authService.dio.delete(
+        '/api/chats/${widget.chatId}/discussion-settings/avatar',
+      );
+      final data = response.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        setState(() => _chat = Map<String, dynamic>.from(data['data'] as Map));
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = _extractError(e));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _addMember(String userId) async {
+    setState(() {
+      _saving = true;
+      _error = '';
+    });
+    try {
+      final response = await authService.dio.post(
+        '/api/chats/${widget.chatId}/discussion-settings/members',
+        data: {'user_id': userId},
+      );
+      final data = response.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final payload = Map<String, dynamic>.from(data['data'] as Map);
+        setState(() {
+          _members = (payload['members'] is List)
+              ? List<Map<String, dynamic>>.from(
+                  (payload['members'] as List).map(
+                    (item) => Map<String, dynamic>.from(item as Map),
+                  ),
+                )
+              : _members;
+          _candidates = (payload['candidates'] is List)
+              ? List<Map<String, dynamic>>.from(
+                  (payload['candidates'] as List).map(
+                    (item) => Map<String, dynamic>.from(item as Map),
+                  ),
+                )
+              : _candidates;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = _extractError(e));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _removeMember(String userId) async {
+    setState(() {
+      _saving = true;
+      _error = '';
+    });
+    try {
+      final response = await authService.dio.delete(
+        '/api/chats/${widget.chatId}/discussion-settings/members/$userId',
+      );
+      final data = response.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final payload = Map<String, dynamic>.from(data['data'] as Map);
+        setState(() {
+          _members = (payload['members'] is List)
+              ? List<Map<String, dynamic>>.from(
+                  (payload['members'] as List).map(
+                    (item) => Map<String, dynamic>.from(item as Map),
+                  ),
+                )
+              : _members;
+          _candidates = (payload['candidates'] is List)
+              ? List<Map<String, dynamic>>.from(
+                  (payload['candidates'] as List).map(
+                    (item) => Map<String, dynamic>.from(item as Map),
+                  ),
+                )
+              : _candidates;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = _extractError(e));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Widget _buildUserTile(
+    ThemeData theme,
+    Map<String, dynamic> user, {
+    required bool member,
+  }) {
+    final userId = (user['user_id'] ?? '').toString();
+    final userRole = (user['user_role'] ?? '').toString();
+    final canRemove = user['can_remove'] == true;
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: AppAvatar(
+        title: _displayName(user),
+        imageUrl: resolveMediaUrl(
+          (user['avatar_url'] ?? '').toString(),
+          apiBaseUrl: authService.dio.options.baseUrl,
+        ),
+        focusX: double.tryParse('${user['avatar_focus_x'] ?? 0}') ?? 0,
+        focusY: double.tryParse('${user['avatar_focus_y'] ?? 0}') ?? 0,
+        zoom: double.tryParse('${user['avatar_zoom'] ?? 1}') ?? 1,
+        radius: 17,
+      ),
+      title: Text(
+        _displayName(user),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        [
+          if ((user['email'] ?? '').toString().trim().isNotEmpty)
+            (user['email'] ?? '').toString().trim(),
+          if ((user['phone'] ?? '').toString().trim().isNotEmpty)
+            (user['phone'] ?? '').toString().trim(),
+          if (userRole.isNotEmpty) userRole,
+        ].join(' • '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: !widget.canManage
+          ? null
+          : member
+          ? IconButton(
+              tooltip: canRemove
+                  ? 'Убрать доступ'
+                  : 'Создатель и арендатор всегда имеют доступ',
+              onPressed: canRemove && !_saving ? () => _removeMember(userId) : null,
+              icon: const Icon(Icons.person_remove_alt_1_outlined),
+            )
+          : IconButton(
+              tooltip: 'Дать доступ',
+              onPressed: _saving ? null : () => _addMember(userId),
+              icon: const Icon(Icons.person_add_alt_1_outlined),
+            ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final title = (_chat?['title'] ?? widget.title).toString().trim();
+    final bottom = MediaQuery.viewInsetsOf(context).bottom;
+    return Padding(
+      padding: EdgeInsets.only(bottom: bottom),
+      child: DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.82,
+        minChildSize: 0.45,
+        maxChildSize: 0.95,
+        builder: (context, scrollController) {
+          return ListView(
+            controller: scrollController,
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
+            children: [
+              Center(
+                child: Container(
+                  width: 44,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.outlineVariant,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  AppAvatar(
+                    title: title.isEmpty ? 'Обсуждения' : title,
+                    imageUrl: _avatarUrl(),
+                    focusX: _avatarFocus('avatar_focus_x', 0),
+                    focusY: _avatarFocus('avatar_focus_y', 0),
+                    zoom: _avatarZoom(),
+                    radius: 34,
+                    fallbackIcon: Icons.forum_outlined,
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title.isEmpty ? 'Обсуждения' : title,
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        Text(
+                          'Закрытый чат для создателя, арендаторов и выбранных пользователей',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              if (!widget.canManage) ...[
+                const SizedBox(height: 20),
+                AppSurfaceCard(
+                  child: Text(
+                    'Настройки этого чата доступны только Создателю.',
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                ),
+              ] else ...[
+                const SizedBox(height: 22),
+                Text('Настройки', style: theme.textTheme.titleMedium),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _titleController,
+                  decoration: const InputDecoration(
+                    labelText: 'Название чата',
+                    border: OutlineInputBorder(),
+                  ),
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _saving ? null : _saveTitle(),
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _saving ? null : _saveTitle,
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.save_outlined),
+                      label: const Text('Сохранить название'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _saving ? null : _uploadAvatar,
+                      icon: const Icon(Icons.image_outlined),
+                      label: const Text('Сменить аватарку'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _saving || _avatarUrl() == null
+                          ? null
+                          : _removeAvatar,
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text('Убрать аватарку'),
+                    ),
+                  ],
+                ),
+                if (_error.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    _error,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.error,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 22),
+                Row(
+                  children: [
+                    Text('Участники', style: theme.textTheme.titleMedium),
+                    const Spacer(),
+                    if (_loading)
+                      const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                if (_members.isEmpty && !_loading)
+                  Text(
+                    'Список участников пока пуст.',
+                    style: theme.textTheme.bodyMedium,
+                  )
+                else
+                  ..._members.map(
+                    (member) => _buildUserTile(theme, member, member: true),
+                  ),
+                const SizedBox(height: 18),
+                Text('Добавить доступ', style: theme.textTheme.titleMedium),
+                const SizedBox(height: 8),
+                if (_candidates.isEmpty && !_loading)
+                  Text(
+                    'Нет доступных пользователей для добавления.',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  )
+                else
+                  ..._candidates
+                      .take(80)
+                      .map(
+                        (candidate) =>
+                            _buildUserTile(theme, candidate, member: false),
+                      ),
+              ],
+            ],
+          );
+        },
       ),
     );
   }

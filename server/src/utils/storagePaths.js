@@ -47,6 +47,8 @@ function ensureStorageLayout() {
   fs.mkdirSync(uploadsPath("products", "variants"), { recursive: true });
   fs.mkdirSync(uploadsPath("channels"), { recursive: true });
   fs.mkdirSync(uploadsPath("channels", "variants"), { recursive: true });
+  fs.mkdirSync(uploadsPath("chat_avatars"), { recursive: true });
+  fs.mkdirSync(uploadsPath("chat_avatars", "variants"), { recursive: true });
   fs.mkdirSync(uploadsPath("users"), { recursive: true });
   fs.mkdirSync(uploadsPath("users", "variants"), { recursive: true });
   fs.mkdirSync(uploadsPath("claims"), { recursive: true });

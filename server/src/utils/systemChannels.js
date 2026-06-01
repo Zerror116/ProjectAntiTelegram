@@ -563,6 +563,115 @@ async function ensureAdminSystemChat(client, createdBy, tenantId = null) {
   return { chat: inserted.rows[0], created: true };
 }
 
+async function findDiscussionsChat(client, tenantId = null) {
+  return client.query(
+    `SELECT id, title, type, created_by, settings, created_at, updated_at
+     FROM chats
+     WHERE type = 'private'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+       AND (
+         COALESCE(settings->>'system_key', '') = 'discussions'
+         OR COALESCE(settings->>'kind', '') = 'discussions'
+         OR LOWER(TRIM(title)) = 'обсуждения'
+       )
+     ORDER BY
+       CASE WHEN COALESCE(settings->>'system_key', '') = 'discussions' THEN 0 ELSE 1 END,
+       updated_at DESC NULLS LAST,
+       created_at DESC
+     LIMIT 1`,
+    [tenantId || null],
+  );
+}
+
+async function ensureDiscussionBaseMembers(client, chatId, tenantId, createdBy = null) {
+  const memberQ = await client.query(
+    `SELECT id, role
+     FROM users
+     WHERE (
+       role = 'tenant'
+       AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+     )
+     OR (
+       role = 'creator'
+       AND (
+         tenant_id IS NULL
+         OR $1::uuid IS NULL
+         OR tenant_id = $1::uuid
+       )
+     )
+     OR id = $2::uuid`,
+    [tenantId || null, createdBy || null],
+  );
+
+  for (const row of memberQ.rows) {
+    const role = String(row.role || "").toLowerCase().trim();
+    const memberRole = role === "creator" ? "owner" : "member";
+    await client.query(
+      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+       VALUES ($1, $2, $3, now(), $4)
+       ON CONFLICT (chat_id, user_id)
+       DO UPDATE SET role = CASE
+         WHEN EXCLUDED.role = 'owner' THEN 'owner'
+         ELSE chat_members.role
+       END`,
+      [uuidv4(), chatId, row.id, memberRole],
+    );
+  }
+}
+
+async function ensureDiscussionsChat(client, createdBy, tenantId = null) {
+  const discussionsQ = await findDiscussionsChat(client, tenantId);
+  const baseSettings = {
+    kind: "discussions",
+    system_key: "discussions",
+    tenant_id: tenantId || null,
+    visibility: "private",
+    admin_only: false,
+    worker_can_post: false,
+    is_post_channel: false,
+    creator_managed: true,
+    description:
+      "Закрытый чат для создателя, арендаторов и пользователей, которым создатель выдал доступ.",
+  };
+
+  if (discussionsQ.rowCount > 0) {
+    const current = discussionsQ.rows[0];
+    const currentSettings = normalizeSettings(current.settings);
+    const nextSettings = mergeJson(currentSettings, baseSettings);
+    const updated = await client.query(
+      `UPDATE chats
+       SET title = COALESCE(NULLIF(BTRIM(title), ''), 'Обсуждения'),
+           settings = $2::jsonb,
+           tenant_id = $3,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+      [current.id, JSON.stringify(nextSettings), tenantId || null],
+    );
+    await ensureDiscussionBaseMembers(
+      client,
+      updated.rows[0].id,
+      tenantId,
+      createdBy,
+    );
+    return { chat: updated.rows[0], created: false };
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, 'Обсуждения', 'private', $2, $3, $4::jsonb, now(), now())
+     RETURNING id, title, type, created_by, settings, created_at, updated_at`,
+    [uuidv4(), createdBy || null, tenantId || null, JSON.stringify(baseSettings)],
+  );
+  await ensureDiscussionBaseMembers(
+    client,
+    inserted.rows[0].id,
+    tenantId,
+    createdBy,
+  );
+  return { chat: inserted.rows[0], created: true };
+}
+
 async function insertAdminSystemMessage(
   client,
   {
@@ -664,6 +773,7 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
   const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
   const postsArchive = await ensurePostsArchiveChannel(client, createdBy, tenantId);
   const adminSystem = await ensureAdminSystemChat(client, createdBy, tenantId);
+  const discussions = await ensureDiscussionsChat(client, createdBy, tenantId);
   await consolidateSystemDuplicates(
     client,
     tenantId,
@@ -687,11 +797,13 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
     reservedChannel: reserved.channel,
     postsArchiveChannel: postsArchive.channel,
     adminSystemChat: adminSystem.chat,
+    discussionsChat: discussions.chat,
     created: {
       main: main.created,
       reserved: reserved.created,
       posts_archive: postsArchive.created,
       admin_system: adminSystem.created,
+      discussions: discussions.created,
     },
   };
 }
@@ -700,6 +812,7 @@ module.exports = {
   ensureSystemChannels,
   ensureStaffMembers,
   ensureAdminSystemChat,
+  ensureDiscussionsChat,
   insertAdminSystemMessage,
   normalizeSettings,
 };

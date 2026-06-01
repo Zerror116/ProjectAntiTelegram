@@ -380,7 +380,7 @@ function placeholderAbsolutePathForPublicDir(publicDir) {
   );
 }
 
-for (const publicDir of ["products", "channels", "users", "claims"]) {
+for (const publicDir of ["products", "channels", "users", "claims", "chat_avatars"]) {
   const fullDir = path.join(uploadsRoot, publicDir);
   app.use(
     `/uploads/${publicDir}`,
@@ -890,7 +890,7 @@ async function resolveChatActivityContext(user, chatId) {
   // Legacy direct chats were created before settings.kind was consistently set.
   // Treat empty kind as a regular private DM, but keep all explicit non-DM
   // private service chats (support/reserved/etc.) out of typing/activity relay.
-  if (kind && kind !== "direct_message") return null;
+  if (kind && kind !== "direct_message" && kind !== "discussions") return null;
   const allowed = await canUserAccessChat(user, chatId);
   if (!allowed) return null;
   const memberUserIds = [

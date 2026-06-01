@@ -30,6 +30,12 @@ const IMAGE_PROFILE_BY_KIND = {
     cardWidth: 512,
     detailWidth: 1024,
   },
+  chat_avatars: {
+    maxOriginalWidth: 1400,
+    thumbWidth: 160,
+    cardWidth: 512,
+    detailWidth: 1024,
+  },
 };
 
 function cleanString(rawValue) {

@@ -3,18 +3,20 @@ const path = require('path');
 const db = require('../db');
 const { uploadsRoot } = require('./storagePaths');
 
-const PUBLIC_UPLOAD_KINDS = new Set(['products', 'channels', 'users', 'claims']);
+const PUBLIC_UPLOAD_KINDS = new Set(['products', 'channels', 'users', 'claims', 'chat_avatars']);
 const DEFAULT_VARIANT_BY_KIND = {
   products: 'card',
   claims: 'card',
   users: 'thumb',
   channels: 'thumb',
+  chat_avatars: 'thumb',
 };
 const PUBLIC_PLACEHOLDER_BY_KIND = {
   products: '/uploads/products/demo-placeholder.png',
   claims: '/uploads/claims/public-media-unavailable.png',
   users: '/uploads/chat_media/images/media-unavailable.png',
   channels: '/uploads/chat_media/images/media-unavailable.png',
+  chat_avatars: '/uploads/chat_media/images/media-unavailable.png',
 };
 const PUBLIC_FIELD_HINTS = [
   { pattern: /(^|_)avatar_url$/i, preferredVariant: 'thumb' },
@@ -43,7 +45,7 @@ function normalizePublicUploadRef(rawValue) {
   if (!raw) return null;
 
   const match = raw.match(
-    /^(https?:\/\/[^/?#\s]+)?\/uploads\/(products|channels|users|claims)\/([^?#\s]+(?:\/[^?#\s]+)*)(?:\?[^#\s]*)?(?:#.*)?$/i,
+    /^(https?:\/\/[^/?#\s]+)?\/uploads\/(products|channels|users|claims|chat_avatars)\/([^?#\s]+(?:\/[^?#\s]+)*)(?:\?[^#\s]*)?(?:#.*)?$/i,
   );
   if (!match) return null;
 
