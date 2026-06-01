@@ -31,6 +31,7 @@ const CHANNEL_PUBLICATION_TENANT_CACHE_MS = Math.max(
 );
 const SAMARA_TZ = 'Europe/Samara';
 const PROCESSOR_ID = process.env.FENIX_CHANNEL_PUBLICATION_PROCESSOR_ID || `api:${process.pid}`;
+const PUBLICATION_DEBUG_LOGS = process.env.PHX_PUBLICATION_DEBUG_LOGS === '1';
 
 let processorTimer = null;
 let processorTickRunning = false;
@@ -38,6 +39,15 @@ let processorStarted = false;
 let processorTenantTargetsCache = [];
 let processorTenantTargetsCacheExpiresAt = 0;
 let processorScopeCursor = 0;
+
+function publicationDebug(label, details = {}) {
+  if (!PUBLICATION_DEBUG_LOGS) return;
+  try {
+    console.log(`[PHX:PUBLISH] ${new Date().toISOString()} ${label}`, details);
+  } catch (_) {
+    console.log(`[PHX:PUBLISH] ${new Date().toISOString()} ${label}`);
+  }
+}
 
 function normalizeQueueUuidList(raw) {
   if (!Array.isArray(raw)) return [];
@@ -66,14 +76,19 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
-function buildPublicationChatMessagePayload(message, { action = 'message_published', queueId = null } = {}) {
+function buildPublicationChatMessagePayload(
+  message,
+  { action = 'message_published', queueId = null, tenantId = null } = {},
+) {
   if (!message || typeof message !== 'object') return null;
   const chatId = String(message.chat_id || message.chatId || '').trim();
   const messageId = String(message.id || '').trim();
   if (!chatId || !messageId) return null;
   const updatedAt = message.updated_at || message.created_at || new Date().toISOString();
   return {
+    type: 'chat:message',
     event_id: `chat-message:${messageId}:${action}`,
+    tenant_id: tenantId || message.tenant_id || message.tenantId || null,
     entity: 'chat_message',
     entity_id: messageId,
     action,
@@ -87,15 +102,38 @@ function buildPublicationChatMessagePayload(message, { action = 'message_publish
 }
 
 function emitPublicationChatMessage(socketIo, tenantId, message, options = {}) {
-  const payload = buildPublicationChatMessagePayload(message, options);
+  const payload = buildPublicationChatMessagePayload(message, {
+    ...options,
+    tenantId: tenantId || options.tenantId || null,
+  });
   if (!socketIo || !payload) return;
+  const chatRoom = `chat:${payload.chat_id}`;
+  const tenantRoom = tenantId ? `tenant:${tenantId}` : null;
+  const chatRoomSize = socketIo.sockets?.adapter?.rooms?.get(chatRoom)?.size || 0;
+  const tenantRoomSize = tenantRoom
+    ? socketIo.sockets?.adapter?.rooms?.get(tenantRoom)?.size || 0
+    : 0;
+  publicationDebug('emit chat:message', {
+    action: payload.action,
+    tenant_id: payload.tenant_id,
+    tenant_room: tenantRoom,
+    tenant_room_sockets: tenantRoomSize,
+    chat_id: payload.chat_id,
+    chat_room: chatRoom,
+    chat_room_sockets: chatRoomSize,
+    message_id: payload.message_id,
+    queue_id: payload.queue_id,
+    event_id: payload.event_id,
+  });
 
   // Primary path: sockets that explicitly joined the currently opened chat.
-  socketIo.to(`chat:${payload.chat_id}`).emit('chat:message', payload);
+  socketIo.to(chatRoom).emit('chat:message', payload);
+  socketIo.to(chatRoom).emit('chat:message:global', payload);
 
   // Fallback path: channel publication can happen while the UI is already open.
   // Tenant-scoped delivery prevents "post exists after refresh, but not live" gaps.
   emitToTenant(socketIo, tenantId || null, 'chat:message', payload);
+  emitToTenant(socketIo, tenantId || null, 'chat:message:global', payload);
 }
 
 function archivedProductMessageText({
@@ -106,7 +144,11 @@ function archivedProductMessageText({
   queuedByPhone,
 }) {
   const creator = queuedByName || queuedByEmail || 'Неизвестно';
-  const productLabel = formatProductLabel(product.product_code, product.shelf_number);
+  const productLabel = formatProductLabel(
+    product.product_code,
+    product.shelf_number,
+    product.manual_shelf_label,
+  );
   const lines = [
     '🗂 Архив поста товара',
     `Название: ${product.title}`,
@@ -121,13 +163,16 @@ function archivedProductMessageText({
   return lines.join('\n');
 }
 
-function formatProductLabel(productCode, shelfNumber) {
+function formatProductLabel(productCode, shelfNumber, manualShelfLabel = '') {
   const code = Number(productCode);
   const shelf = Number(shelfNumber);
   const codePart = Number.isFinite(code) && code > 0 ? String(Math.floor(code)) : '—';
-  const shelfPart = Number.isFinite(shelf) && shelf > 0
-    ? String(Math.floor(shelf)).padStart(2, '0')
-    : '—';
+  const manualShelf = String(manualShelfLabel || '').trim();
+  const shelfPart = manualShelf || (
+    Number.isFinite(shelf) && shelf > 0
+      ? String(Math.floor(shelf)).padStart(2, '0')
+      : '—'
+  );
   return `${codePart}--${shelfPart}`;
 }
 
@@ -441,6 +486,14 @@ async function enqueueChannelPublicationBatches({
   intervalMs = DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
 } = {}) {
   const normalizedQueueIds = normalizeQueueUuidList(queueIds);
+  publicationDebug('enqueue requested', {
+    tenant_id: tenantId || null,
+    created_by: createdBy || null,
+    channel_id: channelId || null,
+    requested_queue_ids: Array.isArray(queueIds) ? queueIds.length : 0,
+    normalized_queue_ids: normalizedQueueIds.length,
+    interval_ms: intervalMs,
+  });
   const params = [];
   let paramIndex = 1;
   const conditions = [
@@ -479,6 +532,13 @@ async function enqueueChannelPublicationBatches({
      FOR UPDATE OF q`,
     params,
   );
+  publicationDebug('enqueue eligible rows loaded', {
+    tenant_id: tenantId || null,
+    channel_id: channelId || null,
+    eligible_count: eligibleQ.rowCount,
+    queue_ids: eligibleQ.rows.map((row) => row.id),
+    product_ids: eligibleQ.rows.map((row) => row.product_id),
+  });
 
   const grouped = new Map();
   for (const row of eligibleQ.rows) {
@@ -511,6 +571,15 @@ async function enqueueChannelPublicationBatches({
       [group.channel_id],
     );
     if (activeBatchQ.rowCount > 0) {
+      publicationDebug('enqueue skipped: channel already has active batch', {
+        channel_id: group.channel_id,
+        channel_title: group.channel_title,
+        active_batch_id: activeBatchQ.rows[0].id,
+        active_status: activeBatchQ.rows[0].status,
+        total_count: Number(activeBatchQ.rows[0].total_count || 0),
+        published_count: Number(activeBatchQ.rows[0].published_count || 0),
+        failed_count: Number(activeBatchQ.rows[0].failed_count || 0),
+      });
       alreadyRunningChannels.push({
         batch_id: activeBatchQ.rows[0].id,
         channel_id: group.channel_id,
@@ -586,6 +655,17 @@ async function enqueueChannelPublicationBatches({
     );
 
     acceptedCount += group.items.length;
+    publicationDebug('enqueue batch created', {
+      batch_id: batchId,
+      tenant_id: group.tenant_id || null,
+      channel_id: group.channel_id,
+      channel_title: group.channel_title,
+      item_count: group.items.length,
+      queue_ids: queueIdsForBatch,
+      publish_orders: publishOrders,
+      interval_ms: Math.max(1000, Number(intervalMs || DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS)),
+      first_product_title: firstProductTitle || null,
+    });
     batches.push({
       batch_id: batchId,
       channel_id: group.channel_id,
@@ -599,6 +679,14 @@ async function enqueueChannelPublicationBatches({
       status: 'queued',
     });
   }
+
+  publicationDebug('enqueue finished', {
+    tenant_id: tenantId || null,
+    accepted_count: acceptedCount,
+    batch_count: batches.length,
+    already_running_count: alreadyRunningChannels.length,
+    interval_ms: Math.max(1000, Number(intervalMs || DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS)),
+  });
 
   return {
     accepted_count: acceptedCount,
@@ -821,6 +909,17 @@ async function selectDueBatch(client, tenantId = null) {
 
 async function processBatchItem(client, batch) {
   await recoverStalePublicationItems(client, batch.id);
+  publicationDebug('process batch item: looking for next queued item', {
+    batch_id: batch.id,
+    tenant_id: batch.tenant_id || null,
+    channel_id: batch.channel_id || null,
+    status: batch.status,
+    interval_ms: batch.interval_ms,
+    published_count: Number(batch.published_count || 0),
+    failed_count: Number(batch.failed_count || 0),
+    total_count: Number(batch.total_count || 0),
+    next_publish_at: batch.next_publish_at || null,
+  });
 
   const nextItemQ = await client.query(
     `SELECT q.id,
@@ -837,6 +936,9 @@ async function processBatchItem(client, batch) {
             p.price,
             p.quantity,
             p.shelf_number,
+            p.manual_shelf_label,
+            p.shelf_floor,
+            p.pickup_only,
             p.image_url,
             p.product_code,
             c.title AS channel_title,
@@ -865,6 +967,10 @@ async function processBatchItem(client, batch) {
 
   if (nextItemQ.rowCount === 0) {
     const finalized = await finalizeBatch(client, batch.id);
+    publicationDebug('process batch item: no queued item', {
+      batch_id: batch.id,
+      finalized,
+    });
     return {
       processed: finalized,
       kind: finalized ? 'batch_finalized' : 'idle',
@@ -872,6 +978,19 @@ async function processBatchItem(client, batch) {
   }
 
   const row = nextItemQ.rows[0];
+  publicationDebug('process batch item: selected queue item', {
+    batch_id: batch.id,
+    tenant_id: batch.tenant_id || null,
+    channel_id: row.channel_id,
+    queue_item_id: row.id,
+    product_id: row.product_id,
+    product_code: row.product_code,
+    publish_order: row.publish_order,
+    title: row.title,
+    shelf_number: row.shelf_number,
+    manual_shelf_label: row.manual_shelf_label,
+    pickup_only: row.pickup_only,
+  });
   await client.query(
     `UPDATE channel_publication_batches
      SET status = 'running',
@@ -944,6 +1063,14 @@ async function processBatchItem(client, batch) {
     const nextImageUrl = payload.image_url
       ? toOriginalPublicMediaUrl(payload.image_url)
       : row.image_url || null;
+    const nextManualShelfLabel = String(
+      payload.manual_shelf_label ?? row.manual_shelf_label ?? '',
+    ).trim();
+    const nextShelfFloor = String(payload.shelf_floor ?? row.shelf_floor ?? '').trim();
+    const nextPickupOnly =
+      payload.pickup_only === true ||
+      String(payload.pickup_only || '').toLowerCase().trim() === 'true' ||
+      row.pickup_only === true;
 
     let productUpdate = null;
     for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -956,12 +1083,16 @@ async function processBatchItem(client, batch) {
                price = $4,
                quantity = $5,
                shelf_number = $6,
-               image_url = $7,
+               manual_shelf_label = NULLIF($7, ''),
+               shelf_floor = NULLIF($8, ''),
+               pickup_only = $9,
+               image_url = $10,
                status = 'published',
                reusable_at = NULL,
                updated_at = now()
-           WHERE id = $8
-           RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status, updated_at`,
+           WHERE id = $11
+           RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+                     title, description, price, quantity, image_url, status, updated_at`,
           [
             code,
             nextTitle,
@@ -969,6 +1100,9 @@ async function processBatchItem(client, batch) {
             nextPrice,
             nextQuantity,
             nextShelfNumber,
+            nextManualShelfLabel,
+            nextShelfFloor,
+            nextPickupOnly,
             nextImageUrl,
             row.product_id,
           ],
@@ -1002,10 +1136,17 @@ async function processBatchItem(client, batch) {
       kind: 'catalog_product',
       product_id: product.id,
       product_code: product.product_code,
-      product_label: formatProductLabel(product.product_code, product.shelf_number),
+      product_label: formatProductLabel(
+        product.product_code,
+        product.shelf_number,
+        product.manual_shelf_label,
+      ),
       price: Number(product.price),
       quantity: Number(product.quantity),
       shelf_number: Number(product.shelf_number),
+      manual_shelf_label: product.manual_shelf_label || null,
+      shelf_floor: product.shelf_floor || null,
+      pickup_only: product.pickup_only === true,
       image_url: product.image_url,
       card_snapshot: productCardSnapshot,
     };
@@ -1022,6 +1163,18 @@ async function processBatchItem(client, batch) {
       ],
     );
     const message = messageInsert.rows[0];
+    publicationDebug('process batch item: main channel message inserted', {
+      batch_id: batch.id,
+      tenant_id: batch.tenant_id || null,
+      channel_id: row.channel_id,
+      queue_item_id: row.id,
+      product_id: product.id,
+      message_id: message.id,
+      message_created_at: message.created_at,
+      product_code: product.product_code,
+      product_label: messageMeta.product_label,
+      title: product.title,
+    });
     await upsertMessageSearchDocument({
       queryable: client,
       messageId: message.id,
@@ -1068,10 +1221,17 @@ async function processBatchItem(client, batch) {
         kind: 'catalog_product_archive',
         product_id: product.id,
         product_code: product.product_code,
-        product_label: formatProductLabel(product.product_code, product.shelf_number),
+        product_label: formatProductLabel(
+          product.product_code,
+          product.shelf_number,
+          product.manual_shelf_label,
+        ),
         price: Number(product.price),
         quantity: Number(product.quantity),
         shelf_number: Number(product.shelf_number),
+        manual_shelf_label: product.manual_shelf_label || null,
+        shelf_floor: product.shelf_floor || null,
+        pickup_only: product.pickup_only === true,
         image_url: product.image_url,
         source_channel_id: row.channel_id,
         source_channel_title: row.channel_title,
@@ -1176,6 +1336,16 @@ async function processBatchItem(client, batch) {
     }
 
     await client.query('RELEASE SAVEPOINT publish_batch_item');
+    publicationDebug('process batch item: published successfully', {
+      batch_id: batch.id,
+      tenant_id: batch.tenant_id || null,
+      channel_id: row.channel_id,
+      queue_item_id: row.id,
+      product_id: product.id,
+      message_id: message.id,
+      remaining_count: remainingCount,
+      next_publish_delay_ms: remainingCount > 0 ? batch.interval_ms : 0,
+    });
 
     return {
       processed: true,
@@ -1194,6 +1364,16 @@ async function processBatchItem(client, batch) {
       throw rollbackError;
     }
     const normalized = normalizePublicationError(error);
+    publicationDebug('process batch item: failed', {
+      batch_id: batch.id,
+      tenant_id: batch.tenant_id || null,
+      channel_id: row.channel_id,
+      queue_item_id: row.id,
+      product_id: row.product_id,
+      error_code: normalized.code,
+      error_message: normalized.message,
+      stack: String(error?.stack || '').split('\n').slice(0, 6).join('\n'),
+    });
     const remainingQ = await client.query(
       `SELECT COUNT(*)::int AS remaining_count
        FROM product_publication_queue
@@ -1290,6 +1470,7 @@ function emitProcessedPublicationResult(result, io = null) {
         action: 'message_published',
         message_id: result.emitted.mainMessage.id,
         queue_id: result.queueItemId || null,
+        message: result.emitted.mainMessage,
       });
     }
     for (const archiveMessage of result.emitted.archiveMessages || []) {
@@ -1355,8 +1536,28 @@ async function processNextChannelPublicationStepForScope(scope, { io = null } = 
         await client.query('ROLLBACK');
         return null;
       }
+      publicationDebug('processor selected due batch', {
+        tenant_id: scopeTenantId,
+        tenant_code: String(scope?.code || '').trim() || null,
+        batch_id: batch.id,
+        channel_id: batch.channel_id,
+        status: batch.status,
+        next_publish_at: batch.next_publish_at || null,
+        published_count: Number(batch.published_count || 0),
+        failed_count: Number(batch.failed_count || 0),
+        total_count: Number(batch.total_count || 0),
+      });
       const result = await processBatchItem(client, batch);
       await client.query('COMMIT');
+      publicationDebug('processor committed batch step', {
+        tenant_id: scopeTenantId,
+        batch_id: batch.id,
+        kind: result?.kind || null,
+        processed: result?.processed === true,
+        channel_id: result?.channelId || batch.channel_id || null,
+        queue_item_id: result?.queueItemId || null,
+        message_id: result?.emitted?.mainMessage?.id || null,
+      });
       emitProcessedPublicationResult(result, io);
       return result;
     } catch (error) {
@@ -1416,6 +1617,11 @@ async function runProcessorTick(io = null) {
 function startChannelPublicationProcessor({ io = null } = {}) {
   if (processorStarted) return;
   processorStarted = true;
+  publicationDebug('processor started', {
+    worker_id: PROCESSOR_ID,
+    poll_ms: CHANNEL_PUBLICATION_POLL_MS,
+    recovery_ms: CHANNEL_PUBLICATION_RECOVERY_MS,
+  });
   processorTimer = setInterval(() => {
     void runProcessorTick(io);
   }, CHANNEL_PUBLICATION_POLL_MS);
@@ -1428,6 +1634,9 @@ function startChannelPublicationProcessor({ io = null } = {}) {
 }
 
 function kickChannelPublicationProcessor(io = null) {
+  publicationDebug('processor kick requested', {
+    worker_id: PROCESSOR_ID,
+  });
   setImmediate(() => {
     void runProcessorTick(io);
   });

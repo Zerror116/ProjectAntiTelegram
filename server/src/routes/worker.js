@@ -9,7 +9,7 @@ const router = express.Router();
 const db = require('../db');
 const { authMiddleware } = require('../utils/auth');
 const { requireRole } = require('../utils/roles');
-const { ensureSystemChannels } = require('../utils/systemChannels');
+const { ensureSystemChannels, insertAdminSystemMessage } = require('../utils/systemChannels');
 const { emitToTenant } = require('../utils/socket');
 const { emitCatalogQueueUpdated } = require('../utils/catalogQueueSocket');
 const { encryptMessageText, decryptMessageRow } = require('../utils/messageCrypto');
@@ -18,6 +18,7 @@ const { uploadsPath } = require('../utils/storagePaths');
 const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
 const { upsertProductCardSnapshot } = require('../utils/productCardSnapshots');
 const { normalizeCatalogTitle } = require('../utils/catalogTitle');
+const { getTenantFeatureSettings } = require('../utils/tenantFeatureSettings');
 const {
   toOriginalPublicMediaUrl,
   normalizePublicUploadRef,
@@ -44,6 +45,19 @@ const allowedImageExtensions = new Set([
   '.heif',
   '.avif',
 ]);
+
+function parseBooleanFormValue(value) {
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value ?? '').toLowerCase().trim();
+  return ['1', 'true', 'yes', 'on', 'y', 'да'].includes(normalized);
+}
+
+function normalizeFreeShelfText(value, maxLength = 80) {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
 
 function isAcceptedProductImage(file) {
   const mime = String(file?.mimetype || '')
@@ -285,13 +299,16 @@ async function resolveAutoShelfNumber(
   return (diffDays % 10) + 1;
 }
 
-function formatProductLabel(productCode, shelfNumber) {
+function formatProductLabel(productCode, shelfNumber, manualShelfLabel = "") {
   const code = Number(productCode);
   const shelf = Number(shelfNumber);
   const codePart = Number.isFinite(code) && code > 0 ? String(Math.floor(code)) : '—';
-  const shelfPart = Number.isFinite(shelf) && shelf > 0
-    ? String(Math.floor(shelf)).padStart(2, '0')
-    : '—';
+  const manualShelf = String(manualShelfLabel || "").trim();
+  const shelfPart = manualShelf || (
+    Number.isFinite(shelf) && shelf > 0
+      ? String(Math.floor(shelf)).padStart(2, '0')
+      : '—'
+  );
   return `${codePart}--${shelfPart}`;
 }
 
@@ -325,6 +342,19 @@ function productMessageText(product) {
   return lines.join('\n');
 }
 
+function buildRevisionDeleteRequestText({ workerName, productTitle, productLabel, reason }) {
+  return [
+    'Рабочий запросил удаление товара из ревизии.',
+    `Рабочий: ${String(workerName || 'Сотрудник').trim() || 'Сотрудник'}`,
+    `Товар: ${String(productTitle || 'Без названия').trim() || 'Без названия'}`,
+    productLabel ? `ID: ${productLabel}` : null,
+    reason ? `Причина: ${reason}` : null,
+    'Проверьте запрос и подтвердите или отклоните удаление.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     String(value || '').trim(),
@@ -346,6 +376,20 @@ async function resolveActorUserId(queryable, user) {
   const normalizedName = String(user?.name || '').trim();
   const role = normalizeUserRoleForInsert(user?.base_role || user?.role);
   const tenantId = isUuid(user?.tenant_id) ? String(user.tenant_id).trim() : null;
+
+  const tenantContext = db.currentTenantContext?.();
+  const tenantScope = tenantContext?.tenant || null;
+  if (
+    isUuid(tokenUserId) &&
+    user?.is_platform_creator === true &&
+    tenantScope &&
+    !db.isIsolatedTenantRow(tenantScope) &&
+    !db.isSchemaIsolatedTenantRow(tenantScope)
+  ) {
+    // Shared tenants use the platform users table. The creator already exists
+    // globally, but RLS can hide that row inside another tenant scope.
+    return tokenUserId;
+  }
 
   if (isUuid(tokenUserId)) {
     const byId = await queryable.query(
@@ -1415,6 +1459,15 @@ router.post(
             price,
             quantity = 1,
           } = req.body || {};
+          const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+          const manualShelfLabel = tenantSettings.manual_shelf_enabled
+            ? normalizeFreeShelfText(req.body?.manual_shelf_label)
+            : '';
+          const shelfFloor = tenantSettings.manual_shelf_enabled
+            ? normalizeFreeShelfText(req.body?.shelf_floor)
+            : '';
+          const pickupOnly =
+            tenantSettings.pickup_only_enabled && parseBooleanFormValue(req.body?.pickup_only);
 
           const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
           const normalizedTitle = normalizeCatalogTitle(title);
@@ -1464,9 +1517,14 @@ router.post(
           const code = await allocateProductCode(client, req.user?.tenant_id || null);
 
           const productInsert = await client.query(
-            `INSERT INTO products (id, title, description, price, quantity, shelf_number, image_url, created_by, status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', now(), now())
-             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+            `INSERT INTO products (
+               id, title, description, price, quantity, shelf_number,
+               manual_shelf_label, shelf_floor, pickup_only,
+               image_url, created_by, status, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, $11, 'draft', now(), now())
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+                       title, description, price, quantity, image_url, status`,
             [
               uuidv4(),
               normalizedTitle,
@@ -1474,6 +1532,9 @@ router.post(
               normalizedPrice,
               normalizedQuantity,
               normalizedShelfNumber,
+              manualShelfLabel,
+              shelfFloor,
+              pickupOnly,
               imageUrl,
               actorUserId,
             ]
@@ -1484,7 +1545,8 @@ router.post(
              SET product_code = $1,
                  updated_at = now()
              WHERE id = $2
-             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+                       title, description, price, quantity, image_url, status`,
             [code, productId]
           );
           const product = productCodeUpdate.rows[0];
@@ -1507,15 +1569,18 @@ router.post(
             price: Number(product.price),
             quantity: Number(product.quantity),
             shelf_number: Number(product.shelf_number),
+            manual_shelf_label: product.manual_shelf_label || null,
+            shelf_floor: product.shelf_floor || null,
+            pickup_only: product.pickup_only === true,
             image_url: product.image_url,
             card_snapshot: cardSnapshot,
           };
 
           const queueInsert = await client.query(
-            `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
-             VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
+            `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, created_at)
+             VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, now())
              RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-            [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
+            [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), pickupOnly]
           );
 
           await client.query('COMMIT');
@@ -1537,7 +1602,11 @@ router.post(
               queue: queueInsert.rows[0],
               product,
               card_snapshot: cardSnapshot,
-              product_label: formatProductLabel(product.product_code, product.shelf_number),
+              product_label: formatProductLabel(
+                product.product_code,
+                product.shelf_number,
+                product.manual_shelf_label,
+              ),
               message: 'Товар отправлен в очередь. Пост появится после подтверждения админом/создателем.',
             },
           });
@@ -1583,6 +1652,7 @@ router.post(
           } = req.body || {};
           const shouldMergePending =
             merge_pending === true || String(merge_pending || '').toLowerCase() === 'true';
+          const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
 
           if (!channel_id) {
             removeUploadedFile(req.file);
@@ -1598,7 +1668,8 @@ router.post(
           const targetChannelId = String(mainChannel.id);
 
           const productQ = await client.query(
-            `SELECT id, product_code, shelf_number, title, description, price, quantity, image_url
+            `SELECT id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+                    title, description, price, quantity, image_url
              FROM products
              WHERE id = $1
                AND EXISTS (
@@ -1648,6 +1719,18 @@ router.post(
             null,
             1
           );
+          const nextManualShelfLabel = tenantSettings.manual_shelf_enabled &&
+            Object.prototype.hasOwnProperty.call(req.body || {}, 'manual_shelf_label')
+              ? normalizeFreeShelfText(req.body?.manual_shelf_label)
+              : String(current.manual_shelf_label || '').trim();
+          const nextShelfFloor = tenantSettings.manual_shelf_enabled &&
+            Object.prototype.hasOwnProperty.call(req.body || {}, 'shelf_floor')
+              ? normalizeFreeShelfText(req.body?.shelf_floor)
+              : String(current.shelf_floor || '').trim();
+          const nextPickupOnly = tenantSettings.pickup_only_enabled &&
+            Object.prototype.hasOwnProperty.call(req.body || {}, 'pickup_only')
+              ? parseBooleanFormValue(req.body?.pickup_only)
+              : current.pickup_only === true;
           let nextImageUrl = current.image_url;
           if (req.file) {
             nextImageUrl = toAbsoluteImageUrl(req, req.file);
@@ -1693,18 +1776,25 @@ router.post(
                  price = $3,
                  quantity = $4,
                  shelf_number = $5,
-                 image_url = $6,
-                 product_code = $7,
+                 manual_shelf_label = NULLIF($6, ''),
+                 shelf_floor = NULLIF($7, ''),
+                 pickup_only = $8,
+                 image_url = $9,
+                 product_code = $10,
                  status = 'draft',
                  updated_at = now()
-             WHERE id = $8
-             RETURNING id, product_code, shelf_number, title, description, price, quantity, image_url, status`,
+             WHERE id = $11
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+                       title, description, price, quantity, image_url, status`,
             [
               nextTitle,
               nextDescription,
               nextPrice,
               Math.floor(nextQuantity),
               Math.floor(nextShelfNumber),
+              nextManualShelfLabel,
+              nextShelfFloor,
+              nextPickupOnly,
               nextImageUrl,
               nextCode,
               productId,
@@ -1730,6 +1820,9 @@ router.post(
             price: Number(product.price),
             quantity: Number(product.quantity),
             shelf_number: Number(product.shelf_number),
+            manual_shelf_label: product.manual_shelf_label || null,
+            shelf_floor: product.shelf_floor || null,
+            pickup_only: product.pickup_only === true,
             image_url: product.image_url,
             card_snapshot: cardSnapshot,
           };
@@ -1754,10 +1847,11 @@ router.post(
               const mergedQueue = await client.query(
                 `UPDATE product_publication_queue
                  SET payload = $2::jsonb,
+                     pickup_only = $3,
                      created_at = now()
                  WHERE id = $1
                  RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-                [queueId, JSON.stringify(payload)]
+                [queueId, JSON.stringify(payload), product.pickup_only === true]
               );
               queueRow = mergedQueue.rows[0];
 
@@ -1778,10 +1872,10 @@ router.post(
 
           if (!queueRow) {
             const queueInsert = await client.query(
-              `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, created_at)
-               VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, now())
+              `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, created_at)
+               VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, now())
                RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-              [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload)]
+              [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), product.pickup_only === true]
             );
             queueRow = queueInsert.rows[0];
           }
@@ -1805,7 +1899,11 @@ router.post(
               queue: queueRow,
               product,
               card_snapshot: cardSnapshot,
-              product_label: formatProductLabel(product.product_code, product.shelf_number),
+              product_label: formatProductLabel(
+                product.product_code,
+                product.shelf_number,
+                product.manual_shelf_label,
+              ),
               message: 'Товар переотправлен в очередь',
             },
           });
@@ -1845,11 +1943,14 @@ router.get(
                   q.is_sent,
                   COALESCE(q.publish_status, 'pending') AS publish_status,
                   q.payload,
-                  q.created_at,
-                  c.title AS channel_title,
-                  p.product_code,
-                  p.shelf_number AS product_shelf_number,
-                  COALESCE(NULLIF(BTRIM(q.payload->>'title'), ''), p.title) AS product_title,
+	                  q.created_at,
+	                  c.title AS channel_title,
+	                  p.product_code,
+	                  p.shelf_number AS product_shelf_number,
+	                  p.manual_shelf_label,
+	                  p.shelf_floor,
+	                  COALESCE(q.pickup_only, p.pickup_only, false) AS pickup_only,
+	                  COALESCE(NULLIF(BTRIM(q.payload->>'title'), ''), p.title) AS product_title,
                   COALESCE(NULLIF(BTRIM(q.payload->>'description'), ''), p.description) AS product_description,
                   COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
                   COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
@@ -2233,6 +2334,131 @@ router.get(
         await client.query('ROLLBACK');
       } catch (_) {}
       console.error('worker.revision.posts error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.post(
+  '/revision/delete-request',
+  authMiddleware,
+  requireRole('worker', 'admin', 'tenant', 'creator'),
+  async (req, res) => {
+    const productId = String(req.body?.product_id || '').trim();
+    const channelIdFromBody = String(req.body?.channel_id || '').trim();
+    const messageId = String(req.body?.message_id || '').trim();
+    const reason = normalizeFreeShelfText(req.body?.reason, 500);
+    if (!isUuid(productId)) {
+      return res.status(400).json({ ok: false, error: 'product_id обязателен' });
+    }
+
+    const client = await db.pool.connect();
+    try {
+      const actorUserId = await resolveActorUserId(client, req.user);
+      const tenantId = req.user?.tenant_id || null;
+      const settings = await getTenantFeatureSettings(tenantId);
+      if (settings.revision_delete_approval_enabled !== true) {
+        return res.status(403).json({
+          ok: false,
+          error: 'Удаление через ревизию недоступно для этой группы',
+        });
+      }
+
+      await client.query('BEGIN');
+      const { mainChannel } = await ensureSystemChannels(client, actorUserId, tenantId);
+      const channelId = isUuid(channelIdFromBody) ? channelIdFromBody : mainChannel.id;
+      const productQ = await client.query(
+        `SELECT p.id,
+                p.product_code,
+                p.shelf_number,
+                p.manual_shelf_label,
+                p.title,
+                p.image_url,
+                COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Сотрудник') AS worker_name
+         FROM products p
+         LEFT JOIN users u ON u.id = $2::uuid
+         WHERE p.id = $1::uuid
+         LIMIT 1`,
+        [productId, actorUserId],
+      );
+      if (productQ.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ ok: false, error: 'Товар не найден' });
+      }
+      const product = productQ.rows[0];
+      const existingQ = await client.query(
+        `SELECT id, status
+         FROM revision_delete_requests
+         WHERE product_id = $1::uuid
+           AND status = 'pending'
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [productId],
+      );
+      if (existingQ.rowCount > 0) {
+        await client.query('COMMIT');
+        return res.json({
+          ok: true,
+          data: existingQ.rows[0],
+          message: 'Запрос на удаление уже ожидает решения администратора',
+        });
+      }
+
+      const requestQ = await client.query(
+        `INSERT INTO revision_delete_requests (
+           tenant_id, worker_id, product_id, queue_id, channel_id, reason,
+           status, created_at, updated_at
+         )
+         VALUES ($1, $2, $3, NULL, $4, $5, 'pending', now(), now())
+         RETURNING id, tenant_id, worker_id, product_id, channel_id, reason,
+                   status, created_at, updated_at`,
+        [tenantId, actorUserId, productId, channelId, reason],
+      );
+      const requestRow = requestQ.rows[0];
+      const productLabel = formatProductLabel(
+        product.product_code,
+        product.shelf_number,
+        product.manual_shelf_label,
+      );
+      await insertAdminSystemMessage(client, {
+        tenantId,
+        createdBy: actorUserId,
+        text: buildRevisionDeleteRequestText({
+          workerName: product.worker_name,
+          productTitle: product.title,
+          productLabel,
+          reason,
+        }),
+        meta: {
+          kind: 'revision_delete_request',
+          request_id: requestRow.id,
+          product_id: productId,
+          channel_id: channelId,
+          message_id: messageId || null,
+          product_label: productLabel,
+          product_title: product.title,
+          image_url: product.image_url || null,
+          reason,
+          action: 'review_revision_delete',
+        },
+        dedupeKey: `revision_delete_request:${requestRow.id}`,
+      });
+      await client.query('COMMIT');
+
+      emitToTenant(req.app.get('io'), tenantId, 'revision:delete-request:updated', {
+        entity: 'revision_delete_request',
+        entity_id: requestRow.id,
+        action: 'created',
+        request: requestRow,
+      });
+      return res.status(201).json({ ok: true, data: requestRow });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('worker.revision.deleteRequest error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
     } finally {
       client.release();

@@ -88,6 +88,9 @@ const { queueChatMessageWebPushForRooms } = require("./utils/webPush");
 const {
   startChannelPublicationProcessor,
 } = require("./utils/channelPublicationQueue");
+const {
+  startAutoProductProcessing,
+} = require("./utils/autoProductProcessing");
 
 if (!global.__fenixProcessMonitoringHooksInstalled) {
   global.__fenixProcessMonitoringHooksInstalled = true;
@@ -957,6 +960,7 @@ async function resolveChatActivityContext(user, chatId) {
     global.__projectPhoenixSocketIo = io;
     patchSocketEmittersWithSignedUploads(io);
     startChannelPublicationProcessor({ io });
+    startAutoProductProcessing({ io });
     console.log("✅ Socket.io initialized");
     if (typeof deliveryRoutes.startBackgroundTasks === "function") {
       deliveryRoutes.startBackgroundTasks(io);

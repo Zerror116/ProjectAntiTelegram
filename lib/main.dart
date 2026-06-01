@@ -5,6 +5,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -25,6 +26,7 @@ import 'services/notification_open_tracker_service.dart';
 import 'services/notification_runtime_preference_service.dart';
 import 'services/offline_purchase_queue_service.dart';
 import 'services/startup_bootstrap_bridge.dart';
+import 'services/sticker_print_service.dart';
 import 'services/web_notification_service.dart';
 import 'services/web_push_client_service.dart';
 import 'src/utils/media_url.dart';
@@ -122,6 +124,8 @@ DateTime? _lastSocketDisconnectedAt;
 String _lastSocketDisconnectReason = '';
 String _lastSocketConnectError = '';
 final Map<String, DateTime> _recentRealtimeEventKeys = <String, DateTime>{};
+final Set<String> _activeStickerPrintJobIds = <String>{};
+bool _stickerPrintPendingLoadInProgress = false;
 const Duration _realtimeEventDedupeTtl = Duration(seconds: 45);
 const bool _verboseSocketLogs = bool.fromEnvironment(
   'FENIX_VERBOSE_SOCKET_LOGS',
@@ -160,8 +164,9 @@ bool _socketEventTenantMatches(Map<String, dynamic>? data) {
   final currentTenant = _normalizeRealtimeText(
     authService.currentUser?.tenantId,
   );
-  final currentRole = _normalizeRealtimeText(authService.currentUser?.role)
-      .toLowerCase();
+  final currentRole = _normalizeRealtimeText(
+    authService.currentUser?.role,
+  ).toLowerCase();
   final creatorTenantScope = _normalizeRealtimeText(
     authService.creatorTenantScopeCode,
   );
@@ -230,6 +235,98 @@ bool _shouldDispatchSocketEvent(String type, dynamic data) {
 void _dispatchSocketEvent(String type, dynamic data) {
   if (!_shouldDispatchSocketEvent(type, data)) return;
   chatEventsController.add({'type': type, 'data': data});
+}
+
+Map<String, dynamic> _mapFromDynamic(dynamic raw) {
+  if (raw is Map) return Map<String, dynamic>.from(raw);
+  return <String, dynamic>{};
+}
+
+Future<void> _markStickerPrintJob(
+  String jobId,
+  String action, {
+  String error = '',
+}) async {
+  if (jobId.trim().isEmpty) return;
+  try {
+    await dio.post(
+      '/api/admin/delivery/sticker-print-jobs/$jobId/$action',
+      data: error.trim().isEmpty ? null : {'error': error.trim()},
+    );
+  } catch (e) {
+    debugPrint('mark sticker print job error: $e');
+  }
+}
+
+Future<bool> _claimStickerPrintJob(String jobId) async {
+  if (jobId.trim().isEmpty) return false;
+  try {
+    final resp = await dio.post(
+      '/api/admin/delivery/sticker-print-jobs/$jobId/claim',
+    );
+    final data = resp.data;
+    return data is Map && data['ok'] == true;
+  } catch (e) {
+    debugPrint('claim sticker print job skipped: $e');
+    return false;
+  }
+}
+
+Future<void> _handleStickerPrintJob(dynamic data) async {
+  if (!isStickerPrintSupported) return;
+  final map = _mapFromDynamic(data);
+  final jobId = (map['id'] ?? '').toString().trim();
+  if (jobId.isEmpty || _activeStickerPrintJobIds.contains(jobId)) return;
+  final payload = _mapFromDynamic(map['payload']);
+  _activeStickerPrintJobIds.add(jobId);
+  try {
+    final claimed = await _claimStickerPrintJob(jobId);
+    if (!claimed) return;
+    await printStickerJob(
+      StickerPrintJob(
+        phone: (payload['phone'] ?? '—').toString(),
+        name: (payload['name'] ?? 'Клиент').toString(),
+        productTitle: (payload['productTitle'] ?? '').toString().trim().isEmpty
+            ? null
+            : (payload['productTitle'] ?? '').toString(),
+        priceLabel: (payload['priceLabel'] ?? '').toString().trim().isEmpty
+            ? null
+            : (payload['priceLabel'] ?? '').toString(),
+        kindLabel: (payload['kindLabel'] ?? '').toString().trim().isEmpty
+            ? null
+            : (payload['kindLabel'] ?? '').toString(),
+        footerText: (payload['footerText'] ?? 'Феникс').toString(),
+        showFooter: payload['showFooter'] == true,
+      ),
+    );
+    await _markStickerPrintJob(jobId, 'printed');
+  } catch (e) {
+    debugPrint('handle sticker print job error: $e');
+    await _markStickerPrintJob(jobId, 'failed', error: '$e');
+  } finally {
+    _activeStickerPrintJobIds.remove(jobId);
+  }
+}
+
+Future<void> _loadPendingStickerPrintJobs() async {
+  if (!isStickerPrintSupported || _stickerPrintPendingLoadInProgress) return;
+  _stickerPrintPendingLoadInProgress = true;
+  try {
+    final resp = await dio.get(
+      '/api/admin/delivery/sticker-print-jobs/pending',
+    );
+    final data = resp.data;
+    final jobs = data is Map && data['data'] is List
+        ? List<dynamic>.from(data['data'] as List)
+        : const <dynamic>[];
+    for (final job in jobs) {
+      await _handleStickerPrintJob(job);
+    }
+  } catch (e) {
+    debugPrint('load pending sticker print jobs error: $e');
+  } finally {
+    _stickerPrintPendingLoadInProgress = false;
+  }
 }
 
 Map<String, dynamic> runtimeSocketDiagnosticsSnapshot() {
@@ -971,6 +1068,14 @@ Future<void> _refreshSupportQueueNotices() async {
 }
 
 Future<void> refreshSupportQueueNotices() async {
+  final binding = WidgetsBinding.instance;
+  final phase = binding.schedulerPhase;
+  if (phase != SchedulerPhase.idle &&
+      phase != SchedulerPhase.postFrameCallbacks) {
+    final completer = Completer<void>();
+    binding.addPostFrameCallback((_) => completer.complete());
+    await completer.future;
+  }
   await _refreshSupportQueueNotices();
 }
 
@@ -4983,6 +5088,7 @@ Future<void> _initSocket() async {
       });
       unawaited(_refreshSupportQueueNotices());
       unawaited(refreshNotificationBadgeCount());
+      unawaited(_loadPendingStickerPrintJobs());
     });
 
     socket?.on('disconnect', (reason) {
@@ -5163,6 +5269,12 @@ Future<void> _initSocket() async {
     socket?.on('delivery:updated', (data) {
       _socketVerboseLog('📬 Socket event delivery:updated -> $data');
       _dispatchSocketEvent('delivery:updated', data);
+    });
+
+    socket?.on('sticker:print-job', (data) {
+      _socketVerboseLog('📬 Socket event sticker:print-job -> $data');
+      chatEventsController.add({'type': 'sticker:print-job', 'data': data});
+      unawaited(_handleStickerPrintJob(data));
     });
 
     socket?.on('claims:updated', (data) {

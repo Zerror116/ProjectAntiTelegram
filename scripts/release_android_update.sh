@@ -421,7 +421,7 @@ smoke_check_remote_release() {
   [[ "$(printf '%s' "$manifest_json" | jq -r '.data.manifest.sha256')" == "$APK_SHA256" ]] || fail "Smoke failed: manifest sha256 mismatch"
   [[ "$(printf '%s' "$manifest_json" | jq -r '.data.key_id')" == "${APP_UPDATE_MANIFEST_KEY_ID}" ]] || fail "Smoke failed: manifest key_id mismatch"
   printf '%s' "$manifest_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
-    node "$SCRIPT_DIR/check_android_manifest_parity.js" --stdin >/dev/null || fail "Smoke failed: manifest parity/signature verification failed"
+    node "$SCRIPT_DIR/check_android_manifest_parity.cjs" --stdin >/dev/null || fail "Smoke failed: manifest parity/signature verification failed"
 
   note "smoke: GET $base/api/app/update/android/manifest?current_build=21"
   legacy_manifest_21_json="$(curl -fsSL "$base/api/app/update/android/manifest?current_build=21")"
@@ -429,7 +429,7 @@ smoke_check_remote_release() {
   [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.data.manifest.version')" == "$APP_VERSION_NAME" ]] || fail "Smoke failed: legacy build 21 manifest version mismatch"
   [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.data.manifest.build')" == "$APP_BUILD_NUMBER" ]] || fail "Smoke failed: legacy build 21 manifest build mismatch"
   printf '%s' "$legacy_manifest_21_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
-    node "$SCRIPT_DIR/check_android_manifest_parity.js" --stdin >/dev/null || fail "Smoke failed: legacy build 21 parity/signature verification failed"
+    node "$SCRIPT_DIR/check_android_manifest_parity.cjs" --stdin >/dev/null || fail "Smoke failed: legacy build 21 parity/signature verification failed"
 
   legacy20_manifest_file="$(mktemp -t fenix-legacy20-manifest.XXXXXX.json)"
   legacy20_status="$(curl -sS -o "$legacy20_manifest_file" -w '%{http_code}' "$base/api/app/update/android/manifest?current_build=20")"

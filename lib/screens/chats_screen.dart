@@ -77,6 +77,29 @@ class _ChatsScreenState extends State<ChatsScreen> {
           'visibility': 'private',
         };
       }
+      if (_isAdminSystemChat(normalized)) {
+        normalized['title'] = 'Система';
+        normalized['display_title'] = 'Система';
+        normalized['peer_user_id'] = null;
+        normalized['peer_display_name'] = null;
+        normalized['peer_name'] = null;
+        normalized['peer_phone'] = null;
+        normalized['peer_avatar_url'] = null;
+        normalized['peer_avatar_focus_x'] = 0;
+        normalized['peer_avatar_focus_y'] = 0;
+        normalized['peer_avatar_zoom'] = 1;
+        normalized['last_message_sender_avatar_url'] = null;
+        normalized['last_message_sender_avatar_focus_x'] = 0;
+        normalized['last_message_sender_avatar_focus_y'] = 0;
+        normalized['last_message_sender_avatar_zoom'] = 1;
+        normalized['settings'] = {
+          ..._settingsOf(normalized),
+          'kind': 'admin_system',
+          'system_key': 'admin_system',
+          'visibility': 'private',
+          'admin_only': true,
+        };
+      }
       sanitized.add(normalized);
     }
     return sanitized;
@@ -250,6 +273,22 @@ class _ChatsScreenState extends State<ChatsScreen> {
     if (raw is Map<String, dynamic>) return raw;
     if (raw is Map) return Map<String, dynamic>.from(raw);
     return {};
+  }
+
+  bool _isAdminSystemChat(Map<String, dynamic> chat) {
+    final settings = _settingsOf(chat);
+    final kind = (settings['kind'] ?? '').toString().trim().toLowerCase();
+    final systemKey = (settings['system_key'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final title = (chat['display_title'] ?? chat['title'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    return kind == 'admin_system' ||
+        systemKey == 'admin_system' ||
+        title == 'система';
   }
 
   String? _resolveImageUrl(String? raw) {
@@ -655,6 +694,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
         .toLowerCase();
     return kind == 'reserved_orders' ||
         systemKey == 'reserved_orders' ||
+        kind == 'admin_system' ||
+        systemKey == 'admin_system' ||
         kind == 'support_ticket' ||
         kind == 'delivery' ||
         kind == 'delivery_chat' ||
@@ -960,6 +1001,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
         label: 'Избранное',
         icon: Icons.bookmark_border_rounded,
         tone: _ChatListBadgeTone.primary,
+      );
+    }
+    if (_isAdminSystemChat(chat)) {
+      return const _ChatListBadgeSpec(
+        label: 'Система',
+        icon: Icons.admin_panel_settings_outlined,
+        tone: _ChatListBadgeTone.secondary,
       );
     }
     final requestStatus =
@@ -1475,29 +1523,43 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
   }
 
+  Future<void> _retryLoadChats() async {
+    _refreshQueued = false;
+    await _loadChats(showLoader: true);
+  }
+
   Widget _buildItem(Map<String, dynamic> chat) {
     final theme = Theme.of(context);
     final title = _chatDisplayTitle(chat);
     final time = _formatTime(chat['updated_at'] ?? chat['time']);
     final settings = _settingsOf(chat);
     final chatType = (chat['type'] ?? '').toString().trim().toLowerCase();
-    final usePeerAvatar = chatType == 'private';
+    final isAdminSystemChat = _isAdminSystemChat(chat);
+    final usePeerAvatar = chatType == 'private' && !isAdminSystemChat;
     final peerAvatarUrl = _resolveImageUrl(
       (chat['peer_avatar_url'] ?? '').toString(),
     );
     final channelAvatarUrl = _resolveImageUrl(
       (settings['avatar_url'] ?? '').toString(),
     );
-    final avatarUrl = usePeerAvatar
+    final avatarUrl = isAdminSystemChat
+        ? null
+        : usePeerAvatar
         ? (peerAvatarUrl ?? channelAvatarUrl)
         : channelAvatarUrl;
-    final avatarFocusX = usePeerAvatar && peerAvatarUrl != null
+    final avatarFocusX = isAdminSystemChat
+        ? 0.0
+        : usePeerAvatar && peerAvatarUrl != null
         ? _toAvatarFocus(chat['peer_avatar_focus_x'])
         : _toAvatarFocus(settings['avatar_focus_x']);
-    final avatarFocusY = usePeerAvatar && peerAvatarUrl != null
+    final avatarFocusY = isAdminSystemChat
+        ? 0.0
+        : usePeerAvatar && peerAvatarUrl != null
         ? _toAvatarFocus(chat['peer_avatar_focus_y'])
         : _toAvatarFocus(settings['avatar_focus_y']);
-    final avatarZoom = usePeerAvatar && peerAvatarUrl != null
+    final avatarZoom = isAdminSystemChat
+        ? 1.0
+        : usePeerAvatar && peerAvatarUrl != null
         ? _toAvatarZoom(chat['peer_avatar_zoom'])
         : _toAvatarZoom(settings['avatar_zoom']);
     final preview = _lastMessagePreview(chat);
@@ -1560,13 +1622,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 child: Row(
                   children: [
                     _buildPreviewableAvatar(
-                      title: title,
+                      title: isAdminSystemChat ? '?' : title,
                       imageUrl: avatarUrl,
                       focusX: avatarFocusX,
                       focusY: avatarFocusY,
                       zoom: avatarZoom,
                       radius: 26,
-                      fallbackIcon: Icons.forum_outlined,
+                      fallbackIcon: isAdminSystemChat
+                          ? Icons.admin_panel_settings_outlined
+                          : Icons.forum_outlined,
                     ),
                     const SizedBox(width: 14),
                     Expanded(
@@ -1725,7 +1789,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                       assetPath: PhoenixAssets.emptyStateNetworkError,
                       accentColor: theme.colorScheme.error,
                       action: ElevatedButton.icon(
-                        onPressed: _loadChats,
+                        onPressed: () => unawaited(_retryLoadChats()),
                         icon: const Icon(Icons.refresh_rounded),
                         label: const Text('Повторить'),
                       ),

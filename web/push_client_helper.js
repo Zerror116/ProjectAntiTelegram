@@ -1,4 +1,6 @@
 (function () {
+  let workerScriptAvailable;
+
   function urlBase64ToUint8Array(base64String) {
     const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
     const base64 = (base64String + padding)
@@ -8,11 +10,30 @@
     return Uint8Array.from([...rawData].map((ch) => ch.charCodeAt(0)));
   }
 
+  async function hasWorkerScript() {
+    if (workerScriptAvailable !== undefined) {
+      return workerScriptAvailable;
+    }
+    try {
+      const response = await fetch('/flutter_service_worker.js', {
+        method: 'HEAD',
+        cache: 'no-store',
+      });
+      workerScriptAvailable = response.ok;
+    } catch (_) {
+      workerScriptAvailable = false;
+    }
+    return workerScriptAvailable;
+  }
+
   async function ensureRegistration() {
     if (!('serviceWorker' in navigator)) {
       return null;
     }
     const existing = await navigator.serviceWorker.getRegistration();
+    if (!existing && !(await hasWorkerScript())) {
+      return null;
+    }
     const registration =
       existing || (await navigator.serviceWorker.register('/flutter_service_worker.js'));
     await navigator.serviceWorker.ready;

@@ -58,6 +58,10 @@ const {
 const { isMailConfigured, sendMail } = require('../utils/mailer');
 const { ensureSystemChannels } = require("../utils/systemChannels");
 const { createNotificationInboxItem } = require("../utils/notifications");
+const {
+  getInviteClientCityOptions,
+  getTenantFeatureSettings,
+} = require("../utils/tenantFeatureSettings");
 require('dotenv').config();
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
@@ -104,35 +108,6 @@ const PASSKEY_CHALLENGE_TTL_MS = Math.max(
 );
 const PASSKEY_RP_NAME = String(process.env.AUTH_PASSKEY_RP_NAME || 'Проект Феникс').trim() || 'Проект Феникс';
 const passkeyChallenges = new Map();
-const CLIENT_INVITE_CITY_OPTIONS = Object.freeze({
-  [normalizeInviteCode('INV-W8V6-UZCA')]: Object.freeze([
-    'Алексеевка',
-    'Бобровка',
-    'Георгиевка',
-    'Горный',
-    'Елшняги',
-    'Кинель-север',
-    'Кинель-юг',
-    'Кинельский',
-    'Комсомолец',
-    'Лебедь',
-    'Луговой',
-    'Новый бяун',
-    'Новый сарбай',
-    'Отрадный',
-    'Самара',
-    'Сухая Самарка',
-    'Усть-Кинельский',
-  ]),
-  [normalizeInviteCode('INV-TS5W-RZ5L')]: Object.freeze([
-    'Борское',
-    'Богатое',
-    'Бузулук',
-    'Петровка',
-    'Виловатое',
-  ]),
-});
-
 if (
   process.env.NODE_ENV === 'production' &&
   !CREATOR_SECRET &&
@@ -169,10 +144,22 @@ function parseDurationMs(raw, fallbackMs) {
   }
 }
 
-function normalizeClientCityForInvite(inviteCode, raw) {
-  const options = CLIENT_INVITE_CITY_OPTIONS[normalizeInviteCode(inviteCode)] || [];
+function normalizeClientCityFromOptions(options, raw) {
   const value = String(raw || '').replace(/\s+/g, ' ').trim();
-  return options.includes(value) ? value : '';
+  return Array.isArray(options) && options.includes(value) ? value : '';
+}
+
+async function getClientCityOptionsForInvite(invite) {
+  const inviteOptions = getInviteClientCityOptions(invite);
+  if (inviteOptions.length > 0) return inviteOptions;
+  const tenantId = String(invite?.tenant_id || "").trim();
+  if (!tenantId) return [];
+  const settings = await getTenantFeatureSettings(tenantId);
+  const registrationOptions = settings?.registration?.client_city_options;
+  if (Array.isArray(registrationOptions)) return registrationOptions;
+  return Array.isArray(settings?.client_city_options)
+    ? settings.client_city_options
+    : [];
 }
 
 function buildAccessExpiry(now = Date.now()) {
@@ -853,6 +840,7 @@ async function loadPlatformTenantInviteByCode(normalizedInviteCode) {
             i.max_uses,
             i.used_count,
             i.expires_at,
+            i.settings,
             t.code AS tenant_code,
             t.name AS tenant_name,
             t.status,
@@ -880,6 +868,7 @@ async function migrateLegacyTenantInviteToPlatform(normalizedInviteCode, tenantR
     try {
       const legacyQ = await db.query(
         `SELECT code, role, is_active, max_uses, used_count, expires_at,
+                COALESCE(settings, '{}'::jsonb) AS settings,
                 last_used_at, notes, created_at, updated_at
          FROM tenant_invites
          WHERE code = $1
@@ -902,11 +891,11 @@ async function migrateLegacyTenantInviteToPlatform(normalizedInviteCode, tenantR
   await db.platformQuery(
     `INSERT INTO tenant_invites (
        id, tenant_id, code, role, is_active, max_uses,
-       used_count, expires_at, created_by, last_used_at, notes, created_at, updated_at
+       used_count, expires_at, settings, created_by, last_used_at, notes, created_at, updated_at
      )
      VALUES (
        $1, $2, $3, $4, $5, $6,
-       $7, $8, NULL, $9, $10, COALESCE($11, now()), COALESCE($12, now())
+       $7, $8, $9::jsonb, NULL, $10, $11, COALESCE($12, now()), COALESCE($13, now())
      )
      ON CONFLICT (code) DO NOTHING`,
     [
@@ -918,6 +907,7 @@ async function migrateLegacyTenantInviteToPlatform(normalizedInviteCode, tenantR
       legacyInvite.max_uses,
       Number(legacyInvite.used_count || 0),
       legacyInvite.expires_at || null,
+      JSON.stringify(legacyInvite.settings || {}),
       legacyInvite.last_used_at || null,
       legacyInvite.notes || 'Migrated from tenant invite storage',
       legacyInvite.created_at || null,
@@ -1973,6 +1963,8 @@ async function handleInviteResolve(req, res) {
       });
     }
 
+    const clientCityOptions = await getClientCityOptionsForInvite(invite);
+
     return res.json({
       ok: true,
       data: {
@@ -1981,6 +1973,7 @@ async function handleInviteResolve(req, res) {
         tenant_id: invite.tenant_id,
         tenant_code: invite.tenant_code,
         tenant_name: invite.tenant_name,
+        client_city_options: clientCityOptions,
         status: 'active',
         invite_link: buildInviteLink(req, normalized, invite.tenant_code),
       },
@@ -2124,8 +2117,9 @@ router.post('/register', async (req, res) => {
           db_name: invite.db_name || null,
           db_schema: invite.db_schema || null,
         };
-        if (CLIENT_INVITE_CITY_OPTIONS[rawInviteCode]) {
-          clientCity = normalizeClientCityForInvite(rawInviteCode, client_city);
+        const clientCityOptions = await getClientCityOptionsForInvite(invite);
+        if (clientCityOptions.length > 0) {
+          clientCity = normalizeClientCityFromOptions(clientCityOptions, client_city);
           if (!clientCity) {
             return res.status(400).json({ error: 'Выберите город из списка' });
           }

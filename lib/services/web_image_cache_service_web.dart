@@ -16,6 +16,20 @@ final List<String> _rememberedPrimedOrder = <String>[];
 Timer? _flushTimer;
 bool _flushInFlight = false;
 
+Future<bool> _serviceWorkerScriptAvailable() async {
+  try {
+    final request = await html.HttpRequest.request(
+      _rootWorkerUrl,
+      method: 'HEAD',
+      requestHeaders: const {'Cache-Control': 'no-cache'},
+    ).timeout(const Duration(seconds: 2));
+    final status = request.status ?? 0;
+    return status >= 200 && status < 400;
+  } catch (_) {
+    return false;
+  }
+}
+
 Future<html.ServiceWorkerRegistration?> _ensureImageWorkerRegistration() async {
   final sw = html.window.navigator.serviceWorker;
   if (sw == null) return null;
@@ -26,6 +40,7 @@ Future<html.ServiceWorkerRegistration?> _ensureImageWorkerRegistration() async {
     // ignore
   }
   try {
+    if (!await _serviceWorkerScriptAvailable()) return null;
     return await sw.register(_rootWorkerUrl);
   } catch (_) {
     return null;

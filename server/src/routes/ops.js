@@ -11,6 +11,7 @@ const requirePermission = require('../middleware/requirePermission');
 const { logAudit } = require('../utils/audit');
 const { guardAction } = require('../utils/antifraud');
 const {
+  monitoringEnabled,
   logMonitoringEvent,
   logReleaseCheck,
   sanitizeDetails,
@@ -42,8 +43,6 @@ const requireDeliveryManagePermission = requirePermission('delivery.manage');
 const requireTenantUsersManagePermission = requirePermission('tenant.users.manage');
 
 const MONEY_STATUSES = [
-  'processed',
-  'preparing_delivery',
   'in_delivery',
   'delivered',
 ];
@@ -167,6 +166,10 @@ function tenantVisibilitySql(column = 'tenant_id', tenantParamIndex = 1, allowNu
   return `(${column} = $${tenantParamIndex}::uuid OR ($${allowNullParamIndex}::boolean = true AND ${column} IS NULL))`;
 }
 
+function rejectMonitoringDisabled(res) {
+  return res.status(404).json({ ok: false, error: 'Мониторинг отключен' });
+}
+
 function periodStartExpression(period) {
   switch (period) {
     case 'day':
@@ -174,6 +177,17 @@ function periodStartExpression(period) {
     case 'week':
       return "date_trunc('week', now())";
     case 'month':
+      return "date_trunc('month', now())";
+    case 'last_month':
+      return "date_trunc('month', now()) - interval '1 month'";
+    default:
+      return null;
+  }
+}
+
+function periodEndExpression(period) {
+  switch (period) {
+    case 'last_month':
       return "date_trunc('month', now())";
     default:
       return null;
@@ -494,27 +508,39 @@ async function getFinanceSummary({
   period,
 }) {
   const periodExpr = periodStartExpression(period);
+  const periodEndExpr = periodEndExpression(period);
   const params = [tenantId || null];
   let rangeSql = '';
   if (periodExpr) {
-    rangeSql = `AND COALESCE(c.updated_at, c.created_at) >= ${periodExpr}`;
+    rangeSql = `AND COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at) >= ${periodExpr}`;
+  }
+  if (periodEndExpr) {
+    rangeSql += ` AND COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at) < ${periodEndExpr}`;
   }
 
   const summaryQ = await db.query(
     `WITH base AS (
        SELECT c.user_id,
-              c.quantity::numeric AS qty,
-              p.price::numeric AS price,
+              COALESCE(NULLIF(dbi.quantity, 0), c.quantity)::numeric AS qty,
+              CASE
+                WHEN dbi.line_total IS NOT NULL AND dbi.line_total > 0
+                  THEN dbi.line_total::numeric
+                ELSE (c.quantity * p.price)::numeric
+              END AS line_total,
               COALESCE(p.cost_price, 0)::numeric AS cost_price,
-              COALESCE(c.updated_at, c.created_at) AS ts
+              COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at) AS ts
        FROM cart_items c
        JOIN products p ON p.id = c.product_id
        JOIN users u ON u.id = c.user_id
+       LEFT JOIN delivery_batch_items dbi ON dbi.cart_item_id = c.id
+       LEFT JOIN delivery_batch_customers dbc ON dbc.id = dbi.batch_customer_id
+       LEFT JOIN delivery_batches dbt ON dbt.id = dbi.batch_id
        WHERE c.status = ANY($2::text[])
          AND (${tenantFilterSql('u', 1)})
+         AND COALESCE(dbi.assembly_status, 'collected') <> 'removed'
          ${rangeSql}
      )
-     SELECT COALESCE(SUM(qty * price), 0)::numeric(14,2) AS revenue,
+     SELECT COALESCE(SUM(line_total), 0)::numeric(14,2) AS revenue,
             COALESCE(SUM(qty * cost_price), 0)::numeric(14,2) AS cost,
             COUNT(*)::int AS lines,
             COUNT(DISTINCT user_id)::int AS buyers
@@ -530,45 +556,66 @@ async function getFinanceSummary({
   const avgCheck = row.buyers > 0 ? toMoney(revenue / Number(row.buyers)) : 0;
 
   const byDayQ = await db.query(
-    `SELECT to_char(date_trunc('day', COALESCE(c.updated_at, c.created_at)), 'YYYY-MM-DD') AS bucket,
-            COALESCE(SUM(c.quantity * p.price), 0)::numeric(14,2) AS revenue,
-            COALESCE(SUM(c.quantity * COALESCE(p.cost_price, 0)), 0)::numeric(14,2) AS cost
+    `SELECT to_char(date_trunc('day', COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at)), 'YYYY-MM-DD') AS bucket,
+            COALESCE(SUM(CASE
+              WHEN dbi.line_total IS NOT NULL AND dbi.line_total > 0 THEN dbi.line_total
+              ELSE c.quantity * p.price
+            END), 0)::numeric(14,2) AS revenue,
+            COALESCE(SUM(COALESCE(NULLIF(dbi.quantity, 0), c.quantity) * COALESCE(p.cost_price, 0)), 0)::numeric(14,2) AS cost
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
      JOIN users u ON u.id = c.user_id
+     LEFT JOIN delivery_batch_items dbi ON dbi.cart_item_id = c.id
+     LEFT JOIN delivery_batch_customers dbc ON dbc.id = dbi.batch_customer_id
+     LEFT JOIN delivery_batches dbt ON dbt.id = dbi.batch_id
      WHERE c.status = ANY($2::text[])
        AND (${tenantFilterSql('u', 1)})
-       AND COALESCE(c.updated_at, c.created_at) >= now() - interval '30 days'
+       AND COALESCE(dbi.assembly_status, 'collected') <> 'removed'
+       ${rangeSql || "AND COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at) >= now() - interval '30 days'"}
      GROUP BY 1
      ORDER BY 1 ASC`,
     [tenantId || null, MONEY_STATUSES],
   );
 
   const byWeekQ = await db.query(
-    `SELECT to_char(date_trunc('week', COALESCE(c.updated_at, c.created_at)), 'IYYY-IW') AS bucket,
-            COALESCE(SUM(c.quantity * p.price), 0)::numeric(14,2) AS revenue,
-            COALESCE(SUM(c.quantity * COALESCE(p.cost_price, 0)), 0)::numeric(14,2) AS cost
+    `SELECT to_char(date_trunc('week', COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at)), 'IYYY-IW') AS bucket,
+            COALESCE(SUM(CASE
+              WHEN dbi.line_total IS NOT NULL AND dbi.line_total > 0 THEN dbi.line_total
+              ELSE c.quantity * p.price
+            END), 0)::numeric(14,2) AS revenue,
+            COALESCE(SUM(COALESCE(NULLIF(dbi.quantity, 0), c.quantity) * COALESCE(p.cost_price, 0)), 0)::numeric(14,2) AS cost
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
      JOIN users u ON u.id = c.user_id
+     LEFT JOIN delivery_batch_items dbi ON dbi.cart_item_id = c.id
+     LEFT JOIN delivery_batch_customers dbc ON dbc.id = dbi.batch_customer_id
+     LEFT JOIN delivery_batches dbt ON dbt.id = dbi.batch_id
      WHERE c.status = ANY($2::text[])
        AND (${tenantFilterSql('u', 1)})
-       AND COALESCE(c.updated_at, c.created_at) >= now() - interval '24 weeks'
+       AND COALESCE(dbi.assembly_status, 'collected') <> 'removed'
+       AND COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at) >= now() - interval '24 weeks'
      GROUP BY 1
      ORDER BY 1 ASC`,
     [tenantId || null, MONEY_STATUSES],
   );
 
   const byMonthQ = await db.query(
-    `SELECT to_char(date_trunc('month', COALESCE(c.updated_at, c.created_at)), 'YYYY-MM') AS bucket,
-            COALESCE(SUM(c.quantity * p.price), 0)::numeric(14,2) AS revenue,
-            COALESCE(SUM(c.quantity * COALESCE(p.cost_price, 0)), 0)::numeric(14,2) AS cost
+    `SELECT to_char(date_trunc('month', COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at)), 'YYYY-MM') AS bucket,
+            COALESCE(SUM(CASE
+              WHEN dbi.line_total IS NOT NULL AND dbi.line_total > 0 THEN dbi.line_total
+              ELSE c.quantity * p.price
+            END), 0)::numeric(14,2) AS revenue,
+            COALESCE(SUM(COALESCE(NULLIF(dbi.quantity, 0), c.quantity) * COALESCE(p.cost_price, 0)), 0)::numeric(14,2) AS cost
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
      JOIN users u ON u.id = c.user_id
+     LEFT JOIN delivery_batch_items dbi ON dbi.cart_item_id = c.id
+     LEFT JOIN delivery_batch_customers dbc ON dbc.id = dbi.batch_customer_id
+     LEFT JOIN delivery_batches dbt ON dbt.id = dbi.batch_id
      WHERE c.status = ANY($2::text[])
        AND (${tenantFilterSql('u', 1)})
-       AND COALESCE(c.updated_at, c.created_at) >= now() - interval '18 months'
+       AND COALESCE(dbi.assembly_status, 'collected') <> 'removed'
+       AND COALESCE(dbt.handed_off_at, dbc.updated_at, c.updated_at, c.created_at) >= now() - interval '18 months'
      GROUP BY 1
      ORDER BY 1 ASC`,
     [tenantId || null, MONEY_STATUSES],
@@ -776,7 +823,7 @@ async function insertAuditFromReq(req, payload) {
 router.get('/finance/summary', requireAuth, requireRole('admin', 'tenant', 'creator'), async (req, res) => {
   try {
     const periodRaw = String(req.query?.period || 'month').toLowerCase().trim();
-    const period = ['day', 'week', 'month', 'all'].includes(periodRaw)
+    const period = ['day', 'week', 'month', 'last_month', 'all'].includes(periodRaw)
       ? periodRaw
       : 'month';
     const data = await getFinanceSummary({
@@ -1305,6 +1352,9 @@ router.post('/notifications/test', requireAuth, requireRole('creator'), async (r
 
 router.get('/diagnostics/center', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -1317,6 +1367,9 @@ router.get('/diagnostics/center', requireAuth, requireRole('creator'), async (re
 
 router.post('/monitoring/events', requireAuth, async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return res.status(202).json({ ok: true, disabled: true });
+    }
     const body =
       req.body && typeof req.body === 'object' && !Array.isArray(req.body)
         ? req.body
@@ -1379,6 +1432,9 @@ router.post('/monitoring/events', requireAuth, async (req, res) => {
 
 router.get('/monitoring/center', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -1391,6 +1447,9 @@ router.get('/monitoring/center', requireAuth, requireRole('creator'), async (req
 
 router.get('/monitoring/events', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -1440,6 +1499,9 @@ router.get('/monitoring/events', requireAuth, requireRole('creator'), async (req
 
 router.get('/monitoring/releases', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -1456,6 +1518,9 @@ router.get('/monitoring/releases', requireAuth, requireRole('creator'), async (r
 
 router.get('/monitoring/realtime', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -1491,6 +1556,9 @@ router.get('/monitoring/realtime', requireAuth, requireRole('creator'), async (r
 
 router.patch('/monitoring/events/:id/resolve', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -1520,6 +1588,9 @@ router.patch('/monitoring/events/:id/resolve', requireAuth, requireRole('creator
 
 router.post('/monitoring/releases', requireAuth, requireRole('creator'), async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return rejectMonitoringDisabled(res);
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
@@ -3556,9 +3627,13 @@ router.get(
     }
 
     if (kind === 'finance_summary') {
+      const periodRaw = String(req.query?.period || 'month').trim();
+      const period = ['day', 'week', 'month', 'last_month', 'all'].includes(periodRaw)
+        ? periodRaw
+        : 'month';
       const data = await getFinanceSummary({
         tenantId: req.user?.tenant_id || null,
-        period: 'month',
+        period,
       });
       const wb = new ExcelJS.Workbook();
       const ws = wb.addWorksheet('Финансы');
@@ -3580,7 +3655,7 @@ router.get(
         userId: req.user?.id || null,
         kind: 'finance_summary',
         fileName,
-        meta: { period: 'month' },
+        meta: { period },
       });
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);

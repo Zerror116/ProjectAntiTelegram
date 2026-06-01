@@ -64,10 +64,8 @@ class _DeliveryAddressPickerDialogState
   Timer? _debounce;
   List<Map<String, dynamic>> _suggestions = <Map<String, dynamic>>[];
   List<Map<String, dynamic>> _savedAddresses = <Map<String, dynamic>>[];
-  List<Map<String, dynamic>> _zones = <Map<String, dynamic>>[];
   bool _loadingSuggestions = false;
   bool _loadingSavedAddresses = false;
-  bool _loadingZones = false;
   bool _reversingPoint = false;
   bool _submitting = false;
   bool _confirmSelection = false;
@@ -103,7 +101,7 @@ class _DeliveryAddressPickerDialogState
   }
 
   Future<void> _loadInitialData() async {
-    await Future.wait<void>([_loadSavedAddresses(), _loadZones()]);
+    await _loadSavedAddresses();
     if (_addressCtrl.text.trim().length >= 3) {
       await _loadSuggestions(_addressCtrl.text.trim(), immediate: true);
     }
@@ -133,26 +131,6 @@ class _DeliveryAddressPickerDialogState
     } finally {
       if (mounted) {
         setState(() => _loadingSavedAddresses = false);
-      }
-    }
-  }
-
-  Future<void> _loadZones() async {
-    setState(() => _loadingZones = true);
-    try {
-      final resp = await authService.dio.get('/api/delivery/zones');
-      final data = resp.data;
-      final items = data is Map && data['ok'] == true && data['data'] is List
-          ? List<Map<String, dynamic>>.from(data['data'])
-          : <Map<String, dynamic>>[];
-      if (!mounted) return;
-      setState(() => _zones = items);
-    } catch (_) {
-      if (!mounted) return;
-      setState(() => _zones = <Map<String, dynamic>>[]);
-    } finally {
-      if (mounted) {
-        setState(() => _loadingZones = false);
       }
     }
   }
@@ -389,43 +367,7 @@ class _DeliveryAddressPickerDialogState
         );
       }
     }
-    if (_zones.isNotEmpty) {
-      final zone = _zones.first;
-      final center = zone['center'] is Map
-          ? Map<String, dynamic>.from(zone['center'])
-          : <String, dynamic>{};
-      final lat = center['lat'];
-      final lng = center['lng'];
-      if (lat is num && lng is num) {
-        return LatLng(lat.toDouble(), lng.toDouble());
-      }
-    }
     return _defaultCenter;
-  }
-
-  List<CircleMarker> _buildZoneCircles() {
-    return _zones
-        .map((zone) {
-          final center = zone['center'] is Map
-              ? Map<String, dynamic>.from(zone['center'])
-              : <String, dynamic>{};
-          final lat = center['lat'];
-          final lng = center['lng'];
-          final radius = zone['radius_meters'];
-          if (lat is! num || lng is! num || radius is! num) {
-            return null;
-          }
-          return CircleMarker(
-            point: LatLng(lat.toDouble(), lng.toDouble()),
-            radius: radius.toDouble(),
-            useRadiusInMeter: true,
-            color: Colors.green.withValues(alpha: 0.12),
-            borderColor: Colors.green.withValues(alpha: 0.55),
-            borderStrokeWidth: 2,
-          );
-        })
-        .whereType<CircleMarker>()
-        .toList();
   }
 
   Widget _buildSavedAddresses() {
@@ -536,7 +478,6 @@ class _DeliveryAddressPickerDialogState
         ),
     ];
 
-    final circles = _buildZoneCircles();
     final routeTrace = selectedPoint == null
         ? const <Polyline>[]
         : <Polyline>[
@@ -560,7 +501,7 @@ class _DeliveryAddressPickerDialogState
             children: [
               Text(
                 '1. Начни вводить адрес или выбери точку на карте.\n'
-                '2. Если нужно, перетащи точку ближе к подъезду или ориентиру.\n'
+                '2. Карта и подсказки помогают уточнить адрес, но не блокируют сохранение.\n'
                 '3. В поле ниже можно указать "Магнит", "автомагазин", "у торца" и другие ориентиры.',
                 style: theme.textTheme.bodySmall,
               ),
@@ -630,7 +571,6 @@ class _DeliveryAddressPickerDialogState
                         ),
                       ],
                     ),
-                    if (circles.isNotEmpty) CircleLayer(circles: circles),
                     if (routeTrace.isNotEmpty)
                       PolylineLayer(polylines: routeTrace),
                     MarkerLayer(markers: markers),
@@ -648,12 +588,6 @@ class _DeliveryAddressPickerDialogState
                       style: theme.textTheme.bodySmall,
                     ),
                   ),
-                  if (_loadingZones)
-                    const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
                 ],
               ),
               const SizedBox(height: 12),
@@ -764,13 +698,7 @@ class _DeliveryAddressPickerDialogState
         ),
         FilledButton(
           onPressed: _submitting ? null : _submit,
-          child: Text(
-            _submitting
-                ? 'Проверяем...'
-                : _confirmSelection
-                ? 'Подтвердить адрес'
-                : 'Сохранить адрес',
-          ),
+          child: Text(_submitting ? 'Сохраняем...' : 'Сохранить адрес'),
         ),
       ],
     );

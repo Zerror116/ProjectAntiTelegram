@@ -4,6 +4,7 @@ const path = require("path");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
 const { generateInviteCode, normalizeInviteCode } = require("../utils/tenants");
+const { getTenantFeatureSettings } = require("../utils/tenantFeatureSettings");
 
 const router = express.Router();
 const db = require("../db");
@@ -1179,6 +1180,20 @@ router.get("/", authMiddleware, async (req, res) => {
       ok: false,
       error: "Internal server error",
     });
+  }
+});
+
+router.get("/tenant/feature-settings", authMiddleware, async (req, res) => {
+  const tenantId = String(req.user?.tenant_id || "").trim();
+  if (!tenantId) {
+    return res.json({ ok: true, data: await getTenantFeatureSettings(null) });
+  }
+  try {
+    const settings = await getTenantFeatureSettings(tenantId);
+    return res.json({ ok: true, data: settings });
+  } catch (err) {
+    console.error("profile.tenant.featureSettings error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
   }
 });
 

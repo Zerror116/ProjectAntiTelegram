@@ -42,7 +42,7 @@
 <body>
   <main>
     <h1>Обновляем Феникс</h1>
-    <p id="status">Очищаем локальный web-кэш...</p>
+    <p id="status">Отключаем старый загрузчик приложения...</p>
   </main>
   <script>
     (async function resetPhoenixCache() {
@@ -59,20 +59,13 @@
           }));
         }
 
-        if ('caches' in window) {
-          const names = await caches.keys();
-          await Promise.all(names.map(function (name) {
-            return caches.delete(name);
-          }));
-        }
-
-        setStatus('Готово. Открываем свежую сборку...');
+        setStatus('Готово. Открываем свежую сборку без удаления данных входа...');
       } catch (_) {
-        setStatus('Кэш сброшен частично. Всё равно открываем приложение...');
+        setStatus('Обновление выполнено частично. Всё равно открываем приложение...');
       }
 
       const nextUrl = new URL('/', window.location.origin);
-      nextUrl.searchParams.set('fresh', Date.now().toString());
+      nextUrl.searchParams.set('v', Date.now().toString());
       window.location.replace(nextUrl.toString());
     })();
   </script>

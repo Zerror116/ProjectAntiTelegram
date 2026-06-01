@@ -618,6 +618,19 @@ function isReservedOrdersChannel(chat, settings) {
   );
 }
 
+function isAdminSystemChatRow(chat, settings) {
+  const kind = String(settings?.kind || "")
+    .toLowerCase()
+    .trim();
+  const systemKey = String(settings?.system_key || "")
+    .toLowerCase()
+    .trim();
+  const title = String(chat?.title || chat?.display_title || "")
+    .toLowerCase()
+    .trim();
+  return kind === "admin_system" || systemKey === "admin_system" || title === "система";
+}
+
 async function getChatAccessContext(chatId, userId, tenantId = null) {
   const chatQ = await db.query(
     `SELECT id, title, type, settings, tenant_id
@@ -1275,6 +1288,20 @@ async function getDirectAliasForViewer(
 async function ensureScopedViewerUser(client, user) {
   const userId = trimOptionalUuid(user?.id);
   if (!userId) return null;
+
+  const tenantContext = db.currentTenantContext?.();
+  const tenantScope = tenantContext?.tenant || null;
+  if (
+    user?.is_platform_creator === true &&
+    tenantScope &&
+    !db.isIsolatedTenantRow(tenantScope) &&
+    !db.isSchemaIsolatedTenantRow(tenantScope)
+  ) {
+    // In shared-DB tenants the platform creator already exists as one global
+    // users.id row. RLS can hide that row inside a tenant scope, but creating a
+    // second row with the same UUID is impossible and breaks chats/list.
+    return userId;
+  }
 
   const existingQ = await client.query(
     `SELECT id
@@ -3726,6 +3753,29 @@ async function listChatsHandler(req, res) {
       }
       chat.settings = settings;
       chat.last_message = decryptMessageText(chat.last_message);
+      if (isAdminSystemChatRow(chat, settings)) {
+        chat.title = "Система";
+        chat.display_title = "Система";
+        chat.peer_user_id = null;
+        chat.peer_display_name = null;
+        chat.peer_name = null;
+        chat.peer_phone = null;
+        chat.peer_avatar_url = null;
+        chat.peer_avatar_focus_x = 0;
+        chat.peer_avatar_focus_y = 0;
+        chat.peer_avatar_zoom = 1;
+        chat.last_message_sender_avatar_url = null;
+        chat.last_message_sender_avatar_focus_x = 0;
+        chat.last_message_sender_avatar_focus_y = 0;
+        chat.last_message_sender_avatar_zoom = 1;
+        chat.settings = {
+          ...settings,
+          kind: "admin_system",
+          system_key: "admin_system",
+          visibility: "private",
+          admin_only: true,
+        };
+      }
       if (isSavedMessagesChatRow(chat)) {
         if (savedMessagesIncluded) continue;
         savedMessagesIncluded = true;
@@ -4055,6 +4105,9 @@ router.get("/:chatId/activity", requireAuth, async (req, res) => {
  */
 router.get("/:chatId/messages", requireAuth, async (req, res) => {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
     const userId = req.user.id;
     const role = req.user.role;
     const { chatId } = req.params;

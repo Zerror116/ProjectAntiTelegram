@@ -166,6 +166,17 @@ async function ensureScopedAuthUserShadowRow(user, tenantScope) {
   const tenantId = String(tenantScope?.id || user?.tenant_id || '').trim();
   if (!userId || !tenantId) return;
 
+  if (
+    user?.is_platform_creator === true &&
+    !db.isIsolatedTenantRow(tenantScope) &&
+    !db.isSchemaIsolatedTenantRow(tenantScope)
+  ) {
+    // Shared tenants use one public users table. A platform creator already has a
+    // global users.id row, so a per-tenant shadow row with the same UUID cannot
+    // be created without fighting RLS/primary-key ownership.
+    return;
+  }
+
   const email = String(user?.email || '').trim().toLowerCase();
   const name = String(user?.name || '').trim();
   const role = normalizeScopedUserRole(user?.base_role || user?.role);
@@ -489,10 +500,26 @@ async function authMiddleware(req, res, next) {
       return db.runWithPlatform(() => next());
     }
     if (context.tenantScope) {
-      return db.runWithTenantRow(context.tenantScope, async () => {
-        await ensureScopedAuthUserShadowRow(context.user, context.tenantScope);
-        return next();
-      });
+      return db
+        .runWithTenantRow(context.tenantScope, async () => {
+          try {
+            await ensureScopedAuthUserShadowRow(context.user, context.tenantScope);
+            return next();
+          } catch (err) {
+            console.error('authMiddleware tenant shadow user sync error:', err);
+            if (!res.headersSent) {
+              return res.status(500).json({ error: 'Server error' });
+            }
+            return undefined;
+          }
+        })
+        .catch((err) => {
+          console.error('authMiddleware tenant context error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({ error: 'Server error' });
+          }
+          return undefined;
+        });
     }
     return db.runWithPlatform(() => next());
   } catch (err) {

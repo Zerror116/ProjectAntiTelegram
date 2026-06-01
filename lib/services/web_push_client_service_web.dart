@@ -101,6 +101,21 @@ Future<dynamic> _callPushHelper(
   }
 }
 
+Future<bool> _serviceWorkerScriptAvailable() async {
+  try {
+    final request = await html.HttpRequest.request(
+      _rootWorkerUrl,
+      method: 'HEAD',
+      requestHeaders: const {'Cache-Control': 'no-cache'},
+    ).timeout(const Duration(seconds: 2));
+    final status = request.status ?? 0;
+    return status >= 200 && status < 400;
+  } catch (e) {
+    _logWebPush('[web-push] service worker script unavailable: $e');
+    return false;
+  }
+}
+
 Future<html.ServiceWorkerRegistration?> _getRegistration() async {
   final sw = html.window.navigator.serviceWorker;
   if (sw == null) {
@@ -123,6 +138,10 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
   }
 
   try {
+    if (!await _serviceWorkerScriptAvailable()) {
+      _logWebPush('[web-push] _getRegistration: worker script missing');
+      return null;
+    }
     final registration = await sw.register(_rootWorkerUrl);
     _logWebPush(
       '[web-push] _getRegistration: registered scope=${registration.scope}',

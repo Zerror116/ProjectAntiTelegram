@@ -1,5 +1,11 @@
 const db = require('../db');
 
+function monitoringEnabled() {
+  return String(process.env.PHX_MONITORING_ENABLED || '')
+    .trim()
+    .toLowerCase() === 'true';
+}
+
 function normalizeLevel(value) {
   const level = String(value || 'info').toLowerCase().trim();
   if (['info', 'warn', 'error', 'critical'].includes(level)) {
@@ -84,6 +90,8 @@ async function logMonitoringEvent({
   releaseChannel = null,
   sessionState = null,
 }) {
+  if (!monitoringEnabled()) return null;
+
   const normalizedMessage = String(message || '').trim();
   if (!normalizedMessage) return null;
 
@@ -176,6 +184,8 @@ async function logReleaseCheck({
   summary = null,
   details = {},
 }) {
+  if (!monitoringEnabled()) return null;
+
   const normalizedTitle = String(title || '').trim();
   if (!normalizedTitle) return null;
   const normalizedStatus = ['pass', 'warn', 'fail'].includes(String(status || '').trim())
@@ -260,6 +270,7 @@ async function logReleaseCheck({
 }
 
 module.exports = {
+  monitoringEnabled,
   logMonitoringEvent,
   logReleaseCheck,
   normalizeLevel,

@@ -1,5 +1,6 @@
 // lib/screens/cart_screen.dart
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
@@ -34,12 +35,14 @@ class _CartScreenState extends State<CartScreen> {
   List<Map<String, dynamic>> _recentDeliveries = [];
   List<Map<String, dynamic>> _claims = [];
   Map<String, dynamic>? _cartRetentionWarning;
+  Map<String, dynamic> _deliveryReady = <String, dynamic>{};
   double _total = 0;
   double _processed = 0;
   double _claimsTotal = 0;
   StreamSubscription? _eventsSub;
   Timer? _reloadDebounceTimer;
   bool _claimSubmitting = false;
+  bool _deliveryReadySubmitting = false;
   final Set<String> _claimDecisionBusyIds = <String>{};
   final Set<String> _recentlyChangedItemIds = <String>{};
   final Map<String, String> _lastItemSignatures = <String, String>{};
@@ -87,6 +90,9 @@ class _CartScreenState extends State<CartScreen> {
     _cartRetentionWarning = payload['cart_retention_warning'] is Map
         ? Map<String, dynamic>.from(payload['cart_retention_warning'])
         : null;
+    _deliveryReady = payload['delivery_ready'] is Map
+        ? Map<String, dynamic>.from(payload['delivery_ready'])
+        : <String, dynamic>{};
     _total = (payload['total_sum'] is num)
         ? (payload['total_sum'] as num).toDouble()
         : double.tryParse('${payload['total_sum'] ?? 0}') ?? 0;
@@ -204,6 +210,22 @@ class _CartScreenState extends State<CartScreen> {
       return e.message ?? 'Ошибка запроса';
     }
     return e.toString();
+  }
+
+  bool _boolValue(dynamic value) {
+    if (value is bool) return value;
+    final normalized = '${value ?? ''}'.trim().toLowerCase();
+    return normalized == 'true' ||
+        normalized == '1' ||
+        normalized == 'yes' ||
+        normalized == 'on' ||
+        normalized == 'да';
+  }
+
+  double _doubleValue(dynamic value, [double fallback = 0]) {
+    if (value is num) return value.toDouble();
+    final parsed = double.tryParse('${value ?? ''}'.replaceAll(',', '.'));
+    return parsed ?? fallback;
   }
 
   String _statusText(String raw) {
@@ -516,6 +538,83 @@ class _CartScreenState extends State<CartScreen> {
       );
     } finally {
       if (mounted) setState(() => _cancelling = false);
+    }
+  }
+
+  Future<void> _requestDeliveryReady() async {
+    if (_deliveryReadySubmitting) return;
+    final addressCtrl = TextEditingController();
+    try {
+      final address = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Адрес доставки'),
+          content: TextField(
+            controller: addressCtrl,
+            minLines: 3,
+            maxLines: 5,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Введите полный адрес',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(addressCtrl.text.trim()),
+              child: const Text('Отправить'),
+            ),
+          ],
+        ),
+      );
+      if (address == null) return;
+      if (address.trim().isEmpty) {
+        if (!mounted) return;
+        showAppNotice(
+          context,
+          'Введите адрес доставки',
+          tone: AppNoticeTone.warning,
+        );
+        return;
+      }
+      setState(() => _deliveryReadySubmitting = true);
+      await authService.dio.post(
+        '/api/cart/ready-for-delivery',
+        data: {'address': address.trim()},
+      );
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Заявка на доставку отправлена администратору',
+        tone: AppNoticeTone.success,
+      );
+      setState(() {
+        _deliveryReadySubmitting = false;
+        _deliveryReady = {
+          ..._deliveryReady,
+          'can_request': false,
+          'request_pending': true,
+        };
+      });
+      unawaited(playAppSound(AppUiSound.success).catchError((_) {}));
+      _scheduleReload(delay: const Duration(milliseconds: 120));
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка заявки на доставку: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 3),
+      );
+    } finally {
+      addressCtrl.dispose();
+      if (mounted && _deliveryReadySubmitting) {
+        setState(() => _deliveryReadySubmitting = false);
+      }
     }
   }
 
@@ -924,6 +1023,66 @@ class _CartScreenState extends State<CartScreen> {
     );
   }
 
+  Widget? _buildDeliveryReadyButton() {
+    if (!_boolValue(_deliveryReady['enabled'])) return null;
+    final theme = Theme.of(context);
+    final minAmount = _doubleValue(_deliveryReady['min_amount'], 1500);
+    final totalSum = _doubleValue(_deliveryReady['total_sum'], _total);
+    final hasBulky = _boolValue(_deliveryReady['has_bulky']);
+    final hasPickupOnly = _boolValue(_deliveryReady['has_pickup_only']);
+    final canRequest = _boolValue(_deliveryReady['can_request']);
+    final requestPending = _boolValue(_deliveryReady['request_pending']);
+    String hint;
+    if (requestPending) {
+      hint = 'Заявка на доставку отправлена администратору.';
+    } else if (hasBulky) {
+      hint = 'В корзине есть габаритный товар. Доставку оформит администратор.';
+    } else if (hasPickupOnly) {
+      hint =
+          'В корзине есть товар только для самовывоза. Доставка недоступна, свяжитесь с администратором.';
+    } else if (!canRequest) {
+      final missing = math.max(0, minAmount - totalSum);
+      hint =
+          'Минимальная сумма для доставки в ваш город пока не набрана. '
+          'До минимальной суммы осталось: ${_formatMoney(missing)}.';
+    } else {
+      hint = 'Нажмите и укажите адрес, администратор получит заявку.';
+    }
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: canRequest && !_deliveryReadySubmitting
+                    ? _requestDeliveryReady
+                    : null,
+                icon: _deliveryReadySubmitting
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.local_shipping_outlined),
+                label: const Text('Готов на доставку'),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              hint,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildImage(String? imageUrl) {
     final theme = Theme.of(context);
     if (imageUrl == null || imageUrl.isEmpty) {
@@ -963,10 +1122,42 @@ class _CartScreenState extends State<CartScreen> {
     );
   }
 
+  Widget _buildPickupOnlyNotice() {
+    final theme = Theme.of(context);
+    final warningColor = theme.colorScheme.tertiary;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: warningColor.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: warningColor.withValues(alpha: 0.34)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.storefront_outlined, size: 18, color: warningColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Самовывоз: этот товар не привезут. Если он в корзине, всю корзину нужно будет забрать самостоятельно.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurface,
+                fontWeight: FontWeight.w700,
+                height: 1.25,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildItemCard(Map<String, dynamic> item) {
     final theme = Theme.of(context);
     final title = (item['title'] ?? 'Товар').toString();
     final statusRaw = (item['status'] ?? '').toString();
+    final pickupOnly = _boolValue(item['pickup_only']);
     final quantity = (item['quantity'] is num)
         ? (item['quantity'] as num).toInt()
         : int.tryParse('${item['quantity']}') ?? 0;
@@ -1027,6 +1218,10 @@ class _CartScreenState extends State<CartScreen> {
                 ),
               ],
             ),
+            if (pickupOnly) ...[
+              const SizedBox(height: 10),
+              _buildPickupOnlyNotice(),
+            ],
             const SizedBox(height: 10),
             Row(
               children: [
@@ -1285,6 +1480,7 @@ class _CartScreenState extends State<CartScreen> {
         .toList();
     final hasVisibleCartContent =
         basketItems.isNotEmpty || inDeliveryItems.isNotEmpty;
+    final deliveryReadyButton = _buildDeliveryReadyButton();
 
     return Scaffold(
       appBar: AppBar(title: const Text('Корзина')),
@@ -1318,6 +1514,10 @@ class _CartScreenState extends State<CartScreen> {
                   padding: const EdgeInsets.all(16),
                   children: [
                     _buildSummary(),
+                    if (deliveryReadyButton != null) ...[
+                      const SizedBox(height: 10),
+                      deliveryReadyButton,
+                    ],
                     const SizedBox(height: 14),
                     if (!hasVisibleCartContent)
                       const AppEmptyState(

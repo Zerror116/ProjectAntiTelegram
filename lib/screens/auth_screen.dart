@@ -30,28 +30,6 @@ class AuthScreen extends StatefulWidget {
 class _AuthScreenState extends State<AuthScreen> {
   static const String _creatorEmail = 'zerotwo02166@gmail.com';
   static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
-  static const Map<String, List<String>> _clientInviteCities = {
-    'INV-W8V6-UZCA': [
-      'Алексеевка',
-      'Бобровка',
-      'Георгиевка',
-      'Горный',
-      'Елшняги',
-      'Кинель-север',
-      'Кинель-юг',
-      'Кинельский',
-      'Комсомолец',
-      'Лебедь',
-      'Луговой',
-      'Новый бяун',
-      'Новый сарбай',
-      'Отрадный',
-      'Самара',
-      'Сухая Самарка',
-      'Усть-Кинельский',
-    ],
-    'INV-TS5W-RZ5L': ['Борское', 'Богатое', 'Бузулук', 'Петровка', 'Виловатое'],
-  };
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -73,6 +51,8 @@ class _AuthScreenState extends State<AuthScreen> {
   String _tenantCodeFromLink = '';
   String _tenantNameFromInvite = '';
   String _inviteResolveMessage = '';
+  String _resolvedInviteCode = '';
+  List<String> _clientCityOptions = const <String>[];
   bool _handledIncomingAuthAction = false;
   bool _routeNoticeApplied = false;
   bool _passwordResetEnabled = false;
@@ -105,7 +85,15 @@ class _AuthScreenState extends State<AuthScreen> {
     // Подписываемся на контроллеры, чтобы гарантированно перерисовывать UI при вводе
     _emailListener = () => setState(() {});
     _passwordListener = () => setState(() {});
-    _accessKeyListener = () => setState(() {});
+    _accessKeyListener = () {
+      final normalized = _normalizeInviteCode(_accessKeyController.text);
+      setState(() {
+        if (normalized != _resolvedInviteCode) {
+          _clientCityOptions = const <String>[];
+          _selectedClientCity = '';
+        }
+      });
+    };
     _nameListener = () => setState(() {});
     _phoneListener = () => setState(() {});
     _tenantGroupNameListener = () => setState(() {});
@@ -559,7 +547,11 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   List<String> _clientCitiesForInvite(String raw) {
-    return _clientInviteCities[_normalizeInviteCode(raw)] ?? const [];
+    final normalized = _normalizeInviteCode(raw);
+    if (normalized.isEmpty || normalized != _resolvedInviteCode) {
+      return const [];
+    }
+    return _clientCityOptions;
   }
 
   bool _looksLikeInviteCode(String raw) {
@@ -581,10 +573,25 @@ class _AuthScreenState extends State<AuthScreen> {
     if (data is Map && data['ok'] == true && data['data'] is Map) {
       final row = Map<String, dynamic>.from(data['data'] as Map);
       final tenantName = (row['tenant_name'] ?? '').toString().trim();
+      final resolvedInvite = _normalizeInviteCode(
+        (row['invite_code'] ?? normalized).toString(),
+      );
+      final rawCityOptions = row['client_city_options'];
+      final cityOptions = rawCityOptions is List
+          ? rawCityOptions
+                .map((item) => item.toString().trim())
+                .where((item) => item.isNotEmpty)
+                .toList(growable: false)
+          : const <String>[];
       if (mounted) {
         setState(() {
           _tenantNameFromInvite = tenantName;
           _inviteResolveMessage = '';
+          _resolvedInviteCode = resolvedInvite;
+          _clientCityOptions = cityOptions;
+          if (!_clientCityOptions.contains(_selectedClientCity)) {
+            _selectedClientCity = '';
+          }
         });
       }
       return _normalizeTenantCode((row['tenant_code'] ?? '').toString());
@@ -604,6 +611,9 @@ class _AuthScreenState extends State<AuthScreen> {
       if (!mounted) return;
       setState(() {
         _inviteResolveMessage = 'Ссылка приглашения недействительна';
+        _resolvedInviteCode = '';
+        _clientCityOptions = const <String>[];
+        _selectedClientCity = '';
       });
     }
   }
@@ -1292,6 +1302,15 @@ class _AuthScreenState extends State<AuthScreen> {
           if (mounted) {
             setState(() => _loading = false);
           }
+          return;
+        }
+        final requiredCities = _clientCitiesForInvite(accessKey);
+        if (requiredCities.isNotEmpty &&
+            !requiredCities.contains(_selectedClientCity.trim())) {
+          setState(() {
+            _message = 'Выберите город';
+            _loading = false;
+          });
           return;
         }
         if (!_emailRecoveryStatusLoaded) {

@@ -10,6 +10,10 @@ import '../src/utils/device_utils.dart';
 class MonitoringService {
   MonitoringService._();
 
+  static const bool _enabled = bool.fromEnvironment(
+    'PHX_MONITORING_ENABLED',
+    defaultValue: false,
+  );
   static const int _maxRecentFingerprints = 48;
   static final List<String> _recentFingerprints = <String>[];
   static final Map<String, DateTime> _recentFingerprintTimestamps =
@@ -58,7 +62,8 @@ class MonitoringService {
     final normalizedSubsystem = subsystem.trim().toLowerCase();
     final normalizedCode = code.trim().toLowerCase();
     final normalizedMessage = message.trim().toLowerCase();
-    final isClientRuntime = normalizedSubsystem == 'client' &&
+    final isClientRuntime =
+        normalizedSubsystem == 'client' &&
         (normalizedCode == 'flutter_error' ||
             normalizedCode == 'platform_dispatcher_error');
 
@@ -88,6 +93,7 @@ class MonitoringService {
     String? source,
     Map<String, dynamic> details = const <String, dynamic>{},
   }) async {
+    if (!_enabled) return;
     final user = authService.currentUser;
     if (user == null) return;
     if (_isMuted()) return;

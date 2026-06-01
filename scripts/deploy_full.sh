@@ -210,6 +210,15 @@ install_custom_service_worker() {
   chmod 644 "$target"
 }
 
+install_static_web_extras() {
+  local reset_source="$PROJECT_ROOT/web/phoenix_cache_reset.html"
+  local reset_target="$PROJECT_ROOT/build/web/phoenix_cache_reset.html"
+  [[ -f "$reset_source" ]] || return 0
+  [[ -d "$PROJECT_ROOT/build/web" ]] || return 0
+  cp "$reset_source" "$reset_target"
+  chmod 644 "$reset_target"
+}
+
 cd "$PROJECT_ROOT"
 
 if [[ "$NO_COMMIT" != "1" ]]; then
@@ -251,6 +260,7 @@ fi
 
 strip_web_debug_artifacts
 install_custom_service_worker
+install_static_web_extras
 normalize_web_build_permissions
 
 APK_SOURCE_RESOLVED=""

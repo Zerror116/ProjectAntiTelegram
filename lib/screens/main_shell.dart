@@ -19,8 +19,6 @@ import 'admin_panel.dart';
 import 'auth_screen.dart';
 import 'cart_screen.dart';
 import 'chats_screen.dart';
-import 'contacts_screen.dart';
-import 'monitoring_screen.dart';
 import 'profile_screen.dart';
 import 'pwa_guide_screen.dart';
 import 'settings_screen.dart';
@@ -33,14 +31,12 @@ class _ShellDestination {
     required this.label,
     required this.icon,
     required this.builder,
-    this.priority = 0,
   });
 
   final String id;
   final String label;
   final IconData icon;
   final WidgetBuilder builder;
-  final int priority;
 }
 
 class MainShell extends StatefulWidget {
@@ -168,20 +164,17 @@ class _MainShellState extends State<MainShell> {
         normalized == 'admin' ||
         normalized == 'tenant' ||
         normalized == 'creator';
-    final showStats = showAdmin;
+    final showStats = normalized == 'tenant' || normalized == 'creator';
     final showWorker =
         normalized == 'worker' ||
         normalized == 'tenant' ||
         normalized == 'creator';
-    final showMonitoring = normalized == 'creator';
     return <String>[
       'chats',
-      'contacts',
       'cart',
       if (showAdmin) 'admin',
-      if (showStats) 'stats',
       if (showWorker) 'worker',
-      if (showMonitoring) 'monitoring',
+      if (showStats) 'stats',
       'profile',
       'settings',
     ];
@@ -223,7 +216,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   bool _hasStatsTab() {
-    const roles = {'admin', 'tenant', 'creator'};
+    const roles = {'tenant', 'creator'};
     final role = _effectiveRole();
     if (!roles.contains(role)) return false;
     if (_isCreatorNativeView()) return true;
@@ -247,12 +240,6 @@ class _MainShellState extends State<MainShell> {
       'product.requeue',
       'product.edit.own_pending',
     ]);
-  }
-
-  bool _hasMonitoringTab() {
-    const roles = {'creator'};
-    final role = _effectiveRole();
-    return roles.contains(role);
   }
 
   bool _hasAnyPermission(List<String> keys) {
@@ -553,28 +540,18 @@ class _MainShellState extends State<MainShell> {
     required bool showStats,
     required bool showWorker,
   }) {
-    final isClient = _effectiveRole() == 'client';
     return <_ShellDestination>[
       const _ShellDestination(
         id: 'chats',
         label: 'Чаты',
         icon: Icons.chat_bubble_outline_rounded,
         builder: _buildChatsScreen,
-        priority: 100,
-      ),
-      const _ShellDestination(
-        id: 'contacts',
-        label: 'Контакты',
-        icon: Icons.contacts_outlined,
-        builder: _buildContactsScreen,
-        priority: 98,
       ),
       const _ShellDestination(
         id: 'cart',
         label: 'Корзина',
         icon: Icons.shopping_bag_outlined,
         builder: _buildCartScreen,
-        priority: 95,
       ),
       if (showAdmin)
         const _ShellDestination(
@@ -582,15 +559,6 @@ class _MainShellState extends State<MainShell> {
           label: 'Админ',
           icon: Icons.admin_panel_settings_outlined,
           builder: _buildAdminScreen,
-          priority: 85,
-        ),
-      if (showStats)
-        const _ShellDestination(
-          id: 'stats',
-          label: 'Статистика',
-          icon: Icons.bar_chart_rounded,
-          builder: _buildStatsScreen,
-          priority: 80,
         ),
       if (showWorker)
         const _ShellDestination(
@@ -598,43 +566,35 @@ class _MainShellState extends State<MainShell> {
           label: 'Рабочий',
           icon: Icons.inventory_2_outlined,
           builder: _buildWorkerScreen,
-          priority: 70,
         ),
-      if (_hasMonitoringTab())
+      if (showStats)
         const _ShellDestination(
-          id: 'monitoring',
-          label: 'Мониторинг',
-          icon: Icons.monitor_heart_outlined,
-          builder: _buildMonitoringScreen,
-          priority: 60,
+          id: 'stats',
+          label: 'Статистика',
+          icon: Icons.bar_chart_rounded,
+          builder: _buildStatsScreen,
         ),
       _ShellDestination(
         id: 'profile',
         label: 'Профиль',
         icon: Icons.person_outline_rounded,
         builder: _buildProfileScreen,
-        priority: isClient ? 92 : 90,
       ),
       _ShellDestination(
         id: 'settings',
         label: 'Настройки',
         icon: Icons.tune_rounded,
         builder: _buildSettingsScreen,
-        priority: isClient ? 91 : 40,
       ),
     ];
   }
 
   static Widget _buildChatsScreen(BuildContext context) => const ChatsScreen();
-  static Widget _buildContactsScreen(BuildContext context) =>
-      const ContactsScreen();
   static Widget _buildCartScreen(BuildContext context) => const CartScreen();
   static Widget _buildAdminScreen(BuildContext context) => const AdminPanel();
   static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
   static Widget _buildStatsScreen(BuildContext context) =>
       const StatsDashboardScreen();
-  static Widget _buildMonitoringScreen(BuildContext context) =>
-      const MonitoringScreen();
   static Widget _buildProfileScreen(BuildContext context) =>
       const ProfileScreen();
   static Widget _buildSettingsScreen(BuildContext context) =>
@@ -942,10 +902,7 @@ class _MainShellState extends State<MainShell> {
             ? false
             : _useCompactNavigation(context);
         final primaryDestinations = compactNavigation
-            ? (destinations.toList()
-                    ..sort((a, b) => b.priority.compareTo(a.priority)))
-                  .take(4)
-                  .toList()
+            ? destinations.take(4).toList()
             : destinations;
         final hiddenDestinations = compactNavigation
             ? destinations

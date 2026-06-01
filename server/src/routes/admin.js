@@ -10,7 +10,7 @@ const requireAuth = require("../middleware/requireAuth");
 const requireRole = require("../middleware/requireRole");
 const requirePermission = require("../middleware/requirePermission");
 const db = require("../db");
-const { ensureSystemChannels } = require("../utils/systemChannels");
+const { ensureSystemChannels, insertAdminSystemMessage } = require("../utils/systemChannels");
 const {
   generateAccessKey,
   generateInviteCode,
@@ -24,7 +24,7 @@ const {
   provisionIsolatedTenantDatabase,
   syncTenantShadowTenantState,
 } = require("../utils/tenantDatabases");
-const { logMonitoringEvent } = require("../utils/monitoring");
+const { logMonitoringEvent, monitoringEnabled } = require("../utils/monitoring");
 const { emitToTenant } = require("../utils/socket");
 const { emitCatalogQueueUpdated } = require("../utils/catalogQueueSocket");
 const { antifraudGuard } = require("../utils/antifraud");
@@ -32,11 +32,16 @@ const {
   encryptMessageText,
   decryptMessageRow,
 } = require("../utils/messageCrypto");
+const { readEncryptedText } = require("../utils/secureData");
 const { runInRequestTenantScope } = require("../utils/requestScope");
 const { uploadsPath } = require("../utils/storagePaths");
 const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
 const { toOriginalPublicMediaUrl } = require("../utils/mediaAssets");
 const { normalizeCatalogTitle } = require("../utils/catalogTitle");
+const {
+  getTenantFeatureSettings,
+  patchTenantFeatureSettings,
+} = require("../utils/tenantFeatureSettings");
 const {
   DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
   enqueueChannelPublicationBatches,
@@ -46,7 +51,9 @@ const {
   getChannelPublicationBatch,
   kickChannelPublicationProcessor,
 } = require("../utils/channelPublicationQueue");
-const { upsertMessageSearchDocument } = require("../utils/chatSearchIndex");
+const {
+  upsertMessageSearchDocument,
+} = require("../utils/chatSearchIndex");
 
 const requireProductPublishPermission = requirePermission("product.publish");
 const requireReservationFulfillPermission = requirePermission(
@@ -54,6 +61,10 @@ const requireReservationFulfillPermission = requirePermission(
 );
 const PUBLISH_POST_INTERVAL_MS = DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS;
 const SAMARA_TZ = "Europe/Samara";
+
+function tenantIdFromRequest(req) {
+  return String(req.user?.tenant_id || "").trim();
+}
 
 function emitChannelUpdated(io, tenantId, channelId, payload = {}) {
   if (!io || !channelId) return;
@@ -107,6 +118,480 @@ function emitReservedOrderUpdated(io, tenantId, reservedChannelId, payload = {})
     ...payload,
   });
 }
+
+function buildRevisionDeleteDecisionText({ approved, productTitle, productLabel, adminName }) {
+  const action = approved ? "одобрил удаление" : "отклонил удаление";
+  return [
+    `Ревизия: администратор ${adminName || "Администратор"} ${action} товара.`,
+    `Товар: ${productTitle || "без названия"}`,
+    `ID: ${productLabel || "—"}`,
+  ].join("\n");
+}
+
+function firstLocalityLetterFromAddress(addressText, fallbackCity = "") {
+  const source = String(addressText || fallbackCity || "").trim();
+  if (!source) return "";
+  const firstPart = source
+    .split(",")[0]
+    .replace(/^г\.?\s+/i, "")
+    .replace(/^город\s+/i, "")
+    .trim();
+  if (!firstPart) return "";
+  return firstPart[0].toUpperCase();
+}
+
+function buildChannelClientExcelRow(row) {
+  const deliveryAddress = readEncryptedText({
+    address_text: row.delivery_address_text,
+    address_ciphertext: row.delivery_address_ciphertext,
+    address_iv: row.delivery_address_iv,
+    address_tag: row.delivery_address_tag,
+  });
+  const savedAddress = readEncryptedText({
+    address_text: row.saved_address_text,
+    address_ciphertext: row.saved_address_ciphertext,
+    address_iv: row.saved_address_iv,
+    address_tag: row.saved_address_tag,
+  });
+  const effectiveAddress = deliveryAddress || savedAddress || "";
+  const deliverySum = Number(row.delivery_sum || 0);
+  const cartSum = Number(row.cart_sum || 0);
+  const deliveryShelfLabel = String(row.delivery_shelf_label || "").trim();
+  const deliveryShelfNumber = row.delivery_shelf_number == null
+    ? ""
+    : String(row.delivery_shelf_number).trim();
+  const shelfLabel = deliveryShelfLabel ||
+    deliveryShelfNumber ||
+    (row.shelf_number == null ? "" : String(row.shelf_number).trim());
+  const bulkyText = String(row.delivery_bulky_note || row.cart_bulky_titles || "").trim();
+  const hasDeliveryRow = row.delivery_customer_id != null;
+  return {
+    total_sum: Number.isFinite(deliverySum) && deliverySum > 0 ? deliverySum : cartSum,
+    delivery_address_text: deliveryAddress,
+    saved_address_text: savedAddress,
+    effective_address_text: effectiveAddress,
+    courier_name: String(row.courier_name || "").trim(),
+    locality_letter: firstLocalityLetterFromAddress(
+      effectiveAddress,
+      row.client_city,
+    ),
+    bulky_text: bulkyText,
+    shelf_label: shelfLabel,
+    package_places: hasDeliveryRow && row.package_places != null
+      ? Number(row.package_places) || null
+      : null,
+  };
+}
+
+router.get(
+  "/tenant/feature-settings",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  async (req, res) => {
+    const tenantId = tenantIdFromRequest(req);
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+    try {
+      const settings = await getTenantFeatureSettings(tenantId);
+      return res.json({ ok: true, data: settings });
+    } catch (err) {
+      console.error("admin.tenant.featureSettings.get error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/tenant/feature-settings",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  async (req, res) => {
+    const tenantId = tenantIdFromRequest(req);
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+    try {
+      const settings = await patchTenantFeatureSettings(tenantId, req.body || {});
+      emitToTenant(req.app.get("io"), tenantId, "tenant:feature-settings:updated", {
+        entity: "tenant_feature_settings",
+        entity_id: tenantId,
+        action: "updated",
+        settings,
+      });
+      return res.json({ ok: true, data: settings });
+    } catch (err) {
+      console.error("admin.tenant.featureSettings.patch error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.get(
+  "/revision/delete-requests",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  async (req, res) => {
+    const tenantId = tenantIdFromRequest(req) || null;
+    try {
+      const settings = await getTenantFeatureSettings(tenantId);
+      if (settings.revision_delete_approval_enabled !== true) {
+        return res.json({ ok: true, enabled: false, data: [] });
+      }
+      const result = await db.query(
+        `SELECT r.id,
+                r.tenant_id,
+                r.worker_id,
+                r.product_id,
+                r.queue_id,
+                r.channel_id,
+                r.reason,
+                r.status,
+                r.decided_by,
+                r.decided_at,
+                r.created_at,
+                r.updated_at,
+                p.title AS product_title,
+                p.product_code,
+                p.shelf_number,
+                p.manual_shelf_label,
+                p.image_url,
+                COALESCE(NULLIF(BTRIM(w.name), ''), NULLIF(BTRIM(w.email), ''), 'Рабочий') AS worker_name,
+                COALESCE(NULLIF(BTRIM(a.name), ''), NULLIF(BTRIM(a.email), ''), '') AS decided_by_name,
+                c.title AS channel_title
+         FROM revision_delete_requests r
+         LEFT JOIN products p ON p.id = r.product_id
+         LEFT JOIN users w ON w.id = r.worker_id
+         LEFT JOIN users a ON a.id = r.decided_by
+         LEFT JOIN chats c ON c.id = r.channel_id
+         WHERE ($1::uuid IS NULL OR r.tenant_id = $1::uuid)
+         ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,
+                  r.created_at DESC
+         LIMIT 120`,
+        [tenantId],
+      );
+      return res.json({ ok: true, enabled: true, data: result.rows });
+    } catch (err) {
+      console.error("admin.revision.deleteRequests.list error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.post(
+  "/revision/delete-requests/:requestId/decision",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  async (req, res) => {
+    const requestId = String(req.params?.requestId || "").trim();
+    const rawDecision = String(req.body?.decision || req.body?.status || "")
+      .trim()
+      .toLowerCase();
+    const approved = ["approve", "approved", "yes", "true", "да"].includes(rawDecision);
+    const rejected = ["reject", "rejected", "no", "false", "нет"].includes(rawDecision);
+    if (!isUuidLike(requestId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный id запроса" });
+    }
+    if (!approved && !rejected) {
+      return res.status(400).json({ ok: false, error: "Укажите решение: approved или rejected" });
+    }
+
+    const tenantId = tenantIdFromRequest(req) || null;
+    const client = await db.pool.connect();
+    let hiddenMessages = [];
+    let affectedChannelIds = new Set();
+    let requestRow = null;
+    try {
+      const settings = await getTenantFeatureSettings(tenantId);
+      if (settings.revision_delete_approval_enabled !== true) {
+        return res.status(403).json({
+          ok: false,
+          error: "Удаление через ревизию недоступно для этой группы",
+        });
+      }
+
+      await client.query("BEGIN");
+      const requestQ = await client.query(
+        `SELECT r.*,
+                p.title AS product_title,
+                p.product_code,
+                p.shelf_number,
+                p.image_url,
+                COALESCE(NULLIF(BTRIM(a.name), ''), NULLIF(BTRIM(a.email), ''), 'Администратор') AS admin_name
+         FROM revision_delete_requests r
+         LEFT JOIN products p ON p.id = r.product_id
+         LEFT JOIN users a ON a.id = $3::uuid
+         WHERE r.id = $1::uuid
+           AND ($2::uuid IS NULL OR r.tenant_id = $2::uuid)
+         LIMIT 1
+         FOR UPDATE`,
+        [requestId, tenantId, req.user.id],
+      );
+      if (requestQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Запрос не найден" });
+      }
+      requestRow = requestQ.rows[0];
+      if (String(requestRow.status || "") !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ ok: false, error: "По этому запросу уже принято решение" });
+      }
+
+      const productLabel = formatProductLabel(
+        requestRow.product_code,
+        requestRow.shelf_number,
+        requestRow.manual_shelf_label,
+      );
+
+      if (approved) {
+        await client.query(
+          `UPDATE products
+           SET status = 'archived',
+               quantity = 0,
+               reusable_at = now(),
+               updated_at = now()
+           WHERE id = $1::uuid`,
+          [requestRow.product_id],
+        );
+        await client.query(
+          `UPDATE product_publication_queue
+           SET status = 'archived',
+               is_sent = true,
+               publish_error_code = 'revision_delete_approved',
+               publish_error_message = 'Удалено администратором по запросу ревизии'
+           WHERE product_id = $1::uuid
+             AND status = 'pending'
+             AND COALESCE(is_sent, false) = false`,
+          [requestRow.product_id],
+        );
+        const hiddenQ = await client.query(
+          `UPDATE messages
+           SET meta = jsonb_set(
+                 jsonb_set(
+                   jsonb_set(
+                     COALESCE(meta, '{}'::jsonb),
+                     '{hidden_for_all}',
+                     'true'::jsonb,
+                     true
+                   ),
+                   '{hidden_revision_delete_approved}',
+                   'true'::jsonb,
+                   true
+                 ),
+                 '{hidden_revision_delete_request_id}',
+                 to_jsonb($2::text),
+                 true
+               )
+           WHERE COALESCE(meta->>'kind', '') = 'catalog_product'
+             AND COALESCE(meta->>'product_id', '') = $1::text
+             AND ($3::uuid IS NULL OR chat_id = $3::uuid)
+             AND COALESCE((meta->>'hidden_for_all')::boolean, false) = false
+           RETURNING id, chat_id, sender_id, text, meta, created_at`,
+          [requestRow.product_id, requestId, requestRow.channel_id || null],
+        );
+        hiddenMessages = hiddenQ.rows;
+        for (const message of hiddenMessages) {
+          if (message.chat_id) affectedChannelIds.add(String(message.chat_id));
+        }
+      }
+
+      const decisionStatus = approved ? "approved" : "rejected";
+      const updatedQ = await client.query(
+        `UPDATE revision_delete_requests
+         SET status = $2,
+             decided_by = $3::uuid,
+             decided_at = now(),
+             updated_at = now()
+         WHERE id = $1::uuid
+         RETURNING id, tenant_id, worker_id, product_id, queue_id, channel_id,
+                   reason, status, decided_by, decided_at, created_at, updated_at`,
+        [requestId, decisionStatus, req.user.id],
+      );
+      const updatedRequest = updatedQ.rows[0];
+
+      await insertAdminSystemMessage(client, {
+        tenantId,
+        createdBy: req.user.id,
+        text: buildRevisionDeleteDecisionText({
+          approved,
+          productTitle: requestRow.product_title,
+          productLabel,
+          adminName: requestRow.admin_name,
+        }),
+        meta: {
+          kind: "revision_delete_decision",
+          request_id: requestId,
+          product_id: requestRow.product_id,
+          channel_id: requestRow.channel_id || null,
+          decision: decisionStatus,
+          product_label: productLabel,
+          action: "revision_delete_decision",
+        },
+        dedupeKey: `revision_delete_decision:${requestId}:${decisionStatus}`,
+      });
+
+      if (requestRow.channel_id) {
+        await client.query("UPDATE chats SET updated_at = now() WHERE id = $1", [
+          requestRow.channel_id,
+        ]);
+        affectedChannelIds.add(String(requestRow.channel_id));
+      }
+      await client.query("COMMIT");
+
+      const io = req.app.get("io");
+      if (io) {
+        for (const message of hiddenMessages) {
+          io.to(`chat:${message.chat_id}`).emit("chat:message", {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+        }
+        for (const channelId of affectedChannelIds) {
+          emitToTenant(io, tenantId, "chat:updated", { chatId: channelId });
+        }
+        emitCatalogQueueUpdated(io, tenantId, {
+          action: approved ? "revision_delete_approved" : "revision_delete_rejected",
+          product_id: requestRow.product_id,
+          request_id: requestId,
+          channel_id: requestRow.channel_id || null,
+        });
+        emitToTenant(io, tenantId, "revision:delete-request:updated", {
+          entity: "revision_delete_request",
+          entity_id: requestId,
+          action: decisionStatus,
+          request: updatedRequest,
+        });
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          request: updatedRequest,
+          hidden_messages: hiddenMessages.length,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
+      console.error("admin.revision.deleteRequests.decision error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.get(
+  "/defects/stats",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  async (req, res) => {
+    const tenantId = tenantIdFromRequest(req) || null;
+    try {
+      const settings = await getTenantFeatureSettings(tenantId);
+      if (settings.defect_stats_enabled !== true) {
+        return res.json({
+          ok: true,
+          enabled: false,
+          data: {
+            items: [],
+            counts: { week: 0, two_weeks: 0, month: 0, total: 0 },
+          },
+        });
+      }
+      const result = await db.query(
+        `WITH defect_rows AS (
+           SELECT d.id,
+                  d.tenant_id,
+                  d.product_id,
+                  d.created_at,
+                  d.title,
+                  d.reason,
+                  d.image_url,
+                  d.amount,
+                  COALESCE(NULLIF(BTRIM(author.name), ''), NULLIF(BTRIM(author.email), ''), '') AS uploader_name,
+                  'defect_report'::text AS source
+           FROM product_defect_reports d
+           LEFT JOIN users author ON author.id = d.created_by
+           WHERE d.status = 'active'
+             AND ($1::uuid IS NULL OR d.tenant_id = $1::uuid)
+           UNION ALL
+           SELECT cc.id,
+                  cc.tenant_id,
+                  cc.product_id,
+                  cc.created_at,
+                  COALESCE(NULLIF(BTRIM(p.title), ''), 'Товар') AS title,
+                  COALESCE(NULLIF(BTRIM(cc.description), ''), cc.claim_type) AS reason,
+                  COALESCE(NULLIF(BTRIM(cc.image_url), ''), NULLIF(BTRIM(p.image_url), '')) AS image_url,
+                  GREATEST(COALESCE(cc.approved_amount, 0), COALESCE(cc.requested_amount, 0)) AS amount,
+                  COALESCE(NULLIF(BTRIM(author.name), ''), NULLIF(BTRIM(author.email), ''), '') AS uploader_name,
+                  'customer_claim'::text AS source
+           FROM customer_claims cc
+           LEFT JOIN products p ON p.id = cc.product_id
+           LEFT JOIN users author ON author.id = p.created_by
+           WHERE cc.status IN ('pending', 'approved_return', 'approved_discount', 'settled')
+             AND ($1::uuid IS NULL OR cc.tenant_id = $1::uuid)
+         )
+         SELECT id,
+                tenant_id,
+                product_id,
+                created_at,
+                title,
+                reason,
+                image_url,
+                amount,
+                uploader_name,
+                source,
+                COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days') OVER ()::int AS week_count,
+                COUNT(*) FILTER (WHERE created_at >= now() - interval '14 days') OVER ()::int AS two_weeks_count,
+                COUNT(*) FILTER (WHERE created_at >= now() - interval '30 days') OVER ()::int AS month_count,
+                COUNT(*) OVER ()::int AS total_count
+         FROM defect_rows
+         ORDER BY created_at DESC
+         LIMIT 200`,
+        [tenantId],
+      );
+      const first = result.rows[0] || {};
+      return res.json({
+        ok: true,
+        enabled: true,
+        data: {
+          counts: {
+            week: Number(first.week_count || 0),
+            two_weeks: Number(first.two_weeks_count || 0),
+            month: Number(first.month_count || 0),
+            total: Number(first.total_count || 0),
+          },
+          items: result.rows.map((row) => ({
+            id: row.id,
+            tenant_id: row.tenant_id,
+            product_id: row.product_id,
+            created_at: row.created_at,
+            title: row.title,
+            reason: row.reason,
+            image_url: row.image_url,
+            amount: Number(row.amount || 0),
+            uploader_name: row.uploader_name || "",
+            uploaded_by_name: row.uploader_name || "",
+            source_label:
+              row.source === "customer_claim" ? "Возврат клиента" : "Брак",
+            source: row.source,
+          })),
+        },
+      });
+    } catch (err) {
+      console.error("admin.defects.stats error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
 const TENANT_ACCESS_KEY_PATTERN = /^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$/;
 
 function buildIsolatedProvisionWarning(err) {
@@ -367,6 +852,10 @@ function isUuidLike(value) {
   );
 }
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function normalizeUuidList(raw) {
   if (!Array.isArray(raw)) return [];
   const unique = new Set();
@@ -387,6 +876,21 @@ function parseSettingsStringList(raw) {
     unique.add(value);
   }
   return Array.from(unique);
+}
+
+function buildTenantWorkflowSettingsPayload(body = {}) {
+  const source = isPlainObject(body) ? body : {};
+  const payload = isPlainObject(source.workflow_settings)
+    ? { ...source.workflow_settings }
+    : {};
+  if (Object.prototype.hasOwnProperty.call(source, "client_city_options")) {
+    payload.registration = {
+      ...(isPlainObject(payload.registration) ? payload.registration : {}),
+      client_city_options: source.client_city_options,
+    };
+    payload.client_city_options = source.client_city_options;
+  }
+  return payload;
 }
 
 function isBugReportsTitle(value) {
@@ -479,13 +983,16 @@ function productMessageText(product) {
   return lines.join("\n");
 }
 
-function formatProductLabel(productCode, shelfNumber) {
+function formatProductLabel(productCode, shelfNumber, manualShelfLabel = "") {
   const code = Number(productCode);
   const shelf = Number(shelfNumber);
   const codePart = Number.isFinite(code) && code > 0 ? String(Math.floor(code)) : "—";
-  const shelfPart = Number.isFinite(shelf) && shelf > 0
-    ? String(Math.floor(shelf)).padStart(2, "0")
-    : "—";
+  const manualShelf = String(manualShelfLabel || "").trim();
+  const shelfPart = manualShelf || (
+    Number.isFinite(shelf) && shelf > 0
+      ? String(Math.floor(shelf)).padStart(2, "0")
+      : "—"
+  );
   return `${codePart}--${shelfPart}`;
 }
 
@@ -577,6 +1084,7 @@ function reservedOrderMessageText(order) {
   const productLabel = formatProductLabel(
     order.product_code,
     order.product_shelf_number,
+    order.manual_shelf_label,
   );
   const clientShelf = displayShelfValue(order.shelf_label, order.shelf_number);
   const lines = [
@@ -604,7 +1112,11 @@ function archivedProductMessageText({
   queuedByPhone,
 }) {
   const creator = queuedByName || queuedByEmail || "Неизвестно";
-  const productLabel = formatProductLabel(product.product_code, product.shelf_number);
+  const productLabel = formatProductLabel(
+    product.product_code,
+    product.shelf_number,
+    product.manual_shelf_label,
+  );
   const lines = [
     "🗂 Архив поста товара",
     `Название: ${product.title}`,
@@ -1005,6 +1517,73 @@ router.get("/tenants", requireAuth, requireRole("creator"), async (req, res) => 
   }
 });
 
+router.get(
+  "/tenants/:tenantId/feature-settings",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = String(req.params?.tenantId || "").trim();
+    if (!isUuidLike(tenantId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
+    }
+
+    try {
+      const tenant = await getTenantById(tenantId);
+      if (!tenant || tenant.is_deleted === true) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      const settings = await getTenantFeatureSettings(tenantId);
+      return res.json({ ok: true, data: settings });
+    } catch (err) {
+      console.error("admin.tenants.featureSettings.get error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/tenants/:tenantId/feature-settings",
+  requireAuth,
+  requireRole("creator"),
+  async (req, res) => {
+    if (req.user?.is_platform_creator !== true) {
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+    }
+    const tenantId = String(req.params?.tenantId || "").trim();
+    if (!isUuidLike(tenantId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный tenantId" });
+    }
+
+    try {
+      const tenant = await getTenantById(tenantId);
+      if (!tenant || tenant.is_deleted === true) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "Арендатор не найден" });
+      }
+      const settings = await patchTenantFeatureSettings(
+        tenantId,
+        buildTenantWorkflowSettingsPayload(req.body || {}),
+      );
+      emitToTenant(req.app.get("io"), tenantId, "tenant:feature-settings:updated", {
+        entity: "tenant_feature_settings",
+        entity_id: tenantId,
+        action: "updated",
+        settings,
+      });
+      return res.json({ ok: true, data: settings });
+    } catch (err) {
+      console.error("admin.tenants.featureSettings.patch error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 router.post(
   "/tenants",
   requireAuth,
@@ -1151,6 +1730,17 @@ router.post(
         }
       }
 
+      let featureSettings = null;
+      try {
+        featureSettings = await patchTenantFeatureSettings(
+          tenantId,
+          buildTenantWorkflowSettingsPayload(req.body || {}),
+        );
+      } catch (settingsErr) {
+        console.error("admin.tenants.create feature settings failed", settingsErr);
+        warning = `${warning ? `${warning} ` : ""}Настройки группы не сохранены, можно повторить через кнопку "Настройки".`;
+      }
+
       return res.status(201).json({
         ok: true,
         data: {
@@ -1159,6 +1749,7 @@ router.post(
           db_mode: dbMode,
           db_name: dbName,
           db_schema: dbSchema,
+          feature_settings: featureSettings,
           warning,
         },
       });
@@ -2480,10 +3071,68 @@ router.get(
                   u.email,
                   u.client_city,
                   ph.phone,
+                  COALESCE(cart_summary.total_sum, 0)::numeric AS cart_sum,
+                  us.shelf_number,
+                  saved_addr.address_text AS saved_address_text,
+                  saved_addr.address_ciphertext AS saved_address_ciphertext,
+                  saved_addr.address_iv AS saved_address_iv,
+                  saved_addr.address_tag AS saved_address_tag,
+                  latest_delivery.id::text AS delivery_customer_id,
+                  latest_delivery.processed_sum,
+                  latest_delivery.agreed_sum,
+                  COALESCE(latest_delivery.agreed_sum, latest_delivery.processed_sum, 0)::numeric AS delivery_sum,
+                  latest_delivery.address_text AS delivery_address_text,
+                  latest_delivery.address_ciphertext AS delivery_address_ciphertext,
+                  latest_delivery.address_iv AS delivery_address_iv,
+                  latest_delivery.address_tag AS delivery_address_tag,
+                  latest_delivery.courier_name,
+                  latest_delivery.shelf_number AS delivery_shelf_number,
+                  latest_delivery.shelf_label AS delivery_shelf_label,
+                  latest_delivery.bulky_places,
+                  latest_delivery.bulky_note AS delivery_bulky_note,
+                  latest_delivery.package_places,
+                  cart_summary.bulky_titles AS cart_bulky_titles,
                   true AS is_member
            FROM chat_members cm
            JOIN users u ON u.id = cm.user_id
            LEFT JOIN phones ph ON ph.user_id = u.id
+           LEFT JOIN user_shelves us ON us.user_id = u.id
+           LEFT JOIN LATERAL (
+             SELECT COALESCE(SUM(COALESCE(ci.custom_price, p.price) * ci.quantity), 0)::numeric AS total_sum,
+                    STRING_AGG(DISTINCT p.title, ', ') FILTER (
+                      WHERE COALESCE(ci.processing_mode, 'standard') = 'oversize'
+                    ) AS bulky_titles
+             FROM cart_items ci
+             JOIN products p ON p.id = ci.product_id
+             WHERE ci.user_id = u.id
+               AND ci.status IN ('processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
+           ) AS cart_summary ON true
+           LEFT JOIN LATERAL (
+             SELECT a.address_text,
+                    a.address_ciphertext,
+                    a.address_iv,
+                    a.address_tag
+             FROM user_delivery_addresses a
+             WHERE a.user_id = u.id
+             ORDER BY a.is_default DESC, a.updated_at DESC
+             LIMIT 1
+           ) AS saved_addr ON true
+           LEFT JOIN LATERAL (
+             SELECT dbc.*
+             FROM delivery_batch_customers dbc
+             JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
+             WHERE dbc.user_id = u.id
+             ORDER BY
+               CASE dbt.status
+                 WHEN 'calling' THEN 0
+                 WHEN 'couriers_assigned' THEN 1
+                 WHEN 'handed_off' THEN 2
+                 WHEN 'completed' THEN 3
+                 ELSE 4
+               END,
+               dbc.updated_at DESC
+             LIMIT 1
+           ) AS latest_delivery ON true
            WHERE cm.chat_id = $1 AND u.role = 'client'
            ORDER BY cm.joined_at DESC
            LIMIT 300`,
@@ -2497,12 +3146,70 @@ router.get(
                   u.email,
                   u.client_city,
                   ph.phone,
+                  COALESCE(cart_summary.total_sum, 0)::numeric AS cart_sum,
+                  us.shelf_number,
+                  saved_addr.address_text AS saved_address_text,
+                  saved_addr.address_ciphertext AS saved_address_ciphertext,
+                  saved_addr.address_iv AS saved_address_iv,
+                  saved_addr.address_tag AS saved_address_tag,
+                  latest_delivery.id::text AS delivery_customer_id,
+                  latest_delivery.processed_sum,
+                  latest_delivery.agreed_sum,
+                  COALESCE(latest_delivery.agreed_sum, latest_delivery.processed_sum, 0)::numeric AS delivery_sum,
+                  latest_delivery.address_text AS delivery_address_text,
+                  latest_delivery.address_ciphertext AS delivery_address_ciphertext,
+                  latest_delivery.address_iv AS delivery_address_iv,
+                  latest_delivery.address_tag AS delivery_address_tag,
+                  latest_delivery.courier_name,
+                  latest_delivery.shelf_number AS delivery_shelf_number,
+                  latest_delivery.shelf_label AS delivery_shelf_label,
+                  latest_delivery.bulky_places,
+                  latest_delivery.bulky_note AS delivery_bulky_note,
+                  latest_delivery.package_places,
+                  cart_summary.bulky_titles AS cart_bulky_titles,
                   EXISTS (
                     SELECT 1 FROM chat_members cm
                     WHERE cm.chat_id = $1 AND cm.user_id = u.id
                   ) AS is_member
            FROM users u
            LEFT JOIN phones ph ON ph.user_id = u.id
+           LEFT JOIN user_shelves us ON us.user_id = u.id
+           LEFT JOIN LATERAL (
+             SELECT COALESCE(SUM(COALESCE(ci.custom_price, p.price) * ci.quantity), 0)::numeric AS total_sum,
+                    STRING_AGG(DISTINCT p.title, ', ') FILTER (
+                      WHERE COALESCE(ci.processing_mode, 'standard') = 'oversize'
+                    ) AS bulky_titles
+             FROM cart_items ci
+             JOIN products p ON p.id = ci.product_id
+             WHERE ci.user_id = u.id
+               AND ci.status IN ('processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
+           ) AS cart_summary ON true
+           LEFT JOIN LATERAL (
+             SELECT a.address_text,
+                    a.address_ciphertext,
+                    a.address_iv,
+                    a.address_tag
+             FROM user_delivery_addresses a
+             WHERE a.user_id = u.id
+             ORDER BY a.is_default DESC, a.updated_at DESC
+             LIMIT 1
+           ) AS saved_addr ON true
+           LEFT JOIN LATERAL (
+             SELECT dbc.*
+             FROM delivery_batch_customers dbc
+             JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
+             WHERE dbc.user_id = u.id
+             ORDER BY
+               CASE dbt.status
+                 WHEN 'calling' THEN 0
+                 WHEN 'couriers_assigned' THEN 1
+                 WHEN 'handed_off' THEN 2
+                 WHEN 'completed' THEN 3
+                 ELSE 4
+               END,
+               dbc.updated_at DESC
+             LIMIT 1
+           ) AS latest_delivery ON true
            WHERE u.role = 'client'
              AND u.tenant_id = $2
            ORDER BY u.created_at DESC
@@ -2521,6 +3228,7 @@ router.get(
 
       const clients = clientsQ.rows.map((row) => ({
         ...row,
+        ...buildChannelClientExcelRow(row),
         is_blacklisted: blacklistedSet.has(String(row.user_id)),
       }));
 
@@ -3123,6 +3831,9 @@ router.get(
                   COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
                   COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
                   p.shelf_number AS product_shelf_number,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'manual_shelf_label'), ''), p.manual_shelf_label) AS manual_shelf_label,
+                  COALESCE(NULLIF(BTRIM(q.payload->>'shelf_floor'), ''), p.shelf_floor) AS shelf_floor,
+                  COALESCE(q.pickup_only, p.pickup_only, false) AS pickup_only,
                   COALESCE(NULLIF(BTRIM(q.payload->>'image_url'), ''), p.image_url) AS product_image_url,
                   p.product_code,
                   u.email AS queued_by_email,
@@ -3505,6 +4216,8 @@ router.post(
                 r.is_sent,
                 p.product_code,
                 p.shelf_number AS product_shelf_number,
+                p.manual_shelf_label,
+                COALESCE(p.pickup_only, false) AS pickup_only,
                 p.title AS product_title,
                 p.description AS product_description,
                 p.price AS product_price,
@@ -3520,7 +4233,6 @@ router.post(
          LEFT JOIN phones ph ON ph.user_id = r.user_id
          LEFT JOIN user_shelves us ON us.user_id = r.user_id
          WHERE r.is_fulfilled = false
-           AND COALESCE(r.is_sent, false) = false
            AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
          ORDER BY DATE(COALESCE(r.created_at, now())) ASC,
                   CASE
@@ -3562,8 +4274,11 @@ router.post(
           product_label: formatProductLabel(
             row.product_code,
             row.product_shelf_number,
+            row.manual_shelf_label,
           ),
           product_shelf_number: row.product_shelf_number,
+          manual_shelf_label: row.manual_shelf_label || null,
+          pickup_only: row.pickup_only === true,
           title: row.product_title,
           description: row.product_description,
           price: Number(row.product_price),
@@ -3574,6 +4289,7 @@ router.post(
           shelf_number: row.shelf_number,
           shelf_label: row.shelf_label,
           placed: false,
+          resent: row.is_sent === true,
         };
 
         const messageInsert = await client.query(
@@ -4449,6 +5165,34 @@ router.post(
 
     const client = await db.pool.connect();
     try {
+      const tenantSettings = await getTenantFeatureSettings(req.user.tenant_id || null);
+      const rawRequestedInterval =
+        req.body?.publication_interval_ms ??
+        (req.body?.publication_interval_seconds == null
+          ? null
+          : Number(req.body.publication_interval_seconds) * 1000);
+      let publicationIntervalMs = Number(tenantSettings.publication_interval_ms) ||
+        DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS;
+      if (tenantSettings.custom_workflows_enabled && rawRequestedInterval != null) {
+        publicationIntervalMs = Math.round(
+          Math.min(10 * 60 * 1000, Math.max(500, Number(rawRequestedInterval) || publicationIntervalMs)),
+        );
+        await patchTenantFeatureSettings(req.user.tenant_id || null, {
+          publication_interval_ms: publicationIntervalMs,
+        });
+      }
+      if (process.env.PHX_PUBLICATION_DEBUG_LOGS === "1") {
+        console.log("[PHX:PUBLISH] publish_pending request", {
+          tenant_id: req.user?.tenant_id || null,
+          user_id: req.user?.id || null,
+          role: req.user?.role || null,
+          requested_channel_id: channelId,
+          only_selected: onlySelected,
+          queue_ids: queueIds,
+          raw_requested_interval: rawRequestedInterval,
+          effective_interval_ms: publicationIntervalMs,
+        });
+      }
       await client.query("BEGIN");
       const enqueueResult = await enqueueChannelPublicationBatches({
         queryable: client,
@@ -4456,13 +5200,28 @@ router.post(
         createdBy: req.user.id || null,
         channelId,
         queueIds: onlySelected ? queueIds : [],
-        intervalMs: DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS,
+        intervalMs: publicationIntervalMs,
       });
       const batches = Array.isArray(enqueueResult.batches)
         ? enqueueResult.batches
         : [];
 
       await client.query("COMMIT");
+      if (process.env.PHX_PUBLICATION_DEBUG_LOGS === "1") {
+        console.log("[PHX:PUBLISH] publish_pending committed", {
+          tenant_id: req.user?.tenant_id || null,
+          accepted_count: enqueueResult.accepted_count,
+          batch_count: batches.length,
+          batches: batches.map((item) => ({
+            batch_id: item.batch_id,
+            channel_id: item.channel_id,
+            total_count: item.total_count,
+            interval_ms: item.interval_ms,
+          })),
+          already_running_channels:
+            enqueueResult.already_running_channels || [],
+        });
+      }
 
       emitCatalogQueueUpdated(req.app.get("io"), req.user?.tenant_id || null, {
         action: "publish_enqueued",
@@ -4482,6 +5241,16 @@ router.post(
         });
       });
       kickChannelPublicationProcessor(req.app.get("io"));
+      if (process.env.PHX_PUBLICATION_DEBUG_LOGS === "1") {
+        console.log(
+          "[PHX:PUBLISH] publish_pending realtime emitted and processor kicked",
+          {
+            tenant_id: req.user?.tenant_id || null,
+            channel_id: channelId,
+            batch_ids: batches.map((item) => item.batch_id).filter(Boolean),
+          },
+        );
+      }
 
       const alreadyRunningChannels = Array.isArray(
         enqueueResult.already_running_channels,
@@ -4955,6 +5724,295 @@ router.post(
   },
 );
 
+router.delete(
+  "/products/:id/full",
+  requireAuth,
+  requireRole("tenant", "creator"),
+  requireProductPublishPermission,
+  async (req, res) => {
+    const productId = String(req.params?.id || "").trim();
+    if (!productId) {
+      return res.status(400).json({ ok: false, error: "productId обязателен" });
+    }
+
+    try {
+      const result = await runInRequestTenantScope(req, async () => {
+        const client = await db.pool.connect();
+        try {
+          await client.query("BEGIN");
+          const productQ = await client.query(
+            `SELECT p.id,
+                    p.product_code,
+                    p.title,
+                    p.status,
+                    p.deleted_at
+             FROM products p
+             WHERE p.id = $1
+               AND (
+                 $2::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM users cu
+                   WHERE cu.id = p.created_by
+                     AND cu.tenant_id = $2::uuid
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                   FROM product_publication_queue q
+                   JOIN chats c ON c.id = q.channel_id
+                   WHERE q.product_id = p.id
+                     AND c.tenant_id = $2::uuid
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                   FROM cart_items ci
+                   JOIN users u ON u.id = ci.user_id
+                   WHERE ci.product_id = p.id
+                     AND u.tenant_id = $2::uuid
+                 )
+               )
+             LIMIT 1
+             FOR UPDATE`,
+            [productId, req.user?.tenant_id || null],
+          );
+          if (productQ.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return null;
+          }
+
+          const affectedUsersQ = await client.query(
+            `SELECT DISTINCT ci.user_id::text AS user_id
+             FROM cart_items ci
+             JOIN users u ON u.id = ci.user_id
+             WHERE ci.product_id = $1
+               AND ci.status NOT IN ('in_delivery', 'delivered')
+               AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)`,
+            [productId, req.user?.tenant_id || null],
+          );
+
+          await client.query(
+            `UPDATE reservations r
+             SET is_fulfilled = true,
+                 fulfilled_at = COALESCE(fulfilled_at, now()),
+                 updated_at = now()
+             WHERE r.product_id = $1
+               AND r.is_fulfilled = false
+               AND (
+                 $2::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM users u
+                   WHERE u.id = r.user_id
+                     AND u.tenant_id = $2::uuid
+                 )
+               )`,
+            [productId, req.user?.tenant_id || null],
+          );
+
+          await client.query(
+            `UPDATE delivery_batch_items i
+             SET assembly_status = 'removed',
+                 removed_reason = COALESCE(NULLIF(removed_reason, ''), 'Товар полностью удален'),
+                 removed_at = COALESCE(removed_at, now()),
+                 removed_by = COALESCE(removed_by, $3)
+             FROM delivery_batches b
+             JOIN delivery_batch_customers c ON c.batch_id = b.id
+             JOIN users u ON u.id = c.user_id
+             WHERE i.batch_id = b.id
+               AND i.batch_customer_id = c.id
+               AND i.product_id = $1
+               AND b.status IN ('calling', 'couriers_assigned')
+               AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)`,
+            [productId, req.user?.tenant_id || null, req.user?.id || null],
+          );
+
+          await client.query(
+            `UPDATE cart_items ci
+             SET status = 'cancelled',
+                 updated_at = now()
+             WHERE ci.product_id = $1
+               AND ci.status NOT IN ('in_delivery', 'delivered')
+               AND (
+                 $2::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM users u
+                   WHERE u.id = ci.user_id
+                     AND u.tenant_id = $2::uuid
+                 )
+               )`,
+            [productId, req.user?.tenant_id || null],
+          );
+
+          await client.query(
+            `UPDATE product_publication_queue q
+             SET status = 'deleted',
+                 is_sent = true
+             WHERE q.product_id = $1
+               AND (
+                 $2::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM chats c
+                   WHERE c.id = q.channel_id
+                     AND c.tenant_id = $2::uuid
+                 )
+               )`,
+            [productId, req.user?.tenant_id || null],
+          );
+
+          const hiddenMessagesQ = await client.query(
+            `UPDATE messages m
+             SET meta = jsonb_set(
+                   jsonb_set(
+                     jsonb_set(
+                       COALESCE(m.meta, '{}'::jsonb),
+                       '{hidden_for_all}',
+                       'true'::jsonb,
+                       true
+                     ),
+                     '{product_deleted}',
+                     'true'::jsonb,
+                     true
+                   ),
+                   '{deleted_by}',
+                   to_jsonb($3::text),
+                   true
+                 )
+             FROM chats c
+             WHERE c.id = m.chat_id
+               AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+               AND COALESCE(m.meta->>'product_id', '') = $1::text
+               AND ($2::uuid IS NULL OR c.tenant_id = $2::uuid)
+             RETURNING m.id, m.chat_id`,
+            [productId, req.user?.tenant_id || null, String(req.user?.id || "")],
+          );
+
+          const hiddenMessageIds = hiddenMessagesQ.rows
+            .map((row) => String(row.id || "").trim())
+            .filter(Boolean);
+          if (hiddenMessageIds.length > 0) {
+            await client.query(
+              `DELETE FROM message_search_documents
+               WHERE message_id = ANY($1::uuid[])`,
+              [hiddenMessageIds],
+            );
+          }
+
+          await client.query(
+            `UPDATE products
+             SET status = 'deleted',
+                 deleted_at = COALESCE(deleted_at, now()),
+                 deleted_by = COALESCE(deleted_by, $2),
+                 deletion_reason = COALESCE(NULLIF(deletion_reason, ''), 'full_delete'),
+                 reusable_at = NULL,
+                 updated_at = now()
+             WHERE id = $1`,
+            [productId, req.user?.id || null],
+          );
+
+          const depsQ = await client.query(
+            `SELECT
+               (SELECT COUNT(*) FROM cart_items WHERE product_id = $1)::int AS cart_count,
+               (SELECT COUNT(*) FROM reservations WHERE product_id = $1)::int AS reservation_count,
+               (SELECT COUNT(*) FROM delivery_batch_items WHERE product_id = $1)::int AS delivery_count`,
+            [productId],
+          );
+          const deps = depsQ.rows[0] || {};
+          const canPhysicallyDelete =
+            Number(deps.cart_count || 0) === 0 &&
+            Number(deps.reservation_count || 0) === 0 &&
+            Number(deps.delivery_count || 0) === 0;
+          let physicallyDeleted = false;
+          if (canPhysicallyDelete) {
+            const deleteQ = await client.query(
+              `DELETE FROM products
+               WHERE id = $1
+               RETURNING id`,
+              [productId],
+            );
+            physicallyDeleted = deleteQ.rowCount > 0;
+          }
+
+          const chatIds = Array.from(
+            new Set(
+              hiddenMessagesQ.rows
+                .map((row) => String(row.chat_id || "").trim())
+                .filter(Boolean),
+            ),
+          );
+          await client.query("COMMIT");
+          return {
+            product: productQ.rows[0],
+            hidden_messages: hiddenMessagesQ.rows,
+            hidden_message_count: hiddenMessagesQ.rowCount,
+            affected_user_ids: affectedUsersQ.rows.map((row) => row.user_id),
+            chat_ids: chatIds,
+            physically_deleted: physicallyDeleted,
+          };
+        } catch (err) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (_) {}
+          throw err;
+        } finally {
+          client.release();
+        }
+      });
+
+      if (!result) {
+        return res.status(404).json({ ok: false, error: "Товар не найден" });
+      }
+
+      const io = req.app.get("io");
+      if (io) {
+        for (const row of result.hidden_messages) {
+          const chatId = String(row.chat_id || "").trim();
+          const messageId = String(row.id || "").trim();
+          if (!chatId || !messageId) continue;
+          io.to(`chat:${chatId}`).emit("chat:message:deleted", {
+            chatId,
+            messageId,
+            reason: "product_full_delete",
+            product_id: productId,
+          });
+        }
+        for (const chatId of result.chat_ids) {
+          emitToTenant(io, req.user?.tenant_id || null, "chat:updated", {
+            chatId,
+            action: "product_deleted",
+            product_id: productId,
+          });
+        }
+        for (const userId of result.affected_user_ids) {
+          io.to(`user:${userId}`).emit("cart:updated", {
+            userId,
+            reason: "product_deleted",
+            product_id: productId,
+          });
+        }
+        emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+          action: "product_deleted",
+          product_id: productId,
+        });
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          product_id: productId,
+          hidden_message_count: result.hidden_message_count,
+          affected_user_count: result.affected_user_ids.length,
+          physically_deleted: result.physically_deleted,
+        },
+      });
+    } catch (err) {
+      console.error("admin.products.fullDelete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 function isCreatorBase(user) {
   const base = String(user?.base_role || user?.role || "")
     .toLowerCase()
@@ -5361,6 +6419,9 @@ router.get("/problem-report", requireAuth, async (req, res) => {
 
 router.get("/monitoring/events", requireAuth, async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return res.status(404).json({ ok: false, error: "Мониторинг отключен" });
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: "Доступ только создателю" });
     }
@@ -5398,6 +6459,9 @@ router.get("/monitoring/events", requireAuth, async (req, res) => {
 
 router.patch("/monitoring/events/:id/resolve", requireAuth, async (req, res) => {
   try {
+    if (!monitoringEnabled()) {
+      return res.status(404).json({ ok: false, error: "Мониторинг отключен" });
+    }
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: "Доступ только создателю" });
     }

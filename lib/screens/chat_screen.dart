@@ -139,6 +139,10 @@ class _ChatScreenState extends State<ChatScreen>
   static const Duration _channelPublicationLiveSyncWarmWindow = Duration(
     minutes: 6,
   );
+  static const bool _channelLiveDebugLogs = bool.fromEnvironment(
+    'FENIX_CHANNEL_LIVE_LOGS',
+    defaultValue: false,
+  );
   static const Duration _remoteActivityFallbackPollInterval = Duration(
     seconds: 8,
   );
@@ -256,6 +260,7 @@ class _ChatScreenState extends State<ChatScreen>
   bool _readSyncPending = false;
   bool _directMessageLiveSyncInFlight = false;
   bool _channelPublicationLiveSyncInFlight = false;
+  bool _channelPublicationForceLatestFallback = false;
   bool _remoteActivityPollInFlight = false;
   DateTime? _channelPublicationLiveSyncWarmUntil;
   int _bottomSettlePassesRemaining = 0;
@@ -496,6 +501,7 @@ class _ChatScreenState extends State<ChatScreen>
         : Map<String, dynamic>.from(widget.chatSettings!);
     _chatTitle = widget.chatTitle;
     activeChatIdNotifier.value = widget.chatId;
+    _channelLiveLog('initState');
     unawaited(_initializeChat());
     _loadPinnedMessage();
     _joinRoom();
@@ -594,6 +600,15 @@ class _ChatScreenState extends State<ChatScreen>
           data is Map) {
         final msg = data['message'] ?? data;
         final chatId = data['chatId'] ?? msg['chat_id'] ?? msg['chatId'];
+        _channelLiveLog('socket event chat:message received', {
+          'event_chat_id': chatId?.toString(),
+          'matches_current':
+              chatId != null && chatId.toString() == widget.chatId,
+          'action': (data['action'] ?? data['type'] ?? '').toString(),
+          'message_id': msg is Map ? (msg['id'] ?? '').toString() : '',
+          'queue_id': (data['queue_id'] ?? data['queueId'] ?? '').toString(),
+          'event_id': (data['event_id'] ?? data['eventId'] ?? '').toString(),
+        });
         if (chatId != null && chatId.toString() == widget.chatId) {
           final message = Map<String, dynamic>.from(msg);
           final action = (data['action'] ?? data['type'] ?? '')
@@ -606,7 +621,7 @@ class _ChatScreenState extends State<ChatScreen>
           _enqueueIncomingMessage(message, action: action);
           if (_isPublicationLiveSyncChannel()) {
             _startChannelPublicationLiveSync(resetWindow: true);
-            _scheduleChannelPublicationImmediateSync();
+            _scheduleChannelPublicationImmediateSync(forceLatest: true);
           }
         }
         return;
@@ -614,13 +629,19 @@ class _ChatScreenState extends State<ChatScreen>
       if (type == 'chat:updated' && data is Map) {
         final chatId = (data['chatId'] ?? data['chat_id'] ?? '').toString();
         final chat = data['chat'];
+        _channelLiveLog('socket event chat:updated received', {
+          'event_chat_id': chatId,
+          'matches_current': chatId == widget.chatId,
+          'action': (data['action'] ?? '').toString(),
+          'event_id': (data['event_id'] ?? data['eventId'] ?? '').toString(),
+        });
         if (chatId == widget.chatId) {
           if (chat is Map) {
             _applyIncomingChatSnapshot(Map<String, dynamic>.from(chat));
           }
           _scheduleRealtimeChatRefresh(reason: 'chat_updated');
           if (_isPublicationLiveSyncChannel()) {
-            _scheduleChannelPublicationImmediateSync();
+            _scheduleChannelPublicationImmediateSync(forceLatest: true);
           }
           _startChannelPublicationLiveSync(resetWindow: true);
         }
@@ -630,12 +651,63 @@ class _ChatScreenState extends State<ChatScreen>
         final chatId = (data['chatId'] ?? data['chat_id'] ?? '').toString();
         final channelId = (data['channel_id'] ?? data['channelId'] ?? '')
             .toString();
+        _channelLiveLog('socket event channel:media:updated received', {
+          'event_chat_id': chatId,
+          'event_channel_id': channelId,
+          'matches_current':
+              chatId == widget.chatId || channelId == widget.chatId,
+          'action': (data['action'] ?? '').toString(),
+          'message_id': (data['message_id'] ?? data['messageId'] ?? '')
+              .toString(),
+          'queue_id': (data['queue_id'] ?? data['queueId'] ?? '').toString(),
+          'event_id': (data['event_id'] ?? data['eventId'] ?? '').toString(),
+        });
         if (chatId == widget.chatId || channelId == widget.chatId) {
+          final message = data['message'];
+          if (message is Map) {
+            final action = (data['action'] ?? 'message_published')
+                .toString()
+                .trim()
+                .toLowerCase();
+            _enqueueIncomingMessage(
+              Map<String, dynamic>.from(message),
+              action: action,
+            );
+          }
           _scheduleRealtimeChatRefresh(reason: 'channel_media_updated');
           if (_isPublicationLiveSyncChannel()) {
-            _scheduleChannelPublicationImmediateSync();
+            _scheduleChannelPublicationImmediateSync(forceLatest: true);
           }
           _startChannelPublicationLiveSync(resetWindow: true);
+        }
+        return;
+      }
+      if (type == 'catalog:queue:updated' && data is Map) {
+        final chatId =
+            (data['chatId'] ??
+                    data['chat_id'] ??
+                    data['channel_id'] ??
+                    data['channelId'] ??
+                    '')
+                .toString()
+                .trim();
+        final action = (data['action'] ?? '').toString().trim().toLowerCase();
+        final affectsCurrentChannel =
+            chatId == widget.chatId ||
+            (chatId.isEmpty &&
+                _isPublicationLiveSyncChannel() &&
+                action.contains('publish'));
+        _channelLiveLog('socket event catalog:queue:updated received', {
+          'event_chat_or_channel_id': chatId,
+          'action': action,
+          'affects_current': affectsCurrentChannel,
+          'queue_ids': data['queue_ids'],
+          'batch_ids': data['batch_ids'],
+          'event_id': (data['event_id'] ?? data['eventId'] ?? '').toString(),
+        });
+        if (affectsCurrentChannel && _isPublicationLiveSyncChannel()) {
+          _startChannelPublicationLiveSync(resetWindow: true);
+          _scheduleChannelPublicationImmediateSync(forceLatest: true);
         }
         return;
       }
@@ -794,6 +866,7 @@ class _ChatScreenState extends State<ChatScreen>
       if (type == 'socket:disconnected' || type == 'socket:connect_error') {
         _startDirectMessageLiveSync();
         _startRemoteActivityPolling();
+        _startChannelPublicationLiveSync(resetWindow: true);
         return;
       }
       if (type == 'chat:pinned' && data is Map) {
@@ -820,6 +893,32 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Map<String, dynamic> _effectiveChatSettings() => _chatSettings;
+
+  void _channelLiveLog(String label, [Map<String, dynamic>? details]) {
+    if (!kDebugMode || !_channelLiveDebugLogs) return;
+    final payload = <String, dynamic>{
+      'chat_id': widget.chatId,
+      'title': _chatTitle,
+      'type': widget.chatType,
+      'is_channel': _isChannelChat(),
+      'is_publication_channel': _isPublicationLiveSyncChannel(),
+      'messages': _messages.length,
+      if (_newestLoadedMessageId != null) 'newest_id': _newestLoadedMessageId,
+      if (_newestLoadedCreatedAt != null)
+        'newest_created_at': _newestLoadedCreatedAt,
+      ...?details,
+    };
+    String encoded;
+    try {
+      encoded = jsonEncode(payload);
+    } catch (_) {
+      encoded = payload.toString();
+    }
+    debugPrint(
+      '[PHX:CHANNEL-LIVE] ${DateTime.now().toIso8601String()} $label $encoded',
+      wrapWidth: 1200,
+    );
+  }
 
   String _myUserId() => authService.currentUser?.id.trim() ?? '';
 
@@ -2478,8 +2577,13 @@ class _ChatScreenState extends State<ChatScreen>
   void _forceChannelPublicationViewportToLatest({
     bool animated = true,
     int passes = 4,
+    bool respectUserScroll = true,
   }) {
     if (!mounted || !_isPublicationLiveSyncChannel()) return;
+    if (respectUserScroll && !_isNearBottom() && !_stickToBottom) {
+      _channelLiveLog('force latest viewport skipped: user is reading above');
+      return;
+    }
     _manualBottomLockSuppressed = false;
     _stickToBottom = true;
     _savedScrollOffset = null;
@@ -2945,9 +3049,6 @@ class _ChatScreenState extends State<ChatScreen>
         .map((message) => _normalizeMessage(message))
         .toList(growable: true);
     merged.sort(_compareByCreatedAt);
-    final newestServerCreatedAt = merged.isEmpty
-        ? null
-        : _parseDate(merged.last['created_at']);
     final localOnlyMessages = _messages.where((message) {
       final meta = _metaMapOf(message['meta']);
       return meta['local_only'] == true;
@@ -2978,11 +3079,9 @@ class _ChatScreenState extends State<ChatScreen>
         }
         final existingIndex = _messageIndexInList(merged, messageId: id);
         if (existingIndex >= 0) continue;
-        final createdAt = _parseDate(message['created_at']);
-        final isNewerThanServerPage =
-            newestServerCreatedAt == null ||
-            (createdAt != null && createdAt.isAfter(newestServerCreatedAt));
-        if (!isNewerThanServerPage) continue;
+        // Silent channel reloads fetch only the latest page. Preserve already
+        // loaded older messages so live-refresh does not erase the user's
+        // current reading position.
         merged.add(_normalizeMessage(message));
       }
     }
@@ -3015,6 +3114,7 @@ class _ChatScreenState extends State<ChatScreen>
     final meta = _metaMapOf(normalized['meta']);
     final localOnly = meta['local_only'] == true;
     var inserted = false;
+    var insertedMessageId = '';
     setState(() {
       if (msgId == null || msgId.isEmpty) {
         inserted = true;
@@ -3036,6 +3136,8 @@ class _ChatScreenState extends State<ChatScreen>
           }
         } else {
           inserted = true;
+          insertedMessageId = msgId;
+          _appearingMessageIds.add(msgId);
           _messages = [..._messages, normalized];
         }
         _messages = _dedupeMessages(_messages);
@@ -3045,8 +3147,8 @@ class _ChatScreenState extends State<ChatScreen>
       }
     });
 
-    if (inserted && msgId != null && msgId.isNotEmpty) {
-      _markMessageAppearing(msgId);
+    if (inserted && insertedMessageId.isNotEmpty) {
+      _scheduleMessageAppearanceClear(insertedMessageId);
     }
     _refreshLoadedMessageBounds();
     _recomputeSearchResults();
@@ -3093,6 +3195,9 @@ class _ChatScreenState extends State<ChatScreen>
 
   void _startChannelPublicationLiveSync({bool resetWindow = false}) {
     if (!_isPublicationLiveSyncChannel()) {
+      _channelLiveLog('live-sync start skipped: not publication channel', {
+        'reset_window': resetWindow,
+      });
       _stopChannelPublicationLiveSync();
       return;
     }
@@ -3104,34 +3209,57 @@ class _ChatScreenState extends State<ChatScreen>
         _channelPublicationLiveSyncWarmWindow,
       );
     }
+    _channelLiveLog('live-sync started/scheduled', {
+      'reset_window': resetWindow,
+      'warm_until': _channelPublicationLiveSyncWarmUntil?.toIso8601String(),
+    });
     _scheduleNextChannelPublicationLiveSync(
       delay: const Duration(milliseconds: 650),
     );
   }
 
   void _stopChannelPublicationLiveSync() {
+    _channelLiveLog('live-sync stopped');
     _channelPublicationLiveSyncTimer?.cancel();
     _channelPublicationLiveSyncTimer = null;
     _channelPublicationImmediateSyncTimer?.cancel();
     _channelPublicationImmediateSyncTimer = null;
     _channelPublicationLiveSyncWarmUntil = null;
+    _channelPublicationForceLatestFallback = false;
     _channelPublicationLiveSyncInFlight = false;
   }
 
   void _scheduleChannelPublicationImmediateSync({
     Duration delay = const Duration(milliseconds: 140),
+    bool forceLatest = false,
   }) {
     if (!mounted || !_isPublicationLiveSyncChannel()) return;
+    if (forceLatest) {
+      _channelPublicationForceLatestFallback = true;
+    }
+    _channelLiveLog('immediate sync scheduled', {
+      'delay_ms': delay.inMilliseconds,
+      'force_latest': forceLatest,
+    });
     _channelPublicationImmediateSyncTimer?.cancel();
     _channelPublicationImmediateSyncTimer = Timer(delay, () {
       if (!mounted || !_isPublicationLiveSyncChannel()) return;
-      unawaited(_syncLatestChannelMessages());
+      if (_channelPublicationForceLatestFallback) {
+        _channelLiveLog('immediate sync running silent latest reload');
+        unawaited(_loadMessages(showLoader: false));
+        return;
+      }
+      _channelLiveLog('immediate sync running silent reload');
+      unawaited(_loadMessages(showLoader: false));
     });
   }
 
   void _scheduleNextChannelPublicationLiveSync({Duration? delay}) {
     _channelPublicationLiveSyncTimer?.cancel();
     if (!mounted || !_isPublicationLiveSyncChannel()) {
+      _channelLiveLog(
+        'next live-sync skipped: not mounted/publication channel',
+      );
       _stopChannelPublicationLiveSync();
       return;
     }
@@ -3143,6 +3271,11 @@ class _ChatScreenState extends State<ChatScreen>
         (isWarm
             ? _channelPublicationLiveSyncFastInterval
             : _channelPublicationLiveSyncSlowInterval);
+    _channelLiveLog('next live-sync scheduled', {
+      'delay_ms': nextDelay.inMilliseconds,
+      'is_warm': isWarm,
+      'warm_until': warmUntil?.toIso8601String(),
+    });
     _channelPublicationLiveSyncTimer = Timer(nextDelay, () {
       unawaited(_runChannelPublicationLiveSyncTick());
     });
@@ -3150,159 +3283,33 @@ class _ChatScreenState extends State<ChatScreen>
 
   Future<void> _runChannelPublicationLiveSyncTick() async {
     if (!mounted || !_isPublicationLiveSyncChannel()) {
+      _channelLiveLog(
+        'live-sync tick skipped: not mounted/publication channel',
+      );
       _stopChannelPublicationLiveSync();
       return;
     }
     if (_channelPublicationLiveSyncInFlight ||
         _loadingNewerMessages ||
         _messagesLoadInFlight) {
+      _channelLiveLog('live-sync tick skipped: busy', {
+        'sync_in_flight': _channelPublicationLiveSyncInFlight,
+        'loading_newer': _loadingNewerMessages,
+        'messages_load_in_flight': _messagesLoadInFlight,
+      });
       _scheduleNextChannelPublicationLiveSync();
       return;
     }
     _channelPublicationLiveSyncInFlight = true;
     try {
-      await _syncLatestChannelMessages();
+      _channelLiveLog('live-sync tick running silent latest reload');
+      await _loadMessages(showLoader: false);
     } finally {
       _channelPublicationLiveSyncInFlight = false;
       if (mounted) {
+        _channelLiveLog('live-sync tick finished');
         _scheduleNextChannelPublicationLiveSync();
       }
-    }
-  }
-
-  Future<void> _syncLatestChannelMessages() async {
-    if (!_isPublicationLiveSyncChannel()) return;
-    if (_messagesLoadInFlight || _loadingNewerMessages) {
-      _scheduleChannelPublicationImmediateSync(
-        delay: const Duration(milliseconds: 420),
-      );
-      return;
-    }
-    try {
-      final wasNearBottom = _isNearBottom();
-      final afterCreatedAt = _newestLoadedCreatedAt?.trim() ?? '';
-      final afterId = _newestLoadedMessageId?.trim() ?? '';
-      final hasAfterCursor = afterCreatedAt.isNotEmpty && afterId.isNotEmpty;
-      final resp = await authService.dio.get(
-        '/api/chats/${widget.chatId}/messages',
-        queryParameters: <String, dynamic>{
-          'limit': hasAfterCursor ? 80 : (kIsWeb ? 60 : 80),
-          if (kIsWeb) 'view': 'summary',
-          if (hasAfterCursor) 'after_created_at': afterCreatedAt,
-          if (hasAfterCursor) 'after_id': afterId,
-        },
-        options: Options(
-          connectTimeout: const Duration(seconds: 8),
-          sendTimeout: const Duration(seconds: 8),
-          receiveTimeout: const Duration(seconds: 12),
-        ),
-      );
-      final data = resp.data;
-      if (data is! Map || data['ok'] != true || data['data'] is! List) return;
-      final pageMessages = List<Map<String, dynamic>>.from(data['data'])
-        ..sort(_compareByCreatedAt);
-      if (pageMessages.isEmpty) {
-        if (hasAfterCursor) {
-          _scheduleNextChannelPublicationLiveSync(
-            delay: const Duration(milliseconds: 900),
-          );
-        }
-        return;
-      }
-
-      final state = _chatStateMapOf(data['state']);
-      final appearingIds = <String>[];
-      var changed = false;
-      var insertedAny = false;
-
-      if (mounted) {
-        setState(() {
-          for (final raw in pageMessages) {
-            final message = _normalizeMessage(Map<String, dynamic>.from(raw));
-            final id = _messageIdOf(message);
-            final clientMsgId = (message['client_msg_id'] ?? '')
-                .toString()
-                .trim();
-            final index = _messageIndexInList(
-              _messages,
-              messageId: id,
-              clientMsgId: clientMsgId,
-            );
-            if (index >= 0) {
-              final previous = _messages[index];
-              _messages[index] = {...previous, ...message};
-              changed = true;
-            } else {
-              _messages.add(message);
-              if (id.isNotEmpty) appearingIds.add(id);
-              insertedAny = true;
-              changed = true;
-            }
-          }
-          if (changed) {
-            _messages = _dedupeMessages(_messages)..sort(_compareByCreatedAt);
-            _messageIds
-              ..clear()
-              ..addAll(
-                _messages.map(_messageIdOf).where((id) => id.isNotEmpty),
-              );
-            _refreshLoadedMessageBounds();
-          }
-          _applyServerChatState(
-            state,
-            restoreDraft: false,
-            restoreScroll: false,
-          );
-        });
-      } else {
-        for (final raw in pageMessages) {
-          final message = _normalizeMessage(Map<String, dynamic>.from(raw));
-          final id = _messageIdOf(message);
-          final clientMsgId = (message['client_msg_id'] ?? '')
-              .toString()
-              .trim();
-          final index = _messageIndexInList(
-            _messages,
-            messageId: id,
-            clientMsgId: clientMsgId,
-          );
-          if (index >= 0) {
-            _messages[index] = {..._messages[index], ...message};
-          } else {
-            _messages.add(message);
-            insertedAny = true;
-          }
-        }
-        _messages = _dedupeMessages(_messages)..sort(_compareByCreatedAt);
-        _refreshLoadedMessageBounds();
-        _applyServerChatState(state, restoreDraft: false, restoreScroll: false);
-      }
-
-      for (final id in appearingIds) {
-        _markMessageAppearing(id);
-      }
-      if (changed) {
-        _recomputeSearchResults();
-      }
-      if (changed && (wasNearBottom || insertedAny)) {
-        if (_isPublicationLiveSyncChannel() && insertedAny) {
-          _forceChannelPublicationViewportToLatest(animated: true);
-        } else {
-          _scrollToBottom(animated: true);
-        }
-        _scheduleReadSync();
-      }
-    } catch (e, st) {
-      unawaited(
-        MonitoringService.captureError(
-          e,
-          st,
-          subsystem: 'realtime',
-          code: 'channel_latest_live_sync_failed',
-          level: _isTransientMessageLoadError(e) ? 'warn' : 'error',
-          details: <String, dynamic>{'chat_id': widget.chatId},
-        ),
-      );
     }
   }
 
@@ -3501,9 +3508,8 @@ class _ChatScreenState extends State<ChatScreen>
     _recomputeSearchResults();
   }
 
-  void _markMessageAppearing(String messageId) {
+  void _scheduleMessageAppearanceClear(String messageId) {
     if (messageId.isEmpty) return;
-    setState(() => _appearingMessageIds.add(messageId));
     Future.delayed(const Duration(milliseconds: 780), () {
       if (!mounted) return;
       setState(() => _appearingMessageIds.remove(messageId));
@@ -3801,10 +3807,10 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Key _messageKeyFor(String messageId) {
-    if (_useApproximateViewportTracking) {
-      return ValueKey<String>('message-$messageId');
-    }
-    return _messageItemKeys.putIfAbsent(messageId, GlobalKey.new);
+    // Search navigation uses approximate offsets; keeping GlobalKeys for every
+    // message made large chats expensive and could trigger inherited-widget
+    // disposal assertions during rapid search/exit.
+    return ValueKey<String>('message-$messageId');
   }
 
   Future<bool> _approximateScrollToMessageId(
@@ -4201,13 +4207,15 @@ class _ChatScreenState extends State<ChatScreen>
       final normalizedAction = action.trim().toLowerCase();
       final shouldScroll =
           (_isPublicationLiveSyncChannel() &&
-              normalizedAction == 'message_published') ||
+              normalizedAction == 'message_published' &&
+              (_isNearBottom() ||
+                  (_stickToBottom && !_manualBottomLockSuppressed))) ||
           _isNearBottom() ||
           fromMe;
       _upsertMessage(msg, autoScroll: shouldScroll);
       _startChannelPublicationLiveSync(resetWindow: true);
       if (_isPublicationLiveSyncChannel()) {
-        _scheduleChannelPublicationImmediateSync();
+        _scheduleChannelPublicationImmediateSync(forceLatest: true);
         if (shouldScroll) {
           _forceChannelPublicationViewportToLatest(animated: true);
         }
@@ -4274,7 +4282,7 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   bool _isPublicChannel() {
-    if ((widget.chatType ?? '').toLowerCase().trim() != 'channel') return false;
+    if (!_isChannelChat()) return false;
     final settings = _effectiveChatSettings();
     final visibility = (settings['visibility'] ?? 'public')
         .toString()
@@ -4285,7 +4293,6 @@ class _ChatScreenState extends State<ChatScreen>
 
   bool _isChannelChat() {
     final type = (widget.chatType ?? '').toLowerCase().trim();
-    if (type == 'channel') return true;
     final settings = _effectiveChatSettings();
     final systemKey = (settings['system_key'] ?? '')
         .toString()
@@ -4299,7 +4306,21 @@ class _ChatScreenState extends State<ChatScreen>
       return true;
     }
     final title = _chatTitle.toLowerCase().trim();
-    return title == 'основной' || title == 'основной канал';
+    if (title == 'основной' ||
+        title == 'основной канал' ||
+        title.contains('канал')) {
+      return true;
+    }
+    if (type == 'channel') return true;
+    if (type == 'public') return true;
+    final visibility = (settings['visibility'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    return visibility == 'public' &&
+        !_isReservedOrdersChat() &&
+        !_isBugReportsChat() &&
+        !_isSupportTicketChat();
   }
 
   bool _isPublicationLiveSyncChannel() {
@@ -4326,6 +4347,7 @@ class _ChatScreenState extends State<ChatScreen>
     if (excludedKinds.contains(systemKey) || excludedKinds.contains(kind)) {
       return false;
     }
+    final type = (widget.chatType ?? '').toLowerCase().trim();
     final title = _chatTitle.toLowerCase().trim();
     final explicitlyMain =
         systemKey == 'main_channel' ||
@@ -4339,7 +4361,14 @@ class _ChatScreenState extends State<ChatScreen>
     // Existing tenants can have the main sales channel renamed and without the
     // newer settings flags. For realtime publication, any regular channel must
     // be able to merge freshly published messages while it is already open.
-    return true;
+    final visibility = (settings['visibility'] ?? '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    return type == 'channel' ||
+        type == 'public' ||
+        visibility == 'public' ||
+        title.contains('канал');
   }
 
   bool _isSupportTicketChat() {
@@ -4782,9 +4811,17 @@ class _ChatScreenState extends State<ChatScreen>
   Future<void> _joinRoom() async {
     try {
       final activeSocket = socket;
-      if (activeSocket == null || !activeSocket.connected) return;
+      if (activeSocket == null || !activeSocket.connected) {
+        _channelLiveLog('join_chat skipped: socket not connected', {
+          'socket_exists': activeSocket != null,
+          'socket_connected': activeSocket?.connected == true,
+        });
+        return;
+      }
+      _channelLiveLog('join_chat emit', {'socket_id': activeSocket.id});
       activeSocket.emit('join_chat', widget.chatId);
     } catch (e, st) {
+      _channelLiveLog('join_chat error', {'error': e.toString()});
       unawaited(
         MonitoringService.captureError(
           e,
@@ -4809,6 +4846,25 @@ class _ChatScreenState extends State<ChatScreen>
     _messagesLoadInFlight = true;
     var loadedSuccessfully = false;
     final isPublicationChannel = _isPublicationLiveSyncChannel();
+    final wasNearBottomBeforeLoad = _isNearBottom();
+    final shouldKeepPublicationAtBottom =
+        showLoader ||
+        wasNearBottomBeforeLoad ||
+        (_stickToBottom && !_manualBottomLockSuppressed);
+    final existingIdsBeforeLoad = isPublicationChannel
+        ? _messages.map(_messageIdOf).where((id) => id.isNotEmpty).toSet()
+        : <String>{};
+    var appearingIdsFromLoad = <String>[];
+    if (isPublicationChannel) {
+      _channelLiveLog('loadMessages start', {
+        'show_loader': showLoader,
+        'messages_before': _messages.length,
+        'was_near_bottom': wasNearBottomBeforeLoad,
+        'stick_to_bottom': _stickToBottom,
+        'manual_bottom_lock_suppressed': _manualBottomLockSuppressed,
+        'should_keep_at_bottom': shouldKeepPublicationAtBottom,
+      });
+    }
     if (mounted && showLoader) {
       setState(() => _loading = true);
     }
@@ -4823,8 +4879,16 @@ class _ChatScreenState extends State<ChatScreen>
             queryParameters: <String, dynamic>{
               'limit': initialLimit,
               if (kIsWeb) 'view': 'summary',
+              if (kIsWeb) '_ts': DateTime.now().millisecondsSinceEpoch,
             },
             options: Options(
+              headers: kIsWeb
+                  ? const {
+                      'Cache-Control': 'no-cache, no-store, must-revalidate',
+                      'Pragma': 'no-cache',
+                      'Expires': '0',
+                    }
+                  : null,
               connectTimeout: const Duration(seconds: 15),
               sendTimeout: const Duration(seconds: 15),
               receiveTimeout: const Duration(seconds: 20),
@@ -4834,14 +4898,47 @@ class _ChatScreenState extends State<ChatScreen>
           if (data is Map && data['ok'] == true && data['data'] is List) {
             final serverMessages = List<Map<String, dynamic>>.from(data['data'])
               ..sort(_compareByCreatedAt);
+            if (isPublicationChannel) {
+              _channelLiveLog('loadMessages response', {
+                'attempt': attempt,
+                'server_count': serverMessages.length,
+                'first_id': serverMessages.isEmpty
+                    ? null
+                    : _messageIdOf(serverMessages.first),
+                'last_id': serverMessages.isEmpty
+                    ? null
+                    : _messageIdOf(serverMessages.last),
+                'last_created_at': serverMessages.isEmpty
+                    ? null
+                    : (serverMessages.last['created_at'] ?? '').toString(),
+                'paging': data['paging'],
+                'state': data['state'],
+              });
+            }
             final messages = _mergeServerMessagesWithLocalState(serverMessages);
+            final messageIdsAfterLoad = messages
+                .map(_messageIdOf)
+                .where((id) => id.isNotEmpty)
+                .toSet();
+            appearingIdsFromLoad = isPublicationChannel && !showLoader
+                ? messageIdsAfterLoad
+                      .where((id) => !existingIdsBeforeLoad.contains(id))
+                      .toList()
+                : <String>[];
             final paging = _chatStateMapOf(data['paging']);
             final state = _chatStateMapOf(data['state']);
             if (mounted) {
               setState(() {
                 _messages = messages;
                 _incomingQueue.clear();
-                _appearingMessageIds.clear();
+                if (!isPublicationChannel || showLoader) {
+                  _appearingMessageIds.clear();
+                } else {
+                  _appearingMessageIds.removeWhere(
+                    (id) => !messageIdsAfterLoad.contains(id),
+                  );
+                  _appearingMessageIds.addAll(appearingIdsFromLoad);
+                }
                 _hasMoreBefore = paging['has_more_before'] == true;
                 _messageIds
                   ..clear()
@@ -4891,6 +4988,12 @@ class _ChatScreenState extends State<ChatScreen>
           lastError = null;
           break;
         } catch (e) {
+          if (isPublicationChannel) {
+            _channelLiveLog('loadMessages attempt failed', {
+              'attempt': attempt,
+              'error': e.toString(),
+            });
+          }
           lastError = e;
           debugPrint(
             'Error loading messages (attempt $attempt/$maxAttempts): $e',
@@ -4904,6 +5007,11 @@ class _ChatScreenState extends State<ChatScreen>
         }
       }
       if (lastError != null) {
+        if (isPublicationChannel) {
+          _channelLiveLog('loadMessages failed after retries', {
+            'error': lastError.toString(),
+          });
+        }
         debugPrint('Error loading messages: $lastError');
         unawaited(
           MonitoringService.captureError(
@@ -4938,11 +5046,27 @@ class _ChatScreenState extends State<ChatScreen>
       }
       if (loadedSuccessfully) {
         if (isPublicationChannel) {
+          _channelLiveLog('loadMessages success applied', {
+            'messages_after': _messages.length,
+            'has_more_before': _hasMoreBefore,
+            'appearing_count': appearingIdsFromLoad.length,
+            'should_keep_at_bottom': shouldKeepPublicationAtBottom,
+          });
           _initialViewportApplied = true;
           _initialViewportFailsafeTimer?.cancel();
           _markInitialViewportReady();
-          _startChannelPublicationLiveSync(resetWindow: true);
-          _forceChannelPublicationViewportToLatest(animated: false);
+          for (final id in appearingIdsFromLoad) {
+            _scheduleMessageAppearanceClear(id);
+          }
+          _startChannelPublicationLiveSync(
+            resetWindow: showLoader || appearingIdsFromLoad.isNotEmpty,
+          );
+          if (shouldKeepPublicationAtBottom) {
+            _forceChannelPublicationViewportToLatest(
+              animated: false,
+              respectUserScroll: !showLoader,
+            );
+          }
         } else {
           _applyInitialViewportAfterLoad();
         }
@@ -5269,7 +5393,7 @@ class _ChatScreenState extends State<ChatScreen>
   void _scheduleRealtimeChatRefresh({String reason = 'realtime_update'}) {
     if (!mounted) return;
     if (_isPublicationLiveSyncChannel()) {
-      _scheduleChannelPublicationImmediateSync();
+      _scheduleChannelPublicationImmediateSync(forceLatest: true);
       return;
     }
     final delay = reason.trim() == 'chat_updated'
@@ -8954,6 +9078,63 @@ class _ChatScreenState extends State<ChatScreen>
     }
   }
 
+  Future<void> _deleteCatalogProductFully(Map<String, dynamic> meta) async {
+    final productId = (meta['product_id'] ?? '').toString().trim();
+    if (productId.isEmpty || !_isAdminOrCreator()) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Удалить товар полностью?'),
+        content: const Text(
+          'Товар исчезнет из канала, активных корзин и очередей. История доставки сохранится, если она уже нужна для отчетов.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await authService.dio.delete('/api/admin/products/$productId/full');
+      if (!mounted) return;
+      setState(() {
+        _messages = _messages.where((message) {
+          final messageMeta = _metaMapOf(message['meta']);
+          return (messageMeta['product_id'] ?? '').toString().trim() !=
+              productId;
+        }).toList();
+        _messageIds
+          ..clear()
+          ..addAll(
+            _messages
+                .map((message) => (message['id'] ?? '').toString().trim())
+                .where((id) => id.isNotEmpty),
+          );
+      });
+      showAppNotice(
+        context,
+        'Товар удален из активной системы',
+        tone: AppNoticeTone.success,
+        duration: const Duration(seconds: 2),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка удаления товара: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 3),
+      );
+    }
+  }
+
   String _extractDioError(Object e) {
     if (e is DioException) {
       final data = e.response?.data;
@@ -9000,7 +9181,6 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   bool _isReservedOrdersChat() {
-    if ((widget.chatType ?? '').toLowerCase().trim() != 'channel') return false;
     final settings = _effectiveChatSettings();
     final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
     final systemKey = (settings['system_key'] ?? '')
@@ -9014,7 +9194,6 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   bool _isBugReportsChat() {
-    if ((widget.chatType ?? '').toLowerCase().trim() != 'channel') return false;
     final settings = _effectiveChatSettings();
     final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
     final title = _chatTitle.toLowerCase().trim();
@@ -9201,7 +9380,7 @@ class _ChatScreenState extends State<ChatScreen>
 
   bool _canMarkReservedOrderPlaced() {
     final role = authService.effectiveRole.toLowerCase().trim();
-    return role == 'admin' || role == 'creator';
+    return role == 'admin' || role == 'tenant' || role == 'creator';
   }
 
   bool _requiresManualShelfOnPlaced() {
@@ -9889,7 +10068,8 @@ class _ChatScreenState extends State<ChatScreen>
 
   void _scheduleServerSearch() {
     _searchDebounceTimer?.cancel();
-    _searchDebounceTimer = Timer(const Duration(milliseconds: 280), () {
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
       unawaited(_performServerSearch());
     });
   }
@@ -9916,13 +10096,7 @@ class _ChatScreenState extends State<ChatScreen>
               ..sort(_compareByCreatedAt))
           : const <Map<String, dynamic>>[];
       if (_searchQuery.trim() != query) return;
-      if (!mounted) {
-        _serverSearchMessages = results;
-        _serverSearchLoaded = true;
-        _serverSearchLoading = false;
-        _recomputeSearchResults(keepCurrent: false);
-        return;
-      }
+      if (!mounted) return;
       setState(() {
         _serverSearchMessages = results;
         _serverSearchLoaded = true;
@@ -9931,13 +10105,7 @@ class _ChatScreenState extends State<ChatScreen>
       _recomputeSearchResults(keepCurrent: false);
     } catch (_) {
       if (_searchQuery.trim() != query) return;
-      if (!mounted) {
-        _serverSearchMessages = const [];
-        _serverSearchLoaded = true;
-        _serverSearchLoading = false;
-        _recomputeSearchResults(keepCurrent: false);
-        return;
-      }
+      if (!mounted) return;
       setState(() {
         _serverSearchMessages = const [];
         _serverSearchLoaded = true;
@@ -10433,15 +10601,52 @@ class _ChatScreenState extends State<ChatScreen>
     );
   }
 
+  Widget _buildPickupOnlyProductNotice(ThemeData theme) {
+    final warningColor = theme.colorScheme.tertiary;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: warningColor.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: warningColor.withValues(alpha: 0.34)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.storefront_outlined, size: 18, color: warningColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Только самовывоз',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurface,
+                fontWeight: FontWeight.w700,
+                height: 1.25,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Map<String, dynamic> _productCardSnapshotOf(Map<String, dynamic> metaMap) {
     return _metaMapOf(metaMap['card_snapshot']);
   }
 
-  String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
+  String _formatProductLabel(
+    dynamic productCode,
+    dynamic shelfNumber, {
+    dynamic manualShelfLabel,
+  }) {
     final code = int.tryParse('${productCode ?? ''}') ?? 0;
     final shelf = int.tryParse('${shelfNumber ?? ''}') ?? 0;
+    final manualShelf = (manualShelfLabel ?? '').toString().trim();
     final codePart = code > 0 ? '$code' : '—';
-    final shelfPart = shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+    final shelfPart = manualShelf.isNotEmpty
+        ? manualShelf
+        : (shelf > 0 ? shelf.toString().padLeft(2, '0') : '—');
     return '$codePart--$shelfPart';
   }
 
@@ -13939,6 +14144,7 @@ class _ChatScreenState extends State<ChatScreen>
 
   Widget _wrapNewMessageAppearance({
     required Widget child,
+    required String messageId,
     required bool reducedMotion,
     required bool useChannelPostAppearance,
     required bool isAppearing,
@@ -13947,9 +14153,15 @@ class _ChatScreenState extends State<ChatScreen>
     // Visual extension point: replace this wrapper to change message entrance motion.
     if (reducedMotion) return child;
     if (useChannelPostAppearance) {
-      return _ChannelPostRevealHighlight(child: child);
+      return _ChannelPostRevealHighlight(
+        key: ValueKey<String>('channel-post-appear-$messageId'),
+        child: child,
+      );
     }
     return TweenAnimationBuilder<double>(
+      key: isAppearing
+          ? ValueKey<String>('message-appear-$messageId')
+          : ValueKey<String>('message-stable-$messageId'),
       tween: Tween<double>(begin: isAppearing ? 0 : 1, end: 1),
       duration: const Duration(milliseconds: 380),
       curve: Curves.easeOutCubic,
@@ -14002,9 +14214,10 @@ class _ChatScreenState extends State<ChatScreen>
 
   Widget _buildMessageItem(Map<String, dynamic> message) {
     final theme = Theme.of(context);
+    final accessibilityReducedMotion =
+        MediaQuery.maybeOf(context)?.disableAnimations == true;
     final reducedMotion =
-        performanceModeNotifier.value ||
-        (MediaQuery.maybeOf(context)?.disableAnimations == true);
+        performanceModeNotifier.value || accessibilityReducedMotion;
     final fromMe = _isOwnMessage(message);
     final messageId = message['id']?.toString().trim() ?? '';
     final hasMessageId = messageId.isNotEmpty;
@@ -14082,12 +14295,16 @@ class _ChatScreenState extends State<ChatScreen>
                 '')
             .toString()
             .trim();
+    final productPickupOnly =
+        _flagFrom(metaMap['pickup_only']) ||
+        _flagFrom(catalogSnapshot['pickup_only']);
     final productLabel = (() {
       final fromMeta = metaMap['product_label']?.toString().trim() ?? '';
       if (fromMeta.isNotEmpty) return fromMeta;
       return _formatProductLabel(
         metaMap['product_code'],
         metaMap['product_shelf_number'] ?? metaMap['shelf_number'],
+        manualShelfLabel: metaMap['manual_shelf_label'],
       );
     })();
     final price = metaMap['price']?.toString() ?? '—';
@@ -14147,9 +14364,9 @@ class _ChatScreenState extends State<ChatScreen>
         _supportFeedbackBusyTicketIds.contains(supportTicketId);
     final isAppearing =
         messageId.isNotEmpty && _appearingMessageIds.contains(messageId);
-    final isChannelChat =
-        (widget.chatType ?? '').toLowerCase().trim() == 'channel';
-    final useChannelPostAppearance = isChannelChat && isAppearing;
+    final isChannelChat = _isChannelChat();
+    final useChannelPostAppearance =
+        (isChannelChat || _isPublicationLiveSyncChannel()) && isAppearing;
 
     final bubbleColor = hasBuy || isReservedOrder || isStandaloneMediaMessage
         ? Colors.transparent
@@ -14573,6 +14790,10 @@ class _ChatScreenState extends State<ChatScreen>
                               ),
                             ),
                           ],
+                          if (productPickupOnly) ...[
+                            const SizedBox(height: 12),
+                            _buildPickupOnlyProductNotice(theme),
+                          ],
                           const SizedBox(height: 12),
                           Builder(
                             builder: (context) {
@@ -14639,6 +14860,18 @@ class _ChatScreenState extends State<ChatScreen>
                               ),
                             ),
                           ),
+                          if (_isAdminOrCreator()) ...[
+                            const SizedBox(height: 8),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                icon: const Icon(Icons.delete_forever_outlined),
+                                onPressed: () =>
+                                    _deleteCatalogProductFully(metaMap),
+                                label: const Text('Полностью удалить товар'),
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -14723,6 +14956,10 @@ class _ChatScreenState extends State<ChatScreen>
                                 color: theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
+                          ],
+                          if (productPickupOnly) ...[
+                            const SizedBox(height: 12),
+                            _buildPickupOnlyProductNotice(theme),
                           ],
                           const SizedBox(height: 12),
                           Row(
@@ -15141,7 +15378,8 @@ class _ChatScreenState extends State<ChatScreen>
 
     final animatedItem = _wrapNewMessageAppearance(
       child: bubbleRow,
-      reducedMotion: reducedMotion,
+      messageId: messageId,
+      reducedMotion: accessibilityReducedMotion,
       useChannelPostAppearance: useChannelPostAppearance,
       isAppearing: isAppearing,
       fromMe: fromMe,
@@ -15168,6 +15406,13 @@ class _ChatScreenState extends State<ChatScreen>
 
   @override
   Widget build(BuildContext context) {
+    if (_isPublicationLiveSyncChannel() &&
+        _channelPublicationLiveSyncTimer == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_isPublicationLiveSyncChannel()) return;
+        _startChannelPublicationLiveSync(resetWindow: true);
+      });
+    }
     final platform = defaultTargetPlatform;
     final theme = Theme.of(context);
     final viewportWidth = MediaQuery.sizeOf(context).width;
@@ -15270,8 +15515,12 @@ class _ChatScreenState extends State<ChatScreen>
                 }
                 setState(() {
                   if (_searchMode) {
+                    _searchDebounceTimer?.cancel();
                     _searchController.clear();
                     _searchQuery = '';
+                    _serverSearchMessages = const [];
+                    _serverSearchLoaded = false;
+                    _serverSearchLoading = false;
                   }
                   _searchMode = !_searchMode;
                 });
@@ -16045,7 +16294,7 @@ class _ChatScreenState extends State<ChatScreen>
 }
 
 class _ChannelPostRevealHighlight extends StatelessWidget {
-  const _ChannelPostRevealHighlight({required this.child});
+  const _ChannelPostRevealHighlight({super.key, required this.child});
 
   final Widget child;
 
@@ -16054,10 +16303,10 @@ class _ChannelPostRevealHighlight extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return TweenAnimationBuilder<double>(
       tween: Tween<double>(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 720),
+      duration: const Duration(milliseconds: 520),
       curve: Curves.easeOutCubic,
       builder: (context, value, child) {
-        final reveal = Curves.easeOutCubic.transform(
+        final eased = Curves.easeOutCubic.transform(
           value.clamp(0.0, 1.0).toDouble(),
         );
         final glowPhase = value < 0.55
@@ -16066,14 +16315,14 @@ class _ChannelPostRevealHighlight extends StatelessWidget {
         final glow = Curves.easeOut.transform(
           glowPhase.clamp(0.0, 1.0).toDouble(),
         );
-        return ClipRect(
-          child: Align(
-            alignment: Alignment.bottomCenter,
-            heightFactor: math.max(0.04, reveal),
-            child: Opacity(
-              opacity: (0.22 + reveal * 0.78).clamp(0.0, 1.0).toDouble(),
-              child: Transform.translate(
-                offset: Offset(0, 30 * (1 - reveal)),
+        return RepaintBoundary(
+          child: Opacity(
+            opacity: (0.42 + eased * 0.58).clamp(0.0, 1.0).toDouble(),
+            child: Transform.translate(
+              offset: Offset(0, 18 * (1 - eased)),
+              child: Transform.scale(
+                alignment: Alignment.bottomCenter,
+                scale: 0.985 + 0.015 * eased,
                 child: Stack(
                   clipBehavior: Clip.none,
                   children: [
@@ -16085,11 +16334,11 @@ class _ChannelPostRevealHighlight extends StatelessWidget {
                             boxShadow: [
                               BoxShadow(
                                 color: scheme.primary.withValues(
-                                  alpha: 0.16 * glow,
+                                  alpha: 0.12 * glow,
                                 ),
-                                blurRadius: 34 * glow,
-                                spreadRadius: 2 * glow,
-                                offset: Offset(0, 14 * glow),
+                                blurRadius: 24 * glow,
+                                spreadRadius: 1 * glow,
+                                offset: Offset(0, 10 * glow),
                               ),
                             ],
                           ),

@@ -149,7 +149,7 @@
       </div>
       <div class="bootstrap-actions">
         <button class="bootstrap-button" id="bootstrap-retry" hidden>Повторить</button>
-        <button class="bootstrap-button secondary" id="bootstrap-reload-cache" hidden>Сбросить кэш</button>
+        <button class="bootstrap-button secondary" id="bootstrap-reload-cache" hidden>Обновить</button>
       </div>
     </div>
   </div>
@@ -308,7 +308,7 @@
         }
         setBootstrapStatus(
           message || 'Феникс не смог запуститься с первой попытки.',
-          'Можно повторить запуск или очистить кэш этой версии сайта.',
+          'Можно повторить запуск или мягко обновить загрузчик без выхода из аккаунта.',
         );
         if (retryButton) retryButton.hidden = false;
         if (reloadCacheButton) reloadCacheButton.hidden = false;
@@ -325,8 +325,8 @@
       }
 
       async function restartWithCacheReset() {
-        await clearOldWebCaches();
-        window.location.reload();
+        await refreshWebShellOnly();
+        navigateToFreshBuild(Date.now().toString());
       }
 
       window.projectPhoenixBootstrap = {
@@ -407,7 +407,7 @@
           );
           armBootstrapTimeout(
             isSafariLikeBrowser() ? bootstrapExtendedTimeoutMs + 15000 : bootstrapExtendedTimeoutMs,
-            'Феникс загрузился слишком медленно. Можно повторить запуск или очистить кэш.',
+            'Феникс загрузился слишком медленно. Можно повторить запуск или обновить загрузчик.',
           );
         };
         script.onerror = function () {
@@ -433,19 +433,13 @@
           .trim();
       }
 
-      async function clearOldWebCaches() {
+      async function refreshWebShellOnly() {
         if ('serviceWorker' in navigator) {
           try {
             const registrations = await navigator.serviceWorker.getRegistrations();
             for (const registration of registrations) {
               await registration.unregister();
             }
-          } catch (_) {}
-        }
-        if ('caches' in window) {
-          try {
-            const cacheKeys = await caches.keys();
-            await Promise.all(cacheKeys.map((key) => caches.delete(key)));
           } catch (_) {}
         }
       }
@@ -461,7 +455,7 @@
       }
 
       async function hardRefreshToVersion(versionToken) {
-        await clearOldWebCaches();
+        await refreshWebShellOnly();
         navigateToFreshBuild(versionToken);
       }
 

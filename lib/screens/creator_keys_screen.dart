@@ -22,10 +22,23 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   final _tenantNameCtrl = TextEditingController();
   final _tenantNotesCtrl = TextEditingController();
   final _tenantMonthsCtrl = TextEditingController(text: '1');
+  final _tenantPublicationIntervalSecondsCtrl = TextEditingController(
+    text: '2',
+  );
+  final _tenantAutoProcessingDelayCtrl = TextEditingController(text: '60');
+  final _tenantDeliveryMinAmountCtrl = TextEditingController(text: '1500');
+  final _tenantClientCitiesCtrl = TextEditingController();
 
   bool _loading = true;
   bool _tenantActionLoading = false;
   bool _tenantsLoading = false;
+  bool _tenantAutoProcessingEnabled = false;
+  bool _tenantManualShelfEnabled = false;
+  bool _tenantPickupOnlyEnabled = false;
+  bool _tenantCartDeliveryReadyEnabled = false;
+  bool _tenantDeliverySnapshotOnAdminApprove = false;
+  bool _tenantRevisionDeleteApprovalEnabled = false;
+  bool _tenantDefectStatsEnabled = false;
 
   String _message = '';
   String _lastGeneratedTenantKey = '';
@@ -59,6 +72,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantNameCtrl.dispose();
     _tenantNotesCtrl.dispose();
     _tenantMonthsCtrl.dispose();
+    _tenantPublicationIntervalSecondsCtrl.dispose();
+    _tenantAutoProcessingDelayCtrl.dispose();
+    _tenantDeliveryMinAmountCtrl.dispose();
+    _tenantClientCitiesCtrl.dispose();
     super.dispose();
   }
 
@@ -91,7 +108,149 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   int _tenantMonthsOrDefault() {
     final parsed = int.tryParse(_tenantMonthsCtrl.text.trim());
     if (parsed == null) return 1;
-    return parsed.clamp(1, 24);
+    return parsed.clamp(1, 24).toInt();
+  }
+
+  bool _toBoolValue(dynamic value) {
+    if (value is bool) return value;
+    final normalized = (value ?? '').toString().trim().toLowerCase();
+    return normalized == 'true' ||
+        normalized == '1' ||
+        normalized == 'yes' ||
+        normalized == 'on' ||
+        normalized == 'да';
+  }
+
+  int _parseIntValue(
+    String raw, {
+    required int fallback,
+    required int min,
+    required int max,
+  }) {
+    final parsed = int.tryParse(raw.trim());
+    if (parsed == null) return fallback;
+    return parsed.clamp(min, max).toInt();
+  }
+
+  Map<String, dynamic> _asMap(dynamic value) {
+    if (value is Map) return Map<String, dynamic>.from(value);
+    return <String, dynamic>{};
+  }
+
+  List<String> _stringListFromText(String raw) {
+    final result = <String>[];
+    final seen = <String>{};
+    for (final line in raw.split(RegExp(r'\r?\n|,'))) {
+      final value = line.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (value.isEmpty) continue;
+      final key = value.toLowerCase();
+      if (seen.contains(key)) continue;
+      seen.add(key);
+      result.add(value);
+      if (result.length >= 80) break;
+    }
+    return result;
+  }
+
+  List<String> _stringListFromSettings(dynamic raw) {
+    if (raw is List) {
+      return raw
+          .map((item) => item.toString().replaceAll(RegExp(r'\s+'), ' ').trim())
+          .where((item) => item.isNotEmpty)
+          .toList();
+    }
+    return _stringListFromText((raw ?? '').toString());
+  }
+
+  Map<String, dynamic> _tenantWorkflowPayload({
+    required TextEditingController publicationSecondsCtrl,
+    required TextEditingController autoDelayCtrl,
+    required TextEditingController minAmountCtrl,
+    required TextEditingController citiesCtrl,
+    required bool autoProcessingEnabled,
+    required bool manualShelfEnabled,
+    required bool pickupOnlyEnabled,
+    required bool deliveryReadyEnabled,
+    required bool deliverySnapshotOnAdminApprove,
+    required bool revisionDeleteApprovalEnabled,
+    required bool defectStatsEnabled,
+  }) {
+    final publicationSeconds = _parseIntValue(
+      publicationSecondsCtrl.text,
+      fallback: 2,
+      min: 1,
+      max: 600,
+    );
+    final autoDelayMinutes = _parseIntValue(
+      autoDelayCtrl.text,
+      fallback: 60,
+      min: 1,
+      max: 1440,
+    );
+    final minAmount = _parseIntValue(
+      minAmountCtrl.text,
+      fallback: 1500,
+      min: 0,
+      max: 10000000,
+    );
+    final cities = _stringListFromText(citiesCtrl.text);
+    final workflowSettings = <String, dynamic>{
+      'version': 1,
+      'product_processing': {
+        'mode': autoProcessingEnabled ? 'auto_after_delay' : 'manual',
+        'auto_delay_minutes': autoDelayMinutes,
+      },
+      'delivery': {
+        'mode': deliverySnapshotOnAdminApprove
+            ? 'snapshot_after_admin_approve'
+            : 'classic',
+        'client_ready_button': deliveryReadyEnabled,
+        'min_amount': minAmount,
+        'snapshot_on_admin_approve': deliverySnapshotOnAdminApprove,
+      },
+      'worker': {
+        'manual_shelf_enabled': manualShelfEnabled,
+        'pickup_only_enabled': pickupOnlyEnabled,
+        'revision_delete_approval_enabled': revisionDeleteApprovalEnabled,
+      },
+      'channels': {'publication_interval_ms': publicationSeconds * 1000},
+      'registration': {'client_city_options': cities},
+      'analytics': {'defect_stats_enabled': defectStatsEnabled},
+    };
+    return {
+      'workflow_settings': workflowSettings,
+      'client_city_options': cities,
+    };
+  }
+
+  Map<String, dynamic> _createTenantWorkflowPayload() {
+    return _tenantWorkflowPayload(
+      publicationSecondsCtrl: _tenantPublicationIntervalSecondsCtrl,
+      autoDelayCtrl: _tenantAutoProcessingDelayCtrl,
+      minAmountCtrl: _tenantDeliveryMinAmountCtrl,
+      citiesCtrl: _tenantClientCitiesCtrl,
+      autoProcessingEnabled: _tenantAutoProcessingEnabled,
+      manualShelfEnabled: _tenantManualShelfEnabled,
+      pickupOnlyEnabled: _tenantPickupOnlyEnabled,
+      deliveryReadyEnabled: _tenantCartDeliveryReadyEnabled,
+      deliverySnapshotOnAdminApprove: _tenantDeliverySnapshotOnAdminApprove,
+      revisionDeleteApprovalEnabled: _tenantRevisionDeleteApprovalEnabled,
+      defectStatsEnabled: _tenantDefectStatsEnabled,
+    );
+  }
+
+  void _resetCreateTenantSettings() {
+    _tenantPublicationIntervalSecondsCtrl.text = '2';
+    _tenantAutoProcessingDelayCtrl.text = '60';
+    _tenantDeliveryMinAmountCtrl.text = '1500';
+    _tenantClientCitiesCtrl.clear();
+    _tenantAutoProcessingEnabled = false;
+    _tenantManualShelfEnabled = false;
+    _tenantPickupOnlyEnabled = false;
+    _tenantCartDeliveryReadyEnabled = false;
+    _tenantDeliverySnapshotOnAdminApprove = false;
+    _tenantRevisionDeleteApprovalEnabled = false;
+    _tenantDefectStatsEnabled = false;
   }
 
   Future<void> _reloadAll() async {
@@ -195,6 +354,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           'months': _tenantMonthsOrDefault(),
           if (_tenantNotesCtrl.text.trim().isNotEmpty)
             'notes': _tenantNotesCtrl.text.trim(),
+          ..._createTenantWorkflowPayload(),
         },
         options: _creatorRequestOptions(),
       );
@@ -208,6 +368,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             _tenantNameCtrl.clear();
             _tenantNotesCtrl.clear();
             _tenantMonthsCtrl.text = '1';
+            _resetCreateTenantSettings();
             _message = warning.isNotEmpty
                 ? 'Ключ создан. $warning'
                 : 'Ключ арендатора создан';
@@ -489,6 +650,435 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     }
   }
 
+  Future<void> _openTenantSettings(String tenantId, String tenantName) async {
+    if (tenantId.isEmpty) return;
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    Map<String, dynamic> settings = <String, dynamic>{};
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/tenants/$tenantId/feature-settings',
+        options: _creatorRequestOptions(),
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        settings = Map<String, dynamic>.from(data['data'] as Map);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка загрузки настроек: ${_extractDioError(e)}',
+      );
+      return;
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+    if (!mounted) return;
+
+    final payload = await _showTenantSettingsEditor(
+      title: tenantName.isEmpty ? 'Настройки группы' : 'Настройки: $tenantName',
+      initialSettings: settings,
+    );
+    if (payload == null) return;
+
+    setState(() {
+      _tenantActionLoading = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/tenants/$tenantId/feature-settings',
+        data: payload,
+        options: _creatorRequestOptions(),
+      );
+      if (!mounted) return;
+      setState(() => _message = 'Настройки сохранены');
+      await _loadTenants(silent: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка сохранения настроек: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) setState(() => _tenantActionLoading = false);
+    }
+  }
+
+  Future<Map<String, dynamic>?> _showTenantSettingsEditor({
+    required String title,
+    required Map<String, dynamic> initialSettings,
+  }) async {
+    final productProcessing = _asMap(initialSettings['product_processing']);
+    final delivery = _asMap(initialSettings['delivery']);
+    final worker = _asMap(initialSettings['worker']);
+    final channels = _asMap(initialSettings['channels']);
+    final registration = _asMap(initialSettings['registration']);
+    final analytics = _asMap(initialSettings['analytics']);
+
+    final publicationMs = _parseIntValue(
+      (channels['publication_interval_ms'] ??
+              initialSettings['publication_interval_ms'] ??
+              2000)
+          .toString(),
+      fallback: 2000,
+      min: 500,
+      max: 600000,
+    );
+    final publicationSecondsCtrl = TextEditingController(
+      text: (publicationMs / 1000).round().clamp(1, 600).toString(),
+    );
+    final autoDelayCtrl = TextEditingController(
+      text:
+          (productProcessing['auto_delay_minutes'] ??
+                  initialSettings['auto_product_processing_delay_minutes'] ??
+                  60)
+              .toString(),
+    );
+    final minAmountCtrl = TextEditingController(
+      text:
+          (delivery['min_amount'] ??
+                  initialSettings['cart_delivery_ready_min_amount'] ??
+                  1500)
+              .toString(),
+    );
+    final citiesCtrl = TextEditingController(
+      text: _stringListFromSettings(
+        registration['client_city_options'] ??
+            initialSettings['client_city_options'],
+      ).join('\n'),
+    );
+
+    var autoProcessingEnabled =
+        (productProcessing['mode'] ??
+                    initialSettings['product_processing_mode'] ??
+                    '')
+                .toString() ==
+            'auto_after_delay' ||
+        _toBoolValue(initialSettings['auto_product_processing_enabled']);
+    var manualShelfEnabled = _toBoolValue(
+      worker['manual_shelf_enabled'] ?? initialSettings['manual_shelf_enabled'],
+    );
+    var pickupOnlyEnabled = _toBoolValue(
+      worker['pickup_only_enabled'] ?? initialSettings['pickup_only_enabled'],
+    );
+    var deliveryReadyEnabled = _toBoolValue(
+      delivery['client_ready_button'] ??
+          initialSettings['cart_delivery_ready_enabled'],
+    );
+    var deliverySnapshotOnAdminApprove = _toBoolValue(
+      delivery['snapshot_on_admin_approve'] ??
+          initialSettings['delivery_snapshot_on_admin_approve'],
+    );
+    var revisionDeleteApprovalEnabled = _toBoolValue(
+      worker['revision_delete_approval_enabled'] ??
+          initialSettings['revision_delete_approval_enabled'],
+    );
+    var defectStatsEnabled = _toBoolValue(
+      analytics['defect_stats_enabled'] ??
+          initialSettings['defect_stats_enabled'],
+    );
+
+    try {
+      return await showDialog<Map<String, dynamic>>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: Text(title),
+            content: SizedBox(
+              width: 720,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _settingsSectionTitle('Каналы'),
+                    _settingsNumberField(
+                      controller: publicationSecondsCtrl,
+                      labelText: 'Интервал публикации постов',
+                      suffixText: 'сек',
+                      helperText: 'От 1 до 600 секунд.',
+                    ),
+                    _settingsSectionTitle('Обработка товара'),
+                    _settingsSwitchTile(
+                      title: 'Автообработка товара',
+                      subtitle: 'Через заданное время после покупки.',
+                      value: autoProcessingEnabled,
+                      onChanged: (value) =>
+                          setDialogState(() => autoProcessingEnabled = value),
+                    ),
+                    _settingsNumberField(
+                      controller: autoDelayCtrl,
+                      labelText: 'Через сколько минут автообработка',
+                      suffixText: 'мин',
+                      helperText: 'От 1 минуты до 24 часов.',
+                    ),
+                    _settingsSectionTitle('Доставка'),
+                    _settingsSwitchTile(
+                      title: 'Кнопка клиента "Готов на доставку"',
+                      subtitle: 'Кнопка активируется от указанной суммы.',
+                      value: deliveryReadyEnabled,
+                      onChanged: (value) =>
+                          setDialogState(() => deliveryReadyEnabled = value),
+                    ),
+                    _settingsNumberField(
+                      controller: minAmountCtrl,
+                      labelText: 'Готов на доставку от суммы',
+                      suffixText: '₽',
+                      helperText: 'Минимальная сумма обработанных товаров.',
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Сборка доставки после подтверждения админа',
+                      subtitle: 'Черновой режим новой логики доставки.',
+                      value: deliverySnapshotOnAdminApprove,
+                      onChanged: (value) => setDialogState(
+                        () => deliverySnapshotOnAdminApprove = value,
+                      ),
+                    ),
+                    _settingsSectionTitle('Рабочий'),
+                    _settingsSwitchTile(
+                      title: 'Ручная полка у рабочего',
+                      subtitle: 'Рабочий сможет вводить любую полку вручную.',
+                      value: manualShelfEnabled,
+                      onChanged: (value) =>
+                          setDialogState(() => manualShelfEnabled = value),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Самовывоз',
+                      subtitle: 'Рабочий сможет отмечать товар как самовывоз.',
+                      value: pickupOnlyEnabled,
+                      onChanged: (value) =>
+                          setDialogState(() => pickupOnlyEnabled = value),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Удаление в ревизии через администратора',
+                      subtitle: 'Рабочий отправляет запрос, админ решает.',
+                      value: revisionDeleteApprovalEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => revisionDeleteApprovalEnabled = value,
+                      ),
+                    ),
+                    _settingsSectionTitle('Регистрация'),
+                    TextField(
+                      controller: citiesCtrl,
+                      minLines: 3,
+                      maxLines: 7,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Города клиентов',
+                          helperText: 'Каждый город с новой строки.',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: citiesCtrl,
+                      ),
+                    ),
+                    _settingsSectionTitle('Статистика'),
+                    _settingsSwitchTile(
+                      title: 'Статистика брака',
+                      subtitle: 'Включает будущий учёт брака и возвратов.',
+                      value: defectStatsEnabled,
+                      onChanged: (value) =>
+                          setDialogState(() => defectStatsEnabled = value),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Отмена'),
+              ),
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.pop(
+                    ctx,
+                    _tenantWorkflowPayload(
+                      publicationSecondsCtrl: publicationSecondsCtrl,
+                      autoDelayCtrl: autoDelayCtrl,
+                      minAmountCtrl: minAmountCtrl,
+                      citiesCtrl: citiesCtrl,
+                      autoProcessingEnabled: autoProcessingEnabled,
+                      manualShelfEnabled: manualShelfEnabled,
+                      pickupOnlyEnabled: pickupOnlyEnabled,
+                      deliveryReadyEnabled: deliveryReadyEnabled,
+                      deliverySnapshotOnAdminApprove:
+                          deliverySnapshotOnAdminApprove,
+                      revisionDeleteApprovalEnabled:
+                          revisionDeleteApprovalEnabled,
+                      defectStatsEnabled: defectStatsEnabled,
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.save_outlined),
+                label: const Text('Сохранить'),
+              ),
+            ],
+          ),
+        ),
+      );
+    } finally {
+      publicationSecondsCtrl.dispose();
+      autoDelayCtrl.dispose();
+      minAmountCtrl.dispose();
+      citiesCtrl.dispose();
+    }
+  }
+
+  Widget _settingsSectionTitle(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 14, bottom: 8),
+      child: Text(text, style: const TextStyle(fontWeight: FontWeight.w800)),
+    );
+  }
+
+  Widget _settingsNumberField({
+    required TextEditingController controller,
+    required String labelText,
+    required String suffixText,
+    String? helperText,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: TextField(
+        controller: controller,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        decoration: withInputLanguageBadge(
+          InputDecoration(
+            labelText: labelText,
+            suffixText: suffixText,
+            helperText: helperText,
+            border: const OutlineInputBorder(),
+          ),
+          controller: controller,
+        ),
+      ),
+    );
+  }
+
+  Widget _settingsSwitchTile({
+    required String title,
+    required String subtitle,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return SwitchListTile(
+      contentPadding: EdgeInsets.zero,
+      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+      subtitle: Text(subtitle),
+      value: value,
+      onChanged: onChanged,
+    );
+  }
+
+  Widget _tenantCreateSettingsBlock() {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: ExpansionTile(
+        title: const Text(
+          'Настройки группы',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+        subtitle: const Text('Черновая настройка логики для арендатора'),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          _settingsSectionTitle('Каналы'),
+          _settingsNumberField(
+            controller: _tenantPublicationIntervalSecondsCtrl,
+            labelText: 'Интервал публикации постов',
+            suffixText: 'сек',
+            helperText: 'По умолчанию 2 секунды.',
+          ),
+          _settingsSectionTitle('Обработка товара'),
+          _settingsSwitchTile(
+            title: 'Автообработка товара',
+            subtitle: 'Через заданное время после покупки.',
+            value: _tenantAutoProcessingEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantAutoProcessingEnabled = value),
+          ),
+          _settingsNumberField(
+            controller: _tenantAutoProcessingDelayCtrl,
+            labelText: 'Через сколько минут автообработка',
+            suffixText: 'мин',
+            helperText: 'По умолчанию 60 минут.',
+          ),
+          _settingsSectionTitle('Доставка'),
+          _settingsSwitchTile(
+            title: 'Кнопка клиента "Готов на доставку"',
+            subtitle: 'Кнопка активируется от указанной суммы.',
+            value: _tenantCartDeliveryReadyEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantCartDeliveryReadyEnabled = value),
+          ),
+          _settingsNumberField(
+            controller: _tenantDeliveryMinAmountCtrl,
+            labelText: 'Готов на доставку от суммы',
+            suffixText: '₽',
+            helperText: 'По умолчанию 1500 ₽.',
+          ),
+          _settingsSwitchTile(
+            title: 'Сборка доставки после подтверждения админа',
+            subtitle: 'Черновой режим новой доставки.',
+            value: _tenantDeliverySnapshotOnAdminApprove,
+            onChanged: (value) =>
+                setState(() => _tenantDeliverySnapshotOnAdminApprove = value),
+          ),
+          _settingsSectionTitle('Рабочий'),
+          _settingsSwitchTile(
+            title: 'Ручная полка у рабочего',
+            subtitle: 'Рабочий сможет вводить любую полку вручную.',
+            value: _tenantManualShelfEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantManualShelfEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Самовывоз',
+            subtitle: 'Рабочий сможет отмечать товар как самовывоз.',
+            value: _tenantPickupOnlyEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantPickupOnlyEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Удаление в ревизии через администратора',
+            subtitle: 'Рабочий отправляет запрос, админ решает.',
+            value: _tenantRevisionDeleteApprovalEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantRevisionDeleteApprovalEnabled = value),
+          ),
+          _settingsSectionTitle('Регистрация'),
+          TextField(
+            controller: _tenantClientCitiesCtrl,
+            minLines: 3,
+            maxLines: 7,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Города клиентов',
+                helperText: 'Каждый город с новой строки.',
+                border: OutlineInputBorder(),
+              ),
+              controller: _tenantClientCitiesCtrl,
+            ),
+          ),
+          _settingsSectionTitle('Статистика'),
+          _settingsSwitchTile(
+            title: 'Статистика брака',
+            subtitle: 'Включает будущий учёт брака и возвратов.',
+            value: _tenantDefectStatsEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantDefectStatsEnabled = value),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _tenantCreateCard() {
     return Card(
       child: Padding(
@@ -536,6 +1126,8 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                 controller: _tenantNotesCtrl,
               ),
             ),
+            const SizedBox(height: 12),
+            _tenantCreateSettingsBlock(),
             const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _tenantActionLoading ? null : _createTenantKey,
@@ -706,6 +1298,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                           : () => _changeTenantAccessKey(id, name, keyShown),
                       icon: const Icon(Icons.key_outlined),
                       label: const Text('Изменить ключ'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _tenantActionLoading
+                          ? null
+                          : () => _openTenantSettings(id, name),
+                      icon: const Icon(Icons.tune_outlined),
+                      label: const Text('Настройки'),
                     ),
                     OutlinedButton.icon(
                       onPressed: _tenantActionLoading

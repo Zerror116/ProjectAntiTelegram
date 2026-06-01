@@ -18,6 +18,7 @@ const { uploadsPath } = require('../utils/storagePaths');
 const { registerPublicImageUpload } = require('../utils/publicMediaRegistration');
 const { toOriginalPublicMediaUrl } = require('../utils/mediaAssets');
 const { insertAdminSystemMessage } = require('../utils/systemChannels');
+const { getTenantFeatureSettings } = require('../utils/tenantFeatureSettings');
 
 const requireReservationFulfillPermission = requirePermission('reservation.fulfill');
 const requireDeliveryManagePermission = requirePermission('delivery.manage');
@@ -75,6 +76,81 @@ function toMoney(value, fallback = 0) {
   return Math.round(normalized * 100) / 100;
 }
 
+function normalizeCityName(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, 120);
+}
+
+function normalizeDeliveryCityRates(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const city = normalizeCityName(item.city || item.name || item.client_city);
+    if (!city) continue;
+    const key = city.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      city,
+      threshold_amount: Math.max(
+        0,
+        toMoney(
+          item.threshold_amount ??
+            item.min_amount ??
+            item.delivery_threshold_amount ??
+            0,
+          0,
+        ),
+      ),
+      delivery_fee_amount: 0,
+      is_active: item.is_active !== false && item.enabled !== false,
+    });
+  }
+  return result;
+}
+
+function deliverySettingsKey(tenantId = null) {
+  const normalized = String(tenantId || '').trim();
+  return normalized ? `delivery:${normalized}` : 'delivery';
+}
+
+async function getCartDeliveryPricing(queryable, tenantId, city, fallbackMinAmount) {
+  const scopedKey = deliverySettingsKey(tenantId);
+  const result = await queryable.query(
+    `SELECT value
+     FROM system_settings
+     WHERE key = ANY($1::text[])
+     ORDER BY CASE WHEN key = $2 THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [[scopedKey, 'delivery'], scopedKey],
+  );
+  const settings =
+    result.rows[0]?.value && typeof result.rows[0].value === 'object'
+      ? result.rows[0].value
+      : {};
+  const cityName = normalizeCityName(city);
+  const rate = normalizeDeliveryCityRates(settings.city_rates).find(
+    (item) =>
+      item.is_active !== false &&
+      item.city.toLowerCase() === cityName.toLowerCase(),
+  );
+  const baseMin = toMoney(
+    settings.threshold_amount ?? fallbackMinAmount,
+    fallbackMinAmount,
+  );
+  return {
+    client_city: cityName,
+    min_amount: rate ? toMoney(rate.threshold_amount, baseMin) : baseMin,
+    delivery_fee_amount: 0,
+    city_rate_applied: Boolean(rate),
+  };
+}
+
 function normalizePhoneDigits(raw) {
   return String(raw || '').replace(/\D/g, '').slice(0, 20);
 }
@@ -103,6 +179,84 @@ function buildCartDismantledSystemText({
     `Полка: ${formatCartSystemShelf(shelfLabel)}`,
     `Возвращено товаров: ${Number(removedUnits || 0)}`,
   ].join('\n');
+}
+
+function buildDeliveryReadySystemText({
+  customerName,
+  phoneLabel,
+  address,
+  totalSum,
+  hasPickupOnly,
+}) {
+  return [
+    'Клиент нажал «Готов на доставку».',
+    `Клиент: ${String(customerName || 'Клиент').trim() || 'Клиент'}`,
+    `Телефон: ${String(phoneLabel || 'номер не указан').trim() || 'номер не указан'}`,
+    `Адрес: ${String(address || '').trim() || 'не указан'}`,
+    `Сумма корзины: ${toMoney(totalSum).toFixed(2)} ₽`,
+    hasPickupOnly
+      ? 'Важно: в корзине есть товар только для самовывоза.'
+      : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function getCartDeliveryReadyState(queryable, userId, tenantId) {
+  const settings = await getTenantFeatureSettings(tenantId || null);
+  const q = await queryable.query(
+    `SELECT COALESCE(SUM(COALESCE(c.custom_price, p.price) * c.quantity), 0)::numeric AS total_sum,
+            false AS has_bulky,
+            BOOL_OR(COALESCE(p.pickup_only, false) = true) AS has_pickup_only,
+            COALESCE(NULLIF(BTRIM(u.client_city), ''), '') AS client_city
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id
+     JOIN users u ON u.id = c.user_id
+     WHERE c.user_id = $1
+       AND c.status NOT IN ('delivered', 'cancelled')
+       AND p.deleted_at IS NULL
+       AND COALESCE(p.status, '') <> 'deleted'
+     GROUP BY u.client_city`,
+    [userId],
+  );
+  const row = q.rows[0] || {};
+  const totalSum = toMoney(row.total_sum);
+  const pricing = await getCartDeliveryPricing(
+    queryable,
+    tenantId,
+    row.client_city,
+    toMoney(settings.cart_delivery_ready_min_amount, 1500),
+  );
+  const minAmount = pricing.min_amount;
+  const enabled = settings.cart_delivery_ready_enabled === true;
+  const hasBulky = false;
+  const pendingRequestQ = await queryable.query(
+    `SELECT 1
+     FROM cart_delivery_ready_requests
+     WHERE user_id = $1
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       AND status = 'pending'
+     LIMIT 1`,
+    [userId, tenantId || null],
+  );
+  const requestPending = pendingRequestQ.rowCount > 0;
+  return {
+    enabled,
+    min_amount: minAmount,
+    delivery_fee_amount: pricing.delivery_fee_amount,
+    city_rate_applied: pricing.city_rate_applied,
+    client_city: pricing.client_city,
+    total_sum: totalSum,
+    has_bulky: hasBulky,
+    has_pickup_only: row.has_pickup_only === true,
+    request_pending: requestPending,
+    can_request:
+      enabled &&
+      !requestPending &&
+      totalSum >= minAmount &&
+      !hasBulky &&
+      row.has_pickup_only !== true,
+  };
 }
 
 function emitCartUpdated(req, userId, payload = {}, extraUserIds = []) {
@@ -338,7 +492,7 @@ async function archiveProductAfterCartDismissal(
      FROM cart_items c
      JOIN users u ON u.id = c.user_id
      WHERE c.product_id = $1
-       AND c.status <> 'delivered'
+       AND c.status NOT IN ('delivered', 'cancelled')
        AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
      LIMIT 1`,
     [productIdText, tenantId || null],
@@ -862,7 +1016,9 @@ router.get('/', authMiddleware, async (req, res) => {
               COALESCE(c.custom_price, p.price) AS price,
               c.custom_price,
               c.custom_description,
+              COALESCE(c.processing_mode, 'standard') AS processing_mode,
               p.image_url,
+              COALESCE(p.pickup_only, false) AS pickup_only,
               delivery.delivery_date,
               delivery.courier_name,
               delivery.courier_code,
@@ -891,7 +1047,7 @@ router.get('/', authMiddleware, async (req, res) => {
          LIMIT 1
        ) AS delivery ON true
        WHERE c.user_id = $1
-         AND c.status <> 'delivered'
+         AND c.status NOT IN ('delivered', 'cancelled')
        ORDER BY
          CASE c.status
            WHEN 'pending_processing' THEN 0
@@ -1121,6 +1277,11 @@ router.get('/', authMiddleware, async (req, res) => {
       approved_amount: toMoney(row.approved_amount),
     }));
     const retentionWarning = buildCartRetentionWarning(retentionQ.rows[0]);
+    const deliveryReadyState = await getCartDeliveryReadyState(
+      db,
+      userId,
+      req.user?.tenant_id || null,
+    );
 
     return res.json({
       ok: true,
@@ -1133,11 +1294,132 @@ router.get('/', authMiddleware, async (req, res) => {
         recent_deliveries: recentDeliveries,
         claims,
         cart_retention_warning: retentionWarning,
+        delivery_ready: deliveryReadyState,
       },
     });
   } catch (err) {
     console.error('cart.list error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
+router.post('/ready-for-delivery', authMiddleware, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const actorUserId = String(req.user?.id || '').trim();
+    const tenantId = req.user?.tenant_id || null;
+    const userId = await resolveEffectiveCartUserId(client, req.user);
+    const address = normalizeNullableText(req.body?.address, { max: 1000 });
+    if (!address) {
+      return res.status(400).json({ ok: false, error: 'Введите адрес доставки' });
+    }
+
+    await client.query('BEGIN');
+    const state = await getCartDeliveryReadyState(client, userId, tenantId);
+    if (!state.enabled) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        ok: false,
+        error: 'Заявка на доставку недоступна для этой группы',
+      });
+    }
+    if (state.has_bulky) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'В корзине есть габаритный товар. Заявку на доставку нужно оформить через администратора.',
+      });
+    }
+    if (state.has_pickup_only) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error:
+          'В корзине есть товар только для самовывоза. Доставка недоступна, свяжитесь с администратором.',
+      });
+    }
+    if (state.total_sum < state.min_amount) {
+      await client.query('ROLLBACK');
+      const missing = Math.max(0, toMoney(state.min_amount - state.total_sum));
+      return res.status(400).json({
+        ok: false,
+        error:
+          'Минимальная сумма для доставки в ваш город пока не набрана. ' +
+          `До минимальной суммы осталось: ${missing.toFixed(2)} ₽`,
+      });
+    }
+
+    const userQ = await client.query(
+      `SELECT COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS name,
+              COALESCE(ph.phone, '') AS phone
+       FROM users u
+       LEFT JOIN phones ph ON ph.user_id = u.id
+       WHERE u.id = $1
+       LIMIT 1`,
+      [userId],
+    );
+    const userRow = userQ.rows[0] || {};
+    const requestQ = await client.query(
+      `INSERT INTO cart_delivery_ready_requests (
+         tenant_id, user_id, address, total_sum, has_bulky, has_pickup_only,
+         status, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', now(), now())
+       RETURNING id, tenant_id, user_id, address, total_sum, has_bulky,
+                 has_pickup_only, status, created_at, updated_at`,
+      [
+        tenantId,
+        userId,
+        address,
+        state.total_sum,
+        state.has_bulky,
+        state.has_pickup_only,
+      ],
+    );
+    const requestRow = requestQ.rows[0];
+    await insertAdminSystemMessage(client, {
+      tenantId,
+      createdBy: actorUserId || null,
+      text: buildDeliveryReadySystemText({
+        customerName: userRow.name,
+        phoneLabel: userRow.phone,
+        address,
+        totalSum: state.total_sum,
+        hasPickupOnly: state.has_pickup_only,
+      }),
+      meta: {
+        kind: 'cart_delivery_ready_request',
+        request_id: requestRow.id,
+        user_id: userId,
+        address,
+        total_sum: state.total_sum,
+        has_bulky: state.has_bulky,
+        has_pickup_only: state.has_pickup_only,
+        action: 'open_delivery',
+      },
+      dedupeKey: `cart_delivery_ready:${requestRow.id}`,
+    });
+    await client.query('COMMIT');
+
+    emitCartUpdated(req, userId, {
+      reason: 'delivery_ready_requested',
+      request_id: requestRow.id,
+    });
+    emitToTenant(req.app.get('io'), tenantId, 'delivery:updated', {
+      entity: 'cart_delivery_ready_request',
+      entity_id: requestRow.id,
+      action: 'created',
+      request: requestRow,
+    });
+    return res.status(201).json({ ok: true, data: requestRow });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    console.error('cart.readyForDelivery error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1476,7 +1758,7 @@ router.get(
                   COUNT(*)::int AS active_items_count
            FROM cart_items ci
            WHERE ci.user_id = ANY($1::uuid[])
-             AND ci.status <> 'delivered'
+             AND ci.status NOT IN ('delivered', 'cancelled')
            GROUP BY ci.user_id`,
           [ownerIdsList],
         );
@@ -1590,7 +1872,7 @@ router.get(
          FROM cart_items c
          JOIN products p ON p.id = c.product_id
          WHERE c.user_id = $1
-           AND c.status <> 'delivered'
+           AND c.status NOT IN ('delivered', 'cancelled')
          ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
         [cartOwnerId],
       );
@@ -1682,7 +1964,7 @@ router.patch(
          WHERE c.id = $1
            AND u.id = c.user_id
            AND p.id = c.product_id
-           AND c.status <> 'delivered'
+           AND c.status NOT IN ('delivered', 'cancelled')
            AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
          RETURNING c.id,
                    c.user_id,
@@ -1913,7 +2195,7 @@ router.post(
         `SELECT c.id
          FROM cart_items c
          WHERE c.user_id = $1
-           AND c.status <> 'delivered'
+           AND c.status NOT IN ('delivered', 'cancelled')
          ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
         [cartOwnerId],
       );
@@ -2104,7 +2386,7 @@ router.post(
          WHERE c.user_id = $1
            AND u.id = c.user_id
            AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
-           AND c.status <> 'delivered'
+           AND c.status NOT IN ('delivered', 'cancelled')
          RETURNING c.id, c.user_id`,
         [cartOwnerId, req.user?.tenant_id || null],
       );

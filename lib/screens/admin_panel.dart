@@ -86,6 +86,8 @@ class _AdminTabSpec {
 }
 
 class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
+  static const Duration _clientCartUndoDelay = Duration(seconds: 2);
+
   TabController? _tabController;
   StreamSubscription? _authSub;
   List<_AdminTabSpec> _visibleTabs = const <_AdminTabSpec>[];
@@ -93,6 +95,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final _channelTitleCtrl = TextEditingController();
   final _channelDescriptionCtrl = TextEditingController();
   final _deliveryThresholdCtrl = TextEditingController();
+  final _publicationIntervalCtrl = TextEditingController(text: '2');
   final _deliveryOriginCtrl = TextEditingController();
   final _deliveryManualPhonesCtrl = TextEditingController();
   final _courierNamesCtrl = TextEditingController();
@@ -124,6 +127,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _saving = false;
   bool _publishing = false;
   bool _pendingPostsLoading = false;
+  bool _tenantFeatureSettingsLoading = false;
+  bool _tenantFeatureSettingsSaving = false;
+  bool _revisionDeleteRequestsLoading = false;
   bool _dispatchingOrders = false;
   bool _avatarUpdating = false;
   bool _deliveryLoading = false;
@@ -141,6 +147,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _supportFaqIsActive = true;
   bool _supportNotificationsLoading = false;
   bool _returnsAnalyticsLoading = false;
+  bool _defectStatsLoading = false;
   bool _supportDraftRestoreInProgress = false;
   bool _clientCartSearchLoading = false;
   bool _clientCartLoading = false;
@@ -152,7 +159,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _inviteActionLoading = false;
   bool _financeLoading = false;
   bool _controlLoading = false;
-  bool _diagnosticsLoading = false;
   bool _smartNotifyLoading = false;
   bool _returnsActionBusy = false;
   bool _demoModeBusy = false;
@@ -175,10 +181,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   List<Map<String, dynamic>> _channels = [];
   List<Map<String, dynamic>> _pendingPosts = [];
+  Map<String, dynamic> _tenantFeatureSettings = <String, dynamic>{};
+  List<Map<String, dynamic>> _revisionDeleteRequests = [];
   List<Map<String, dynamic>> _activePublishBatches = [];
   List<Map<String, dynamic>> _lastDispatchedOrders = [];
   List<Map<String, dynamic>> _deliveryBatches = [];
-  List<Map<String, dynamic>> _deliveryZones = [];
+  List<Map<String, dynamic>> _deliveryCityRates = [];
   List<Map<String, dynamic>> _supportPendingTickets = [];
   List<Map<String, dynamic>> _supportActiveTickets = [];
   List<Map<String, dynamic>> _supportArchivedTickets = [];
@@ -196,17 +204,19 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   List<Map<String, dynamic>> _tenants = [];
   List<Map<String, dynamic>> _tenantInvites = [];
   Map<String, dynamic>? _deliveryActiveBatch;
+  Map<String, dynamic>? _deliveryEligiblePreview;
   Map<String, dynamic>? _deliveryManualPhonesResult;
   Map<String, dynamic>? _financeData;
   Map<String, dynamic>? _rolesDraft;
-  Map<String, dynamic>? _diagnosticsData;
   Map<String, dynamic>? _smartNotifySettings;
   Map<String, dynamic>? _selectedClientCartUser;
   Map<String, dynamic>? _supportNotificationSummary;
   Map<String, dynamic>? _returnsAnalytics;
+  Map<String, dynamic>? _defectStats;
   Map<String, dynamic>? _publishingSummary;
   int _reservedPendingTotal = 0;
   int _reservedPendingUnits = 0;
+  int _deliveryEligiblePreviewPage = 0;
   String _lastGeneratedTenantKey = '';
   bool _tenantApiAllowed = true;
   bool _inviteApiAllowed = true;
@@ -220,6 +230,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final Set<String> _supportClaimBusyTicketIds = <String>{};
   final Set<String> _supportFinishBusyTicketIds = <String>{};
   final Set<String> _cartRetentionBusyIds = <String>{};
+  final Set<String> _revisionDeleteDecisionBusyIds = <String>{};
   Timer? _supportDraftSaveTimer;
   Timer? _clientCartUndoTimer;
   Timer? _publishProgressTimer;
@@ -262,6 +273,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         if (channelId.isNotEmpty) {
           _scheduleChannelOverviewRealtimeRefresh(channelId);
         }
+        return;
+      }
+      if (type == 'revision:delete-request:updated' &&
+          _canViewModerationTab()) {
+        unawaited(_loadRevisionDeleteRequests(silent: true));
         return;
       }
       if (type == 'chat:created' || type == 'chat:deleted') {
@@ -337,6 +353,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _channelTitleCtrl.dispose();
     _channelDescriptionCtrl.dispose();
     _deliveryThresholdCtrl.dispose();
+    _publicationIntervalCtrl.dispose();
     _deliveryOriginCtrl.dispose();
     _deliveryManualPhonesCtrl.dispose();
     _courierNamesCtrl.dispose();
@@ -398,6 +415,31 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     if (raw is bool) return raw;
     final normalized = '${raw ?? ''}'.trim().toLowerCase();
     return normalized == 'true' || normalized == '1' || normalized == 'yes';
+  }
+
+  bool get _tenantCustomWorkflowsEnabled =>
+      _boolValue(_tenantFeatureSettings['custom_workflows_enabled']);
+
+  int get _publicationIntervalMs {
+    final raw = _tenantFeatureSettings['publication_interval_ms'];
+    final parsed = _toInt(raw, fallback: 2000);
+    return parsed.clamp(500, 10 * 60 * 1000).toInt();
+  }
+
+  String _formatIntervalSeconds(int milliseconds) {
+    final seconds = milliseconds / 1000;
+    if ((seconds - seconds.round()).abs() < 0.001) {
+      return seconds.round().toString();
+    }
+    return seconds.toStringAsFixed(1);
+  }
+
+  int? _parsePublicationIntervalInputMs() {
+    final raw = _publicationIntervalCtrl.text.trim().replaceAll(',', '.');
+    final seconds = double.tryParse(raw);
+    if (seconds == null || !seconds.isFinite || seconds <= 0) return null;
+    final milliseconds = (seconds * 1000).round();
+    return milliseconds.clamp(500, 10 * 60 * 1000).toInt();
   }
 
   String _channelIdOf(Map<String, dynamic> channel) {
@@ -485,6 +527,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   bool _canViewDeliveryTab() {
     return _hasPermission('delivery.manage') || _isCreatorBase();
+  }
+
+  bool _canEditDeliveryPricing() {
+    if (_isCreatorBase()) return true;
+    final effectiveRole = authService.effectiveRole.toLowerCase().trim();
+    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    return effectiveRole == 'tenant' || baseRole == 'tenant';
   }
 
   bool _canViewSupportTab() {
@@ -654,11 +703,18 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return parsed;
   }
 
-  String _formatProductLabel(dynamic productCode, dynamic shelfNumber) {
+  String _formatProductLabel(
+    dynamic productCode,
+    dynamic shelfNumber, {
+    dynamic manualShelfLabel,
+  }) {
     final code = _toInt(productCode, fallback: 0);
     final shelf = _toInt(shelfNumber, fallback: 1);
+    final manualShelf = (manualShelfLabel ?? '').toString().trim();
     final codePart = code > 0 ? '$code' : '—';
-    final shelfPart = shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+    final shelfPart = manualShelf.isNotEmpty
+        ? manualShelf
+        : (shelf > 0 ? shelf.toString().padLeft(2, '0') : '—');
     return '$codePart--$shelfPart';
   }
 
@@ -933,7 +989,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       case 'client_carts':
         return;
       case 'moderation':
-        await _loadPendingPosts();
+        await Future.wait([
+          _loadTenantFeatureSettings(silent: silent),
+          _loadPendingPosts(),
+          _loadRevisionDeleteRequests(silent: silent),
+        ]);
         return;
       case 'create':
       case 'channels':
@@ -949,6 +1009,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         await _loadReturnsWorkflow(silent: true);
         await _loadSupportNotificationCenter(silent: true);
         await _loadReturnsAnalytics(silent: true);
+        await _loadDefectStats(silent: true);
         return;
       default:
         return;
@@ -968,6 +1029,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
     if (_canViewModerationTab()) {
       await _loadPendingPosts();
+      await _loadRevisionDeleteRequests(silent: true);
     }
     if (_canViewDeliveryTab()) {
       await _loadDeliveryDashboard();
@@ -979,9 +1041,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       await _loadReturnsWorkflow(silent: true);
       await _loadSupportNotificationCenter(silent: true);
       await _loadReturnsAnalytics(silent: true);
-    }
-    if (_isCreatorBase() && _hasPermission('diagnostics.view')) {
-      await _loadDiagnostics(silent: true);
+      await _loadDefectStats(silent: true);
     }
     if (_showKeysTab) {
       await _loadTenants();
@@ -1477,6 +1537,153 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
+  Future<void> _loadTenantFeatureSettings({bool silent = true}) async {
+    if (_tenantFeatureSettingsLoading) return;
+    _tenantFeatureSettingsLoading = true;
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/tenant/feature-settings',
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final settings = Map<String, dynamic>.from(data['data'] as Map);
+        if (!mounted) return;
+        setState(() {
+          _tenantFeatureSettings = settings;
+          _publicationIntervalCtrl.text = _formatIntervalSeconds(
+            _toInt(settings['publication_interval_ms'], fallback: 2000),
+          );
+        });
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message =
+              'Ошибка загрузки настроек группы: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      _tenantFeatureSettingsLoading = false;
+    }
+  }
+
+  Future<void> _loadRevisionDeleteRequests({bool silent = true}) async {
+    if (_revisionDeleteRequestsLoading) return;
+    _revisionDeleteRequestsLoading = true;
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/revision/delete-requests',
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true) {
+        final items = data['data'] is List
+            ? List<Map<String, dynamic>>.from(data['data'])
+            : <Map<String, dynamic>>[];
+        if (!mounted) return;
+        setState(() {
+          _revisionDeleteRequests = items;
+        });
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message =
+              'Ошибка загрузки запросов ревизии: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      _revisionDeleteRequestsLoading = false;
+    }
+  }
+
+  Future<void> _savePublicationIntervalSetting() async {
+    final intervalMs = _parsePublicationIntervalInputMs();
+    if (intervalMs == null) {
+      setState(() => _message = 'Введите интервал в секундах');
+      return;
+    }
+    setState(() {
+      _tenantFeatureSettingsSaving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.patch(
+        '/api/admin/tenant/feature-settings',
+        data: {'publication_interval_ms': intervalMs},
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final settings = Map<String, dynamic>.from(data['data'] as Map);
+        if (!mounted) return;
+        setState(() {
+          _tenantFeatureSettings = settings;
+          _publicationIntervalCtrl.text = _formatIntervalSeconds(
+            _toInt(settings['publication_interval_ms'], fallback: intervalMs),
+          );
+          _message = 'Интервал публикации сохранён';
+        });
+      } else if (mounted) {
+        setState(() => _message = 'Не удалось сохранить интервал');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () =>
+              _message = 'Ошибка сохранения интервала: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _tenantFeatureSettingsSaving = false);
+    }
+  }
+
+  Future<void> _decideRevisionDeleteRequest(
+    Map<String, dynamic> request,
+    bool approve,
+  ) async {
+    final id = (request['id'] ?? '').toString().trim();
+    if (id.isEmpty || _revisionDeleteDecisionBusyIds.contains(id)) return;
+    setState(() {
+      _revisionDeleteDecisionBusyIds.add(id);
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/revision/delete-requests/$id/decision',
+        data: {'decision': approve ? 'approved' : 'rejected'},
+      );
+      if (!mounted) return;
+      setState(() {
+        _message = approve
+            ? 'Удаление товара одобрено'
+            : 'Удаление товара отклонено';
+      });
+      showAppNotice(
+        context,
+        approve ? 'Товар удалён из ревизии' : 'Запрос на удаление отклонён',
+        tone: approve ? AppNoticeTone.success : AppNoticeTone.info,
+      );
+      await Future.wait([
+        _loadRevisionDeleteRequests(silent: true),
+        _loadPendingPosts(),
+      ]);
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка решения по удалению: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _revisionDeleteDecisionBusyIds.remove(id);
+        });
+      } else {
+        _revisionDeleteDecisionBusyIds.remove(id);
+      }
+    }
+  }
+
   void _schedulePendingPostsRealtimeRefresh() {
     _pendingPostsRefreshDebounce?.cancel();
     _pendingPostsRefreshDebounce = Timer(const Duration(milliseconds: 250), () {
@@ -1544,6 +1751,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       unawaited(_loadReturnsWorkflow(silent: true));
       unawaited(_loadSupportNotificationCenter(silent: true));
       unawaited(_loadReturnsAnalytics(silent: true));
+      unawaited(_loadDefectStats(silent: true));
     });
   }
 
@@ -2797,6 +3005,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       await _loadReturnsWorkflow(silent: true);
       await _loadSupportNotificationCenter(silent: true);
       await _loadReturnsAnalytics(silent: true);
+      await _loadDefectStats(silent: true);
       if (mounted) {
         setState(() => _message = 'Статус заявки обновлен');
       }
@@ -2807,39 +3016,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     } finally {
       if (mounted) {
         setState(() => _returnsActionBusy = false);
-      }
-    }
-  }
-
-  Future<void> _loadDiagnostics({bool silent = false}) async {
-    if (!_isCreatorBase()) return;
-    if (!silent && mounted) {
-      setState(() => _diagnosticsLoading = true);
-    } else {
-      _diagnosticsLoading = true;
-    }
-    try {
-      final resp = await authService.dio.get(
-        '/api/admin/ops/diagnostics/center',
-      );
-      final data = resp.data;
-      if (data is Map && data['ok'] == true && data['data'] is Map) {
-        if (!mounted) return;
-        setState(
-          () => _diagnosticsData = Map<String, dynamic>.from(data['data']),
-        );
-      } else if (!silent && mounted) {
-        setState(() => _message = 'Не удалось загрузить диагностику');
-      }
-    } catch (e) {
-      if (!silent && mounted) {
-        setState(() => _message = 'Ошибка диагностики: ${_extractDioError(e)}');
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _diagnosticsLoading = false);
-      } else {
-        _diagnosticsLoading = false;
       }
     }
   }
@@ -3025,6 +3201,19 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return result;
   }
 
+  bool _isSelectedClientCartUser(String userId) {
+    final normalized = userId.trim();
+    if (normalized.isEmpty) return false;
+    return (_selectedClientCartUser?['id'] ?? '').toString().trim() ==
+        normalized;
+  }
+
+  Future<void> _reloadClientCartIfStillSelected(String userId) async {
+    final normalized = userId.trim();
+    if (normalized.isEmpty || !_isSelectedClientCartUser(normalized)) return;
+    await _loadSelectedClientCart(normalized);
+  }
+
   Future<void> _scheduleClientCartUndoAction({
     required String label,
     required Future<void> Function() commit,
@@ -3043,21 +3232,21 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _clientCartPendingRollback = rollback;
     _clientCartPendingLabel = label;
     _clientCartUndoTimer?.cancel();
-    _clientCartUndoTimer = Timer(const Duration(seconds: 10), () {
+    _clientCartUndoTimer = Timer(_clientCartUndoDelay, () {
       unawaited(_commitPendingClientCartAction());
     });
 
     if (mounted) {
       setState(() {
         _clientCartUndoPending = true;
-        _message = '$label: можно отменить в течение 10 секунд';
+        _message = '$label: можно отменить в течение 2 секунд';
       });
       final messenger = ScaffoldMessenger.maybeOf(context);
       messenger?.hideCurrentSnackBar();
       messenger?.showSnackBar(
         SnackBar(
-          duration: const Duration(seconds: 10),
-          content: Text('$label через 10 секунд'),
+          duration: _clientCartUndoDelay,
+          content: Text('$label через 2 секунды'),
           action: SnackBarAction(
             label: 'Отменить',
             onPressed: _cancelPendingClientCartAction,
@@ -3285,7 +3474,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ? null
           : () {
               if (!mounted) return;
-              setState(() => _selectedClientCartItems[index] = previousItem);
+              if (!_isSelectedClientCartUser(userId)) return;
+              final currentIndex = _selectedClientCartItems.indexWhere(
+                (row) => (row['id'] ?? '').toString().trim() == itemId,
+              );
+              if (currentIndex < 0) return;
+              setState(
+                () => _selectedClientCartItems[currentIndex] = previousItem,
+              );
             },
       commit: () async {
         await authService.dio.patch(
@@ -3295,9 +3491,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             'custom_description': normalizedDescription,
           },
         );
-        if (userId.isNotEmpty) {
-          await _loadSelectedClientCart(userId);
-        }
+        await _reloadClientCartIfStillSelected(userId);
       },
     );
   }
@@ -3344,6 +3538,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ? null
           : () {
               if (!mounted) return;
+              if (!_isSelectedClientCartUser(userId)) return;
+              final alreadyRestored = _selectedClientCartItems.any(
+                (row) => (row['id'] ?? '').toString().trim() == itemId,
+              );
+              if (alreadyRestored) return;
               final safeIndex = index.clamp(0, _selectedClientCartItems.length);
               setState(
                 () => _selectedClientCartItems.insert(
@@ -3354,9 +3553,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             },
       commit: () async {
         await authService.dio.delete('/api/cart/admin/cart-items/$itemId');
-        if (userId.isNotEmpty) {
-          await _loadSelectedClientCart(userId);
-        }
+        await _reloadClientCartIfStillSelected(userId);
       },
     );
   }
@@ -3398,6 +3595,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ? null
           : () {
               if (!mounted) return;
+              if (!_isSelectedClientCartUser(userId)) return;
               setState(() {
                 _selectedClientCartItems = previousItems
                     .map((row) => Map<String, dynamic>.from(row))
@@ -3408,7 +3606,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         await authService.dio.post(
           '/api/cart/admin/clients/$userId/cart/clear',
         );
-        await _loadSelectedClientCart(userId);
+        await _reloadClientCartIfStillSelected(userId);
       },
     );
   }
@@ -3565,6 +3763,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           'kind': kind,
           'format': format,
           if (batchId.trim().isNotEmpty) 'batch_id': batchId,
+          if (kind == 'finance_summary') 'period': _financePeriod,
         },
         options: Options(responseType: ResponseType.bytes),
       );
@@ -3978,9 +4177,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                       ),
                     ),
                     child: Text(
-                      'Карта Самарской области готова.\n'
+                      'Карта доставки готова.\n'
                       'Точки и линии появятся после подтверждения адресов.\n'
-                      '${originAddress.isNotEmpty ? 'Старт: $originAddress' : 'Старт пока не задан, используется центр Самары.'}',
+                      '${originAddress.isNotEmpty ? 'Старт: $originAddress' : 'Старт пока не задан, используется точка по умолчанию.'}',
                       style: theme.textTheme.bodyMedium?.copyWith(
                         color: theme.colorScheme.onSurface,
                       ),
@@ -4044,7 +4243,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         ),
         const SizedBox(height: 8),
         Text(
-          'Карта Самарской области для текущего листа доставки. Маршрут начинается от точки отправки, старается делить доставки поровну и уменьшать пересечения. Нажми на точку клиента, чтобы перекинуть его на другого курьера.',
+          'Карта доставки для текущего листа. Маршрут начинается от точки отправки, старается делить доставки поровну и уменьшать пересечения. Нажми на точку клиента, чтобы перекинуть его на другого курьера.',
           style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -4129,6 +4328,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           _deliveryLoading = false;
           _deliveryActiveBatch = null;
           _deliveryBatches = [];
+          _deliveryEligiblePreview = null;
+          _deliveryEligiblePreviewPage = 0;
         });
       }
       return;
@@ -4149,8 +4350,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             .toString();
         final originLabel = (settings['route_origin_label'] ?? 'Точка отправки')
             .toString();
-        final deliveryZones = settings['delivery_zones'] is List
-            ? List<Map<String, dynamic>>.from(settings['delivery_zones'])
+        final deliveryCityRates = settings['city_rates'] is List
+            ? List<Map<String, dynamic>>.from(settings['city_rates'])
             : <Map<String, dynamic>>[];
         _deliveryThresholdCtrl.text = _toInt(
           threshold,
@@ -4163,8 +4364,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             _deliveryActiveBatch = payload['active_batch'] is Map
                 ? Map<String, dynamic>.from(payload['active_batch'])
                 : null;
+            _deliveryEligiblePreview = payload['eligible_preview'] is Map
+                ? Map<String, dynamic>.from(payload['eligible_preview'])
+                : null;
             _deliveryOriginLabel = originLabel;
-            _deliveryZones = deliveryZones;
+            _deliveryCityRates = deliveryCityRates;
             _deliveryOriginLat = _toNullableDouble(
               settings['route_origin_lat'],
             );
@@ -4180,6 +4384,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           setState(() {
             _deliveryActiveBatch = null;
             _deliveryBatches = [];
+            _deliveryEligiblePreview = null;
+            _deliveryEligiblePreviewPage = 0;
           });
         }
         return;
@@ -4220,10 +4426,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ? Map<String, dynamic>.from(data['data'])
           : <String, dynamic>{};
       if (!mounted) return;
+      final processedCount = _toInt(payload['processed_count']);
+      final skippedCount = _toInt(payload['skipped_count']);
       setState(() {
         _deliveryManualPhonesResult = payload;
         _message =
-            'Ручная обработка: обработано ${_toInt(payload['processed_count'])} товаров';
+            'Ручная обработка: обработано $processedCount товаров'
+            '${skippedCount > 0 ? ', пропущено $skippedCount номеров' : ''}';
       });
       unawaited(_loadDeliveryDashboard());
     } catch (e) {
@@ -4336,6 +4545,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         ...clients.map((client) {
           final products = _asMapList(client['products']);
           final found = client['found'] == true;
+          final hasProducts = products.isNotEmpty;
           final phone = (client['phone'] ?? client['raw_phone'] ?? '')
               .toString()
               .trim();
@@ -4356,10 +4566,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 Row(
                   children: [
                     Icon(
-                      found ? Icons.person_outline : Icons.person_off_outlined,
-                      color: found
+                      hasProducts
+                          ? Icons.check_circle_outline
+                          : found
+                          ? Icons.info_outline
+                          : Icons.person_off_outlined,
+                      color: hasProducts
                           ? theme.colorScheme.primary
-                          : theme.colorScheme.error,
+                          : theme.colorScheme.onSurfaceVariant,
                     ),
                     const SizedBox(width: 8),
                     Expanded(
@@ -4370,9 +4584,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     ),
                     Chip(
                       label: Text(
-                        found
+                        hasProducts
                             ? 'Обработано: ${products.length}'
-                            : 'Нет клиента',
+                            : found
+                            ? 'Пропущено: нет товаров'
+                            : 'Пропущено: нет клиента',
                       ),
                     ),
                   ],
@@ -4606,6 +4822,36 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         setState(() => _returnsAnalyticsLoading = false);
       } else {
         _returnsAnalyticsLoading = false;
+      }
+    }
+  }
+
+  Future<void> _loadDefectStats({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() => _defectStatsLoading = true);
+    } else {
+      _defectStatsLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get('/api/admin/defects/stats');
+      final data = resp.data;
+      if (!mounted) return;
+      setState(() {
+        _defectStats = data is Map && data['ok'] == true
+            ? Map<String, dynamic>.from(data)
+            : <String, dynamic>{};
+      });
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () => _message = 'Ошибка статистики брака: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _defectStatsLoading = false);
+      } else {
+        _defectStatsLoading = false;
       }
     }
   }
@@ -4916,8 +5162,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     )) {
       return;
     }
+    final canEditPricing = _canEditDeliveryPricing();
     final threshold = int.tryParse(_deliveryThresholdCtrl.text.trim());
-    if (threshold == null || threshold < 0) {
+    if (canEditPricing && (threshold == null || threshold < 0)) {
       setState(() => _message = 'Введите корректную сумму для доставки');
       return;
     }
@@ -4927,22 +5174,25 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       _message = '';
     });
     try {
+      final payload = <String, dynamic>{
+        'route_origin_label': _deliveryOriginLabel,
+        'route_origin_address': originAddress,
+      };
+      if (canEditPricing) {
+        payload['threshold_amount'] = threshold;
+        payload['city_rates'] = _deliveryCityRates;
+      }
       await authService.dio.patch(
         '/api/admin/delivery/settings',
-        data: {
-          'threshold_amount': threshold,
-          'route_origin_label': _deliveryOriginLabel,
-          'route_origin_address': originAddress,
-          'delivery_zones': _deliveryZones,
-        },
+        data: payload,
       );
       await _loadDeliveryDashboard();
       if (mounted) {
-        setState(() => _message = 'Порог доставки сохранен');
+        setState(() => _message = 'Настройки доставки сохранены');
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _message = 'Ошибка порога: ${_extractDioError(e)}');
+        setState(() => _message = 'Ошибка настроек: ${_extractDioError(e)}');
       }
     } finally {
       if (mounted) {
@@ -4958,8 +5208,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     )) {
       return;
     }
+    final canEditPricing = _canEditDeliveryPricing();
     final threshold = int.tryParse(_deliveryThresholdCtrl.text.trim());
-    if (threshold == null || threshold < 0) {
+    if (canEditPricing && (threshold == null || threshold < 0)) {
       setState(() => _message = 'Введите корректную сумму для доставки');
       return;
     }
@@ -4970,7 +5221,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     try {
       final resp = await authService.dio.post(
         '/api/admin/delivery/broadcast',
-        data: {'threshold_amount': threshold},
+        data: {if (canEditPricing) 'threshold_amount': threshold},
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true) {
@@ -5311,6 +5562,454 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
+  String _deliveryAssemblyStatusLabel(String raw) {
+    switch (raw.trim()) {
+      case 'assembling':
+        return 'Собирается';
+      case 'assembled':
+        return 'Собрано';
+      case 'issue':
+        return 'Есть проблема';
+      case 'not_started':
+      default:
+        return 'Не начато';
+    }
+  }
+
+  Future<Map<String, dynamic>?> _askDeliveryAssemblyData(
+    Map<String, dynamic> customer,
+  ) async {
+    final rawItems = _asMapList(customer['items']);
+    final rows = rawItems.map((item) {
+      final manualShelf = (item['manual_shelf_label'] ?? '').toString().trim();
+      final shelfFloor = (item['shelf_floor'] ?? '').toString().trim();
+      final productShelf = _toInt(
+        item['product_shelf_number'] ?? item['shelf_number'],
+        fallback: 0,
+      );
+      final shelfLabel = [
+        if (manualShelf.isNotEmpty) manualShelf,
+        if (manualShelf.isEmpty && productShelf > 0)
+          'Полка ${productShelf.toString().padLeft(2, '0')}',
+        if (shelfFloor.isNotEmpty) 'этаж $shelfFloor',
+      ].join(' · ');
+      final assemblyStatus = (item['assembly_status'] ?? 'pending')
+          .toString()
+          .trim();
+      return <String, dynamic>{
+        'id': (item['id'] ?? '').toString(),
+        'title': (item['product_title'] ?? 'Товар').toString(),
+        'description': (item['product_description'] ?? '').toString(),
+        'image_url': (item['product_image_url'] ?? '').toString(),
+        'code': item['product_code'],
+        'shelf_label': shelfLabel,
+        'quantity': _toInt(item['quantity'], fallback: 1),
+        'line_total': item['line_total'],
+        'collected': assemblyStatus == 'collected',
+        'is_bulky': item['is_bulky'] == true,
+        'removed': assemblyStatus == 'removed',
+        'removed_reason': (item['removed_reason'] ?? '').toString(),
+        'bulky_note': (item['bulky_note'] ?? item['product_title'] ?? '')
+            .toString(),
+      };
+    }).toList();
+    final reasonCtrls = <String, TextEditingController>{};
+    final bulkyCtrls = <String, TextEditingController>{};
+    for (final row in rows) {
+      final id = row['id'].toString();
+      reasonCtrls[id] = TextEditingController(
+        text: row['removed_reason'].toString(),
+      );
+      bulkyCtrls[id] = TextEditingController(
+        text: row['bulky_note'].toString(),
+      );
+    }
+
+    try {
+      final result = await showDialog<Map<String, dynamic>>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            return AlertDialog(
+              title: const Text('Сборка корзины'),
+              content: SizedBox(
+                width: 720,
+                height: math.min<double>(
+                  MediaQuery.of(ctx).size.height * 0.72,
+                  620,
+                ),
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: ListView.separated(
+                        itemCount: rows.length,
+                        separatorBuilder: (context, index) =>
+                            const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final row = rows[index];
+                          final id = row['id'].toString();
+                          final removed = row['removed'] == true;
+                          final collected = row['collected'] == true;
+                          final isBulky = row['is_bulky'] == true;
+                          final imageUrl = row['image_url'].toString().trim();
+                          final description = row['description']
+                              .toString()
+                              .trim();
+                          final shelfLabel = row['shelf_label']
+                              .toString()
+                              .trim();
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: imageUrl.isEmpty
+                                          ? Container(
+                                              width: 54,
+                                              height: 54,
+                                              color: Theme.of(ctx)
+                                                  .colorScheme
+                                                  .surfaceContainerHighest,
+                                              child: const Icon(
+                                                Icons
+                                                    .image_not_supported_outlined,
+                                              ),
+                                            )
+                                          : Image.network(
+                                              imageUrl,
+                                              width: 54,
+                                              height: 54,
+                                              fit: BoxFit.cover,
+                                              errorBuilder:
+                                                  (
+                                                    context,
+                                                    error,
+                                                    stackTrace,
+                                                  ) => Container(
+                                                    width: 54,
+                                                    height: 54,
+                                                    color: Theme.of(ctx)
+                                                        .colorScheme
+                                                        .surfaceContainerHighest,
+                                                    child: const Icon(
+                                                      Icons
+                                                          .broken_image_outlined,
+                                                    ),
+                                                  ),
+                                            ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            '${row['title']} · ${_formatMoney(row['line_total'])}',
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                          Text(
+                                            'ID: ${row['code'] ?? '—'} · Кол-во: ${row['quantity']}',
+                                          ),
+                                          if (shelfLabel.isNotEmpty)
+                                            Text('Полка: $shelfLabel'),
+                                          if (description.isNotEmpty)
+                                            Text(
+                                              description,
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                CheckboxListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  value: collected,
+                                  onChanged: removed
+                                      ? null
+                                      : (value) => setDialogState(() {
+                                          row['collected'] = value == true;
+                                          if (value == true) {
+                                            row['removed'] = false;
+                                          }
+                                        }),
+                                  title: const Text('Положил'),
+                                  subtitle: const Text(
+                                    'Товар физически найден и положен в пакет клиента',
+                                  ),
+                                ),
+                                CheckboxListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  value: isBulky,
+                                  onChanged: removed || !collected
+                                      ? null
+                                      : (value) => setDialogState(
+                                          () => row['is_bulky'] = value == true,
+                                        ),
+                                  title: const Text('Габарит'),
+                                  subtitle: const Text(
+                                    'Напечатается габаритный стикер с названием и ценой товара',
+                                  ),
+                                ),
+                                if (isBulky && !removed)
+                                  TextField(
+                                    controller: bulkyCtrls[id],
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Что за габарит',
+                                        border: OutlineInputBorder(),
+                                      ),
+                                      controller: bulkyCtrls[id],
+                                    ),
+                                  ),
+                                CheckboxListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  value: removed,
+                                  onChanged: (value) => setDialogState(() {
+                                    row['removed'] = value == true;
+                                    if (value == true) {
+                                      row['is_bulky'] = false;
+                                      row['collected'] = false;
+                                    }
+                                  }),
+                                  title: const Text('Ненаход / убрать'),
+                                  subtitle: const Text(
+                                    'Товар уйдет в статистику брака/потерь, сумма пересчитается',
+                                  ),
+                                ),
+                                if (removed)
+                                  TextField(
+                                    controller: reasonCtrls[id],
+                                    minLines: 1,
+                                    maxLines: 3,
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Причина',
+                                        hintText: 'Сломан, потерян, брак...',
+                                        border: OutlineInputBorder(),
+                                      ),
+                                      controller: reasonCtrls[id],
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    Navigator.of(ctx).pop({
+                      'items': rows.map((row) {
+                        final id = row['id'].toString();
+                        return {
+                          'id': id,
+                          'collected': row['collected'] == true,
+                          'assembly_status': row['removed'] == true
+                              ? 'removed'
+                              : row['collected'] == true
+                              ? 'collected'
+                              : 'pending',
+                          'is_bulky': row['is_bulky'] == true,
+                          'removed': row['removed'] == true,
+                          'bulky_note': bulkyCtrls[id]?.text.trim() ?? '',
+                          'removed_reason': reasonCtrls[id]?.text.trim() ?? '',
+                        };
+                      }).toList(),
+                    });
+                  },
+                  child: const Text('Сохранить сборку'),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+      return result;
+    } finally {
+      for (final ctrl in reasonCtrls.values) {
+        ctrl.dispose();
+      }
+      for (final ctrl in bulkyCtrls.values) {
+        ctrl.dispose();
+      }
+    }
+  }
+
+  Future<int?> _askDeliveryPackagePlacesData(
+    Map<String, dynamic> customer,
+  ) async {
+    final packageCtrl = TextEditingController(
+      text: _toInt(customer['package_places'], fallback: 1).toString(),
+    );
+    try {
+      return await showDialog<int>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Сколько мест в доставке?'),
+          content: SizedBox(
+            width: 360,
+            child: TextField(
+              controller: packageCtrl,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Количество мест всего',
+                helperText:
+                    'Пакеты + габариты. Первый обычный стикер уже напечатан при старте сборки.',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final places = int.tryParse(packageCtrl.text.trim()) ?? 0;
+                if (places <= 0) return;
+                Navigator.of(ctx).pop(places);
+              },
+              child: const Text('Сохранить'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      packageCtrl.dispose();
+    }
+  }
+
+  Future<void> _startDeliveryAssembly(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для сборки доставки',
+    )) {
+      return;
+    }
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (batchId.trim().isEmpty || customerId.isEmpty) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/assembly/start',
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() {
+          _message = 'Сборка начата. Первый стикер отправлен на печать';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка старта сборки: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deliverySaving = false);
+    }
+  }
+
+  Future<void> _editDeliveryAssembly(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для сборки доставки',
+    )) {
+      return;
+    }
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (batchId.trim().isEmpty || customerId.isEmpty) return;
+    final payload = await _askDeliveryAssemblyData(customer);
+    if (payload == null) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/assembly',
+        data: payload,
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Сборка обновлена');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка сборки: ${_extractDioError(e)}');
+      }
+    } finally {
+      if (mounted) setState(() => _deliverySaving = false);
+    }
+  }
+
+  Future<void> _completeDeliveryAssembly(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для завершения сборки',
+    )) {
+      return;
+    }
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (batchId.trim().isEmpty || customerId.isEmpty) return;
+    final packagePlaces = await _askDeliveryPackagePlacesData(customer);
+    if (packagePlaces == null) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/assembly/complete',
+        data: {'package_places': packagePlaces},
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Корзина собрана');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка завершения сборки: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deliverySaving = false);
+    }
+  }
+
   Future<void> _manualAddDeliveryCustomer(String batchId) async {
     if (!_ensurePermission(
       'delivery.manage',
@@ -5355,7 +6054,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   decoration: withInputLanguageBadge(
                     const InputDecoration(
                       labelText: 'Адрес доставки',
-                      hintText: 'Самара, улица, дом, подъезд',
+                      hintText: 'Город, улица, дом, подъезд',
                       border: OutlineInputBorder(),
                     ),
                     controller: addressCtrl,
@@ -5504,215 +6203,131 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _editDeliveryZone([Map<String, dynamic>? existing]) async {
-    final titleCtrl = TextEditingController(
-      text: (existing?['title'] ?? '').toString(),
-    );
-    final radiusCtrl = TextEditingController(
-      text: (existing?['radius_meters'] ?? 2500).toString(),
-    );
-    final center = existing?['center'] is Map
-        ? Map<String, dynamic>.from(existing!['center'] as Map)
-        : <String, dynamic>{};
-    double lat =
-        _toNullableDouble(center['lat']) ?? _deliveryOriginLat ?? 53.195878;
-    double lng =
-        _toNullableDouble(center['lng']) ?? _deliveryOriginLng ?? 50.100202;
-    bool active = existing?['is_active'] != false;
-    final mapController = MapController();
+  String _normalizeDeliveryCityName(dynamic raw) {
+    return (raw ?? '').toString().trim().replaceAll(RegExp(r'\s+'), ' ');
+  }
 
-    final result = await showDialog<Map<String, dynamic>>(
-      context: context,
-      builder: (ctx) {
-        final theme = Theme.of(ctx);
-        final tileUrl = _activeMapTileUrl(theme);
-        final subdomains = _activeMapSubdomains(tileUrl);
-        return StatefulBuilder(
-          builder: (context, setLocalState) => AlertDialog(
-            title: Text(
-              existing == null ? 'Новая зона доставки' : 'Зона доставки',
-            ),
-            content: SizedBox(
-              width: 640,
-              child: SingleChildScrollView(
+  Future<void> _editDeliveryCityRate([Map<String, dynamic>? existing]) async {
+    final cityCtrl = TextEditingController(
+      text: _normalizeDeliveryCityName(existing?['city']),
+    );
+    final thresholdCtrl = TextEditingController(
+      text: _toDouble(existing?['threshold_amount']).toStringAsFixed(0),
+    );
+    bool active = existing?['is_active'] != false;
+
+    try {
+      final result = await showDialog<Map<String, dynamic>>(
+        context: context,
+        builder: (ctx) {
+          return StatefulBuilder(
+            builder: (ctx, setDialogState) => AlertDialog(
+              title: Text(existing == null ? 'Добавить город' : 'Город'),
+              content: SizedBox(
+                width: 420,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     TextField(
-                      controller: titleCtrl,
+                      controller: cityCtrl,
                       decoration: withInputLanguageBadge(
                         const InputDecoration(
-                          labelText: 'Название зоны',
-                          hintText: 'Например: Самара центр',
+                          labelText: 'Город',
                           border: OutlineInputBorder(),
                         ),
-                        controller: titleCtrl,
+                        controller: cityCtrl,
                       ),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 10),
                     TextField(
-                      controller: radiusCtrl,
+                      controller: thresholdCtrl,
                       keyboardType: TextInputType.number,
                       decoration: withInputLanguageBadge(
                         const InputDecoration(
-                          labelText: 'Радиус в метрах',
+                          labelText: 'Порог доставки',
+                          suffixText: '₽',
                           border: OutlineInputBorder(),
                         ),
-                        controller: radiusCtrl,
+                        controller: thresholdCtrl,
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    SwitchListTile.adaptive(
-                      value: active,
-                      onChanged: (value) => setLocalState(() => active = value),
+                    const SizedBox(height: 6),
+                    SwitchListTile(
                       contentPadding: EdgeInsets.zero,
-                      title: const Text('Зона активна'),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Нажми на карту, чтобы выбрать центр зоны.',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 8),
-                    Container(
-                      height: 300,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(
-                          color: theme.colorScheme.outlineVariant,
-                        ),
-                      ),
-                      clipBehavior: Clip.antiAlias,
-                      child: FlutterMap(
-                        mapController: mapController,
-                        options: MapOptions(
-                          initialCenter: LatLng(lat, lng),
-                          initialZoom: 10.5,
-                          onTap: (_, point) {
-                            setLocalState(() {
-                              lat = point.latitude;
-                              lng = point.longitude;
-                            });
-                          },
-                        ),
-                        children: [
-                          TileLayer(
-                            urlTemplate: tileUrl,
-                            subdomains: subdomains,
-                            userAgentPackageName: 'projectphoenix',
-                          ),
-                          RichAttributionWidget(
-                            attributions: [
-                              TextSourceAttribution(
-                                _mapAttributionText,
-                                textStyle: theme.textTheme.labelSmall,
-                              ),
-                            ],
-                          ),
-                          CircleLayer(
-                            circles: [
-                              CircleMarker(
-                                point: LatLng(lat, lng),
-                                radius:
-                                    double.tryParse(radiusCtrl.text.trim()) ??
-                                    2500,
-                                useRadiusInMeter: true,
-                                color: theme.colorScheme.primary.withValues(
-                                  alpha: 0.12,
-                                ),
-                                borderColor: theme.colorScheme.primary
-                                    .withValues(alpha: 0.52),
-                                borderStrokeWidth: 2,
-                              ),
-                            ],
-                          ),
-                          MarkerLayer(
-                            markers: [
-                              Marker(
-                                point: LatLng(lat, lng),
-                                width: 48,
-                                height: 48,
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    color: theme.colorScheme.primary,
-                                    shape: BoxShape.circle,
-                                    border: Border.all(
-                                      color: Colors.white,
-                                      width: 3,
-                                    ),
-                                  ),
-                                  child: const Icon(
-                                    Icons.place,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Центр: ${lat.toStringAsFixed(6)}, ${lng.toStringAsFixed(6)}',
-                      style: theme.textTheme.bodySmall,
+                      value: active,
+                      title: const Text('Расценка включена'),
+                      onChanged: (value) =>
+                          setDialogState(() => active = value),
                     ),
                   ],
                 ),
               ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final city = _normalizeDeliveryCityName(cityCtrl.text);
+                    final threshold = _toDouble(
+                      thresholdCtrl.text.replaceAll(',', '.'),
+                      fallback: -1,
+                    );
+                    if (city.length < 2 || threshold < 0) {
+                      return;
+                    }
+                    Navigator.of(ctx).pop({
+                      'city': city,
+                      'threshold_amount': threshold,
+                      'delivery_fee_amount': 0,
+                      'is_active': active,
+                    });
+                  },
+                  child: const Text('Сохранить'),
+                ),
+              ],
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(),
-                child: const Text('Отмена'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  final title = titleCtrl.text.trim();
-                  final radius = int.tryParse(radiusCtrl.text.trim());
-                  if (title.length < 2 || radius == null || radius < 100) {
-                    return;
-                  }
-                  Navigator.of(ctx).pop({
-                    'id': (existing?['id'] ?? '').toString().trim().isEmpty
-                        ? 'zone_${DateTime.now().millisecondsSinceEpoch}'
-                        : existing?['id'],
-                    'title': title,
-                    'center': {'lat': lat, 'lng': lng},
-                    'radius_meters': radius,
-                    'is_active': active,
-                  });
-                },
-                child: const Text('Сохранить'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-
-    if (result == null) return;
-    if (!mounted) return;
-    setState(() {
-      final zoneId = (result['id'] ?? '').toString().trim();
-      final index = _deliveryZones.indexWhere(
-        (zone) => (zone['id'] ?? '').toString().trim() == zoneId,
+          );
+        },
       );
-      if (index >= 0) {
-        _deliveryZones[index] = result;
-      } else {
-        _deliveryZones = [..._deliveryZones, result];
-      }
-    });
+      if (result == null || !mounted) return;
+      final cityKey = _normalizeDeliveryCityName(result['city']).toLowerCase();
+      if (cityKey.isEmpty) return;
+      setState(() {
+        final next = List<Map<String, dynamic>>.from(_deliveryCityRates);
+        final index = next.indexWhere(
+          (rate) =>
+              _normalizeDeliveryCityName(rate['city']).toLowerCase() == cityKey,
+        );
+        if (index >= 0) {
+          next[index] = result;
+        } else {
+          next.add(result);
+        }
+        next.sort(
+          (a, b) => _normalizeDeliveryCityName(
+            a['city'],
+          ).compareTo(_normalizeDeliveryCityName(b['city'])),
+        );
+        _deliveryCityRates = next;
+      });
+    } finally {
+      cityCtrl.dispose();
+      thresholdCtrl.dispose();
+    }
   }
 
-  void _removeDeliveryZone(Map<String, dynamic> zone) {
-    final zoneId = (zone['id'] ?? '').toString().trim();
-    if (zoneId.isEmpty) return;
+  void _removeDeliveryCityRate(Map<String, dynamic> rate) {
+    final cityKey = _normalizeDeliveryCityName(rate['city']).toLowerCase();
+    if (cityKey.isEmpty) return;
     setState(() {
-      _deliveryZones = _deliveryZones
-          .where((item) => (item['id'] ?? '').toString().trim() != zoneId)
+      _deliveryCityRates = _deliveryCityRates
+          .where(
+            (item) =>
+                _normalizeDeliveryCityName(item['city']).toLowerCase() !=
+                cityKey,
+          )
           .toList();
     });
   }
@@ -6882,9 +7497,21 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       _message = '';
     });
     try {
+      final payload = <String, dynamic>{};
+      if (_tenantCustomWorkflowsEnabled) {
+        final intervalMs = _parsePublicationIntervalInputMs();
+        if (intervalMs == null) {
+          setState(() {
+            _publishing = false;
+            _message = 'Введите интервал публикации в секундах';
+          });
+          return;
+        }
+        payload['publication_interval_ms'] = intervalMs;
+      }
       final resp = await authService.dio.post(
         '/api/admin/channels/publish_pending',
-        data: const {},
+        data: payload,
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true) {
@@ -6893,7 +7520,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         if (mounted) {
           setState(() {
             if (acceptedCount > 0) {
-              _message = 'Публикация запущена: $acceptedCount постов';
+              final intervalLabel = _tenantCustomWorkflowsEnabled
+                  ? ' · интервал ${_formatIntervalSeconds(_publicationIntervalMs)} сек'
+                  : '';
+              _message =
+                  'Публикация запущена: $acceptedCount постов$intervalLabel';
             } else if (runningChannels.isNotEmpty) {
               _message = 'Публикация уже идёт для выбранного канала';
             } else {
@@ -7493,6 +8124,385 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  String _channelClientExcelText(Map<String, dynamic> client, String field) {
+    switch (field) {
+      case 'phone':
+        return _displayPhone((client['phone'] ?? '').toString(), fallback: '');
+      case 'name':
+        return _displayName(client, fallback: 'Клиент');
+      case 'sum':
+        return _formatMoney(client['total_sum']);
+      case 'address':
+        return (client['effective_address_text'] ??
+                client['delivery_address_text'] ??
+                client['saved_address_text'] ??
+                '')
+            .toString()
+            .trim();
+      case 'courier':
+        return (client['courier_name'] ?? '').toString().trim();
+      case 'locality':
+        return (client['locality_letter'] ?? '').toString().trim();
+      case 'bulky':
+        return (client['bulky_text'] ?? '').toString().trim();
+      case 'shelf':
+        return (client['shelf_label'] ?? '').toString().trim();
+      case 'places':
+        final places = _toInt(client['package_places']);
+        return places > 0 ? places.toString() : '';
+      default:
+        return '';
+    }
+  }
+
+  Widget _buildExcelFilterField({
+    required TextEditingController controller,
+    required String label,
+    required VoidCallback onChanged,
+    double width = 120,
+  }) {
+    return SizedBox(
+      width: width,
+      child: TextField(
+        controller: controller,
+        style: const TextStyle(fontSize: 14),
+        decoration: InputDecoration(
+          labelText: label,
+          isDense: true,
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 10,
+            vertical: 10,
+          ),
+          border: const OutlineInputBorder(),
+          suffixIconConstraints: const BoxConstraints(
+            minWidth: 30,
+            minHeight: 30,
+          ),
+          suffixIcon: controller.text.trim().isEmpty
+              ? null
+              : IconButton(
+                  tooltip: 'Очистить',
+                  icon: const Icon(Icons.close, size: 16),
+                  onPressed: () {
+                    controller.clear();
+                    onChanged();
+                  },
+                ),
+        ),
+        onChanged: (_) => onChanged(),
+      ),
+    );
+  }
+
+  Future<void> _openClientsExcelDialog(
+    String channelId,
+    String channelTitle,
+  ) async {
+    final overview = await _loadChannelOverview(channelId, force: true);
+    if (!mounted || overview == null) return;
+
+    final sourceClients = _asMapList(overview['clients']);
+    final filters = <String, TextEditingController>{
+      'phone': TextEditingController(),
+      'name': TextEditingController(),
+      'sum': TextEditingController(),
+      'address': TextEditingController(),
+      'courier': TextEditingController(),
+      'locality': TextEditingController(),
+      'bulky': TextEditingController(),
+      'shelf': TextEditingController(),
+      'places': TextEditingController(),
+    };
+    final horizontalScrollCtrl = ScrollController();
+    final verticalScrollCtrl = ScrollController();
+
+    List<Map<String, dynamic>> filteredRows() {
+      return sourceClients.where((client) {
+        for (final entry in filters.entries) {
+          final query = entry.value.text.trim().toLowerCase();
+          if (query.isEmpty) continue;
+          final value = _channelClientExcelText(
+            client,
+            entry.key,
+          ).toLowerCase();
+          if (!value.contains(query)) return false;
+        }
+        return true;
+      }).toList()..sort((a, b) {
+        final left = _toDouble(a['total_sum']);
+        final right = _toDouble(b['total_sum']);
+        return right.compareTo(left);
+      });
+    }
+
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (context, setDialogState) {
+            final rows = filteredRows();
+            void refreshFilters() => setDialogState(() {});
+            final size = MediaQuery.sizeOf(context);
+            final dialogWidth = math.min(
+              1360.0,
+              math.max(360.0, size.width - 24),
+            );
+            final dialogHeight = math.min(
+              680.0,
+              math.max(440.0, size.height - 96),
+            );
+            return AlertDialog(
+              insetPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 20,
+              ),
+              contentPadding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              title: Text('Excel: клиенты канала "$channelTitle"'),
+              content: SizedBox(
+                width: dialogWidth,
+                height: dialogHeight,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          _buildExcelFilterField(
+                            controller: filters['phone']!,
+                            label: 'Телефон',
+                            onChanged: refreshFilters,
+                            width: 125,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['name']!,
+                            label: 'Имя',
+                            onChanged: refreshFilters,
+                            width: 125,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['sum']!,
+                            label: 'Сумма',
+                            onChanged: refreshFilters,
+                            width: 105,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['address']!,
+                            label: 'Адрес',
+                            onChanged: refreshFilters,
+                            width: 190,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['courier']!,
+                            label: 'Курьер',
+                            onChanged: refreshFilters,
+                            width: 110,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['locality']!,
+                            label: 'НП',
+                            onChanged: refreshFilters,
+                            width: 72,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['bulky']!,
+                            label: 'Габарит',
+                            onChanged: refreshFilters,
+                            width: 120,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['shelf']!,
+                            label: 'Полка',
+                            onChanged: refreshFilters,
+                            width: 82,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
+                            controller: filters['places']!,
+                            label: 'Мест',
+                            onChanged: refreshFilters,
+                            width: 72,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      'Строк: ${rows.length} из ${sourceClients.length}',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: Scrollbar(
+                        controller: verticalScrollCtrl,
+                        thumbVisibility: true,
+                        child: SingleChildScrollView(
+                          controller: verticalScrollCtrl,
+                          child: Scrollbar(
+                            controller: horizontalScrollCtrl,
+                            thumbVisibility: true,
+                            notificationPredicate: (notification) =>
+                                notification.metrics.axis == Axis.horizontal,
+                            child: SingleChildScrollView(
+                              controller: horizontalScrollCtrl,
+                              scrollDirection: Axis.horizontal,
+                              child: DataTable(
+                                headingRowColor: WidgetStatePropertyAll(
+                                  Colors.greenAccent.withValues(alpha: 0.28),
+                                ),
+                                dataRowMinHeight: 42,
+                                dataRowMaxHeight: 72,
+                                columnSpacing: 18,
+                                columns: const [
+                                  DataColumn(label: Text('Телефон')),
+                                  DataColumn(label: Text('Имя')),
+                                  DataColumn(label: Text('Сумма')),
+                                  DataColumn(label: Text('Адрес')),
+                                  DataColumn(label: Text('Курьер')),
+                                  DataColumn(label: Text('НП')),
+                                  DataColumn(label: Text('Габарит')),
+                                  DataColumn(label: Text('Полка')),
+                                  DataColumn(label: Text('Мест')),
+                                ],
+                                rows: rows.map((client) {
+                                  final address = _channelClientExcelText(
+                                    client,
+                                    'address',
+                                  );
+                                  final bulky = _channelClientExcelText(
+                                    client,
+                                    'bulky',
+                                  );
+                                  return DataRow(
+                                    cells: [
+                                      DataCell(
+                                        Text(
+                                          _channelClientExcelText(
+                                            client,
+                                            'phone',
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        SizedBox(
+                                          width: 150,
+                                          child: Text(
+                                            _channelClientExcelText(
+                                              client,
+                                              'name',
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          _channelClientExcelText(
+                                            client,
+                                            'sum',
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        SizedBox(
+                                          width: 330,
+                                          child: Text(
+                                            address,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          _channelClientExcelText(
+                                            client,
+                                            'courier',
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          _channelClientExcelText(
+                                            client,
+                                            'locality',
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        SizedBox(
+                                          width: 230,
+                                          child: Text(
+                                            bulky,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          _channelClientExcelText(
+                                            client,
+                                            'shelf',
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          _channelClientExcelText(
+                                            client,
+                                            'places',
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                }).toList(),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton.icon(
+                  onPressed: () {
+                    for (final controller in filters.values) {
+                      controller.clear();
+                    }
+                    refreshFilters();
+                  },
+                  icon: const Icon(Icons.filter_alt_off_outlined),
+                  label: const Text('Сбросить фильтры'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Закрыть'),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+    } finally {
+      for (final controller in filters.values) {
+        controller.dispose();
+      }
+      horizontalScrollCtrl.dispose();
+      verticalScrollCtrl.dispose();
+    }
   }
 
   Future<void> _openMediaDialog(String channelId, String channelTitle) async {
@@ -8191,12 +9201,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 ),
               ),
               OutlinedButton.icon(
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: id));
-                  setState(() => _message = 'ID канала скопирован');
-                },
-                icon: const Icon(Icons.copy_outlined),
-                label: const Text('Скопировать ID'),
+                onPressed: !isOverviewAvailable || _overviewLoading.contains(id)
+                    ? null
+                    : () => _openClientsExcelDialog(id, title),
+                icon: const Icon(Icons.table_chart_outlined),
+                label: const Text('Excel'),
               ),
             ],
           ),
@@ -8481,6 +9490,184 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     );
   }
 
+  Widget _buildRevisionDeleteRequestsSection() {
+    final theme = Theme.of(context);
+    final pendingRequests = _revisionDeleteRequests
+        .where((item) => (item['status'] ?? '').toString().trim() == 'pending')
+        .toList();
+    if (!_revisionDeleteRequestsLoading && pendingRequests.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.delete_sweep_outlined,
+                  color: theme.colorScheme.tertiary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Запросы на удаление из ревизии',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                if (_revisionDeleteRequestsLoading)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (pendingRequests.isEmpty)
+              Text(
+                'Ожидающих запросов нет',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              )
+            else
+              ...pendingRequests.map((request) {
+                final id = (request['id'] ?? '').toString().trim();
+                final busy = _revisionDeleteDecisionBusyIds.contains(id);
+                final imageUrl = _resolveImageUrl(
+                  (request['image_url'] ?? '').toString(),
+                );
+                final productTitle = (request['product_title'] ?? 'Товар')
+                    .toString();
+                final workerName = (request['worker_name'] ?? 'Рабочий')
+                    .toString();
+                final reason = (request['reason'] ?? '').toString().trim();
+                final productLabel = _formatProductLabel(
+                  request['product_code'],
+                  request['shelf_number'],
+                );
+                return Container(
+                  margin: const EdgeInsets.only(top: 10),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: SizedBox(
+                          width: 72,
+                          height: 72,
+                          child: imageUrl != null
+                              ? AdaptiveNetworkImage(
+                                  imageUrl,
+                                  width: 72,
+                                  height: 72,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, error, stackTrace) =>
+                                      Container(
+                                        color: theme
+                                            .colorScheme
+                                            .surfaceContainerHighest,
+                                        alignment: Alignment.center,
+                                        child: const Icon(Icons.photo_outlined),
+                                      ),
+                                )
+                              : Container(
+                                  color:
+                                      theme.colorScheme.surfaceContainerHighest,
+                                  alignment: Alignment.center,
+                                  child: const Icon(Icons.photo_outlined),
+                                ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              productTitle,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '$workerName просит удалить · ID $productLabel',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            if (reason.isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                reason,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ],
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                FilledButton.icon(
+                                  onPressed: busy
+                                      ? null
+                                      : () => _decideRevisionDeleteRequest(
+                                          request,
+                                          true,
+                                        ),
+                                  icon: busy
+                                      ? const SizedBox(
+                                          width: 16,
+                                          height: 16,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                          ),
+                                        )
+                                      : const Icon(Icons.check_rounded),
+                                  label: const Text('Разрешить'),
+                                ),
+                                OutlinedButton.icon(
+                                  onPressed: busy
+                                      ? null
+                                      : () => _decideRevisionDeleteRequest(
+                                          request,
+                                          false,
+                                        ),
+                                  icon: const Icon(Icons.close_rounded),
+                                  label: const Text('Отклонить'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildModerationTab() {
     final theme = Theme.of(context);
     final compact = MediaQuery.of(context).size.width < 640;
@@ -8505,7 +9692,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         ? 'Идёт публикация: ${_toInt(_publishingSummary?['published_count'])}/${_toInt(_publishingSummary?['total_count'])}'
         : null;
     return RefreshIndicator(
-      onRefresh: _loadPendingPosts,
+      onRefresh: () async {
+        await Future.wait([
+          _loadTenantFeatureSettings(silent: true),
+          _loadPendingPosts(),
+          _loadRevisionDeleteRequests(silent: true),
+        ]);
+      },
       child: ListView(
         padding: EdgeInsets.all(compact ? 10 : 16),
         children: [
@@ -8670,6 +9863,72 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               ),
             ),
           ],
+          if (_tenantCustomWorkflowsEnabled) ...[
+            SizedBox(height: compact ? 10 : 14),
+            Card(
+              child: Padding(
+                padding: EdgeInsets.all(compact ? 12 : 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Интервал публикации',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Пауза между постами в Основной канал для этой группы.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _publicationIntervalCtrl,
+                            keyboardType: const TextInputType.numberWithOptions(
+                              decimal: true,
+                            ),
+                            decoration: const InputDecoration(
+                              labelText: 'Секунд между постами',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        FilledButton.icon(
+                          onPressed: _tenantFeatureSettingsSaving
+                              ? null
+                              : _savePublicationIntervalSetting,
+                          icon: _tenantFeatureSettingsSaving
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.save_outlined),
+                          label: const Text('Сохранить'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+          if (_revisionDeleteRequestsLoading ||
+              _revisionDeleteRequests.any(
+                (item) => (item['status'] ?? '').toString().trim() == 'pending',
+              )) ...[
+            SizedBox(height: compact ? 10 : 14),
+            _buildRevisionDeleteRequestsSection(),
+          ],
           SizedBox(height: compact ? 10 : 14),
           SizedBox(
             width: double.infinity,
@@ -8739,7 +9998,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               final productLabel = _formatProductLabel(
                 p['product_code'],
                 p['product_shelf_number'],
+                manualShelfLabel: p['manual_shelf_label'],
               );
+              final manualShelfLabel = (p['manual_shelf_label'] ?? '')
+                  .toString()
+                  .trim();
+              final shelfFloor = (p['shelf_floor'] ?? '').toString().trim();
+              final pickupOnly = _boolValue(p['pickup_only']);
               final imageUrl = _resolveImageUrl(
                 (p['product_image_url'] ?? '').toString(),
               );
@@ -8816,6 +10081,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                 runSpacing: 6,
                                 children: [
                                   _buildModerationChip('ID $productLabel'),
+                                  if (manualShelfLabel.isNotEmpty)
+                                    _buildModerationChip(
+                                      'Полка: $manualShelfLabel',
+                                    ),
+                                  if (shelfFloor.isNotEmpty)
+                                    _buildModerationChip('Этаж: $shelfFloor'),
+                                  if (pickupOnly)
+                                    _buildModerationChip('Самовывоз'),
                                   Container(
                                     padding: const EdgeInsets.symmetric(
                                       horizontal: 10,
@@ -9172,6 +10445,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final notificationsSummary = _asMap(_supportNotificationSummary);
     final returnsSummary = _asMap(_returnsAnalytics?['summary']);
     final returnsTopProducts = _asMapList(_returnsAnalytics?['top_products']);
+    final defectStatsEnabled = _boolValue(_defectStats?['enabled']);
+    final defectStatsData = _asMap(_defectStats?['data']);
+    final defectStatsCounts = _asMap(defectStatsData['counts']);
+    final defectStatsItems = _asMapList(defectStatsData['items']);
     final canForceCloseSupport = _canForceCloseSupportTicket();
     final canManageSupportKnowledgeBase = _canManageSupportKnowledgeBase();
 
@@ -9183,6 +10460,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         await _loadReturnsWorkflow(silent: true);
         await _loadSupportNotificationCenter(silent: true);
         await _loadReturnsAnalytics(silent: true);
+        await _loadDefectStats(silent: true);
       },
       child: ListView(
         padding: const EdgeInsets.all(16),
@@ -9207,6 +10485,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                         await _loadReturnsWorkflow(silent: true);
                         await _loadSupportNotificationCenter(silent: true);
                         await _loadReturnsAnalytics(silent: true);
+                        await _loadDefectStats(silent: true);
                       },
                 icon: const Icon(Icons.refresh),
                 tooltip: 'Обновить',
@@ -9518,6 +10797,146 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               ),
             ),
           ),
+          if (defectStatsEnabled) ...[
+            const SizedBox(height: 12),
+            Text(
+              'Статистика брака группы',
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            if (_defectStatsLoading && _defectStats == null)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: LinearProgressIndicator(minHeight: 2),
+              ),
+            const SizedBox(height: 8),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _buildModerationChip(
+                          'Неделя: ${_toInt(defectStatsCounts['week'])}',
+                        ),
+                        _buildModerationChip(
+                          '2 недели: ${_toInt(defectStatsCounts['two_weeks'])}',
+                        ),
+                        _buildModerationChip(
+                          'Месяц: ${_toInt(defectStatsCounts['month'])}',
+                        ),
+                        _buildModerationChip(
+                          'Всего: ${_toInt(defectStatsCounts['total'])}',
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    if (defectStatsItems.isEmpty)
+                      Text(
+                        'Список брака пока пуст',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      )
+                    else
+                      ...defectStatsItems.take(12).map((item) {
+                        final title = (item['title'] ?? 'Товар').toString();
+                        final reason = (item['reason'] ?? 'Причина не указана')
+                            .toString();
+                        final uploader =
+                            (item['uploaded_by_name'] ??
+                                    item['uploaded_by_email'] ??
+                                    'Неизвестно')
+                                .toString();
+                        final sourceLabel = (item['source_label'] ?? 'Брак')
+                            .toString();
+                        final createdAt = _formatDateTimeLabel(
+                          item['created_at'],
+                        );
+                        final imageUrl = _resolveImageUrl(
+                          (item['image_url'] ?? '').toString(),
+                        );
+
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: SizedBox(
+                                  width: 58,
+                                  height: 58,
+                                  child: imageUrl == null
+                                      ? Container(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.surfaceContainerHighest,
+                                          child: Icon(
+                                            Icons.image_not_supported_outlined,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.onSurfaceVariant,
+                                          ),
+                                        )
+                                      : AdaptiveNetworkImage(
+                                          imageUrl,
+                                          fit: BoxFit.cover,
+                                        ),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      'Причина: $reason',
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      [
+                                        'Выложил: $uploader',
+                                        sourceLabel,
+                                        if (createdAt.isNotEmpty) createdAt,
+                                      ].join(' • '),
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.onSurfaceVariant,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Card(
             child: Padding(
@@ -10435,7 +11854,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
     return RefreshIndicator(
       onRefresh: () async {
-        if (_clientCartUndoPending) return;
         if (_clientCartSearchCtrl.text.trim().isNotEmpty) {
           await _searchClientCartsByPhone();
         }
@@ -10472,7 +11890,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             runSpacing: 8,
             children: [
               FilledButton.icon(
-                onPressed: _clientCartSearchLoading || _clientCartUndoPending
+                onPressed: _clientCartSearchLoading
                     ? null
                     : _searchClientCartsByPhone,
                 icon: _clientCartSearchLoading
@@ -10489,7 +11907,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               ),
               if (selectedUserId.isNotEmpty)
                 OutlinedButton.icon(
-                  onPressed: _clientCartLoading || _clientCartUndoPending
+                  onPressed: _clientCartLoading
                       ? null
                       : () => _loadSelectedClientCart(selectedUserId),
                   icon: const Icon(Icons.refresh),
@@ -10535,7 +11953,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   trailing: user['is_active'] == false
                       ? const Icon(Icons.block, color: Colors.red)
                       : const Icon(Icons.chevron_right),
-                  onTap: userId.isEmpty || _clientCartUndoPending
+                  onTap: userId.isEmpty
                       ? null
                       : () => _loadSelectedClientCart(userId),
                 ),
@@ -10586,7 +12004,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                       Padding(
                         padding: const EdgeInsets.only(top: 6),
                         child: Text(
-                          'Есть отложенное действие (10 сек). Можно отменить через кнопку "Отменить" внизу экрана.',
+                          'Есть отложенное действие (2 сек). Можно отменить через кнопку "Отменить" внизу экрана. Переход по другим клиентам не блокируется.',
                           style: TextStyle(
                             color: Theme.of(context).colorScheme.primary,
                             fontWeight: FontWeight.w600,
@@ -10763,10 +12181,19 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   Widget _buildFinanceTab() {
     final summary = _asMap(_financeData?['summary']);
     final byDay = _asMapList(_financeData?['by_day']);
+    final visibleByDay = byDay
+        .where(
+          (row) =>
+              _toDouble(row['revenue']) > 0 ||
+              _toDouble(row['profit']) != 0 ||
+              _toDouble(row['cost']) > 0,
+        )
+        .toList();
     final periodLabels = {
       'day': 'День',
       'week': 'Неделя',
       'month': 'Месяц',
+      'last_month': 'Прошлый месяц',
       'all': 'Все время',
     };
     return RefreshIndicator(
@@ -10852,21 +12279,21 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ),
           const SizedBox(height: 16),
           Text(
-            'Динамика по дням (последние 30 дней)',
+            'Динамика по дням',
             style: Theme.of(
               context,
             ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 8),
-          if (byDay.isEmpty)
+          if (visibleByDay.isEmpty)
             const Card(
               child: Padding(
                 padding: EdgeInsets.all(12),
-                child: Text('Нет данных для выбранного периода'),
+                child: Text('Нет данных за выбранный период'),
               ),
             )
           else
-            ...byDay.reversed.take(14).map((row) {
+            ...visibleByDay.reversed.take(14).map((row) {
               return Card(
                 child: ListTile(
                   dense: true,
@@ -10890,15 +12317,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final rolesTemplates = _asMapList(_rolesDraft?['templates']);
     final roleModules = _asMapList(_rolesDraft?['modules']);
     final returnItems = _returnsWorkflow.take(20).toList();
-    final diagnostics = _asMap(_diagnosticsData);
-    final monitoring = _asMap(diagnostics['monitoring']);
     final smartNotify = _asMap(_smartNotifySettings);
     final canManageRoleTemplates =
         _isCreatorBase() || _hasPermission('tenant.users.manage');
     return RefreshIndicator(
       onRefresh: () async {
         await _loadControlCenter();
-        await _loadDiagnostics();
         await _loadSmartNotificationSettings();
       },
       child: ListView(
@@ -10919,7 +12343,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     ? null
                     : () async {
                         await _loadControlCenter();
-                        await _loadDiagnostics();
                       },
                 icon: const Icon(Icons.refresh),
               ),
@@ -11534,38 +12957,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Центр диагностики создателя',
-                      style: TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                    const SizedBox(height: 8),
-                    if (_diagnosticsLoading)
-                      const LinearProgressIndicator()
-                    else ...[
-                      Text(
-                        'API uptime: ${_toInt(_asMap(diagnostics['api'])['uptime_sec'])} сек',
-                      ),
-                      Text(
-                        'DB latency: ${_toInt(_asMap(diagnostics['database'])['latency_ms'])} ms',
-                      ),
-                      Text(
-                        'Socket clients: ${_toInt(_asMap(diagnostics['socket'])['connected_clients'])}',
-                      ),
-                      Text(
-                        'Monitoring: критичные ${_toInt(monitoring['critical'])}, ошибки ${_toInt(monitoring['error'])}',
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
                 child: Row(
                   children: [
                     const Expanded(
@@ -11586,6 +12977,272 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ],
           const SizedBox(height: 24),
         ],
+      ),
+    );
+  }
+
+  String _deliveryCallStatusLabel(Map<String, dynamic> customer) {
+    final callStatus = (customer['call_status'] ?? '').toString().trim();
+    final deliveryStatus = (customer['delivery_status'] ?? '')
+        .toString()
+        .trim();
+    if (callStatus == 'accepted') return 'Согласился';
+    if (callStatus == 'declined') return 'Отказался';
+    if (callStatus == 'removed' || deliveryStatus == 'returned_to_cart') {
+      return 'Убрали из маршрута';
+    }
+    if (callStatus == 'pending') {
+      if (deliveryStatus == 'offer_sent') {
+        return 'Нужно звонить вручную, если не ответит';
+      }
+      return 'Нужно звонить вручную';
+    }
+    return callStatus.isEmpty ? '—' : callStatus;
+  }
+
+  Widget _buildDeliveryEligiblePreviewCard() {
+    final preview = _deliveryEligiblePreview;
+    if (preview == null) return const SizedBox.shrink();
+    final customers = _asMapList(preview['customers']);
+    final eligibleCount = _toInt(preview['eligible_count']);
+    final belowCount = _toInt(preview['below_threshold_count']);
+    final threshold = _formatMoney(preview['threshold_amount']);
+    final eligibleSum = _formatMoney(preview['eligible_sum']);
+    final theme = Theme.of(context);
+    const pageSize = 10;
+    final totalPages = customers.isEmpty
+        ? 1
+        : ((customers.length + pageSize - 1) ~/ pageSize);
+    final currentPage = _deliveryEligiblePreviewPage
+        .clamp(0, totalPages - 1)
+        .toInt();
+    final startIndex = currentPage * pageSize;
+    final endIndex = math.min(startIndex + pageSize, customers.length);
+    final pageCustomers = customers.skip(startIndex).take(pageSize).toList();
+
+    Widget compactCell(
+      String text, {
+      required double width,
+      FontWeight? weight,
+      TextAlign align = TextAlign.left,
+      Color? color,
+    }) {
+      return SizedBox(
+        width: width,
+        child: Text(
+          text,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: align,
+          style: TextStyle(fontWeight: weight, color: color),
+        ),
+      );
+    }
+
+    Widget compactRow(
+      Map<String, dynamic> customer,
+      int index, {
+      required bool isOdd,
+    }) {
+      final name = (customer['customer_name'] ?? 'Клиент').toString();
+      final phone = _displayPhone(
+        (customer['customer_phone'] ?? '').toString(),
+      );
+      final sum = _formatMoney(customer['processed_sum']);
+      final city = _normalizeDeliveryCityName(customer['client_city']);
+      final cityThreshold = _formatMoney(
+        customer['delivery_threshold_amount'] ?? preview['threshold_amount'],
+      );
+      final shelf = _displayShelfValue(
+        customer['shelf_label'],
+        customer['shelf_number'],
+      );
+      final itemsCount = _toInt(customer['processed_items_count']);
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: isOdd
+              ? theme.colorScheme.surfaceContainerHighest.withValues(
+                  alpha: 0.35,
+                )
+              : Colors.transparent,
+          border: Border(
+            bottom: BorderSide(color: theme.colorScheme.outlineVariant),
+          ),
+        ),
+        child: Row(
+          children: [
+            compactCell(
+              '${startIndex + index + 1}',
+              width: 34,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            compactCell(name, width: 160, weight: FontWeight.w700),
+            compactCell(phone, width: 135),
+            compactCell(sum, width: 105, align: TextAlign.right),
+            const SizedBox(width: 14),
+            compactCell(city.isEmpty ? '—' : city, width: 120),
+            compactCell(cityThreshold, width: 105, align: TextAlign.right),
+            const SizedBox(width: 14),
+            compactCell(shelf, width: 115),
+            compactCell('$itemsCount шт.', width: 72, align: TextAlign.right),
+          ],
+        ),
+      );
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.delivery_dining_outlined),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Готовы к рассылке',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Порог: $threshold • подходят: $eligibleCount • сумма: $eligibleSum',
+            ),
+            if (belowCount > 0)
+              Text(
+                'Еще $belowCount клиентов пока ниже порога и не попадут в рассылку.',
+                style: theme.textTheme.bodySmall,
+              ),
+            const SizedBox(height: 12),
+            if (customers.isEmpty)
+              const Text(
+                'Пока нет клиентов, которые набрали сумму выше порога доставки.',
+              )
+            else ...[
+              Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minWidth: 900),
+                    child: Column(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
+                          color: theme.colorScheme.surfaceContainerHighest,
+                          child: Row(
+                            children: [
+                              compactCell(
+                                '#',
+                                width: 34,
+                                weight: FontWeight.w800,
+                              ),
+                              compactCell(
+                                'Клиент',
+                                width: 160,
+                                weight: FontWeight.w800,
+                              ),
+                              compactCell(
+                                'Телефон',
+                                width: 135,
+                                weight: FontWeight.w800,
+                              ),
+                              compactCell(
+                                'Сумма',
+                                width: 105,
+                                weight: FontWeight.w800,
+                                align: TextAlign.right,
+                              ),
+                              const SizedBox(width: 14),
+                              compactCell(
+                                'Город',
+                                width: 120,
+                                weight: FontWeight.w800,
+                              ),
+                              compactCell(
+                                'Порог',
+                                width: 105,
+                                weight: FontWeight.w800,
+                                align: TextAlign.right,
+                              ),
+                              const SizedBox(width: 14),
+                              compactCell(
+                                'Полка',
+                                width: 115,
+                                weight: FontWeight.w800,
+                              ),
+                              compactCell(
+                                'Товар',
+                                width: 72,
+                                weight: FontWeight.w800,
+                                align: TextAlign.right,
+                              ),
+                            ],
+                          ),
+                        ),
+                        ...pageCustomers.asMap().entries.map(
+                          (entry) => compactRow(
+                            entry.value,
+                            entry.key,
+                            isOdd: entry.key.isOdd,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              if (customers.length > pageSize) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Показаны ${startIndex + 1}-$endIndex из ${customers.length}',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Предыдущая страница',
+                      onPressed: currentPage <= 0
+                          ? null
+                          : () => setState(
+                              () => _deliveryEligiblePreviewPage =
+                                  currentPage - 1,
+                            ),
+                      icon: const Icon(Icons.chevron_left),
+                    ),
+                    Text('${currentPage + 1}/$totalPages'),
+                    IconButton(
+                      tooltip: 'Следующая страница',
+                      onPressed: currentPage >= totalPages - 1
+                          ? null
+                          : () => setState(
+                              () => _deliveryEligiblePreviewPage =
+                                  currentPage + 1,
+                            ),
+                      icon: const Icon(Icons.chevron_right),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -11628,6 +13285,19 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
     final callStatus = (customer['call_status'] ?? '').toString().trim();
     final canManualDecide = callStatus == 'pending';
+    final assemblyStatus = (customer['assembly_status'] ?? 'not_started')
+        .toString()
+        .trim();
+    final canStartAssembly =
+        callStatus == 'accepted' && assemblyStatus == 'not_started';
+    final canEditAssembly =
+        callStatus == 'accepted' && assemblyStatus != 'not_started';
+    final canCompleteAssembly =
+        callStatus == 'accepted' &&
+        assemblyStatus != 'not_started' &&
+        assemblyStatus != 'assembled';
+    final normalStickers = _toInt(customer['normal_stickers_requested']);
+    final bulkyStickers = _toInt(customer['bulky_stickers_requested']);
     final batchStatus = (_deliveryActiveBatch?['status'] ?? '')
         .toString()
         .trim();
@@ -11653,17 +13323,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             Text('Сумма в доставке: $sum'),
             Text('Полка: $shelf'),
             Text('Статус доставки: $status'),
-            Text(
-              'Ответ в личке: ${callStatus == 'accepted'
-                  ? 'Согласен'
-                  : callStatus == 'declined'
-                  ? 'Отказался'
-                  : callStatus == 'removed'
-                  ? 'Убрали из маршрута'
-                  : callStatus == 'pending'
-                  ? 'Ожидаем ответ'
-                  : '—'}',
-            ),
+            Text('Ответ после рассылки: ${_deliveryCallStatusLabel(customer)}'),
+            if (callStatus == 'accepted') ...[
+              Text('Сборка: ${_deliveryAssemblyStatusLabel(assemblyStatus)}'),
+              Text(
+                'Стикеры: обычных $normalStickers · габаритных $bulkyStickers',
+              ),
+            ],
             if (address.isNotEmpty) Text('Адрес: $address'),
             if (preferredAfter.isNotEmpty || preferredBefore.isNotEmpty)
               Text(
@@ -11690,6 +13356,26 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
               ),
+              const SizedBox(height: 6),
+              ...items.take(6).map((item) {
+                final itemTitle = (item['product_title'] ?? 'Товар')
+                    .toString()
+                    .trim();
+                final itemStatus = (item['assembly_status'] ?? 'pending')
+                    .toString()
+                    .trim();
+                final flags = <String>[
+                  if (item['is_bulky'] == true) 'габарит',
+                  if (itemStatus == 'removed') 'убран',
+                ];
+                return Text(
+                  '• $itemTitle · ${_formatMoney(item['line_total'])}'
+                  '${flags.isNotEmpty ? ' · ${flags.join(', ')}' : ''}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                );
+              }),
+              if (items.length > 6) Text('Ещё товаров: ${items.length - 6}'),
             ],
             if (_canPrintDeliverySticker) ...[
               const SizedBox(height: 12),
@@ -11701,6 +13387,36 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     onPressed: () => _printDeliveryCustomerSticker(customer),
                     icon: const Icon(Icons.print_outlined),
                     label: const Text('Распечатать стикер'),
+                  ),
+                ],
+              ),
+            ],
+            if (callStatus == 'accepted') ...[
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _deliverySaving || !canStartAssembly
+                        ? null
+                        : () => _startDeliveryAssembly(batchId, customer),
+                    icon: const Icon(Icons.playlist_add_check_circle_outlined),
+                    label: const Text('Начать сборку'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving || !canEditAssembly
+                        ? null
+                        : () => _editDeliveryAssembly(batchId, customer),
+                    icon: const Icon(Icons.inventory_2_outlined),
+                    label: const Text('Сборка товаров'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving || !canCompleteAssembly
+                        ? null
+                        : () => _completeDeliveryAssembly(batchId, customer),
+                    icon: const Icon(Icons.task_alt_outlined),
+                    label: const Text('Собрано'),
                   ),
                 ],
               ),
@@ -11766,13 +13482,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 spacing: 8,
                 runSpacing: 8,
                 children: [
-                  OutlinedButton.icon(
-                    onPressed: _deliverySaving
-                        ? null
-                        : () => _editDeliveryLogistics(batchId, customer),
-                    icon: const Icon(Icons.inventory_2_outlined),
-                    label: const Text('Логистика'),
-                  ),
+                  if (callStatus != 'accepted')
+                    OutlinedButton.icon(
+                      onPressed: _deliverySaving
+                          ? null
+                          : () => _editDeliveryLogistics(batchId, customer),
+                      icon: const Icon(Icons.inventory_2_outlined),
+                      label: const Text('Логистика'),
+                    ),
                   OutlinedButton.icon(
                     onPressed: _deliverySaving
                         ? null
@@ -11800,9 +13517,117 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     );
   }
 
+  Widget _buildDeliveryCityRatesCard() {
+    final theme = Theme.of(context);
+    final canEditPricing = _canEditDeliveryPricing();
+    final defaultThreshold = _formatMoney(
+      _toDouble(_deliveryThresholdCtrl.text, fallback: 1500),
+    );
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Пороги доставки по городам',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _deliverySaving || !canEditPricing
+                      ? null
+                      : () => _editDeliveryCityRate(),
+                  icon: const Icon(Icons.add_location_alt_outlined),
+                  label: const Text('Добавить город'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              canEditPricing
+                  ? 'Если город не указан здесь, используется общий порог: $defaultThreshold.'
+                  : 'Пороги меняет создатель или арендатор. Если город не указан, используется общий порог: $defaultThreshold.',
+              style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            if (_deliveryCityRates.isEmpty)
+              const Text('Отдельных городских порогов пока нет.')
+            else
+              ..._deliveryCityRates.map((rate) {
+                final city = _normalizeDeliveryCityName(rate['city']);
+                final threshold = _formatMoney(rate['threshold_amount']);
+                final active = rate['is_active'] != false;
+                return Card(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(
+                      active
+                          ? Icons.location_city_outlined
+                          : Icons.location_disabled_outlined,
+                    ),
+                    title: Text(city.isEmpty ? 'Город без названия' : city),
+                    subtitle: Text('Порог: $threshold'),
+                    trailing: Wrap(
+                      spacing: 4,
+                      children: [
+                        IconButton(
+                          tooltip: 'Изменить',
+                          onPressed: _deliverySaving || !canEditPricing
+                              ? null
+                              : () => _editDeliveryCityRate(rate),
+                          icon: const Icon(Icons.edit_outlined),
+                        ),
+                        IconButton(
+                          tooltip: 'Удалить',
+                          onPressed: _deliverySaving || !canEditPricing
+                              ? null
+                              : () => _removeDeliveryCityRate(rate),
+                          icon: const Icon(Icons.delete_outline),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildDeliveryTab() {
     final activeBatch = _deliveryActiveBatch;
     final customers = _asMapList(activeBatch?['customers']);
+    final acceptedCount = customers
+        .where(
+          (customer) =>
+              (customer['call_status'] ?? '').toString() == 'accepted',
+        )
+        .length;
+    final declinedCount = customers
+        .where(
+          (customer) =>
+              (customer['call_status'] ?? '').toString() == 'declined',
+        )
+        .length;
+    final manualCallCount = customers
+        .where(
+          (customer) => (customer['call_status'] ?? '').toString() == 'pending',
+        )
+        .length;
+    final canEditPricing = _canEditDeliveryPricing();
+    final assembledAcceptedCount = customers
+        .where(
+          (customer) =>
+              (customer['call_status'] ?? '').toString() == 'accepted' &&
+              (customer['assembly_status'] ?? '').toString() == 'assembled',
+        )
+        .length;
 
     return RefreshIndicator(
       onRefresh: _loadDeliveryDashboard,
@@ -11811,16 +13636,21 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         children: [
           TextField(
             controller: _deliveryThresholdCtrl,
+            enabled: canEditPricing,
             keyboardType: TextInputType.number,
             decoration: withInputLanguageBadge(
-              const InputDecoration(
+              InputDecoration(
                 labelText: 'Сумма для попадания в доставку',
                 border: OutlineInputBorder(),
-                helperText: 'Сумма в ₽',
+                helperText: canEditPricing
+                    ? 'Сумма в ₽'
+                    : 'Порог может менять только создатель или арендатор',
               ),
               controller: _deliveryThresholdCtrl,
             ),
           ),
+          const SizedBox(height: 12),
+          _buildDeliveryCityRatesCard(),
           const SizedBox(height: 12),
           TextField(
             controller: _deliveryOriginCtrl,
@@ -11829,7 +13659,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             decoration: withInputLanguageBadge(
               const InputDecoration(
                 labelText: 'Точка отправки курьеров',
-                hintText: 'Самара, адрес склада или точки старта',
+                hintText: 'Город, адрес склада или точки старта',
                 border: OutlineInputBorder(),
                 helperText: 'Отсюда начинается маршрут каждого курьера',
               ),
@@ -11838,87 +13668,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ),
           const SizedBox(height: 12),
           _buildDeliveryManualPhonesCard(),
-          const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Expanded(
-                        child: Text(
-                          'Зоны доставки',
-                          style: TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: _deliverySaving
-                            ? null
-                            : () => _editDeliveryZone(),
-                        icon: const Icon(Icons.add_location_alt_outlined),
-                        label: const Text('Добавить зону'),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Адрес клиента будет проверяться по этим зонам до сохранения.',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  const SizedBox(height: 12),
-                  if (_deliveryZones.isEmpty)
-                    const Text(
-                      'Зоны пока не заданы. Пока что адреса будут сохраняться без проверки зоны.',
-                    )
-                  else
-                    ..._deliveryZones.map((zone) {
-                      final center = zone['center'] is Map
-                          ? Map<String, dynamic>.from(zone['center'])
-                          : <String, dynamic>{};
-                      final lat = _toNullableDouble(center['lat']);
-                      final lng = _toNullableDouble(center['lng']);
-                      return Card(
-                        margin: const EdgeInsets.only(bottom: 8),
-                        child: ListTile(
-                          leading: Icon(
-                            zone['is_active'] == false
-                                ? Icons.location_off_outlined
-                                : Icons.location_on_outlined,
-                          ),
-                          title: Text((zone['title'] ?? 'Зона').toString()),
-                          subtitle: Text(
-                            'Радиус: ${(zone['radius_meters'] ?? 0).toString()} м'
-                            '${lat != null && lng != null ? '\nЦентр: ${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}' : ''}',
-                          ),
-                          isThreeLine: lat != null && lng != null,
-                          trailing: Wrap(
-                            spacing: 4,
-                            children: [
-                              IconButton(
-                                tooltip: 'Изменить',
-                                onPressed: _deliverySaving
-                                    ? null
-                                    : () => _editDeliveryZone(zone),
-                                icon: const Icon(Icons.edit_outlined),
-                              ),
-                              IconButton(
-                                tooltip: 'Удалить',
-                                onPressed: _deliverySaving
-                                    ? null
-                                    : () => _removeDeliveryZone(zone),
-                                icon: const Icon(Icons.delete_outline),
-                              ),
-                            ],
-                          ),
-                        ),
-                      );
-                    }),
-                ],
-              ),
-            ),
-          ),
           const SizedBox(height: 12),
           Card(
             child: Padding(
@@ -11950,7 +13699,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   onPressed: _deliverySaving ? null : _saveDeliverySettings,
                   icon: const Icon(Icons.save_outlined),
                   label: Text(
-                    _deliverySaving ? 'Сохранение...' : 'Сохранить порог',
+                    _deliverySaving ? 'Сохранение...' : 'Сохранить настройки',
                   ),
                 ),
               ),
@@ -11965,14 +13714,22 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             ],
           ),
           const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerRight,
-            child: TextButton.icon(
-              onPressed: _deliverySaving ? null : _resetDeliveryTesting,
-              icon: const Icon(Icons.delete_sweep_outlined),
-              label: const Text('Очистить доставку'),
-            ),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              TextButton.icon(
+                onPressed: _deliverySaving ? null : _resetDeliveryTesting,
+                icon: const Icon(Icons.delete_sweep_outlined),
+                label: const Text('Очистить доставку'),
+              ),
+            ],
           ),
+          if (_deliveryEligiblePreview != null) ...[
+            const SizedBox(height: 12),
+            _buildDeliveryEligiblePreviewCard(),
+          ],
           const SizedBox(height: 16),
           SegmentedButton<String>(
             segments: const [
@@ -12036,7 +13793,16 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     Text(
                       'Клиентов: ${activeBatch['customers_total'] ?? customers.length}',
                     ),
-                    Text('Подтвердили: ${activeBatch['accepted_total'] ?? 0}'),
+                    Text(
+                      'Согласились: ${activeBatch['accepted_total'] ?? acceptedCount}',
+                    ),
+                    Text(
+                      'Собрано корзин: $assembledAcceptedCount/$acceptedCount',
+                    ),
+                    Text(
+                      'Отказались: ${activeBatch['declined_total'] ?? declinedCount}',
+                    ),
+                    Text('Нужно звонить вручную: $manualCallCount'),
                     if (((activeBatch['route_origin_address'] ?? '')
                             .toString()
                             .trim())
@@ -12063,7 +13829,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                       runSpacing: 8,
                       children: [
                         FilledButton.icon(
-                          onPressed: _deliverySaving
+                          onPressed:
+                              _deliverySaving ||
+                                  (acceptedCount > 0 &&
+                                      assembledAcceptedCount < acceptedCount)
                               ? null
                               : () => _assignCouriers(
                                   (activeBatch['id'] ?? '').toString(),
