@@ -90,7 +90,7 @@ async function upsertQueuedPushDelivery({
      VALUES (
        $1, $2, $3, 'push', $4, $5, $6, 'push', 'queued', NULL, $7::jsonb, 0, now(), now()
      )
-     ON CONFLICT (inbox_item_id, endpoint_id, channel)
+     ON CONFLICT (inbox_item_id, endpoint_id, channel) WHERE endpoint_id IS NOT NULL
      DO UPDATE
        SET provider = EXCLUDED.provider,
            transport = EXCLUDED.transport,

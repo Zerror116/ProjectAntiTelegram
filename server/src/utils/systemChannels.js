@@ -583,6 +583,24 @@ async function findDiscussionsChat(client, tenantId = null) {
   );
 }
 
+async function findPlatformDiscussionsChat(client) {
+  return client.query(
+    `SELECT id, title, type, created_by, settings, created_at, updated_at
+     FROM chats
+     WHERE type = 'private'
+       AND tenant_id IS NULL
+       AND (
+         COALESCE(settings->>'system_key', '') = 'platform_discussions'
+         OR COALESCE(settings->>'kind', '') = 'platform_discussions'
+       )
+     ORDER BY
+       CASE WHEN COALESCE(settings->>'system_key', '') = 'platform_discussions' THEN 0 ELSE 1 END,
+       updated_at DESC NULLS LAST,
+       created_at DESC
+     LIMIT 1`,
+  );
+}
+
 async function ensureDiscussionBaseMembers(client, chatId, tenantId, createdBy = null) {
   const memberQ = await client.query(
     `SELECT id, role
@@ -617,6 +635,296 @@ async function ensureDiscussionBaseMembers(client, chatId, tenantId, createdBy =
       [uuidv4(), chatId, row.id, memberRole],
     );
   }
+}
+
+function normalizeDiscussionUserRole(rawRole) {
+  const role = String(rawRole || "client").toLowerCase().trim();
+  return ["client", "worker", "admin", "tenant", "creator"].includes(role)
+    ? role
+    : "client";
+}
+
+function normalizeDiscussionEmail(rawEmail) {
+  return String(rawEmail || "").trim().toLowerCase();
+}
+
+function fallbackDiscussionName(email, role = "client") {
+  const localPart = String(email || "").split("@")[0]?.trim();
+  if (localPart) return localPart;
+  return role === "tenant" ? "Арендатор" : "Пользователь";
+}
+
+function isPoolLikeQueryable(queryable) {
+  return (
+    queryable &&
+    typeof queryable.connect === "function" &&
+    typeof queryable.release !== "function"
+  );
+}
+
+async function prepareUnscopedPlatformClient(client) {
+  await client.query("SELECT set_config('app.tenant_id', '', false)");
+  await client.query("SELECT set_config('search_path', 'public', false)");
+}
+
+async function withUnscopedPlatformClient(queryable, fn) {
+  if (isPoolLikeQueryable(queryable)) {
+    const client = await queryable.connect();
+    try {
+      await prepareUnscopedPlatformClient(client);
+      return await fn(client);
+    } finally {
+      client.release();
+    }
+  }
+  await prepareUnscopedPlatformClient(queryable);
+  return await fn(queryable);
+}
+
+async function ensurePlatformDiscussionUserShadow(queryable, user = {}) {
+  if (isPoolLikeQueryable(queryable)) {
+    return withUnscopedPlatformClient(queryable, (client) =>
+      ensurePlatformDiscussionUserShadow(client, user),
+    );
+  }
+  const client = queryable;
+  await prepareUnscopedPlatformClient(client);
+
+  const userId = String(user?.id || user?.user_id || "").trim();
+  if (!userId) return null;
+
+  const email = normalizeDiscussionEmail(user?.email);
+  const role = normalizeDiscussionUserRole(user?.base_role || user?.role);
+  const name = String(user?.name || "").trim() || fallbackDiscussionName(email, role);
+  const tenantId = String(user?.tenant_id || "").trim() || null;
+
+  const existingQ = await client.query(
+    `SELECT id, email
+     FROM users
+     WHERE id = $1::uuid
+        OR ($2::text <> '' AND lower(email) = $2)
+     ORDER BY CASE WHEN id = $1::uuid THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [userId, email],
+  );
+  const existing = existingQ.rows[0] || null;
+  if (existing && String(existing.id) !== userId) {
+    // The global users.email unique index already belongs to another account.
+    // Do not guess identity mapping here; the creator can add the existing row.
+    return existing;
+  }
+
+  if (existing) {
+    const updateValues = [userId, role, name, tenantId];
+    const emailSet = email ? ", email = COALESCE(NULLIF($5, ''), email)" : "";
+    if (email) updateValues.push(email);
+    const updatedQ = await client.query(
+      `UPDATE users
+       SET role = CASE
+             WHEN role = 'creator' THEN 'creator'
+             ELSE $2
+           END,
+           name = COALESCE(NULLIF(BTRIM(name), ''), $3),
+           tenant_id = COALESCE(tenant_id, $4::uuid),
+           is_active = true,
+           updated_at = now()
+           ${emailSet}
+       WHERE id = $1::uuid
+       RETURNING id, email, role`,
+      updateValues,
+    );
+    return updatedQ.rows[0] || existing;
+  }
+
+  const insertedQ = await client.query(
+    `INSERT INTO users (
+       id,
+       email,
+       role,
+       name,
+       is_active,
+       tenant_id,
+       created_at,
+       updated_at
+     )
+     VALUES ($1::uuid, NULLIF($2, ''), $3, $4, true, $5::uuid, now(), now())
+     ON CONFLICT (id) DO UPDATE
+     SET role = CASE
+           WHEN users.role = 'creator' THEN 'creator'
+           ELSE EXCLUDED.role
+         END,
+         name = COALESCE(NULLIF(BTRIM(users.name), ''), EXCLUDED.name),
+         tenant_id = COALESCE(users.tenant_id, EXCLUDED.tenant_id),
+         is_active = true,
+         updated_at = now()
+     RETURNING id, email, role`,
+    [userId, email, role, name, tenantId],
+  );
+  return insertedQ.rows[0] || null;
+}
+
+async function syncPlatformDiscussionIndexedUsers(queryable, roles = null) {
+  if (isPoolLikeQueryable(queryable)) {
+    return withUnscopedPlatformClient(queryable, (client) =>
+      syncPlatformDiscussionIndexedUsers(client, roles),
+    );
+  }
+  const client = queryable;
+  await prepareUnscopedPlatformClient(client);
+
+  const normalizedRoles = Array.isArray(roles)
+    ? roles.map(normalizeDiscussionUserRole).filter(Boolean)
+    : null;
+  await client.query(
+    `INSERT INTO users (
+       id,
+       email,
+       role,
+       name,
+       is_active,
+       tenant_id,
+       created_at,
+       updated_at
+     )
+     SELECT tui.user_id,
+            lower(tui.email),
+            CASE
+              WHEN lower(tui.role) IN ('client', 'worker', 'admin', 'tenant', 'creator')
+                THEN lower(tui.role)
+              ELSE 'client'
+            END AS role,
+            COALESCE(NULLIF(split_part(lower(tui.email), '@', 1), ''), 'Пользователь') AS name,
+            COALESCE(tui.is_active, true),
+            tui.tenant_id,
+            COALESCE(tui.created_at, now()),
+            now()
+     FROM tenant_user_index tui
+     WHERE COALESCE(tui.is_active, true) = true
+       AND NULLIF(BTRIM(tui.email), '') IS NOT NULL
+       AND ($1::text[] IS NULL OR lower(tui.role) = ANY($1::text[]))
+       AND NOT EXISTS (
+         SELECT 1
+         FROM users existing
+         WHERE lower(existing.email) = lower(tui.email)
+           AND existing.id <> tui.user_id
+       )
+     ON CONFLICT (id) DO UPDATE
+     SET role = CASE
+           WHEN users.role = 'creator' THEN 'creator'
+           ELSE EXCLUDED.role
+         END,
+         email = COALESCE(NULLIF(users.email, ''), EXCLUDED.email),
+         name = COALESCE(NULLIF(BTRIM(users.name), ''), EXCLUDED.name),
+         tenant_id = COALESCE(users.tenant_id, EXCLUDED.tenant_id),
+         is_active = EXCLUDED.is_active,
+         updated_at = now()`,
+    [normalizedRoles && normalizedRoles.length > 0 ? normalizedRoles : null],
+  );
+}
+
+async function ensurePlatformDiscussionBaseMembers(client, chatId, createdBy = null) {
+  await prepareUnscopedPlatformClient(client);
+  await syncPlatformDiscussionIndexedUsers(client, ["tenant", "admin", "worker"]);
+
+  const memberQ = await client.query(
+    `WITH ranked_staff AS (
+       SELECT id,
+              role,
+              tenant_id,
+              row_number() OVER (
+                PARTITION BY tenant_id
+                ORDER BY
+                  CASE
+                    WHEN role = 'tenant' THEN 0
+                    WHEN role = 'admin' THEN 1
+                    WHEN role = 'worker' THEN 2
+                    ELSE 3
+                  END,
+                  created_at ASC,
+                  id ASC
+              ) AS tenant_rank
+       FROM users
+       WHERE is_active IS DISTINCT FROM false
+         AND (
+           role IN ('tenant', 'admin', 'worker', 'creator')
+           OR id = $1::uuid
+         )
+     )
+     SELECT id, role
+     FROM ranked_staff
+     WHERE role = 'creator'
+        OR id = $1::uuid
+        OR (tenant_id IS NOT NULL AND tenant_rank = 1)`,
+    [createdBy || null],
+  );
+
+  for (const row of memberQ.rows) {
+    const role = String(row.role || "").toLowerCase().trim();
+    const memberRole = role === "creator" ? "owner" : "member";
+    await client.query(
+      `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
+       VALUES ($1, $2, $3, now(), $4)
+       ON CONFLICT (chat_id, user_id)
+       DO UPDATE SET role = CASE
+         WHEN EXCLUDED.role = 'owner' THEN 'owner'
+         ELSE chat_members.role
+       END`,
+      [uuidv4(), chatId, row.id, memberRole],
+    );
+  }
+}
+
+async function ensurePlatformDiscussionsChat(queryable, createdBy = null) {
+  if (isPoolLikeQueryable(queryable)) {
+    return withUnscopedPlatformClient(queryable, (client) =>
+      ensurePlatformDiscussionsChat(client, createdBy),
+    );
+  }
+  const client = queryable;
+  await prepareUnscopedPlatformClient(client);
+
+  const discussionsQ = await findPlatformDiscussionsChat(client);
+  const baseSettings = {
+    kind: "discussions",
+    system_key: "platform_discussions",
+    tenant_id: null,
+    scope: "platform",
+    global_discussions: true,
+    visibility: "private",
+    admin_only: false,
+    worker_can_post: false,
+    is_post_channel: false,
+    creator_managed: true,
+    description:
+      "Общий закрытый чат для создателя, всех арендаторов и пользователей, которым создатель выдал доступ.",
+  };
+
+  if (discussionsQ.rowCount > 0) {
+    const current = discussionsQ.rows[0];
+    const currentSettings = normalizeSettings(current.settings);
+    const nextSettings = mergeJson(currentSettings, baseSettings);
+    const updated = await client.query(
+      `UPDATE chats
+       SET title = COALESCE(NULLIF(BTRIM(title), ''), 'Обсуждения'),
+           settings = $2::jsonb,
+           tenant_id = NULL,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, title, type, created_by, tenant_id, settings, created_at, updated_at`,
+      [current.id, JSON.stringify(nextSettings)],
+    );
+    await ensurePlatformDiscussionBaseMembers(client, updated.rows[0].id, createdBy);
+    return { chat: updated.rows[0], created: false };
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO chats (id, title, type, created_by, tenant_id, settings, created_at, updated_at)
+     VALUES ($1, 'Обсуждения', 'private', $2, NULL, $3::jsonb, now(), now())
+     RETURNING id, title, type, created_by, tenant_id, settings, created_at, updated_at`,
+    [uuidv4(), createdBy || null, JSON.stringify(baseSettings)],
+  );
+  await ensurePlatformDiscussionBaseMembers(client, inserted.rows[0].id, createdBy);
+  return { chat: inserted.rows[0], created: true };
 }
 
 async function ensureDiscussionsChat(client, createdBy, tenantId = null) {
@@ -773,7 +1081,6 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
   const reserved = await ensureReservedOrdersChannel(client, createdBy, tenantId);
   const postsArchive = await ensurePostsArchiveChannel(client, createdBy, tenantId);
   const adminSystem = await ensureAdminSystemChat(client, createdBy, tenantId);
-  const discussions = await ensureDiscussionsChat(client, createdBy, tenantId);
   await consolidateSystemDuplicates(
     client,
     tenantId,
@@ -797,13 +1104,13 @@ async function ensureSystemChannels(client, createdBy, tenantId = null) {
     reservedChannel: reserved.channel,
     postsArchiveChannel: postsArchive.channel,
     adminSystemChat: adminSystem.chat,
-    discussionsChat: discussions.chat,
+    discussionsChat: null,
     created: {
       main: main.created,
       reserved: reserved.created,
       posts_archive: postsArchive.created,
       admin_system: adminSystem.created,
-      discussions: discussions.created,
+      discussions: false,
     },
   };
 }
@@ -813,6 +1120,9 @@ module.exports = {
   ensureStaffMembers,
   ensureAdminSystemChat,
   ensureDiscussionsChat,
+  ensurePlatformDiscussionUserShadow,
+  syncPlatformDiscussionIndexedUsers,
+  ensurePlatformDiscussionsChat,
   insertAdminSystemMessage,
   normalizeSettings,
 };

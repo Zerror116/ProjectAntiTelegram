@@ -19,13 +19,13 @@
   const versionToken =
     scriptUrl?.searchParams.get("v") ||
     pageUrl?.searchParams.get("v") ||
-    Date.now().toString();
+    "";
   const encodedToken = encodeURIComponent(versionToken);
   const builds = Array.isArray(_flutter?.buildConfig?.builds)
     ? _flutter.buildConfig.builds
     : [];
   for (const build of builds) {
-    if (build && build.mainJsPath === "main.dart.js") {
+    if (encodedToken && build && build.mainJsPath === "main.dart.js") {
       build.mainJsPath = `main.dart.js?v=${encodedToken}`;
     }
   }

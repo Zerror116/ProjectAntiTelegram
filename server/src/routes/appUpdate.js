@@ -2,6 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 
+const db = require('../db');
 const { resolveAuthContextFromToken } = require('../utils/auth');
 const { createNotificationInboxItem } = require('../utils/notifications');
 const { signManifestPayload } = require('../utils/appUpdateManifest');
@@ -614,35 +615,41 @@ async function maybeCreateUpdateNotification(req, platformConfig, platform) {
       latest.version,
       latest.build,
     );
-    await createNotificationInboxItem({
-      user: context.user,
-      category: 'updates',
-      priority: platformConfig.required ? 'high' : 'low',
-      channel: 'mixed',
-      title:
-        cleanString(platformConfig.title) || 'Доступно обновление Феникс',
-      body:
-        cleanString(platformConfig.message) ||
-        `Доступна версия ${publicVersionLabel}.`,
-      deepLink: `/update?platform=${encodeURIComponent(platform)}&version=${encodeURIComponent(versionToken)}`,
-      payload: {
-        version: versionToken,
-        required_update: platformConfig.required === true,
-        platform,
-        download_url: cleanString(platformConfig.download_url),
-        manifest_url: cleanString(platformConfig.manifest_url),
-        cta_label: 'Открыть обновление',
-      },
-      dedupeKey: `update:${platform}:${versionToken}`,
-      collapseKey: `update:${platform}:${versionToken}`,
-      ttlSeconds: 60 * 60 * 24 * 3,
-      sourceType: 'app_update',
-      sourceId: `${platform}:${versionToken}`,
-      forceShow: false,
-      isActionable: true,
-      emit: true,
-      attemptPush: true,
-    });
+    const createUpdateNotification = () =>
+      createNotificationInboxItem({
+        user: context.user,
+        category: 'updates',
+        priority: platformConfig.required ? 'high' : 'low',
+        channel: 'mixed',
+        title:
+          cleanString(platformConfig.title) || 'Доступно обновление Феникс',
+        body:
+          cleanString(platformConfig.message) ||
+          `Доступна версия ${publicVersionLabel}.`,
+        deepLink: `/update?platform=${encodeURIComponent(platform)}&version=${encodeURIComponent(versionToken)}`,
+        payload: {
+          version: versionToken,
+          required_update: platformConfig.required === true,
+          platform,
+          download_url: cleanString(platformConfig.download_url),
+          manifest_url: cleanString(platformConfig.manifest_url),
+          cta_label: 'Открыть обновление',
+        },
+        dedupeKey: `update:${platform}:${versionToken}`,
+        collapseKey: `update:${platform}:${versionToken}`,
+        ttlSeconds: 60 * 60 * 24 * 3,
+        sourceType: 'app_update',
+        sourceId: `${platform}:${versionToken}`,
+        forceShow: false,
+        isActionable: true,
+        emit: true,
+        attemptPush: true,
+      });
+    if (context.tenantScope) {
+      await db.runWithTenantRow(context.tenantScope, createUpdateNotification);
+    } else {
+      await db.runWithPlatform(createUpdateNotification);
+    }
   } catch (err) {
     console.error('app.update.notification error', err);
   }

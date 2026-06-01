@@ -44,7 +44,11 @@ const {
 } = require("../utils/chatMediaPipeline");
 const { uploadsRoot, uploadsPath } = require("../utils/storagePaths");
 const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
-const { ensureDiscussionsChat } = require("../utils/systemChannels");
+const {
+  ensurePlatformDiscussionUserShadow,
+  ensurePlatformDiscussionsChat,
+  syncPlatformDiscussionIndexedUsers,
+} = require("../utils/systemChannels");
 const chatActivityStateService = require("../services/chatActivityState");
 
 const chatImageUploadsDir = uploadsPath("chat_media", "images");
@@ -717,8 +721,19 @@ function isDiscussionsChatRow(chat, settings) {
   return kind === "discussions" || systemKey === "discussions" || title === "обсуждения";
 }
 
+function isPlatformDiscussionsSettings(settings) {
+  const systemKey = String(settings?.system_key || "")
+    .toLowerCase()
+    .trim();
+  const scope = String(settings?.scope || "")
+    .toLowerCase()
+    .trim();
+  return systemKey === "platform_discussions" || settings?.global_discussions === true || scope === "platform";
+}
+
 function canManageDiscussionsChat(user) {
-  return String(user?.role || "").toLowerCase().trim() === "creator";
+  const role = String(user?.base_role || user?.role || "").toLowerCase().trim();
+  return role === "creator" || user?.is_platform_creator === true;
 }
 
 async function getChatAccessContext(chatId, userId, tenantId = null) {
@@ -726,7 +741,11 @@ async function getChatAccessContext(chatId, userId, tenantId = null) {
     `SELECT id, title, type, settings, tenant_id
      FROM chats
      WHERE id = $1
-       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       AND (
+         $2::uuid IS NULL
+         OR tenant_id = $2::uuid
+         OR COALESCE(settings->>'system_key', '') = 'platform_discussions'
+       )
      LIMIT 1`,
     [chatId, tenantId || null],
   );
@@ -2404,6 +2423,7 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
   if (io) {
     const payload = { chatId, message: broadcastMessage };
     let emittedToDirectMembers = false;
+    let isPlatformDiscussionsChat = false;
     try {
       const memberQ = await db.query(
         `SELECT c.type,
@@ -2424,7 +2444,11 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
       const isDirectMessage =
         String(firstRow.type || "").trim().toLowerCase() === "private" &&
         String(settings.kind || "").trim().toLowerCase() === "direct_message";
-      if (isDirectMessage && memberQ.rowCount > 0) {
+      const isPlatformDiscussions =
+        String(firstRow.type || "").trim().toLowerCase() === "private" &&
+        isPlatformDiscussionsSettings(settings);
+      isPlatformDiscussionsChat = isPlatformDiscussions;
+      if ((isDirectMessage || isPlatformDiscussions) && memberQ.rowCount > 0) {
         const emittedUserIds = new Set();
         for (const row of memberQ.rows) {
           const memberUserId = String(row.user_id || "").trim();
@@ -2440,7 +2464,11 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
     if (!emittedToDirectMembers) {
       io.to(`chat:${chatId}`).emit("chat:message", payload);
     }
-    emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+    if (isPlatformDiscussionsChat) {
+      io.to(`chat:${chatId}`).emit("chat:updated", { chatId });
+    } else {
+      emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+    }
   }
 
   return responseMessage;
@@ -3322,6 +3350,87 @@ async function getChatUnreadCount(chatId, userId) {
   return Number(result.rows[0]?.unread_count || 0);
 }
 
+async function loadPlatformDiscussionsChatForList(req) {
+  const userId = String(req.user?.id || "").trim();
+  const role = String(req.user?.base_role || req.user?.role || "")
+    .toLowerCase()
+    .trim();
+  if (!userId) return null;
+
+  if (role === "tenant" || role === "creator") {
+    await ensurePlatformDiscussionUserShadow(db.platformPool, req.user);
+    await ensurePlatformDiscussionsChat(db.platformPool, userId);
+  }
+
+  const chatQ = await db.platformQuery(
+    `SELECT c.id,
+            c.title,
+            c.type,
+            c.settings,
+            COALESCE(NULLIF(BTRIM(c.title), ''), 'Обсуждения') AS display_title,
+            NULL::uuid AS peer_user_id,
+            NULL::text AS peer_display_name,
+            NULL::text AS peer_name,
+            NULL::text AS peer_phone,
+            NULL::text AS peer_avatar_url,
+            0::float8 AS peer_avatar_focus_x,
+            0::float8 AS peer_avatar_focus_y,
+            1::float8 AS peer_avatar_zoom,
+            COALESCE(pref.pinned, false) AS is_pinned,
+            pref.pinned_at,
+            last_msg.text AS last_message,
+            last_msg.created_at AS updated_at,
+            COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
+            NULL::text AS support_ticket_status,
+            NULL::text AS support_assignee_name,
+            last_msg.sender_id AS last_message_sender_id,
+            COALESCE(NULLIF(BTRIM(last_user.name), ''), NULLIF(BTRIM(last_user.email), ''), 'Система') AS last_message_sender_name,
+            last_user.avatar_url AS last_message_sender_avatar_url,
+            COALESCE(last_user.avatar_focus_x, 0) AS last_message_sender_avatar_focus_x,
+            COALESCE(last_user.avatar_focus_y, 0) AS last_message_sender_avatar_focus_y,
+            COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
+     FROM chats c
+     JOIN chat_members self_member
+       ON self_member.chat_id = c.id
+      AND self_member.user_id = $1
+     LEFT JOIN user_chat_preferences pref
+       ON pref.chat_id = c.id
+      AND pref.user_id = $1
+     LEFT JOIN LATERAL (
+       SELECT m.text, m.created_at, m.sender_id
+       FROM messages m
+       WHERE m.chat_id = c.id
+         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       ORDER BY m.created_at DESC, m.id DESC
+       LIMIT 1
+     ) AS last_msg ON true
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*) AS unread_count
+       FROM messages um
+       WHERE um.chat_id = c.id
+         AND um.sender_id IS NOT NULL
+         AND um.sender_id <> $1
+         AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+         AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
+         AND NOT EXISTS (
+           SELECT 1
+           FROM message_reads mr
+           WHERE mr.message_id = um.id
+             AND mr.user_id = $1
+         )
+     ) AS unread_stats ON true
+     LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
+     WHERE c.type = 'private'
+       AND c.tenant_id IS NULL
+       AND COALESCE(c.settings->>'system_key', '') = 'platform_discussions'
+       AND COALESCE(pref.hidden, false) = false
+     LIMIT 1`,
+    [userId, userId],
+  );
+  return chatQ.rows[0] || null;
+}
+
 async function loadPagedMessages(req, {
   chatId,
   userId,
@@ -3511,9 +3620,7 @@ async function listChatsHandler(req, res) {
     const bugReportViewer = canAccessBugReportsChannel(req.user.role);
 
     await ensureSavedMessagesChat(db.pool, req.user);
-    if (rawRole === "tenant" || rawRole === "creator") {
-      await ensureDiscussionsChat(db.pool, req.user.id, tenantId);
-    }
+    const platformDiscussionsChat = await loadPlatformDiscussionsChatForList(req);
 
     const publicAndChannelQ = await db.query(
       `SELECT c.id,
@@ -3833,7 +3940,11 @@ async function listChatsHandler(req, res) {
     );
 
     const byId = new Map();
-    for (const row of [...publicAndChannelQ.rows, ...privateQ.rows]) {
+    for (const row of [
+      ...(platformDiscussionsChat ? [platformDiscussionsChat] : []),
+      ...publicAndChannelQ.rows,
+      ...privateQ.rows,
+    ]) {
       if (!byId.has(row.id)) byId.set(row.id, row);
     }
     const chats = Array.from(byId.values());
@@ -3877,6 +3988,9 @@ async function listChatsHandler(req, res) {
         };
       }
       if (isDiscussionsChatRow(chat, settings)) {
+        if (!isPlatformDiscussionsSettings(settings)) {
+          continue;
+        }
         chat.display_title = String(chat.title || "").trim() || "Обсуждения";
         chat.peer_user_id = null;
         chat.peer_display_name = null;
@@ -3889,7 +4003,9 @@ async function listChatsHandler(req, res) {
         chat.settings = {
           ...settings,
           kind: "discussions",
-          system_key: "discussions",
+          system_key: "platform_discussions",
+          scope: "platform",
+          global_discussions: true,
           visibility: "private",
           creator_managed: true,
         };
@@ -4224,7 +4340,11 @@ async function loadDiscussionChatForManagement(req, chatId) {
      FROM chats
      WHERE id = $1
        AND type = 'private'
-       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       AND (
+         $2::uuid IS NULL
+         OR tenant_id = $2::uuid
+         OR COALESCE(settings->>'system_key', '') = 'platform_discussions'
+       )
      LIMIT 1`,
     [chatId, req.user?.tenant_id || null],
   );
@@ -4235,7 +4355,12 @@ async function loadDiscussionChatForManagement(req, chatId) {
   chat.settings = {
     ...settings,
     kind: "discussions",
-    system_key: "discussions",
+    system_key: isPlatformDiscussionsSettings(settings)
+      ? "platform_discussions"
+      : "discussions",
+    ...(isPlatformDiscussionsSettings(settings)
+      ? { scope: "platform", global_discussions: true }
+      : {}),
     visibility: "private",
     creator_managed: true,
   };
@@ -4244,11 +4369,18 @@ async function loadDiscussionChatForManagement(req, chatId) {
 
 async function loadDiscussionMembersAndCandidates(chat) {
   const tenantId = chat.tenant_id || null;
+  const settings = normalizeSettings(chat.settings);
+  const isPlatformDiscussion = isPlatformDiscussionsSettings(settings);
+  if (isPlatformDiscussion) {
+    await syncPlatformDiscussionIndexedUsers(db, ["tenant", "admin", "worker"]);
+  }
   const membersQ = await db.query(
     `SELECT u.id AS user_id,
             u.name,
             u.email,
             u.role AS user_role,
+            t.code AS tenant_code,
+            t.name AS tenant_name,
             p.phone,
             cm.role AS chat_role,
             cm.joined_at,
@@ -4258,6 +4390,7 @@ async function loadDiscussionMembersAndCandidates(chat) {
             COALESCE(u.avatar_zoom, 1) AS avatar_zoom
      FROM chat_members cm
      JOIN users u ON u.id = cm.user_id
+     LEFT JOIN tenants t ON t.id = u.tenant_id
      LEFT JOIN phones p ON p.user_id = u.id
      WHERE cm.chat_id = $1
      ORDER BY
@@ -4270,18 +4403,27 @@ async function loadDiscussionMembersAndCandidates(chat) {
             u.name,
             u.email,
             u.role AS user_role,
+            t.code AS tenant_code,
+            t.name AS tenant_name,
             p.phone,
             u.avatar_url,
             COALESCE(u.avatar_focus_x, 0) AS avatar_focus_x,
             COALESCE(u.avatar_focus_y, 0) AS avatar_focus_y,
             COALESCE(u.avatar_zoom, 1) AS avatar_zoom
      FROM users u
+     LEFT JOIN tenants t ON t.id = u.tenant_id
      LEFT JOIN phones p ON p.user_id = u.id
      WHERE u.is_active IS DISTINCT FROM false
        AND (
-         $1::uuid IS NULL
-         OR u.tenant_id = $1::uuid
-         OR u.role = 'creator'
+         ($3::boolean = true AND u.role IN ('creator', 'tenant', 'admin', 'worker'))
+         OR (
+           $3::boolean = false
+           AND (
+             $1::uuid IS NULL
+             OR u.tenant_id = $1::uuid
+             OR u.role = 'creator'
+           )
+         )
        )
        AND NOT EXISTS (
          SELECT 1 FROM chat_members cm
@@ -4291,7 +4433,7 @@ async function loadDiscussionMembersAndCandidates(chat) {
        CASE WHEN u.role = 'creator' THEN 0 WHEN u.role = 'tenant' THEN 1 ELSE 2 END,
        COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), p.phone, '') ASC
      LIMIT 250`,
-    [tenantId, chat.id],
+    [tenantId, chat.id, isPlatformDiscussion],
   );
   return {
     members: membersQ.rows.map((row) => ({
@@ -4304,9 +4446,10 @@ async function loadDiscussionMembersAndCandidates(chat) {
   };
 }
 
-function emitDiscussionChatUpdated(req, chat, action = "updated", extra = {}) {
+async function emitDiscussionChatUpdated(req, chat, action = "updated", extra = {}) {
   const io = req.app.get("io");
   if (!io || !chat?.id) return;
+  const settings = normalizeSettings(chat.settings);
   const payload = {
     chatId: String(chat.id),
     chat_id: String(chat.id),
@@ -4314,6 +4457,23 @@ function emitDiscussionChatUpdated(req, chat, action = "updated", extra = {}) {
     chat,
     ...extra,
   };
+  if (isPlatformDiscussionsSettings(settings)) {
+    io.to(`chat:${chat.id}`).emit("chat:updated", payload);
+    const membersQ = await db.query(
+      `SELECT user_id
+       FROM chat_members
+       WHERE chat_id = $1`,
+      [chat.id],
+    );
+    const emitted = new Set();
+    for (const row of membersQ.rows) {
+      const memberUserId = String(row.user_id || "").trim();
+      if (!memberUserId || emitted.has(memberUserId)) continue;
+      emitted.add(memberUserId);
+      emitToUser(io, memberUserId, "chat:updated", payload);
+    }
+    return;
+  }
   emitToTenant(io, req.user?.tenant_id || chat.tenant_id || null, "chat:updated", payload);
 }
 
@@ -4369,7 +4529,7 @@ router.patch("/:chatId/discussion-settings", requireAuth, async (req, res) => {
       [nextTitle, JSON.stringify(chat.settings), chat.id],
     );
     const updatedChat = updated.rows[0];
-    emitDiscussionChatUpdated(req, updatedChat, "settings_updated");
+    await emitDiscussionChatUpdated(req, updatedChat, "settings_updated");
     return res.json({ ok: true, data: updatedChat });
   } catch (err) {
     console.error("chats.discussions.settings.patch error", err);
@@ -4419,7 +4579,7 @@ router.post(
         removeDiscussionAvatarByUrl(previousAvatar);
       }
       const updatedChat = updated.rows[0];
-      emitDiscussionChatUpdated(req, updatedChat, "avatar_updated");
+      await emitDiscussionChatUpdated(req, updatedChat, "avatar_updated");
       return res.json({ ok: true, data: updatedChat });
     } catch (err) {
       removeUploadedFile(req.file);
@@ -4455,7 +4615,7 @@ router.delete("/:chatId/discussion-settings/avatar", requireAuth, async (req, re
       removeDiscussionAvatarByUrl(previousAvatar);
     }
     const updatedChat = updated.rows[0];
-    emitDiscussionChatUpdated(req, updatedChat, "avatar_removed");
+    await emitDiscussionChatUpdated(req, updatedChat, "avatar_removed");
     return res.json({ ok: true, data: updatedChat });
   } catch (err) {
     console.error("chats.discussions.avatar.delete error", err);
@@ -4479,17 +4639,26 @@ router.post("/:chatId/discussion-settings/members", requireAuth, async (req, res
     if (!uuidValidate(userId)) {
       return res.status(400).json({ ok: false, error: "Некорректный пользователь" });
     }
+    const isPlatformDiscussion = isPlatformDiscussionsSettings(
+      normalizeSettings(chat.settings),
+    );
     const userQ = await db.query(
       `SELECT id, role
        FROM users
        WHERE id = $1
          AND (
-           $2::uuid IS NULL
-           OR tenant_id = $2::uuid
-           OR role = 'creator'
+           ($3::boolean = true AND role IN ('creator', 'tenant', 'admin', 'worker'))
+           OR (
+             $3::boolean = false
+             AND (
+               $2::uuid IS NULL
+               OR tenant_id = $2::uuid
+               OR role = 'creator'
+             )
+           )
          )
        LIMIT 1`,
-      [userId, chat.tenant_id || null],
+      [userId, chat.tenant_id || null, isPlatformDiscussion],
     );
     if (userQ.rowCount === 0) {
       return res.status(404).json({ ok: false, error: "Пользователь не найден" });
@@ -4500,7 +4669,7 @@ router.post("/:chatId/discussion-settings/members", requireAuth, async (req, res
        ON CONFLICT (chat_id, user_id) DO UPDATE SET role = chat_members.role`,
       [uuidv4(), chat.id, userId],
     );
-    emitDiscussionChatUpdated(req, chat, "member_added", { user_id: userId });
+    await emitDiscussionChatUpdated(req, chat, "member_added", { user_id: userId });
     const lists = await loadDiscussionMembersAndCandidates(chat);
     return res.status(201).json({ ok: true, data: lists });
   } catch (err) {
@@ -4550,7 +4719,7 @@ router.delete(
         chat.id,
         userId,
       ]);
-      emitDiscussionChatUpdated(req, chat, "member_removed", { user_id: userId });
+      await emitDiscussionChatUpdated(req, chat, "member_removed", { user_id: userId });
       const io = req.app.get("io");
       if (io) {
         emitToUser(io, userId, "chat:deleted", {

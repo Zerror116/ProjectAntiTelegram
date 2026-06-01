@@ -74,6 +74,10 @@ const { runNotificationDigestSweep } = require("./utils/notifications");
 const { authMiddleware, resolveAuthContextFromToken } = require("./utils/auth");
 const { bootstrapDatabase } = require("./utils/bootstrap");
 const {
+  ensurePlatformDiscussionUserShadow,
+  ensurePlatformDiscussionsChat,
+} = require("./utils/systemChannels");
+const {
   runMessageEncryptionBackfill,
 } = require("./utils/messageEncryptionBackfill");
 const { logMonitoringEvent } = require("./utils/monitoring");
@@ -772,6 +776,11 @@ async function canUserAccessChat(user, chatId) {
   const role = rawRole === "tenant" ? "admin" : rawRole;
   if (!userId || !chatId) return false;
 
+  const platformDiscussion = await resolvePlatformDiscussionSocketContext(user, chatId);
+  if (platformDiscussion) {
+    return platformDiscussion.allowed;
+  }
+
   const chatQ = await db.query(
     `SELECT id, title, type, settings
      FROM chats
@@ -860,10 +869,49 @@ async function canUserAccessChat(user, chatId) {
   return memberQ.rowCount > 0;
 }
 
+async function resolvePlatformDiscussionSocketContext(user, chatId) {
+  const userId = String(user?.id || "").trim();
+  const role = String(user?.base_role || user?.role || "").toLowerCase().trim();
+  if (!userId || !chatId) return null;
+  if (role === "tenant" || role === "creator") {
+    await ensurePlatformDiscussionUserShadow(db.platformPool, user);
+    await ensurePlatformDiscussionsChat(db.platformPool, userId);
+  }
+
+  const chatQ = await db.platformQuery(
+    `SELECT c.id,
+            c.tenant_id,
+            cm.user_id
+     FROM chats c
+     LEFT JOIN chat_members cm ON cm.chat_id = c.id
+     WHERE c.id = $1
+       AND c.type = 'private'
+       AND COALESCE(c.settings->>'system_key', '') = 'platform_discussions'`,
+    [chatId],
+  );
+  if (chatQ.rowCount === 0) return null;
+  const memberUserIds = [
+    ...new Set(
+      chatQ.rows
+        .map((row) => String(row.user_id || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  return {
+    allowed: memberUserIds.includes(userId),
+    tenantId: null,
+    memberUserIds,
+  };
+}
+
 async function resolveChatActivityContext(user, chatId) {
   const userId = user?.id;
   const tenantId = user?.tenant_id || null;
   if (!userId || !chatId) return null;
+  const platformDiscussion = await resolvePlatformDiscussionSocketContext(user, chatId);
+  if (platformDiscussion) {
+    return platformDiscussion.allowed ? platformDiscussion : null;
+  }
   const chatQ = await db.query(
     `SELECT c.id,
             c.type,

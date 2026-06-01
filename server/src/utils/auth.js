@@ -4,6 +4,10 @@ const db = require('../db');
 const { isTenantActive, isPlatformCreatorEmail } = require('./tenants');
 const { touchUserSession } = require('./sessions');
 const { resolvePhoneAccessState } = require('./phoneAccess');
+const {
+  ensurePlatformDiscussionUserShadow,
+  ensurePlatformDiscussionsChat,
+} = require('./systemChannels');
 require('dotenv').config();
 
 const JWT_FALLBACK_SECRET = String(process.env.JWT_SECRET || '').trim();
@@ -126,6 +130,71 @@ function isPhoneAccessBypassRequest(req) {
     return true;
   }
   return false;
+}
+
+function normalizeRequestUuid(raw) {
+  const value = String(raw || '').trim();
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  ) {
+    return value;
+  }
+  return '';
+}
+
+function extractChatIdFromRequest(req) {
+  return (
+    normalizeRequestUuid(req?.params?.chatId) ||
+    normalizeRequestUuid(req?.body?.chat_id || req?.body?.chatId) ||
+    normalizeRequestUuid(req?.query?.chat_id || req?.query?.chatId)
+  );
+}
+
+function extractUploadSessionIdFromRequest(req) {
+  return (
+    normalizeRequestUuid(req?.params?.sessionId) ||
+    normalizeRequestUuid(req?.body?.session_id || req?.body?.sessionId) ||
+    normalizeRequestUuid(req?.query?.session_id || req?.query?.sessionId)
+  );
+}
+
+async function shouldUsePlatformDiscussionContext(req) {
+  const baseUrl = String(req?.baseUrl || '').toLowerCase().trim();
+  if (!baseUrl.endsWith('/api/chats')) return false;
+  const chatId = extractChatIdFromRequest(req);
+  try {
+    if (chatId) {
+      const result = await db.platformQuery(
+        `SELECT 1
+         FROM chats
+         WHERE id = $1
+           AND type = 'private'
+           AND COALESCE(settings->>'system_key', '') = 'platform_discussions'
+         LIMIT 1`,
+        [chatId],
+      );
+      return result.rowCount > 0;
+    }
+
+    const sessionId = extractUploadSessionIdFromRequest(req);
+    if (!sessionId) return false;
+    const sessionQ = await db.platformQuery(
+      `SELECT 1
+       FROM chat_upload_sessions s
+       JOIN chats c ON c.id = s.chat_id
+       WHERE s.id = $1
+         AND c.type = 'private'
+         AND COALESCE(c.settings->>'system_key', '') = 'platform_discussions'
+       LIMIT 1`,
+      [sessionId],
+    );
+    return sessionQ.rowCount > 0;
+  } catch (err) {
+    console.error('platform discussion context check error:', err);
+    return false;
+  }
 }
 
 async function resolveCreatorTenantScope(requestedTenantCode = '') {
@@ -481,6 +550,7 @@ async function authMiddleware(req, res, next) {
       });
     }
     req.user = context.user;
+    const usePlatformDiscussionContext = await shouldUsePlatformDiscussionContext(req);
     if (
       isPhoneAccessRestrictionState(req.user?.phone_access_state) &&
       !isPhoneAccessBypassRequest(req)
@@ -497,6 +567,16 @@ async function authMiddleware(req, res, next) {
       });
     }
     if (context.user?.is_platform_creator === true && !context.tenantScope) {
+      return db.runWithPlatform(() => next());
+    }
+    if (usePlatformDiscussionContext) {
+      const baseRole = String(context.user?.base_role || context.user?.role || '')
+        .toLowerCase()
+        .trim();
+      if (baseRole === 'tenant' || baseRole === 'creator') {
+        await ensurePlatformDiscussionUserShadow(db.platformPool, context.user);
+        await ensurePlatformDiscussionsChat(db.platformPool, context.user.id);
+      }
       return db.runWithPlatform(() => next());
     }
     if (context.tenantScope) {

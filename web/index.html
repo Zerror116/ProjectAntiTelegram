@@ -357,10 +357,8 @@
       }
 
       function versionedAsset(path, versionToken) {
-        const token =
-          (versionToken || '').toString().trim() ||
-          Date.now().toString();
-        return `${path}?v=${encodeURIComponent(token)}`;
+        const token = (versionToken || '').toString().trim();
+        return token ? `${path}?v=${encodeURIComponent(token)}` : path;
       }
 
       function applyVersionedShellAssets(versionToken) {
