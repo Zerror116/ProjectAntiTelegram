@@ -345,7 +345,7 @@ object PhoenixManagedUpdateEngine {
                     action = ACTION_INSTALL_RESULT
                 }
                 val flags = PendingIntent.FLAG_UPDATE_CURRENT or
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
                 val pendingIntent = PendingIntent.getBroadcast(
                     context,
                     sessionId,
@@ -1099,7 +1099,35 @@ class PhoenixManagedUpdateInstallReceiver : BroadcastReceiver() {
                 }
                 confirmIntent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 if (confirmIntent != null) {
-                    context.startActivity(confirmIntent)
+                    try {
+                        context.startActivity(confirmIntent)
+                    } catch (t: Throwable) {
+                        PhoenixManagedUpdateStore.save(
+                            context,
+                            current.copy(
+                                status = STATUS_FAILED,
+                                stage = "Android не открыл окно установки.",
+                                errorCode = "install_confirmation_failed",
+                                errorMessage = t.message ?: "Не удалось открыть подтверждение установки Android.",
+                                pendingInstallAfterPermission = false,
+                                lastUpdatedAtMs = System.currentTimeMillis(),
+                            ),
+                        )
+                        return
+                    }
+                } else {
+                    PhoenixManagedUpdateStore.save(
+                        context,
+                        current.copy(
+                            status = STATUS_FAILED,
+                            stage = "Android не открыл окно установки.",
+                            errorCode = "install_confirmation_missing",
+                            errorMessage = "Android не передал окно подтверждения установки APK.",
+                            pendingInstallAfterPermission = false,
+                            lastUpdatedAtMs = System.currentTimeMillis(),
+                        ),
+                    )
+                    return
                 }
                 PhoenixManagedUpdateStore.save(
                     context,
