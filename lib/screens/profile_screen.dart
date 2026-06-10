@@ -19,6 +19,22 @@ import 'change_password_screen.dart';
 import 'change_phone_screen.dart';
 import 'creator_keys_screen.dart';
 
+Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
+  final path = (file.path ?? '').trim();
+  if (path.isNotEmpty && !kIsWeb) {
+    try {
+      return await File(path).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return await file.readAsBytes();
+  } catch (_) {
+    return null;
+  }
+}
+
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
 
@@ -639,25 +655,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Future<void> _pickAndUploadAvatar() async {
     if (_avatarBusy) return;
 
-    final picked = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      allowMultiple: false,
-      withData: kIsWeb,
-    );
-    if (picked == null || picked.files.isEmpty) return;
-    final pickedFile = picked.files.single;
+    final pickedFile = await FilePicker.pickFile(type: FileType.image);
+    if (pickedFile == null) return;
 
-    Uint8List? sourceBytes = pickedFile.bytes;
-    if (sourceBytes == null || sourceBytes.isEmpty) {
-      final path = pickedFile.path;
-      if (path != null && path.isNotEmpty) {
-        try {
-          sourceBytes = await File(path).readAsBytes();
-        } catch (_) {
-          sourceBytes = null;
-        }
-      }
-    }
+    final sourceBytes = await _readPickedPlatformFileBytes(pickedFile);
     if (sourceBytes == null || sourceBytes.isEmpty) {
       if (!mounted) return;
       setState(() => _message = 'Не удалось прочитать выбранный файл');

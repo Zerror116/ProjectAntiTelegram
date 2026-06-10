@@ -18,7 +18,7 @@ const { createRateGuard } = require("../utils/rateGuard");
 const { buildSupportTemplateAutoReply } = require("../utils/supportAutoReply");
 const {
   markChatInboxItemsRead,
-  computeNotificationBadgeCount,
+  computeNotificationBadgeSnapshot,
 } = require("../utils/notifications");
 const {
   encryptMessageText,
@@ -47,7 +47,7 @@ const { registerPublicImageUpload } = require("../utils/publicMediaRegistration"
 const {
   ensurePlatformDiscussionUserShadow,
   ensurePlatformDiscussionsChat,
-  syncPlatformDiscussionIndexedUsers,
+  syncPlatformDiscussionTenantUsers,
 } = require("../utils/systemChannels");
 const chatActivityStateService = require("../services/chatActivityState");
 
@@ -2454,7 +2454,31 @@ async function finalizeCreatedMessage(req, chatId, messageId, currentUserId) {
           const memberUserId = String(row.user_id || "").trim();
           if (!memberUserId || emittedUserIds.has(memberUserId)) continue;
           emittedUserIds.add(memberUserId);
-          io.to(`user:${memberUserId}`).emit("chat:message", payload);
+          const memberPayload = { ...payload };
+          if (memberUserId !== String(currentUserId || "").trim()) {
+            try {
+              const [chatUnreadCount, badgeSnapshot] = await Promise.all([
+                getChatUnreadCount(chatId, memberUserId),
+                computeNotificationBadgeSnapshot(memberUserId),
+              ]);
+              memberPayload.unread_count = chatUnreadCount;
+              memberPayload.badge_count = badgeSnapshot.unread_count;
+              memberPayload.inbox_unread_count = badgeSnapshot.inbox_unread_count;
+              memberPayload.chat_unread_count = badgeSnapshot.chat_unread_count;
+              io.to(`user:${memberUserId}`).emit("notification:badge", {
+                unread_count: badgeSnapshot.unread_count,
+                inbox_unread_count: badgeSnapshot.inbox_unread_count,
+                chat_unread_count: badgeSnapshot.chat_unread_count,
+              });
+            } catch (badgeErr) {
+              console.warn("chat.message badge snapshot skipped", {
+                chat_id: chatId,
+                user_id: memberUserId,
+                message: badgeErr?.message || String(badgeErr),
+              });
+            }
+          }
+          io.to(`user:${memberUserId}`).emit("chat:message", memberPayload);
         }
         emittedToDirectMembers = true;
       }
@@ -3203,27 +3227,64 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
     : null;
 
   const result = await db.query(
-    `WITH unread AS (
-       SELECT m.id, m.sender_id
+    `WITH read_state AS (
+       SELECT lr.id AS last_read_message_id,
+              lr.created_at AS last_read_created_at,
+              cm.joined_at
+       FROM chats c
+       LEFT JOIN user_chat_state ucs
+         ON ucs.chat_id = c.id
+        AND ucs.user_id = $2
+       LEFT JOIN messages lr
+         ON lr.id = ucs.last_read_message_id
+        AND lr.chat_id = c.id
+       LEFT JOIN chat_members cm
+         ON cm.chat_id = c.id
+        AND cm.user_id = $2
+       WHERE c.id = $1
+       LIMIT 1
+     ),
+     unread AS (
+       SELECT m.id, m.sender_id, m.created_at
        FROM messages m
-     WHERE m.chat_id = $1
-       AND (
-         (m.sender_id IS NOT NULL AND m.sender_id <> $2)
-         OR COALESCE(m.meta->>'kind', '') = 'reserved_order_item'
-       )
-       AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
-       AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-       AND NOT EXISTS (
-         SELECT 1
-         FROM message_reads mr
+       CROSS JOIN read_state rs
+       WHERE m.chat_id = $1
+         AND (
+           (m.sender_id IS NOT NULL AND m.sender_id <> $2)
+           OR COALESCE(m.meta->>'kind', '') = 'reserved_order_item'
+         )
+         AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         AND (
+           (
+             rs.last_read_message_id IS NOT NULL
+             AND (
+               m.created_at > rs.last_read_created_at
+               OR (
+                 m.created_at = rs.last_read_created_at
+                 AND m.id > rs.last_read_message_id
+               )
+             )
+           )
+           OR (
+             rs.last_read_message_id IS NULL
+             AND (
+               rs.joined_at IS NULL
+               OR m.created_at >= rs.joined_at
+             )
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM message_reads mr
            WHERE mr.message_id = m.id
              AND mr.user_id = $2
-       )
-       AND (
-         $3::uuid IS NULL
-         OR m.created_at < $4::timestamptz
-         OR (m.created_at = $4::timestamptz AND m.id <= $3::uuid)
-       )
+         )
+         AND (
+           $3::uuid IS NULL
+           OR m.created_at < $4::timestamptz
+           OR (m.created_at = $4::timestamptz AND m.id <= $3::uuid)
+         )
      ),
      inserted AS (
        INSERT INTO message_reads (message_id, user_id, chat_id, read_at)
@@ -3235,7 +3296,8 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
      SELECT unread.id::text AS message_id,
             unread.sender_id::text AS sender_id
      FROM inserted i
-     JOIN unread ON unread.id = i.message_id`,
+     JOIN unread ON unread.id = i.message_id
+     ORDER BY unread.created_at ASC, unread.id ASC`,
     [
       chatId,
       userId,
@@ -3306,8 +3368,26 @@ async function getActivePinForUser(req, chatId, userId) {
 
 async function getFirstUnreadMessageId(chatId, userId) {
   const result = await db.query(
-    `SELECT m.id::text AS id
+    `WITH read_state AS (
+       SELECT lr.id AS last_read_message_id,
+              lr.created_at AS last_read_created_at,
+              cm.joined_at
+       FROM chats c
+       LEFT JOIN user_chat_state ucs
+         ON ucs.chat_id = c.id
+        AND ucs.user_id = $2
+       LEFT JOIN messages lr
+         ON lr.id = ucs.last_read_message_id
+        AND lr.chat_id = c.id
+       LEFT JOIN chat_members cm
+         ON cm.chat_id = c.id
+        AND cm.user_id = $2
+       WHERE c.id = $1
+       LIMIT 1
+     )
+     SELECT m.id::text AS id
      FROM messages m
+     CROSS JOIN read_state rs
      WHERE m.chat_id = $1
        AND (
          (m.sender_id IS NOT NULL AND m.sender_id <> $2)
@@ -3315,11 +3395,22 @@ async function getFirstUnreadMessageId(chatId, userId) {
        )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-       AND NOT EXISTS (
-         SELECT 1
-         FROM message_reads mr
-         WHERE mr.message_id = m.id
-           AND mr.user_id = $2
+       AND (
+         (
+           rs.last_read_message_id IS NOT NULL
+           AND (
+             m.created_at > rs.last_read_created_at
+             OR (
+               m.created_at = rs.last_read_created_at
+               AND m.id > rs.last_read_message_id
+             )
+           )
+         )
+         OR (
+           rs.last_read_message_id IS NULL
+           AND rs.joined_at IS NOT NULL
+           AND m.created_at >= rs.joined_at
+         )
        )
      ORDER BY m.created_at ASC, m.id ASC
      LIMIT 1`,
@@ -3330,8 +3421,26 @@ async function getFirstUnreadMessageId(chatId, userId) {
 
 async function getChatUnreadCount(chatId, userId) {
   const result = await db.query(
-    `SELECT COUNT(*)::int AS unread_count
+    `WITH read_state AS (
+       SELECT lr.id AS last_read_message_id,
+              lr.created_at AS last_read_created_at,
+              cm.joined_at
+       FROM chats c
+       LEFT JOIN user_chat_state ucs
+         ON ucs.chat_id = c.id
+        AND ucs.user_id = $2
+       LEFT JOIN messages lr
+         ON lr.id = ucs.last_read_message_id
+        AND lr.chat_id = c.id
+       LEFT JOIN chat_members cm
+         ON cm.chat_id = c.id
+        AND cm.user_id = $2
+       WHERE c.id = $1
+       LIMIT 1
+     )
+     SELECT COUNT(*)::int AS unread_count
      FROM messages m
+     CROSS JOIN read_state rs
      WHERE m.chat_id = $1
        AND (
          (m.sender_id IS NOT NULL AND m.sender_id <> $2)
@@ -3339,11 +3448,22 @@ async function getChatUnreadCount(chatId, userId) {
        )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
-       AND NOT EXISTS (
-         SELECT 1
-         FROM message_reads mr
-         WHERE mr.message_id = m.id
-           AND mr.user_id = $2
+       AND (
+         (
+           rs.last_read_message_id IS NOT NULL
+           AND (
+             m.created_at > rs.last_read_created_at
+             OR (
+               m.created_at = rs.last_read_created_at
+               AND m.id > rs.last_read_message_id
+             )
+           )
+         )
+         OR (
+           rs.last_read_message_id IS NULL
+           AND rs.joined_at IS NOT NULL
+           AND m.created_at >= rs.joined_at
+         )
        )`,
     [chatId, String(userId || "")],
   );
@@ -3357,8 +3477,8 @@ async function loadPlatformDiscussionsChatForList(req) {
     .trim();
   if (!userId) return null;
 
+  await ensurePlatformDiscussionUserShadow(db.platformPool, req.user);
   if (role === "tenant" || role === "creator") {
-    await ensurePlatformDiscussionUserShadow(db.platformPool, req.user);
     await ensurePlatformDiscussionsChat(db.platformPool, userId);
   }
 
@@ -3396,6 +3516,12 @@ async function loadPlatformDiscussionsChatForList(req) {
      LEFT JOIN user_chat_preferences pref
        ON pref.chat_id = c.id
       AND pref.user_id = $1
+     LEFT JOIN user_chat_state chat_state
+       ON chat_state.chat_id = c.id
+      AND chat_state.user_id = $1
+     LEFT JOIN messages last_read_msg
+       ON last_read_msg.id = chat_state.last_read_message_id
+      AND last_read_msg.chat_id = c.id
      LEFT JOIN LATERAL (
        SELECT m.text, m.created_at, m.sender_id
        FROM messages m
@@ -3406,18 +3532,29 @@ async function loadPlatformDiscussionsChatForList(req) {
        LIMIT 1
      ) AS last_msg ON true
      LEFT JOIN LATERAL (
-       SELECT COUNT(*) AS unread_count
+       SELECT COUNT(*)::int AS unread_count
        FROM messages um
        WHERE um.chat_id = c.id
          AND um.sender_id IS NOT NULL
          AND um.sender_id <> $1
          AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
          AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
-         AND NOT EXISTS (
-           SELECT 1
-           FROM message_reads mr
-           WHERE mr.message_id = um.id
-             AND mr.user_id = $1
+         AND (
+           (
+             last_read_msg.id IS NOT NULL
+             AND (
+               um.created_at > last_read_msg.created_at
+               OR (
+                 um.created_at = last_read_msg.created_at
+                 AND um.id > last_read_msg.id
+               )
+             )
+           )
+           OR (
+             last_read_msg.id IS NULL
+             AND self_member.joined_at IS NOT NULL
+             AND um.created_at >= self_member.joined_at
+           )
          )
      ) AS unread_stats ON true
      LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
@@ -3619,8 +3756,22 @@ async function listChatsHandler(req, res) {
       role === "admin" || role === "tenant" || role === "creator";
     const bugReportViewer = canAccessBugReportsChannel(req.user.role);
 
-    await ensureSavedMessagesChat(db.pool, req.user);
-    const platformDiscussionsChat = await loadPlatformDiscussionsChatForList(req);
+    try {
+      await ensureSavedMessagesChat(db.pool, req.user);
+    } catch (err) {
+      console.warn("chats.list saved messages skipped", {
+        user_id: req.user?.id || null,
+        tenant_id: req.user?.tenant_id || null,
+        code: err?.code || null,
+        message: err?.message || String(err),
+      });
+    }
+    let platformDiscussionsChat = null;
+    try {
+      platformDiscussionsChat = await loadPlatformDiscussionsChatForList(req);
+    } catch (err) {
+      console.warn("chats.list platform discussions skipped", err);
+    }
 
     const publicAndChannelQ = await db.query(
       `SELECT c.id,
@@ -3659,19 +3810,28 @@ async function listChatsHandler(req, res) {
               COALESCE(NULLIF(BTRIM(support_assignee.name), ''), NULLIF(BTRIM(support_assignee.email), ''), '') AS support_assignee_name,
               last_msg.sender_id AS last_message_sender_id,
               COALESCE(NULLIF(BTRIM(last_user.name), ''), NULLIF(BTRIM(last_user.email), ''), 'Система') AS last_message_sender_name,
-              last_user.avatar_url AS last_message_sender_avatar_url,
-              COALESCE(last_user.avatar_focus_x, 0) AS last_message_sender_avatar_focus_x,
-              COALESCE(last_user.avatar_focus_y, 0) AS last_message_sender_avatar_focus_y,
-              COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
-       FROM chats c
-       LEFT JOIN support_tickets st
-         ON st.chat_id = c.id
-       LEFT JOIN users support_assignee
-         ON support_assignee.id = st.assignee_id
-       LEFT JOIN user_chat_preferences pref
-         ON pref.chat_id = c.id
-        AND pref.user_id = $1
-       LEFT JOIN LATERAL (
+	              last_user.avatar_url AS last_message_sender_avatar_url,
+	              COALESCE(last_user.avatar_focus_x, 0) AS last_message_sender_avatar_focus_x,
+	              COALESCE(last_user.avatar_focus_y, 0) AS last_message_sender_avatar_focus_y,
+	              COALESCE(last_user.avatar_zoom, 1) AS last_message_sender_avatar_zoom
+	       FROM chats c
+	       LEFT JOIN chat_members self_member
+	         ON self_member.chat_id = c.id
+	        AND self_member.user_id = $1
+	       LEFT JOIN support_tickets st
+	         ON st.chat_id = c.id
+	       LEFT JOIN users support_assignee
+	         ON support_assignee.id = st.assignee_id
+	       LEFT JOIN user_chat_preferences pref
+	         ON pref.chat_id = c.id
+	        AND pref.user_id = $1
+	       LEFT JOIN user_chat_state chat_state
+	         ON chat_state.chat_id = c.id
+	        AND chat_state.user_id = $1
+	       LEFT JOIN messages last_read_msg
+	         ON last_read_msg.id = chat_state.last_read_message_id
+	        AND last_read_msg.chat_id = c.id
+	       LEFT JOIN LATERAL (
          SELECT ou.id AS peer_user_id,
                 COALESCE(
                   NULLIF(BTRIM(uc.alias_name), ''),
@@ -3705,24 +3865,35 @@ async function listChatsHandler(req, res) {
            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
          ORDER BY m.created_at DESC, m.id DESC
          LIMIT 1
-       ) AS last_msg ON true
-       LEFT JOIN LATERAL (
-         SELECT COUNT(*) AS unread_count
-         FROM messages um
-         WHERE um.chat_id = c.id
-           AND (
-             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
-             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
-           )
-           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
-           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
-           AND NOT EXISTS (
-             SELECT 1
-             FROM message_reads mr
-             WHERE mr.message_id = um.id
-               AND mr.user_id = $1
-           )
-       ) AS unread_stats ON true
+	       ) AS last_msg ON true
+	       LEFT JOIN LATERAL (
+	         SELECT COUNT(*)::int AS unread_count
+	         FROM messages um
+	         WHERE um.chat_id = c.id
+	           AND (
+	             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
+	             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
+	           )
+	           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
+	           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
+	           AND (
+	             (
+	               last_read_msg.id IS NOT NULL
+	               AND (
+	                 um.created_at > last_read_msg.created_at
+	                 OR (
+	                   um.created_at = last_read_msg.created_at
+	                   AND um.id > last_read_msg.id
+	                 )
+	               )
+	             )
+	             OR (
+	               last_read_msg.id IS NULL
+	               AND self_member.joined_at IS NOT NULL
+	               AND um.created_at >= self_member.joined_at
+	             )
+	           )
+	       ) AS unread_stats ON true
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE (
          (
@@ -3850,10 +4021,16 @@ async function listChatsHandler(req, res) {
          ON st.chat_id = c.id
        LEFT JOIN users support_assignee
          ON support_assignee.id = st.assignee_id
-       LEFT JOIN user_chat_preferences pref
-         ON pref.chat_id = c.id
-        AND pref.user_id = $1
-       LEFT JOIN LATERAL (
+	       LEFT JOIN user_chat_preferences pref
+	         ON pref.chat_id = c.id
+	        AND pref.user_id = $1
+	       LEFT JOIN user_chat_state chat_state
+	         ON chat_state.chat_id = c.id
+	        AND chat_state.user_id = $1
+	       LEFT JOIN messages last_read_msg
+	         ON last_read_msg.id = chat_state.last_read_message_id
+	        AND last_read_msg.chat_id = c.id
+	       LEFT JOIN LATERAL (
          SELECT ou.id AS peer_user_id,
                 COALESCE(
                   NULLIF(BTRIM(uc.alias_name), ''),
@@ -3887,24 +4064,35 @@ async function listChatsHandler(req, res) {
            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
          ORDER BY m.created_at DESC, m.id DESC
          LIMIT 1
-       ) AS last_msg ON true
-       LEFT JOIN LATERAL (
-         SELECT COUNT(*) AS unread_count
-         FROM messages um
-         WHERE um.chat_id = c.id
-           AND (
-             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
-             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
-           )
-           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
-           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
-           AND NOT EXISTS (
-             SELECT 1
-             FROM message_reads mr
-             WHERE mr.message_id = um.id
-               AND mr.user_id = $1
-           )
-       ) AS unread_stats ON true
+	       ) AS last_msg ON true
+	       LEFT JOIN LATERAL (
+	         SELECT COUNT(*)::int AS unread_count
+	         FROM messages um
+	         WHERE um.chat_id = c.id
+	           AND (
+	             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
+	             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
+	           )
+	           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+	           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
+	           AND (
+	             (
+	               last_read_msg.id IS NOT NULL
+	               AND (
+	                 um.created_at > last_read_msg.created_at
+	                 OR (
+	                   um.created_at = last_read_msg.created_at
+	                   AND um.id > last_read_msg.id
+	                 )
+	               )
+	             )
+	             OR (
+	               last_read_msg.id IS NULL
+	               AND cm.joined_at IS NOT NULL
+	               AND um.created_at >= cm.joined_at
+	             )
+	           )
+	       ) AS unread_stats ON true
        LEFT JOIN users last_user ON last_user.id = last_msg.sender_id
        WHERE c.type <> 'channel'
          AND (
@@ -4367,12 +4555,39 @@ async function loadDiscussionChatForManagement(req, chatId) {
   return chat;
 }
 
-async function loadDiscussionMembersAndCandidates(chat) {
+function discussionRemovedUserIds(settings) {
+  const raw = normalizeSettings(settings).discussion_removed_user_ids;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((value) => String(value || "").trim())
+    .filter((value) => uuidValidate(value));
+}
+
+function nextDiscussionSettingsWithRemoval(settings, userId, shouldRemove) {
+  const normalizedUserId = String(userId || "").trim();
+  const ids = new Set(discussionRemovedUserIds(settings));
+  if (uuidValidate(normalizedUserId)) {
+    if (shouldRemove) {
+      ids.add(normalizedUserId);
+    } else {
+      ids.delete(normalizedUserId);
+    }
+  }
+  return {
+    ...normalizeSettings(settings),
+    discussion_removed_user_ids: Array.from(ids),
+  };
+}
+
+async function loadDiscussionMembersAndCandidates(chat, search = "") {
   const tenantId = chat.tenant_id || null;
   const settings = normalizeSettings(chat.settings);
   const isPlatformDiscussion = isPlatformDiscussionsSettings(settings);
+  const normalizedSearch = String(search || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  const searchPattern = normalizedSearch ? `%${normalizedSearch}%` : "";
+  const searchDigits = normalizePhoneDigits(normalizedSearch).slice(0, 20);
   if (isPlatformDiscussion) {
-    await syncPlatformDiscussionIndexedUsers(db, ["tenant", "admin", "worker"]);
+    await syncPlatformDiscussionTenantUsers(db);
   }
   const membersQ = await db.query(
     `SELECT u.id AS user_id,
@@ -4415,7 +4630,10 @@ async function loadDiscussionMembersAndCandidates(chat) {
      LEFT JOIN phones p ON p.user_id = u.id
      WHERE u.is_active IS DISTINCT FROM false
        AND (
-         ($3::boolean = true AND u.role IN ('creator', 'tenant', 'admin', 'worker'))
+         (
+           $3::boolean = true
+           AND u.tenant_id IS NOT NULL
+         )
          OR (
            $3::boolean = false
            AND (
@@ -4425,22 +4643,32 @@ async function loadDiscussionMembersAndCandidates(chat) {
            )
          )
        )
+       AND (
+         $4::text = ''
+         OR COALESCE(u.name, '') ILIKE $4::text
+         OR COALESCE(u.email, '') ILIKE $4::text
+         OR COALESCE(t.name, '') ILIKE $4::text
+         OR COALESCE(t.code, '') ILIKE $4::text
+         OR (
+           $5::text <> ''
+           AND regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') LIKE '%' || $5::text || '%'
+         )
+       )
        AND NOT EXISTS (
          SELECT 1 FROM chat_members cm
          WHERE cm.chat_id = $2 AND cm.user_id = u.id
        )
      ORDER BY
-       CASE WHEN u.role = 'creator' THEN 0 WHEN u.role = 'tenant' THEN 1 ELSE 2 END,
+       CASE WHEN u.role = 'creator' THEN 0 WHEN u.role = 'tenant' THEN 1 WHEN u.role = 'admin' THEN 2 WHEN u.role = 'worker' THEN 3 ELSE 4 END,
+       COALESCE(NULLIF(BTRIM(t.name), ''), NULLIF(BTRIM(t.code), ''), '') ASC,
        COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), p.phone, '') ASC
      LIMIT 250`,
-    [tenantId, chat.id, isPlatformDiscussion],
+    [tenantId, chat.id, isPlatformDiscussion, searchPattern, searchDigits],
   );
   return {
     members: membersQ.rows.map((row) => ({
       ...row,
-      can_remove: !["creator", "tenant"].includes(
-        String(row.user_role || "").toLowerCase().trim(),
-      ),
+      can_remove: String(row.user_role || "").toLowerCase().trim() !== "creator",
     })),
     candidates: candidatesQ.rows,
   };
@@ -4489,7 +4717,10 @@ router.get("/:chatId/discussion-settings", requireAuth, async (req, res) => {
     if (!chat) {
       return res.status(404).json({ ok: false, error: "Чат обсуждений не найден" });
     }
-    const lists = await loadDiscussionMembersAndCandidates(chat);
+    const lists = await loadDiscussionMembersAndCandidates(
+      chat,
+      String(req.query?.search || ""),
+    );
     return res.json({ ok: true, data: { chat, ...lists } });
   } catch (err) {
     console.error("chats.discussions.settings.get error", err);
@@ -4643,17 +4874,29 @@ router.post("/:chatId/discussion-settings/members", requireAuth, async (req, res
       normalizeSettings(chat.settings),
     );
     const userQ = await db.query(
-      `SELECT id, role
-       FROM users
-       WHERE id = $1
+      `SELECT u.id,
+              u.email,
+              u.role,
+              u.name,
+              u.tenant_id,
+              u.is_active,
+              p.phone
+       FROM users u
+       LEFT JOIN tenants t ON t.id = u.tenant_id
+       LEFT JOIN phones p ON p.user_id = u.id
+       WHERE u.id = $1
+         AND u.is_active IS DISTINCT FROM false
          AND (
-           ($3::boolean = true AND role IN ('creator', 'tenant', 'admin', 'worker'))
+           (
+             $3::boolean = true
+             AND u.tenant_id IS NOT NULL
+           )
            OR (
              $3::boolean = false
              AND (
                $2::uuid IS NULL
-               OR tenant_id = $2::uuid
-               OR role = 'creator'
+               OR u.tenant_id = $2::uuid
+               OR u.role = 'creator'
              )
            )
          )
@@ -4663,14 +4906,45 @@ router.post("/:chatId/discussion-settings/members", requireAuth, async (req, res
     if (userQ.rowCount === 0) {
       return res.status(404).json({ ok: false, error: "Пользователь не найден" });
     }
+    const targetUser = userQ.rows[0];
+    if (isPlatformDiscussion) {
+      await ensurePlatformDiscussionUserShadow(db.platformPool, targetUser);
+    }
     await db.query(
       `INSERT INTO chat_members (id, chat_id, user_id, joined_at, role)
        VALUES ($1, $2, $3, now(), 'member')
        ON CONFLICT (chat_id, user_id) DO UPDATE SET role = chat_members.role`,
       [uuidv4(), chat.id, userId],
     );
+    if (isPlatformDiscussion) {
+      const nextSettings = nextDiscussionSettingsWithRemoval(
+        chat.settings,
+        userId,
+        false,
+      );
+      await db.query(
+        `UPDATE chats
+         SET settings = $1::jsonb,
+             updated_at = now()
+         WHERE id = $2`,
+        [JSON.stringify(nextSettings), chat.id],
+      );
+      chat.settings = nextSettings;
+    }
     await emitDiscussionChatUpdated(req, chat, "member_added", { user_id: userId });
-    const lists = await loadDiscussionMembersAndCandidates(chat);
+    const io = req.app.get("io");
+    if (io) {
+      emitToUser(io, userId, "chat:created", {
+        chatId: String(chat.id),
+        chat_id: String(chat.id),
+        action: "member_added",
+        chat,
+      });
+    }
+    const lists = await loadDiscussionMembersAndCandidates(
+      chat,
+      String(req.body?.search || req.query?.search || ""),
+    );
     return res.status(201).json({ ok: true, data: lists });
   } catch (err) {
     console.error("chats.discussions.members.post error", err);
@@ -4706,14 +4980,38 @@ router.delete(
         [chat.id, userId],
       );
       if (memberQ.rowCount === 0) {
-        return res.json({ ok: true, data: await loadDiscussionMembersAndCandidates(chat) });
+        return res.json({
+          ok: true,
+          data: await loadDiscussionMembersAndCandidates(
+            chat,
+            String(req.query?.search || ""),
+          ),
+        });
       }
       const userRole = String(memberQ.rows[0].role || "").toLowerCase().trim();
-      if (userRole === "creator" || userRole === "tenant") {
+      if (userRole === "creator") {
         return res.status(403).json({
           ok: false,
-          error: "Создателя и арендатора нельзя убрать из обсуждений",
+          error: "Создателя нельзя убрать из обсуждений",
         });
+      }
+      const isPlatformDiscussion = isPlatformDiscussionsSettings(
+        normalizeSettings(chat.settings),
+      );
+      if (isPlatformDiscussion) {
+        const nextSettings = nextDiscussionSettingsWithRemoval(
+          chat.settings,
+          userId,
+          true,
+        );
+        await db.query(
+          `UPDATE chats
+           SET settings = $1::jsonb,
+               updated_at = now()
+           WHERE id = $2`,
+          [JSON.stringify(nextSettings), chat.id],
+        );
+        chat.settings = nextSettings;
       }
       await db.query("DELETE FROM chat_members WHERE chat_id = $1 AND user_id = $2", [
         chat.id,
@@ -4728,7 +5026,13 @@ router.delete(
           reason: "discussion_access_revoked",
         });
       }
-      return res.json({ ok: true, data: await loadDiscussionMembersAndCandidates(chat) });
+      return res.json({
+        ok: true,
+        data: await loadDiscussionMembersAndCandidates(
+          chat,
+          String(req.query?.search || ""),
+        ),
+      });
     } catch (err) {
       console.error("chats.discussions.members.delete error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
@@ -5392,9 +5696,9 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
       .map((row) => row.message_id)
       .filter(Boolean);
 
-    const [chatUnreadCount, badgeCount] = await Promise.all([
+    const [chatUnreadCount, badgeSnapshot] = await Promise.all([
       getChatUnreadCount(chatId, userId),
-      computeNotificationBadgeCount(userId),
+      computeNotificationBadgeSnapshot(userId),
     ]);
     const io = req.app.get("io");
     if (io) {
@@ -5421,7 +5725,9 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         }
       }
       io.to(`user:${userId}`).emit("notification:badge", {
-        unread_count: badgeCount,
+        unread_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
       });
       io.to(`user:${userId}`).emit("chat:message:read", {
         chatId,
@@ -5429,7 +5735,9 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         readerId: String(userId),
         reader_id: String(userId),
         unread_count: chatUnreadCount,
-        badge_count: badgeCount,
+        badge_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
       });
     }
 
@@ -5440,7 +5748,9 @@ router.post("/:chatId/read", requireAuth, async (req, res) => {
         message_ids: messageIds,
         visible_until_message_id: visibleUntilMessageId,
         unread_count: chatUnreadCount,
-        badge_count: badgeCount,
+        badge_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
       },
     });
   } catch (err) {

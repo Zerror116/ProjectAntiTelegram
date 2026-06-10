@@ -290,6 +290,14 @@ resolve_apk_package_name() {
   printf '%s\n' "$package_name"
 }
 
+resolve_apk_version_code() {
+  local version_code
+  version_code="$($APKANALYZER_BIN manifest version-code "$LOCAL_APK_PATH" 2>/dev/null | head -n 1 | tr -d '\r')"
+  [[ -n "$version_code" ]] || fail "Could not read versionCode from APK via apkanalyzer"
+  [[ "$version_code" =~ ^[0-9]+$ ]] || fail "Invalid APK versionCode: $version_code"
+  printf '%s\n' "$version_code"
+}
+
 stat_file_size() {
   local file_path="$1"
   if stat -f%z "$file_path" >/dev/null 2>&1; then
@@ -402,7 +410,13 @@ upload_release_files() {
 
 smoke_check_remote_release() {
   local base="${PUBLIC_BASE_URL%/}"
-  local update_json manifest_json legacy_manifest_21_json headers_html landing_html legacy20_manifest_file legacy20_status
+  local update_json manifest_json min_build_manifest_json headers_html landing_html legacy_manifest_file legacy_status report_json
+  local managed_manifest_min_build="${APP_UPDATE_ANDROID_MANIFEST_MIN_BUILD:-}"
+  if [[ -z "$managed_manifest_min_build" ]]; then
+    managed_manifest_min_build="$(run_ssh "$SERVER" "grep -E '^APP_UPDATE_ANDROID_MANIFEST_MIN_BUILD=' '$REMOTE_PROJECT_DIR/server/.env' 2>/dev/null | tail -n 1 | cut -d= -f2-" || true)"
+  fi
+  managed_manifest_min_build="${managed_manifest_min_build:-21}"
+  [[ "$managed_manifest_min_build" =~ ^[0-9]+$ ]] || managed_manifest_min_build="21"
 
   note "smoke: GET $base/api/app/update"
   update_json="$(curl -fsSL "$base/api/app/update")"
@@ -423,25 +437,37 @@ smoke_check_remote_release() {
   printf '%s' "$manifest_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
     node "$SCRIPT_DIR/check_android_manifest_parity.cjs" --stdin >/dev/null || fail "Smoke failed: manifest parity/signature verification failed"
 
-  note "smoke: GET $base/api/app/update/android/manifest?current_build=21"
-  legacy_manifest_21_json="$(curl -fsSL "$base/api/app/update/android/manifest?current_build=21")"
-  [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.ok')" == "true" ]] || fail "Smoke failed: legacy build 21 manifest returned ok=false"
-  [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.data.manifest.version')" == "$APP_VERSION_NAME" ]] || fail "Smoke failed: legacy build 21 manifest version mismatch"
-  [[ "$(printf '%s' "$legacy_manifest_21_json" | jq -r '.data.manifest.build')" == "$APP_BUILD_NUMBER" ]] || fail "Smoke failed: legacy build 21 manifest build mismatch"
-  printf '%s' "$legacy_manifest_21_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
-    node "$SCRIPT_DIR/check_android_manifest_parity.cjs" --stdin >/dev/null || fail "Smoke failed: legacy build 21 parity/signature verification failed"
+  if [[ "$managed_manifest_min_build" -gt 0 ]]; then
+    note "smoke: GET $base/api/app/update/android/manifest?current_build=$managed_manifest_min_build"
+    min_build_manifest_json="$(curl -fsSL "$base/api/app/update/android/manifest?current_build=$managed_manifest_min_build")"
+    [[ "$(printf '%s' "$min_build_manifest_json" | jq -r '.ok')" == "true" ]] || fail "Smoke failed: min managed build manifest returned ok=false"
+    [[ "$(printf '%s' "$min_build_manifest_json" | jq -r '.data.manifest.version')" == "$APP_VERSION_NAME" ]] || fail "Smoke failed: min managed build manifest version mismatch"
+    [[ "$(printf '%s' "$min_build_manifest_json" | jq -r '.data.manifest.build')" == "$APP_BUILD_NUMBER" ]] || fail "Smoke failed: min managed build manifest build mismatch"
+    printf '%s' "$min_build_manifest_json" | APP_UPDATE_MANIFEST_PUBLIC_KEY="$APP_UPDATE_MANIFEST_PUBLIC_KEY" \
+      node "$SCRIPT_DIR/check_android_manifest_parity.cjs" --stdin >/dev/null || fail "Smoke failed: min managed build parity/signature verification failed"
 
-  legacy20_manifest_file="$(mktemp -t fenix-legacy20-manifest.XXXXXX.json)"
-  legacy20_status="$(curl -sS -o "$legacy20_manifest_file" -w '%{http_code}' "$base/api/app/update/android/manifest?current_build=20")"
-  [[ "$legacy20_status" == "404" ]] || fail "Smoke failed: legacy build 20 expected 404, got $legacy20_status"
-  [[ "$(jq -r '.code' < "$legacy20_manifest_file")" == "unsupported_legacy_build" ]] || fail "Smoke failed: legacy build 20 code mismatch"
-  rm -f "$legacy20_manifest_file"
+    if [[ "$managed_manifest_min_build" -gt 1 ]]; then
+      legacy_manifest_file="$(mktemp -t fenix-legacy-manifest.XXXXXX.json)"
+      local unsupported_build=$((managed_manifest_min_build - 1))
+      legacy_status="$(curl -sS -o "$legacy_manifest_file" -w '%{http_code}' "$base/api/app/update/android/manifest?current_build=$unsupported_build")"
+      [[ "$legacy_status" == "404" ]] || fail "Smoke failed: unsupported build $unsupported_build expected 404, got $legacy_status"
+      [[ "$(jq -r '.code' < "$legacy_manifest_file")" == "unsupported_legacy_build" ]] || fail "Smoke failed: unsupported build code mismatch"
+      rm -f "$legacy_manifest_file"
+    fi
+  fi
 
   note "smoke: HEAD $base/api/app/update/android/apk"
   headers_html="$(curl -fsSI -H 'User-Agent: Android' -H 'X-Fenix-Platform: android' "$base/api/app/update/android/apk")"
   printf '%s' "$headers_html" | grep -iq '^accept-ranges: bytes' || fail "Smoke failed: APK endpoint missing Accept-Ranges"
   printf '%s' "$headers_html" | grep -iq '^etag:' || fail "Smoke failed: APK endpoint missing ETag"
   printf '%s' "$headers_html" | grep -iq '^last-modified:' || fail "Smoke failed: APK endpoint missing Last-Modified"
+
+  note "smoke: POST $base/api/app/update/android/report"
+  report_json="$(curl -fsSL -X POST "$base/api/app/update/android/report" \
+    -H 'Content-Type: application/json' \
+    -H 'X-Fenix-Platform: android' \
+    --data "{\"event_type\":\"release_smoke\",\"status\":\"ok\",\"app_version\":\"$APP_VERSION_NAME\",\"app_build\":$APP_BUILD_NUMBER,\"update_version\":\"$APP_VERSION_NAME\",\"update_build\":$APP_BUILD_NUMBER,\"payload\":{\"scope\":\"release_android_update\"}}")"
+  [[ "$(printf '%s' "$report_json" | jq -r '.ok')" == "true" ]] || fail "Smoke failed: android report endpoint returned ok=false"
 
   note "smoke: GET $base/download/android"
   landing_html="$(curl -fsSL -L "$base/download/android")"
@@ -477,6 +503,8 @@ build_release_apk_if_needed
 
 ACTUAL_PACKAGE_NAME="$(resolve_apk_package_name)"
 [[ "$ACTUAL_PACKAGE_NAME" == "$EXPECTED_PACKAGE_NAME" ]] || fail "APK package_name mismatch: expected $EXPECTED_PACKAGE_NAME, got $ACTUAL_PACKAGE_NAME"
+ACTUAL_VERSION_CODE="$(resolve_apk_version_code)"
+[[ "$ACTUAL_VERSION_CODE" == "$APP_BUILD_NUMBER" ]] || fail "APK versionCode mismatch: expected $APP_BUILD_NUMBER, got $ACTUAL_VERSION_CODE"
 
 APK_SHA256="$(shasum -a 256 "$LOCAL_APK_PATH" | awk '{print $1}')"
 APK_FILE_SIZE="$(stat_file_size "$LOCAL_APK_PATH")"

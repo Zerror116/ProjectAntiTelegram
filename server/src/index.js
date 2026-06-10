@@ -85,6 +85,9 @@ const realtimeDiagnostics = require("./utils/realtimeDiagnostics");
 const chatActivityStateService = require("./services/chatActivityState");
 const { tenantRoom } = require("./utils/socket");
 const {
+  androidCompatibilityGuard,
+} = require("./utils/androidCompatibility");
+const {
   rewriteSignedUploadsInPayload,
   signedUploadGuard,
 } = require("./utils/signedUploads");
@@ -588,6 +591,9 @@ app.use("/api/admin/delivery", applyForWriteMethods(heavyWriteLimiter));
 app.use("/api/admin/ops", applyForWriteMethods(heavyWriteLimiter));
 app.use("/api/delivery", applyForWriteMethods(heavyWriteLimiter));
 app.use("/api/support", applyForWriteMethods(heavyWriteLimiter));
+app.use((req, res, next) =>
+  androidCompatibilityGuard(req, res, next, { downloadsRoot }),
+);
 
 // ===================================
 // РОУТЫ

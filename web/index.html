@@ -440,6 +440,25 @@
             }
           } catch (_) {}
         }
+        await clearLegacyFlutterCaches();
+      }
+
+      async function clearLegacyFlutterCaches() {
+        if (!('caches' in window)) return;
+        try {
+          const cacheNames = await caches.keys();
+          await Promise.all(
+            cacheNames
+              .filter((cacheName) =>
+                cacheName === 'flutter-app-cache' ||
+                cacheName === 'flutter-temp-cache' ||
+                cacheName === 'flutter-app-manifest' ||
+                cacheName.startsWith('flutter-app-cache-') ||
+                cacheName.startsWith('flutter-temp-cache-'),
+              )
+              .map((cacheName) => caches.delete(cacheName)),
+          );
+        } catch (_) {}
       }
 
       function navigateToFreshBuild(versionToken) {
@@ -503,6 +522,7 @@
           !alreadyReloaded;
 
         applyVersionedShellAssets(serverVersion);
+        await clearLegacyFlutterCaches();
 
         if (shouldHardRefresh) {
           try {

@@ -1,5 +1,4 @@
 const db = require("../db");
-const { computeNotificationInboxBadgeCount } = require("./notifications");
 
 let vapidConfigured = false;
 let cachedWebPushModule = undefined;
@@ -185,25 +184,8 @@ function buildMessagePreview(message) {
 }
 
 async function computeUnreadBadgeCount(userId) {
-  const result = await db.query(
-    `SELECT COUNT(*)::int AS unread_count
-       FROM messages m
-       JOIN chat_members cm
-         ON cm.chat_id = m.chat_id
-        AND cm.user_id = $1
-      WHERE m.sender_id IS NOT NULL
-        AND m.sender_id <> $1
-        AND NOT EXISTS (
-          SELECT 1
-            FROM message_reads mr
-           WHERE mr.message_id = m.id
-             AND mr.user_id = $1
-        )
-        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
-        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false`,
-    [userId, String(userId)],
-  );
-  return Number(result.rows?.[0]?.unread_count || 0) || 0;
+  const { computeNotificationBadgeCount } = require("./notifications");
+  return computeNotificationBadgeCount(userId);
 }
 
 async function resolveChatPushRecipients({ chatId, senderId, explicitUserIds = [] }) {
@@ -348,7 +330,8 @@ async function sendWebPushPayloadToUser(userId, payload) {
 }
 
 async function sendTestWebPushToUser(userId) {
-  const unreadCount = await computeNotificationInboxBadgeCount(userId);
+  const { computeNotificationBadgeCount } = require("./notifications");
+  const unreadCount = await computeNotificationBadgeCount(userId);
   return sendPayloadToUserSubscriptions(userId, {
     type: "test",
     title: "Проект Феникс",

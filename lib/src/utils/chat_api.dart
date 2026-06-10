@@ -33,12 +33,12 @@ Future<List<Map<String, dynamic>>> loadChatsCollection() async {
           'Pragma': 'no-cache',
           'Accept': 'application/json',
         },
-        sendTimeout: const Duration(seconds: 12),
-        receiveTimeout: const Duration(seconds: 12),
+        sendTimeout: const Duration(seconds: 20),
+        receiveTimeout: const Duration(seconds: 20),
       ),
     );
     final response = await future.timeout(
-      const Duration(seconds: 14),
+      const Duration(seconds: 22),
       onTimeout: () {
         throw DioException(
           requestOptions: RequestOptions(path: path),
@@ -67,7 +67,10 @@ Future<List<Map<String, dynamic>>> loadChatsCollection() async {
   } catch (firstError) {
     try {
       return await attempt('/api/chats');
-    } catch (_) {
+    } catch (fallbackError, fallbackStack) {
+      if (fallbackError is DioException && fallbackError.response != null) {
+        Error.throwWithStackTrace(fallbackError, fallbackStack);
+      }
       throw firstError;
     }
   }

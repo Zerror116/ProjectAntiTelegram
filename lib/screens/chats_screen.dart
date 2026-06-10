@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
@@ -7,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../assets/phoenix_assets.dart';
 import '../main.dart';
+import '../services/android_update_report_service.dart';
 import '../src/utils/chat_api.dart';
 import '../src/utils/messenger_ui_helpers.dart';
 import '../src/utils/media_url.dart';
@@ -25,6 +27,8 @@ class ChatsScreen extends StatefulWidget {
 }
 
 class _ChatsScreenState extends State<ChatsScreen> {
+  static const String _chatsCachePrefix = 'chats_screen_cache_v2_';
+
   List<Map<String, dynamic>> _chats = [];
   bool _loading = true;
   String _error = '';
@@ -39,6 +43,75 @@ class _ChatsScreenState extends State<ChatsScreen> {
   final Map<String, Timer> _recentlyUpdatedChatTimers = <String, Timer>{};
 
   String _chatIdOf(Map<String, dynamic> chat) => (chat['id'] ?? '').toString();
+
+  String _chatsCacheKey() {
+    final user = authService.currentUser;
+    final userId = (user?.id ?? '').trim();
+    final tenantCode =
+        (authService.creatorTenantScopeCode ?? user?.tenantCode ?? '').trim();
+    final scope = [
+      userId.isEmpty ? 'guest' : userId,
+      tenantCode.isEmpty ? 'default' : tenantCode,
+      authService.effectiveRole.trim().toLowerCase(),
+    ].join('_');
+    return '$_chatsCachePrefix$scope';
+  }
+
+  int _localChatUnreadTotal() {
+    var total = 0;
+    for (final chat in _chats) {
+      final count = int.tryParse('${chat['unread_count'] ?? 0}') ?? 0;
+      if (count > 0) total += count;
+    }
+    return total;
+  }
+
+  void _syncChatUnreadBadgeFromLocal() {
+    chatUnreadBadgeCountNotifier.value = _localChatUnreadTotal();
+  }
+
+  Future<void> _saveChatsCache(List<Map<String, dynamic>> chats) async {
+    if (authService.currentUser == null || chats.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_chatsCacheKey(), jsonEncode(chats));
+    } catch (e) {
+      debugPrint('Chats cache save skipped: $e');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _readChatsCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_chatsCacheKey())?.trim() ?? '';
+      if (raw.isEmpty) return const <Map<String, dynamic>>[];
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const <Map<String, dynamic>>[];
+      return decoded
+          .whereType<Map>()
+          .map((row) => Map<String, dynamic>.from(row))
+          .toList(growable: true);
+    } catch (e) {
+      debugPrint('Chats cache read skipped: $e');
+      return const <Map<String, dynamic>>[];
+    }
+  }
+
+  Future<bool> _restoreCachedChats() async {
+    if (_chats.isNotEmpty || authService.currentUser == null) return false;
+    final cached = await _readChatsCache();
+    if (cached.isEmpty || !mounted) return false;
+    cached.sort(_compareChats);
+    setState(() {
+      _chats = _sanitizeChatsForUi(cached);
+      _activeFolder = _effectiveActiveFolder();
+      _loadedOnce = true;
+      _loading = false;
+      _error = '';
+    });
+    _syncChatUnreadBadgeFromLocal();
+    return true;
+  }
 
   Map<String, dynamic> _normalizeChatRow(Map<String, dynamic> row) {
     final normalized = Map<String, dynamic>.from(row);
@@ -174,6 +247,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       }
       _sortChats();
     });
+    _syncChatUnreadBadgeFromLocal();
   }
 
   void _removeChatLocally(String chatId) {
@@ -181,6 +255,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     setState(() {
       _chats = _chats.where((c) => _chatIdOf(c) != chatId).toList();
     });
+    _syncChatUnreadBadgeFromLocal();
   }
 
   void _markChatReadLocally(String chatId, {int unreadCount = 0}) {
@@ -193,12 +268,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
         'unread_count': unreadCount.clamp(0, 999999),
       };
     });
+    _syncChatUnreadBadgeFromLocal();
   }
 
   void _applyIncomingMessagePreview(
     String chatId,
-    Map<String, dynamic> message,
-  ) {
+    Map<String, dynamic> message, {
+    int? unreadCountOverride,
+    int? globalChatUnreadCountOverride,
+  }) {
     if (chatId.isEmpty) return;
     final text = (message['text'] ?? '').toString();
     final senderId = (message['sender_id'] ?? '').toString();
@@ -227,9 +305,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
       final previousUnread = index >= 0
           ? int.tryParse('${_chats[index]['unread_count'] ?? 0}') ?? 0
           : 0;
-      patch['unread_count'] = (!fromCurrentUser && !isActiveChat)
-          ? previousUnread + 1
-          : 0;
+      patch['unread_count'] =
+          unreadCountOverride ??
+          ((!fromCurrentUser && !isActiveChat) ? previousUnread + 1 : 0);
       if (index >= 0) {
         _chats[index] = {..._chats[index], ...patch};
       } else {
@@ -237,6 +315,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
       }
       _sortChats();
     });
+    if (globalChatUnreadCountOverride != null) {
+      chatUnreadBadgeCountNotifier.value = globalChatUnreadCountOverride.clamp(
+        0,
+        999999,
+      );
+    } else {
+      _syncChatUnreadBadgeFromLocal();
+    }
     _markChatRowRecentlyUpdated(chatId);
   }
 
@@ -395,11 +481,38 @@ class _ChatsScreenState extends State<ChatsScreen> {
       }
       if (error.type == DioExceptionType.connectionError ||
           error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.sendTimeout ||
           error.type == DioExceptionType.receiveTimeout) {
         return 'Не удалось подключиться к чатам. Проверьте интернет и попробуйте снова.';
       }
     }
     return 'Не удалось загрузить чаты. Попробуйте ещё раз.';
+  }
+
+  void _reportChatsLoadFailure(Object error) {
+    var statusCode = '';
+    var errorCode = 'unknown';
+    var errorMessage = error.toString();
+    if (error is DioException) {
+      statusCode = '${error.response?.statusCode ?? ''}';
+      errorCode = error.type.name;
+      errorMessage = _chatLoadErrorText(error);
+    }
+    unawaited(
+      AndroidUpdateReportService.report(
+        authService.dio,
+        eventType: 'screen_load_failed',
+        status: 'error',
+        stage: 'chats',
+        errorCode: statusCode.isNotEmpty ? 'http_$statusCode' : errorCode,
+        errorMessage: errorMessage,
+        payload: <String, dynamic>{
+          'screen': 'chats',
+          'path': '/api/chats/list',
+          if (statusCode.isNotEmpty) 'status_code': statusCode,
+        },
+      ),
+    );
   }
 
   Future<void> _openChat(Map<String, dynamic> chat) async {
@@ -1125,6 +1238,12 @@ class _ChatsScreenState extends State<ChatsScreen> {
         final apiError = (responseData['error'] ?? '').toString().trim();
         if (apiError.isNotEmpty) return apiError;
       }
+      if (error.type == DioExceptionType.connectionError ||
+          error.type == DioExceptionType.connectionTimeout ||
+          error.type == DioExceptionType.sendTimeout ||
+          error.type == DioExceptionType.receiveTimeout) {
+        return 'Не удалось подключиться к серверу. Проверьте интернет и попробуйте снова.';
+      }
       final message = error.message?.trim() ?? '';
       if (message.isNotEmpty) return message;
       return 'Ошибка сети';
@@ -1334,7 +1453,10 @@ class _ChatsScreenState extends State<ChatsScreen> {
   @override
   void initState() {
     super.initState();
-    _loadChats(showLoader: true);
+    unawaited(() async {
+      await _restoreCachedChats();
+      await _loadChats(showLoader: true);
+    }());
     unawaited(refreshSupportQueueNotices());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_ensureRulesPromptShown());
@@ -1383,9 +1505,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
           final chatId = (data['chatId'] ?? msg?['chat_id'] ?? msg?['chatId'])
               ?.toString();
           if (chatId != null && msg is Map) {
+            final unreadCountOverride = data.containsKey('unread_count')
+                ? int.tryParse('${data['unread_count'] ?? 0}')
+                : null;
+            final globalChatUnreadCountOverride =
+                data.containsKey('chat_unread_count')
+                ? int.tryParse('${data['chat_unread_count'] ?? 0}')
+                : null;
             _applyIncomingMessagePreview(
               chatId,
               Map<String, dynamic>.from(msg),
+              unreadCountOverride: unreadCountOverride,
+              globalChatUnreadCountOverride: globalChatUnreadCountOverride,
             );
           }
         }
@@ -1437,20 +1568,34 @@ class _ChatsScreenState extends State<ChatsScreen> {
     return 'chat_rules_seen_$userId';
   }
 
+  Future<String> _loadTenantRulesText() async {
+    const fallback =
+        'Правила группы пока не заполнены. Следите за объявлениями администратора.';
+    try {
+      final resp = await authService.dio.get('/api/profile/tenant/rules');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final rules = (data['data']['rules_text'] ?? '').toString().trim();
+        if (rules.isNotEmpty) return rules;
+      }
+    } catch (_) {
+      // Правила не должны блокировать список чатов, поэтому показываем запасной текст.
+    }
+    return fallback;
+  }
+
   Future<void> _showRulesDialog({bool persistSeen = false}) async {
     if (!mounted) return;
     if (_rulesPromptInProgress) return;
     _rulesPromptInProgress = true;
     try {
+      final rulesText = await _loadTenantRulesText();
+      if (!mounted) return;
       await showDialog<void>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('Правила канала'),
-          content: const Text(
-            'Это макет правил, в будущем он будет обновлён.\n\n'
-            'Пока соблюдайте приятное общение, без матов, желательно.\n\n'
-            'Пока что главное правило: если что-то работает не так или сломается, напишите в этом же приложении через меню "Настройки" -> "Сообщить о проблеме".',
-          ),
+          content: SingleChildScrollView(child: SelectableText(rulesText)),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(ctx).pop(),
@@ -1502,10 +1647,17 @@ class _ChatsScreenState extends State<ChatsScreen> {
         _activeFolder = _effectiveActiveFolder();
         _loadedOnce = true;
       });
+      _syncChatUnreadBadgeFromLocal();
+      unawaited(_saveChatsCache(_chats));
     } catch (e) {
+      _reportChatsLoadFailure(e);
       if (!mounted) return;
       if (_chats.isEmpty) {
-        setState(() => _error = _chatLoadErrorText(e));
+        final restored = await _restoreCachedChats();
+        if (!mounted) return;
+        if (!restored) {
+          setState(() => _error = _chatLoadErrorText(e));
+        }
       }
     } finally {
       _refreshInFlight = false;

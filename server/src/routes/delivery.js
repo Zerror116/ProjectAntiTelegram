@@ -24,8 +24,10 @@ const {
   validateAddressSelection,
   isAddressProviderError,
 } = require("../utils/deliveryAddressing");
+const { getTenantFeatureSettings } = require("../utils/tenantFeatureSettings");
 
 const requireDeliveryManagePermission = requirePermission("delivery.manage");
+const KINEL_TENANT_CODE = "kinel-8997";
 
 const DEFAULT_ROUTE_ORIGIN = { lat: 55.751244, lng: 37.618423 };
 const DELIVERY_DAY_START_MINUTES = 10 * 60;
@@ -101,6 +103,44 @@ let deliveryDialogCleanupTimer = null;
 let deliveryDialogCleanupRunning = false;
 let deliveryDialogCleanupIo = null;
 let lastClientRetentionSweepAt = 0;
+
+function cartRetentionDaysFromSettings(settings) {
+  const parsed = Number(settings?.cart_retention_days);
+  if (!Number.isFinite(parsed)) return CART_RETENTION_WARNING_DAYS;
+  return Math.max(1, Math.min(365, Math.round(parsed)));
+}
+
+function normalizeRoleValue(value) {
+  return String(value || "").toLowerCase().trim();
+}
+
+function isKinelTenantScope(user) {
+  const tenantCode = String(user?.tenant_code || "")
+    .toLowerCase()
+    .trim();
+  const tenantName = String(user?.tenant_name || "")
+    .toLowerCase()
+    .trim();
+  return (
+    tenantCode === KINEL_TENANT_CODE ||
+    tenantCode.includes("kinel") ||
+    tenantName.includes("кинель")
+  );
+}
+
+function isKinelWorkerDeliveryAssemblyUser(user) {
+  return normalizeRoleValue(user?.role) === "worker" && isKinelTenantScope(user);
+}
+
+function requireDeliveryAssemblyAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  if (isKinelWorkerDeliveryAssemblyUser(req.user)) {
+    return next();
+  }
+  return requireDeliveryManagePermission(req, res, next);
+}
 
 function deliveryDialogWhere(alias = "c") {
   return `${alias}.type = 'private'
@@ -275,6 +315,44 @@ function formatDateOnly(date) {
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   const dd = String(date.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function formatSamaraDateOnly(date = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Samara",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    if (values.year && values.month && values.day) {
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+  } catch (_) {}
+  return date.toISOString().slice(0, 10);
+}
+
+function formatSamaraDateRu(date = new Date()) {
+  try {
+    return new Intl.DateTimeFormat("ru-RU", {
+      timeZone: "Europe/Samara",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    }).format(date);
+  } catch (_) {}
+  return date.toLocaleDateString("ru-RU");
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + Number(days || 0));
+  return next;
+}
+
+function buildSelfPickupDeliveryLabel(date = new Date()) {
+  return `Самовывоз ${formatSamaraDateRu(date)}`;
 }
 
 function firstLetterCode(name) {
@@ -1535,6 +1613,7 @@ async function getCartRetentionSnapshot(
   userId,
   tenantId = null,
   statuses = CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE,
+  retentionDays = CART_RETENTION_WARNING_DAYS,
 ) {
   if (!userId) return null;
   const scopedTenantId = resolveTenantScopeId(tenantId);
@@ -1562,12 +1641,17 @@ async function getCartRetentionSnapshot(
     0,
     Math.floor((Date.now() - oldestCreatedAt.getTime()) / (24 * 60 * 60 * 1000)),
   );
+  const thresholdDays = Math.max(
+    1,
+    Math.min(365, Math.round(Number(retentionDays) || CART_RETENTION_WARNING_DAYS)),
+  );
   return {
     oldest_created_at: oldestCreatedAt.toISOString(),
     items_count: Number(row.items_count || 0),
     total_sum: toMoney(row.total_sum),
     days_held: daysHeld,
-    is_stale: daysHeld >= CART_RETENTION_WARNING_DAYS,
+    threshold_days: thresholdDays,
+    is_stale: daysHeld >= thresholdDays,
   };
 }
 
@@ -1577,14 +1661,23 @@ async function autoDismantleStaleCart(
     userId,
     tenantId = null,
     statuses = CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE,
+    retentionDays = null,
   } = {},
 ) {
   const safeStatuses = normalizeCartStatusList(statuses);
+  const effectiveRetentionDays =
+    retentionDays == null
+      ? cartRetentionDaysFromSettings(await getTenantFeatureSettings(tenantId || null))
+      : Math.max(
+          1,
+          Math.min(365, Math.round(Number(retentionDays) || CART_RETENTION_WARNING_DAYS)),
+        );
   const retention = await getCartRetentionSnapshot(
     queryable,
     userId,
     tenantId,
     safeStatuses,
+    effectiveRetentionDays,
   );
   if (!retention || !retention.is_stale) {
     return { applied: false, retention };
@@ -1742,10 +1835,18 @@ async function autoDismantleStaleCart(
 
 async function listStaleCartUserIds(
   queryable,
-  { tenantId = null, limit = CLIENT_RETENTION_SWEEP_LIMIT } = {},
+  {
+    tenantId = null,
+    limit = CLIENT_RETENTION_SWEEP_LIMIT,
+    retentionDays = CART_RETENTION_WARNING_DAYS,
+  } = {},
 ) {
   const scopedTenantId = resolveTenantScopeId(tenantId);
   const safeLimit = Math.max(1, Number(limit) || CLIENT_RETENTION_SWEEP_LIMIT);
+  const safeRetentionDays = Math.max(
+    1,
+    Math.min(365, Math.round(Number(retentionDays) || CART_RETENTION_WARNING_DAYS)),
+  );
   const result = await queryable.query(
     `SELECT c.user_id::text AS user_id,
             MAX(COALESCE(c.updated_at, c.created_at)) AS last_activity_at
@@ -1768,7 +1869,7 @@ async function listStaleCartUserIds(
     [
       CART_INACTIVITY_SWEEP_STATUSES,
       scopedTenantId,
-      CART_RETENTION_WARNING_DAYS,
+      safeRetentionDays,
       safeLimit,
     ],
   );
@@ -1899,9 +2000,12 @@ async function runClientRetentionSweepInScope(
   queryable,
   { tenantId = null, io = null, scopeLabel = "shared" } = {},
 ) {
+  const tenantSettings = await getTenantFeatureSettings(tenantId || null);
+  const retentionDays = cartRetentionDaysFromSettings(tenantSettings);
   const staleUserIds = await listStaleCartUserIds(queryable, {
     tenantId,
     limit: CLIENT_RETENTION_SWEEP_LIMIT,
+    retentionDays,
   });
   let staleCartsDismantled = 0;
   for (const userId of staleUserIds) {
@@ -1912,6 +2016,7 @@ async function runClientRetentionSweepInScope(
         userId,
         tenantId,
         statuses: CART_INACTIVITY_SWEEP_STATUSES,
+        retentionDays,
       });
       await client.query("COMMIT");
       if (result?.applied) {
@@ -1925,7 +2030,7 @@ async function runClientRetentionSweepInScope(
           type: "cart_auto_dismantled_inactive",
           tenant_id: resolveTenantScopeId(tenantId),
           user_id: userId,
-          reason: "inactive_30d",
+          reason: `inactive_${retentionDays}d`,
           at: new Date().toISOString(),
         });
       }
@@ -2100,12 +2205,12 @@ async function insertDeliveryBatchItems(
       `INSERT INTO delivery_batch_items (
          id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
          quantity, unit_price, line_total, product_code, product_title,
-         product_description, product_image_url, created_at
+         product_description, product_image_url, is_bulky, bulky_note, created_at
        )
        VALUES (
          $1, $2, $3, $4, $5, $6,
          $7, $8, $9, $10, $11,
-         $12, $13, now()
+         $12, $13, $14, NULLIF(BTRIM($15::text), ''), now()
        )
        ON CONFLICT (cart_item_id) DO NOTHING
        RETURNING id`,
@@ -2123,6 +2228,8 @@ async function insertDeliveryBatchItems(
         item.product_title,
         item.product_description,
         item.product_image_url,
+        item.is_bulky === true,
+        item.is_bulky === true ? String(item.product_title || '') : '',
       ],
     );
     inserted += result.rowCount || 0;
@@ -2177,6 +2284,7 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
             p.description AS product_description,
             p.image_url AS product_image_url,
             COALESCE(p.pickup_only, false) AS pickup_only,
+            COALESCE(p.is_bulky, false) AS is_bulky,
             COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
             COALESCE(NULLIF(BTRIM(u.client_city), ''), '') AS client_city,
             COALESCE(ph.phone, '') AS customer_phone,
@@ -2206,7 +2314,7 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
        ORDER BY a.is_default DESC, a.updated_at DESC
        LIMIT 1
      ) AS addr ON true
-     WHERE c.status = 'processed'
+     WHERE c.status = ANY($2::text[])
        AND p.deleted_at IS NULL
        AND COALESCE(p.status, '') <> 'deleted'
        AND ($1::uuid IS NULL OR u.tenant_id = $1::uuid)
@@ -2243,7 +2351,7 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
            )
        )
      ORDER BY c.user_id ASC, c.updated_at DESC, c.created_at DESC`,
-    [scopedTenantId],
+    [scopedTenantId, ["processed", "pending_processing", "pending"]],
   );
 
   const grouped = new Map();
@@ -2293,8 +2401,10 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
     const bucket = grouped.get(key);
     bucket.processed_sum = toMoney(bucket.processed_sum + lineTotal);
     bucket.processed_items_count += Number(row.quantity) || 0;
-    // В новой схеме доставки габарит определяется только во время сборки.
-    // Старый processing_mode='oversize' не должен заранее создавать места.
+    if (row.is_bulky === true) {
+      bucket.bulky_places += Number(row.quantity) || 1;
+      bucket.bulky_titles.push(String(row.product_title || '').trim() || 'Габарит');
+    }
     if (row.pickup_only === true) {
       bucket.has_pickup_only = true;
     }
@@ -2311,6 +2421,8 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
       product_description: row.product_description,
       product_image_url: row.product_image_url,
       pickup_only: row.pickup_only === true,
+      is_bulky: row.is_bulky === true,
+      bulky_note: row.is_bulky === true ? row.product_title : null,
     });
   }
   return Array.from(grouped.values()).map((entry) => {
@@ -3195,12 +3307,10 @@ function buildDeliveryDeclinedText() {
 function buildDeliveryAutoDismantledText(autoResult) {
   const removedCount = Number(autoResult?.removed_items_count || 0);
   const daysHeld = Number(autoResult?.retention?.days_held || 0);
+  const thresholdDays = Number(autoResult?.retention?.threshold_days || CART_RETENTION_WARNING_DAYS);
   return [
     "Доставка отклонена.",
-    `Корзина была расформирована автоматически, так как держалась больше ${Math.max(
-      CART_RETENTION_WARNING_DAYS,
-      daysHeld,
-    )} дней.`,
+    `Корзина была расформирована автоматически, так как держалась ${daysHeld} дн. при лимите ${thresholdDays} дн.`,
     removedCount > 0
       ? `Удалено позиций: ${removedCount}.`
       : "Позиции корзины были очищены.",
@@ -3260,6 +3370,8 @@ async function rerouteAcceptedCustomers(queryable, batchId) {
      FROM delivery_batch_customers
      WHERE batch_id = $1
        AND call_status = 'accepted'
+       AND COALESCE(route_excluded, false) = false
+       AND COALESCE(self_pickup, false) = false
      ORDER BY customer_name ASC`,
     [batchId],
   );
@@ -3278,7 +3390,9 @@ async function rerouteAcceptedCustomers(queryable, batchId) {
          delivery_status = 'preparing_delivery',
          updated_at = now()
      WHERE batch_id = $1
-       AND call_status = 'accepted'`,
+       AND call_status = 'accepted'
+       AND COALESCE(route_excluded, false) = false
+       AND COALESCE(self_pickup, false) = false`,
     [batchId],
   );
 
@@ -3328,6 +3442,8 @@ async function rerouteAcceptedCustomers(queryable, batchId) {
        JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
        WHERE i.batch_id = $1
          AND c.call_status = 'accepted'
+         AND COALESCE(c.route_excluded, false) = false
+         AND COALESCE(c.self_pickup, false) = false
      )`,
     [batchId],
   );
@@ -3520,6 +3636,286 @@ async function createDefectReportForDeliveryItem(
   );
 }
 
+async function createManualPhoneSelfPickupArchive(
+  queryable,
+  {
+    actorUserId,
+    tenantId = null,
+    deliveryDate = new Date(),
+    pickupNote,
+    rows = [],
+  },
+) {
+  const sourceRows = Array.isArray(rows)
+    ? rows.filter((row) => row && !String(row.existing_delivery_item_id || "").trim())
+    : [];
+  const normalizedDeliveryDate = formatSamaraDateOnly(deliveryDate);
+  const deliveryLabel = buildSelfPickupDeliveryLabel(deliveryDate);
+  if (sourceRows.length === 0) {
+    return {
+      batchId: null,
+      deliveryDate: normalizedDeliveryDate,
+      deliveryLabel,
+      archivedItems: 0,
+      archivedCartItemIds: [],
+      customerIds: [],
+    };
+  }
+
+  const settings = await getDeliverySettings(queryable, tenantId);
+  const existingBatchQ = await queryable.query(
+    `SELECT b.id
+     FROM delivery_batches b
+     WHERE b.delivery_date = $1::date
+       AND b.delivery_label = $2
+       AND COALESCE(b.status, '') = 'completed'
+       AND (
+         $3::uuid IS NULL
+         OR EXISTS (
+           SELECT 1
+           FROM users bu
+           WHERE bu.id = b.created_by
+             AND bu.tenant_id = $3::uuid
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM delivery_batch_customers dbc
+           JOIN users cu ON cu.id = dbc.user_id
+           WHERE dbc.batch_id = b.id
+             AND cu.tenant_id = $3::uuid
+         )
+       )
+     ORDER BY b.created_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedDeliveryDate, deliveryLabel, tenantId || null],
+  );
+
+  let batchCreated = false;
+  let batchId = existingBatchQ.rows[0]?.id
+    ? String(existingBatchQ.rows[0].id)
+    : "";
+  if (!batchId) {
+    const batchInsert = await queryable.query(
+      `INSERT INTO delivery_batches (
+         id, delivery_date, delivery_label, threshold_amount, status,
+         courier_count, courier_names, created_by, confirmed_at,
+         handed_off_at, completed_at, created_at, updated_at
+       )
+       VALUES (
+         $1, $2::date, $3, $4, 'completed',
+         0, '[]'::jsonb, $5, now(),
+         now(), now(), now(), now()
+       )
+       RETURNING id`,
+      [
+        uuidv4(),
+        normalizedDeliveryDate,
+        deliveryLabel,
+        toMoney(settings.threshold_amount, 1500),
+        actorUserId || null,
+      ],
+    );
+    batchId = String(batchInsert.rows[0].id);
+    batchCreated = true;
+  }
+
+  const rowsByUserId = new Map();
+  for (const row of sourceRows) {
+    const userId = String(row.user_id || "").trim();
+    if (!userId) continue;
+    if (!rowsByUserId.has(userId)) rowsByUserId.set(userId, []);
+    rowsByUserId.get(userId).push(row);
+  }
+
+  const archivedCartItemIds = [];
+  const customerIds = [];
+  let archivedItems = 0;
+  for (const [userId, userRows] of rowsByUserId.entries()) {
+    const first = userRows[0] || {};
+    const items = [];
+    let totalSum = 0;
+    let itemCount = 0;
+    for (const row of userRows) {
+      const quantity = Math.max(1, Number(row.quantity) || 1);
+      const unitPrice = toMoney(row.product_price);
+      const lineTotal = toMoney(unitPrice * quantity);
+      totalSum = toMoney(totalSum + lineTotal);
+      itemCount += quantity;
+      items.push({
+        cart_item_id: row.cart_item_id,
+        user_id: row.user_id,
+        product_id: row.product_id,
+        quantity,
+        unit_price: unitPrice,
+        line_total: lineTotal,
+        product_code: row.product_code == null ? null : Number(row.product_code),
+        product_title: row.product_title,
+        product_description: row.product_description,
+        product_image_url: row.product_image_url,
+        is_bulky: row.is_bulky === true,
+        bulky_note: row.is_bulky === true ? row.product_title : null,
+      });
+    }
+    if (items.length === 0) continue;
+
+    const clientCity = normalizeCityName(first.client_city);
+    const rules = deliveryRulesForCustomer(settings, clientCity);
+    const customerName =
+      String(first.client_name || "").trim() ||
+      String(first.email || "").trim() ||
+      "Клиент";
+    const customerPhone = String(first.stored_phone || "").trim();
+    const shelfNumber =
+      first.user_shelf_number == null
+        ? null
+        : Number(first.user_shelf_number) || null;
+    const customerQ = await queryable.query(
+      `INSERT INTO delivery_batch_customers (
+         id, batch_id, user_id, customer_name, customer_phone,
+         processed_sum, agreed_sum, claim_return_sum, claim_discount_sum,
+         claims_total, processed_items_count, shelf_number,
+         call_status, delivery_status, package_places, bulky_places,
+         bulky_note, notes, accepted_at, assembly_status,
+         assembly_started_at, assembly_started_by, assembly_completed_at,
+         assembly_completed_by, client_city, delivery_threshold_amount,
+         delivery_fee_amount, created_at, updated_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5,
+         $6, $6, 0, 0,
+         0, $7, $8,
+         'accepted', 'completed', 1, 0,
+         NULL, $9, now(), 'assembled',
+         now(), $10, now(),
+         $10, NULLIF($11, ''), $12,
+         $13, now(), now()
+       )
+       ON CONFLICT (batch_id, user_id) DO UPDATE
+       SET customer_name = EXCLUDED.customer_name,
+           customer_phone = EXCLUDED.customer_phone,
+           call_status = 'accepted',
+           delivery_status = 'completed',
+           package_places = GREATEST(delivery_batch_customers.package_places, 1),
+           bulky_places = 0,
+           bulky_note = NULL,
+           notes = CASE
+             WHEN COALESCE(BTRIM(delivery_batch_customers.notes), '') = '' THEN EXCLUDED.notes
+             WHEN delivery_batch_customers.notes LIKE '%' || EXCLUDED.notes || '%' THEN delivery_batch_customers.notes
+             ELSE CONCAT(delivery_batch_customers.notes, E'\n', EXCLUDED.notes)
+           END,
+           accepted_at = COALESCE(delivery_batch_customers.accepted_at, now()),
+           assembly_status = 'assembled',
+           assembly_started_at = COALESCE(delivery_batch_customers.assembly_started_at, now()),
+           assembly_started_by = COALESCE(delivery_batch_customers.assembly_started_by, $10),
+           assembly_completed_at = now(),
+           assembly_completed_by = $10,
+           client_city = EXCLUDED.client_city,
+           delivery_threshold_amount = EXCLUDED.delivery_threshold_amount,
+           delivery_fee_amount = EXCLUDED.delivery_fee_amount,
+           updated_at = now()
+       RETURNING id`,
+      [
+        uuidv4(),
+        batchId,
+        userId,
+        customerName,
+        customerPhone,
+        totalSum,
+        itemCount,
+        shelfNumber,
+        pickupNote,
+        actorUserId || null,
+        clientCity,
+        toMoney(rules.threshold_amount, settings.threshold_amount),
+        toMoney(rules.delivery_fee_amount, 0),
+      ],
+    );
+    const batchCustomerId = String(customerQ.rows[0].id);
+
+    let insertedForCustomer = 0;
+    for (const item of items) {
+      const inserted = await queryable.query(
+        `INSERT INTO delivery_batch_items (
+           id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
+           quantity, unit_price, line_total, product_code, product_title,
+           product_description, product_image_url, assembly_status,
+           is_bulky, bulky_note, removed_reason, removed_at, removed_by, created_at
+         )
+         VALUES (
+           $1, $2, $3, $4, $5, $6,
+           $7, $8, $9, $10, $11,
+           $12, $13, 'collected',
+           $14, NULLIF(BTRIM($15::text), ''), NULL, NULL, NULL, now()
+         )
+         ON CONFLICT (cart_item_id) DO NOTHING
+         RETURNING id`,
+        [
+          uuidv4(),
+          batchId,
+          batchCustomerId,
+          item.cart_item_id,
+          item.user_id,
+          item.product_id,
+          item.quantity,
+          item.unit_price,
+          item.line_total,
+          item.product_code,
+          item.product_title,
+          item.product_description,
+          item.product_image_url,
+          item.is_bulky === true,
+          item.bulky_note || '',
+        ],
+      );
+      if ((inserted.rowCount || 0) > 0) {
+        insertedForCustomer += 1;
+        archivedItems += 1;
+        archivedCartItemIds.push(String(item.cart_item_id));
+      }
+    }
+
+    if (insertedForCustomer > 0) {
+      customerIds.push(batchCustomerId);
+      await recalculateDeliveryCustomerTotals(queryable, batchCustomerId);
+    }
+  }
+
+  if (archivedItems === 0) {
+    if (batchCreated) {
+      await queryable.query(`DELETE FROM delivery_batches WHERE id = $1`, [batchId]);
+    }
+    return {
+      batchId: null,
+      deliveryDate: normalizedDeliveryDate,
+      deliveryLabel,
+      archivedItems: 0,
+      archivedCartItemIds: [],
+      customerIds: [],
+    };
+  }
+
+  await queryable.query(
+    `UPDATE delivery_batches
+     SET status = 'completed',
+         confirmed_at = COALESCE(confirmed_at, now()),
+         handed_off_at = COALESCE(handed_off_at, now()),
+         completed_at = COALESCE(completed_at, now()),
+         updated_at = now()
+     WHERE id = $1`,
+    [batchId],
+  );
+
+  return {
+    batchId,
+    deliveryDate: normalizedDeliveryDate,
+    deliveryLabel,
+    archivedItems,
+    archivedCartItemIds,
+    customerIds,
+  };
+}
+
 router.post(
   "/manual-processing-by-phones",
   requireAuth,
@@ -3598,38 +3994,65 @@ router.post(
                   c.product_id::text AS product_id,
                   c.quantity,
                   c.status,
+                  COALESCE(c.processing_mode, 'standard') AS processing_mode,
                   p.product_code,
                   p.shelf_number AS product_shelf_number,
                   p.title AS product_title,
                   p.description AS product_description,
                   p.image_url AS product_image_url,
-                  p.price AS product_price
+                  COALESCE(p.is_bulky, false) AS is_bulky,
+                  COALESCE(c.custom_price, p.price) AS product_price,
+                  COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS client_name,
+                  u.email,
+                  COALESCE(NULLIF(BTRIM(u.client_city), ''), '') AS client_city,
+                  COALESCE(ph.phone, '') AS stored_phone,
+                  us.shelf_number AS user_shelf_number,
+                  dbi.id::text AS existing_delivery_item_id,
+                  dbi.batch_id::text AS existing_delivery_batch_id,
+                  dbt.delivery_date AS existing_delivery_date,
+                  dbt.delivery_label AS existing_delivery_label,
+                  dbt.status AS existing_delivery_batch_status,
+                  dbc.delivery_status AS existing_delivery_status
            FROM cart_items c
            JOIN products p ON p.id = c.product_id
            JOIN users u ON u.id = c.user_id
+           LEFT JOIN phones ph ON ph.user_id = c.user_id
+           LEFT JOIN user_shelves us ON us.user_id = c.user_id
+           LEFT JOIN delivery_batch_items dbi ON dbi.cart_item_id = c.id
+           LEFT JOIN delivery_batches dbt ON dbt.id = dbi.batch_id
+           LEFT JOIN delivery_batch_customers dbc ON dbc.id = dbi.batch_customer_id
            WHERE c.user_id = ANY($1::uuid[])
              AND c.status = ANY($2::text[])
              AND ($3::uuid IS NULL OR u.tenant_id = $3::uuid)
-           ORDER BY c.user_id ASC, c.updated_at DESC, c.created_at DESC
+             AND p.deleted_at IS NULL
+             AND COALESCE(p.status, '') <> 'deleted'
+           ORDER BY c.user_id ASC, p.shelf_number ASC NULLS LAST, p.product_code ASC NULLS LAST, c.updated_at DESC
            FOR UPDATE OF c`,
-          [matchedUserIds, ["pending_processing", "pending"], tenantId],
+          [
+            matchedUserIds,
+            ["pending_processing", "pending", "processed"],
+            tenantId,
+          ],
         );
         itemRows = itemsQ.rows;
       }
 
-      const cartItemIds = itemRows
+      const shouldManuallyProcess = (status) =>
+        ["pending_processing", "pending"].includes(String(status || "").trim());
+      const cartItemIdsToProcess = itemRows
+        .filter((row) => shouldManuallyProcess(row.status))
         .map((row) => String(row.cart_item_id || "").trim())
         .filter(Boolean);
 
       let updatedMessages = [];
-      if (cartItemIds.length > 0) {
+      if (cartItemIdsToProcess.length > 0) {
         await client.query(
           `UPDATE cart_items
            SET status = 'processed',
                processing_mode = 'manual',
                updated_at = now()
            WHERE id = ANY($1::uuid[])`,
-          [cartItemIds],
+          [cartItemIdsToProcess],
         );
 
         await client.query(
@@ -3640,7 +4063,7 @@ router.post(
                fulfilled_at = now(),
                updated_at = now()
            WHERE cart_item_id = ANY($1::uuid[])`,
-          [cartItemIds, req.user.id],
+          [cartItemIdsToProcess, req.user.id],
         );
 
         const updatedMessagesQ = await client.query(
@@ -3659,17 +4082,22 @@ router.post(
            WHERE COALESCE(meta->>'kind', '') = 'reserved_order_item'
              AND COALESCE(meta->>'cart_item_id', '') = ANY($1::text[])
            RETURNING id, chat_id, sender_id, text, meta, created_at`,
-          [cartItemIds, String(req.user.id), processedByName],
+          [cartItemIdsToProcess, String(req.user.id), processedByName],
         );
         updatedMessages = updatedMessagesQ.rows;
       }
 
       const itemsByUserId = new Map();
+      const processedCartItemIdSet = new Set(cartItemIdsToProcess);
       for (const row of itemRows) {
         const userId = String(row.user_id || "");
         if (!itemsByUserId.has(userId)) itemsByUserId.set(userId, []);
+        const cartItemId = String(row.cart_item_id || "").trim();
+        const previousStatus = String(row.status || "").trim();
+        const newlyProcessed = processedCartItemIdSet.has(cartItemId);
+        const existingDeliveryItemId = String(row.existing_delivery_item_id || "").trim();
         itemsByUserId.get(userId).push({
-          cart_item_id: row.cart_item_id,
+          cart_item_id: cartItemId,
           product_id: row.product_id,
           product_code: row.product_code == null ? null : Number(row.product_code),
           product_shelf_number:
@@ -3681,10 +4109,24 @@ router.post(
           image_url: row.product_image_url,
           price: row.product_price,
           quantity: Number(row.quantity) || 1,
-          previous_status: row.status,
-          status: "processed",
-          processing_mode: "manual",
+          previous_status: previousStatus,
+          status: newlyProcessed ? "processed" : previousStatus,
+          processing_mode: newlyProcessed ? "manual" : row.processing_mode,
           shelf_label: "ручное",
+          newly_processed: newlyProcessed,
+          already_processed: previousStatus === "processed",
+          pickup_added: false,
+          existing_delivery: Boolean(existingDeliveryItemId),
+          existing_delivery_item_id: existingDeliveryItemId || null,
+          existing_delivery_batch_id:
+            String(row.existing_delivery_batch_id || "").trim() || null,
+          existing_delivery_date: row.existing_delivery_date || null,
+          existing_delivery_label:
+            String(row.existing_delivery_label || "").trim() || null,
+          existing_delivery_batch_status:
+            String(row.existing_delivery_batch_status || "").trim() || null,
+          existing_delivery_status:
+            String(row.existing_delivery_status || "").trim() || null,
         });
       }
 
@@ -3699,15 +4141,20 @@ router.post(
           client_name: row.client_name || null,
           email: row.email || null,
           phone: row.stored_phone || row.raw_phone,
+          reserved_count: products.length,
           processed_count: products.length,
+          newly_processed_count: products.filter((product) => product.newly_processed).length,
+          already_processed_count: products.filter((product) => product.already_processed).length,
+          existing_delivery_count: products.filter((product) => product.existing_delivery).length,
+          pickup_added_count: 0,
           products,
         };
       });
       const processedClients = responseClients.filter(
-        (item) => Number(item.processed_count) > 0,
+        (item) => Number(item.reserved_count) > 0,
       );
       const skippedNoItems = responseClients.filter(
-        (item) => item.found && Number(item.processed_count) === 0,
+        (item) => item.found && Number(item.reserved_count) === 0,
       );
       const notFound = responseClients.filter((item) => !item.found);
 
@@ -3744,10 +4191,22 @@ router.post(
           requested_count: phoneEntries.length,
           matched_clients: responseClients.filter((item) => item.found).length,
           processed_clients: processedClients.length,
-          processed_count: cartItemIds.length,
+          processed_count: cartItemIdsToProcess.length,
+          newly_processed_count: cartItemIdsToProcess.length,
+          already_processed_count: itemRows.filter(
+            (row) => String(row.status || "").trim() === "processed",
+          ).length,
+          pickup_added_count: 0,
+          existing_delivery_count: itemRows.filter(
+            (row) => String(row.existing_delivery_item_id || "").trim(),
+          ).length,
           skipped_count: skippedNoItems.length + notFound.length,
           skipped_no_items_count: skippedNoItems.length,
           not_found_count: notFound.length,
+          delivery_batch_id: null,
+          delivery_date: null,
+          delivery_label: null,
+          pickup_note: null,
           clients: responseClients,
           skipped_no_items: skippedNoItems,
           not_found: notFound,
@@ -3889,14 +4348,16 @@ router.post(
 router.get(
   "/dashboard",
   requireAuth,
-  requireRole("admin", "tenant", "creator"),
-  requireDeliveryManagePermission,
+  requireDeliveryAssemblyAccess,
   async (req, res) => {
     try {
       const tenantId = req.user?.tenant_id || null;
+      const assemblyOnly = isKinelWorkerDeliveryAssemblyUser(req.user);
       const settings = await getDeliverySettings(db, tenantId);
       const batches = await fetchBatchSummaries(db, tenantId);
-      const eligiblePreview = await buildEligiblePreview(db, settings, tenantId);
+      const eligiblePreview = assemblyOnly
+        ? null
+        : await buildEligiblePreview(db, settings, tenantId);
       const activeBatchSummary =
         batches.find((item) => item.status !== "completed" && item.status !== "cancelled") ||
         null;
@@ -3914,6 +4375,29 @@ router.get(
       });
     } catch (err) {
       console.error("delivery.dashboard error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.get(
+  "/batches/:batchId",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  requireDeliveryManagePermission,
+  async (req, res) => {
+    try {
+      const detail = await fetchBatchDetails(
+        db,
+        req.params.batchId,
+        req.user?.tenant_id || null,
+      );
+      if (!detail) {
+        return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
+      }
+      return res.json({ ok: true, data: { batch: detail } });
+    } catch (err) {
+      console.error("delivery.batchDetails error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     }
   },
@@ -4014,10 +4498,18 @@ router.patch(
         routeOriginLat = geocoded.lat;
         routeOriginLng = geocoded.lng;
       } catch (error) {
-        return res.status(400).json({
-          ok: false,
-          error: error.message || "Не удалось проверить точку отправки",
-        });
+        const missingProvider =
+          String(error?.message || "").includes("не настроен") ||
+          String(error?.code || "").includes("ADDRESS_PROVIDER") ||
+          String(error?.provider || "").trim().isNotEmpty;
+        if (!missingProvider) {
+          return res.status(400).json({
+            ok: false,
+            error: error.message || "Не удалось проверить точку отправки",
+          });
+        }
+        routeOriginLat = null;
+        routeOriginLng = null;
       }
     }
 
@@ -6403,8 +6895,7 @@ router.post(
 router.patch(
   "/batches/:batchId/customers/:customerId/assembly/start",
   requireAuth,
-  requireRole("admin", "tenant", "creator"),
-  requireDeliveryManagePermission,
+  requireDeliveryAssemblyAccess,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const tenantId = req.user?.tenant_id || null;
@@ -6496,8 +6987,7 @@ router.patch(
 router.patch(
   "/batches/:batchId/customers/:customerId/assembly",
   requireAuth,
-  requireRole("admin", "tenant", "creator"),
-  requireDeliveryManagePermission,
+  requireDeliveryAssemblyAccess,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const tenantId = req.user?.tenant_id || null;
@@ -6651,8 +7141,7 @@ router.patch(
 router.post(
   "/batches/:batchId/customers/:customerId/assembly/complete",
   requireAuth,
-  requireRole("admin", "tenant", "creator"),
-  requireDeliveryManagePermission,
+  requireDeliveryAssemblyAccess,
   async (req, res) => {
     const { batchId, customerId } = req.params;
     const tenantId = req.user?.tenant_id || null;
@@ -7662,6 +8151,7 @@ router.post(
       const io = req.app.get("io");
       if (io && detail) {
         for (const customer of detail.customers) {
+          if (customer.self_pickup === true || customer.route_excluded === true) continue;
           emitCartUpdated(io, customer.user_id, {
             status: "handing_to_courier",
             reason: "couriers_assigned",
@@ -7693,7 +8183,7 @@ router.post(
       await client.query("BEGIN");
 
       const batchQ = await client.query(
-        `SELECT b.id
+        `SELECT b.id, b.status
          FROM delivery_batches b
          WHERE b.id = $1
            AND (
@@ -7721,14 +8211,43 @@ router.post(
         return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
       }
 
-      const readyForHandoffQ = await client.query(
-        `SELECT COUNT(*)::int AS total
+      const batchStatus = String(batchQ.rows[0].status || "");
+      if (batchStatus === "completed") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ ok: false, error: "Этот лист уже завершен" });
+      }
+
+      const readinessQ = await client.query(
+        `SELECT
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+           )::int AS accepted_total,
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+               AND COALESCE(self_pickup, false) = false
+               AND COALESCE(route_excluded, false) = false
+           )::int AS route_total,
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+               AND COALESCE(assembly_status, 'not_started') <> 'assembled'
+           )::int AS not_assembled_total,
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+               AND COALESCE(self_pickup, false) = false
+               AND COALESCE(route_excluded, false) = false
+               AND courier_name IS NOT NULL
+               AND courier_name <> ''
+               AND COALESCE(assembly_status, 'not_started') = 'assembled'
+           )::int AS route_ready_total,
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+               AND COALESCE(self_pickup, false) = false
+               AND COALESCE(route_excluded, false) = false
+               AND COALESCE(assembly_status, 'not_started') = 'assembled'
+               AND (courier_name IS NULL OR courier_name = '')
+           )::int AS route_unassigned_total
          FROM delivery_batch_customers
          WHERE batch_id = $1
-           AND call_status = 'accepted'
-           AND courier_name IS NOT NULL
-           AND courier_name <> ''
-           AND COALESCE(assembly_status, 'not_started') = 'assembled'
            AND (
              $2::uuid IS NULL
              OR EXISTS (
@@ -7740,37 +8259,142 @@ router.post(
            )`,
         [batchId, req.user?.tenant_id || null],
       );
-      if ((Number(readyForHandoffQ.rows[0]?.total) || 0) <= 0) {
+      const readiness = readinessQ.rows[0] || {};
+      const acceptedTotal = Number(readiness.accepted_total || 0);
+      const routeTotal = Number(readiness.route_total || 0);
+      const notAssembledTotal = Number(readiness.not_assembled_total || 0);
+      const routeReadyTotal = Number(readiness.route_ready_total || 0);
+      const routeUnassignedTotal = Number(readiness.route_unassigned_total || 0);
+
+      if (acceptedTotal <= 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
-          error: "Сначала распределите подтвержденных клиентов по курьерам",
+          error: "В листе нет подтвержденных клиентов для передачи",
         });
       }
-      const notAssembledQ = await client.query(
-        `SELECT COUNT(*)::int AS total
-         FROM delivery_batch_customers
-         WHERE batch_id = $1
-           AND call_status = 'accepted'
-           AND courier_name IS NOT NULL
-           AND courier_name <> ''
-           AND COALESCE(assembly_status, 'not_started') <> 'assembled'
-           AND (
-             $2::uuid IS NULL
-             OR EXISTS (
-               SELECT 1
-               FROM users u
-               WHERE u.id = delivery_batch_customers.user_id
-                 AND u.tenant_id = $2::uuid
-             )
-           )`,
-        [batchId, req.user?.tenant_id || null],
-      );
-      if ((Number(notAssembledQ.rows[0]?.total) || 0) > 0) {
+
+      if (notAssembledTotal > 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
           error: "Передать курьерам можно только собранные корзины",
+        });
+      }
+
+      if (routeTotal === 0) {
+        const usersQ = await client.query(
+          `SELECT DISTINCT c.user_id::text AS user_id
+           FROM delivery_batch_customers c
+           WHERE c.batch_id = $1
+             AND c.call_status = 'accepted'
+             AND (
+               COALESCE(c.self_pickup, false) = true
+               OR COALESCE(c.route_excluded, false) = true
+             )
+             AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
+             AND (
+               $2::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1
+                 FROM users u
+                 WHERE u.id = c.user_id
+                   AND u.tenant_id = $2::uuid
+               )
+             )`,
+          [batchId, req.user?.tenant_id || null],
+        );
+
+        await client.query(
+          `UPDATE delivery_batch_customers
+           SET delivery_status = 'completed',
+               updated_at = now()
+           WHERE batch_id = $1
+             AND call_status = 'accepted'
+             AND (
+               COALESCE(self_pickup, false) = true
+               OR COALESCE(route_excluded, false) = true
+             )
+             AND COALESCE(assembly_status, 'not_started') = 'assembled'
+             AND (
+               $2::uuid IS NULL
+               OR EXISTS (
+                 SELECT 1
+                 FROM users u
+                 WHERE u.id = delivery_batch_customers.user_id
+                   AND u.tenant_id = $2::uuid
+               )
+             )`,
+          [batchId, req.user?.tenant_id || null],
+        );
+
+        await client.query(
+          `UPDATE cart_items
+           SET status = 'delivered',
+               updated_at = now()
+           WHERE id IN (
+             SELECT i.cart_item_id
+             FROM delivery_batch_items i
+             JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
+             WHERE i.batch_id = $1
+               AND c.call_status = 'accepted'
+               AND (
+                 COALESCE(c.self_pickup, false) = true
+                 OR COALESCE(c.route_excluded, false) = true
+               )
+               AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
+               AND (
+                 $2::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM users u
+                   WHERE u.id = c.user_id
+                     AND u.tenant_id = $2::uuid
+                 )
+               )
+           )`,
+          [batchId, req.user?.tenant_id || null],
+        );
+
+        await client.query(
+          `UPDATE delivery_batches
+           SET status = 'completed',
+               completed_at = COALESCE(completed_at, now()),
+               updated_at = now()
+           WHERE id = $1`,
+          [batchId],
+        );
+
+        await client.query("COMMIT");
+
+        const detail = await fetchBatchDetails(
+          db,
+          batchId,
+          req.user?.tenant_id || null,
+        );
+        const io = req.app.get("io");
+        if (io) {
+          for (const row of usersQ.rows) {
+            emitCartUpdated(io, row.user_id, {
+              status: "delivered",
+              reason: "self_pickup_completed",
+              batch_id: batchId,
+            });
+          }
+          emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
+        }
+
+        return res.json({
+          ok: true,
+          data: { active_batch: detail, batch_id: batchId, self_pickup_completed: true },
+        });
+      }
+
+      if (routeReadyTotal <= 0 || routeUnassignedTotal > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Сначала распределите подтвержденных клиентов по курьерам",
         });
       }
 
@@ -7780,6 +8404,8 @@ router.post(
              updated_at = now()
          WHERE batch_id = $1
            AND call_status = 'accepted'
+           AND COALESCE(self_pickup, false) = false
+           AND COALESCE(route_excluded, false) = false
            AND courier_name IS NOT NULL
            AND courier_name <> ''
            AND COALESCE(assembly_status, 'not_started') = 'assembled'
@@ -7805,6 +8431,8 @@ router.post(
            JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
            WHERE i.batch_id = $1
              AND c.call_status = 'accepted'
+             AND COALESCE(c.self_pickup, false) = false
+             AND COALESCE(c.route_excluded, false) = false
              AND c.courier_name IS NOT NULL
              AND c.courier_name <> ''
              AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
@@ -7828,6 +8456,8 @@ router.post(
            FROM delivery_batch_customers c
            WHERE c.batch_id = $1
              AND c.call_status = 'accepted'
+             AND COALESCE(c.self_pickup, false) = false
+             AND COALESCE(c.route_excluded, false) = false
              AND c.courier_name IS NOT NULL
              AND c.courier_name <> ''
              AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
@@ -7864,6 +8494,8 @@ router.post(
              JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
              WHERE i.batch_id = $1
                AND c.call_status = 'accepted'
+               AND COALESCE(c.self_pickup, false) = false
+               AND COALESCE(c.route_excluded, false) = false
                AND c.courier_name IS NOT NULL
                AND c.courier_name <> ''
                AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
@@ -7882,6 +8514,7 @@ router.post(
       if (io && detail) {
         for (const customer of detail.customers) {
           if (customer.call_status !== "accepted") continue;
+          if (customer.self_pickup === true || customer.route_excluded === true) continue;
           emitCartUpdated(io, customer.user_id, {
             status: "in_delivery",
             reason: "delivery_handed_off",
@@ -7946,14 +8579,41 @@ router.post(
         return res.status(404).json({ ok: false, error: "Лист доставки не найден" });
       }
       const batchStatus = String(batchQ.rows[0].status || "");
-      if (batchStatus !== "handed_off") {
+      const completionReadinessQ = await client.query(
+        `SELECT
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+           )::int AS accepted_total,
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+               AND COALESCE(route_excluded, false) = false
+               AND COALESCE(self_pickup, false) = false
+           )::int AS route_total,
+           COUNT(*) FILTER (
+             WHERE call_status = 'accepted'
+               AND COALESCE(assembly_status, 'not_started') <> 'assembled'
+           )::int AS not_assembled_total
+         FROM delivery_batch_customers
+         WHERE batch_id = $1`,
+        [batchId],
+      );
+      const readiness = completionReadinessQ.rows[0] || {};
+      const routeTotal = Number(readiness.route_total || 0);
+      const acceptedTotal = Number(readiness.accepted_total || 0);
+      const notAssembledTotal = Number(readiness.not_assembled_total || 0);
+      const selfPickupOnlyCompletion =
+        routeTotal === 0 &&
+        acceptedTotal > 0 &&
+        notAssembledTotal === 0 &&
+        ["calling", "couriers_assigned"].includes(batchStatus);
+      if (batchStatus !== "handed_off" && !selfPickupOnlyCompletion) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
           error:
             batchStatus === "completed"
               ? "Этот лист уже завершен"
-              : "Завершить можно только лист, который уже передан курьерам",
+              : "Завершить можно только лист, который уже передан курьерам, или полностью собранный самовывоз",
         });
       }
 
@@ -7962,8 +8622,12 @@ router.post(
          FROM delivery_batch_customers c
          WHERE c.batch_id = $1
            AND c.call_status = 'accepted'
-           AND c.courier_name IS NOT NULL
-           AND c.courier_name <> ''
+           AND (
+             (c.courier_name IS NOT NULL AND c.courier_name <> '')
+             OR COALESCE(c.self_pickup, false) = true
+             OR COALESCE(c.route_excluded, false) = true
+           )
+           AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
            AND (
              $2::uuid IS NULL
              OR EXISTS (
@@ -7982,8 +8646,12 @@ router.post(
              updated_at = now()
          WHERE batch_id = $1
            AND call_status = 'accepted'
-           AND courier_name IS NOT NULL
-           AND courier_name <> ''
+           AND (
+             (courier_name IS NOT NULL AND courier_name <> '')
+             OR COALESCE(self_pickup, false) = true
+             OR COALESCE(route_excluded, false) = true
+           )
+           AND COALESCE(assembly_status, 'not_started') = 'assembled'
            AND (
              $2::uuid IS NULL
              OR EXISTS (
@@ -8006,8 +8674,12 @@ router.post(
            JOIN delivery_batch_customers c ON c.id = i.batch_customer_id
            WHERE i.batch_id = $1
              AND c.call_status = 'accepted'
-             AND c.courier_name IS NOT NULL
-             AND c.courier_name <> ''
+             AND (
+               (c.courier_name IS NOT NULL AND c.courier_name <> '')
+               OR COALESCE(c.self_pickup, false) = true
+               OR COALESCE(c.route_excluded, false) = true
+             )
+             AND COALESCE(c.assembly_status, 'not_started') = 'assembled'
              AND (
                $2::uuid IS NULL
                OR EXISTS (
@@ -8185,6 +8857,243 @@ router.post(
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     } finally {
       client.release();
+    }
+  },
+);
+
+router.post(
+  "/batches/:batchId/customers/:customerId/return-to-route",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  requireDeliveryManagePermission,
+  async (req, res) => {
+    const { batchId, customerId } = req.params;
+    const client = await db.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const customerQ = await client.query(
+        `SELECT c.*,
+                b.status AS batch_status
+         FROM delivery_batch_customers c
+         JOIN delivery_batches b ON b.id = c.batch_id
+         JOIN users scope_u ON scope_u.id = c.user_id
+         WHERE c.id = $1
+           AND c.batch_id = $2
+           AND ($3::uuid IS NULL OR scope_u.tenant_id = $3::uuid)
+         LIMIT 1
+         FOR UPDATE`,
+        [customerId, batchId, req.user?.tenant_id || null],
+      );
+      if (customerQ.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "Клиент в листе доставки не найден" });
+      }
+
+      const customer = customerQ.rows[0];
+      const batchStatus = String(customer.batch_status || "");
+      if (!["calling", "couriers_assigned", "handed_off", "cancelled"].includes(batchStatus)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "В этот лист уже нельзя вернуть клиента на маршрут",
+        });
+      }
+
+      if (String(customer.call_status || "") !== "declined") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "Вернуть на маршрут можно только клиента со статусом отказа",
+        });
+      }
+
+      const itemsQ = await client.query(
+        `SELECT COUNT(*)::int AS total
+         FROM delivery_batch_items
+         WHERE batch_customer_id = $1
+           AND COALESCE(assembly_status, 'pending') <> 'removed'`,
+        [customerId],
+      );
+      if ((Number(itemsQ.rows[0]?.total) || 0) < 1) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          error: "У клиента нет товаров, которые можно вернуть на маршрут",
+        });
+      }
+
+      await client.query(
+        `UPDATE delivery_batch_customers
+         SET call_status = 'accepted',
+             delivery_status = 'preparing_delivery',
+             accepted_at = now(),
+             agreed_sum = processed_sum,
+             assembly_status = 'not_started',
+             assembly_started_at = NULL,
+             assembly_started_by = NULL,
+             assembly_completed_at = NULL,
+             assembly_completed_by = NULL,
+             assembly_note = NULL,
+             normal_stickers_requested = 0,
+             bulky_stickers_requested = 0,
+             courier_slot = NULL,
+             courier_name = NULL,
+             courier_code = NULL,
+             route_order = NULL,
+             eta_from = NULL,
+             eta_to = NULL,
+             updated_at = now()
+         WHERE id = $1`,
+        [customerId],
+      );
+
+      await client.query(
+        `UPDATE delivery_batch_items
+         SET assembly_status = 'pending',
+             removed_reason = NULL,
+             removed_at = NULL,
+             removed_by = NULL
+         WHERE batch_customer_id = $1
+           AND COALESCE(assembly_status, 'pending') <> 'removed'`,
+        [customerId],
+      );
+
+      await client.query(
+        `UPDATE cart_items
+         SET status = 'preparing_delivery',
+             updated_at = now()
+         WHERE id IN (
+           SELECT cart_item_id
+           FROM delivery_batch_items
+           WHERE batch_customer_id = $1
+             AND COALESCE(assembly_status, 'pending') <> 'removed'
+         )`,
+        [customerId],
+      );
+
+      await client.query(
+        `UPDATE delivery_batches
+         SET status = CASE WHEN status = 'cancelled' THEN 'calling' ELSE status END,
+             updated_at = now()
+         WHERE id = $1`,
+        [batchId],
+      );
+
+      if (batchStatus === "couriers_assigned") {
+        await rerouteAcceptedCustomers(client, batchId);
+      }
+
+      await client.query("COMMIT");
+
+      const detail = await fetchBatchDetails(
+        db,
+        batchId,
+        req.user?.tenant_id || null,
+      );
+      const io = req.app.get("io");
+      if (io) {
+        emitCartUpdated(io, customer.user_id, {
+          status: "preparing_delivery",
+          reason: "delivery_returned_to_route",
+          batch_id: batchId,
+        });
+        emitDeliveryUpdated(io, batchId, req.user?.tenant_id || null);
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          customer_id: customerId,
+          status: "accepted",
+          active_batch: detail,
+        },
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("delivery.returnToRoute error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    } finally {
+      client.release();
+    }
+  },
+);
+
+router.get(
+  "/archive",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  requireDeliveryManagePermission,
+  async (req, res) => {
+    try {
+      const deliveryDate = ensureIsoDate(req.query.date || new Date());
+      const typeRaw = String(req.query.type || "all").trim().toLowerCase();
+      const archiveType = ["delivery", "self_pickup", "all"].includes(typeRaw)
+        ? typeRaw
+        : "all";
+      const tenantId = req.user?.tenant_id || null;
+
+      const typePredicate =
+        archiveType === "self_pickup"
+          ? "AND COALESCE(c.self_pickup, false) = true"
+          : archiveType === "delivery"
+            ? "AND COALESCE(c.self_pickup, false) = false"
+            : "";
+
+      const batchesQ = await db.query(
+        `SELECT DISTINCT b.id
+         FROM delivery_batches b
+         JOIN delivery_batch_customers c ON c.batch_id = b.id
+         JOIN users u ON u.id = c.user_id
+         WHERE b.delivery_date::date = $1::date
+           AND c.call_status = 'accepted'
+           AND (
+             $2::uuid IS NULL
+             OR u.tenant_id = $2::uuid
+           )
+           ${typePredicate}
+         ORDER BY b.id ASC
+         LIMIT 50`,
+        [deliveryDate, tenantId],
+      );
+
+      const batches = [];
+      for (const row of batchesQ.rows) {
+        const detail = await fetchBatchDetails(db, row.id, tenantId);
+        if (!detail) continue;
+        const customers = (Array.isArray(detail.customers) ? detail.customers : [])
+          .filter((customer) => {
+            if (String(customer.call_status || "") !== "accepted") return false;
+            if (archiveType === "self_pickup") {
+              return customer.self_pickup === true;
+            }
+            if (archiveType === "delivery") {
+              return customer.self_pickup !== true;
+            }
+            return true;
+          });
+        if (customers.length === 0) continue;
+        batches.push({
+          ...detail,
+          customers,
+        });
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          date: deliveryDate,
+          type: archiveType,
+          batches,
+        },
+      });
+    } catch (err) {
+      const message = String(err?.message || "");
+      if (message.includes("Некорректная дата")) {
+        return res.status(400).json({ ok: false, error: message });
+      }
+      console.error("delivery.archive error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     }
   },
 );

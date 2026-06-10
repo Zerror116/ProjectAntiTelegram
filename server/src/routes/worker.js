@@ -29,6 +29,7 @@ const {
 const productUploadsDir = uploadsPath('products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
 const SAMARA_TZ = 'Europe/Samara';
+const CREATOR_MISSING_PHOTO_REVISION_SHELF = 7;
 const productImageMaxMb = Math.max(
   1,
   Number.parseInt(String(process.env.PRODUCT_IMAGE_MAX_MB || '8').trim(), 10) || 8,
@@ -57,6 +58,10 @@ function normalizeFreeShelfText(value, maxLength = 80) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength);
+}
+
+function escapeLikePattern(raw) {
+  return String(raw || '').replace(/[\\%_]/g, '\\$&');
 }
 
 function isAcceptedProductImage(file) {
@@ -155,6 +160,13 @@ function parseSettings(raw) {
   return raw;
 }
 
+function canSeeMissingPhotoRevisionItems(user) {
+  const role = String(user?.base_role || user?.role || '')
+    .toLowerCase()
+    .trim();
+  return role === 'creator' || role === 'worker';
+}
+
 function toPositiveNumber(value, fallback = 0) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return fallback;
@@ -198,6 +210,20 @@ function parseRevisionShelfNumber(value) {
   const shelf = Number(String(raw ?? '').trim());
   if (!Number.isFinite(shelf) || shelf < 1 || shelf > 10) return null;
   return Math.floor(shelf);
+}
+
+function normalizeRevisionProductIdSearch(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
+function normalizeRevisionProductCodeSearch(value) {
+  const normalized = normalizeRevisionProductIdSearch(value)
+    .replace(/^(?:id|ид)\s*(?:товара)?\s*:?\s*/i, '')
+    .split('--')[0]
+    .trim();
+  const firstNumber = normalized.match(/\d+/)?.[0] || '';
+  return (firstNumber || normalized).toLowerCase().slice(0, 32);
 }
 
 const REVISION_PENDING_CART_STATUSES = ['pending_processing'];
@@ -491,6 +517,21 @@ function normalizeRevisionEntry(raw) {
   };
 }
 
+function parseRevisionEntriesInput(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
 function compareNullableStringsAsc(a, b) {
   return String(a || '').trim().localeCompare(String(b || '').trim(), 'ru', {
     sensitivity: 'base',
@@ -499,13 +540,35 @@ function compareNullableStringsAsc(a, b) {
 }
 
 function compareRevisionPosts(a, b) {
+  const shelfCompare =
+    toShelfNumber(
+      a.revision_shelf_number ?? a.shelf_number,
+      Number.MAX_SAFE_INTEGER,
+    ) -
+    toShelfNumber(
+      b.revision_shelf_number ?? b.shelf_number,
+      Number.MAX_SAFE_INTEGER,
+    );
+  if (shelfCompare !== 0) return shelfCompare;
+
+  const sourceShelfCompare =
+    toShelfNumber(
+      a.source_product_shelf_number ?? a.product_shelf_number,
+      Number.MAX_SAFE_INTEGER,
+    ) -
+    toShelfNumber(
+      b.source_product_shelf_number ?? b.product_shelf_number,
+      Number.MAX_SAFE_INTEGER,
+    );
+  if (sourceShelfCompare !== 0) return sourceShelfCompare;
+
+  const codeCompare =
+    toPositiveInteger(a.product_code, Number.MAX_SAFE_INTEGER) -
+    toPositiveInteger(b.product_code, Number.MAX_SAFE_INTEGER);
+  if (codeCompare !== 0) return codeCompare;
+
   const dayCompare = compareNullableStringsAsc(a.day, b.day);
   if (dayCompare != 0) return dayCompare;
-
-  const shelfCompare =
-    toShelfNumber(a.shelf_number, Number.MAX_SAFE_INTEGER) -
-    toShelfNumber(b.shelf_number, Number.MAX_SAFE_INTEGER);
-  if (shelfCompare !== 0) return shelfCompare;
 
   const clientCompare = compareNullableStringsAsc(a.client_name, b.client_name);
   if (clientCompare !== 0) return clientCompare;
@@ -516,11 +579,6 @@ function compareRevisionPosts(a, b) {
   const createdCompare =
     Date.parse(String(a.created_at || '')) - Date.parse(String(b.created_at || ''));
   if (createdCompare !== 0) return createdCompare;
-
-  const codeCompare =
-    toPositiveInteger(a.product_code, Number.MAX_SAFE_INTEGER) -
-    toPositiveInteger(b.product_code, Number.MAX_SAFE_INTEGER);
-  if (codeCompare !== 0) return codeCompare;
 
   return compareNullableStringsAsc(a.message_id, b.message_id);
 }
@@ -1009,7 +1067,10 @@ async function fetchRevisionDays(client, channelId, limit = 2) {
   return rows.slice(0, safeLimit);
 }
 
-async function fetchRevisionShelves(client, channelId) {
+async function fetchRevisionShelves(client, channelId, options = {}) {
+  const includeHiddenMissingPhotoShelf = parseRevisionShelfNumber(
+    options.includeHiddenMissingPhotoShelfNumber,
+  );
   const q = await client.query(
     `WITH visible_catalog AS (
        SELECT m.id AS message_id,
@@ -1021,6 +1082,24 @@ async function fetchRevisionShelves(client, channelId) {
          AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
          AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
          AND p.shelf_number BETWEEN 1 AND 10
+     ),
+     hidden_missing_photo_catalog AS (
+       SELECT m.id AS message_id,
+              p.id AS product_id,
+              p.shelf_number AS product_shelf_number
+       FROM messages m
+       JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+       WHERE m.chat_id = $1
+         AND $3::int IS NOT NULL
+         AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = true
+         AND COALESCE((m.meta->>'hidden_missing_photo')::boolean, false) = true
+         AND p.shelf_number = $3::int
+     ),
+     revision_catalog AS (
+       SELECT * FROM visible_catalog
+       UNION
+       SELECT * FROM hidden_missing_photo_catalog
      ),
      queue_state AS (
        SELECT q.product_id,
@@ -1045,7 +1124,7 @@ async function fetchRevisionShelves(client, channelId) {
      )
      SELECT vc.product_shelf_number::int AS shelf_number,
             COUNT(*)::int AS posts
-     FROM visible_catalog vc
+     FROM revision_catalog vc
      LEFT JOIN queue_state qs ON qs.product_id = vc.product_id
      LEFT JOIN cart_state cs ON cs.product_id = vc.product_id
      LEFT JOIN reservation_state rs ON rs.product_id = vc.product_id
@@ -1059,6 +1138,7 @@ async function fetchRevisionShelves(client, channelId) {
     [
       channelId,
       REVISION_COMPLETED_CART_STATUSES,
+      includeHiddenMissingPhotoShelf,
     ],
   );
   const countByShelf = new Map(
@@ -1092,6 +1172,22 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
   const shelfFilter = parseRevisionShelfNumber(
     Array.isArray(selection) ? null : selection.selectedShelfNumber,
   );
+  const includeHiddenMissingPhotoShelf = parseRevisionShelfNumber(
+    Array.isArray(selection) ? null : selection.includeHiddenMissingPhotoShelfNumber,
+  );
+  const includeHiddenMissingPhotoRows =
+    includeHiddenMissingPhotoShelf != null &&
+    shelfFilter === includeHiddenMissingPhotoShelf;
+  const productSearch = normalizeRevisionProductIdSearch(
+    Array.isArray(selection) ? '' : selection.productIdSearch,
+  ).toLowerCase();
+  const productCodeSearch = normalizeRevisionProductCodeSearch(productSearch);
+  const productSearchLike = productSearch
+    ? `%${escapeLikePattern(productSearch)}%`
+    : '';
+  const productCodeSearchLike = productCodeSearch
+    ? `%${escapeLikePattern(productCodeSearch)}%`
+    : productSearchLike;
   const revisionDaySequence = await fetchRevisionDaySequence(client, channelId);
   const revisionShelfCache = new Map(
     revisionDaySequence.map((item) => [
@@ -1113,12 +1209,22 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
               p.description AS product_description,
               p.price AS product_price,
               p.quantity AS product_quantity,
-              p.image_url AS product_image_url
+              p.image_url AS product_image_url,
+              COALESCE((m.meta->>'hidden_for_all')::boolean, false) AS message_hidden,
+              COALESCE((m.meta->>'hidden_missing_photo')::boolean, false) AS hidden_missing_photo
        FROM messages m
        LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
        WHERE m.chat_id = $1
          AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
-         AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         AND (
+           COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+           OR (
+             $10::boolean = true
+             AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = true
+             AND COALESCE((m.meta->>'hidden_missing_photo')::boolean, false) = true
+             AND p.shelf_number = $4::int
+           )
+         )
          AND (
            $2::text[] IS NULL
            OR to_char((m.created_at AT TIME ZONE $3), 'YYYY-MM-DD') = ANY($2::text[])
@@ -1126,6 +1232,13 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
          AND (
            $4::int IS NULL
            OR p.shelf_number = $4::int
+         )
+         AND (
+           $7::text = ''
+           OR lower(COALESCE(p.product_code::text, '')) = $8::text
+           OR lower(COALESCE(m.meta->>'product_code', '')) = $8::text
+           OR lower(COALESCE(p.product_code::text, '')) LIKE $9::text ESCAPE '\\'
+           OR lower(COALESCE(m.meta->>'product_code', '')) LIKE $9::text ESCAPE '\\'
          )
      ),
      queue_state AS (
@@ -1164,6 +1277,8 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
             vc.product_price,
             vc.product_quantity,
             vc.product_image_url,
+            vc.message_hidden,
+            vc.hidden_missing_photo,
             to_char((vc.created_at AT TIME ZONE $3), 'YYYY-MM-DD') AS day,
             to_char((vc.created_at AT TIME ZONE $3), 'DD.MM.YYYY') AS day_label,
             COALESCE(qs.has_pending, false) AS has_pending_queue,
@@ -1187,6 +1302,10 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       shelfFilter,
       REVISION_PENDING_CART_STATUSES,
       REVISION_COMPLETED_CART_STATUSES,
+      productSearchLike,
+      productCodeSearch,
+      productCodeSearchLike,
+      includeHiddenMissingPhotoRows,
     ]
   );
   const mapped = [];
@@ -1223,9 +1342,20 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       price: Number(row.product_price ?? fallbackPrice),
       quantity: Number(row.product_quantity ?? fallbackQuantity),
       image_url: normalizeImageUrl(row.product_image_url) || fallbackImage,
+      message_hidden: row.message_hidden === true,
+      hidden_missing_photo: row.hidden_missing_photo === true,
+      creator_missing_photo_recovery:
+        includeHiddenMissingPhotoRows &&
+        row.message_hidden === true &&
+        row.hidden_missing_photo === true,
       revision_state: state.revision_state,
       revision_allowed: state.revision_allowed,
-      revision_note: state.revision_note,
+      revision_note:
+        includeHiddenMissingPhotoRows &&
+        row.message_hidden === true &&
+        row.hidden_missing_photo === true
+          ? 'Фото было потеряно, товар скрыт с канала. Откройте ручную ревизию, добавьте новое фото и верните товар на канал с тем же ID.'
+          : state.revision_note,
       has_pending_processing: row.has_pending_processing === true,
       has_unfulfilled_reservation: row.has_unfulfilled_reservation === true,
     });
@@ -1342,11 +1472,19 @@ router.get('/channels', authMiddleware, requireRole('worker', 'admin', 'tenant',
   }
 });
 
-// Поиск старых товаров по названию/описанию
+// Поиск старых товаров по ID товара/названию/описанию
 router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 'tenant', 'creator'), async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ ok: true, data: [] });
+    const productTextSearchLike = `%${escapeLikePattern(q)}%`;
+    const productCodeSearch = normalizeRevisionProductCodeSearch(q);
+    const isProductCodeOnlySearch =
+      productCodeSearch.length > 0 &&
+      /^(?:id|ид)?\s*(?:товара)?\s*:?\s*\d+\s*$/i.test(q);
+    const productCodeSearchLike = productCodeSearch
+      ? `%${escapeLikePattern(productCodeSearch)}%`
+      : productTextSearchLike;
     return await runInRequestTenantScope(req, async () => {
       const client = await db.pool.connect();
       try {
@@ -1371,6 +1509,13 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
                     p.status,
                     p.created_at,
                     p.updated_at,
+                    (
+                      lower(COALESCE(p.product_code::text, '')) = $4::text
+                      OR lower(COALESCE(p.product_code::text, '')) LIKE $5::text ESCAPE '\\'
+                    ) AS is_product_id_match,
+                    (
+                      lower(COALESCE(p.product_code::text, '')) = $4::text
+                    ) AS is_product_id_exact_match,
                     EXISTS (
                       SELECT 1
                       FROM messages m
@@ -1392,7 +1537,17 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
                       ORDER BY p.created_at DESC, p.updated_at DESC
                     ) AS title_rank
              FROM products p
-             WHERE (p.title ILIKE $1 OR p.description ILIKE $1)
+             WHERE (
+                 (
+                   $6::boolean = false
+                   AND (
+                     p.title ILIKE $1 ESCAPE '\\'
+                     OR p.description ILIKE $1 ESCAPE '\\'
+                   )
+                 )
+                 OR lower(COALESCE(p.product_code::text, '')) = $4::text
+                 OR lower(COALESCE(p.product_code::text, '')) LIKE $5::text ESCAPE '\\'
+               )
                AND EXISTS (
                  SELECT 1
                  FROM product_publication_queue q
@@ -1402,17 +1557,34 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
                )
            )
            SELECT id, product_code, shelf_number, title, description, price, quantity, image_url, status,
-                  created_at, updated_at, is_visible_in_main_channel, has_pending_in_main_channel,
+                  created_at, updated_at, is_product_id_match, is_product_id_exact_match,
+                  is_visible_in_main_channel, has_pending_in_main_channel,
                   CASE
                     WHEN is_visible_in_main_channel THEN false
                     WHEN has_pending_in_main_channel THEN false
                     ELSE true
-                  END AS requeue_allowed
+                  END AS requeue_allowed,
+                  CASE
+                    WHEN has_pending_in_main_channel THEN false
+                    ELSE true
+                  END AS quick_duplicate_allowed
            FROM ranked
-           WHERE title_rank <= 2
-           ORDER BY requeue_allowed DESC, created_at DESC, updated_at DESC
+           WHERE title_rank <= 2 OR is_product_id_match
+           ORDER BY is_product_id_exact_match DESC,
+                    is_product_id_match DESC,
+                    requeue_allowed DESC,
+                    product_code ASC NULLS LAST,
+                    created_at DESC,
+                    updated_at DESC
            LIMIT 30`,
-          [`%${q}%`, req.user?.tenant_id || null, mainChannel.id],
+          [
+            productTextSearchLike,
+            req.user?.tenant_id || null,
+            mainChannel.id,
+            productCodeSearch,
+            productCodeSearchLike,
+            isProductCodeOnlySearch,
+          ],
         );
         await client.query('COMMIT');
 
@@ -1420,7 +1592,7 @@ router.get('/products/search', authMiddleware, requireRole('worker', 'admin', 't
           ...row,
           reuse_hint:
             row.is_visible_in_main_channel === true
-              ? 'Сейчас товар в основном канале. Используйте Ревизию.'
+              ? 'Сейчас товар в основном канале. Быстрый дубль создаст новый товар.'
               : row.has_pending_in_main_channel === true
                   ? 'Товар уже стоит в очереди публикации.'
                   : null,
@@ -1468,6 +1640,7 @@ router.post(
             : '';
           const pickupOnly =
             tenantSettings.pickup_only_enabled && parseBooleanFormValue(req.body?.pickup_only);
+          const isBulky = parseBooleanFormValue(req.body?.is_bulky);
 
           const imageUrl = req.file ? toAbsoluteImageUrl(req, req.file) : normalizeImageUrl(req.body?.image_url);
           const normalizedTitle = normalizeCatalogTitle(title);
@@ -1519,11 +1692,11 @@ router.post(
           const productInsert = await client.query(
             `INSERT INTO products (
                id, title, description, price, quantity, shelf_number,
-               manual_shelf_label, shelf_floor, pickup_only,
+               manual_shelf_label, shelf_floor, pickup_only, is_bulky,
                image_url, created_by, status, created_at, updated_at
              )
-             VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, $11, 'draft', now(), now())
-             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+             VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, $11, $12, 'draft', now(), now())
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
                        title, description, price, quantity, image_url, status`,
             [
               uuidv4(),
@@ -1535,6 +1708,7 @@ router.post(
               manualShelfLabel,
               shelfFloor,
               pickupOnly,
+              isBulky,
               imageUrl,
               actorUserId,
             ]
@@ -1545,7 +1719,7 @@ router.post(
              SET product_code = $1,
                  updated_at = now()
              WHERE id = $2
-             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
                        title, description, price, quantity, image_url, status`,
             [code, productId]
           );
@@ -1572,15 +1746,16 @@ router.post(
             manual_shelf_label: product.manual_shelf_label || null,
             shelf_floor: product.shelf_floor || null,
             pickup_only: product.pickup_only === true,
+            is_bulky: product.is_bulky === true,
             image_url: product.image_url,
             card_snapshot: cardSnapshot,
           };
 
           const queueInsert = await client.query(
-            `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, created_at)
-             VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, now())
+            `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, is_bulky, created_at)
+             VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, $7, now())
              RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-            [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), pickupOnly]
+            [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), pickupOnly, product.is_bulky === true]
           );
 
           await client.query('COMMIT');
@@ -1668,7 +1843,7 @@ router.post(
           const targetChannelId = String(mainChannel.id);
 
           const productQ = await client.query(
-            `SELECT id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+            `SELECT id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
                     title, description, price, quantity, image_url
              FROM products
              WHERE id = $1
@@ -1697,7 +1872,8 @@ router.post(
              LIMIT 1`,
             [targetChannelId, productId],
           );
-          if (liveMainChannelQ.rowCount > 0) {
+          const isVisibleInMainChannel = liveMainChannelQ.rowCount > 0;
+          if (isVisibleInMainChannel && !shouldMergePending) {
             removeUploadedFile(req.file);
             await client.query('ROLLBACK');
             return res.status(409).json({
@@ -1731,6 +1907,9 @@ router.post(
             Object.prototype.hasOwnProperty.call(req.body || {}, 'pickup_only')
               ? parseBooleanFormValue(req.body?.pickup_only)
               : current.pickup_only === true;
+          const nextIsBulky = Object.prototype.hasOwnProperty.call(req.body || {}, 'is_bulky')
+            ? parseBooleanFormValue(req.body?.is_bulky)
+            : current.is_bulky === true;
           let nextImageUrl = current.image_url;
           if (req.file) {
             nextImageUrl = toAbsoluteImageUrl(req, req.file);
@@ -1765,6 +1944,202 @@ router.post(
             return res.status(400).json({ ok: false, error: 'Фото товара обязательно' });
           }
 
+          if (isVisibleInMainChannel && shouldMergePending) {
+            const existingDuplicateQ = await client.query(
+              `SELECT q.id AS queue_id,
+                      q.payload,
+                      p.id,
+                      p.product_code,
+                      p.shelf_number,
+                      p.manual_shelf_label,
+                      p.shelf_floor,
+                      p.pickup_only,
+                      p.is_bulky,
+                      p.title,
+                      p.description,
+                      p.price,
+                      p.quantity,
+                      p.image_url,
+                      p.status
+               FROM product_publication_queue q
+               JOIN products p ON p.id = q.product_id
+               WHERE q.channel_id = $1
+                 AND q.queued_by = $2
+                 AND q.status = 'pending'
+                 AND COALESCE(q.is_sent, false) = false
+                 AND COALESCE(q.payload->>'quick_duplicate_source_product_id', '') = $3::text
+               ORDER BY q.created_at DESC
+               LIMIT 1
+               FOR UPDATE OF q, p`,
+              [targetChannelId, actorUserId, productId],
+            );
+
+            let product;
+            let queueRow;
+            let mode = 'created_duplicate';
+            if (existingDuplicateQ.rowCount > 0) {
+              mode = 'updated_duplicate';
+              const duplicate = existingDuplicateQ.rows[0];
+              const previousPayload = parseSettings(duplicate.payload);
+              const previousQuantity = toPositiveInteger(
+                previousPayload.quantity ?? duplicate.quantity,
+                0,
+              );
+              const mergedQuantity = Math.max(
+                previousQuantity + 1,
+                Math.floor(nextQuantity),
+                1,
+              );
+              const updDuplicate = await client.query(
+                `UPDATE products
+                 SET title = $1,
+                     description = $2,
+                     price = $3,
+                     quantity = $4,
+                     image_url = $5,
+                     is_bulky = $7,
+                     status = 'draft',
+                     updated_at = now()
+                 WHERE id = $6
+                 RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
+                           title, description, price, quantity, image_url, status`,
+                [
+                  nextTitle,
+                  nextDescription,
+                  nextPrice,
+                  mergedQuantity,
+                  nextImageUrl,
+                  duplicate.id,
+                  nextIsBulky,
+                ],
+              );
+              product = updDuplicate.rows[0];
+            } else {
+              const duplicateCode = await allocateProductCode(client, req.user?.tenant_id || null);
+              const insertedDuplicate = await client.query(
+                `INSERT INTO products (
+                   id, title, description, price, quantity, shelf_number,
+                   manual_shelf_label, shelf_floor, pickup_only, is_bulky,
+                   image_url, created_by, status, created_at, updated_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10, $11, $12, 'draft', now(), now())
+                 RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
+                           title, description, price, quantity, image_url, status`,
+                [
+                  uuidv4(),
+                  nextTitle,
+                  nextDescription,
+                  nextPrice,
+                  Math.floor(nextQuantity),
+                  Math.floor(nextShelfNumber),
+                  nextManualShelfLabel,
+                  nextShelfFloor,
+                  nextPickupOnly,
+                  nextIsBulky,
+                  nextImageUrl,
+                  actorUserId,
+                ],
+              );
+              const duplicateId = insertedDuplicate.rows[0].id;
+              const codedDuplicate = await client.query(
+                `UPDATE products
+                 SET product_code = $1,
+                     updated_at = now()
+                 WHERE id = $2
+                 RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
+                           title, description, price, quantity, image_url, status`,
+                [duplicateCode, duplicateId],
+              );
+              product = codedDuplicate.rows[0];
+            }
+
+            if (product?.image_url) {
+              await registerPublicImageUpload({
+                queryable: client,
+                ownerKind: 'product_image',
+                ownerId: product.id,
+                rawUrl: product.image_url,
+              });
+            }
+            const cardSnapshot = await upsertProductCardSnapshot(client, product, {
+              req,
+              tenantId: req.user?.tenant_id || null,
+            });
+
+            const payload = {
+              title: product.title,
+              description: product.description,
+              price: Number(product.price),
+              quantity: Number(product.quantity),
+              shelf_number: Number(product.shelf_number),
+              manual_shelf_label: product.manual_shelf_label || null,
+              shelf_floor: product.shelf_floor || null,
+              pickup_only: product.pickup_only === true,
+              is_bulky: product.is_bulky === true,
+              image_url: product.image_url,
+              card_snapshot: cardSnapshot,
+              quick_duplicate: true,
+              quick_duplicate_source_product_id: productId,
+              quick_duplicate_source_product_code: current.product_code ?? null,
+            };
+
+            if (existingDuplicateQ.rowCount > 0) {
+              const queueId = existingDuplicateQ.rows[0].queue_id;
+              const updatedQueue = await client.query(
+                `UPDATE product_publication_queue
+                 SET payload = $2::jsonb,
+                     pickup_only = $3,
+                     is_bulky = $4,
+                     created_at = now()
+                 WHERE id = $1
+                 RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
+                [queueId, JSON.stringify(payload), product.pickup_only === true, product.is_bulky === true],
+              );
+              queueRow = updatedQueue.rows[0];
+            } else {
+              const queueInsert = await client.query(
+                `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, is_bulky, created_at)
+                 VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, $7, now())
+                 RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
+                [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), product.pickup_only === true, product.is_bulky === true],
+              );
+              queueRow = queueInsert.rows[0];
+            }
+
+            await client.query('COMMIT');
+
+            const io = req.app.get('io');
+            if (io) {
+              emitCatalogQueueUpdated(io, req.user?.tenant_id || null, {
+                action: 'quick_duplicate',
+                channel_id: targetChannelId,
+                queue_id: queueRow?.id || null,
+                product_id: product.id,
+                source_product_id: productId,
+                queued_by: actorUserId,
+              });
+            }
+
+            return res.status(201).json({
+              ok: true,
+              data: {
+                queue: queueRow,
+                product,
+                card_snapshot: cardSnapshot,
+                mode,
+                source_product_id: productId,
+                product_label: formatProductLabel(
+                  product.product_code,
+                  product.shelf_number,
+                  product.manual_shelf_label,
+                ),
+                message: mode === 'updated_duplicate'
+                  ? 'Количество дубля увеличено'
+                  : 'Создан новый дубль товара',
+              },
+            });
+          }
+
           const nextCode = current.product_code != null
             ? Number(current.product_code)
             : await allocateProductCode(client, req.user?.tenant_id || null);
@@ -1779,12 +2154,13 @@ router.post(
                  manual_shelf_label = NULLIF($6, ''),
                  shelf_floor = NULLIF($7, ''),
                  pickup_only = $8,
-                 image_url = $9,
-                 product_code = $10,
+                 is_bulky = $9,
+                 image_url = $10,
+                 product_code = $11,
                  status = 'draft',
                  updated_at = now()
-             WHERE id = $11
-             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+             WHERE id = $12
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
                        title, description, price, quantity, image_url, status`,
             [
               nextTitle,
@@ -1795,6 +2171,7 @@ router.post(
               nextManualShelfLabel,
               nextShelfFloor,
               nextPickupOnly,
+              nextIsBulky,
               nextImageUrl,
               nextCode,
               productId,
@@ -1823,6 +2200,7 @@ router.post(
             manual_shelf_label: product.manual_shelf_label || null,
             shelf_floor: product.shelf_floor || null,
             pickup_only: product.pickup_only === true,
+            is_bulky: product.is_bulky === true,
             image_url: product.image_url,
             card_snapshot: cardSnapshot,
           };
@@ -1848,10 +2226,11 @@ router.post(
                 `UPDATE product_publication_queue
                  SET payload = $2::jsonb,
                      pickup_only = $3,
+                     is_bulky = $4,
                      created_at = now()
                  WHERE id = $1
                  RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-                [queueId, JSON.stringify(payload), product.pickup_only === true]
+                [queueId, JSON.stringify(payload), product.pickup_only === true, product.is_bulky === true]
               );
               queueRow = mergedQueue.rows[0];
 
@@ -1872,10 +2251,10 @@ router.post(
 
           if (!queueRow) {
             const queueInsert = await client.query(
-              `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, created_at)
-               VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, now())
+              `INSERT INTO product_publication_queue (id, product_id, channel_id, queued_by, status, is_sent, payload, pickup_only, is_bulky, created_at)
+               VALUES ($1, $2, $3, $4, 'pending', false, $5::jsonb, $6, $7, now())
                RETURNING id, product_id, channel_id, queued_by, status, is_sent, payload, created_at`,
-              [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), product.pickup_only === true]
+              [uuidv4(), product.id, targetChannelId, actorUserId, JSON.stringify(payload), product.pickup_only === true, product.is_bulky === true]
             );
             queueRow = queueInsert.rows[0];
           }
@@ -2226,7 +2605,11 @@ router.get(
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
       });
-      const shelves = await fetchRevisionShelves(client, mainChannel.id);
+      const shelves = await fetchRevisionShelves(client, mainChannel.id, {
+        includeHiddenMissingPhotoShelfNumber: canSeeMissingPhotoRevisionItems(req.user)
+          ? CREATOR_MISSING_PHOTO_REVISION_SHELF
+          : null,
+      });
       await client.query('COMMIT');
       try {
         const io = req.app.get('io');
@@ -2266,6 +2649,9 @@ router.get(
       req.query?.shelf_number ?? req.query?.shelf,
     );
     const selectedDates = parseRevisionDates(req.query?.dates);
+    const productIdSearch = normalizeRevisionProductIdSearch(
+      req.query?.product_id ?? req.query?.product_code ?? req.query?.search ?? req.query?.q,
+    );
     if (requestedShelfNumber == null && selectedDates.length > 1) {
       return res.status(400).json({
         ok: false,
@@ -2286,7 +2672,12 @@ router.get(
         selectedDates: requestedShelfNumber == null ? selectedDates : [],
         selectedShelfNumber: requestedShelfNumber,
       });
-      const shelves = await fetchRevisionShelves(client, mainChannel.id);
+      const creatorMissingPhotoShelfNumber = canSeeMissingPhotoRevisionItems(req.user)
+        ? CREATOR_MISSING_PHOTO_REVISION_SHELF
+        : null;
+      const shelves = await fetchRevisionShelves(client, mainChannel.id, {
+        includeHiddenMissingPhotoShelfNumber: creatorMissingPhotoShelfNumber,
+      });
       const selectedShelfNumber =
         requestedShelfNumber ??
         shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
@@ -2299,8 +2690,12 @@ router.get(
         client,
         mainChannel.id,
         fallbackDays.length > 0
-          ? { selectedDates: fallbackDays }
-          : { selectedShelfNumber },
+          ? { selectedDates: fallbackDays, productIdSearch }
+          : {
+              selectedShelfNumber,
+              productIdSearch,
+              includeHiddenMissingPhotoShelfNumber: creatorMissingPhotoShelfNumber,
+            },
       );
       const enrichedPosts = await attachProductMediaToRows(client, posts);
       await client.query('COMMIT');
@@ -2470,39 +2865,58 @@ router.post(
   '/revision/manual',
   authMiddleware,
   requireRole('worker', 'admin', 'tenant', 'creator'),
+  uploadProductImage,
   async (req, res) => {
-    const entries = Array.isArray(req.body?.entries) ? req.body.entries : [];
+    const entries = parseRevisionEntriesInput(req.body?.entries);
     if (!entries.length) {
+      removeUploadedFile(req.file);
       return res.status(400).json({ ok: false, error: 'Передайте entries для ручной ревизии' });
     }
     if (entries.length > 200) {
+      removeUploadedFile(req.file);
       return res.status(400).json({ ok: false, error: 'Слишком много позиций за один запрос' });
+    }
+    if (req.file && entries.length !== 1) {
+      removeUploadedFile(req.file);
+      return res.status(400).json({
+        ok: false,
+        error: 'Фото можно прикрепить только к одной позиции ручной ревизии',
+      });
     }
 
     const normalized = entries.map(normalizeRevisionEntry);
+    if (req.file) {
+      normalized[0].image_url = toAbsoluteImageUrl(req, req.file);
+    }
     for (const item of normalized) {
       if (!item.product_id && !item.message_id) {
+        removeUploadedFile(req.file);
         return res.status(400).json({
           ok: false,
           error: 'Для каждой позиции нужен product_id или message_id',
         });
       }
       if (!item.title) {
+        removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
       }
       if (!hasAtLeastTwoLetters(item.description)) {
+        removeUploadedFile(req.file);
         return res.status(400).json({
           ok: false,
           error: 'Описание должно содержать минимум 2 буквы',
         });
       }
       if (!Number.isFinite(item.price) || item.price <= 0) {
+        removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Цена должна быть больше нуля' });
       }
       if (!Number.isFinite(item.quantity) || item.quantity <= 0) {
+        removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
       }
       if (Number.isFinite(item.shelf_number) && item.shelf_number <= 0) {
+        removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Номер полки должен быть больше нуля' });
       }
     }
@@ -2530,6 +2944,19 @@ router.post(
         const productId = String(target.product_id || '').trim();
         if (!productId) {
           continue;
+        }
+        const targetMeta = parseSettings(target.meta);
+        const requiresRestoredPhoto =
+          target.message_hidden === true &&
+          (targetMeta.hidden_missing_photo === true ||
+            String(targetMeta.hidden_missing_photo || '').toLowerCase().trim() === 'true');
+        if (requiresRestoredPhoto && !item.image_url) {
+          removeUploadedFile(req.file);
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            ok: false,
+            error: 'Для товара с потерянным фото нужно добавить новое фото через ручную ревизию',
+          });
         }
         const revisionState = await fetchRevisionEligibilityForProduct(client, productId);
         if (revisionState.revision_state !== 'available') {
@@ -2561,6 +2988,14 @@ router.post(
         const nextProductShelfNumber = toShelfNumber(target.product_shelf_number, 1);
         const nextPrice = Number(item.price);
         const nextImageUrl = item.image_url || normalizeImageUrl(target.product_image_url) || null;
+        if (req.file && nextImageUrl) {
+          await registerPublicImageUpload({
+            queryable: client,
+            ownerKind: 'product_image',
+            ownerId: productId,
+            rawUrl: nextImageUrl,
+          });
+        }
         const payload = buildRevisionQueuePayload({
           post: {
             message_id: target.message_id,
@@ -2649,6 +3084,9 @@ router.post(
         });
       }
 
+      if (req.file && queuedItems.length === 0) {
+        removeUploadedFile(req.file);
+      }
       await client.query('UPDATE chats SET updated_at = now() WHERE id = $1', [mainChannel.id]);
       await client.query('COMMIT');
 
@@ -2685,6 +3123,7 @@ router.post(
         },
       });
     } catch (err) {
+      removeUploadedFile(req.file);
       try {
         await client.query('ROLLBACK');
       } catch (_) {}

@@ -56,6 +56,15 @@ class MainActivity : FlutterActivity() {
         latestDeepLink = intent.dataString
     }
 
+    override fun onResume() {
+        super.onResume()
+        try {
+            PhoenixManagedUpdateEngine.resumePendingInstallIfAllowed(applicationContext)
+        } catch (_: Throwable) {
+            // Update resume must never break normal app foregrounding.
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 

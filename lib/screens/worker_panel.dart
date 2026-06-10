@@ -1,6 +1,8 @@
 // lib/screens/worker_panel.dart
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
@@ -11,6 +13,8 @@ import 'package:image_picker/image_picker.dart';
 import '../main.dart';
 import '../services/web_media_capture_permission_service.dart';
 import '../src/utils/media_url.dart';
+import '../utils/date_time_utils.dart';
+import '../utils/phone_utils.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/app_status_badge.dart';
 import '../widgets/app_skeleton.dart';
@@ -20,6 +24,22 @@ import '../widgets/phoenix_loader.dart';
 import '../widgets/phoenix_visual_effects.dart';
 import '../widgets/product_media_gallery.dart';
 import '../widgets/product_photo_crop_dialog.dart';
+
+Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
+  final path = (file.path ?? '').trim();
+  if (path.isNotEmpty && !kIsWeb) {
+    try {
+      return await File(path).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return await file.readAsBytes();
+  } catch (_) {
+    return null;
+  }
+}
 
 class WorkerPanel extends StatefulWidget {
   const WorkerPanel({super.key});
@@ -40,6 +60,18 @@ class _WorkerTabSpec {
   final Widget Function() builder;
 }
 
+class _RevisionPickedImage {
+  const _RevisionPickedImage({
+    required this.bytes,
+    required this.fileName,
+    this.file,
+  });
+
+  final Uint8List bytes;
+  final String fileName;
+  final XFile? file;
+}
+
 class _WorkerPanelState extends State<WorkerPanel>
     with SingleTickerProviderStateMixin {
   TabController? _tabController;
@@ -48,6 +80,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   StreamSubscription? _chatEventsSub;
   Timer? _channelsRefreshDebounce;
   Timer? _ownPostsRefreshDebounce;
+  Timer? _revisionProductSearchDebounce;
 
   final _titleCtrl = TextEditingController();
   final _descriptionCtrl = TextEditingController();
@@ -57,6 +90,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   final _shelfFloorCtrl = TextEditingController();
   final _searchCtrl = TextEditingController();
   final _revisionPercentCtrl = TextEditingController(text: '10');
+  final _revisionProductIdSearchCtrl = TextEditingController();
   final Map<String, int> _quickDuplicateCounters = {};
 
   final ImagePicker _imagePicker = ImagePicker();
@@ -79,7 +113,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   bool get _preferFilePickerForGallery {
-    if (kIsWeb) return true;
+    if (kIsWeb) return false;
     return Platform.isMacOS || Platform.isWindows || Platform.isLinux;
   }
 
@@ -91,6 +125,8 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool _loadingTenantFeatureSettings = false;
   bool _loadingRevisionShelves = false;
   bool _loadingRevisionPosts = false;
+  bool _loadingDeliveryDashboard = false;
+  bool _deliverySaving = false;
   bool _runningRevision = false;
   bool _autoHideOldRevisionPosts = true;
   String _message = '';
@@ -117,6 +153,50 @@ class _WorkerPanelState extends State<WorkerPanel>
         normalized == 'yes' ||
         normalized == 'on' ||
         normalized == 'да';
+  }
+
+  Map<String, dynamic> _asMap(dynamic raw) {
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return <String, dynamic>{};
+  }
+
+  List<Map<String, dynamic>> _asMapList(dynamic raw) {
+    if (raw is! List) return const <Map<String, dynamic>>[];
+    return raw.map((item) => _asMap(item)).toList();
+  }
+
+  String _formatMoney(dynamic value) {
+    final amount = _toDoubleValue(value, 0);
+    return '${amount.toStringAsFixed(2)} ₽';
+  }
+
+  String _formatDateTimeLabel(dynamic raw) {
+    return formatDateTimeValue(raw, fallback: '');
+  }
+
+  String _formatClockLabel(dynamic raw) {
+    final value = (raw ?? '').toString().trim();
+    if (value.isEmpty) return '';
+    if (value.length >= 5 && value[2] == ':') {
+      return value.substring(0, 5);
+    }
+    return value;
+  }
+
+  String _displayPhone(String raw, {String fallback = '—'}) {
+    final formatted = PhoneUtils.formatForDisplay(raw);
+    if (formatted.isNotEmpty) return formatted;
+    final trimmed = raw.trim();
+    return trimmed.isNotEmpty ? trimmed : fallback;
+  }
+
+  String _displayShelfValue(dynamic shelfLabel, dynamic shelfNumber) {
+    final label = (shelfLabel ?? '').toString().trim();
+    if (label.isNotEmpty) return label;
+    final rawNumber = (shelfNumber ?? '').toString().trim();
+    if (rawNumber.isNotEmpty) return rawNumber;
+    return 'не назначена';
   }
 
   bool get _manualShelfEnabled =>
@@ -275,9 +355,12 @@ class _WorkerPanelState extends State<WorkerPanel>
   List<Map<String, dynamic>> _ownQueuedPosts = [];
   List<Map<String, dynamic>> _revisionShelves = [];
   List<Map<String, dynamic>> _revisionPosts = [];
+  List<Map<String, dynamic>> _deliveryBatches = [];
   Map<String, dynamic> _tenantFeatureSettings = <String, dynamic>{};
+  Map<String, dynamic>? _deliveryActiveBatch;
   int? _selectedRevisionShelfNumber;
   bool _pickupOnly = false;
+  bool _isBulkyProduct = false;
 
   @override
   void initState() {
@@ -314,6 +397,10 @@ class _WorkerPanelState extends State<WorkerPanel>
           },
         );
       }
+      if ((type == 'delivery:updated' || type == 'socket:connected') &&
+          _isActiveTab('delivery')) {
+        unawaited(_loadDeliveryDashboard());
+      }
     });
     _authSub = authService.authStream.listen((_) {
       final changed = _rebuildVisibleTabs();
@@ -329,6 +416,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _authSub?.cancel();
     _channelsRefreshDebounce?.cancel();
     _ownPostsRefreshDebounce?.cancel();
+    _revisionProductSearchDebounce?.cancel();
     _tabController?.dispose();
     _titleCtrl.dispose();
     _descriptionCtrl.dispose();
@@ -338,6 +426,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _shelfFloorCtrl.dispose();
     _searchCtrl.dispose();
     _revisionPercentCtrl.dispose();
+    _revisionProductIdSearchCtrl.dispose();
     super.dispose();
   }
 
@@ -351,6 +440,106 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool _hasFullWorkerMenuAccess() {
     final role = authService.effectiveRole.toLowerCase().trim();
     return role == 'creator' || role == 'tenant';
+  }
+
+  bool _isKinelTenantScope() {
+    final user = authService.currentUser;
+    final tenantCode = (user?.tenantCode ?? '').toLowerCase().trim();
+    final tenantName = (user?.tenantName ?? '').toLowerCase().trim();
+    return tenantCode == 'kinel-8997' ||
+        tenantCode.contains('kinel') ||
+        tenantName.contains('кинель');
+  }
+
+  bool _isAnnaUtevskayaTenantScope() {
+    final user = authService.currentUser;
+    final tenantCode = [
+      authService.creatorTenantScopeCode,
+      user?.tenantCode,
+    ].whereType<String>().join(' ').toLowerCase().trim();
+    final tenantName = (user?.tenantName ?? '').toLowerCase().trim();
+    final compactCode = tenantCode.replaceAll(RegExp(r'[\s_-]+'), '');
+    final compactName = tenantName.replaceAll(RegExp(r'\s+'), ' ');
+    return tenantCode == 'anna-utevskaya-4898' ||
+        (compactCode.contains('anna') && compactCode.contains('utev')) ||
+        (compactName.contains('анна') && compactName.contains('утев')) ||
+        (compactName.contains('anna') && compactName.contains('utev'));
+  }
+
+  String get _placementShelfInputLabel {
+    final label = (_tenantFeatureSettings['shelf_field_label'] ?? '')
+        .toString()
+        .trim();
+    if (label.isNotEmpty) return label;
+    return _isAnnaUtevskayaTenantScope() ? 'Стеллаж' : 'Номер / название полки';
+  }
+
+  String get _placementShelfInputHint => _isAnnaUtevskayaTenantScope()
+      ? 'Например: 03 или A-2'
+      : 'Например: 03, A-2, верхняя';
+
+  String get _placementBoxInputLabel {
+    final label = (_tenantFeatureSettings['floor_field_label'] ?? '')
+        .toString()
+        .trim();
+    if (label.isNotEmpty) return label;
+    return _isAnnaUtevskayaTenantScope() ? 'Коробка' : 'Этаж / секция';
+  }
+
+  String get _placementBoxInputHint =>
+      _isAnnaUtevskayaTenantScope() ? 'Номер коробки' : 'Любые символы';
+
+  String get _placementShelfDisplayLabel {
+    final label = (_tenantFeatureSettings['shelf_field_label'] ?? '')
+        .toString()
+        .trim();
+    if (label.isNotEmpty) return label;
+    return _isAnnaUtevskayaTenantScope() ? 'Стеллаж' : 'Полка';
+  }
+
+  String get _placementBoxDisplayLabel {
+    final label = (_tenantFeatureSettings['floor_field_label'] ?? '')
+        .toString()
+        .trim();
+    if (label.isNotEmpty) return label;
+    return _isAnnaUtevskayaTenantScope() ? 'Коробка' : 'этаж';
+  }
+
+  String _productShelfValue(dynamic shelfNumber, dynamic manualShelfLabel) {
+    final manualShelf = (manualShelfLabel ?? '').toString().trim();
+    if (manualShelf.isNotEmpty) return manualShelf;
+    final shelf = _toIntValue(shelfNumber, 0);
+    if (shelf > 0) return shelf.toString().padLeft(2, '0');
+    final raw = (shelfNumber ?? '').toString().trim();
+    return raw.isNotEmpty ? raw : '—';
+  }
+
+  String _productBoxValue(dynamic shelfFloor) {
+    final value = (shelfFloor ?? '').toString().trim();
+    return value.isNotEmpty ? value : '—';
+  }
+
+  List<Widget> _ownPostIdentityChips(Map<String, dynamic> post) {
+    if (!_isAnnaUtevskayaTenantScope()) {
+      return [
+        _statChip(
+          'ID ${_formatProductLabel(post['product_code'], post['product_shelf_number'], manualShelfLabel: post['manual_shelf_label'])}',
+        ),
+      ];
+    }
+    return [
+      _statChip('ID товара: ${_productCodePart(post['product_code'])}'),
+      _statChip(
+        'Стеллаж: ${_productShelfValue(post['product_shelf_number'], post['manual_shelf_label'])}',
+      ),
+      _statChip('Коробка: ${_productBoxValue(post['shelf_floor'])}'),
+    ];
+  }
+
+  bool _canViewDeliveryTab() {
+    final role = authService.effectiveRole.toLowerCase().trim();
+    if (role == 'worker' && _isKinelTenantScope()) return true;
+    return false;
   }
 
   bool _canViewNewTab() {
@@ -405,6 +594,12 @@ class _WorkerPanelState extends State<WorkerPanel>
           id: 'revision',
           label: 'Ревизия',
           builder: _buildRevisionTab,
+        ),
+      if (_canViewDeliveryTab())
+        _WorkerTabSpec(
+          id: 'delivery',
+          label: 'Доставка',
+          builder: _buildDeliveryTab,
         ),
     ];
     if (tabs.isNotEmpty) return tabs;
@@ -498,6 +693,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       case 'revision':
         _loadTenantFeatureSettings();
         _loadRevisionShelves();
+        break;
+      case 'delivery':
+        _loadDeliveryDashboard();
         break;
     }
   }
@@ -709,6 +907,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     _existingImageUrl = null;
     _removeImageOnSubmit = false;
     _pickupOnly = false;
+    _isBulkyProduct = false;
   }
 
   Color _messageColor(ThemeData theme) {
@@ -784,63 +983,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Future<void> _openImagePickerSheet() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      builder: (context) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (_cameraSupported)
-                ListTile(
-                  leading: const Icon(Icons.photo_camera_outlined),
-                  title: const Text('Сделать фото'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _pickImageWithDelay(ImageSource.camera);
-                  },
-                )
-              else
-                const ListTile(
-                  leading: Icon(Icons.info_outline),
-                  title: Text('Камера недоступна на этом устройстве'),
-                  subtitle: Text(
-                    'На этом устройстве используйте выбор фото с устройства',
-                  ),
-                ),
-              ListTile(
-                leading: const Icon(Icons.photo_library_outlined),
-                title: Text(
-                  _preferFilePickerForGallery
-                      ? 'Выбрать фото с устройства'
-                      : 'Выбрать из галереи',
-                ),
-                onTap: () {
-                  Navigator.pop(context);
-                  _pickImageWithDelay(ImageSource.gallery);
-                },
-              ),
-              if (_pickedImage != null ||
-                  (_existingImageUrl?.isNotEmpty ?? false))
-                ListTile(
-                  leading: const Icon(Icons.delete_outline),
-                  title: const Text('Удалить фото'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _clearSelectedImage();
-                  },
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _pickImageWithDelay(ImageSource source) async {
-    // On desktop/macOS opening picker right after bottomsheet close may no-op.
-    await Future.delayed(const Duration(milliseconds: 120));
-    await _pickImage(source);
+    await _pickImage(ImageSource.gallery);
   }
 
   String _resolvedPickedFileName(XFile? picked) {
@@ -933,13 +1076,10 @@ class _WorkerPanelState extends State<WorkerPanel>
           );
         } catch (_) {}
         if (picked == null) {
-          final result = await FilePicker.platform.pickFiles(
-            type: FileType.image,
-            allowMultiple: false,
-            withData: true,
-          );
-          final selected = result?.files.single;
-          final bytes = selected?.bytes;
+          final selected = await FilePicker.pickFile(type: FileType.image);
+          final bytes = selected == null
+              ? null
+              : await _readPickedPlatformFileBytes(selected);
           if (bytes != null && bytes.isNotEmpty) {
             preloadedBytes = bytes;
             preloadedFileName = (selected?.name ?? 'camera-image.jpg').trim();
@@ -950,13 +1090,10 @@ class _WorkerPanelState extends State<WorkerPanel>
           _preferFilePickerForGallery) {
         if (kIsWeb) {
           // Web: read bytes directly from FilePicker to avoid revoked Blob URLs.
-          final result = await FilePicker.platform.pickFiles(
-            type: FileType.image,
-            allowMultiple: false,
-            withData: true,
-          );
-          final selected = result?.files.single;
-          final bytes = selected?.bytes;
+          final selected = await FilePicker.pickFile(type: FileType.image);
+          final bytes = selected == null
+              ? null
+              : await _readPickedPlatformFileBytes(selected);
           if (bytes != null && bytes.isNotEmpty) {
             preloadedBytes = bytes;
             preloadedFileName = (selected?.name ?? 'image.jpg').trim();
@@ -976,17 +1113,14 @@ class _WorkerPanelState extends State<WorkerPanel>
 
           try {
             if (picked == null) {
-              final result = await FilePicker.platform.pickFiles(
-                type: FileType.image,
-                allowMultiple: false,
-                withData: false,
-              );
-              final selected = result?.files.single;
+              final selected = await FilePicker.pickFile(type: FileType.image);
               final path = selected?.path;
               if (path != null && path.isNotEmpty) {
                 picked = XFile(path, name: selected?.name ?? '');
               } else {
-                final bytes = selected?.bytes;
+                final bytes = selected == null
+                    ? null
+                    : await _readPickedPlatformFileBytes(selected);
                 if (bytes != null && bytes.isNotEmpty) {
                   preloadedBytes = bytes;
                   preloadedFileName = (selected?.name ?? 'image.jpg').trim();
@@ -1114,6 +1248,147 @@ class _WorkerPanelState extends State<WorkerPanel>
     return MultipartFile.fromFile(path, filename: fileName);
   }
 
+  String _resolvedRevisionFileName(XFile? picked, String? preferred) {
+    final explicit = preferred?.trim();
+    if (explicit != null && explicit.isNotEmpty) return explicit;
+    final fromName = picked?.name.trim() ?? '';
+    if (fromName.isNotEmpty) return fromName;
+    final path = picked?.path.trim() ?? '';
+    if (path.isNotEmpty) {
+      final normalized = path.replaceAll('\\', '/');
+      final fromPath = normalized.split('/').last.trim();
+      if (fromPath.isNotEmpty) return fromPath;
+    }
+    return 'revision-photo.jpg';
+  }
+
+  Future<_RevisionPickedImage?> _pickRevisionImage(ImageSource source) async {
+    try {
+      var effectiveSource = source;
+      if (source == ImageSource.camera && !_cameraSupported) {
+        effectiveSource = ImageSource.gallery;
+      }
+
+      XFile? picked;
+      Uint8List? preloadedBytes;
+      String? preloadedFileName;
+      if (kIsWeb && effectiveSource == ImageSource.camera) {
+        try {
+          await WebMediaCapturePermissionService.requestPreferredAccess(
+            includeVideo: true,
+          );
+        } catch (_) {}
+        try {
+          picked = await _imagePicker.pickImage(
+            source: ImageSource.camera,
+            preferredCameraDevice: CameraDevice.rear,
+          );
+        } catch (_) {}
+        if (picked == null) {
+          final selected = await FilePicker.pickFile(type: FileType.image);
+          final bytes = selected == null
+              ? null
+              : await _readPickedPlatformFileBytes(selected);
+          if (bytes != null && bytes.isNotEmpty) {
+            preloadedBytes = bytes;
+            preloadedFileName = (selected?.name ?? 'camera-image.jpg').trim();
+            picked = XFile.fromData(bytes, name: preloadedFileName);
+          }
+        }
+      } else if (effectiveSource == ImageSource.gallery &&
+          _preferFilePickerForGallery) {
+        if (kIsWeb) {
+          final selected = await FilePicker.pickFile(type: FileType.image);
+          final bytes = selected == null
+              ? null
+              : await _readPickedPlatformFileBytes(selected);
+          if (bytes != null && bytes.isNotEmpty) {
+            preloadedBytes = bytes;
+            preloadedFileName = (selected?.name ?? 'image.jpg').trim();
+            picked = XFile.fromData(bytes, name: preloadedFileName);
+          }
+        } else {
+          try {
+            picked = await _imagePicker.pickImage(source: ImageSource.gallery);
+          } catch (_) {}
+          if (picked == null) {
+            final selected = await FilePicker.pickFile(type: FileType.image);
+            final path = selected?.path;
+            if (path != null && path.isNotEmpty) {
+              picked = XFile(path, name: selected?.name ?? '');
+            } else {
+              final bytes = selected == null
+                  ? null
+                  : await _readPickedPlatformFileBytes(selected);
+              if (bytes != null && bytes.isNotEmpty) {
+                preloadedBytes = bytes;
+                preloadedFileName = (selected?.name ?? 'image.jpg').trim();
+                picked = XFile.fromData(bytes, name: preloadedFileName);
+              }
+            }
+          }
+        }
+      } else {
+        picked = await _imagePicker.pickImage(source: effectiveSource);
+      }
+
+      Uint8List? pickedBytes = preloadedBytes;
+      if ((pickedBytes == null || pickedBytes.isEmpty) && picked != null) {
+        pickedBytes = await picked.readAsBytes();
+      }
+      if (pickedBytes == null || pickedBytes.isEmpty) {
+        return null;
+      }
+
+      final stableBytes = Uint8List.fromList(pickedBytes);
+      final originalFileName = _resolvedRevisionFileName(
+        picked,
+        preloadedFileName,
+      );
+      try {
+        if (!mounted) return null;
+        final cropResult = await showProductPhotoCropDialog(
+          context: context,
+          sourceBytes: stableBytes,
+          originalFileName: originalFileName,
+        );
+        if (cropResult == null) return null;
+        return _RevisionPickedImage(
+          bytes: cropResult.bytes,
+          fileName: cropResult.fileName,
+          file: picked,
+        );
+      } catch (_) {
+        return _RevisionPickedImage(
+          bytes: stableBytes,
+          fileName: originalFileName,
+          file: picked,
+        );
+      }
+    } catch (e) {
+      if (!mounted) return null;
+      setState(() => _message = 'Не удалось выбрать фото: $e');
+      return null;
+    }
+  }
+
+  Future<MultipartFile> _buildRevisionImageMultipart(
+    _RevisionPickedImage image,
+  ) async {
+    if (image.bytes.isNotEmpty) {
+      return MultipartFile.fromBytes(image.bytes, filename: image.fileName);
+    }
+    final path = image.file?.path ?? '';
+    return MultipartFile.fromFile(path, filename: image.fileName);
+  }
+
+  Future<void> _openRevisionImagePickerSheet({
+    required ValueChanged<_RevisionPickedImage?> onChanged,
+  }) async {
+    final picked = await _pickRevisionImage(ImageSource.gallery);
+    if (picked != null) onChanged(picked);
+  }
+
   Future<FormData> _buildCreateProductPayload({
     required String title,
     required String description,
@@ -1125,6 +1400,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       'description': description,
       'price': price,
       'quantity': quantity,
+      'is_bulky': _isBulkyProduct ? 'true' : 'false',
     };
     if (_manualShelfEnabled) {
       map['manual_shelf_label'] = _manualShelfLabelCtrl.text.trim();
@@ -1163,6 +1439,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       'description': description,
       'price': price,
       'quantity': quantity,
+      'is_bulky': _isBulkyProduct ? 'true' : 'false',
     };
     if (_manualShelfEnabled) {
       map['manual_shelf_label'] = _manualShelfLabelCtrl.text.trim();
@@ -1294,15 +1571,30 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
+  void _scheduleRevisionProductSearch(String value) {
+    _revisionProductSearchDebounce?.cancel();
+    _revisionProductSearchDebounce = Timer(
+      const Duration(milliseconds: 350),
+      () {
+        if (!mounted) return;
+        unawaited(_loadRevisionPosts());
+      },
+    );
+  }
+
   Future<void> _loadRevisionPosts() async {
     if (mounted) {
       setState(() => _loadingRevisionPosts = true);
     }
     try {
       final selected = _selectedRevisionShelfNumber ?? 1;
+      final productSearch = _revisionProductIdSearchCtrl.text.trim();
       final resp = await authService.dio.get(
         '/api/worker/revision/posts',
-        queryParameters: {'shelf_number': selected},
+        queryParameters: {
+          'shelf_number': selected,
+          if (productSearch.isNotEmpty) 'product_id': productSearch,
+        },
       );
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
@@ -1353,6 +1645,10 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   bool _oldPostRequeueAllowed(Map<String, dynamic> product) {
     return product['requeue_allowed'] != false;
+  }
+
+  bool _oldPostQuickDuplicateAllowed(Map<String, dynamic> product) {
+    return product['quick_duplicate_allowed'] != false;
   }
 
   String _oldPostReuseHint(Map<String, dynamic> product) {
@@ -1575,6 +1871,13 @@ class _WorkerPanelState extends State<WorkerPanel>
       );
       return;
     }
+    final missingPhotoRecovery =
+        _toBoolValue(post['creator_missing_photo_recovery']) ||
+        _toBoolValue(post['hidden_missing_photo']);
+    final existingRevisionImageUrl = missingPhotoRecovery
+        ? ''
+        : (post['image_url'] ?? '').toString().trim();
+    _RevisionPickedImage? revisionImage;
     final titleCtrl = TextEditingController(
       text: (post['title'] ?? '').toString(),
     );
@@ -1590,89 +1893,197 @@ class _WorkerPanelState extends State<WorkerPanel>
 
     final confirm = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Ручная ревизия товара'),
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 520),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: titleCtrl,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Название',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: titleCtrl,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: descriptionCtrl,
-                  minLines: 3,
-                  maxLines: 5,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Описание',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: descriptionCtrl,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 12,
-                  runSpacing: 12,
-                  children: [
-                    SizedBox(
-                      width: 180,
-                      child: TextField(
-                        controller: priceCtrl,
-                        keyboardType: const TextInputType.numberWithOptions(
-                          decimal: true,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final theme = Theme.of(context);
+            final resolvedExistingImage = _resolveImageUrl(
+              existingRevisionImageUrl,
+            );
+            final hasSelectedRevisionImage = revisionImage != null;
+            final hasRevisionImage =
+                hasSelectedRevisionImage || resolvedExistingImage != null;
+            return AlertDialog(
+              title: Text(
+                missingPhotoRecovery
+                    ? 'Восстановить фото товара'
+                    : 'Ручная ревизия товара',
+              ),
+              content: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 560),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (missingPhotoRecovery) ...[
+                        AppStatusBadge(
+                          icon: Icons.photo_camera_back_outlined,
+                          label:
+                              'Фото было потеряно. Добавьте новое фото, ID товара сохранится.',
+                          background: theme.colorScheme.tertiaryContainer
+                              .withValues(alpha: 0.52),
+                          foreground: theme.colorScheme.onTertiaryContainer,
+                          border: theme.colorScheme.tertiary.withValues(
+                            alpha: 0.24,
+                          ),
                         ),
+                        const SizedBox(height: 12),
+                      ],
+                      TextField(
+                        controller: titleCtrl,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
-                            labelText: 'Цена',
+                            labelText: 'Название',
                             border: OutlineInputBorder(),
                           ),
-                          controller: priceCtrl,
+                          controller: titleCtrl,
                         ),
                       ),
-                    ),
-                    SizedBox(
-                      width: 140,
-                      child: TextField(
-                        controller: quantityCtrl,
-                        keyboardType: TextInputType.number,
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: descriptionCtrl,
+                        minLines: 3,
+                        maxLines: 5,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
-                            labelText: 'Кол-во',
+                            labelText: 'Описание',
                             border: OutlineInputBorder(),
                           ),
-                          controller: quantityCtrl,
+                          controller: descriptionCtrl,
                         ),
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 12,
+                        runSpacing: 12,
+                        children: [
+                          SizedBox(
+                            width: 180,
+                            child: TextField(
+                              controller: priceCtrl,
+                              keyboardType:
+                                  const TextInputType.numberWithOptions(
+                                    decimal: true,
+                                  ),
+                              decoration: withInputLanguageBadge(
+                                const InputDecoration(
+                                  labelText: 'Цена',
+                                  border: OutlineInputBorder(),
+                                ),
+                                controller: priceCtrl,
+                              ),
+                            ),
+                          ),
+                          SizedBox(
+                            width: 140,
+                            child: TextField(
+                              controller: quantityCtrl,
+                              keyboardType: TextInputType.number,
+                              decoration: withInputLanguageBadge(
+                                const InputDecoration(
+                                  labelText: 'Кол-во',
+                                  border: OutlineInputBorder(),
+                                ),
+                                controller: quantityCtrl,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        missingPhotoRecovery ? 'Новое фото' : 'Фото товара',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      if (revisionImage != null)
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: SizedBox(
+                            height: 220,
+                            child: Image.memory(
+                              revisionImage!.bytes,
+                              width: double.infinity,
+                              fit: BoxFit.cover,
+                              filterQuality: FilterQuality.high,
+                            ),
+                          ),
+                        )
+                      else
+                        ProductMediaGallery(
+                          coverImageUrl: resolvedExistingImage,
+                          media: resolvedExistingImage != null
+                              ? [
+                                  <String, dynamic>{
+                                    'card_url': resolvedExistingImage,
+                                    'detail_url': resolvedExistingImage,
+                                    'original_url': resolvedExistingImage,
+                                  },
+                                ]
+                              : const <Map<String, dynamic>>[],
+                          height: 220,
+                          heroLabel: hasRevisionImage ? 'Cover' : 'Нет фото',
+                          fit: BoxFit.contain,
+                        ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              icon: const Icon(Icons.attach_file),
+                              label: Text(
+                                hasRevisionImage
+                                    ? 'Изменить фото'
+                                    : 'Добавить фото',
+                              ),
+                              onPressed: () async {
+                                await _openRevisionImagePickerSheet(
+                                  onChanged: (picked) {
+                                    setDialogState(() {
+                                      revisionImage = picked;
+                                    });
+                                  },
+                                );
+                              },
+                            ),
+                          ),
+                          if (revisionImage != null) ...[
+                            const SizedBox(width: 8),
+                            IconButton(
+                              tooltip: 'Удалить выбранное фото',
+                              onPressed: () {
+                                setDialogState(() {
+                                  revisionImage = null;
+                                });
+                              },
+                              icon: const Icon(Icons.delete_outline),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: Text(
+                    missingPhotoRecovery ? 'Вернуть на канал' : 'Применить',
+                  ),
                 ),
               ],
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Применить'),
-          ),
-        ],
-      ),
+            );
+          },
+        );
+      },
     );
     if (confirm != true) return;
 
@@ -1680,7 +2091,9 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
-    final hasImage = (post['image_url'] ?? '').toString().trim().isNotEmpty;
+    final hasImage =
+        revisionImage != null ||
+        (!missingPhotoRecovery && existingRevisionImageUrl.isNotEmpty);
     final validationError = _validateProductFields(
       title: title,
       description: description,
@@ -1698,27 +2111,36 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _runningRevision = true);
     }
     try {
+      final entry = {
+        'product_id': (post['product_id'] ?? '').toString(),
+        'message_id': (post['message_id'] ?? '').toString(),
+        'title': title,
+        'description': description,
+        'price': price,
+        'quantity': quantity,
+        'shelf_number':
+            post['source_product_shelf_number'] ??
+            post['product_shelf_number'] ??
+            post['shelf_number'],
+        'revision_shelf_number':
+            post['revision_shelf_number'] ?? post['shelf_number'],
+        'image_url': revisionImage == null ? existingRevisionImageUrl : '',
+      };
+      final Object requestData;
+      final pickedRevisionImage = revisionImage;
+      if (pickedRevisionImage != null) {
+        requestData = FormData.fromMap({
+          'entries': jsonEncode([entry]),
+          'image': await _buildRevisionImageMultipart(pickedRevisionImage),
+        });
+      } else {
+        requestData = {
+          'entries': [entry],
+        };
+      }
       final resp = await authService.dio.post(
         '/api/worker/revision/manual',
-        data: {
-          'entries': [
-            {
-              'product_id': (post['product_id'] ?? '').toString(),
-              'message_id': (post['message_id'] ?? '').toString(),
-              'title': title,
-              'description': description,
-              'price': price,
-              'quantity': quantity,
-              'shelf_number':
-                  post['source_product_shelf_number'] ??
-                  post['product_shelf_number'] ??
-                  post['shelf_number'],
-              'revision_shelf_number':
-                  post['revision_shelf_number'] ?? post['shelf_number'],
-              'image_url': (post['image_url'] ?? '').toString(),
-            },
-          ],
-        },
+        data: requestData,
       );
       final data = resp.data;
       final payload = data is Map && data['data'] is Map
@@ -1740,17 +2162,25 @@ class _WorkerPanelState extends State<WorkerPanel>
         _mergeOwnQueuedPostLocally(queuedItems.first);
       }
       if (!mounted) return;
-      setState(() => _message = 'Ревизия товара сохранена');
+      setState(
+        () => _message = missingPhotoRecovery
+            ? 'Фото товара восстановлено и отправлено в очередь'
+            : 'Ревизия товара сохранена',
+      );
       showAppNotice(
         context,
-        'Изменения ревизии сохранены',
+        missingPhotoRecovery
+            ? 'Фото восстановлено. ID товара сохранен'
+            : 'Изменения ревизии сохранены',
         tone: AppNoticeTone.success,
       );
       await playAppSound(AppUiSound.success);
       unawaited(_loadOwnQueuedPosts());
     } catch (e) {
       if (!mounted) return;
-      setState(() => _message = 'Ошибка ручной ревизии: $e');
+      setState(
+        () => _message = 'Ошибка ручной ревизии: ${_extractRequestError(e)}',
+      );
     } finally {
       if (mounted) {
         setState(() => _runningRevision = false);
@@ -2015,6 +2445,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   void _fillFormFromProduct(Map<String, dynamic> product) {
+    final missingPhotoRecovery =
+        _toBoolValue(product['creator_missing_photo_recovery']) ||
+        _toBoolValue(product['hidden_missing_photo']);
     _titleCtrl.text = (product['title'] ?? '').toString();
     _descriptionCtrl.text = (product['description'] ?? '').toString();
     _priceCtrl.text = (product['price'] ?? '').toString();
@@ -2026,10 +2459,15 @@ class _WorkerPanelState extends State<WorkerPanel>
       _pickedImage = null;
       _pickedImageBytes = null;
       _pickedImageUploadFileName = null;
-      _existingImageUrl = (product['image_url'] ?? '').toString();
-      _removeImageOnSubmit = false;
+      _existingImageUrl = missingPhotoRecovery
+          ? ''
+          : (product['image_url'] ?? '').toString();
+      _removeImageOnSubmit = missingPhotoRecovery;
       _pickupOnly = _toBoolValue(product['pickup_only']);
-      _message = 'Данные товара подставлены. Проверьте и отправьте в очередь.';
+      _isBulkyProduct = _toBoolValue(product['is_bulky']);
+      _message = missingPhotoRecovery
+          ? 'Данные товара подставлены. Добавьте новое фото и отправьте в очередь.'
+          : 'Данные товара подставлены. Проверьте и отправьте в очередь.';
     });
     _animateToTab('new');
   }
@@ -2179,7 +2617,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   Future<void> _quickDuplicateProduct(Map<String, dynamic> product) async {
-    if (!_oldPostRequeueAllowed(product)) {
+    if (!_oldPostQuickDuplicateAllowed(product)) {
       setState(
         () => _message = _oldPostReuseHint(product).isNotEmpty
             ? _oldPostReuseHint(product)
@@ -2248,10 +2686,10 @@ class _WorkerPanelState extends State<WorkerPanel>
         },
       );
       if (resp.statusCode == 201 || resp.statusCode == 200) {
-        _quickDuplicateCounters[productId] = quantity;
         String? productLabel;
         String? placementShelfLabel;
         String? placementProductCode;
+        int? serverQuantity;
         final data = resp.data;
         if (data is Map && data['data'] is Map) {
           final body = Map<String, dynamic>.from(data['data']);
@@ -2259,6 +2697,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           final productMap = body['product'];
           if (productMap is Map) {
             final manualShelfLabel = productMap['manual_shelf_label'];
+            serverQuantity = _toIntValue(productMap['quantity'], quantity);
             placementShelfLabel = _placementShelfLabel(
               shelfNumber: productMap['shelf_number'],
               manualShelfLabel: manualShelfLabel,
@@ -2272,6 +2711,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             );
           }
         }
+        _quickDuplicateCounters[productId] = serverQuantity ?? quantity;
         placementShelfLabel ??= _placementShelfLabel(
           productLabel: productLabel,
         );
@@ -2437,7 +2877,9 @@ class _WorkerPanelState extends State<WorkerPanel>
               const SizedBox(height: 6),
               Text(
                 _manualShelfEnabled
-                    ? 'Подготовьте карточку товара для очереди публикации. Для этой группы можно вручную указать полку и этаж.'
+                    ? (_isAnnaUtevskayaTenantScope()
+                          ? 'Подготовьте карточку товара для очереди публикации. Для этой группы можно вручную указать стеллаж и коробку.'
+                          : 'Подготовьте карточку товара для очереди публикации. Для этой группы можно вручную указать полку и этаж.')
                     : 'Подготовьте карточку товара для очереди публикации. Полка назначится автоматически по дате, а фото сразу станет обложкой поста.',
               ),
             ],
@@ -2552,10 +2994,10 @@ class _WorkerPanelState extends State<WorkerPanel>
                       child: TextField(
                         controller: _manualShelfLabelCtrl,
                         decoration: withInputLanguageBadge(
-                          const InputDecoration(
-                            labelText: 'Номер / название полки',
-                            hintText: 'Например: 03, A-2, верхняя',
-                            border: OutlineInputBorder(),
+                          InputDecoration(
+                            labelText: _placementShelfInputLabel,
+                            hintText: _placementShelfInputHint,
+                            border: const OutlineInputBorder(),
                           ),
                           controller: _manualShelfLabelCtrl,
                         ),
@@ -2566,10 +3008,10 @@ class _WorkerPanelState extends State<WorkerPanel>
                       child: TextField(
                         controller: _shelfFloorCtrl,
                         decoration: withInputLanguageBadge(
-                          const InputDecoration(
-                            labelText: 'Этаж / секция',
-                            hintText: 'Любые символы',
-                            border: OutlineInputBorder(),
+                          InputDecoration(
+                            labelText: _placementBoxInputLabel,
+                            hintText: _placementBoxInputHint,
+                            border: const OutlineInputBorder(),
                           ),
                           controller: _shelfFloorCtrl,
                         ),
@@ -2595,6 +3037,18 @@ class _WorkerPanelState extends State<WorkerPanel>
                   ),
                 ),
               ],
+              CheckboxListTile(
+                value: _isBulkyProduct,
+                onChanged: (value) {
+                  setState(() => _isBulkyProduct = value ?? false);
+                },
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: const Text('Габарит'),
+                subtitle: const Text(
+                  'Полка и этаж для такого товара не обязательны. При сборке доставки он будет предложен как габарит.',
+                ),
+              ),
               if (_pickupOnlyEnabled) ...[
                 const SizedBox(height: 8),
                 CheckboxListTile(
@@ -2659,7 +3113,8 @@ class _WorkerPanelState extends State<WorkerPanel>
                   controller: _searchCtrl,
                   decoration: withInputLanguageBadge(
                     const InputDecoration(
-                      labelText: 'Поиск старого товара по описанию',
+                      labelText: 'Поиск по ID, названию или описанию',
+                      hintText: 'Например 328 или коврик',
                       border: OutlineInputBorder(),
                     ),
                     controller: _searchCtrl,
@@ -2687,7 +3142,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         if (!_searching && _searchResults.isEmpty)
           const AppEmptyState(
             title: 'Результаты появятся здесь',
-            subtitle: 'Введите описание товара, чтобы найти старые позиции.',
+            subtitle: 'Введите ID товара, название или описание.',
             icon: Icons.search_rounded,
           ),
         ...searchResults.map((p) {
@@ -2706,7 +3161,9 @@ class _WorkerPanelState extends State<WorkerPanel>
           final imageUrl = _coverImageOf(p);
           final mediaItems = _mediaItemsOf(p);
           final requeueAllowed = _oldPostRequeueAllowed(p);
+          final quickDuplicateAllowed = _oldPostQuickDuplicateAllowed(p);
           final reuseHint = _oldPostReuseHint(p);
+          final hintIsActionable = requeueAllowed || quickDuplicateAllowed;
           return AppSurfaceCard(
             key: ValueKey(itemKey),
             compact: true,
@@ -2764,21 +3221,21 @@ class _WorkerPanelState extends State<WorkerPanel>
                       if (reuseHint.isNotEmpty) ...[
                         const SizedBox(height: 10),
                         AppStatusBadge(
-                          icon: requeueAllowed
+                          icon: hintIsActionable
                               ? Icons.info_outline_rounded
                               : Icons.block_rounded,
                           label: reuseHint,
-                          background: requeueAllowed
+                          background: hintIsActionable
                               ? theme.colorScheme.primaryContainer.withValues(
                                   alpha: 0.42,
                                 )
                               : theme.colorScheme.tertiaryContainer.withValues(
                                   alpha: 0.52,
                                 ),
-                          foreground: requeueAllowed
+                          foreground: hintIsActionable
                               ? theme.colorScheme.onPrimaryContainer
                               : theme.colorScheme.onTertiaryContainer,
-                          border: requeueAllowed
+                          border: hintIsActionable
                               ? theme.colorScheme.primary.withValues(
                                   alpha: 0.18,
                                 )
@@ -2793,7 +3250,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         children: [
                           Expanded(
                             child: FilledButton.tonalIcon(
-                              onPressed: _posting || !requeueAllowed
+                              onPressed: _posting || !quickDuplicateAllowed
                                   ? null
                                   : () => _quickDuplicateProduct(p),
                               icon: const Icon(
@@ -2817,7 +3274,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                             itemBuilder: (_) => [
                               PopupMenuItem(
                                 value: 'quick_requeue',
-                                enabled: requeueAllowed,
+                                enabled: quickDuplicateAllowed,
                                 child: const Text('Быстрый дубль (1 клик)'),
                               ),
                               const PopupMenuItem(
@@ -3165,9 +3622,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                                 'queued',
                                 compact: true,
                               ),
-                              _statChip(
-                                'ID ${_formatProductLabel(post['product_code'], post['product_shelf_number'], manualShelfLabel: post['manual_shelf_label'])}',
-                              ),
+                              ..._ownPostIdentityChips(post),
                               _statChip(
                                 '${_toDoubleValue(post['product_price']).toStringAsFixed(0)} ₽',
                               ),
@@ -3247,6 +3702,8 @@ class _WorkerPanelState extends State<WorkerPanel>
         .cast<Map<String, dynamic>?>()
         .firstWhere((_) => true, orElse: () => null);
     final selectedShelfPosts = _toIntValue(selectedShelfData?['posts'], 0);
+    final revisionProductSearch = _revisionProductIdSearchCtrl.text.trim();
+    final revisionPostsCount = _revisionPosts.length;
     return RefreshIndicator(
       onRefresh: () async {
         await _loadTenantFeatureSettings();
@@ -3320,8 +3777,44 @@ class _WorkerPanelState extends State<WorkerPanel>
               ),
             ),
           const SizedBox(height: 8),
+          AppSurfaceCard(
+            compact: true,
+            child: TextField(
+              controller: _revisionProductIdSearchCtrl,
+              keyboardType: TextInputType.text,
+              textInputAction: TextInputAction.search,
+              enabled: !_runningRevision,
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.search),
+                labelText: 'Поиск по ID товара',
+                hintText: 'Например 123',
+                border: const OutlineInputBorder(),
+                suffixIcon: revisionProductSearch.isEmpty
+                    ? null
+                    : IconButton(
+                        tooltip: 'Очистить поиск',
+                        icon: const Icon(Icons.close),
+                        onPressed: _runningRevision
+                            ? null
+                            : () {
+                                _revisionProductIdSearchCtrl.clear();
+                                if (mounted) setState(() {});
+                                unawaited(_loadRevisionPosts());
+                              },
+                      ),
+              ),
+              onChanged: (value) {
+                if (mounted) setState(() {});
+                _scheduleRevisionProductSearch(value);
+              },
+              onSubmitted: (_) => unawaited(_loadRevisionPosts()),
+            ),
+          ),
+          const SizedBox(height: 8),
           _statChip(
-            "Выбрана полка ${selectedShelf.toString().padLeft(2, '0')} · $selectedShelfPosts товаров",
+            revisionProductSearch.isEmpty
+                ? "Выбрана полка ${selectedShelf.toString().padLeft(2, '0')} · $selectedShelfPosts товаров"
+                : "Выбрана полка ${selectedShelf.toString().padLeft(2, '0')} · найдено $revisionPostsCount из $selectedShelfPosts",
           ),
           const SizedBox(height: 14),
           AppSurfaceCard(
@@ -3424,11 +3917,16 @@ class _WorkerPanelState extends State<WorkerPanel>
               ),
             )
           else if (_revisionPosts.isEmpty)
-            const AppEmptyState(
-              badge: 'Выбранная полка',
-              title: 'Нет постов для выбранной полки',
-              subtitle:
-                  'Либо подходящих товаров нет, либо они уже не участвуют в ревизии.',
+            AppEmptyState(
+              badge: revisionProductSearch.isEmpty
+                  ? 'Выбранная полка'
+                  : 'Поиск',
+              title: revisionProductSearch.isEmpty
+                  ? 'Нет постов для выбранной полки'
+                  : 'Товар с таким ID не найден',
+              subtitle: revisionProductSearch.isEmpty
+                  ? 'Либо подходящих товаров нет, либо они уже не участвуют в ревизии.'
+                  : 'Проверьте ID товара или выберите другую полку.',
               icon: Icons.inventory_2_outlined,
             )
           else
@@ -3436,6 +3934,9 @@ class _WorkerPanelState extends State<WorkerPanel>
               final imageUrl = _coverImageOf(post);
               final mediaItems = _mediaItemsOf(post);
               final blocked = _isRevisionBlocked(post);
+              final missingPhotoRecovery = _toBoolValue(
+                post['creator_missing_photo_recovery'],
+              );
               final blockedNote = _revisionBlockedNote(post);
               final revisionShelfNumber = _toIntValue(
                 post['revision_shelf_number'] ?? post['shelf_number'],
@@ -3486,6 +3987,8 @@ class _WorkerPanelState extends State<WorkerPanel>
                               ),
                               if (createdAtShort.isNotEmpty)
                                 _statChip(createdAtShort),
+                              if (missingPhotoRecovery)
+                                _statChip('Фото потеряно'),
                             ],
                           ),
                           const SizedBox(height: 10),
@@ -3550,14 +4053,18 @@ class _WorkerPanelState extends State<WorkerPanel>
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         IconButton(
-                          tooltip: blocked
+                          tooltip: missingPhotoRecovery
+                              ? 'Восстановить фото через ручную ревизию'
+                              : blocked
                               ? 'Товар уже купили, отнесите администратору'
                               : 'Ручная ревизия',
                           onPressed: _runningRevision || blocked
                               ? null
                               : () => _manualRevisionEdit(post),
                           icon: Icon(
-                            blocked
+                            missingPhotoRecovery
+                                ? Icons.add_photo_alternate_outlined
+                                : blocked
                                 ? Icons.inventory_2_outlined
                                 : Icons.edit_outlined,
                           ),
@@ -3566,8 +4073,13 @@ class _WorkerPanelState extends State<WorkerPanel>
                           IconButton(
                             tooltip: blocked
                                 ? 'Купленный товар нельзя запросить на удаление'
+                                : missingPhotoRecovery
+                                ? 'Сначала восстановите фото через ручную ревизию'
                                 : 'Запросить удаление',
-                            onPressed: _runningRevision || blocked
+                            onPressed:
+                                _runningRevision ||
+                                    blocked ||
+                                    missingPhotoRecovery
                                 ? null
                                 : () => _requestRevisionDelete(post),
                             icon: const Icon(Icons.delete_outline),
@@ -3578,6 +4090,838 @@ class _WorkerPanelState extends State<WorkerPanel>
                 ),
               );
             }),
+        ],
+      ),
+    );
+  }
+
+  String _deliveryBatchStatusLabel(String raw) {
+    switch (raw.trim()) {
+      case 'calling':
+        return 'Идет обзвон';
+      case 'couriers_assigned':
+        return 'Курьеры назначены';
+      case 'handed_off':
+        return 'Передано курьерам';
+      case 'completed':
+        return 'Завершено';
+      case 'cancelled':
+        return 'Отменено';
+      default:
+        return raw.trim().isEmpty ? '—' : raw.trim();
+    }
+  }
+
+  String _deliveryCustomerStatusLabel(String raw) {
+    switch (raw.trim()) {
+      case 'accepted':
+        return 'Согласился';
+      case 'declined':
+        return 'Отказался';
+      case 'pending':
+        return 'Ожидает ответа';
+      case 'preparing_delivery':
+        return 'Идет подготовка';
+      case 'handing_to_courier':
+        return 'Передается курьеру';
+      case 'in_delivery':
+        return 'В доставке';
+      case 'delivered':
+        return 'Доставлено';
+      default:
+        return raw.trim().isEmpty ? '—' : raw.trim();
+    }
+  }
+
+  String _deliveryAssemblyStatusLabel(String raw) {
+    switch (raw.trim()) {
+      case 'assembling':
+        return 'Собирается';
+      case 'assembled':
+        return 'Собрано';
+      case 'issue':
+        return 'Есть проблема';
+      case 'not_started':
+      default:
+        return 'Не начато';
+    }
+  }
+
+  Future<void> _loadDeliveryDashboard({bool silent = true}) async {
+    if (!_canViewDeliveryTab()) {
+      if (mounted) {
+        setState(() {
+          _loadingDeliveryDashboard = false;
+          _deliveryActiveBatch = null;
+          _deliveryBatches = [];
+        });
+      }
+      return;
+    }
+    if (mounted) {
+      setState(() => _loadingDeliveryDashboard = true);
+    }
+    try {
+      final resp = await authService.dio.get('/api/admin/delivery/dashboard');
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final payload = Map<String, dynamic>.from(data['data'] as Map);
+        if (!mounted) return;
+        setState(() {
+          _deliveryBatches = _asMapList(payload['batches']);
+          _deliveryActiveBatch = payload['active_batch'] is Map
+              ? Map<String, dynamic>.from(payload['active_batch'] as Map)
+              : null;
+        });
+      }
+    } catch (e) {
+      if (!silent && mounted) {
+        setState(
+          () =>
+              _message = 'Ошибка загрузки доставки: ${_extractRequestError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _loadingDeliveryDashboard = false);
+      } else {
+        _loadingDeliveryDashboard = false;
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>?> _askDeliveryAssemblyData(
+    Map<String, dynamic> customer,
+  ) async {
+    final rawItems = _asMapList(customer['items']);
+    final rows = rawItems.map((item) {
+      final manualShelf = (item['manual_shelf_label'] ?? '').toString().trim();
+      final shelfFloor = (item['shelf_floor'] ?? '').toString().trim();
+      final productShelf = _toIntValue(
+        item['product_shelf_number'] ?? item['shelf_number'],
+        0,
+      );
+      final shelfLabel = _isAnnaUtevskayaTenantScope()
+          ? [
+              if (manualShelf.isNotEmpty) manualShelf,
+              if (manualShelf.isEmpty && productShelf > 0)
+                productShelf.toString().padLeft(2, '0'),
+              if (shelfFloor.isNotEmpty)
+                '$_placementBoxDisplayLabel $shelfFloor',
+            ].join(' · ')
+          : [
+              if (manualShelf.isNotEmpty) manualShelf,
+              if (manualShelf.isEmpty && productShelf > 0)
+                'Полка ${productShelf.toString().padLeft(2, '0')}',
+              if (shelfFloor.isNotEmpty)
+                '$_placementBoxDisplayLabel $shelfFloor',
+            ].join(' · ');
+      final assemblyStatus = (item['assembly_status'] ?? 'pending')
+          .toString()
+          .trim();
+      return <String, dynamic>{
+        'id': (item['id'] ?? '').toString(),
+        'title': (item['product_title'] ?? 'Товар').toString(),
+        'description': (item['product_description'] ?? '').toString(),
+        'image_url':
+            _resolveImageUrl((item['product_image_url'] ?? '').toString()) ??
+            '',
+        'code': item['product_code'],
+        'shelf_label': shelfLabel,
+        'shelf_title': _placementShelfDisplayLabel,
+        'quantity': _toIntValue(item['quantity'], 1),
+        'line_total': item['line_total'],
+        'collected': assemblyStatus == 'collected',
+        'is_bulky': item['is_bulky'] == true,
+        'removed': assemblyStatus == 'removed',
+        'removed_reason': (item['removed_reason'] ?? '').toString(),
+        'bulky_note': (item['bulky_note'] ?? item['product_title'] ?? '')
+            .toString(),
+      };
+    }).toList();
+    final reasonCtrls = <String, TextEditingController>{};
+    final bulkyCtrls = <String, TextEditingController>{};
+    for (final row in rows) {
+      final id = row['id'].toString();
+      reasonCtrls[id] = TextEditingController(
+        text: row['removed_reason'].toString(),
+      );
+      bulkyCtrls[id] = TextEditingController(
+        text: row['bulky_note'].toString(),
+      );
+    }
+
+    try {
+      final result = await showDialog<Map<String, dynamic>>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            return AlertDialog(
+              title: const Text('Сборка корзины'),
+              content: SizedBox(
+                width: 720,
+                height: math.min<double>(
+                  MediaQuery.of(ctx).size.height * 0.72,
+                  620,
+                ),
+                child: rows.isEmpty
+                    ? const Center(child: Text('В корзине нет товаров'))
+                    : ListView.separated(
+                        itemCount: rows.length,
+                        separatorBuilder: (context, index) =>
+                            const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final row = rows[index];
+                          final id = row['id'].toString();
+                          final removed = row['removed'] == true;
+                          final collected = row['collected'] == true;
+                          final isBulky = row['is_bulky'] == true;
+                          final imageUrl = row['image_url'].toString().trim();
+                          final description = row['description']
+                              .toString()
+                              .trim();
+                          final shelfLabel = row['shelf_label']
+                              .toString()
+                              .trim();
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: imageUrl.isEmpty
+                                          ? Container(
+                                              width: 54,
+                                              height: 54,
+                                              color: Theme.of(ctx)
+                                                  .colorScheme
+                                                  .surfaceContainerHighest,
+                                              child: const Icon(
+                                                Icons
+                                                    .image_not_supported_outlined,
+                                              ),
+                                            )
+                                          : Image.network(
+                                              imageUrl,
+                                              width: 54,
+                                              height: 54,
+                                              fit: BoxFit.cover,
+                                              errorBuilder:
+                                                  (
+                                                    context,
+                                                    error,
+                                                    stackTrace,
+                                                  ) => Container(
+                                                    width: 54,
+                                                    height: 54,
+                                                    color: Theme.of(ctx)
+                                                        .colorScheme
+                                                        .surfaceContainerHighest,
+                                                    child: const Icon(
+                                                      Icons
+                                                          .broken_image_outlined,
+                                                    ),
+                                                  ),
+                                            ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            '${row['title']} · ${_formatMoney(row['line_total'])}',
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                          Text(
+                                            'ID: ${row['code'] ?? '—'} · Кол-во: ${row['quantity']}',
+                                          ),
+                                          if (shelfLabel.isNotEmpty)
+                                            Text(
+                                              '${row['shelf_title']}: $shelfLabel',
+                                            ),
+                                          if (description.isNotEmpty)
+                                            Text(
+                                              description,
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                CheckboxListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  value: collected,
+                                  onChanged: removed
+                                      ? null
+                                      : (value) => setDialogState(() {
+                                          row['collected'] = value == true;
+                                          if (value == true) {
+                                            row['removed'] = false;
+                                          }
+                                        }),
+                                  title: const Text('Положил'),
+                                  subtitle: const Text(
+                                    'Товар найден и положен в пакет клиента',
+                                  ),
+                                ),
+                                CheckboxListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  value: isBulky,
+                                  onChanged: removed || !collected
+                                      ? null
+                                      : (value) => setDialogState(
+                                          () => row['is_bulky'] = value == true,
+                                        ),
+                                  title: const Text('Габарит'),
+                                  subtitle: const Text(
+                                    'Для товара будет напечатан габаритный стикер',
+                                  ),
+                                ),
+                                if (isBulky && !removed)
+                                  TextField(
+                                    controller: bulkyCtrls[id],
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Что за габарит',
+                                        border: OutlineInputBorder(),
+                                      ),
+                                      controller: bulkyCtrls[id],
+                                    ),
+                                  ),
+                                CheckboxListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  value: removed,
+                                  onChanged: (value) => setDialogState(() {
+                                    row['removed'] = value == true;
+                                    if (value == true) {
+                                      row['is_bulky'] = false;
+                                      row['collected'] = false;
+                                    }
+                                  }),
+                                  title: const Text('Ненаход / убрать'),
+                                  subtitle: const Text(
+                                    'Товар будет убран из этой доставки',
+                                  ),
+                                ),
+                                if (removed)
+                                  TextField(
+                                    controller: reasonCtrls[id],
+                                    minLines: 1,
+                                    maxLines: 3,
+                                    decoration: withInputLanguageBadge(
+                                      const InputDecoration(
+                                        labelText: 'Причина',
+                                        hintText: 'Сломан, потерян, брак...',
+                                        border: OutlineInputBorder(),
+                                      ),
+                                      controller: reasonCtrls[id],
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton(
+                  onPressed: rows.isEmpty
+                      ? null
+                      : () {
+                          Navigator.of(ctx).pop({
+                            'items': rows.map((row) {
+                              final id = row['id'].toString();
+                              return {
+                                'id': id,
+                                'collected': row['collected'] == true,
+                                'assembly_status': row['removed'] == true
+                                    ? 'removed'
+                                    : row['collected'] == true
+                                    ? 'collected'
+                                    : 'pending',
+                                'is_bulky': row['is_bulky'] == true,
+                                'removed': row['removed'] == true,
+                                'bulky_note': bulkyCtrls[id]?.text.trim() ?? '',
+                                'removed_reason':
+                                    reasonCtrls[id]?.text.trim() ?? '',
+                              };
+                            }).toList(),
+                          });
+                        },
+                  child: const Text('Сохранить сборку'),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+      return result;
+    } finally {
+      for (final ctrl in reasonCtrls.values) {
+        ctrl.dispose();
+      }
+      for (final ctrl in bulkyCtrls.values) {
+        ctrl.dispose();
+      }
+    }
+  }
+
+  Future<int?> _askDeliveryPackagePlacesData(
+    Map<String, dynamic> customer,
+  ) async {
+    final packageCtrl = TextEditingController(
+      text: _toIntValue(customer['package_places'], 1).toString(),
+    );
+    try {
+      return await showDialog<int>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Сколько мест в доставке?'),
+          content: SizedBox(
+            width: 360,
+            child: TextField(
+              controller: packageCtrl,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Количество мест всего',
+                helperText: 'Пакеты + габариты',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final places = int.tryParse(packageCtrl.text.trim()) ?? 0;
+                if (places <= 0) return;
+                Navigator.of(ctx).pop(places);
+              },
+              child: const Text('Сохранить'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      packageCtrl.dispose();
+    }
+  }
+
+  Future<void> _startDeliveryAssembly(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (batchId.trim().isEmpty || customerId.isEmpty) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/assembly/start',
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() {
+          _message = 'Сборка начата. Первый стикер отправлен на печать';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка старта сборки: ${_extractRequestError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deliverySaving = false);
+    }
+  }
+
+  Future<void> _editDeliveryAssembly(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (batchId.trim().isEmpty || customerId.isEmpty) return;
+    final payload = await _askDeliveryAssemblyData(customer);
+    if (payload == null) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/assembly',
+        data: payload,
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Сборка обновлена');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _message = 'Ошибка сборки: ${_extractRequestError(e)}');
+      }
+    } finally {
+      if (mounted) setState(() => _deliverySaving = false);
+    }
+  }
+
+  Future<void> _completeDeliveryAssembly(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (batchId.trim().isEmpty || customerId.isEmpty) return;
+    final packagePlaces = await _askDeliveryPackagePlacesData(customer);
+    if (packagePlaces == null) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/assembly/complete',
+        data: {'package_places': packagePlaces},
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Корзина собрана');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () =>
+              _message = 'Ошибка завершения сборки: ${_extractRequestError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deliverySaving = false);
+    }
+  }
+
+  Widget _buildDeliveryCustomerCard(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) {
+    final theme = Theme.of(context);
+    final name = (customer['customer_name'] ?? 'Клиент').toString();
+    final phone = _displayPhone((customer['customer_phone'] ?? '').toString());
+    final sum = _formatMoney(
+      customer['agreed_sum'] ?? customer['processed_sum'],
+    );
+    final shelf = _displayShelfValue(
+      customer['shelf_label'],
+      customer['shelf_number'],
+    );
+    final address = (customer['address_text'] ?? '').toString().trim();
+    final courierName = (customer['courier_name'] ?? '').toString().trim();
+    final packagePlaces = _toIntValue(customer['package_places'], 1);
+    final bulkyPlaces = _toIntValue(customer['bulky_places'], 0);
+    final bulkyNote = (customer['bulky_note'] ?? '').toString().trim();
+    final callStatus = (customer['call_status'] ?? '').toString().trim();
+    final deliveryStatus = (customer['delivery_status'] ?? callStatus)
+        .toString()
+        .trim();
+    final assemblyStatus = (customer['assembly_status'] ?? 'not_started')
+        .toString()
+        .trim();
+    final items = _asMapList(customer['items']);
+    final itemsCount = items.fold<int>(
+      0,
+      (sum, item) => sum + _toIntValue(item['quantity'], 0),
+    );
+    final canStartAssembly =
+        callStatus == 'accepted' && assemblyStatus == 'not_started';
+    final canEditAssembly =
+        callStatus == 'accepted' && assemblyStatus != 'not_started';
+    final canCompleteAssembly =
+        callStatus == 'accepted' &&
+        assemblyStatus != 'not_started' &&
+        assemblyStatus != 'assembled';
+    final normalStickers = _toIntValue(customer['normal_stickers_requested']);
+    final bulkyStickers = _toIntValue(customer['bulky_stickers_requested']);
+    final preferredAfter = _formatClockLabel(customer['preferred_time_from']);
+    final preferredBefore = _formatClockLabel(customer['preferred_time_to']);
+    final scheme = theme.colorScheme;
+    final assemblyBadgeIcon = assemblyStatus == 'assembled'
+        ? Icons.task_alt_outlined
+        : assemblyStatus == 'issue'
+        ? Icons.report_problem_outlined
+        : Icons.inventory_2_outlined;
+    final assemblyBadgeBackground = assemblyStatus == 'assembled'
+        ? const Color(0xFF0E8F6A).withValues(alpha: 0.16)
+        : assemblyStatus == 'issue'
+        ? const Color(0xFFFFB648).withValues(alpha: 0.16)
+        : scheme.surfaceContainerHigh;
+    final assemblyBadgeForeground = assemblyStatus == 'assembled'
+        ? const Color(0xFF67E0B6)
+        : assemblyStatus == 'issue'
+        ? const Color(0xFFFFD18A)
+        : scheme.onSurface;
+    final assemblyBadgeBorder = assemblyStatus == 'assembled'
+        ? const Color(0xFF0E8F6A).withValues(alpha: 0.34)
+        : assemblyStatus == 'issue'
+        ? const Color(0xFFFFB648).withValues(alpha: 0.34)
+        : scheme.outlineVariant;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    name,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                AppStatusBadge(
+                  label: _deliveryAssemblyStatusLabel(assemblyStatus),
+                  icon: assemblyBadgeIcon,
+                  background: assemblyBadgeBackground,
+                  foreground: assemblyBadgeForeground,
+                  border: assemblyBadgeBorder,
+                  compact: true,
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text('Телефон: $phone'),
+            Text('Сумма в доставке: $sum'),
+            Text('Полка: $shelf'),
+            Text(
+              'Статус доставки: ${_deliveryCustomerStatusLabel(deliveryStatus)}',
+            ),
+            Text(
+              'Ответ после рассылки: ${_deliveryCustomerStatusLabel(callStatus)}',
+            ),
+            Text(
+              'Стикеры: обычных $normalStickers · габаритных $bulkyStickers',
+            ),
+            if (address.isNotEmpty) Text('Адрес: $address'),
+            if (preferredAfter.isNotEmpty || preferredBefore.isNotEmpty)
+              Text(
+                'Пожелание по времени: ${[if (preferredAfter.isNotEmpty) 'после $preferredAfter', if (preferredBefore.isNotEmpty) 'до $preferredBefore'].join(', ')}',
+              ),
+            if (courierName.isNotEmpty) Text('Курьер: $courierName'),
+            Text('Мест: $packagePlaces'),
+            if (bulkyPlaces > 0 || bulkyNote.isNotEmpty)
+              Text(
+                bulkyNote.isNotEmpty
+                    ? 'Габарит ($bulkyPlaces): $bulkyNote'
+                    : 'Габарит: $bulkyPlaces',
+              ),
+            if (items.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Товаров по штукам: $itemsCount',
+                style: theme.textTheme.labelLarge?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 6),
+              ...items.take(6).map((item) {
+                final itemTitle = (item['product_title'] ?? 'Товар')
+                    .toString()
+                    .trim();
+                final itemStatus = (item['assembly_status'] ?? 'pending')
+                    .toString()
+                    .trim();
+                final flags = <String>[
+                  if (item['is_bulky'] == true) 'габарит',
+                  if (itemStatus == 'removed') 'убран',
+                  if (itemStatus == 'collected') 'положил',
+                ];
+                return Text(
+                  '• ID ${item['product_code'] ?? '—'} · $itemTitle · ${_formatMoney(item['line_total'])}'
+                  '${flags.isNotEmpty ? ' · ${flags.join(', ')}' : ''}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                );
+              }),
+              if (items.length > 6) Text('Ещё товаров: ${items.length - 6}'),
+            ],
+            const SizedBox(height: 12),
+            if (callStatus == 'accepted')
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: _deliverySaving || !canStartAssembly
+                        ? null
+                        : () => _startDeliveryAssembly(batchId, customer),
+                    icon: const Icon(Icons.playlist_add_check_circle_outlined),
+                    label: const Text('Начать сборку'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving || !canEditAssembly
+                        ? null
+                        : () => _editDeliveryAssembly(batchId, customer),
+                    icon: const Icon(Icons.inventory_2_outlined),
+                    label: const Text('Сборка товаров'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _deliverySaving || !canCompleteAssembly
+                        ? null
+                        : () => _completeDeliveryAssembly(batchId, customer),
+                    icon: const Icon(Icons.task_alt_outlined),
+                    label: const Text('Собрано'),
+                  ),
+                ],
+              )
+            else
+              Text(
+                'Сборка откроется после согласия клиента на доставку.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeliveryTab() {
+    final activeBatch = _deliveryActiveBatch;
+    final customers = _asMapList(activeBatch?['customers']);
+    final acceptedCount = customers
+        .where(
+          (customer) =>
+              (customer['call_status'] ?? '').toString() == 'accepted',
+        )
+        .length;
+    final assembledAcceptedCount = customers
+        .where(
+          (customer) =>
+              (customer['call_status'] ?? '').toString() == 'accepted' &&
+              (customer['assembly_status'] ?? '').toString() == 'assembled',
+        )
+        .length;
+
+    return RefreshIndicator(
+      onRefresh: () => _loadDeliveryDashboard(silent: false),
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (_loadingDeliveryDashboard && activeBatch == null)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 36),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (activeBatch == null)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('Активного листа доставки пока нет.'),
+              ),
+            )
+          else ...[
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      (activeBatch['delivery_label'] ?? 'Лист доставки')
+                          .toString(),
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Дата: ${_formatDateTimeLabel(activeBatch['delivery_date'])}',
+                    ),
+                    Text(
+                      'Статус: ${_deliveryBatchStatusLabel((activeBatch['status'] ?? '').toString())}',
+                    ),
+                    Text(
+                      'Клиентов: ${activeBatch['customers_total'] ?? customers.length}',
+                    ),
+                    Text('Согласились: $acceptedCount'),
+                    Text(
+                      'Собрано корзин: $assembledAcceptedCount/$acceptedCount',
+                    ),
+                    if (((activeBatch['route_origin_address'] ?? '')
+                            .toString()
+                            .trim())
+                        .isNotEmpty)
+                      Text(
+                        'Старт маршрута: ${(activeBatch['route_origin_address'] ?? '').toString()}',
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (customers.isEmpty)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Text('В активной доставке пока нет клиентов.'),
+                ),
+              )
+            else
+              ...customers.map(
+                (customer) => _buildDeliveryCustomerCard(
+                  (activeBatch['id'] ?? '').toString(),
+                  customer,
+                ),
+              ),
+          ],
+          if (_deliveryBatches.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            const Text(
+              'Последние листы доставки',
+              style: TextStyle(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            ..._deliveryBatches.take(5).map((batch) {
+              return Card(
+                child: ListTile(
+                  title: Text(
+                    (batch['delivery_label'] ?? 'Лист доставки').toString(),
+                  ),
+                  subtitle: Text(
+                    'Дата: ${_formatDateTimeLabel(batch['delivery_date'])}\n'
+                    'Статус: ${_deliveryBatchStatusLabel((batch['status'] ?? '').toString())}\n'
+                    'Клиентов: ${(batch['customers_total'] ?? 0).toString()}',
+                  ),
+                  isThreeLine: true,
+                ),
+              );
+            }),
+          ],
         ],
       ),
     );

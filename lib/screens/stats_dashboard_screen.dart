@@ -72,21 +72,15 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
   String _dayShortLabel(String rawDay) {
     final date = DateTime.tryParse(rawDay);
     if (date == null) return rawDay;
-    const labels = <int, String>{
-      DateTime.monday: 'Пн',
-      DateTime.tuesday: 'Вт',
-      DateTime.wednesday: 'Ср',
-      DateTime.thursday: 'Чт',
-      DateTime.friday: 'Пт',
-      DateTime.saturday: 'Сб',
-      DateTime.sunday: 'Вс',
-    };
-    return labels[date.weekday] ?? rawDay;
+    final day = date.day.toString().padLeft(2, '0');
+    final month = date.month.toString().padLeft(2, '0');
+    return '$day.$month';
   }
 
   String _workerStatusLabel(Map<String, dynamic> worker) {
     if (worker['active_today'] == true) return 'Работает сегодня';
     if (_toInt(worker['posts_current_week']) > 0) return 'Работал на неделе';
+    if (_toInt(worker['posts_current_month']) > 0) return 'Работал в этом месяце';
     return 'Пока без активности';
   }
 
@@ -95,11 +89,14 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     if (_toInt(worker['posts_current_week']) > 0) {
       return theme.colorScheme.primary;
     }
+    if (_toInt(worker['posts_current_month']) > 0) {
+      return const Color(0xFF0EA5E9);
+    }
     return theme.colorScheme.outline;
   }
 
   String _currentModeForWorker(String workerId) {
-    return _workerDetailModes[workerId] ?? 'current_week';
+    return _workerDetailModes[workerId] ?? 'current_month';
   }
 
   List<Map<String, dynamic>> _detailDaysForMode(
@@ -107,10 +104,12 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     String mode,
   ) {
     switch (mode) {
+      case 'current_month':
+        return _asMapList(worker['days_current_month']);
       case 'previous_week':
         return _asMapList(worker['days_previous_week']);
-      case 'history_14':
-        return _asMapList(worker['history_14_days']);
+      case 'history_30':
+        return _asMapList(worker['history_30_days']);
       case 'current_week':
       default:
         return _asMapList(worker['days_current_week']);
@@ -359,9 +358,10 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
   Widget _detailModeSwitch(String workerId) {
     final mode = _currentModeForWorker(workerId);
     final items = const <MapEntry<String, String>>[
+      MapEntry('current_month', 'Месяц'),
       MapEntry('current_week', 'Эта неделя'),
       MapEntry('previous_week', 'Прошлая'),
-      MapEntry('history_14', '14 дней'),
+      MapEntry('history_30', '30 дней'),
     ];
     return Wrap(
       spacing: 8,
@@ -500,7 +500,7 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     final theme = Theme.of(context);
     final workerId = (worker['worker_id'] ?? '').toString();
     final isExpanded = _expandedWorkerIds.contains(workerId);
-    final currentWeekDays = _asMapList(worker['days_current_week']);
+    final currentMonthDays = _asMapList(worker['days_current_month']);
     final detailDays = _detailDaysForMode(
       worker,
       _currentModeForWorker(workerId),
@@ -513,12 +513,25 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     final todayPosts = _toInt(worker['posts_today']);
     final todayRevisions = _toInt(worker['revisions_today']);
     final weekPosts = _toInt(worker['posts_current_week']);
-    final weekRevisions = _toInt(worker['revisions_current_week']);
     final weekAmount = _formatMoney(
       worker['posted_amount_current_week'],
       compact: true,
     );
-    final workedDays = _toInt(worker['days_worked_current_week']);
+    final monthPosts = _toInt(worker['posts_current_month']);
+    final monthRevisions = _toInt(worker['revisions_current_month']);
+    final monthAmount = _formatMoney(
+      worker['posted_amount_current_month'],
+      compact: true,
+    );
+    final shippedWeekAmount = _formatMoney(
+      worker['shipped_amount_current_week'],
+      compact: true,
+    );
+    final shipped30Amount = _formatMoney(
+      worker['shipped_amount_30_days'],
+      compact: true,
+    );
+    final workedMonthDays = _toInt(worker['days_worked_current_month']);
     final downtime = _asMap(worker['post_downtime']);
     final workerName = (worker['worker_name'] ?? 'Работник').toString().trim();
 
@@ -602,9 +615,9 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                   icon: Icons.today_rounded,
                 ),
                 _summaryCard(
-                  label: 'Неделя',
-                  value: '$weekPosts пост.',
-                  icon: Icons.calendar_view_week_rounded,
+                  label: 'Месяц',
+                  value: '$monthPosts пост.',
+                  icon: Icons.calendar_month_rounded,
                 ),
                 _summaryCard(
                   label: 'Ревизий сегодня',
@@ -612,26 +625,32 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                   icon: Icons.rule_rounded,
                 ),
                 _summaryCard(
-                  label: 'Ревизий неделя',
-                  value: '$weekRevisions',
+                  label: 'Ревизий месяц',
+                  value: '$monthRevisions',
                   icon: Icons.fact_check_rounded,
                 ),
                 _summaryCard(
+                  label: 'Уехало 30 дней',
+                  value: shipped30Amount,
+                  icon: Icons.local_shipping_rounded,
+                ),
+                _summaryCard(
                   label: 'Дней работал',
-                  value: '$workedDays / 7',
+                  value: '$workedMonthDays',
                   icon: Icons.event_available_rounded,
                 ),
               ],
             ),
             const SizedBox(height: 14),
             Text(
-              'На неделе: $weekAmount',
+              'Создал: за месяц $monthAmount · на неделе $weekAmount · $weekPosts пост. '
+              'Уехало клиентам: на неделе $shippedWeekAmount · за 30 дней $shipped30Amount.',
               style: theme.textTheme.bodyMedium?.copyWith(
                 fontWeight: FontWeight.w700,
               ),
             ),
             const SizedBox(height: 10),
-            _weekStatusStrip(currentWeekDays),
+            _weekStatusStrip(currentMonthDays),
             if (isExpanded) ...[
               const SizedBox(height: 14),
               _detailModeSwitch(workerId),
@@ -682,6 +701,10 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
           b['posts_today'],
         ).compareTo(_toInt(a['posts_today']));
         if (todayPostsCompare != 0) return todayPostsCompare;
+        final monthCompare = _toInt(
+          b['posts_current_month'],
+        ).compareTo(_toInt(a['posts_current_month']));
+        if (monthCompare != 0) return monthCompare;
         final weekCompare = _toInt(
           b['posts_current_week'],
         ).compareTo(_toInt(a['posts_current_week']));
@@ -694,7 +717,7 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
     return _section(
       title: 'Кто работает',
       subtitle:
-          'Показываем работников, их активность по дням, сумму выкладки и сколько товаров они провели через ревизию.',
+          'Показываем работников, месячную выкладку, ревизии и только дни, когда были посты.',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -708,21 +731,29 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                 icon: Icons.badge_rounded,
               ),
               _summaryCard(
-                label: 'Работали на неделе',
-                value: '${_toInt(summary['workers_active_current_week'])}',
+                label: 'Работали в месяце',
+                value: '${_toInt(summary['workers_active_current_month'])}',
                 icon: Icons.group_rounded,
               ),
               _summaryCard(
-                label: 'Выложили сегодня',
+                label: 'Выложили за месяц',
                 value: _formatMoney(
-                  summary['posted_amount_today'],
+                  summary['posted_amount_current_month'],
                   compact: true,
                 ),
                 icon: Icons.sell_rounded,
               ),
               _summaryCard(
-                label: 'Постов сегодня',
-                value: '${_toInt(summary['posts_today'])}',
+                label: 'Уехало за 30 дней',
+                value: _formatMoney(
+                  summary['shipped_amount_30_days'],
+                  compact: true,
+                ),
+                icon: Icons.local_shipping_rounded,
+              ),
+              _summaryCard(
+                label: 'Постов за месяц',
+                value: '${_toInt(summary['posts_current_month'])}',
                 icon: Icons.post_add_rounded,
               ),
               _summaryCard(
@@ -731,8 +762,8 @@ class _StatsDashboardScreenState extends State<StatsDashboardScreen> {
                 icon: Icons.rule_rounded,
               ),
               _summaryCard(
-                label: 'Ревизий неделя',
-                value: '${_toInt(summary['revisions_current_week'])}',
+                label: 'Ревизий месяц',
+                value: '${_toInt(summary['revisions_current_month'])}',
                 icon: Icons.fact_check_rounded,
               ),
             ],

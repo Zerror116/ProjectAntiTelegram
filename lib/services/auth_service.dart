@@ -128,6 +128,7 @@ class AuthService {
   static const _creatorTenantScopeKey = 'creator_tenant_scope_code_v1';
   static const _savedSessionsKey = 'saved_tenant_sessions_v1';
   static const _userSnapshotKey = 'auth_user_snapshot_v1';
+  static const _androidSecretMirrorPrefix = 'android_secret_mirror_v1_';
 
   // Temporary storage for multi-step registration
   String? pendingEmail;
@@ -260,6 +261,16 @@ class AuthService {
         message.contains('keychain');
   }
 
+  bool _shouldMirrorSecretsForAndroid() {
+    return !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  }
+
+  String _androidMirrorKey(String key) => '$_androidSecretMirrorPrefix$key';
+
+  bool _shouldFallbackToAndroidSecretMirror(Object error) {
+    return _shouldMirrorSecretsForAndroid() && error is PlatformException;
+  }
+
   void _enableSharedPrefsSecretStoreFallback(Object error) {
     _preferSharedPrefsSecretStore = true;
     if (_loggedSharedPrefsSecretFallback) return;
@@ -292,10 +303,20 @@ class AuthService {
     }
     try {
       await _secureStorage.write(key: key, value: value);
+      if (_shouldMirrorSecretsForAndroid()) {
+        await _writeSharedSecret(_androidMirrorKey(key), value);
+      }
     } catch (error) {
       if (_shouldFallbackToSharedPrefsSecretStore(error)) {
         _enableSharedPrefsSecretStoreFallback(error);
         await _writeSharedSecret(key, value);
+        return;
+      }
+      if (_shouldFallbackToAndroidSecretMirror(error)) {
+        debugPrint(
+          '⚠️ Android secure storage write failed, using local mirror: $error',
+        );
+        await _writeSharedSecret(_androidMirrorKey(key), value);
         return;
       }
       rethrow;
@@ -307,11 +328,22 @@ class AuthService {
       return _readSharedSecret(key);
     }
     try {
-      return await _secureStorage.read(key: key);
+      final value = await _secureStorage.read(key: key);
+      if ((value == null || value.trim().isEmpty) &&
+          _shouldMirrorSecretsForAndroid()) {
+        return _readSharedSecret(_androidMirrorKey(key));
+      }
+      return value;
     } catch (error) {
       if (_shouldFallbackToSharedPrefsSecretStore(error)) {
         _enableSharedPrefsSecretStoreFallback(error);
         return _readSharedSecret(key);
+      }
+      if (_shouldFallbackToAndroidSecretMirror(error)) {
+        debugPrint(
+          '⚠️ Android secure storage read failed, using local mirror: $error',
+        );
+        return _readSharedSecret(_androidMirrorKey(key));
       }
       rethrow;
     }
@@ -330,7 +362,15 @@ class AuthService {
         await _removeSharedSecret(key);
         return;
       }
-      rethrow;
+      if (!_shouldFallbackToAndroidSecretMirror(error)) {
+        rethrow;
+      }
+      debugPrint(
+        '⚠️ Android secure storage delete failed, clearing local mirror: $error',
+      );
+    }
+    if (_shouldMirrorSecretsForAndroid()) {
+      await _removeSharedSecret(_androidMirrorKey(key));
     }
   }
 

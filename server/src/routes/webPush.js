@@ -9,9 +9,7 @@ const {
   removeWebPushSubscription,
   sendTestWebPushToUser,
 } = require("../utils/webPush");
-const {
-  computeNotificationInboxBadgeCount,
-} = require("../utils/notifications");
+const { computeNotificationBadgeSnapshot } = require("../utils/notifications");
 
 const router = express.Router();
 
@@ -25,10 +23,10 @@ router.get("/config", authMiddleware, async (req, res) => {
 
 router.get("/badge-count", authMiddleware, async (req, res) => {
   try {
-    const count = await runInRequestTenantScope(req, async () =>
-      computeNotificationInboxBadgeCount(req.user.id),
+    const snapshot = await runInRequestTenantScope(req, async () =>
+      computeNotificationBadgeSnapshot(req.user.id),
     );
-    return res.json({ ok: true, unread_count: count });
+    return res.json({ ok: true, ...snapshot });
   } catch (err) {
     console.error("webPush.badgeCount error", err);
     return res.status(500).json({ error: "Не удалось получить badge count" });

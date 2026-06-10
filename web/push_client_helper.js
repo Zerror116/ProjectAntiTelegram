@@ -34,8 +34,18 @@
     if (!existing && !(await hasWorkerScript())) {
       return null;
     }
+    if (existing && typeof existing.update === 'function') {
+      await existing.update().catch(() => {});
+    }
+    let workerUrl = '/flutter_service_worker.js';
+    try {
+      const buildVersion = (localStorage.getItem('projectphoenix-web-build-version') || '').trim();
+      if (buildVersion) {
+        workerUrl = `${workerUrl}?v=${encodeURIComponent(buildVersion)}`;
+      }
+    } catch (_) {}
     const registration =
-      existing || (await navigator.serviceWorker.register('/flutter_service_worker.js'));
+      existing || (await navigator.serviceWorker.register(workerUrl, { scope: '/' }));
     await navigator.serviceWorker.ready;
     return registration;
   }

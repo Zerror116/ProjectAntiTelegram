@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/auth_service.dart';
+import '../services/native_push_service.dart';
 import '../services/notification_runtime_preference_service.dart';
 import '../services/uploads_recovery_device_service.dart';
 import '../services/web_notification_service.dart';
@@ -61,6 +62,8 @@ class _MainShellState extends State<MainShell> {
   bool _webNotificationStatusLoaded = false;
   bool _webNotificationBannerDismissed = false;
   bool _webNotificationRequestInProgress = false;
+  bool _nativeNotificationPromptInFlight = false;
+  String? _nativeNotificationPromptedUserId;
   Timer? _supportQueueRefreshTimer;
   VoidCallback? _activeSectionListener;
   bool _initialNotificationDeepLinkHandled = false;
@@ -89,7 +92,10 @@ class _MainShellState extends State<MainShell> {
       unawaited(refreshSupportQueueNotices());
       if (currentUser == null) {
         notificationBadgeCountNotifier.value = 0;
+        chatUnreadBadgeCountNotifier.value = 0;
+        _nativeNotificationPromptedUserId = null;
       } else {
+        unawaited(_maybeRequestNativeNotificationAccess());
         unawaited(_syncNotificationRuntime());
         unawaited(_maybeHandleInitialNotificationDeepLink());
         unawaited(
@@ -119,6 +125,7 @@ class _MainShellState extends State<MainShell> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _maybeShowIosAddToHomeHint();
+      unawaited(_maybeRequestNativeNotificationAccess());
       unawaited(_maybeHandleInitialNotificationDeepLink());
     });
     unawaited(_loadWebNotificationPromptState());
@@ -334,10 +341,13 @@ class _MainShellState extends State<MainShell> {
       final dismissed =
           prefs.getBool(_webNotificationsBannerDismissedKey) == true;
       final permission = await WebNotificationService.getPermissionState();
+      if (permission != WebNotificationPermissionState.granted && dismissed) {
+        await prefs.remove(_webNotificationsBannerDismissedKey);
+      }
       if (!mounted) return;
       setState(() {
         _webNotificationBannerDismissed =
-            dismissed && permission != WebNotificationPermissionState.granted;
+            permission == WebNotificationPermissionState.granted && dismissed;
         _webNotificationPermissionState = permission;
         _webNotificationStatusLoaded = true;
       });
@@ -361,10 +371,16 @@ class _MainShellState extends State<MainShell> {
   Future<void> _dismissWebNotificationPrompt() async {
     if (!kIsWeb) return;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_webNotificationsBannerDismissedKey, true);
+    final permission = await WebNotificationService.getPermissionState();
+    if (permission == WebNotificationPermissionState.granted) {
+      await prefs.setBool(_webNotificationsBannerDismissedKey, true);
+    } else {
+      await prefs.remove(_webNotificationsBannerDismissedKey);
+    }
     if (!mounted) return;
     setState(() {
       _webNotificationBannerDismissed = true;
+      _webNotificationPermissionState = permission;
     });
   }
 
@@ -459,6 +475,9 @@ class _MainShellState extends State<MainShell> {
         if (enabled) {
           await _syncNotificationRuntime();
         }
+      } else {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove(_webNotificationsBannerDismissedKey);
       }
     } finally {
       if (mounted) {
@@ -468,6 +487,30 @@ class _MainShellState extends State<MainShell> {
       } else {
         _webNotificationRequestInProgress = false;
       }
+    }
+  }
+
+  Future<void> _maybeRequestNativeNotificationAccess() async {
+    if (kIsWeb || !NativePushService.isSupported) return;
+    final user = authService.currentUser;
+    if (user == null) return;
+    if (_nativeNotificationPromptInFlight) return;
+    if (_nativeNotificationPromptedUserId == user.id) return;
+    if (!mounted) return;
+
+    _nativeNotificationPromptInFlight = true;
+    _nativeNotificationPromptedUserId = user.id;
+    try {
+      final granted = await NativePushService.ensurePermissionInContext(
+        context,
+      );
+      if (granted) {
+        await _syncNotificationRuntime();
+      }
+    } catch (e) {
+      debugPrint('native notification permission prompt failed: $e');
+    } finally {
+      _nativeNotificationPromptInFlight = false;
     }
   }
 
@@ -623,7 +666,7 @@ class _MainShellState extends State<MainShell> {
               return icon;
             }
             return ValueListenableBuilder<int>(
-              valueListenable: notificationBadgeCountNotifier,
+              valueListenable: chatUnreadBadgeCountNotifier,
               builder: (context, count, _) {
                 final normalized = count.clamp(0, 99);
                 return Stack(

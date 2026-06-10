@@ -1,21 +1,42 @@
 // lib/screens/cart_screen.dart
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../assets/phoenix_assets.dart';
 import '../main.dart';
+import '../services/android_update_report_service.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/app_empty_state.dart';
 import '../widgets/phoenix_loader.dart';
 import '../widgets/phoenix_visual_effects.dart';
+
+Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
+  final path = (file.path ?? '').trim();
+  if (path.isNotEmpty && !kIsWeb) {
+    try {
+      return await File(path).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return await file.readAsBytes();
+  } catch (_) {
+    return null;
+  }
+}
 
 class CartScreen extends StatefulWidget {
   const CartScreen({super.key});
@@ -25,6 +46,8 @@ class CartScreen extends StatefulWidget {
 }
 
 class _CartScreenState extends State<CartScreen> {
+  static const String _cartCachePrefix = 'cart_screen_cache_v1_';
+
   final ImagePicker _imagePicker = ImagePicker();
   bool _loading = true;
   bool _cancelling = false;
@@ -48,6 +71,19 @@ class _CartScreenState extends State<CartScreen> {
   final Map<String, String> _lastItemSignatures = <String, String>{};
   Timer? _cartHighlightTimer;
   bool _summaryRecentlyChanged = false;
+
+  String _cartCacheKey() {
+    final user = authService.currentUser;
+    final userId = (user?.id ?? '').trim();
+    final tenantCode =
+        (authService.creatorTenantScopeCode ?? user?.tenantCode ?? '').trim();
+    final scope = [
+      userId.isEmpty ? 'guest' : userId,
+      tenantCode.isEmpty ? 'default' : tenantCode,
+      authService.effectiveRole.trim().toLowerCase(),
+    ].join('_');
+    return '$_cartCachePrefix$scope';
+  }
 
   @override
   void initState() {
@@ -143,6 +179,67 @@ class _CartScreenState extends State<CartScreen> {
     }
   }
 
+  Future<void> _saveCartCache(Map<String, dynamic> payload) async {
+    if (authService.currentUser == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_cartCacheKey(), jsonEncode(payload));
+    } catch (e) {
+      debugPrint('Cart cache save skipped: $e');
+    }
+  }
+
+  Future<Map<String, dynamic>?> _readCartCache() async {
+    if (authService.currentUser == null) return null;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_cartCacheKey())?.trim() ?? '';
+      if (raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (e) {
+      debugPrint('Cart cache read skipped: $e');
+    }
+    return null;
+  }
+
+  Future<bool> _restoreCachedCart() async {
+    final cached = await _readCartCache();
+    if (cached == null || !mounted) return false;
+    setState(() {
+      _applyPayload(cached);
+      _loading = false;
+      _error = '';
+    });
+    return true;
+  }
+
+  void _reportCartLoadFailure(Object error) {
+    var statusCode = '';
+    var errorCode = 'unknown';
+    var errorMessage = error.toString();
+    if (error is DioException) {
+      statusCode = '${error.response?.statusCode ?? ''}';
+      errorCode = error.type.name;
+      errorMessage = _extractDioError(error);
+    }
+    unawaited(
+      AndroidUpdateReportService.report(
+        authService.dio,
+        eventType: 'screen_load_failed',
+        status: 'error',
+        stage: 'cart',
+        errorCode: statusCode.isNotEmpty ? 'http_$statusCode' : errorCode,
+        errorMessage: errorMessage,
+        payload: <String, dynamic>{
+          'screen': 'cart',
+          'path': '/api/cart',
+          if (statusCode.isNotEmpty) 'status_code': statusCode,
+        },
+      ),
+    );
+  }
+
   String _cartItemVisualSignature(Map<String, dynamic> item) {
     return [
       item['status'],
@@ -178,16 +275,25 @@ class _CartScreenState extends State<CartScreen> {
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final payload = Map<String, dynamic>.from(data['data']);
+        unawaited(_saveCartCache(payload));
+        if (!mounted) return;
         setState(() {
           _applyPayload(payload);
         });
       } else {
+        if (!mounted) return;
         setState(() => _error = 'Неверный ответ сервера');
       }
     } catch (e) {
-      setState(
-        () => _error = 'Ошибка загрузки корзины: ${_extractDioError(e)}',
-      );
+      _reportCartLoadFailure(e);
+      if (!mounted) return;
+      final restored = await _restoreCachedCart();
+      if (!mounted) return;
+      if (!restored) {
+        setState(
+          () => _error = 'Ошибка загрузки корзины: ${_extractDioError(e)}',
+        );
+      }
     } finally {
       _reloading = false;
       if (mounted) {
@@ -395,13 +501,9 @@ class _CartScreenState extends State<CartScreen> {
         return await _uploadClaimImageBytes(bytes, picked.name);
       }
 
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.image,
-        withData: true,
-      );
-      if (result == null || result.files.isEmpty) return null;
-      final file = result.files.first;
-      final data = file.bytes;
+      final file = await FilePicker.pickFile(type: FileType.image);
+      if (file == null) return null;
+      final data = await _readPickedPlatformFileBytes(file);
       if (data == null) return null;
       return await _uploadClaimImageBytes(data, file.name);
     } catch (e) {

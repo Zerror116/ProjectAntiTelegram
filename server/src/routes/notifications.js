@@ -9,8 +9,7 @@ const {
   upsertNotificationPreferences,
   upsertNotificationEndpoint,
   deactivateNotificationEndpoint,
-  computeNotificationBadgeCount,
-  computeNotificationInboxBadgeCount,
+  computeNotificationBadgeSnapshot,
   listNotificationInbox,
   markNotificationInboxItemOpened,
   markNotificationInboxItemRead,
@@ -137,18 +136,13 @@ router.post("/inbox/read-all", requireAuth, async (req, res) => {
 
 router.get("/badge-count", requireAuth, async (req, res) => {
   try {
-    const [unreadCount, inboxUnreadCount] = await runInRequestTenantScope(
+    const snapshot = await runInRequestTenantScope(
       req,
-      async () =>
-        Promise.all([
-          computeNotificationBadgeCount(req.user.id),
-          computeNotificationInboxBadgeCount(req.user.id),
-        ]),
+      async () => computeNotificationBadgeSnapshot(req.user.id),
     );
     return res.json({
       ok: true,
-      unread_count: unreadCount,
-      inbox_unread_count: inboxUnreadCount,
+      ...snapshot,
     });
   } catch (err) {
     console.error("notifications.badgeCount error", err);

@@ -757,6 +757,9 @@ class NativePushService {
             .trim();
     final body = (payload['body'] ?? '').toString().trim();
     final title = (payload['title'] ?? 'Проект Феникс').toString().trim();
+    final badge = int.tryParse(
+      (payload['badge_count'] ?? '').toString().trim(),
+    );
 
     final sender = Person(
       key: threadId.isEmpty ? category : threadId,
@@ -792,6 +795,7 @@ class NativePushService {
       category: _androidCategoryFor(category),
       tag: (payload['inbox_item_id'] ?? payload['id'] ?? category).toString(),
       channelShowBadge: category != 'promo' && category != 'updates',
+      number: badge != null && badge >= 0 ? badge : null,
       icon: '@mipmap/ic_launcher',
       colorized: category == 'security',
       playSound: !silent,

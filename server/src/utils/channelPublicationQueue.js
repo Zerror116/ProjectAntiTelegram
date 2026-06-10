@@ -12,6 +12,7 @@ const { logMonitoringEvent } = require('./monitoring');
 const { upsertMessageSearchDocument } = require('./chatSearchIndex');
 const { normalizeCatalogTitle } = require('./catalogTitle');
 const { createNotificationInboxItem } = require('./notifications');
+const { getTenantFeatureSettings } = require('./tenantFeatureSettings');
 
 const DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS = Math.max(
   1000,
@@ -696,6 +697,63 @@ async function enqueueChannelPublicationBatches({
   };
 }
 
+async function autoEnqueueDuePendingPostsForScope(queryable, tenantId = null) {
+  const settings = await getTenantFeatureSettings(tenantId || null);
+  if (settings.auto_publish_enabled !== true) {
+    return null;
+  }
+
+  const delayMinutes = Math.max(
+    1,
+    Math.min(24 * 60, Math.floor(Number(settings.auto_publish_delay_minutes || 5) || 5)),
+  );
+  const intervalMs = Math.max(
+    1000,
+    Math.floor(Number(settings.publication_interval_ms || DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS) || DEFAULT_CHANNEL_PUBLICATION_INTERVAL_MS),
+  );
+
+  const dueQ = await queryable.query(
+    `SELECT q.id
+     FROM product_publication_queue q
+     JOIN chats c ON c.id = q.channel_id
+     WHERE q.status = 'pending'
+       AND COALESCE(q.is_sent, false) = false
+       AND COALESCE(q.publish_status, 'pending') IN ('pending', 'failed')
+       AND (
+         ($1::uuid IS NULL AND c.tenant_id IS NULL)
+         OR c.tenant_id = $1::uuid
+       )
+       AND q.created_at <= now() - ($2::text)::interval
+     ORDER BY q.created_at ASC, q.id ASC
+     LIMIT 500
+     FOR UPDATE OF q SKIP LOCKED`,
+    [tenantId || null, `${delayMinutes} minutes`],
+  );
+
+  if (dueQ.rowCount === 0) {
+    return null;
+  }
+
+  const queueIds = dueQ.rows.map((row) => row.id);
+  publicationDebug('auto publish due queue rows', {
+    tenant_id: tenantId || null,
+    delay_minutes: delayMinutes,
+    queue_count: queueIds.length,
+    queue_ids: queueIds,
+    interval_ms: intervalMs,
+  });
+
+  const enqueueResult = await enqueueChannelPublicationBatches({
+    queryable,
+    tenantId: tenantId || null,
+    createdBy: null,
+    queueIds,
+    intervalMs,
+  });
+
+  return enqueueResult;
+}
+
 async function notifyChannelPublicationBatchStarted({
   tenantId = null,
   batch,
@@ -939,6 +997,7 @@ async function processBatchItem(client, batch) {
             p.manual_shelf_label,
             p.shelf_floor,
             p.pickup_only,
+            p.is_bulky,
             p.image_url,
             p.product_code,
             c.title AS channel_title,
@@ -990,6 +1049,7 @@ async function processBatchItem(client, batch) {
     shelf_number: row.shelf_number,
     manual_shelf_label: row.manual_shelf_label,
     pickup_only: row.pickup_only,
+    is_bulky: row.is_bulky,
   });
   await client.query(
     `UPDATE channel_publication_batches
@@ -1091,7 +1151,7 @@ async function processBatchItem(client, batch) {
                reusable_at = NULL,
                updated_at = now()
            WHERE id = $11
-           RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only,
+           RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor, pickup_only, is_bulky,
                      title, description, price, quantity, image_url, status, updated_at`,
           [
             code,
@@ -1147,6 +1207,7 @@ async function processBatchItem(client, batch) {
       manual_shelf_label: product.manual_shelf_label || null,
       shelf_floor: product.shelf_floor || null,
       pickup_only: product.pickup_only === true,
+      is_bulky: product.is_bulky === true,
       image_url: product.image_url,
       card_snapshot: productCardSnapshot,
     };
@@ -1531,9 +1592,20 @@ async function processNextChannelPublicationStepForScope(scope, { io = null } = 
     const scopeTenantId = String(scope?.id || '').trim() || null;
     try {
       await client.query('BEGIN');
+      const autoEnqueueResult = await autoEnqueueDuePendingPostsForScope(client, scopeTenantId);
       const batch = await selectDueBatch(client, scopeTenantId);
       if (!batch) {
-        await client.query('ROLLBACK');
+        await client.query('COMMIT');
+        if (autoEnqueueResult?.batches?.length > 0) {
+          void notifyChannelPublicationBatchesStarted({
+            tenantId: scopeTenantId,
+            batches: autoEnqueueResult.batches,
+          });
+          emitCatalogQueueUpdated(io || global.__projectPhoenixSocketIo || null, scopeTenantId, {
+            action: 'auto_publish_enqueued',
+            channel_id: null,
+          });
+        }
         return null;
       }
       publicationDebug('processor selected due batch', {
@@ -1549,6 +1621,12 @@ async function processNextChannelPublicationStepForScope(scope, { io = null } = 
       });
       const result = await processBatchItem(client, batch);
       await client.query('COMMIT');
+      if (autoEnqueueResult?.batches?.length > 0) {
+        void notifyChannelPublicationBatchesStarted({
+          tenantId: scopeTenantId,
+          batches: autoEnqueueResult.batches,
+        });
+      }
       publicationDebug('processor committed batch step', {
         tenant_id: scopeTenantId,
         batch_id: batch.id,

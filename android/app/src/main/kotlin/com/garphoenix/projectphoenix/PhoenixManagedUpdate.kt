@@ -70,9 +70,11 @@ private const val PREF_SHA256 = "sha256"
 private const val PREF_DOWNLOAD_URL = "download_url"
 private const val PREF_TITLE = "title"
 private const val PREF_LAST_UPDATED_AT = "last_updated_at"
+private const val PREF_PENDING_INSTALL_AFTER_PERMISSION = "pending_install_after_permission"
 
 data class ManagedUpdateEnvelope(
     val manifest: Map<String, Any?>,
+    val canonicalJson: String = "",
     val signature: String,
     val keyId: String,
     val algorithm: String,
@@ -142,6 +144,7 @@ data class ManagedUpdateState(
     val downloadUrl: String = "",
     val title: String = "",
     val lastUpdatedAtMs: Long = 0L,
+    val pendingInstallAfterPermission: Boolean = false,
 ) {
     fun asMap(): Map<String, Any?> {
         return mapOf(
@@ -163,11 +166,17 @@ data class ManagedUpdateState(
             "downloadUrl" to downloadUrl,
             "title" to title,
             "lastUpdatedAtMs" to lastUpdatedAtMs,
+            "pendingInstallAfterPermission" to pendingInstallAfterPermission,
             "readyToInstall" to (status == STATUS_READY_TO_INSTALL),
             "canResume" to (status == STATUS_PAUSED || status == STATUS_FAILED),
         )
     }
 }
+
+private data class ManifestVerifyResult(
+    val ok: Boolean,
+    val detail: String = "",
+)
 
 object PhoenixManagedUpdateStore {
     fun load(context: Context): ManagedUpdateState {
@@ -191,6 +200,7 @@ object PhoenixManagedUpdateStore {
             downloadUrl = prefs.getString(PREF_DOWNLOAD_URL, "").orEmpty(),
             title = prefs.getString(PREF_TITLE, "").orEmpty(),
             lastUpdatedAtMs = prefs.getLong(PREF_LAST_UPDATED_AT, 0L),
+            pendingInstallAfterPermission = prefs.getBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, false),
         )
     }
 
@@ -215,6 +225,7 @@ object PhoenixManagedUpdateStore {
             .putString(PREF_DOWNLOAD_URL, state.downloadUrl)
             .putString(PREF_TITLE, state.title)
             .putLong(PREF_LAST_UPDATED_AT, state.lastUpdatedAtMs)
+            .putBoolean(PREF_PENDING_INSTALL_AFTER_PERMISSION, state.pendingInstallAfterPermission)
             .apply()
     }
 
@@ -247,13 +258,29 @@ object PhoenixManagedUpdateEngine {
     }
 
     fun openUnknownAppSourcesSettings(activity: MainActivity) {
-        val intent = Intent(
+        val packageIntent = Intent(
             Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
             android.net.Uri.parse("package:${activity.packageName}"),
         ).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
+        val fallbackIntent = Intent(Settings.ACTION_SECURITY_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val intent = if (packageIntent.resolveActivity(activity.packageManager) != null) {
+            packageIntent
+        } else {
+            fallbackIntent
+        }
         activity.startActivity(intent)
+    }
+
+    fun resumePendingInstallIfAllowed(context: Context): Boolean {
+        val current = PhoenixManagedUpdateStore.load(context)
+        if (!current.pendingInstallAfterPermission) return false
+        if (current.status != STATUS_READY_TO_INSTALL) return false
+        if (!canRequestPackageInstalls(context)) return false
+        return installPreparedUpdate(context)
     }
 
     fun startOrResume(context: Context, payloadJson: String) {
@@ -276,6 +303,7 @@ object PhoenixManagedUpdateEngine {
                     stage = "Нужно разрешить установку APK из Феникс.",
                     errorCode = "install_permission_required",
                     errorMessage = "Разрешите установку APK для Феникс в настройках Android.",
+                    pendingInstallAfterPermission = true,
                     lastUpdatedAtMs = System.currentTimeMillis(),
                 ),
             )
@@ -290,6 +318,9 @@ object PhoenixManagedUpdateEngine {
                 PackageInstaller.SessionParams.MODE_FULL_INSTALL,
             ).apply {
                 setAppPackageName(current.packageName.ifBlank { context.packageName })
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED)
+                }
             }
             val sessionId = packageInstaller.createSession(params)
             packageInstaller.openSession(sessionId).use { session ->
@@ -306,6 +337,7 @@ object PhoenixManagedUpdateEngine {
                         stage = "Открываем системную установку Android...",
                         errorCode = "",
                         errorMessage = "",
+                        pendingInstallAfterPermission = false,
                         lastUpdatedAtMs = System.currentTimeMillis(),
                     ),
                 )
@@ -390,16 +422,17 @@ object PhoenixManagedUpdateEngine {
         )
         updateState(context, checking, service)
 
-        if (!verifyEnvelope(envelope)) {
+        val verifyResult = verifyEnvelope(envelope)
+        if (!verifyResult.ok) {
             Log.w(
                 UPDATE_LOG_TAG,
-                "manifest_signature_invalid: keyId=${envelope.keyId} version=${envelope.versionToken}",
+                "manifest_signature_invalid: keyId=${envelope.keyId} version=${envelope.versionToken} detail=${verifyResult.detail}",
             )
             fail(
                 context = context,
                 current = checking,
                 code = "manifest_signature_invalid",
-                message = "Подпись update manifest не прошла проверку",
+                message = "Подпись update manifest не прошла проверку${verifyResult.detail.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}",
                 service = service,
             )
             return
@@ -633,6 +666,30 @@ object PhoenixManagedUpdateEngine {
             return false
         }
 
+        val archiveVersionCode = readArchiveVersionCode(context, downloadedFile)
+        val manifestBuild = envelope.manifestInt("build").toLong()
+        if (manifestBuild > 0L && archiveVersionCode > 0L && archiveVersionCode != manifestBuild) {
+            fail(
+                context = context,
+                current = baseState,
+                code = "apk_version_mismatch",
+                message = "Версия APK не совпадает с update manifest",
+                service = service,
+            )
+            return false
+        }
+        val installedVersionCode = readInstalledVersionCode(context)
+        if (archiveVersionCode > 0L && installedVersionCode > 0L && archiveVersionCode <= installedVersionCode) {
+            fail(
+                context = context,
+                current = baseState,
+                code = "apk_version_not_newer",
+                message = "APK не новее установленной версии Феникс",
+                service = service,
+            )
+            return false
+        }
+
         val ready = baseState.copy(
             status = STATUS_READY_TO_INSTALL,
             stage = "Обновление готово к установке.",
@@ -664,6 +721,7 @@ object PhoenixManagedUpdateEngine {
                 stage = "Обновление прервано.",
                 errorCode = code,
                 errorMessage = message,
+                pendingInstallAfterPermission = false,
                 speedBytesPerSec = 0L,
                 etaSeconds = -1L,
                 lastUpdatedAtMs = System.currentTimeMillis(),
@@ -686,10 +744,16 @@ object PhoenixManagedUpdateEngine {
     private fun parseEnvelope(payloadJson: String): ManagedUpdateEnvelope? {
         return try {
             val root = JSONObject(payloadJson)
-            val manifestRaw = root.optJSONObject("manifest") ?: return null
+            val canonicalRaw = root.optString("canonical_json", "").trim()
+            val manifestRaw = if (canonicalRaw.isNotEmpty()) {
+                JSONObject(canonicalRaw)
+            } else {
+                root.optJSONObject("manifest") ?: return null
+            }
             val manifest = jsonObjectToMap(manifestRaw)
             ManagedUpdateEnvelope(
                 manifest = manifest,
+                canonicalJson = canonicalRaw,
                 signature = root.optString("signature", "").trim(),
                 keyId = root.optString("key_id", "").trim(),
                 algorithm = root.optString("algorithm", "").trim(),
@@ -699,30 +763,46 @@ object PhoenixManagedUpdateEngine {
         }
     }
 
-    private fun verifyEnvelope(envelope: ManagedUpdateEnvelope): Boolean {
-        if (!envelope.algorithm.equals("ed25519", ignoreCase = true)) return false
-        if (envelope.signature.isBlank()) return false
+    private fun verifyEnvelope(envelope: ManagedUpdateEnvelope): ManifestVerifyResult {
+        if (!envelope.algorithm.equals("ed25519", ignoreCase = true)) {
+            return ManifestVerifyResult(false, "unsupported_algorithm:${envelope.algorithm}")
+        }
+        if (envelope.signature.isBlank()) {
+            return ManifestVerifyResult(false, "missing_signature")
+        }
         val expectedKeyId = BuildConfig.UPDATE_MANIFEST_KEY_ID.trim()
         if (expectedKeyId.isNotEmpty() && envelope.keyId.isNotBlank() && envelope.keyId != expectedKeyId) {
-            return false
+            return ManifestVerifyResult(false, "key_id_mismatch:${envelope.keyId}:expected:$expectedKeyId")
         }
         return try {
-            val canonicalBytes = canonicalJson(envelope.manifest).toByteArray(Charsets.UTF_8)
+            val canonicalSource = envelope.canonicalJson.ifBlank {
+                canonicalJson(envelope.manifest)
+            }
+            val canonicalBytes = canonicalSource.toByteArray(Charsets.UTF_8)
             val signatureBytes = Base64.decode(envelope.signature, Base64.DEFAULT)
             try {
-                verifyEnvelopeWithJca(canonicalBytes, signatureBytes)
+                if (verifyEnvelopeWithJca(canonicalBytes, signatureBytes)) {
+                    ManifestVerifyResult(true, "jca")
+                } else {
+                    ManifestVerifyResult(false, "jca_verify_false")
+                }
             } catch (jcaError: Throwable) {
-                val verified = verifyEnvelopeWithBouncyCastle(canonicalBytes, signatureBytes)
+                val fallback = verifyEnvelopeWithBouncyCastle(canonicalBytes, signatureBytes)
+                val verified = fallback.ok
                 if (verified) {
                     Log.i(
                         UPDATE_LOG_TAG,
-                        "manifest_verify_ok provider=bouncycastle sdk=${Build.VERSION.SDK_INT} reason=${jcaError.javaClass.simpleName}",
+                        "manifest_verify_ok provider=bouncycastle sdk=${Build.VERSION.SDK_INT} reason=${jcaError.javaClass.simpleName} detail=${fallback.detail}",
                     )
                 }
-                verified
+                if (verified) {
+                    ManifestVerifyResult(true, fallback.detail)
+                } else {
+                    ManifestVerifyResult(false, "jca:${jcaError.javaClass.simpleName};${fallback.detail}")
+                }
             }
-        } catch (_: Throwable) {
-            false
+        } catch (t: Throwable) {
+            ManifestVerifyResult(false, "verify_exception:${t.javaClass.simpleName}")
         }
     }
 
@@ -739,14 +819,22 @@ object PhoenixManagedUpdateEngine {
     private fun verifyEnvelopeWithBouncyCastle(
         canonicalBytes: ByteArray,
         signatureBytes: ByteArray,
-    ): Boolean {
-        val verifier = Ed25519Signer()
-        verifier.init(
-            false,
-            Ed25519PublicKeyParameters(loadEd25519PublicKeyBytes(), 0),
-        )
-        verifier.update(canonicalBytes, 0, canonicalBytes.size)
-        return verifier.verifySignature(signatureBytes)
+    ): ManifestVerifyResult {
+        val failures = mutableListOf<String>()
+        for ((label, keyBytes) in loadEd25519PublicKeyByteCandidates()) {
+            try {
+                val verifier = Ed25519Signer()
+                verifier.init(false, Ed25519PublicKeyParameters(keyBytes, 0))
+                verifier.update(canonicalBytes, 0, canonicalBytes.size)
+                if (verifier.verifySignature(signatureBytes)) {
+                    return ManifestVerifyResult(true, "bouncycastle:$label")
+                }
+                failures.add("$label:false")
+            } catch (t: Throwable) {
+                failures.add("$label:${t.javaClass.simpleName}")
+            }
+        }
+        return ManifestVerifyResult(false, failures.joinToString("|").ifBlank { "bouncycastle_no_candidates" })
     }
 
     private fun loadPublicKey(): java.security.PublicKey {
@@ -754,21 +842,38 @@ object PhoenixManagedUpdateEngine {
             .replace("-----BEGIN PUBLIC KEY-----", "")
             .replace("-----END PUBLIC KEY-----", "")
             .replace("\n", "")
+            .replace("\\n", "")
             .trim()
         val keySpec = X509EncodedKeySpec(Base64.decode(pem, Base64.DEFAULT))
         return KeyFactory.getInstance("Ed25519").generatePublic(keySpec)
     }
 
-    private fun loadEd25519PublicKeyBytes(): ByteArray {
+    private fun loadPublicKeyDerBytes(): ByteArray {
         val pem = BuildConfig.UPDATE_MANIFEST_PUBLIC_KEY
             .replace("-----BEGIN PUBLIC KEY-----", "")
             .replace("-----END PUBLIC KEY-----", "")
             .replace("\n", "")
+            .replace("\\n", "")
             .trim()
-        val subjectPublicKeyInfo = SubjectPublicKeyInfo.getInstance(
-            Base64.decode(pem, Base64.DEFAULT),
-        )
-        return subjectPublicKeyInfo.publicKeyData.bytes
+        return Base64.decode(pem, Base64.DEFAULT)
+    }
+
+    private fun loadEd25519PublicKeyByteCandidates(): List<Pair<String, ByteArray>> {
+        val der = loadPublicKeyDerBytes()
+        val candidates = mutableListOf<Pair<String, ByteArray>>()
+        try {
+            val subjectPublicKeyInfo = SubjectPublicKeyInfo.getInstance(der)
+            val asn1Bytes = subjectPublicKeyInfo.publicKeyData.bytes
+            if (asn1Bytes.size == 32) {
+                candidates.add("asn1" to asn1Bytes)
+            }
+        } catch (_: Throwable) {
+            // Fall back to the DER suffix below. Ed25519 X.509 public keys end with the 32-byte raw key.
+        }
+        if (der.size >= 32) {
+            candidates.add("der_suffix" to der.copyOfRange(der.size - 32, der.size))
+        }
+        return candidates.distinctBy { it.second.joinToString(",") }
     }
 
     private fun isAllowedDownloadUrl(rawUrl: String): Boolean {
@@ -838,6 +943,50 @@ object PhoenixManagedUpdateEngine {
             packageInfo?.packageName.orEmpty()
         } catch (_: Throwable) {
             ""
+        }
+    }
+
+    private fun readArchiveVersionCode(context: Context, file: File): Long {
+        return try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageArchiveInfo(
+                    file.absolutePath,
+                    PackageManager.PackageInfoFlags.of(0),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                packageInfo?.longVersionCode ?: 0L
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo?.versionCode?.toLong() ?: 0L
+            }
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    private fun readInstalledVersionCode(context: Context): Long {
+        return try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.PackageInfoFlags.of(0),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(context.packageName, 0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo.versionCode.toLong()
+            }
+        } catch (_: Throwable) {
+            0L
         }
     }
 
@@ -959,6 +1108,7 @@ class PhoenixManagedUpdateInstallReceiver : BroadcastReceiver() {
                         stage = "Подтвердите установку в Android",
                         errorCode = "",
                         errorMessage = "",
+                        pendingInstallAfterPermission = false,
                         lastUpdatedAtMs = System.currentTimeMillis(),
                     ),
                 )
@@ -971,6 +1121,7 @@ class PhoenixManagedUpdateInstallReceiver : BroadcastReceiver() {
                         stage = "Обновление установлено. Перезапустите Феникс.",
                         errorCode = "",
                         errorMessage = "",
+                        pendingInstallAfterPermission = false,
                         lastUpdatedAtMs = System.currentTimeMillis(),
                     ),
                 )
@@ -986,6 +1137,7 @@ class PhoenixManagedUpdateInstallReceiver : BroadcastReceiver() {
                         stage = "Установка Android не завершилась.",
                         errorCode = "install_result_$status",
                         errorMessage = if (message.isNotEmpty()) message else "Android отменил установку APK",
+                        pendingInstallAfterPermission = false,
                         lastUpdatedAtMs = System.currentTimeMillis(),
                     ),
                 )

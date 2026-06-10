@@ -367,13 +367,17 @@ async function loadWorkerPostsByName(tenantId = null) {
               COUNT(*) FILTER (
                 WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now()))
               )::int AS posts_week,
-              COUNT(*) FILTER (
-                WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
-                  AND timezone($1, p.created_at) < date_trunc('week', timezone($1, now()))
-              )::int AS posts_prev_week
-       FROM products p
-       GROUP BY p.created_by
-     ),
+	              COUNT(*) FILTER (
+	                WHERE timezone($1, p.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
+	                  AND timezone($1, p.created_at) < date_trunc('week', timezone($1, now()))
+	              )::int AS posts_prev_week,
+	              COUNT(*) FILTER (
+	                WHERE timezone($1, p.created_at) >= date_trunc('month', timezone($1, now()))
+	                  AND timezone($1, p.created_at) < date_trunc('month', timezone($1, now())) + interval '1 month'
+	              )::int AS posts_month
+	       FROM products p
+	       GROUP BY p.created_by
+	     ),
      revision_counts AS (
        SELECT q.queued_by AS worker_id,
               COUNT(*) FILTER (
@@ -382,23 +386,29 @@ async function loadWorkerPostsByName(tenantId = null) {
               COUNT(*) FILTER (
                 WHERE timezone($1, q.created_at) >= date_trunc('week', timezone($1, now()))
               )::int AS revisions_week,
-              COUNT(*) FILTER (
-                WHERE timezone($1, q.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
-                  AND timezone($1, q.created_at) < date_trunc('week', timezone($1, now()))
-              )::int AS revisions_prev_week
-       FROM product_publication_queue q
+	              COUNT(*) FILTER (
+	                WHERE timezone($1, q.created_at) >= date_trunc('week', timezone($1, now())) - interval '7 days'
+	                  AND timezone($1, q.created_at) < date_trunc('week', timezone($1, now()))
+	              )::int AS revisions_prev_week,
+	              COUNT(*) FILTER (
+	                WHERE timezone($1, q.created_at) >= date_trunc('month', timezone($1, now()))
+	                  AND timezone($1, q.created_at) < date_trunc('month', timezone($1, now())) + interval '1 month'
+	              )::int AS revisions_month
+	       FROM product_publication_queue q
        WHERE COALESCE((q.payload->>'revision_manual')::boolean, false) = true
           OR COALESCE((q.payload->>'revision_auto')::boolean, false) = true
        GROUP BY q.queued_by
      )
      SELECT wc.id::text AS worker_id,
             COALESCE(NULLIF(BTRIM(wc.name), ''), NULLIF(BTRIM(wc.email), ''), 'Работник') AS worker_name,
-            COALESCE(pc.posts_today, 0)::int AS posts_today,
-            COALESCE(pc.posts_week, 0)::int AS posts_week,
-            COALESCE(pc.posts_prev_week, 0)::int AS posts_prev_week,
-            COALESCE(rc.revisions_today, 0)::int AS revisions_today,
-            COALESCE(rc.revisions_week, 0)::int AS revisions_week,
-            COALESCE(rc.revisions_prev_week, 0)::int AS revisions_prev_week
+	            COALESCE(pc.posts_today, 0)::int AS posts_today,
+	            COALESCE(pc.posts_week, 0)::int AS posts_week,
+	            COALESCE(pc.posts_prev_week, 0)::int AS posts_prev_week,
+	            COALESCE(pc.posts_month, 0)::int AS posts_month,
+	            COALESCE(rc.revisions_today, 0)::int AS revisions_today,
+	            COALESCE(rc.revisions_week, 0)::int AS revisions_week,
+	            COALESCE(rc.revisions_prev_week, 0)::int AS revisions_prev_week,
+	            COALESCE(rc.revisions_month, 0)::int AS revisions_month
      FROM worker_candidates wc
      LEFT JOIN post_counts pc ON pc.worker_id = wc.id
      LEFT JOIN revision_counts rc ON rc.worker_id = wc.id
@@ -409,13 +419,15 @@ async function loadWorkerPostsByName(tenantId = null) {
   return rowsQ.rows.map((row) => ({
     worker_id: String(row.worker_id || ''),
     worker_name: String(row.worker_name || 'Работник'),
-    posts_today: toNumber(row.posts_today),
-    posts_week: toNumber(row.posts_week),
-    posts_prev_week: toNumber(row.posts_prev_week),
-    revisions_today: toNumber(row.revisions_today),
-    revisions_week: toNumber(row.revisions_week),
-    revisions_prev_week: toNumber(row.revisions_prev_week),
-  }));
+	    posts_today: toNumber(row.posts_today),
+	    posts_week: toNumber(row.posts_week),
+	    posts_prev_week: toNumber(row.posts_prev_week),
+	    posts_month: toNumber(row.posts_month),
+	    revisions_today: toNumber(row.revisions_today),
+	    revisions_week: toNumber(row.revisions_week),
+	    revisions_prev_week: toNumber(row.revisions_prev_week),
+	    revisions_month: toNumber(row.revisions_month),
+	  }));
 }
 
 async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30 } = {}) {
@@ -449,15 +461,24 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
            )
          )
      ),
-     week_anchor AS (
-       SELECT date_trunc('week', timezone($1, now())) AS current_week_start
+     anchors AS (
+       SELECT date_trunc('week', timezone($1, now())) AS current_week_start,
+              date_trunc('month', timezone($1, now())) AS current_month_start,
+              date_trunc('month', timezone($1, now())) + interval '1 month' AS next_month_start,
+              date_trunc('day', timezone($1, now())) AS today_start
      ),
-     day_series AS (
-       SELECT generate_series(
-                (SELECT current_week_start - interval '7 days' FROM week_anchor),
-                (SELECT current_week_start + interval '6 days' FROM week_anchor),
-                interval '1 day'
-              ) AS day_local
+     bounds AS (
+       SELECT LEAST(
+                current_month_start,
+                current_week_start - interval '7 days',
+                today_start - interval '29 days'
+              ) AS range_start,
+              GREATEST(
+                next_month_start,
+                current_week_start + interval '7 days',
+                today_start + interval '1 day'
+              ) AS range_end
+       FROM anchors
      ),
      post_counts AS (
        SELECT p.created_by AS worker_id,
@@ -466,14 +487,9 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
               COALESCE(SUM(COALESCE(p.price, 0)), 0)::numeric(12,2) AS posted_amount
        FROM products p
        JOIN worker_candidates wc ON wc.id = p.created_by
-       WHERE timezone($1, p.created_at) >= (
-               SELECT current_week_start - interval '7 days'
-               FROM week_anchor
-             )
-         AND timezone($1, p.created_at) < (
-               SELECT current_week_start + interval '7 days'
-               FROM week_anchor
-             )
+       CROSS JOIN bounds b
+       WHERE timezone($1, p.created_at) >= b.range_start
+         AND timezone($1, p.created_at) < b.range_end
        GROUP BY p.created_by, date_trunc('day', timezone($1, p.created_at))
      )
      SELECT wc.id::text AS worker_id,
@@ -482,20 +498,29 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
               NULLIF(BTRIM(wc.email), ''),
               'Работник'
             ) AS worker_name,
-            to_char(ds.day_local, 'YYYY-MM-DD') AS day,
-            CASE
-              WHEN ds.day_local >= (SELECT current_week_start FROM week_anchor)
-                THEN 'current_week'
-              ELSE 'previous_week'
-            END AS period,
-            COALESCE(pc.posts_count, 0)::int AS posts_count,
-            COALESCE(pc.posted_amount, 0)::numeric(12,2) AS posted_amount,
-            (ds.day_local = date_trunc('day', timezone($1, now()))) AS is_today
-     FROM worker_candidates wc
-     CROSS JOIN day_series ds
-     LEFT JOIN post_counts pc
-       ON pc.worker_id = wc.id
-      AND pc.day_local = ds.day_local
+            to_char(pc.day_local, 'YYYY-MM-DD') AS day,
+            pc.posts_count::int AS posts_count,
+            pc.posted_amount::numeric(12,2) AS posted_amount,
+            (pc.day_local = a.today_start) AS is_today,
+            (
+              pc.day_local >= a.current_week_start
+              AND pc.day_local < a.current_week_start + interval '7 days'
+            ) AS in_current_week,
+            (
+              pc.day_local >= a.current_week_start - interval '7 days'
+              AND pc.day_local < a.current_week_start
+            ) AS in_previous_week,
+            (
+              pc.day_local >= a.current_month_start
+              AND pc.day_local < a.next_month_start
+            ) AS in_current_month,
+            (
+              pc.day_local >= a.today_start - interval '29 days'
+              AND pc.day_local < a.today_start + interval '1 day'
+            ) AS in_history_30
+     FROM post_counts pc
+     JOIN worker_candidates wc ON wc.id = pc.worker_id
+     CROSS JOIN anchors a
      ORDER BY worker_name ASC, day ASC`,
     [SAMARA_TZ, tenantId || null],
   );
@@ -560,6 +585,108 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     [tenantId || null, safeDowntimeWindowDays],
   );
 
+  const shippedQ = await pool.query(
+    `WITH worker_candidates AS (
+       SELECT u.id,
+              u.name,
+              u.email
+       FROM users u
+       WHERE ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+         AND (
+           COALESCE(NULLIF(BTRIM(lower(u.role)), ''), '') = 'worker'
+           OR EXISTS (
+             SELECT 1
+             FROM user_role_templates urt
+             JOIN role_templates rt ON rt.id = urt.template_id
+             WHERE urt.user_id = u.id
+               AND (
+                 COALESCE(NULLIF(BTRIM(lower(rt.code)), ''), '') = 'worker'
+                 OR COALESCE(rt.permissions->>'product.create', 'false') = 'true'
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM products pp
+             WHERE pp.created_by = u.id
+           )
+         )
+     ),
+     anchors AS (
+       SELECT date_trunc('week', timezone($1, now())) AS current_week_start,
+              date_trunc('day', timezone($1, now())) AS today_start
+     ),
+     bounds AS (
+       SELECT current_week_start - interval '7 days' AS range_start,
+              today_start + interval '1 day' AS range_end
+       FROM anchors
+     ),
+     shipped AS (
+       SELECT p.created_by AS worker_id,
+              date_trunc(
+                'day',
+                timezone(
+                  $1,
+                  COALESCE(b.handed_off_at, b.completed_at, c.updated_at, dbi.created_at)
+                )
+              ) AS day_local,
+              COUNT(*)::int AS shipped_items_count,
+              COALESCE(
+                SUM(
+                  CASE
+                    WHEN dbi.line_total IS NOT NULL AND dbi.line_total > 0
+                      THEN dbi.line_total
+                    ELSE dbi.quantity * dbi.unit_price
+                  END
+                ),
+                0
+              )::numeric(12,2) AS shipped_amount
+       FROM delivery_batch_items dbi
+       JOIN delivery_batch_customers c ON c.id = dbi.batch_customer_id
+       JOIN delivery_batches b ON b.id = dbi.batch_id
+       JOIN products p ON p.id = dbi.product_id
+       JOIN worker_candidates wc ON wc.id = p.created_by
+       CROSS JOIN bounds bnd
+       WHERE COALESCE(c.delivery_status, '') IN ('in_delivery', 'delivered', 'completed')
+         AND COALESCE(dbi.assembly_status, 'pending') <> 'removed'
+         AND timezone($1, COALESCE(b.handed_off_at, b.completed_at, c.updated_at, dbi.created_at)) >= bnd.range_start
+         AND timezone($1, COALESCE(b.handed_off_at, b.completed_at, c.updated_at, dbi.created_at)) < bnd.range_end
+       GROUP BY p.created_by,
+                date_trunc(
+                  'day',
+                  timezone(
+                    $1,
+                    COALESCE(b.handed_off_at, b.completed_at, c.updated_at, dbi.created_at)
+                  )
+                )
+     )
+     SELECT wc.id::text AS worker_id,
+            COALESCE(
+              NULLIF(BTRIM(wc.name), ''),
+              NULLIF(BTRIM(wc.email), ''),
+              'Работник'
+            ) AS worker_name,
+            to_char(s.day_local, 'YYYY-MM-DD') AS day,
+            s.shipped_items_count::int AS shipped_items_count,
+            s.shipped_amount::numeric(12,2) AS shipped_amount,
+            (
+              s.day_local >= a.current_week_start
+              AND s.day_local < a.current_week_start + interval '7 days'
+            ) AS in_current_week,
+            (
+              s.day_local >= a.current_week_start - interval '7 days'
+              AND s.day_local < a.current_week_start
+            ) AS in_previous_week,
+            (
+              s.day_local >= a.today_start - interval '29 days'
+              AND s.day_local < a.today_start + interval '1 day'
+            ) AS in_history_30
+     FROM shipped s
+     JOIN worker_candidates wc ON wc.id = s.worker_id
+     CROSS JOIN anchors a
+     ORDER BY worker_name ASC, day ASC`,
+    [SAMARA_TZ, tenantId || null],
+  );
+
   const workersMap = new Map();
   const ensureWorker = (workerId, workerName) => {
     const id = String(workerId || "").trim();
@@ -567,23 +694,35 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     if (!workersMap.has(id)) {
       workersMap.set(id, {
         worker_id: id,
-        worker_name: String(workerName || "Работник"),
-        days_current_week: [],
-        days_previous_week: [],
-        history_14_days: [],
-        posts_today: 0,
-        posted_amount_today: 0,
-        active_today: false,
-        posts_current_week: 0,
-        posts_previous_week: 0,
-        revisions_today: 0,
-        revisions_current_week: 0,
-        revisions_previous_week: 0,
-        posted_amount_current_week: 0,
-        posted_amount_previous_week: 0,
-        days_worked_current_week: 0,
-        days_worked_previous_week: 0,
-        post_downtime: {
+	        worker_name: String(workerName || "Работник"),
+	        days_current_week: [],
+	        days_previous_week: [],
+	        days_current_month: [],
+	        history_14_days: [],
+	        history_30_days: [],
+	        posts_today: 0,
+	        posted_amount_today: 0,
+	        active_today: false,
+	        posts_current_week: 0,
+	        posts_previous_week: 0,
+	        posts_current_month: 0,
+	        revisions_today: 0,
+	        revisions_current_week: 0,
+	        revisions_previous_week: 0,
+	        revisions_current_month: 0,
+	        posted_amount_current_week: 0,
+	        posted_amount_previous_week: 0,
+	        posted_amount_current_month: 0,
+	        shipped_amount_current_week: 0,
+	        shipped_amount_previous_week: 0,
+	        shipped_amount_30_days: 0,
+	        shipped_items_current_week: 0,
+	        shipped_items_previous_week: 0,
+	        shipped_items_30_days: 0,
+	        days_worked_current_week: 0,
+	        days_worked_previous_week: 0,
+	        days_worked_current_month: 0,
+	        post_downtime: {
           window_days: safeDowntimeWindowDays,
           gaps_count: 0,
           avg_gap_minutes: 0,
@@ -600,22 +739,31 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     if (!worker) continue;
     const postsCount = toNumber(row.posts_count);
     const postedAmount = toNumber(row.posted_amount);
-    const dayEntry = {
-      day: String(row.day || ""),
-      posts_count: postsCount,
-      posted_amount: postedAmount,
-      worked: postsCount > 0,
-      is_today: row.is_today === true,
-    };
-    if (String(row.period || "") === "current_week") {
-      worker.days_current_week.push(dayEntry);
-    } else {
-      worker.days_previous_week.push(dayEntry);
-    }
-    worker.history_14_days.push(dayEntry);
-    if (row.is_today === true) {
-      worker.posts_today = postsCount;
-      worker.posted_amount_today = postedAmount;
+	    const dayEntry = {
+	      day: String(row.day || ""),
+	      posts_count: postsCount,
+	      posted_amount: postedAmount,
+	      worked: postsCount > 0,
+	      is_today: row.is_today === true,
+	    };
+	    if (row.in_current_week === true) {
+	      worker.days_current_week.push(dayEntry);
+	    }
+	    if (row.in_previous_week === true) {
+	      worker.days_previous_week.push(dayEntry);
+	    }
+	    if (row.in_current_month === true) {
+	      worker.days_current_month.push(dayEntry);
+	    }
+	    if (row.in_current_week === true || row.in_previous_week === true) {
+	      worker.history_14_days.push(dayEntry);
+	    }
+	    if (row.in_history_30 === true) {
+	      worker.history_30_days.push(dayEntry);
+	    }
+	    if (row.is_today === true) {
+	      worker.posts_today = postsCount;
+	      worker.posted_amount_today = postedAmount;
       worker.active_today = postsCount > 0;
     }
   }
@@ -644,6 +792,25 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     }
   }
 
+  for (const row of shippedQ.rows) {
+    const worker = ensureWorker(row.worker_id, row.worker_name);
+    if (!worker) continue;
+    const shippedAmount = toNumber(row.shipped_amount);
+    const shippedItems = toNumber(row.shipped_items_count);
+    if (row.in_current_week === true) {
+      worker.shipped_amount_current_week += shippedAmount;
+      worker.shipped_items_current_week += shippedItems;
+    }
+    if (row.in_previous_week === true) {
+      worker.shipped_amount_previous_week += shippedAmount;
+      worker.shipped_items_previous_week += shippedItems;
+    }
+    if (row.in_history_30 === true) {
+      worker.shipped_amount_30_days += shippedAmount;
+      worker.shipped_items_30_days += shippedItems;
+    }
+  }
+
   const workerRevisionRows = await loadWorkerPostsByName(tenantId);
   const revisionRowsByWorkerId = new Map(
     workerRevisionRows.map((row) => [String(row.worker_id || "").trim(), row]),
@@ -655,34 +822,53 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
       (sum, day) => sum + toNumber(day.posts_count),
       0,
     );
-    worker.posts_previous_week = worker.days_previous_week.reduce(
-      (sum, day) => sum + toNumber(day.posts_count),
-      0,
+	    worker.posts_previous_week = worker.days_previous_week.reduce(
+	      (sum, day) => sum + toNumber(day.posts_count),
+	      0,
+	    );
+	    worker.posts_current_month = worker.days_current_month.reduce(
+	      (sum, day) => sum + toNumber(day.posts_count),
+	      0,
+	    );
+	    worker.days_worked_current_week = worker.days_current_week.reduce(
+	      (sum, day) => sum + (day.worked ? 1 : 0),
+	      0,
     );
-    worker.days_worked_current_week = worker.days_current_week.reduce(
-      (sum, day) => sum + (day.worked ? 1 : 0),
-      0,
+	    worker.days_worked_previous_week = worker.days_previous_week.reduce(
+	      (sum, day) => sum + (day.worked ? 1 : 0),
+	      0,
+	    );
+	    worker.days_worked_current_month = worker.days_current_month.reduce(
+	      (sum, day) => sum + (day.worked ? 1 : 0),
+	      0,
+	    );
+	    worker.posted_amount_current_week = worker.days_current_week.reduce(
+	      (sum, day) => sum + toNumber(day.posted_amount),
+	      0,
     );
-    worker.days_worked_previous_week = worker.days_previous_week.reduce(
-      (sum, day) => sum + (day.worked ? 1 : 0),
-      0,
-    );
-    worker.posted_amount_current_week = worker.days_current_week.reduce(
-      (sum, day) => sum + toNumber(day.posted_amount),
-      0,
-    );
-    worker.posted_amount_previous_week = worker.days_previous_week.reduce(
-      (sum, day) => sum + toNumber(day.posted_amount),
-      0,
-    );
-    worker.revisions_today = toNumber(revisionRow.revisions_today);
-    worker.revisions_current_week = toNumber(revisionRow.revisions_week);
-    worker.revisions_previous_week = toNumber(revisionRow.revisions_prev_week);
-    worker.history_14_days.sort((a, b) =>
-      String(a.day || "").localeCompare(String(b.day || "")),
-    );
-    return worker;
-  });
+	    worker.posted_amount_previous_week = worker.days_previous_week.reduce(
+	      (sum, day) => sum + toNumber(day.posted_amount),
+	      0,
+	    );
+	    worker.posted_amount_current_month = worker.days_current_month.reduce(
+	      (sum, day) => sum + toNumber(day.posted_amount),
+	      0,
+	    );
+	    worker.revisions_today = toNumber(revisionRow.revisions_today);
+	    worker.revisions_current_week = toNumber(revisionRow.revisions_week);
+	    worker.revisions_previous_week = toNumber(revisionRow.revisions_prev_week);
+	    worker.revisions_current_month = toNumber(revisionRow.revisions_month);
+	    worker.history_14_days.sort((a, b) =>
+	      String(a.day || "").localeCompare(String(b.day || "")),
+	    );
+	    worker.history_30_days.sort((a, b) =>
+	      String(a.day || "").localeCompare(String(b.day || "")),
+	    );
+	    worker.days_current_month.sort((a, b) =>
+	      String(a.day || "").localeCompare(String(b.day || "")),
+	    );
+	    return worker;
+	  });
 
   const workersTotal = workers.length;
   const workersActiveCurrentWeek = workers.filter(
@@ -691,9 +877,12 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
   const workersActiveToday = workers.filter(
     (worker) => worker.active_today === true,
   ).length;
-  const workersActivePreviousWeek = workers.filter(
-    (worker) => worker.posts_previous_week > 0,
-  ).length;
+	  const workersActivePreviousWeek = workers.filter(
+	    (worker) => worker.posts_previous_week > 0,
+	  ).length;
+	  const workersActiveCurrentMonth = workers.filter(
+	    (worker) => worker.posts_current_month > 0,
+	  ).length;
   const postsToday = workers.reduce(
     (sum, worker) => sum + toNumber(worker.posts_today),
     0,
@@ -710,32 +899,69 @@ async function loadStaffExtendedStats(tenantId = null, { downtimeWindowDays = 30
     (sum, worker) => sum + toNumber(worker.revisions_current_week),
     0,
   );
-  const revisionsPreviousWeek = workers.reduce(
-    (sum, worker) => sum + toNumber(worker.revisions_previous_week),
-    0,
-  );
+	  const revisionsPreviousWeek = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.revisions_previous_week),
+	    0,
+	  );
+	  const revisionsCurrentMonth = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.revisions_current_month),
+	    0,
+	  );
   const postsPreviousWeek = workers.reduce(
     (sum, worker) => sum + toNumber(worker.posts_previous_week),
     0,
   );
-  const postedAmountToday = workers.reduce(
-    (sum, worker) => sum + toNumber(worker.posted_amount_today),
-    0,
-  );
+	  const postedAmountToday = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.posted_amount_today),
+	    0,
+	  );
+	  const postsCurrentMonth = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.posts_current_month),
+	    0,
+	  );
+	  const postedAmountCurrentMonth = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.posted_amount_current_month),
+	    0,
+	  );
+	  const shippedAmountCurrentWeek = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.shipped_amount_current_week),
+	    0,
+	  );
+	  const shippedAmountPreviousWeek = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.shipped_amount_previous_week),
+	    0,
+	  );
+	  const shippedAmount30Days = workers.reduce(
+	    (sum, worker) => sum + toNumber(worker.shipped_amount_30_days),
+	    0,
+	  );
 
   return {
     summary: {
       workers_total: workersTotal,
       workers_active_today: workersActiveToday,
-      workers_active_current_week: workersActiveCurrentWeek,
-      workers_active_previous_week: workersActivePreviousWeek,
-      posts_today: postsToday,
-      posts_current_week: postsCurrentWeek,
-      posts_previous_week: postsPreviousWeek,
-      revisions_today: revisionsToday,
-      revisions_current_week: revisionsCurrentWeek,
-      revisions_previous_week: revisionsPreviousWeek,
-      posted_amount_today: toNumber(postedAmountToday.toFixed(2)),
+	      workers_active_current_week: workersActiveCurrentWeek,
+	      workers_active_previous_week: workersActivePreviousWeek,
+	      workers_active_current_month: workersActiveCurrentMonth,
+	      posts_today: postsToday,
+	      posts_current_week: postsCurrentWeek,
+	      posts_previous_week: postsPreviousWeek,
+	      posts_current_month: postsCurrentMonth,
+	      revisions_today: revisionsToday,
+	      revisions_current_week: revisionsCurrentWeek,
+	      revisions_previous_week: revisionsPreviousWeek,
+	      revisions_current_month: revisionsCurrentMonth,
+	      posted_amount_today: toNumber(postedAmountToday.toFixed(2)),
+	      posted_amount_current_month: toNumber(
+	        postedAmountCurrentMonth.toFixed(2),
+	      ),
+	      shipped_amount_current_week: toNumber(
+	        shippedAmountCurrentWeek.toFixed(2),
+	      ),
+	      shipped_amount_previous_week: toNumber(
+	        shippedAmountPreviousWeek.toFixed(2),
+	      ),
+	      shipped_amount_30_days: toNumber(shippedAmount30Days.toFixed(2)),
       overall_avg_gap_minutes:
         weightedGapCount > 0
           ? toNumber((weightedGapTotal / weightedGapCount).toFixed(2))
@@ -1193,6 +1419,26 @@ router.get("/tenant/feature-settings", authMiddleware, async (req, res) => {
     return res.json({ ok: true, data: settings });
   } catch (err) {
     console.error("profile.tenant.featureSettings error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+  }
+});
+
+router.get("/tenant/rules", authMiddleware, async (req, res) => {
+  const tenantId = String(req.user?.tenant_id || "").trim();
+  try {
+    const settings = await getTenantFeatureSettings(tenantId || null);
+    const rulesText = String(settings.group_rules_text || "").trim();
+    return res.json({
+      ok: true,
+      data: {
+        rules_text:
+          rulesText ||
+          "Правила группы пока не заполнены. Следите за объявлениями администратора.",
+        updated_at: settings.updated_at || null,
+      },
+    });
+  } catch (err) {
+    console.error("profile.tenant.rules error", err);
     return res.status(500).json({ ok: false, error: "Ошибка сервера" });
   }
 });

@@ -7,8 +7,14 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   pickup_only_enabled: false,
   cart_delivery_ready_enabled: false,
   cart_delivery_ready_min_amount: 1500,
+  cart_retention_days: 30,
   revision_delete_approval_enabled: false,
   defect_stats_enabled: false,
+  auto_publish_enabled: false,
+  auto_publish_delay_minutes: 5,
+  shelf_field_label: "Полка",
+  floor_field_label: "Этаж",
+  group_rules_text: "",
 });
 
 const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
@@ -21,21 +27,29 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
     mode: "classic",
     client_ready_button: false,
     min_amount: 1500,
+    cart_retention_days: 30,
     snapshot_on_admin_approve: false,
   }),
   worker: Object.freeze({
     manual_shelf_enabled: false,
     pickup_only_enabled: false,
     revision_delete_approval_enabled: false,
+    shelf_field_label: "Полка",
+    floor_field_label: "Этаж",
   }),
   channels: Object.freeze({
     publication_interval_ms: 2000,
+    auto_publish_enabled: false,
+    auto_publish_delay_minutes: 5,
   }),
   registration: Object.freeze({
     client_city_options: Object.freeze([]),
   }),
   analytics: Object.freeze({
     defect_stats_enabled: false,
+  }),
+  rules: Object.freeze({
+    group_rules_text: "",
   }),
 });
 
@@ -108,6 +122,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
   const channelsSource = sectionOf(source, "channels");
   const registrationSource = sectionOf(source, "registration");
   const analyticsSource = sectionOf(source, "analytics");
+  const rulesSource = sectionOf(source, "rules");
 
   const publicationIntervalMs = Math.round(
     clampNumber(
@@ -134,6 +149,14 @@ function normalizeTenantFeatureSettings(raw = {}) {
     0,
     10_000_000,
     DEFAULT_TENANT_FEATURE_SETTINGS.cart_delivery_ready_min_amount,
+  );
+  const cartRetentionDays = Math.round(
+    clampNumber(
+      deliverySource.cart_retention_days ?? source.cart_retention_days,
+      1,
+      365,
+      DEFAULT_TENANT_FEATURE_SETTINGS.cart_retention_days,
+    ),
   );
   const revisionDeleteApprovalEnabled = parseBoolean(
     workerSource.revision_delete_approval_enabled ??
@@ -171,6 +194,35 @@ function normalizeTenantFeatureSettings(raw = {}) {
   const clientCityOptions = normalizeStringList(
     registrationSource.client_city_options ?? source.client_city_options,
   );
+  const autoPublishEnabled = parseBoolean(
+    channelsSource.auto_publish_enabled ?? source.auto_publish_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.auto_publish_enabled,
+  );
+  const autoPublishDelayMinutes = Math.round(
+    clampNumber(
+      channelsSource.auto_publish_delay_minutes ??
+        source.auto_publish_delay_minutes,
+      1,
+      24 * 60,
+      DEFAULT_TENANT_FEATURE_SETTINGS.auto_publish_delay_minutes,
+    ),
+  );
+  const shelfFieldLabel =
+    normalizeText(
+      workerSource.shelf_field_label ?? source.shelf_field_label,
+      40,
+    ) || DEFAULT_TENANT_FEATURE_SETTINGS.shelf_field_label;
+  const floorFieldLabel =
+    normalizeText(
+      workerSource.floor_field_label ?? source.floor_field_label,
+      40,
+    ) || DEFAULT_TENANT_FEATURE_SETTINGS.floor_field_label;
+  const groupRulesText = String(
+    rulesSource.group_rules_text ?? source.group_rules_text ?? "",
+  )
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .slice(0, 12000);
   const customWorkflowsEnabled =
     parseBoolean(source.custom_workflows_enabled, false) ||
     productProcessingMode !==
@@ -180,9 +232,16 @@ function normalizeTenantFeatureSettings(raw = {}) {
     manualShelfEnabled === true ||
     pickupOnlyEnabled === true ||
     cartDeliveryReadyEnabled === true ||
+    cartRetentionDays !== DEFAULT_TENANT_FEATURE_SETTINGS.cart_retention_days ||
     revisionDeleteApprovalEnabled === true ||
     defectStatsEnabled === true ||
-    clientCityOptions.length > 0;
+    clientCityOptions.length > 0 ||
+    autoPublishEnabled === true ||
+    autoPublishDelayMinutes !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.auto_publish_delay_minutes ||
+    shelfFieldLabel !== DEFAULT_TENANT_FEATURE_SETTINGS.shelf_field_label ||
+    floorFieldLabel !== DEFAULT_TENANT_FEATURE_SETTINGS.floor_field_label ||
+    groupRulesText.length > 0;
 
   return {
     version: 1,
@@ -194,21 +253,29 @@ function normalizeTenantFeatureSettings(raw = {}) {
       mode: deliveryMode,
       client_ready_button: cartDeliveryReadyEnabled,
       min_amount: cartDeliveryReadyMinAmount,
+      cart_retention_days: cartRetentionDays,
       snapshot_on_admin_approve: snapshotOnAdminApprove,
     },
     worker: {
       manual_shelf_enabled: manualShelfEnabled,
       pickup_only_enabled: pickupOnlyEnabled,
       revision_delete_approval_enabled: revisionDeleteApprovalEnabled,
+      shelf_field_label: shelfFieldLabel,
+      floor_field_label: floorFieldLabel,
     },
     channels: {
       publication_interval_ms: publicationIntervalMs,
+      auto_publish_enabled: autoPublishEnabled,
+      auto_publish_delay_minutes: autoPublishDelayMinutes,
     },
     registration: {
       client_city_options: clientCityOptions,
     },
     analytics: {
       defect_stats_enabled: defectStatsEnabled,
+    },
+    rules: {
+      group_rules_text: groupRulesText,
     },
     ...DEFAULT_TENANT_FEATURE_SETTINGS,
     custom_workflows_enabled: customWorkflowsEnabled,
@@ -217,9 +284,15 @@ function normalizeTenantFeatureSettings(raw = {}) {
     pickup_only_enabled: pickupOnlyEnabled,
     cart_delivery_ready_enabled: cartDeliveryReadyEnabled,
     cart_delivery_ready_min_amount: cartDeliveryReadyMinAmount,
+    cart_retention_days: cartRetentionDays,
     revision_delete_approval_enabled: revisionDeleteApprovalEnabled,
     defect_stats_enabled: defectStatsEnabled,
     client_city_options: clientCityOptions,
+    auto_publish_enabled: autoPublishEnabled,
+    auto_publish_delay_minutes: autoPublishDelayMinutes,
+    shelf_field_label: shelfFieldLabel,
+    floor_field_label: floorFieldLabel,
+    group_rules_text: groupRulesText,
     product_processing_mode: productProcessingMode,
     auto_product_processing_enabled:
       productProcessingMode === "auto_after_delay",

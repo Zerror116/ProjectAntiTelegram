@@ -1003,21 +1003,68 @@ async function countNonUrgentEventsForToday(userId, category) {
 
 async function computeChatUnreadCount(userId) {
   const result = await db.query(
-    `SELECT COUNT(*)::int AS unread_count
-       FROM messages m
-       JOIN chat_members cm
-         ON cm.chat_id = m.chat_id
-        AND cm.user_id = $1
-      WHERE m.sender_id IS NOT NULL
-        AND m.sender_id <> $1
-        AND NOT EXISTS (
-          SELECT 1
-            FROM message_reads mr
-           WHERE mr.message_id = m.id
-             AND mr.user_id = $1
+    `SELECT COALESCE(SUM(chat_unread.unread_count), 0)::int AS unread_count
+       FROM chat_members cm
+       JOIN chats c ON c.id = cm.chat_id
+       LEFT JOIN user_chat_preferences pref
+         ON pref.chat_id = cm.chat_id
+        AND pref.user_id = cm.user_id
+       LEFT JOIN support_tickets st ON st.chat_id = cm.chat_id
+       LEFT JOIN user_chat_state ucs
+         ON ucs.chat_id = cm.chat_id
+        AND ucs.user_id = cm.user_id
+       LEFT JOIN messages last_read_msg
+         ON last_read_msg.id = ucs.last_read_message_id
+        AND last_read_msg.chat_id = cm.chat_id
+       JOIN LATERAL (
+         SELECT COUNT(*)::int AS unread_count
+           FROM messages m
+          WHERE m.chat_id = cm.chat_id
+            AND (
+              (m.sender_id IS NOT NULL AND m.sender_id <> $1)
+              OR COALESCE(m.meta->>'kind', '') = 'reserved_order_item'
+            )
+            AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+            AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+            AND (
+              (
+                last_read_msg.id IS NOT NULL
+                AND (
+                  m.created_at > last_read_msg.created_at
+                  OR (
+                    m.created_at = last_read_msg.created_at
+                    AND m.id > last_read_msg.id
+                  )
+                )
+              )
+              OR (
+                last_read_msg.id IS NULL
+                AND cm.joined_at IS NOT NULL
+                AND m.created_at >= cm.joined_at
+              )
+            )
+       ) chat_unread ON true
+      WHERE cm.user_id = $1
+        AND COALESCE(pref.hidden, false) = false
+        AND COALESCE(c.settings->>'kind', '') <> 'system_duplicate'
+        AND (
+          c.type <> 'channel'
+          OR COALESCE((c.settings->>'hidden_in_chat_list')::boolean, false) = false
         )
-        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
-        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false`,
+        AND NOT (
+          c.type = 'private'
+          AND (
+            COALESCE((c.settings->>'saved_messages')::boolean, false) = true
+            OR COALESCE(c.settings->>'kind', '') = 'saved_messages'
+            OR LOWER(TRIM(COALESCE(c.title, ''))) = 'избранное'
+          )
+        )
+        AND (
+          st.chat_id IS NULL
+          OR COALESCE(st.status, 'open') <> 'archived'
+          OR st.archived_at IS NULL
+          OR st.archived_at > now() - interval '5 seconds'
+        )`,
     [userId, String(userId)],
   );
   return Number(result.rows?.[0]?.unread_count || 0) || 0;
@@ -1040,6 +1087,34 @@ async function computeNotificationBadgeCount(userId) {
     preferences,
   });
   return chatUnread + inboxCount;
+}
+
+async function computeNotificationBadgeSnapshot(userId) {
+  const user = await getNotificationUser(userId);
+  if (!user) {
+    return {
+      unread_count: 0,
+      inbox_unread_count: 0,
+      chat_unread_count: 0,
+    };
+  }
+  const preferences = await getNotificationPreferencesForUser(user);
+  const badgePrefs = preferences.badge_preferences;
+  const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId, {
+    user,
+    preferences,
+  });
+  const chatUnreadCount = await computeChatUnreadCount(userId);
+  const unreadCount =
+    isClientRole(user.role) &&
+    Object.values(preferences.channels).every((value) => value != true)
+      ? 0
+      : (badgePrefs.count_chat ? chatUnreadCount : 0) + inboxUnreadCount;
+  return {
+    unread_count: unreadCount,
+    inbox_unread_count: inboxUnreadCount,
+    chat_unread_count: chatUnreadCount,
+  };
 }
 
 async function computeNotificationInboxBadgeCount(
@@ -1268,8 +1343,7 @@ async function maybeSendWebPushForItem(user, item, preferences) {
   const payload = buildSocketPayload(item, badgeCount, inboxUnreadCount, preferences);
   payload.type = category;
   payload.url = payload.deep_link || "/";
-  // Web/PWA app badges should mirror the inbox/events counter, not chat unread totals.
-  payload.badgeCount = inboxUnreadCount;
+  payload.badgeCount = badgeCount;
   payload.tag = String(item.collapse_key || `${category}:${item.id}`);
   payload.data = {
     ...(payload.payload || {}),
@@ -1575,15 +1649,24 @@ async function createNotificationInboxItem({
         user.id,
         { user },
       );
+      const chatUnreadCount = await computeChatUnreadCount(user.id);
+      const socketPayload = buildSocketPayload(
+        row,
+        badgeCount,
+        inboxUnreadCount,
+        preferences,
+      );
+      socketPayload.chat_unread_count = chatUnreadCount;
       emitToUser(
         io,
         user.id,
         "notification:new",
-        buildSocketPayload(row, badgeCount, inboxUnreadCount, preferences),
+        socketPayload,
       );
       emitToUser(io, user.id, "notification:badge", {
         unread_count: badgeCount,
         inbox_unread_count: inboxUnreadCount,
+        chat_unread_count: chatUnreadCount,
       });
     }
   }
@@ -1624,16 +1707,19 @@ async function markNotificationInboxItemRead({ userId, itemId }) {
   if (row) {
     const badgeCount = await computeNotificationBadgeCount(userId);
     const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
+    const chatUnreadCount = await computeChatUnreadCount(userId);
     const io = global.__projectPhoenixSocketIo;
     if (io) {
       emitToUser(io, userId, "notification:read", {
         id: itemId,
         unread_count: badgeCount,
         inbox_unread_count: inboxUnreadCount,
+        chat_unread_count: chatUnreadCount,
       });
       emitToUser(io, userId, "notification:badge", {
         unread_count: badgeCount,
         inbox_unread_count: inboxUnreadCount,
+        chat_unread_count: chatUnreadCount,
       });
     }
   }
@@ -1690,16 +1776,19 @@ async function markNotificationInboxItemOpened({ userId, itemId }) {
 
   const badgeCount = await computeNotificationBadgeCount(userId);
   const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
+  const chatUnreadCount = await computeChatUnreadCount(userId);
   const io = global.__projectPhoenixSocketIo;
   if (io) {
     emitToUser(io, userId, "notification:read", {
       id: itemId,
       unread_count: badgeCount,
       inbox_unread_count: inboxUnreadCount,
+      chat_unread_count: chatUnreadCount,
     });
     emitToUser(io, userId, "notification:badge", {
       unread_count: badgeCount,
       inbox_unread_count: inboxUnreadCount,
+      chat_unread_count: chatUnreadCount,
     });
   }
   return row;
@@ -1718,11 +1807,13 @@ async function markAllNotificationInboxItemsRead({ userId }) {
   );
   const badgeCount = await computeNotificationBadgeCount(userId);
   const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
+  const chatUnreadCount = await computeChatUnreadCount(userId);
   const io = global.__projectPhoenixSocketIo;
   if (io) {
     emitToUser(io, userId, "notification:badge", {
       unread_count: badgeCount,
       inbox_unread_count: inboxUnreadCount,
+      chat_unread_count: chatUnreadCount,
     });
   }
   return badgeCount;
@@ -2276,7 +2367,9 @@ module.exports = {
   upsertNotificationPreferences,
   upsertNotificationEndpoint,
   deactivateNotificationEndpoint,
+  computeChatUnreadCount,
   computeNotificationBadgeCount,
+  computeNotificationBadgeSnapshot,
   computeNotificationInboxBadgeCount,
   buildSocketPayload,
   evaluatePushEligibility,

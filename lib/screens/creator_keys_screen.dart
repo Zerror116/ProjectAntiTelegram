@@ -26,13 +26,19 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     text: '2',
   );
   final _tenantAutoProcessingDelayCtrl = TextEditingController(text: '60');
+  final _tenantCartRetentionDaysCtrl = TextEditingController(text: '30');
+  final _tenantAutoPublishDelayCtrl = TextEditingController(text: '5');
+  final _tenantShelfFieldLabelCtrl = TextEditingController(text: 'Полка');
+  final _tenantFloorFieldLabelCtrl = TextEditingController(text: 'Этаж');
   final _tenantDeliveryMinAmountCtrl = TextEditingController(text: '1500');
   final _tenantClientCitiesCtrl = TextEditingController();
+  final _tenantRulesTextCtrl = TextEditingController();
 
   bool _loading = true;
   bool _tenantActionLoading = false;
   bool _tenantsLoading = false;
   bool _tenantAutoProcessingEnabled = false;
+  bool _tenantAutoPublishEnabled = false;
   bool _tenantManualShelfEnabled = false;
   bool _tenantPickupOnlyEnabled = false;
   bool _tenantCartDeliveryReadyEnabled = false;
@@ -74,8 +80,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantMonthsCtrl.dispose();
     _tenantPublicationIntervalSecondsCtrl.dispose();
     _tenantAutoProcessingDelayCtrl.dispose();
+    _tenantCartRetentionDaysCtrl.dispose();
+    _tenantAutoPublishDelayCtrl.dispose();
+    _tenantShelfFieldLabelCtrl.dispose();
+    _tenantFloorFieldLabelCtrl.dispose();
     _tenantDeliveryMinAmountCtrl.dispose();
     _tenantClientCitiesCtrl.dispose();
+    _tenantRulesTextCtrl.dispose();
     super.dispose();
   }
 
@@ -165,9 +176,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   Map<String, dynamic> _tenantWorkflowPayload({
     required TextEditingController publicationSecondsCtrl,
     required TextEditingController autoDelayCtrl,
+    required TextEditingController cartRetentionDaysCtrl,
+    required TextEditingController autoPublishDelayCtrl,
     required TextEditingController minAmountCtrl,
     required TextEditingController citiesCtrl,
+    required TextEditingController shelfFieldLabelCtrl,
+    required TextEditingController floorFieldLabelCtrl,
+    required TextEditingController rulesTextCtrl,
     required bool autoProcessingEnabled,
+    required bool autoPublishEnabled,
     required bool manualShelfEnabled,
     required bool pickupOnlyEnabled,
     required bool deliveryReadyEnabled,
@@ -187,6 +204,18 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       min: 1,
       max: 1440,
     );
+    final cartRetentionDays = _parseIntValue(
+      cartRetentionDaysCtrl.text,
+      fallback: 30,
+      min: 1,
+      max: 365,
+    );
+    final autoPublishDelayMinutes = _parseIntValue(
+      autoPublishDelayCtrl.text,
+      fallback: 5,
+      min: 1,
+      max: 1440,
+    );
     final minAmount = _parseIntValue(
       minAmountCtrl.text,
       fallback: 1500,
@@ -194,6 +223,12 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       max: 10000000,
     );
     final cities = _stringListFromText(citiesCtrl.text);
+    final shelfFieldLabel = shelfFieldLabelCtrl.text.trim().isEmpty
+        ? 'Полка'
+        : shelfFieldLabelCtrl.text.trim();
+    final floorFieldLabel = floorFieldLabelCtrl.text.trim().isEmpty
+        ? 'Этаж'
+        : floorFieldLabelCtrl.text.trim();
     final workflowSettings = <String, dynamic>{
       'version': 1,
       'product_processing': {
@@ -207,15 +242,23 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         'client_ready_button': deliveryReadyEnabled,
         'min_amount': minAmount,
         'snapshot_on_admin_approve': deliverySnapshotOnAdminApprove,
+        'cart_retention_days': cartRetentionDays,
       },
       'worker': {
         'manual_shelf_enabled': manualShelfEnabled,
         'pickup_only_enabled': pickupOnlyEnabled,
         'revision_delete_approval_enabled': revisionDeleteApprovalEnabled,
+        'shelf_field_label': shelfFieldLabel,
+        'floor_field_label': floorFieldLabel,
       },
-      'channels': {'publication_interval_ms': publicationSeconds * 1000},
+      'channels': {
+        'publication_interval_ms': publicationSeconds * 1000,
+        'auto_publish_enabled': autoPublishEnabled,
+        'auto_publish_delay_minutes': autoPublishDelayMinutes,
+      },
       'registration': {'client_city_options': cities},
       'analytics': {'defect_stats_enabled': defectStatsEnabled},
+      'rules': {'group_rules_text': rulesTextCtrl.text.trim()},
     };
     return {
       'workflow_settings': workflowSettings,
@@ -227,9 +270,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     return _tenantWorkflowPayload(
       publicationSecondsCtrl: _tenantPublicationIntervalSecondsCtrl,
       autoDelayCtrl: _tenantAutoProcessingDelayCtrl,
+      cartRetentionDaysCtrl: _tenantCartRetentionDaysCtrl,
+      autoPublishDelayCtrl: _tenantAutoPublishDelayCtrl,
       minAmountCtrl: _tenantDeliveryMinAmountCtrl,
       citiesCtrl: _tenantClientCitiesCtrl,
+      shelfFieldLabelCtrl: _tenantShelfFieldLabelCtrl,
+      floorFieldLabelCtrl: _tenantFloorFieldLabelCtrl,
+      rulesTextCtrl: _tenantRulesTextCtrl,
       autoProcessingEnabled: _tenantAutoProcessingEnabled,
+      autoPublishEnabled: _tenantAutoPublishEnabled,
       manualShelfEnabled: _tenantManualShelfEnabled,
       pickupOnlyEnabled: _tenantPickupOnlyEnabled,
       deliveryReadyEnabled: _tenantCartDeliveryReadyEnabled,
@@ -242,9 +291,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   void _resetCreateTenantSettings() {
     _tenantPublicationIntervalSecondsCtrl.text = '2';
     _tenantAutoProcessingDelayCtrl.text = '60';
+    _tenantCartRetentionDaysCtrl.text = '30';
+    _tenantAutoPublishDelayCtrl.text = '5';
+    _tenantShelfFieldLabelCtrl.text = 'Полка';
+    _tenantFloorFieldLabelCtrl.text = 'Этаж';
     _tenantDeliveryMinAmountCtrl.text = '1500';
     _tenantClientCitiesCtrl.clear();
+    _tenantRulesTextCtrl.clear();
     _tenantAutoProcessingEnabled = false;
+    _tenantAutoPublishEnabled = false;
     _tenantManualShelfEnabled = false;
     _tenantPickupOnlyEnabled = false;
     _tenantCartDeliveryReadyEnabled = false;
@@ -736,6 +791,20 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                   60)
               .toString(),
     );
+    final cartRetentionDaysCtrl = TextEditingController(
+      text:
+          (delivery['cart_retention_days'] ??
+                  initialSettings['cart_retention_days'] ??
+                  30)
+              .toString(),
+    );
+    final autoPublishDelayCtrl = TextEditingController(
+      text:
+          (channels['auto_publish_delay_minutes'] ??
+                  initialSettings['auto_publish_delay_minutes'] ??
+                  5)
+              .toString(),
+    );
     final minAmountCtrl = TextEditingController(
       text:
           (delivery['min_amount'] ??
@@ -749,6 +818,27 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             initialSettings['client_city_options'],
       ).join('\n'),
     );
+    final shelfFieldLabelCtrl = TextEditingController(
+      text:
+          (worker['shelf_field_label'] ??
+                  initialSettings['shelf_field_label'] ??
+                  'Полка')
+              .toString(),
+    );
+    final floorFieldLabelCtrl = TextEditingController(
+      text:
+          (worker['floor_field_label'] ??
+                  initialSettings['floor_field_label'] ??
+                  'Этаж')
+              .toString(),
+    );
+    final rulesTextCtrl = TextEditingController(
+      text:
+          (initialSettings['group_rules_text'] ??
+                  _asMap(initialSettings['rules'])['group_rules_text'] ??
+                  '')
+              .toString(),
+    );
 
     var autoProcessingEnabled =
         (productProcessing['mode'] ??
@@ -759,6 +849,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         _toBoolValue(initialSettings['auto_product_processing_enabled']);
     var manualShelfEnabled = _toBoolValue(
       worker['manual_shelf_enabled'] ?? initialSettings['manual_shelf_enabled'],
+    );
+    var autoPublishEnabled = _toBoolValue(
+      channels['auto_publish_enabled'] ??
+          initialSettings['auto_publish_enabled'],
     );
     var pickupOnlyEnabled = _toBoolValue(
       worker['pickup_only_enabled'] ?? initialSettings['pickup_only_enabled'],
@@ -800,6 +894,20 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       suffixText: 'сек',
                       helperText: 'От 1 до 600 секунд.',
                     ),
+                    _settingsSwitchTile(
+                      title: 'Автовыкладка товаров',
+                      subtitle:
+                          'Система сама запускает отправку ожидающих постов.',
+                      value: autoPublishEnabled,
+                      onChanged: (value) =>
+                          setDialogState(() => autoPublishEnabled = value),
+                    ),
+                    _settingsNumberField(
+                      controller: autoPublishDelayCtrl,
+                      labelText: 'Через сколько минут автовыкладка',
+                      suffixText: 'мин',
+                      helperText: 'От 1 минуты до 24 часов.',
+                    ),
                     _settingsSectionTitle('Обработка товара'),
                     _settingsSwitchTile(
                       title: 'Автообработка товара',
@@ -828,6 +936,12 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       suffixText: '₽',
                       helperText: 'Минимальная сумма обработанных товаров.',
                     ),
+                    _settingsNumberField(
+                      controller: cartRetentionDaysCtrl,
+                      labelText: 'Через сколько дней расформировать корзину',
+                      suffixText: 'дн.',
+                      helperText: 'Таймер идёт от старого активного товара.',
+                    ),
                     _settingsSwitchTile(
                       title: 'Сборка доставки после подтверждения админа',
                       subtitle: 'Черновой режим новой логики доставки.',
@@ -844,6 +958,28 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       onChanged: (value) =>
                           setDialogState(() => manualShelfEnabled = value),
                     ),
+                    TextField(
+                      controller: shelfFieldLabelCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Название графы полки',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: shelfFieldLabelCtrl,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: floorFieldLabelCtrl,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Название графы этажа',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: floorFieldLabelCtrl,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
                     _settingsSwitchTile(
                       title: 'Самовывоз',
                       subtitle: 'Рабочий сможет отмечать товар как самовывоз.',
@@ -873,6 +1009,20 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                         controller: citiesCtrl,
                       ),
                     ),
+                    _settingsSectionTitle('Правила'),
+                    TextField(
+                      controller: rulesTextCtrl,
+                      minLines: 4,
+                      maxLines: 8,
+                      decoration: withInputLanguageBadge(
+                        const InputDecoration(
+                          labelText: 'Правила группы',
+                          helperText: 'Этот текст увидят клиенты в чатах.',
+                          border: OutlineInputBorder(),
+                        ),
+                        controller: rulesTextCtrl,
+                      ),
+                    ),
                     _settingsSectionTitle('Статистика'),
                     _settingsSwitchTile(
                       title: 'Статистика брака',
@@ -897,9 +1047,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                     _tenantWorkflowPayload(
                       publicationSecondsCtrl: publicationSecondsCtrl,
                       autoDelayCtrl: autoDelayCtrl,
+                      cartRetentionDaysCtrl: cartRetentionDaysCtrl,
+                      autoPublishDelayCtrl: autoPublishDelayCtrl,
                       minAmountCtrl: minAmountCtrl,
                       citiesCtrl: citiesCtrl,
+                      shelfFieldLabelCtrl: shelfFieldLabelCtrl,
+                      floorFieldLabelCtrl: floorFieldLabelCtrl,
+                      rulesTextCtrl: rulesTextCtrl,
                       autoProcessingEnabled: autoProcessingEnabled,
+                      autoPublishEnabled: autoPublishEnabled,
                       manualShelfEnabled: manualShelfEnabled,
                       pickupOnlyEnabled: pickupOnlyEnabled,
                       deliveryReadyEnabled: deliveryReadyEnabled,
@@ -921,8 +1077,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     } finally {
       publicationSecondsCtrl.dispose();
       autoDelayCtrl.dispose();
+      cartRetentionDaysCtrl.dispose();
+      autoPublishDelayCtrl.dispose();
       minAmountCtrl.dispose();
       citiesCtrl.dispose();
+      shelfFieldLabelCtrl.dispose();
+      floorFieldLabelCtrl.dispose();
+      rulesTextCtrl.dispose();
     }
   }
 
@@ -995,6 +1156,19 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             suffixText: 'сек',
             helperText: 'По умолчанию 2 секунды.',
           ),
+          _settingsSwitchTile(
+            title: 'Автовыкладка товаров',
+            subtitle: 'Система сама запускает отправку ожидающих постов.',
+            value: _tenantAutoPublishEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantAutoPublishEnabled = value),
+          ),
+          _settingsNumberField(
+            controller: _tenantAutoPublishDelayCtrl,
+            labelText: 'Через сколько минут автовыкладка',
+            suffixText: 'мин',
+            helperText: 'По умолчанию 5 минут.',
+          ),
           _settingsSectionTitle('Обработка товара'),
           _settingsSwitchTile(
             title: 'Автообработка товара',
@@ -1023,6 +1197,12 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             suffixText: '₽',
             helperText: 'По умолчанию 1500 ₽.',
           ),
+          _settingsNumberField(
+            controller: _tenantCartRetentionDaysCtrl,
+            labelText: 'Через сколько дней расформировать корзину',
+            suffixText: 'дн.',
+            helperText: 'По умолчанию 30 дней.',
+          ),
           _settingsSwitchTile(
             title: 'Сборка доставки после подтверждения админа',
             subtitle: 'Черновой режим новой доставки.',
@@ -1038,6 +1218,28 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             onChanged: (value) =>
                 setState(() => _tenantManualShelfEnabled = value),
           ),
+          TextField(
+            controller: _tenantShelfFieldLabelCtrl,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Название графы полки',
+                border: OutlineInputBorder(),
+              ),
+              controller: _tenantShelfFieldLabelCtrl,
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _tenantFloorFieldLabelCtrl,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Название графы этажа',
+                border: OutlineInputBorder(),
+              ),
+              controller: _tenantFloorFieldLabelCtrl,
+            ),
+          ),
+          const SizedBox(height: 10),
           _settingsSwitchTile(
             title: 'Самовывоз',
             subtitle: 'Рабочий сможет отмечать товар как самовывоз.',
@@ -1064,6 +1266,20 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                 border: OutlineInputBorder(),
               ),
               controller: _tenantClientCitiesCtrl,
+            ),
+          ),
+          _settingsSectionTitle('Правила'),
+          TextField(
+            controller: _tenantRulesTextCtrl,
+            minLines: 4,
+            maxLines: 8,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Правила группы',
+                helperText: 'Этот текст увидят клиенты в чатах.',
+                border: OutlineInputBorder(),
+              ),
+              controller: _tenantRulesTextCtrl,
             ),
           ),
           _settingsSectionTitle('Статистика'),

@@ -38,6 +38,7 @@ const { uploadsPath } = require("../utils/storagePaths");
 const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
 const { toOriginalPublicMediaUrl } = require("../utils/mediaAssets");
 const { normalizeCatalogTitle } = require("../utils/catalogTitle");
+const { upsertProductCardSnapshot } = require("../utils/productCardSnapshots");
 const {
   getTenantFeatureSettings,
   patchTenantFeatureSettings,
@@ -890,6 +891,30 @@ function buildTenantWorkflowSettingsPayload(body = {}) {
     };
     payload.client_city_options = source.client_city_options;
   }
+  const deliverySource = isPlainObject(payload.delivery) ? payload.delivery : {};
+  const workerSource = isPlainObject(payload.worker) ? payload.worker : {};
+  const channelsSource = isPlainObject(payload.channels) ? payload.channels : {};
+  const rulesSource = isPlainObject(payload.rules) ? payload.rules : {};
+  const directMap = [
+    ["cart_retention_days", "delivery", "cart_retention_days"],
+    ["shelf_field_label", "worker", "shelf_field_label"],
+    ["floor_field_label", "worker", "floor_field_label"],
+    ["auto_publish_enabled", "channels", "auto_publish_enabled"],
+    ["auto_publish_delay_minutes", "channels", "auto_publish_delay_minutes"],
+    ["group_rules_text", "rules", "group_rules_text"],
+  ];
+  for (const [sourceKey, sectionKey, targetKey] of directMap) {
+    if (!Object.prototype.hasOwnProperty.call(source, sourceKey)) continue;
+    payload[sectionKey] = {
+      ...(isPlainObject(payload[sectionKey]) ? payload[sectionKey] : {}),
+      [targetKey]: source[sourceKey],
+    };
+    payload[sourceKey] = source[sourceKey];
+  }
+  if (Object.keys(deliverySource).length > 0) payload.delivery = { ...deliverySource, ...(payload.delivery || {}) };
+  if (Object.keys(workerSource).length > 0) payload.worker = { ...workerSource, ...(payload.worker || {}) };
+  if (Object.keys(channelsSource).length > 0) payload.channels = { ...channelsSource, ...(payload.channels || {}) };
+  if (Object.keys(rulesSource).length > 0) payload.rules = { ...rulesSource, ...(payload.rules || {}) };
   return payload;
 }
 
@@ -3798,6 +3823,68 @@ router.post(
   },
 );
 
+router.get(
+  "/tenant/rules",
+  requireAuth,
+  requireRole("tenant", "creator"),
+  async (req, res) => {
+    const tenantId = tenantIdFromRequest(req);
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+    try {
+      const settings = await getTenantFeatureSettings(tenantId);
+      return res.json({
+        ok: true,
+        data: { rules_text: String(settings.group_rules_text || "") },
+      });
+    } catch (err) {
+      console.error("admin.tenant.rules.get error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/tenant/rules",
+  requireAuth,
+  requireRole("tenant", "creator"),
+  async (req, res) => {
+    const tenantId = tenantIdFromRequest(req);
+    if (!tenantId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Аккаунт не привязан к группе арендатора",
+      });
+    }
+    try {
+      const rulesText = String(req.body?.rules_text || "")
+        .replace(/\r\n/g, "\n")
+        .trim()
+        .slice(0, 12000);
+      const settings = await patchTenantFeatureSettings(tenantId, {
+        rules: { group_rules_text: rulesText },
+        group_rules_text: rulesText,
+      });
+      emitToTenant(req.app.get("io"), tenantId, "tenant:rules:updated", {
+        entity: "tenant_rules",
+        entity_id: tenantId,
+        action: "updated",
+      });
+      return res.json({
+        ok: true,
+        data: { rules_text: String(settings.group_rules_text || "") },
+      });
+    } catch (err) {
+      console.error("admin.tenant.rules.patch error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 // Очередь постов от worker (ожидают подтверждения)
 router.get(
   "/channels/pending_posts",
@@ -4217,6 +4304,7 @@ router.post(
                 p.product_code,
                 p.shelf_number AS product_shelf_number,
                 p.manual_shelf_label,
+                p.shelf_floor,
                 COALESCE(p.pickup_only, false) AS pickup_only,
                 p.title AS product_title,
                 p.description AS product_description,
@@ -4278,6 +4366,7 @@ router.post(
           ),
           product_shelf_number: row.product_shelf_number,
           manual_shelf_label: row.manual_shelf_label || null,
+          shelf_floor: row.shelf_floor || null,
           pickup_only: row.pickup_only === true,
           title: row.product_title,
           description: row.product_description,
@@ -5719,6 +5808,238 @@ router.post(
       return res.json({ ok: true, data: upd.rows[0] });
     } catch (err) {
       console.error("admin.products.archive error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
+router.patch(
+  "/products/:id/channel-post",
+  requireAuth,
+  requireRole("admin", "tenant", "creator"),
+  requireProductPublishPermission,
+  async (req, res) => {
+    const productId = String(req.params?.id || "").trim();
+    const title = normalizeCatalogTitle(req.body?.title || "");
+    const description = String(req.body?.description || "").trim();
+    const price = Number(req.body?.price);
+    const quantity = Number(req.body?.quantity);
+
+    if (!productId) {
+      return res.status(400).json({ ok: false, error: "productId обязателен" });
+    }
+    if (!title) {
+      return res.status(400).json({ ok: false, error: "Название товара обязательно" });
+    }
+    if (!description || description.length < 2) {
+      return res.status(400).json({
+        ok: false,
+        error: "Описание должно содержать минимум 2 символа",
+      });
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ ok: false, error: "Цена должна быть больше нуля" });
+    }
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ ok: false, error: "Количество должно быть больше нуля" });
+    }
+
+    try {
+      const result = await runInRequestTenantScope(req, async () => {
+        const client = await db.pool.connect();
+        try {
+          await client.query("BEGIN");
+
+          const productQ = await client.query(
+            `SELECT p.id
+             FROM products p
+             WHERE p.id = $1
+               AND p.deleted_at IS NULL
+               AND COALESCE(p.status, '') <> 'deleted'
+               AND (
+                 $2::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM product_publication_queue q
+                   JOIN chats c ON c.id = q.channel_id
+                   WHERE q.product_id = p.id
+                     AND c.tenant_id = $2::uuid
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                   FROM users u
+                   WHERE u.id = p.created_by
+                     AND u.tenant_id = $2::uuid
+                 )
+               )
+             LIMIT 1
+             FOR UPDATE`,
+            [productId, req.user?.tenant_id || null],
+          );
+          if (productQ.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return null;
+          }
+
+          const productUpdate = await client.query(
+            `UPDATE products
+             SET title = $2,
+                 description = $3,
+                 price = $4,
+                 quantity = $5,
+                 updated_at = now()
+             WHERE id = $1
+             RETURNING id, product_code, shelf_number, manual_shelf_label, shelf_floor,
+                       pickup_only, is_bulky, title, description, price, quantity,
+                       image_url, status, updated_at`,
+            [productId, title, description, price, Math.floor(quantity)],
+          );
+          const product = productUpdate.rows[0];
+          const cardSnapshot = await upsertProductCardSnapshot(client, product, {
+            tenantId: req.user?.tenant_id || null,
+          });
+          const productLabel = formatProductLabel(
+            product.product_code,
+            product.shelf_number,
+            product.manual_shelf_label,
+          );
+          const messageText = productMessageText(product);
+          const updatedMessagesQ = await client.query(
+            `UPDATE messages m
+             SET text = $2,
+                 meta = COALESCE(m.meta, '{}'::jsonb) || jsonb_build_object(
+                   'product_code', $3::int,
+                   'product_label', $4::text,
+                   'price', $5::numeric,
+                   'quantity', $6::int,
+                   'title', $7::text,
+                   'description', $8::text,
+                   'shelf_number', $9::int,
+                   'manual_shelf_label', NULLIF($10::text, ''),
+                   'shelf_floor', NULLIF($11::text, ''),
+                   'pickup_only', $12::boolean,
+                   'is_bulky', $13::boolean,
+                   'image_url', NULLIF($14::text, ''),
+                   'card_snapshot', $15::jsonb,
+                   'edited', true,
+                   'edited_at', now()::text
+                 )
+             FROM chats c
+             WHERE c.id = m.chat_id
+               AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+               AND COALESCE(m.meta->>'product_id', '') = $1::text
+               AND ($16::uuid IS NULL OR c.tenant_id = $16::uuid)
+             RETURNING m.id, m.chat_id, m.sender_id, m.text, m.meta, m.created_at`,
+            [
+              productId,
+              encryptMessageText(messageText),
+              Number(product.product_code) || null,
+              productLabel,
+              Number(product.price),
+              Number(product.quantity) || 0,
+              product.title,
+              product.description,
+              Number(product.shelf_number) || null,
+              product.manual_shelf_label || "",
+              product.shelf_floor || "",
+              product.pickup_only === true,
+              product.is_bulky === true,
+              product.image_url || "",
+              JSON.stringify(cardSnapshot || {}),
+              req.user?.tenant_id || null,
+            ],
+          );
+
+          await client.query(
+            `UPDATE product_publication_queue
+             SET payload = jsonb_strip_nulls(
+                   COALESCE(payload, '{}'::jsonb) ||
+                   jsonb_build_object(
+                     'title', $2::text,
+                     'description', $3::text,
+                     'price', $4::numeric,
+                     'quantity', $5::int,
+                     'card_snapshot', $6::jsonb
+                   )
+                 )
+             WHERE product_id = $1
+               AND (
+                 $7::uuid IS NULL
+                 OR EXISTS (
+                   SELECT 1
+                   FROM chats c
+                   WHERE c.id = product_publication_queue.channel_id
+                     AND c.tenant_id = $7::uuid
+                 )
+               )`,
+            [
+              productId,
+              product.title,
+              product.description,
+              Number(product.price),
+              Number(product.quantity) || 0,
+              JSON.stringify(cardSnapshot || {}),
+              req.user?.tenant_id || null,
+            ],
+          );
+
+          for (const message of updatedMessagesQ.rows) {
+            await upsertMessageSearchDocument({
+              queryable: client,
+              messageId: message.id,
+              chatId: message.chat_id,
+              tenantId: req.user?.tenant_id || null,
+              senderId: message.sender_id,
+              text: messageText,
+              meta: message.meta,
+              createdAt: message.created_at,
+            });
+          }
+
+          await client.query("COMMIT");
+          return {
+            product,
+            card_snapshot: cardSnapshot,
+            messages: updatedMessagesQ.rows,
+          };
+        } catch (err) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (_) {}
+          throw err;
+        } finally {
+          client.release();
+        }
+      });
+
+      if (!result) {
+        return res.status(404).json({ ok: false, error: "Товар не найден" });
+      }
+
+      const io = req.app.get("io");
+      if (io) {
+        for (const message of result.messages) {
+          io.to(`chat:${message.chat_id}`).emit("chat:message", {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitChannelUpdated(io, req.user?.tenant_id || null, message.chat_id, {
+            action: "product_updated",
+            product_id: productId,
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          product: result.product,
+          card_snapshot: result.card_snapshot,
+          messages: result.messages.map((message) => decryptMessageRow(message)),
+        },
+      });
+    } catch (err) {
+      console.error("admin.products.channelPost.update error", err);
       return res.status(500).json({ ok: false, error: "Ошибка сервера" });
     }
   },

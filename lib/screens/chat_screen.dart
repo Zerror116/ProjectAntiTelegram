@@ -1,6 +1,7 @@
 // lib/screens/chat_screen.dart
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' show Random, max, min;
 import 'dart:math' as math;
 import 'dart:ui' as ui;
@@ -56,6 +57,22 @@ import '../widgets/phoenix_loader.dart';
 import '../widgets/phoenix_micro_interactions.dart';
 import '../widgets/phoenix_visual_effects.dart';
 import '../widgets/submit_on_enter.dart';
+
+Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
+  final path = (file.path ?? '').trim();
+  if (path.isNotEmpty && !kIsWeb) {
+    try {
+      return await File(path).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return await file.readAsBytes();
+  } catch (_) {
+    return null;
+  }
+}
 
 class _ChatUploadFile {
   const _ChatUploadFile({
@@ -5654,7 +5671,7 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   bool get _preferFilePickerForImages {
-    if (kIsWeb) return true;
+    if (kIsWeb) return false;
     return defaultTargetPlatform == TargetPlatform.macOS ||
         defaultTargetPlatform == TargetPlatform.windows ||
         defaultTargetPlatform == TargetPlatform.linux;
@@ -6026,45 +6043,40 @@ class _ChatScreenState extends State<ChatScreen>
     return null;
   }
 
-  Future<_ChatUploadFile?> _pickRawImageUpload(ImageSource source) async {
-    if (kIsWeb ||
-        (source == ImageSource.gallery && _preferFilePickerForImages)) {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.image,
-        allowMultiple: false,
-        withData: true,
-      );
-      final picked = result?.files.single;
-      if (picked == null) return null;
-      final bytes = picked.bytes;
-      if (bytes == null || bytes.isEmpty) return null;
-      return _ChatUploadFile(
-        filename: picked.name.isNotEmpty ? picked.name : 'image.jpg',
-        path: picked.path,
-        bytes: bytes,
-        mimeType: _guessMimeTypeFromFilename(picked.name),
-        fileSize: picked.size,
-      );
-    }
-
-    final picked = await _imagePicker.pickImage(source: source);
-    if (picked == null) return null;
+  Future<_ChatUploadFile?> _chatUploadFromPickedImage(XFile picked) async {
     final bytes = await picked.readAsBytes();
     if (bytes.isEmpty) return null;
+    final filename = picked.name.trim().isNotEmpty
+        ? picked.name.trim()
+        : picked.path.split('/').last;
     return _ChatUploadFile(
-      filename: picked.name.isNotEmpty
-          ? picked.name
-          : picked.path.split('/').last,
+      filename: filename.trim().isNotEmpty ? filename : 'image.jpg',
       path: picked.path.trim().isNotEmpty ? picked.path : null,
       bytes: bytes,
       mimeType: (picked.mimeType ?? '').trim().isNotEmpty == true
           ? picked.mimeType!.trim()
-          : _guessMimeTypeFromFilename(
-              picked.name.isNotEmpty
-                  ? picked.name
-                  : picked.path.split('/').last,
-            ),
+          : _guessMimeTypeFromFilename(filename),
       fileSize: bytes.length,
+    );
+  }
+
+  Future<_ChatUploadFile?> _pickRawImageUpload(ImageSource source) async {
+    if (source != ImageSource.gallery || !_preferFilePickerForImages) {
+      final picked = await _imagePicker.pickImage(source: source);
+      if (picked == null) return null;
+      return _chatUploadFromPickedImage(picked);
+    }
+
+    final picked = await FilePicker.pickFile(type: FileType.image);
+    if (picked == null) return null;
+    final bytes = await _readPickedPlatformFileBytes(picked);
+    if (bytes == null || bytes.isEmpty) return null;
+    return _ChatUploadFile(
+      filename: picked.name.isNotEmpty ? picked.name : 'image.jpg',
+      path: picked.path,
+      bytes: bytes,
+      mimeType: _guessMimeTypeFromFilename(picked.name),
+      fileSize: picked.size,
     );
   }
 
@@ -6209,14 +6221,9 @@ class _ChatScreenState extends State<ChatScreen>
         defaultTargetPlatform == TargetPlatform.linux ||
         source == null;
     if (shouldUsePicker) {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.video,
-        allowMultiple: false,
-        withData: kIsWeb,
-      );
-      final picked = result?.files.single;
+      final picked = await FilePicker.pickFile(type: FileType.video);
       if (picked == null) return null;
-      final bytes = picked.bytes;
+      final bytes = kIsWeb ? await _readPickedPlatformFileBytes(picked) : null;
       return _ChatUploadFile(
         filename: picked.name.isNotEmpty ? picked.name : 'video.mp4',
         path: (picked.path ?? '').trim().isNotEmpty
@@ -6674,17 +6681,59 @@ class _ChatScreenState extends State<ChatScreen>
 
   Future<List<_AttachmentPickedUpload>>
   _pickAttachmentImagesFromDevice() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      allowMultiple: true,
-      withData: true,
-    );
+    if (!_preferFilePickerForImages) {
+      try {
+        final pickedImages = kIsWeb
+            ? await (() async {
+                final picked = await _imagePicker.pickImage(
+                  source: ImageSource.gallery,
+                );
+                return picked == null ? const <XFile>[] : <XFile>[picked];
+              })()
+            : await _imagePicker.pickMultiImage();
+        if (pickedImages.isEmpty) return const <_AttachmentPickedUpload>[];
+        final uploads = <_AttachmentPickedUpload>[];
+        for (final picked in pickedImages) {
+          final bytes = await picked.readAsBytes();
+          if (bytes.isEmpty) continue;
+          final filename = picked.name.trim().isNotEmpty
+              ? picked.name.trim()
+              : picked.path.split('/').last.trim();
+          final resolvedName = filename.isNotEmpty
+              ? filename
+              : 'image-${DateTime.now().millisecondsSinceEpoch}.jpg';
+          uploads.add(
+            _AttachmentPickedUpload(
+              id: 'device-${picked.path}-$resolvedName-${uploads.length}',
+              kind: 'image',
+              upload: _ChatUploadFile(
+                filename: resolvedName,
+                path: picked.path.trim().isNotEmpty ? picked.path.trim() : null,
+                bytes: bytes,
+                mimeType: (picked.mimeType ?? '').trim().isNotEmpty == true
+                    ? picked.mimeType!.trim()
+                    : _guessMimeTypeFromFilename(resolvedName),
+                fileSize: bytes.length,
+              ),
+              previewBytes: bytes,
+            ),
+          );
+        }
+        return uploads;
+      } catch (e) {
+        debugPrint('pick attachment images with ImagePicker failed: $e');
+      }
+    }
+
+    final result = await FilePicker.pickFiles(type: FileType.image);
     final files = result?.files ?? const <PlatformFile>[];
     final uploads = <_AttachmentPickedUpload>[];
     for (final picked in files) {
-      final bytes = picked.bytes;
-      if ((bytes == null || bytes.isEmpty) &&
-          (picked.path ?? '').trim().isEmpty) {
+      final path = (picked.path ?? '').trim();
+      final bytes = path.isEmpty || kIsWeb
+          ? await _readPickedPlatformFileBytes(picked)
+          : null;
+      if ((bytes == null || bytes.isEmpty) && path.isEmpty) {
         continue;
       }
       final filename = picked.name.trim().isNotEmpty
@@ -6696,9 +6745,7 @@ class _ChatScreenState extends State<ChatScreen>
           kind: 'image',
           upload: _ChatUploadFile(
             filename: filename,
-            path: (picked.path ?? '').trim().isNotEmpty
-                ? picked.path!.trim()
-                : null,
+            path: path.isNotEmpty ? path : null,
             bytes: bytes == null || bytes.isEmpty ? null : bytes,
             mimeType: _guessMimeTypeFromFilename(filename),
             fileSize: picked.size,
@@ -6955,6 +7002,7 @@ class _ChatScreenState extends State<ChatScreen>
       builder: (sheetContext) => _ChatAttachmentGallerySheet(
         title: 'Недавние',
         desktopMode: _preferFilePickerForImages,
+        autoStartCamera: !kIsWeb,
         nativeMacCameraMode:
             NativeVideoNoteCaptureService.shouldUseNativeCapture,
         loadRecent: _loadAttachmentRecentGallery,
@@ -9252,6 +9300,193 @@ class _ChatScreenState extends State<ChatScreen>
     }
   }
 
+  Future<void> _editCatalogProductPost(
+    Map<String, dynamic> message,
+    Map<String, dynamic> meta,
+  ) async {
+    final productId = (meta['product_id'] ?? '').toString().trim();
+    if (productId.isEmpty || !_isAdminOrCreator()) return;
+    final catalogTexts = _extractCatalogTexts(
+      (message['text'] ?? '').toString(),
+    );
+    final snapshot = _productCardSnapshotOf(meta);
+    final titleCtrl = TextEditingController(
+      text:
+          (snapshot['title'] ??
+                  meta['title'] ??
+                  catalogTexts['title'] ??
+                  'Товар')
+              .toString(),
+    );
+    final descriptionCtrl = TextEditingController(
+      text:
+          (snapshot['short_description'] ??
+                  meta['description'] ??
+                  catalogTexts['description'] ??
+                  '')
+              .toString(),
+    );
+    final priceCtrl = TextEditingController(
+      text: (meta['price'] ?? snapshot['price'] ?? '').toString(),
+    );
+    final quantityCtrl = TextEditingController(
+      text: (meta['quantity'] ?? snapshot['quantity'] ?? '').toString(),
+    );
+    try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Изменить пост'),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 520),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: titleCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Название',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: descriptionCtrl,
+                    minLines: 3,
+                    maxLines: 6,
+                    decoration: const InputDecoration(
+                      labelText: 'Описание',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: priceCtrl,
+                          keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true,
+                          ),
+                          decoration: const InputDecoration(
+                            labelText: 'Цена',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: quantityCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'Количество',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Сохранить'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+      if (!mounted) return;
+
+      final title = titleCtrl.text.trim();
+      final description = descriptionCtrl.text.trim();
+      final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
+      final quantity = int.tryParse(quantityCtrl.text.trim());
+      if (title.isEmpty) {
+        showAppNotice(
+          context,
+          'Название обязательно',
+          tone: AppNoticeTone.error,
+        );
+        return;
+      }
+      if (description.length < 2) {
+        showAppNotice(
+          context,
+          'Описание должно содержать минимум 2 символа',
+          tone: AppNoticeTone.error,
+        );
+        return;
+      }
+      if (price == null || price <= 0) {
+        showAppNotice(
+          context,
+          'Цена должна быть больше нуля',
+          tone: AppNoticeTone.error,
+        );
+        return;
+      }
+      if (quantity == null || quantity <= 0) {
+        showAppNotice(
+          context,
+          'Количество должно быть больше нуля',
+          tone: AppNoticeTone.error,
+        );
+        return;
+      }
+
+      final resp = await authService.dio.patch(
+        '/api/admin/products/$productId/channel-post',
+        data: {
+          'title': title,
+          'description': description,
+          'price': price,
+          'quantity': quantity,
+        },
+      );
+      final data = resp.data;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        final messages = data['data']['messages'];
+        if (messages is List) {
+          for (final row in messages) {
+            if (row is Map) {
+              _upsertMessage(Map<String, dynamic>.from(row), autoScroll: false);
+            }
+          }
+        }
+      }
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Пост обновлен',
+        tone: AppNoticeTone.success,
+        duration: const Duration(seconds: 2),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      showAppNotice(
+        context,
+        'Ошибка изменения поста: ${_extractDioError(e)}',
+        tone: AppNoticeTone.error,
+        duration: const Duration(seconds: 3),
+      );
+    } finally {
+      titleCtrl.dispose();
+      descriptionCtrl.dispose();
+      priceCtrl.dispose();
+      quantityCtrl.dispose();
+    }
+  }
+
   String _extractDioError(Object e) {
     if (e is DioException) {
       final data = e.response?.data;
@@ -9310,6 +9545,21 @@ class _ChatScreenState extends State<ChatScreen>
         title == 'забронированный товар';
   }
 
+  bool _isAnnaUtevskayaTenantScope() {
+    final user = authService.currentUser;
+    final tenantCode = [
+      authService.creatorTenantScopeCode,
+      user?.tenantCode,
+    ].whereType<String>().join(' ').toLowerCase().trim();
+    final tenantName = (user?.tenantName ?? '').toLowerCase().trim();
+    final compactCode = tenantCode.replaceAll(RegExp(r'[\s_-]+'), '');
+    final compactName = tenantName.replaceAll(RegExp(r'\s+'), ' ');
+    return tenantCode == 'anna-utevskaya-4898' ||
+        (compactCode.contains('anna') && compactCode.contains('utev')) ||
+        (compactName.contains('анна') && compactName.contains('утев')) ||
+        (compactName.contains('anna') && compactName.contains('utev'));
+  }
+
   bool _isBugReportsChat() {
     final settings = _effectiveChatSettings();
     final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
@@ -9354,6 +9604,24 @@ class _ChatScreenState extends State<ChatScreen>
     final numberText = (meta['shelf_number'] ?? '').toString().trim();
     if (numberText.isNotEmpty) return numberText;
     return '';
+  }
+
+  String _reservedProductShelfDisplayOfMeta(Map<String, dynamic> meta) {
+    final manualShelf = (meta['manual_shelf_label'] ?? '').toString().trim();
+    if (manualShelf.isNotEmpty) return manualShelf;
+    final productShelf = (meta['product_shelf_number'] ?? '').toString().trim();
+    if (productShelf.isNotEmpty) return productShelf;
+    final label = (meta['product_label'] ?? '').toString().trim();
+    final parts = label.split('--');
+    if (parts.length >= 2) {
+      final shelf = parts.sublist(1).join('--').trim();
+      if (shelf.isNotEmpty && shelf != '—') return shelf;
+    }
+    return '';
+  }
+
+  String _reservedProductBoxDisplayOfMeta(Map<String, dynamic> meta) {
+    return (meta['shelf_floor'] ?? '').toString().trim();
   }
 
   int? _reservedShelfIntegerValue(String raw) {
@@ -12032,7 +12300,10 @@ class _ChatScreenState extends State<ChatScreen>
     final imageUrl = _resolveImageUrl(
       _metaMapOf(message['meta'])['image_url']?.toString(),
     );
-    final reactionByUser = _reactionByUserOf(_metaMapOf(message['meta']));
+    final metaMap = _metaMapOf(message['meta']);
+    final canEditCatalogProduct =
+        _isAdminOrCreator() && _isCatalogProduct(message);
+    final reactionByUser = _reactionByUserOf(metaMap);
     final currentUserId = authService.currentUser?.id.trim() ?? '';
 
     Future<void> applyAction(String action) async {
@@ -12046,6 +12317,8 @@ class _ChatScreenState extends State<ChatScreen>
         _replyToMessage(message);
       } else if (action == 'edit') {
         await _editMessage(message);
+      } else if (action == 'edit_product') {
+        await _editCatalogProductPost(message, metaMap);
       } else if (action == 'delete_me') {
         await _deleteMessage(message, forAll: false);
       } else if (action == 'delete_all') {
@@ -12101,6 +12374,7 @@ class _ChatScreenState extends State<ChatScreen>
         canOpenImage ||
         canCopyId ||
         canEdit ||
+        canEditCatalogProduct ||
         canDeleteForMe ||
         canDeleteForAll ||
         canDeleteEntireChat;
@@ -12294,6 +12568,12 @@ class _ChatScreenState extends State<ChatScreen>
           ),
         if (canEdit)
           actionTile('edit', icon: Icons.edit_outlined, title: 'Изменить'),
+        if (canEditCatalogProduct)
+          actionTile(
+            'edit_product',
+            icon: Icons.edit_note_outlined,
+            title: 'Изменить пост',
+          ),
         if (canDeleteForMe)
           actionTile(
             'delete_me',
@@ -14436,6 +14716,16 @@ class _ChatScreenState extends State<ChatScreen>
         : (reservedShelfDisplay.isEmpty
               ? 'не назначена'
               : reservedShelfDisplay);
+    final useAnnaPlacementLabels = _isAnnaUtevskayaTenantScope();
+    final reservedProductCode = _reservedProductCodeOf(message) ?? '—';
+    final reservedProductShelfRaw = _reservedProductShelfDisplayOfMeta(metaMap);
+    final reservedProductShelf = reservedProductShelfRaw.isEmpty
+        ? '—'
+        : reservedProductShelfRaw;
+    final reservedProductBoxRaw = _reservedProductBoxDisplayOfMeta(metaMap);
+    final reservedProductBox = reservedProductBoxRaw.isEmpty
+        ? '—'
+        : reservedProductBoxRaw;
     final reservedDescription = metaMap['description']?.toString().trim() ?? '';
     final clientName = metaMap['client_name']?.toString() ?? '—';
     final clientPhone = _formatDisplayPhone(
@@ -15149,12 +15439,32 @@ class _ChatScreenState extends State<ChatScreen>
                                 children: [
                                   _catalogMetaBadge(
                                     theme,
-                                    'ID',
-                                    productLabel,
+                                    useAnnaPlacementLabels ? 'ID товара' : 'ID',
+                                    useAnnaPlacementLabels
+                                        ? reservedProductCode
+                                        : productLabel,
                                     labelStyle: prominentBadgeLabelStyle,
                                     valueStyle: prominentBadgeValueStyle,
                                     padding: prominentBadgePadding,
                                   ),
+                                  if (useAnnaPlacementLabels)
+                                    _catalogMetaBadge(
+                                      theme,
+                                      'Стеллаж',
+                                      reservedProductShelf,
+                                      labelStyle: prominentBadgeLabelStyle,
+                                      valueStyle: prominentBadgeValueStyle,
+                                      padding: prominentBadgePadding,
+                                    ),
+                                  if (useAnnaPlacementLabels)
+                                    _catalogMetaBadge(
+                                      theme,
+                                      'Коробка',
+                                      reservedProductBox,
+                                      labelStyle: prominentBadgeLabelStyle,
+                                      valueStyle: prominentBadgeValueStyle,
+                                      padding: prominentBadgePadding,
+                                    ),
                                   _catalogMetaBadge(
                                     theme,
                                     'Цена',
@@ -15173,7 +15483,9 @@ class _ChatScreenState extends State<ChatScreen>
                                   ),
                                   _catalogMetaBadge(
                                     theme,
-                                    'Полка',
+                                    useAnnaPlacementLabels
+                                        ? 'Полка клиента'
+                                        : 'Полка',
                                     shelf,
                                     labelStyle: prominentBadgeLabelStyle,
                                     valueStyle: prominentBadgeValueStyle,
@@ -15783,9 +16095,10 @@ class _ChatScreenState extends State<ChatScreen>
                                     keyboardDismissBehavior:
                                         ScrollViewKeyboardDismissBehavior
                                             .onDrag,
-                                    cacheExtent:
-                                        media.size.height *
-                                        _timelineCacheExtentMultiplier(),
+                                    scrollCacheExtent: ScrollCacheExtent.pixels(
+                                      media.size.height *
+                                          _timelineCacheExtentMultiplier(),
+                                    ),
                                     itemCount: timeline.length,
                                     itemBuilder: (context, i) {
                                       return _buildTimelineRowSafely(
@@ -17163,6 +17476,7 @@ class _ChatAttachmentGallerySheet extends StatefulWidget {
   const _ChatAttachmentGallerySheet({
     required this.title,
     required this.desktopMode,
+    required this.autoStartCamera,
     required this.nativeMacCameraMode,
     required this.loadRecent,
     required this.loadRecentUpload,
@@ -17179,6 +17493,7 @@ class _ChatAttachmentGallerySheet extends StatefulWidget {
 
   final String title;
   final bool desktopMode;
+  final bool autoStartCamera;
   final bool nativeMacCameraMode;
   final Future<List<ChatRecentGalleryItem>> Function() loadRecent;
   final Future<_AttachmentPickedUpload?> Function(ChatRecentGalleryItem)
@@ -17205,8 +17520,9 @@ class _ChatAttachmentGallerySheetState
   final List<_AttachmentPickedUpload> _picked = <_AttachmentPickedUpload>[];
   List<ChatRecentGalleryItem> _recent = const <ChatRecentGalleryItem>[];
   bool _loadingRecent = true;
-  bool _cameraStarting = true;
+  bool _cameraStarting = false;
   bool _cameraReady = false;
+  bool _cameraStartAttempted = false;
   bool _busy = false;
   bool _recording = false;
   int _recordingSeconds = 0;
@@ -17233,7 +17549,9 @@ class _ChatAttachmentGallerySheetState
       _startNativePreviewFrames();
     }
     unawaited(_loadRecent());
-    unawaited(_startCamera());
+    if (widget.autoStartCamera) {
+      unawaited(_startCamera());
+    }
   }
 
   @override
@@ -17280,9 +17598,11 @@ class _ChatAttachmentGallerySheetState
   }
 
   Future<void> _startCamera() async {
+    if (_cameraStarting) return;
     setState(() {
       _cameraStarting = true;
       _cameraReady = false;
+      _cameraStartAttempted = true;
     });
     try {
       final ready = await widget.startCamera();
@@ -17490,6 +17810,8 @@ class _ChatAttachmentGallerySheetState
         widget.nativeMacCameraMode && _nativePreviewFrame != null;
     final previewReady = widget.cameraPreviewAvailable() || nativePreviewReady;
     final enabledForVideo = _cameraReady || previewReady;
+    final canStartCamera =
+        !_cameraStarting && !previewReady && !_busy && !_recording;
     return ClipRRect(
       borderRadius: BorderRadius.circular(borderRadius),
       child: DecoratedBox(
@@ -17538,6 +17860,8 @@ class _ChatAttachmentGallerySheetState
                     Text(
                       _cameraStarting
                           ? 'Запуск камеры'
+                          : !_cameraStartAttempted
+                          ? 'Нажмите, чтобы включить камеру'
                           : widget.nativeMacCameraMode && _cameraReady
                           ? 'Камера Mac'
                           : _cameraReady
@@ -17554,6 +17878,13 @@ class _ChatAttachmentGallerySheetState
                       ),
                     ),
                   ],
+                ),
+              ),
+            if (canStartCamera)
+              Positioned.fill(
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(onTap: _startCamera),
                 ),
               ),
             Positioned(
@@ -18456,6 +18787,8 @@ class _DiscussionChatSettingsSheet extends StatefulWidget {
 class _DiscussionChatSettingsSheetState
     extends State<_DiscussionChatSettingsSheet> {
   late final TextEditingController _titleController;
+  late final TextEditingController _candidateSearchController;
+  Timer? _candidateSearchDebounce;
   bool _loading = false;
   bool _saving = false;
   String _error = '';
@@ -18467,6 +18800,7 @@ class _DiscussionChatSettingsSheetState
   void initState() {
     super.initState();
     _titleController = TextEditingController(text: widget.title);
+    _candidateSearchController = TextEditingController();
     _chat = <String, dynamic>{
       'id': widget.chatId,
       'title': widget.title,
@@ -18480,7 +18814,9 @@ class _DiscussionChatSettingsSheetState
 
   @override
   void dispose() {
+    _candidateSearchDebounce?.cancel();
     _titleController.dispose();
+    _candidateSearchController.dispose();
     super.dispose();
   }
 
@@ -18531,8 +18867,17 @@ class _DiscussionChatSettingsSheetState
         : 'Пользователь';
   }
 
-  Future<void> _loadSettings() async {
+  void _scheduleCandidateSearch(String value) {
+    _candidateSearchDebounce?.cancel();
+    _candidateSearchDebounce = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) return;
+      unawaited(_loadSettings(candidateSearch: value));
+    });
+  }
+
+  Future<void> _loadSettings({String? candidateSearch}) async {
     if (!mounted) return;
+    final search = (candidateSearch ?? _candidateSearchController.text).trim();
     setState(() {
       _loading = true;
       _error = '';
@@ -18540,6 +18885,7 @@ class _DiscussionChatSettingsSheetState
     try {
       final response = await authService.dio.get(
         '/api/chats/${widget.chatId}/discussion-settings',
+        queryParameters: search.isEmpty ? null : {'search': search},
       );
       final data = response.data;
       if (!mounted) return;
@@ -18547,9 +18893,7 @@ class _DiscussionChatSettingsSheetState
         final payload = Map<String, dynamic>.from(data['data'] as Map);
         final chatRaw = payload['chat'];
         setState(() {
-          _chat = chatRaw is Map
-              ? Map<String, dynamic>.from(chatRaw)
-              : _chat;
+          _chat = chatRaw is Map ? Map<String, dynamic>.from(chatRaw) : _chat;
           _members = (payload['members'] is List)
               ? List<Map<String, dynamic>>.from(
                   (payload['members'] as List).map(
@@ -18564,8 +18908,9 @@ class _DiscussionChatSettingsSheetState
                   ),
                 )
               : const [];
-          _titleController.text =
-              (_chat?['title'] ?? widget.title).toString().trim();
+          _titleController.text = (_chat?['title'] ?? widget.title)
+              .toString()
+              .trim();
         });
       }
     } catch (e) {
@@ -18671,7 +19016,10 @@ class _DiscussionChatSettingsSheetState
     try {
       final response = await authService.dio.post(
         '/api/chats/${widget.chatId}/discussion-settings/members',
-        data: {'user_id': userId},
+        data: {
+          'user_id': userId,
+          'search': _candidateSearchController.text.trim(),
+        },
       );
       final data = response.data;
       if (!mounted) return;
@@ -18709,6 +19057,9 @@ class _DiscussionChatSettingsSheetState
     try {
       final response = await authService.dio.delete(
         '/api/chats/${widget.chatId}/discussion-settings/members/$userId',
+        queryParameters: _candidateSearchController.text.trim().isEmpty
+            ? null
+            : {'search': _candidateSearchController.text.trim()},
       );
       final data = response.data;
       if (!mounted) return;
@@ -18745,9 +19096,21 @@ class _DiscussionChatSettingsSheetState
   }) {
     final userId = (user['user_id'] ?? '').toString();
     final userRole = (user['user_role'] ?? '').toString();
+    final email = (user['email'] ?? '').toString().trim();
+    final phone = (user['phone'] ?? '').toString().trim();
+    final tenantLabel = (user['tenant_name'] ?? '').toString().trim().isNotEmpty
+        ? (user['tenant_name'] ?? '').toString().trim()
+        : (user['tenant_code'] ?? '').toString().trim();
     final canRemove = user['can_remove'] == true;
+    final subtitle = [
+      if (phone.isNotEmpty) 'Тел: $phone',
+      if (email.isNotEmpty) 'Email: $email',
+      if (tenantLabel.isNotEmpty) 'Группа: $tenantLabel',
+      if (userRole.isNotEmpty) 'Роль: $userRole',
+    ].join('\n');
     return ListTile(
-      dense: true,
+      dense: false,
+      isThreeLine: subtitle.contains('\n'),
       contentPadding: EdgeInsets.zero,
       leading: AppAvatar(
         title: _displayName(user),
@@ -18765,25 +19128,17 @@ class _DiscussionChatSettingsSheetState
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
-      subtitle: Text(
-        [
-          if ((user['email'] ?? '').toString().trim().isNotEmpty)
-            (user['email'] ?? '').toString().trim(),
-          if ((user['phone'] ?? '').toString().trim().isNotEmpty)
-            (user['phone'] ?? '').toString().trim(),
-          if (userRole.isNotEmpty) userRole,
-        ].join(' • '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-      ),
+      subtitle: Text(subtitle, maxLines: 4, overflow: TextOverflow.ellipsis),
       trailing: !widget.canManage
           ? null
           : member
           ? IconButton(
               tooltip: canRemove
                   ? 'Убрать доступ'
-                  : 'Создатель и арендатор всегда имеют доступ',
-              onPressed: canRemove && !_saving ? () => _removeMember(userId) : null,
+                  : 'Создателя нельзя убрать из обсуждения',
+              onPressed: canRemove && !_saving
+                  ? () => _removeMember(userId)
+                  : null,
               icon: const Icon(Icons.person_remove_alt_1_outlined),
             )
           : IconButton(
@@ -18942,6 +19297,20 @@ class _DiscussionChatSettingsSheetState
                 const SizedBox(height: 18),
                 Text('Добавить доступ', style: theme.textTheme.titleMedium),
                 const SizedBox(height: 8),
+                TextField(
+                  controller: _candidateSearchController,
+                  decoration: const InputDecoration(
+                    prefixIcon: Icon(Icons.search),
+                    labelText: 'Поиск',
+                    hintText: 'Имя, телефон, email или группа',
+                    border: OutlineInputBorder(),
+                  ),
+                  textInputAction: TextInputAction.search,
+                  onChanged: _scheduleCandidateSearch,
+                  onSubmitted: (value) =>
+                      unawaited(_loadSettings(candidateSearch: value)),
+                ),
+                const SizedBox(height: 10),
                 if (_candidates.isEmpty && !_loading)
                   Text(
                     'Нет доступных пользователей для добавления.',

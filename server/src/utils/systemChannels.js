@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require("uuid");
+const { Pool } = require("pg");
 const { encryptMessageText, decryptMessageRow } = require("./messageCrypto");
 const { emitToTenant } = require("./socket");
 
@@ -654,6 +655,18 @@ function fallbackDiscussionName(email, role = "client") {
   return role === "tenant" ? "Арендатор" : "Пользователь";
 }
 
+function normalizeDiscussionRemovedUserIds(settings) {
+  const raw = normalizeSettings(settings).discussion_removed_user_ids;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((value) => String(value || "").trim())
+    .filter((value) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        value,
+      ),
+    );
+}
+
 function isPoolLikeQueryable(queryable) {
   return (
     queryable &&
@@ -698,26 +711,34 @@ async function ensurePlatformDiscussionUserShadow(queryable, user = {}) {
   const name = String(user?.name || "").trim() || fallbackDiscussionName(email, role);
   const tenantId = String(user?.tenant_id || "").trim() || null;
 
+  let emailForUsers = email;
+  if (emailForUsers) {
+    const duplicateEmailQ = await client.query(
+      `SELECT id
+       FROM users
+       WHERE lower(email) = $1
+         AND id <> $2::uuid
+       LIMIT 1`,
+      [emailForUsers, userId],
+    );
+    if (duplicateEmailQ.rowCount > 0) {
+      emailForUsers = "";
+    }
+  }
+
   const existingQ = await client.query(
     `SELECT id, email
      FROM users
      WHERE id = $1::uuid
-        OR ($2::text <> '' AND lower(email) = $2)
-     ORDER BY CASE WHEN id = $1::uuid THEN 0 ELSE 1 END
      LIMIT 1`,
-    [userId, email],
+    [userId],
   );
   const existing = existingQ.rows[0] || null;
-  if (existing && String(existing.id) !== userId) {
-    // The global users.email unique index already belongs to another account.
-    // Do not guess identity mapping here; the creator can add the existing row.
-    return existing;
-  }
 
   if (existing) {
     const updateValues = [userId, role, name, tenantId];
-    const emailSet = email ? ", email = COALESCE(NULLIF($5, ''), email)" : "";
-    if (email) updateValues.push(email);
+    const emailSet = emailForUsers ? ", email = COALESCE(NULLIF($5, ''), email)" : "";
+    if (emailForUsers) updateValues.push(emailForUsers);
     const updatedQ = await client.query(
       `UPDATE users
        SET role = CASE
@@ -758,7 +779,7 @@ async function ensurePlatformDiscussionUserShadow(queryable, user = {}) {
          is_active = true,
          updated_at = now()
      RETURNING id, email, role`,
-    [userId, email, role, name, tenantId],
+    [userId, emailForUsers, role, name, tenantId],
   );
   return insertedQ.rows[0] || null;
 }
@@ -776,7 +797,37 @@ async function syncPlatformDiscussionIndexedUsers(queryable, roles = null) {
     ? roles.map(normalizeDiscussionUserRole).filter(Boolean)
     : null;
   await client.query(
-    `INSERT INTO users (
+    `WITH indexed_users AS (
+       SELECT tui.user_id,
+              lower(tui.email) AS email,
+              CASE
+                WHEN lower(tui.role) IN ('client', 'worker', 'admin', 'tenant', 'creator')
+                  THEN lower(tui.role)
+                ELSE 'client'
+              END AS role,
+              COALESCE(NULLIF(split_part(lower(tui.email), '@', 1), ''), 'Пользователь') AS name,
+              COALESCE(tui.is_active, true) AS is_active,
+              tui.tenant_id,
+              COALESCE(tui.created_at, now()) AS created_at,
+              COALESCE(tui.updated_at, tui.created_at, now()) AS indexed_at
+       FROM tenant_user_index tui
+       WHERE COALESCE(tui.is_active, true) = true
+         AND NULLIF(BTRIM(tui.email), '') IS NOT NULL
+         AND ($1::text[] IS NULL OR lower(tui.role) = ANY($1::text[]))
+     ),
+     ranked_users AS (
+       SELECT *,
+              row_number() OVER (
+                PARTITION BY user_id
+                ORDER BY indexed_at DESC, created_at DESC, tenant_id ASC
+              ) AS user_rank,
+              row_number() OVER (
+                PARTITION BY email
+                ORDER BY indexed_at DESC, created_at DESC, user_id ASC
+              ) AS email_rank
+       FROM indexed_users
+     )
+     INSERT INTO users (
        id,
        email,
        role,
@@ -786,27 +837,22 @@ async function syncPlatformDiscussionIndexedUsers(queryable, roles = null) {
        created_at,
        updated_at
      )
-     SELECT tui.user_id,
-            lower(tui.email),
-            CASE
-              WHEN lower(tui.role) IN ('client', 'worker', 'admin', 'tenant', 'creator')
-                THEN lower(tui.role)
-              ELSE 'client'
-            END AS role,
-            COALESCE(NULLIF(split_part(lower(tui.email), '@', 1), ''), 'Пользователь') AS name,
-            COALESCE(tui.is_active, true),
-            tui.tenant_id,
-            COALESCE(tui.created_at, now()),
+     SELECT user_id,
+            email,
+            role,
+            name,
+            is_active,
+            tenant_id,
+            created_at,
             now()
-     FROM tenant_user_index tui
-     WHERE COALESCE(tui.is_active, true) = true
-       AND NULLIF(BTRIM(tui.email), '') IS NOT NULL
-       AND ($1::text[] IS NULL OR lower(tui.role) = ANY($1::text[]))
+     FROM ranked_users
+     WHERE user_rank = 1
+       AND email_rank = 1
        AND NOT EXISTS (
          SELECT 1
          FROM users existing
-         WHERE lower(existing.email) = lower(tui.email)
-           AND existing.id <> tui.user_id
+         WHERE lower(existing.email) = ranked_users.email
+           AND existing.id <> ranked_users.user_id
        )
      ON CONFLICT (id) DO UPDATE
      SET role = CASE
@@ -822,40 +868,197 @@ async function syncPlatformDiscussionIndexedUsers(queryable, roles = null) {
   );
 }
 
+async function upsertPlatformDiscussionShadowUser(client, user, fallbackTenantId = null) {
+  const userId = String(user?.id || user?.user_id || "").trim();
+  if (!userId) return;
+
+  const email = normalizeDiscussionEmail(user?.email);
+  const role = normalizeDiscussionUserRole(user?.role);
+  const name =
+    String(user?.name || "").trim() ||
+    String(user?.phone || "").trim() ||
+    fallbackDiscussionName(email, role);
+  const tenantId = String(user?.tenant_id || fallbackTenantId || "").trim() || null;
+  const isActive = user?.is_active !== false;
+  const createdAt = user?.created_at || new Date();
+
+  let emailForUsers = email;
+  if (emailForUsers) {
+    const duplicateEmailQ = await client.query(
+      `SELECT id
+       FROM users
+       WHERE lower(email) = $1
+         AND id <> $2::uuid
+       LIMIT 1`,
+      [emailForUsers, userId],
+    );
+    if (duplicateEmailQ.rowCount > 0) {
+      emailForUsers = "";
+    }
+  }
+
+  await client.query(
+    `INSERT INTO users (
+       id,
+       email,
+       role,
+       name,
+       is_active,
+       tenant_id,
+       created_at,
+       updated_at
+     )
+     VALUES ($1::uuid, NULLIF($2, ''), $3, NULLIF($4, ''), $5, $6::uuid, $7, now())
+     ON CONFLICT (id) DO UPDATE
+     SET email = COALESCE(NULLIF($2, ''), users.email),
+         role = CASE
+           WHEN users.role = 'creator' THEN 'creator'
+           ELSE $3
+         END,
+         name = COALESCE(NULLIF($4, ''), users.name),
+         is_active = $5,
+         tenant_id = COALESCE(users.tenant_id, $6::uuid),
+         updated_at = now()`,
+    [userId, emailForUsers, role, name, isActive, tenantId, createdAt],
+  );
+
+  if (tenantId && email) {
+    await client.query(
+      `INSERT INTO tenant_user_index (
+         tenant_id,
+         user_id,
+         email,
+         role,
+         is_active,
+         created_at,
+         updated_at
+       )
+       VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, now())
+       ON CONFLICT (tenant_id, user_id) DO UPDATE
+       SET email = EXCLUDED.email,
+           role = EXCLUDED.role,
+           is_active = EXCLUDED.is_active,
+           updated_at = now()`,
+      [tenantId, userId, email, role, isActive, createdAt],
+    );
+  }
+
+  const phone = String(user?.phone || "").trim();
+  if (phone) {
+    await client.query(
+      `INSERT INTO phones (user_id, phone, status, created_at)
+       VALUES ($1::uuid, $2, 'pending_verification', now())
+       ON CONFLICT (user_id) DO UPDATE
+       SET phone = EXCLUDED.phone,
+           status = COALESCE(NULLIF(phones.status, ''), EXCLUDED.status)`,
+      [userId, phone],
+    );
+  }
+}
+
+async function syncPlatformDiscussionTenantUsers(queryable, roles = null) {
+  if (isPoolLikeQueryable(queryable)) {
+    return withUnscopedPlatformClient(queryable, (client) =>
+      syncPlatformDiscussionTenantUsers(client, roles),
+    );
+  }
+  const client = queryable;
+  await prepareUnscopedPlatformClient(client);
+
+  await syncPlatformDiscussionIndexedUsers(client, roles);
+
+  const normalizedRoles = Array.isArray(roles)
+    ? roles.map(normalizeDiscussionUserRole).filter(Boolean)
+    : null;
+  const tenantsQ = await client.query(
+    `SELECT id, code, db_url
+     FROM tenants
+     WHERE COALESCE(is_deleted, false) = false
+       AND COALESCE(status, 'active') <> 'deleted'
+       AND lower(COALESCE(db_mode, '')) = 'isolated'
+       AND NULLIF(BTRIM(db_url), '') IS NOT NULL
+       AND lower(COALESCE(code, '')) <> 'default'
+     ORDER BY created_at ASC`,
+  );
+
+  for (const tenant of tenantsQ.rows) {
+    const tenantPool = new Pool({ connectionString: String(tenant.db_url || "") });
+    try {
+      const tenantUsersQ = await tenantPool.query(
+        `SELECT u.id,
+                lower(u.email) AS email,
+                COALESCE(
+                  NULLIF(BTRIM(u.name), ''),
+                  NULLIF(p.phone, ''),
+                  NULLIF(split_part(lower(u.email), '@', 1), ''),
+                  'Пользователь'
+                ) AS name,
+                lower(COALESCE(NULLIF(BTRIM(u.role), ''), 'client')) AS role,
+                COALESCE(u.is_active, true) AS is_active,
+                COALESCE(u.tenant_id, $2::uuid) AS tenant_id,
+                COALESCE(u.created_at, now()) AS created_at,
+                p.phone
+         FROM users u
+         LEFT JOIN phones p ON p.user_id = u.id
+         WHERE COALESCE(u.is_active, true) = true
+           AND NULLIF(BTRIM(u.email), '') IS NOT NULL
+           AND ($1::text[] IS NULL OR lower(COALESCE(u.role, 'client')) = ANY($1::text[]))
+         ORDER BY u.created_at DESC
+         LIMIT 5000`,
+        [normalizedRoles && normalizedRoles.length > 0 ? normalizedRoles : null, tenant.id],
+      );
+      for (const row of tenantUsersQ.rows) {
+        await upsertPlatformDiscussionShadowUser(client, row, tenant.id);
+      }
+    } catch (err) {
+      console.error("syncPlatformDiscussionTenantUsers tenant sync error", {
+        tenant_id: tenant.id,
+        tenant_code: tenant.code,
+        error: err?.message || String(err),
+      });
+    } finally {
+      await tenantPool.end();
+    }
+  }
+}
+
 async function ensurePlatformDiscussionBaseMembers(client, chatId, createdBy = null) {
   await prepareUnscopedPlatformClient(client);
-  await syncPlatformDiscussionIndexedUsers(client, ["tenant", "admin", "worker"]);
+  await syncPlatformDiscussionTenantUsers(client, ["tenant"]);
+
+  const chatQ = await client.query(
+    `SELECT settings
+     FROM chats
+     WHERE id = $1
+     LIMIT 1`,
+    [chatId],
+  );
+  const removedUserIds = normalizeDiscussionRemovedUserIds(
+    chatQ.rows[0]?.settings,
+  );
 
   const memberQ = await client.query(
-    `WITH ranked_staff AS (
-       SELECT id,
-              role,
-              tenant_id,
-              row_number() OVER (
-                PARTITION BY tenant_id
-                ORDER BY
-                  CASE
-                    WHEN role = 'tenant' THEN 0
-                    WHEN role = 'admin' THEN 1
-                    WHEN role = 'worker' THEN 2
-                    ELSE 3
-                  END,
-                  created_at ASC,
-                  id ASC
-              ) AS tenant_rank
-       FROM users
-       WHERE is_active IS DISTINCT FROM false
-         AND (
-           role IN ('tenant', 'admin', 'worker', 'creator')
-           OR id = $1::uuid
+    `SELECT u.id, u.role
+     FROM users u
+     LEFT JOIN tenants t ON t.id = u.tenant_id
+     WHERE u.is_active IS DISTINCT FROM false
+       AND (
+         u.role = 'creator'
+         OR u.id = $1::uuid
+         OR (
+           u.role = 'tenant'
+           AND COALESCE(t.code, '') <> 'default'
          )
-     )
-     SELECT id, role
-     FROM ranked_staff
-     WHERE role = 'creator'
-        OR id = $1::uuid
-        OR (tenant_id IS NOT NULL AND tenant_rank = 1)`,
-    [createdBy || null],
+       )
+       AND (
+         u.role = 'creator'
+         OR NOT (u.id = ANY($2::uuid[]))
+       )
+     ORDER BY
+       CASE WHEN u.role = 'creator' THEN 0 WHEN u.role = 'tenant' THEN 1 ELSE 2 END,
+       COALESCE(NULLIF(BTRIM(t.name), ''), NULLIF(BTRIM(t.code), ''), '') ASC,
+       u.created_at ASC`,
+    [createdBy || null, removedUserIds],
   );
 
   for (const row of memberQ.rows) {
@@ -1122,6 +1325,7 @@ module.exports = {
   ensureDiscussionsChat,
   ensurePlatformDiscussionUserShadow,
   syncPlatformDiscussionIndexedUsers,
+  syncPlatformDiscussionTenantUsers,
   ensurePlatformDiscussionsChat,
   insertAdminSystemMessage,
   normalizeSettings,

@@ -40,6 +40,7 @@ const CLAIM_STATUSES = new Set([
   'settled',
 ]);
 const CART_RETENTION_WARNING_DAYS = 30;
+const SAMARA_TZ = 'Europe/Samara';
 const CART_RETENTION_ACTIVE_STATUSES = [
   'pending_processing',
   'processed',
@@ -114,6 +115,12 @@ function normalizeDeliveryCityRates(raw) {
   return result;
 }
 
+function cartRetentionDaysFromSettings(settings) {
+  const parsed = Number(settings?.cart_retention_days);
+  if (!Number.isFinite(parsed)) return CART_RETENTION_WARNING_DAYS;
+  return Math.max(1, Math.min(365, Math.round(parsed)));
+}
+
 function deliverySettingsKey(tenantId = null) {
   const normalized = String(tenantId || '').trim();
   return normalized ? `delivery:${normalized}` : 'delivery';
@@ -159,6 +166,38 @@ function normalizeNullableText(raw, { max = 1000 } = {}) {
   const text = String(raw ?? '').trim();
   if (!text) return null;
   return text.slice(0, max);
+}
+
+function formatSamaraDateOnly(date = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/Samara',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    if (values.year && values.month && values.day) {
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+  } catch (_) {}
+  return date.toISOString().slice(0, 10);
+}
+
+function formatSamaraDateRu(date = new Date()) {
+  try {
+    return new Intl.DateTimeFormat('ru-RU', {
+      timeZone: 'Europe/Samara',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    }).format(date);
+  } catch (_) {}
+  return date.toLocaleDateString('ru-RU');
+}
+
+function buildSelfPickupDeliveryLabel(date = new Date()) {
+  return `Самовывоз ${formatSamaraDateRu(date)}`;
 }
 
 function formatCartSystemShelf(raw) {
@@ -256,6 +295,297 @@ async function getCartDeliveryReadyState(queryable, userId, tenantId) {
       totalSum >= minAmount &&
       !hasBulky &&
       row.has_pickup_only !== true,
+  };
+}
+
+async function createSelfPickupDeliveryArchive(
+  queryable,
+  {
+    actorUserId,
+    tenantId = null,
+    cartOwnerId,
+    pickupNote,
+    deliveryDate = new Date(),
+  },
+) {
+  const itemsQ = await queryable.query(
+    `SELECT c.id AS cart_item_id,
+            c.user_id::text AS user_id,
+            c.product_id::text AS product_id,
+            c.quantity,
+            COALESCE(c.custom_price, p.price) AS price,
+            p.product_code,
+            p.title AS product_title,
+            COALESCE(c.custom_description, p.description) AS product_description,
+            p.image_url AS product_image_url,
+            COALESCE(p.is_bulky, false) AS is_bulky,
+            COALESCE(NULLIF(BTRIM(u.name), ''), NULLIF(BTRIM(u.email), ''), 'Клиент') AS customer_name,
+            COALESCE(NULLIF(BTRIM(u.client_city), ''), '') AS client_city,
+            COALESCE(ph.phone, '') AS customer_phone,
+            us.shelf_number
+     FROM cart_items c
+     JOIN products p ON p.id = c.product_id
+     JOIN users u ON u.id = c.user_id
+     LEFT JOIN phones ph ON ph.user_id = c.user_id
+     LEFT JOIN user_shelves us ON us.user_id = c.user_id
+     WHERE c.user_id = $1
+       AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+       AND c.status NOT IN ('delivered', 'cancelled')
+       AND p.deleted_at IS NULL
+       AND COALESCE(p.status, '') <> 'deleted'
+     ORDER BY c.updated_at DESC, c.created_at DESC
+     FOR UPDATE OF c`,
+    [cartOwnerId, tenantId || null],
+  );
+  const rows = itemsQ.rows || [];
+  if (rows.length === 0) {
+    return {
+      batchId: null,
+      customerId: null,
+      archivedItems: 0,
+      totalSum: 0,
+    };
+  }
+
+  const normalizedDeliveryDate = formatSamaraDateOnly(deliveryDate);
+  const deliveryLabel = buildSelfPickupDeliveryLabel(deliveryDate);
+  const clientCity = normalizeCityName(rows[0]?.client_city);
+  const settings = await getTenantFeatureSettings(tenantId || null);
+  const pricing = await getCartDeliveryPricing(
+    queryable,
+    tenantId || null,
+    clientCity,
+    toMoney(settings.cart_delivery_ready_min_amount, 1500),
+  );
+
+  let totalSum = 0;
+  let itemCount = 0;
+  const items = rows.map((row) => {
+    const quantity = Math.max(1, Number(row.quantity) || 1);
+    const unitPrice = toMoney(row.price);
+    const lineTotal = toMoney(unitPrice * quantity);
+    totalSum = toMoney(totalSum + lineTotal);
+    itemCount += quantity;
+    return {
+      cart_item_id: row.cart_item_id,
+      user_id: row.user_id,
+      product_id: row.product_id,
+      quantity,
+      unit_price: unitPrice,
+      line_total: lineTotal,
+      product_code: row.product_code == null ? null : Number(row.product_code),
+      product_title: row.product_title,
+      product_description: row.product_description,
+      product_image_url: row.product_image_url,
+      is_bulky: row.is_bulky === true,
+      bulky_note: row.is_bulky === true ? row.product_title : null,
+    };
+  });
+
+  const existingBatchQ = await queryable.query(
+    `SELECT b.id
+     FROM delivery_batches b
+     WHERE b.delivery_date = $1::date
+       AND b.delivery_label = $2
+       AND COALESCE(b.status, '') IN ('calling', 'couriers_assigned')
+       AND (
+         $3::uuid IS NULL
+         OR EXISTS (
+           SELECT 1
+           FROM users bu
+           WHERE bu.id = b.created_by
+             AND bu.tenant_id = $3::uuid
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM delivery_batch_customers dbc
+           JOIN users cu ON cu.id = dbc.user_id
+           WHERE dbc.batch_id = b.id
+             AND cu.tenant_id = $3::uuid
+         )
+       )
+     ORDER BY b.created_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedDeliveryDate, deliveryLabel, tenantId || null],
+  );
+
+  let batchId = existingBatchQ.rows[0]?.id
+    ? String(existingBatchQ.rows[0].id)
+    : '';
+  if (!batchId) {
+    const batchInsert = await queryable.query(
+      `INSERT INTO delivery_batches (
+         id, delivery_date, delivery_label, threshold_amount, status,
+         courier_count, courier_names, created_by, confirmed_at,
+         handed_off_at, completed_at, created_at, updated_at
+       )
+       VALUES (
+         $1, $2::date, $3, $4, 'calling',
+         0, '[]'::jsonb, $5, now(),
+         NULL, NULL, now(), now()
+       )
+       RETURNING id`,
+      [
+        uuidv4(),
+        normalizedDeliveryDate,
+        deliveryLabel,
+        toMoney(pricing.min_amount, 0),
+        actorUserId || null,
+      ],
+    );
+    batchId = String(batchInsert.rows[0].id);
+  }
+
+  const customerName = String(rows[0]?.customer_name || '').trim() || 'Клиент';
+  const customerPhone = String(rows[0]?.customer_phone || '').trim();
+  const shelfNumber =
+    rows[0]?.shelf_number == null ? null : Number(rows[0].shelf_number) || null;
+  const customerId = uuidv4();
+  const customerQ = await queryable.query(
+    `INSERT INTO delivery_batch_customers (
+       id, batch_id, user_id, customer_name, customer_phone,
+       processed_sum, agreed_sum, claim_return_sum, claim_discount_sum,
+       claims_total, processed_items_count, shelf_number,
+       call_status, delivery_status, package_places, bulky_places,
+       bulky_note, notes, accepted_at, assembly_status,
+       assembly_started_at, assembly_started_by, assembly_completed_at,
+       assembly_completed_by, client_city, delivery_threshold_amount,
+       delivery_fee_amount, address_text, self_pickup, route_excluded,
+       pickup_label, created_at, updated_at
+     )
+     VALUES (
+       $1, $2, $3, $4, $5,
+       $6, $6, 0, 0,
+       0, $7, $8,
+       'accepted', 'preparing_delivery', 1, 0,
+       NULL, $9, now(), 'not_started',
+       NULL, NULL, NULL,
+       NULL, NULLIF($10::text, ''), $11,
+       $12, 'Самовывоз', true, true,
+       $9, now(), now()
+     )
+     ON CONFLICT (batch_id, user_id) DO UPDATE
+     SET customer_name = EXCLUDED.customer_name,
+         customer_phone = EXCLUDED.customer_phone,
+         processed_sum = EXCLUDED.processed_sum,
+         agreed_sum = EXCLUDED.agreed_sum,
+         claim_return_sum = 0,
+         claim_discount_sum = 0,
+         claims_total = 0,
+         processed_items_count = EXCLUDED.processed_items_count,
+         shelf_number = EXCLUDED.shelf_number,
+         call_status = 'accepted',
+         delivery_status = 'preparing_delivery',
+         package_places = GREATEST(delivery_batch_customers.package_places, 1),
+         bulky_places = 0,
+         bulky_note = NULL,
+         notes = CASE
+           WHEN COALESCE(BTRIM(delivery_batch_customers.notes), '') = '' THEN EXCLUDED.notes
+           WHEN delivery_batch_customers.notes LIKE '%' || EXCLUDED.notes || '%' THEN delivery_batch_customers.notes
+           ELSE CONCAT(delivery_batch_customers.notes, E'\n', EXCLUDED.notes)
+         END,
+         accepted_at = COALESCE(delivery_batch_customers.accepted_at, now()),
+         assembly_status = 'not_started',
+         assembly_started_at = NULL,
+         assembly_started_by = NULL,
+         assembly_completed_at = NULL,
+         assembly_completed_by = NULL,
+         client_city = EXCLUDED.client_city,
+         delivery_threshold_amount = EXCLUDED.delivery_threshold_amount,
+         delivery_fee_amount = EXCLUDED.delivery_fee_amount,
+         address_text = 'Самовывоз',
+         self_pickup = true,
+         route_excluded = true,
+         pickup_label = EXCLUDED.pickup_label,
+         updated_at = now()
+     RETURNING id, batch_id`,
+    [
+      customerId,
+      batchId,
+      cartOwnerId,
+      customerName,
+      customerPhone,
+      totalSum,
+      itemCount,
+      shelfNumber,
+      pickupNote,
+      clientCity,
+      toMoney(pricing.min_amount, 0),
+      toMoney(pricing.delivery_fee_amount, 0),
+    ],
+  );
+  const batchCustomerId = String(customerQ.rows[0].id);
+
+  let archivedItems = 0;
+  for (const item of items) {
+    const inserted = await queryable.query(
+      `INSERT INTO delivery_batch_items (
+         id, batch_id, batch_customer_id, cart_item_id, user_id, product_id,
+         quantity, unit_price, line_total, product_code, product_title,
+         product_description, product_image_url, assembly_status,
+         is_bulky, bulky_note, removed_reason, removed_at, removed_by, created_at
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6,
+         $7, $8, $9, $10, $11,
+         $12, $13, 'pending',
+         $14, NULLIF(BTRIM($15::text), ''), NULL, NULL, NULL, now()
+       )
+       ON CONFLICT (cart_item_id) DO UPDATE
+       SET batch_id = EXCLUDED.batch_id,
+           batch_customer_id = EXCLUDED.batch_customer_id,
+           user_id = EXCLUDED.user_id,
+           product_id = EXCLUDED.product_id,
+           quantity = EXCLUDED.quantity,
+           unit_price = EXCLUDED.unit_price,
+           line_total = EXCLUDED.line_total,
+           product_code = EXCLUDED.product_code,
+           product_title = EXCLUDED.product_title,
+           product_description = EXCLUDED.product_description,
+           product_image_url = EXCLUDED.product_image_url,
+           assembly_status = 'pending',
+           is_bulky = EXCLUDED.is_bulky,
+           bulky_note = EXCLUDED.bulky_note,
+           removed_reason = NULL,
+           removed_at = NULL,
+           removed_by = NULL
+       RETURNING id`,
+      [
+        uuidv4(),
+        batchId,
+        batchCustomerId,
+        item.cart_item_id,
+        item.user_id,
+        item.product_id,
+        item.quantity,
+        item.unit_price,
+        item.line_total,
+        item.product_code,
+        item.product_title,
+        item.product_description,
+        item.product_image_url,
+        item.is_bulky === true,
+        item.bulky_note || '',
+      ],
+    );
+    archivedItems += inserted.rowCount || 0;
+  }
+
+  await queryable.query(
+    `UPDATE delivery_batches
+     SET status = CASE WHEN status = 'completed' THEN 'calling' ELSE status END,
+         confirmed_at = COALESCE(confirmed_at, now()),
+         updated_at = now()
+     WHERE id = $1`,
+    [batchId],
+  );
+
+  return {
+    batchId,
+    customerId: batchCustomerId,
+    archivedItems,
+    totalSum,
   };
 }
 
@@ -569,27 +899,45 @@ async function archiveProductAfterCartDismissal(
   };
 }
 
-function buildCartRetentionWarning(row) {
+function buildCartRetentionWarning(row, retentionDays = CART_RETENTION_WARNING_DAYS) {
   if (!row || !row.oldest_created_at) return null;
   const oldestCreatedAt = new Date(row.oldest_created_at);
   if (Number.isNaN(oldestCreatedAt.getTime())) return null;
+  const thresholdDays = Math.max(1, Math.min(365, Math.round(Number(retentionDays) || CART_RETENTION_WARNING_DAYS)));
   const nowTs = Date.now();
   const daysHeld = Math.max(
     0,
     Math.floor((nowTs - oldestCreatedAt.getTime()) / (24 * 60 * 60 * 1000)),
   );
-  if (daysHeld < CART_RETENTION_WARNING_DAYS) return null;
+  const deadlineAt = new Date(
+    oldestCreatedAt.getTime() + thresholdDays * 24 * 60 * 60 * 1000,
+  );
+  const daysRemaining = Math.max(
+    0,
+    Math.ceil((deadlineAt.getTime() - nowTs) / (24 * 60 * 60 * 1000)),
+  );
   const itemsCount = Number(row.items_count || 0);
   const totalSum = toMoney(row.total_sum);
+  const deadlineLabel = deadlineAt.toLocaleDateString('ru-RU', {
+    timeZone: SAMARA_TZ,
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  });
   return {
     active: true,
-    threshold_days: CART_RETENTION_WARNING_DAYS,
+    threshold_days: thresholdDays,
     days_held: daysHeld,
+    days_remaining: daysRemaining,
+    deadline_at: deadlineAt.toISOString(),
+    deadline_label: deadlineLabel,
+    is_expired: daysRemaining <= 0,
     items_count: Number.isFinite(itemsCount) ? itemsCount : 0,
     total_sum: totalSum,
     oldest_created_at: oldestCreatedAt.toISOString(),
-    message:
-      'Корзина держится больше месяца. Если при следующем обзвоне/рассылке доставка будет отклонена, корзина расформируется автоматически.',
+    message: daysRemaining <= 0
+      ? `Срок хранения корзины истёк ${deadlineLabel}. Если доставка или самовывоз не подтверждены, корзина будет расформирована автоматически.`
+      : `Корзина расформируется через ${daysRemaining} дн. Дедлайн: ${deadlineLabel}. Подтвердите доставку или самовывоз, чтобы корзина не расформировалась.`,
   };
 }
 
@@ -1150,6 +1498,7 @@ router.get('/', authMiddleware, async (req, res) => {
       [userId, CART_RETENTION_ACTIVE_STATUSES],
     );
 
+    const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
     const grouped = new Map();
     for (const row of result.rows) {
       const normalized = {
@@ -1276,7 +1625,10 @@ router.get('/', authMiddleware, async (req, res) => {
       requested_amount: toMoney(row.requested_amount),
       approved_amount: toMoney(row.approved_amount),
     }));
-    const retentionWarning = buildCartRetentionWarning(retentionQ.rows[0]);
+    const retentionWarning = buildCartRetentionWarning(
+      retentionQ.rows[0],
+      cartRetentionDaysFromSettings(tenantSettings),
+    );
     const deliveryReadyState = await getCartDeliveryReadyState(
       db,
       userId,
@@ -1859,11 +2211,29 @@ router.get(
                 c.updated_at,
                 c.custom_price,
                 c.custom_description,
+                p.created_at AS product_created_at,
                 p.product_code,
                 p.title,
                 COALESCE(c.custom_description, p.description) AS description,
                 COALESCE(c.custom_price, p.price) AS price,
                 p.image_url,
+                p.shelf_number AS product_shelf_number,
+                p.manual_shelf_label,
+                p.shelf_floor,
+                COALESCE(
+                  NULLIF(BTRIM(p.manual_shelf_label), ''),
+                  p.shelf_number::text
+                ) AS shelf_label,
+                CASE
+                  WHEN c.status IN (
+                    'processed',
+                    'preparing_delivery',
+                    'handing_to_courier',
+                    'in_delivery',
+                    'delivered'
+                  ) THEN c.updated_at
+                  ELSE NULL
+                END AS processed_at,
                 EXISTS (
                   SELECT 1
                   FROM delivery_batch_items di
@@ -2008,6 +2378,189 @@ router.patch(
     } catch (err) {
       console.error('cart.admin.updateCartItem error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    }
+  },
+);
+
+router.post(
+  '/admin/cart-items/:id/process',
+  authMiddleware,
+  requireRole('admin', 'creator', 'tenant'),
+  async (req, res) => {
+    const client = await db.pool.connect();
+    try {
+      const id = String(req.params?.id || '').trim();
+      if (!id) {
+        return res.status(400).json({ ok: false, error: 'id обязателен' });
+      }
+
+      await client.query('BEGIN');
+      await acquireCartReservationOperationLock(client, id);
+
+      const itemQ = await client.query(
+        `SELECT c.id,
+                c.user_id,
+                c.product_id,
+                c.quantity,
+                c.status,
+                COALESCE(c.custom_price, p.price) AS price,
+                COALESCE(c.custom_description, p.description) AS description,
+                p.title,
+                p.image_url,
+                p.product_code,
+                p.shelf_number,
+                p.manual_shelf_label,
+                p.shelf_floor
+         FROM cart_items c
+         JOIN users u ON u.id = c.user_id
+         JOIN products p ON p.id = c.product_id
+         WHERE c.id = $1
+           AND ($2::uuid IS NULL OR u.tenant_id = $2::uuid)
+         LIMIT 1
+         FOR UPDATE OF c`,
+        [id, req.user?.tenant_id || null],
+      );
+
+      if (itemQ.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ ok: false, error: 'Позиция не найдена' });
+      }
+
+      const item = itemQ.rows[0];
+      const currentStatus = String(item.status || '').trim();
+      if (['delivered', 'cancelled'].includes(currentStatus)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          ok: false,
+          error: 'Нельзя обработать доставленный или отменённый товар',
+        });
+      }
+
+      if (currentStatus !== 'processed') {
+        await client.query(
+          `UPDATE cart_items
+           SET status = 'processed',
+               processing_mode = 'manual',
+               updated_at = now()
+           WHERE id = $1`,
+          [id],
+        );
+
+        await client.query(
+          `UPDATE reservations
+           SET is_fulfilled = true,
+               is_sent = true,
+               fulfilled_by_id = $2,
+               fulfilled_at = COALESCE(fulfilled_at, now()),
+               updated_at = now()
+           WHERE cart_item_id = $1`,
+          [id, req.user.id],
+        );
+      }
+
+      const actorQ = await client.query(
+        `SELECT name, email
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [req.user.id],
+      );
+      const actor = actorQ.rows[0] || {};
+      const processedByName =
+        String(actor.name || '').trim() ||
+        String(actor.email || '').trim() ||
+        'Администратор';
+
+      const updatedMessagesQ = await client.query(
+        `UPDATE messages
+         SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+               'placed', true,
+               'status', 'processed',
+               'processing_mode', 'manual',
+               'manual_processing', true,
+               'processed_by_id', $2::text,
+               'processed_by_name', $3::text
+             )
+         WHERE COALESCE(meta->>'kind', '') = 'reserved_order_item'
+           AND COALESCE(meta->>'cart_item_id', '') = $1::text
+         RETURNING id, chat_id, sender_id, text, meta, created_at`,
+        [id, String(req.user.id), processedByName],
+      );
+
+      const updatedQ = await client.query(
+        `SELECT c.id,
+                c.user_id,
+                c.product_id,
+                c.quantity,
+                c.status,
+                c.custom_price,
+                c.custom_description,
+                COALESCE(c.custom_price, p.price) AS price,
+                COALESCE(c.custom_description, p.description) AS description,
+                p.title,
+                p.image_url,
+                p.product_code,
+                p.shelf_number AS product_shelf_number,
+                p.manual_shelf_label,
+                p.shelf_floor,
+                c.updated_at AS processed_at
+         FROM cart_items c
+         JOIN products p ON p.id = c.product_id
+         WHERE c.id = $1
+         LIMIT 1`,
+        [id],
+      );
+      const row = updatedQ.rows[0] || item;
+
+      await client.query('COMMIT');
+
+      const io = req.app.get('io');
+      if (io) {
+        for (const message of updatedMessagesQ.rows) {
+          io.to(`chat:${message.chat_id}`).emit('chat:message', {
+            chatId: message.chat_id,
+            message: decryptMessageRow(message),
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
+            chatId: message.chat_id,
+          });
+          emitToTenant(io, req.user?.tenant_id || null, 'reserved:order:updated', {
+            action: 'processed',
+            cart_item_id: id,
+            message_id: message.id,
+          });
+        }
+      }
+
+      emitCartUpdated(req, row.user_id, {
+        reason: 'admin_cart_item_processed',
+        cart_item_id: row.id,
+        product_id: row.product_id,
+        status: 'processed',
+        processing_mode: 'manual',
+        processed_by_name: processedByName,
+      });
+
+      const price = toMoney(row.price, 0);
+      const quantity = Number(row.quantity) || 0;
+      return res.json({
+        ok: true,
+        data: {
+          ...row,
+          quantity,
+          price,
+          line_total: toMoney(price * quantity, 0),
+          processed_by_name: processedByName,
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {}
+      console.error('cart.admin.processCartItem error', err);
+      return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+    } finally {
+      client.release();
     }
   },
 );
@@ -2374,13 +2927,28 @@ router.post(
       );
       const cartOwnerId = String(effectiveOwnerId || '').trim() || userId;
       const pickupNote = normalizeNullableText(req.body?.note, { max: 240 }) ||
-        `Самовывоз ${new Date().toLocaleDateString('ru-RU')}`;
+        buildSelfPickupDeliveryLabel(new Date());
 
       await client.query('BEGIN');
 
+      const selfPickupDelivery = await createSelfPickupDeliveryArchive(client, {
+        actorUserId: req.user?.id || null,
+        tenantId: req.user?.tenant_id || null,
+        cartOwnerId,
+        pickupNote,
+        deliveryDate: new Date(),
+      });
+      if (!selfPickupDelivery.batchId || selfPickupDelivery.archivedItems === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          ok: false,
+          error: 'У клиента нет активных товаров для самовывоза',
+        });
+      }
+
       const updatedItemsQ = await client.query(
         `UPDATE cart_items c
-         SET status = 'delivered',
+         SET status = 'preparing_delivery',
              updated_at = now()
          FROM users u
          WHERE c.user_id = $1
@@ -2397,10 +2965,14 @@ router.post(
                WHEN dbc.call_status = 'pending' THEN 'accepted'
                ELSE dbc.call_status
              END,
-             delivery_status = 'completed',
+             delivery_status = 'preparing_delivery',
+             self_pickup = true,
+             route_excluded = true,
+             address_text = COALESCE(NULLIF(BTRIM(dbc.address_text), ''), 'Самовывоз'),
+             pickup_label = $3::text,
              notes = CASE
-               WHEN COALESCE(BTRIM(dbc.notes), '') = '' THEN $3
-               ELSE CONCAT(dbc.notes, E'\n', $3)
+               WHEN COALESCE(BTRIM(dbc.notes), '') = '' THEN $3::text
+               ELSE CONCAT(dbc.notes, E'\n', $3::text)
              END,
              updated_at = now()
          FROM users u, delivery_batches b
@@ -2421,12 +2993,15 @@ router.post(
 
       const affectedBatchIds = [
         ...new Set(
-          affectedDeliveryCustomersQ.rows
-            .map((row) => String(row.batch_id || '').trim())
+          [
+            selfPickupDelivery.batchId,
+            ...affectedDeliveryCustomersQ.rows.map((row) => row.batch_id),
+          ]
+            .map((batchId) => String(batchId || '').trim())
             .filter(Boolean),
         ),
       ];
-      if (affectedBatchIds.isNotEmpty) {
+      if (affectedBatchIds.length > 0) {
         await client.query(
           `UPDATE delivery_batches
            SET updated_at = now()
@@ -2438,7 +3013,7 @@ router.post(
       await client.query('COMMIT');
 
       emitCartUpdated(req, cartOwnerId, {
-        status: 'delivered',
+        status: 'preparing_delivery',
         reason: 'admin_self_pickup',
         self_pickup: true,
       }, userId == cartOwnerId ? [] : [userId]);
@@ -2457,6 +3032,9 @@ router.post(
         ok: true,
         data: {
           updated_items: updatedItemsQ.rowCount,
+          delivery_batch_id: selfPickupDelivery.batchId,
+          delivery_customer_id: selfPickupDelivery.customerId,
+          archived_delivery_items: selfPickupDelivery.archivedItems,
           affected_delivery_customers: affectedDeliveryCustomersQ.rowCount,
           affected_batches: affectedBatchIds.length,
         },

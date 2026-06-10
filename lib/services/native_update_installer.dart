@@ -25,6 +25,7 @@ class ManagedAndroidUpdateState {
   final String downloadUrl;
   final String title;
   final int lastUpdatedAtMs;
+  final bool pendingInstallAfterPermission;
   final bool readyToInstall;
   final bool canResume;
 
@@ -47,6 +48,7 @@ class ManagedAndroidUpdateState {
     required this.downloadUrl,
     required this.title,
     required this.lastUpdatedAtMs,
+    required this.pendingInstallAfterPermission,
     required this.readyToInstall,
     required this.canResume,
   });
@@ -70,6 +72,7 @@ class ManagedAndroidUpdateState {
       downloadUrl = '',
       title = '',
       lastUpdatedAtMs = 0,
+      pendingInstallAfterPermission = false,
       readyToInstall = false,
       canResume = false;
 
@@ -110,6 +113,9 @@ class ManagedAndroidUpdateState {
       downloadUrl: (raw['downloadUrl'] ?? '').toString().trim(),
       title: (raw['title'] ?? '').toString().trim(),
       lastUpdatedAtMs: _toSafeInt(raw['lastUpdatedAtMs']),
+      pendingInstallAfterPermission: _toSafeBool(
+        raw['pendingInstallAfterPermission'],
+      ),
       readyToInstall: _toSafeBool(
         raw['readyToInstall'],
         fallback: status == 'ready_to_install',

@@ -255,6 +255,10 @@ function buildAndroidMessage(endpoint, payload) {
   const category = normalizeCategory(payload.category);
   const priority = normalizePriority(payload.priority);
   const silent = payload?.silent === true;
+  const badgeCount = Number.parseInt(
+    String(payload.badge_count ?? "").trim(),
+    10,
+  );
   return {
     token: endpoint.push_token,
     data: buildFcmData(payload),
@@ -270,6 +274,10 @@ function buildAndroidMessage(endpoint, payload) {
         channelId: androidChannelIdForCategory(category, silent),
         tag: collapseKeyFromPayload(payload) || undefined,
         imageUrl: imageUrlFromPayload(payload),
+        notificationCount:
+          Number.isFinite(badgeCount) && badgeCount >= 0
+            ? badgeCount
+            : undefined,
       },
     },
   };

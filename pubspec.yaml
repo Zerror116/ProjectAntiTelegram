@@ -2,7 +2,7 @@ name: projectphoenix
 description: "A new Flutter project."
 publish_to: 'none'
 
-version: 1.0.53+54
+version: 1.0.65+66
 
 environment:
   sdk: ^3.11.0
@@ -12,16 +12,16 @@ dependencies:
     sdk: flutter
 
   image_picker: ^0.8.7+5
-  file_picker: ^8.1.2
-  camera: ^0.11.0+2
+  file_picker: ^12.0.0-beta.5
+  camera: ^0.12.0+1
 
   # Сеть
   dio: ^5.2.2
-  package_info_plus: ^8.3.1
+  package_info_plus: ^10.1.0
   url_launcher: ^6.3.1
 
   # Хранение токена
-  shared_preferences: ^2.1.1
+  shared_preferences: ^2.5.5
   flutter_secure_storage: ^10.0.0
 
   # Socket.io клиент для realtime чатов
@@ -29,21 +29,21 @@ dependencies:
 
   # UI / утилиты
   cupertino_icons: ^1.0.9
-  device_info_plus: ^12.4.0
+  device_info_plus: ^13.1.0
   crypto: ^3.0.7
   image: ^4.2.0
-  audioplayers: ^6.1.0
+  audioplayers: ^6.7.1
   connectivity_plus: ^7.1.1
-  flutter_contacts: ^2.0.2
+  flutter_contacts: ^2.2.1
   qr_flutter: ^4.1.0
   path_provider: ^2.1.5
   open_filex: ^4.7.0
-  record: ^6.2.0
+  record: ^7.0.0
   idb_shim: ^2.8.2+2
-  share_plus: ^12.0.2
+  share_plus: ^13.1.0
   flutter_map: ^8.2.2
   latlong2: ^0.9.1
-  video_player: ^2.9.2
+  video_player: ^2.11.1
   crop_your_image: ^2.0.0
   firebase_core: ^4.7.0
   firebase_messaging: ^16.2.0
@@ -59,6 +59,18 @@ dev_dependencies:
   flutter_lints: ^6.0.0
   flutter_launcher_icons: ^0.14.4
   flutter_native_splash: ^2.4.7
+
+dependency_overrides:
+  audioplayers_android:
+    path: third_party/flutter_plugins/audioplayers_android
+  device_info_plus:
+    path: third_party/flutter_plugins/device_info_plus
+  package_info_plus:
+    path: third_party/flutter_plugins/package_info_plus
+  photo_manager:
+    path: third_party/flutter_plugins/photo_manager
+  share_plus:
+    path: third_party/flutter_plugins/share_plus
 
 flutter_launcher_icons:
   android: true

@@ -1,13 +1,32 @@
+import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../main.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/phoenix_visual_effects.dart';
+
+Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
+  final path = (file.path ?? '').trim();
+  if (path.isNotEmpty && !kIsWeb) {
+    try {
+      return await File(path).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return await file.readAsBytes();
+  } catch (_) {
+    return null;
+  }
+}
 
 class _PromotionDestinationOption {
   const _PromotionDestinationOption({
@@ -210,13 +229,8 @@ class _AdminPromotionCenterScreenState
 
   Future<void> _pickAndUploadPromotionImage() async {
     if (_imageUploading) return;
-    final picked = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      allowMultiple: false,
-      withData: kIsWeb,
-    );
-    if (picked == null || picked.files.isEmpty) return;
-    final pickedFile = picked.files.single;
+    final pickedFile = await FilePicker.pickFile(type: FileType.image);
+    if (pickedFile == null) return;
 
     setState(() {
       _imageUploading = true;
@@ -226,7 +240,7 @@ class _AdminPromotionCenterScreenState
     try {
       FormData form;
       if (kIsWeb) {
-        final bytes = pickedFile.bytes;
+        final bytes = await _readPickedPlatformFileBytes(pickedFile);
         if (bytes == null || bytes.isEmpty) {
           throw Exception('Не удалось прочитать выбранный файл');
         }
@@ -238,15 +252,22 @@ class _AdminPromotionCenterScreenState
         });
       } else {
         final path = pickedFile.path;
-        if (path == null || path.isEmpty) {
-          throw Exception('Не удалось получить путь к файлу');
-        }
         final fileName = pickedFile.name.trim().isNotEmpty
             ? pickedFile.name.trim()
             : 'promo-image.jpg';
-        form = FormData.fromMap({
-          'image': await MultipartFile.fromFile(path, filename: fileName),
-        });
+        if (path != null && path.isNotEmpty) {
+          form = FormData.fromMap({
+            'image': await MultipartFile.fromFile(path, filename: fileName),
+          });
+        } else {
+          final bytes = await _readPickedPlatformFileBytes(pickedFile);
+          if (bytes == null || bytes.isEmpty) {
+            throw Exception('Не удалось прочитать выбранный файл');
+          }
+          form = FormData.fromMap({
+            'image': MultipartFile.fromBytes(bytes, filename: fileName),
+          });
+        }
       }
 
       final response = await authService.dio.post(

@@ -241,7 +241,7 @@ self.addEventListener('push', (event) => {
   const title = payload.title || 'Проект Феникс';
   const body = payload.body || 'Новое сообщение';
   const url = payload.url || '/';
-  const badgeCount = Number(payload.badgeCount || 0) || 0;
+  const badgeCount = Number(payload.badgeCount || payload.badge_count || 0) || 0;
   const forceShow = payload.forceShow === true;
   const silent = payload.silent === true;
   const tapPayload = buildNotificationTapPayload(payload);

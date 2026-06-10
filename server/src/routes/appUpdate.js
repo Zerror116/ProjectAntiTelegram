@@ -35,6 +35,35 @@ function cleanOptionalString(rawValue) {
   return normalized || null;
 }
 
+function truncateString(rawValue, maxLength = 255) {
+  const normalized = cleanString(rawValue);
+  if (!normalized) return null;
+  return normalized.length > maxLength
+    ? normalized.slice(0, maxLength)
+    : normalized;
+}
+
+function normalizeReportPayload(rawValue) {
+  if (!rawValue || typeof rawValue !== 'object' || Array.isArray(rawValue)) {
+    return {};
+  }
+  const json = JSON.stringify(rawValue);
+  if (json.length <= 12000) return rawValue;
+  return {
+    truncated: true,
+    preview: json.slice(0, 12000),
+  };
+}
+
+function parseOptionalBoolean(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') return null;
+  if (typeof rawValue === 'boolean') return rawValue;
+  const normalized = cleanString(rawValue).toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'y'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off', 'n'].includes(normalized)) return false;
+  return null;
+}
+
 function getTokenFromHeader(authHeader) {
   const raw = cleanString(authHeader);
   if (!raw) return '';
@@ -316,6 +345,11 @@ function supportsManagedAndroidManifest(req) {
   return getAndroidManagedManifestSupport(req).supported;
 }
 
+function shouldUseDirectAndroidApkFallback(req) {
+  const support = getAndroidManagedManifestSupport(req);
+  return !support.supported && support.reason === 'unsupported_legacy_build';
+}
+
 function resolveAllowedUpdateHosts(req) {
   const hosts = new Set();
   for (const raw of parseStringList(process.env.APP_UPDATE_ALLOWED_HOSTS)) {
@@ -422,6 +456,7 @@ function escapeHtml(value) {
 async function buildEnvAndroidPublicConfig(req) {
   const android = buildPlatformConfig('APP_UPDATE_ANDROID');
   const absoluteDownloadUrl = toAbsolutePublicUrl(android.download_url, req);
+  const directApkFallback = shouldUseDirectAndroidApkFallback(req);
   const mirrors = (android.mirrors || [])
     .map((raw) => toAbsolutePublicUrl(raw, req))
     .filter((raw) => isAllowedAndroidDownloadUrl(raw, req));
@@ -446,7 +481,10 @@ async function buildEnvAndroidPublicConfig(req) {
     ...android,
     channel: cleanString(android.channel) || 'stable',
     download_url: normalizedDownloadUrl || null,
-    landing_url: toAbsolutePublicUrl('/download/android', req),
+    landing_url:
+      directApkFallback && normalizedDownloadUrl
+        ? normalizedDownloadUrl
+        : toAbsolutePublicUrl('/download/android', req),
     manifest_url: toAbsolutePublicUrl('/api/app/update/android/manifest', req),
     mirrors,
     file_size: fileSize,
@@ -502,6 +540,10 @@ function buildAndroidReleaseConfig(req, releaseState) {
     .map((raw) => toAbsolutePublicUrl(raw, req))
     .filter((raw) => isAllowedAndroidDownloadUrl(raw, req));
   const absoluteDownloadUrl = toAbsolutePublicUrl('/api/app/update/android/apk', req);
+  const safeDownloadUrl = isAllowedAndroidDownloadUrl(absoluteDownloadUrl, req)
+    ? absoluteDownloadUrl
+    : null;
+  const directApkFallback = shouldUseDirectAndroidApkFallback(req);
 
   return {
     enabled: true,
@@ -510,9 +552,7 @@ function buildAndroidReleaseConfig(req, releaseState) {
     min_supported_version: release.min_supported_version,
     min_supported_build: release.min_supported_build,
     required: release.required === true,
-    download_url: isAllowedAndroidDownloadUrl(absoluteDownloadUrl, req)
-      ? absoluteDownloadUrl
-      : null,
+    download_url: safeDownloadUrl,
     title: release.title || 'Доступно обновление Феникс',
     message: release.message || null,
     channel: cleanString(release.channel) || 'stable',
@@ -524,7 +564,10 @@ function buildAndroidReleaseConfig(req, releaseState) {
       : [],
     published_at: release.published_at || releaseState.apkMetadata?.publishedAt || null,
     mirrors,
-    landing_url: toAbsolutePublicUrl('/download/android', req),
+    landing_url:
+      directApkFallback && safeDownloadUrl
+        ? safeDownloadUrl
+        : toAbsolutePublicUrl('/download/android', req),
     manifest_url: toAbsolutePublicUrl('/api/app/update/android/manifest', req),
     file_size: releaseState.apkMetadata?.size || null,
     sha256: releaseState.apkMetadata?.sha256 || null,
@@ -577,6 +620,7 @@ async function buildAndroidManifestEnvelope(req) {
   const signed = signManifestPayload(manifest);
   return {
     manifest,
+    canonical_json: signed.canonical,
     signature: signed.signature,
     key_id: signed.keyId,
     algorithm: signed.algorithm,
@@ -652,6 +696,21 @@ async function maybeCreateUpdateNotification(req, platformConfig, platform) {
     }
   } catch (err) {
     console.error('app.update.notification error', err);
+  }
+}
+
+async function resolveOptionalAuthContext(req) {
+  const token = getTokenFromHeader(req.get('authorization'));
+  if (!token) return null;
+  try {
+    const context = await resolveAuthContextFromToken(
+      token,
+      req.headers['x-view-role'],
+      { ignoreTenantSubscription: true },
+    );
+    return context?.ok ? context : null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -910,6 +969,83 @@ function renderAndroidDownloadPage(config) {
 </html>`;
 }
 
+router.post('/android/report', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const authContext = await resolveOptionalAuthContext(req);
+    const appBuild = parsePositiveInt(body.app_build, 0);
+    const updateBuild = parsePositiveInt(body.update_build, 0);
+    const androidSdk = parsePositiveInt(body.android_sdk, 0);
+
+    const result = await db.platformQuery(
+      `INSERT INTO android_update_reports (
+         user_id,
+         tenant_id,
+         event_type,
+         status,
+         stage,
+         error_code,
+         error_message,
+         app_version,
+         app_build,
+         platform,
+         package_name,
+         update_version,
+         update_build,
+         required_update,
+         install_permission,
+         notification_permission,
+         device_model,
+         manufacturer,
+         android_sdk,
+         manifest_url,
+         download_url,
+         payload
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9::integer, 0), 'android',
+         $10, $11, NULLIF($12::integer, 0), $13, $14, $15, $16, $17,
+         NULLIF($18::integer, 0), $19, $20, $21::jsonb
+       )
+       RETURNING id, created_at`,
+      [
+        authContext?.user?.id ? String(authContext.user.id) : null,
+        authContext?.tenantScope?.id ? String(authContext.tenantScope.id) : null,
+        truncateString(body.event_type, 80) || 'android_update_event',
+        truncateString(body.status, 80),
+        truncateString(body.stage, 400),
+        truncateString(body.error_code, 120),
+        truncateString(body.error_message, 1000),
+        truncateString(body.app_version, 80),
+        appBuild,
+        truncateString(body.package_name, 160),
+        truncateString(body.update_version, 80),
+        updateBuild,
+        parseOptionalBoolean(body.required_update),
+        parseOptionalBoolean(body.install_permission),
+        parseOptionalBoolean(body.notification_permission),
+        truncateString(body.device_model, 180),
+        truncateString(body.manufacturer, 120),
+        androidSdk,
+        truncateString(body.manifest_url, 700),
+        truncateString(body.download_url, 700),
+        JSON.stringify(normalizeReportPayload(body.payload)),
+      ],
+    );
+
+    return res.status(201).json({
+      ok: true,
+      data: {
+        id: result.rows[0]?.id,
+        created_at: result.rows[0]?.created_at,
+      },
+    });
+  } catch (err) {
+    console.error('app.update.android.report error', err);
+    return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
+  }
+});
+
 router.get('/android/apk', async (req, res) => {
   try {
     return await sendAndroidApk(req, res);
@@ -931,7 +1067,7 @@ router.get('/android/manifest', async (req, res) => {
         ok: false,
         code: support.reason,
         error:
-          'Для этой версии Феникс встроенный manifest не используется. Скачивание продолжится через сайт.',
+          'Для этой версии Феникс встроенный manifest не используется. Скачивание продолжится прямой APK-ссылкой.',
       });
     }
     const envelope = await buildAndroidManifestEnvelope(req);

@@ -51,6 +51,7 @@ async function buildProductCardSnapshot(queryable, product, context = {}) {
     manual_shelf_label: cleanString(product.manual_shelf_label),
     shelf_floor: cleanString(product.shelf_floor),
     pickup_only: product.pickup_only === true,
+    is_bulky: product.is_bulky === true,
     status: cleanString(product.status),
     cover_image_url: media?.default_url || cleanString(product.image_url) || null,
     image_url: media?.default_url || cleanString(product.image_url) || null,

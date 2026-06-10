@@ -18,6 +18,8 @@ import 'screens/phone_access_pending_screen.dart';
 import 'screens/phone_name_screen.dart';
 import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
+import 'services/android_update_report_service.dart';
+import 'services/app_audio_session_service.dart';
 import 'services/input_language_service.dart';
 import 'services/native_push_service.dart';
 import 'services/native_update_installer.dart';
@@ -51,6 +53,8 @@ final Dio dio = Dio(
   ),
 );
 late final AuthService authService;
+Future<PackageInfo>? _cachedPackageInfoFuture;
+bool _forcedAndroidUpdateFromApiBusy = false;
 
 // Socket and event bus for chat events
 io.Socket? socket;
@@ -60,6 +64,7 @@ final StreamController<Map<String, dynamic>> notificationEventsController =
     StreamController<Map<String, dynamic>>.broadcast();
 final ValueNotifier<bool> notificationsEnabledNotifier = ValueNotifier(true);
 final ValueNotifier<int> notificationBadgeCountNotifier = ValueNotifier<int>(0);
+final ValueNotifier<int> chatUnreadBadgeCountNotifier = ValueNotifier<int>(0);
 final ValueNotifier<int> notificationInboxBadgeCountNotifier =
     ValueNotifier<int>(0);
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(
@@ -134,6 +139,8 @@ const bool _verboseSocketLogs = bool.fromEnvironment(
 const String _localLoopbackHost = '127.0.0.1';
 const int _preferredLocalApiPort = 3001;
 const int _legacyLocalApiPort = 3000;
+const String _productionPrimaryApiBaseUrl = 'https://garphoenix.com';
+const String _productionWwwApiBaseUrl = 'https://www.garphoenix.com';
 
 String _buildLocalApiBaseUrl(int port, {String host = _localLoopbackHost}) {
   return 'http://$host:$port';
@@ -664,6 +671,14 @@ List<String> _buildApiBaseCandidates() {
     if (host == '127.0.0.1' || host == 'localhost') {
       out.add('$scheme://10.0.2.2:$port$pathPart');
       out.add('$scheme://10.0.3.2:$port$pathPart');
+    }
+  }
+
+  if (!_isLoopbackApiBase(current)) {
+    if (host == 'garphoenix.com') {
+      out.add(_productionWwwApiBaseUrl);
+    } else if (host == 'www.garphoenix.com') {
+      out.add(_productionPrimaryApiBaseUrl);
     }
   }
 
@@ -1427,6 +1442,7 @@ Future<void> _prepareAppSoundPlayer() async {
   if (_appSoundPlayerPrepared) return;
   _appSoundPlayerPrepared = true;
   try {
+    AppAudioSessionService.configureUiSoundForMixing();
     await _appSoundPlayer.setAudioContext(_appUiSoundAudioContext);
     try {
       await _appSoundPlayer.setPlayerMode(PlayerMode.lowLatency);
@@ -1451,6 +1467,7 @@ Future<void> playAppSound(AppUiSound sound) async {
   };
 
   try {
+    AppAudioSessionService.configureUiSoundForMixing();
     await _prepareAppSoundPlayer();
     await _appSoundPlayer.stop();
     await _appSoundPlayer.setReleaseMode(ReleaseMode.stop);
@@ -1739,6 +1756,9 @@ String _extractApiErrorMessage(DioException err) {
     final raw = (data['error'] ?? data['message'] ?? '').toString().trim();
     if (raw.isNotEmpty) return raw;
   }
+  if (_isFailedHostLookup(err)) {
+    return 'Не удалось подключиться к серверу: телефон не смог найти garphoenix.com. Проверьте интернет и повторите.';
+  }
   return (err.message ?? '').trim();
 }
 
@@ -1839,6 +1859,46 @@ String? _resolveAppUpdatePlatform() {
   return null;
 }
 
+Future<PackageInfo> _getPackageInfoCached() {
+  return _cachedPackageInfoFuture ??= PackageInfo.fromPlatform();
+}
+
+Future<void> _attachAppVersionHeaders(RequestOptions options) async {
+  final platform = _resolveAppUpdatePlatform();
+  if (platform == null) return;
+  options.headers['X-Fenix-Platform'] = platform;
+  try {
+    final packageInfo = await _getPackageInfoCached();
+    options.headers['X-Fenix-App-Version'] = packageInfo.version;
+    options.headers['X-Fenix-App-Build'] = packageInfo.buildNumber;
+    options.headers['X-Fenix-Package-Name'] = packageInfo.packageName;
+  } catch (_) {
+    // Headers are diagnostic only; request must continue even if package info fails.
+  }
+}
+
+Future<void> _handleAndroidUpdateRequiredFromApi() async {
+  if (_forcedAndroidUpdateFromApiBusy || _nativeAndroidUpdateBusy) return;
+  if (_resolveAppUpdatePlatform() != 'android') return;
+  _forcedAndroidUpdateFromApiBusy = true;
+  try {
+    await AndroidUpdateReportService.report(
+      dio,
+      eventType: 'api_update_required',
+      status: 'blocked_by_server',
+      payload: const <String, dynamic>{'source': 'dio_426'},
+      dedupe: false,
+    );
+    final info = await _fetchAppUpdateInfo();
+    if (info == null || info.platform != 'android') return;
+    await _openUpdateUrl(info);
+  } catch (e) {
+    debugPrint('android forced update handler ignored: $e');
+  } finally {
+    _forcedAndroidUpdateFromApiBusy = false;
+  }
+}
+
 bool _nativeDesktopUpdateBusy = false;
 bool _nativeAndroidUpdateBusy = false;
 
@@ -1876,6 +1936,23 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   final fallbackUri = _resolveAndroidFallbackUpdateUri(info);
   final envelope = info.androidManifestEnvelope;
   if (envelope == null) {
+    unawaited(
+      AndroidUpdateReportService.report(
+        dio,
+        eventType: 'manifest_unavailable',
+        status: 'failed',
+        errorCode: 'manifest_unavailable',
+        errorMessage: 'Android update manifest is unavailable',
+        updateVersion: info.latest.version,
+        updateBuild: info.latest.build,
+        requiredUpdate: info.required,
+        downloadUrl: info.downloadUrl,
+        payload: <String, dynamic>{
+          'fallback_available': fallbackUri != null,
+          'current_build': info.current.build,
+        },
+      ),
+    );
     debugPrint(
       'appUpdate: android manifest_unavailable at launch build=${info.current.build}',
     );
@@ -1912,6 +1989,47 @@ Future<bool> _downloadAndInstallAndroidUpdate({
   Timer? poller;
   var pendingInstallAfterPermission = false;
   var browserFallbackTriggeredByManagedFailure = false;
+  var lastReportedStateKey = '';
+
+  Future<void> reportManagedUpdateEvent(
+    String eventType, {
+    ManagedAndroidUpdateState? state,
+    String? errorCode,
+    String? errorMessage,
+    Map<String, dynamic>? payload,
+    bool dedupe = true,
+  }) {
+    return AndroidUpdateReportService.report(
+      dio,
+      eventType: eventType,
+      status: state?.status,
+      stage: state?.stage,
+      errorCode: errorCode ?? state?.errorCode,
+      errorMessage: errorMessage ?? state?.errorMessage,
+      packageName: state?.packageName,
+      updateVersion: info.latest.version,
+      updateBuild: info.latest.build,
+      requiredUpdate: info.required,
+      manifestUrl: (envelope['manifest_url'] ?? '').toString().trim(),
+      downloadUrl: state?.downloadUrl ?? info.downloadUrl,
+      payload: <String, dynamic>{
+        'current_version': info.current.version,
+        'current_build': info.current.build,
+        'latest_token': info.latest.token,
+        if (state != null) ...<String, dynamic>{
+          'version_token': state.versionToken,
+          'received_bytes': state.receivedBytes,
+          'total_bytes': state.totalBytes,
+          'ready_to_install': state.readyToInstall,
+          'can_resume': state.canResume,
+          'pending_install_after_permission':
+              state.pendingInstallAfterPermission,
+        },
+        ...?payload,
+      },
+      dedupe: dedupe,
+    );
+  }
 
   try {
     var notificationsAllowed = false;
@@ -1943,6 +2061,14 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       envelope,
     );
     if (!started) {
+      unawaited(
+        reportManagedUpdateEvent(
+          'managed_start_failed',
+          errorCode: 'managed_update_start_failed',
+          errorMessage: 'Native managed update did not start',
+          payload: <String, dynamic>{'fallback_available': fallbackUri != null},
+        ),
+      );
       debugPrint(
         'appUpdate: android managed update did not start fallback=${fallbackUri != null}',
       );
@@ -1953,11 +2079,32 @@ Future<bool> _downloadAndInstallAndroidUpdate({
     }
 
     statusNotifier.value = await NativeUpdateInstaller.getManagedUpdateStatus();
+    unawaited(
+      reportManagedUpdateEvent(
+        'managed_download_started',
+        state: statusNotifier.value,
+        dedupe: false,
+      ),
+    );
     poller = Timer.periodic(const Duration(milliseconds: 750), (_) async {
       try {
         final state = await NativeUpdateInstaller.getManagedUpdateStatus();
         statusNotifier.value = state;
         final failureCode = state.errorCode.trim();
+        final shouldReportState =
+            state.status == 'paused' ||
+            state.status == 'failed' ||
+            state.status == 'ready_to_install' ||
+            state.status == 'installing' ||
+            state.status == 'installed_pending_restart';
+        final stateReportKey =
+            '${state.status}|${state.errorCode}|${state.versionToken}';
+        if (shouldReportState && stateReportKey != lastReportedStateKey) {
+          lastReportedStateKey = stateReportKey;
+          unawaited(
+            reportManagedUpdateEvent('managed_update_state', state: state),
+          );
+        }
         final shouldUseBrowserFallback =
             !browserFallbackTriggeredByManagedFailure &&
             fallbackUri != null &&
@@ -1983,6 +2130,13 @@ Future<bool> _downloadAndInstallAndroidUpdate({
               await NativeUpdateInstaller.canRequestPackageInstalls();
           if (canInstall) {
             pendingInstallAfterPermission = false;
+            unawaited(
+              reportManagedUpdateEvent(
+                'install_permission_resolved',
+                state: state,
+                dedupe: false,
+              ),
+            );
             await NativeUpdateInstaller.installManagedUpdate();
           }
         }
@@ -2016,15 +2170,43 @@ Future<bool> _downloadAndInstallAndroidUpdate({
           if (canInstall) {
             final opened = await NativeUpdateInstaller.installManagedUpdate();
             if (!opened) {
+              unawaited(
+                reportManagedUpdateEvent(
+                  'install_open_failed',
+                  state: statusNotifier.value,
+                  errorCode: 'install_open_failed',
+                  errorMessage: 'Android did not open APK installer',
+                  dedupe: false,
+                ),
+              );
               showGlobalAppNotice(
                 'Android не открыл установку APK. Попробуйте ещё раз.',
                 title: 'Обновление Феникс',
                 tone: AppNoticeTone.error,
               );
+            } else {
+              unawaited(
+                reportManagedUpdateEvent(
+                  'install_requested',
+                  state: statusNotifier.value,
+                  dedupe: false,
+                ),
+              );
             }
             return;
           }
           pendingInstallAfterPermission = true;
+          await NativeUpdateInstaller.installManagedUpdate();
+          unawaited(
+            reportManagedUpdateEvent(
+              'install_permission_required',
+              state: statusNotifier.value,
+              errorCode: 'install_permission_required',
+              errorMessage:
+                  'User must allow APK installs from Phoenix in Android settings',
+              dedupe: false,
+            ),
+          );
           await NativeUpdateInstaller.openUnknownAppSourcesSettings();
           showGlobalAppNotice(
             'Разрешите установку APK для Феникс и вернитесь в приложение. Мы продолжим автоматически.',
@@ -3907,9 +4089,15 @@ void _setNotificationInboxBadgeCount(int count) {
   notificationInboxBadgeCountNotifier.value = normalized;
 }
 
+void _setChatUnreadBadgeCount(int count) {
+  final normalized = count < 0 ? 0 : count;
+  chatUnreadBadgeCountNotifier.value = normalized;
+}
+
 Future<void> refreshNotificationBadgeCount() async {
   if (authService.currentUser == null) {
     _setNotificationBadgeCount(0);
+    _setChatUnreadBadgeCount(0);
     _setNotificationInboxBadgeCount(0);
     return;
   }
@@ -3929,7 +4117,15 @@ Future<void> refreshNotificationBadgeCount() async {
             root['inbox_unread_count'] ?? data['inbox_unread_count'] ?? 0,
           )
         : 0;
+    final chatUnreadCount = root is Map
+        ? _notificationUnreadCountFrom(
+            root['chat_unread_count'] ??
+                data['chat_unread_count'] ??
+                (unreadCount - inboxUnreadCount),
+          )
+        : 0;
     _setNotificationBadgeCount(unreadCount, syncWebBadge: false);
+    _setChatUnreadBadgeCount(chatUnreadCount);
     _setNotificationInboxBadgeCount(inboxUnreadCount);
     if (kIsWeb) {
       unawaited(WebPushClientService.syncUnreadBadgeCount(unreadCount));
@@ -4355,10 +4551,16 @@ Future<void> _handleIncomingNotificationPayload(
   final inboxUnreadCount = _notificationUnreadCountFrom(
     map['inbox_unread_count'] ?? 0,
   );
+  final chatUnreadCount = _notificationUnreadCountFrom(
+    map['chat_unread_count'] ?? 0,
+  );
   if (unreadCount > 0 ||
       map.containsKey('badge_count') ||
       map.containsKey('unread_count')) {
     _setNotificationBadgeCount(unreadCount);
+  }
+  if (map.containsKey('chat_unread_count')) {
+    _setChatUnreadBadgeCount(chatUnreadCount);
   }
   if (inboxUnreadCount > 0 || map.containsKey('inbox_unread_count')) {
     _setNotificationInboxBadgeCount(inboxUnreadCount);
@@ -4473,7 +4675,13 @@ void _handleSocketNotificationBadge(dynamic data) {
   final inboxUnreadCount = _notificationUnreadCountFrom(
     map['inbox_unread_count'] ?? 0,
   );
+  final chatUnreadCount = _notificationUnreadCountFrom(
+    map['chat_unread_count'] ?? 0,
+  );
   _setNotificationBadgeCount(unreadCount);
+  if (map.containsKey('chat_unread_count')) {
+    _setChatUnreadBadgeCount(chatUnreadCount);
+  }
   if (map.containsKey('inbox_unread_count')) {
     _setNotificationInboxBadgeCount(inboxUnreadCount);
   }
@@ -4502,8 +4710,14 @@ void _handleSocketNotificationRead(dynamic data) {
   final inboxUnreadCount = _notificationUnreadCountFrom(
     map['inbox_unread_count'] ?? 0,
   );
+  final chatUnreadCount = _notificationUnreadCountFrom(
+    map['chat_unread_count'] ?? 0,
+  );
   if (map.containsKey('unread_count') || map.containsKey('badge_count')) {
     _setNotificationBadgeCount(unreadCount);
+  }
+  if (map.containsKey('chat_unread_count')) {
+    _setChatUnreadBadgeCount(chatUnreadCount);
   }
   if (map.containsKey('inbox_unread_count')) {
     _setNotificationInboxBadgeCount(inboxUnreadCount);
@@ -4634,6 +4848,56 @@ Future<void> _maybeShowIncomingBrowserNotification({
         : ((chatId?.isNotEmpty ?? false) ? 'chat:$chatId' : 'incoming-message'),
     silent: !policy.soundEnabled,
   );
+}
+
+void _bumpChatUnreadBadgeForIncomingMessage(dynamic data) {
+  if (data is Map) {
+    final map = Map<String, dynamic>.from(data);
+    final hasServerBadge =
+        map.containsKey('badge_count') ||
+        map.containsKey('unread_count') ||
+        map.containsKey('chat_unread_count');
+    if (hasServerBadge) {
+      if (map.containsKey('badge_count')) {
+        _setNotificationBadgeCount(
+          _notificationUnreadCountFrom(map['badge_count']),
+        );
+      }
+      if (map.containsKey('inbox_unread_count')) {
+        _setNotificationInboxBadgeCount(
+          _notificationUnreadCountFrom(map['inbox_unread_count']),
+        );
+      }
+      if (map.containsKey('chat_unread_count')) {
+        _setChatUnreadBadgeCount(
+          _notificationUnreadCountFrom(map['chat_unread_count']),
+        );
+      } else if (map.containsKey('unread_count')) {
+        unawaited(refreshNotificationBadgeCount());
+      }
+      return;
+    }
+  }
+  Map<String, dynamic>? message;
+  if (data is Map) {
+    final raw = data['message'] ?? data;
+    if (raw is Map) {
+      message = Map<String, dynamic>.from(raw);
+    }
+  }
+  final currentUserId = authService.currentUser?.id.trim() ?? '';
+  final senderId = (message?['sender_id'] ?? '').toString().trim();
+  if (currentUserId.isNotEmpty && senderId == currentUserId) return;
+
+  final chatId =
+      (data is Map
+              ? (data['chatId'] ?? message?['chat_id'] ?? message?['chatId'])
+              : null)
+          ?.toString()
+          .trim() ??
+      '';
+  if (chatId.isNotEmpty && activeChatIdNotifier.value == chatId) return;
+  unawaited(refreshNotificationBadgeCount());
 }
 
 void _scheduleWebPushBadgeSync() {
@@ -4805,6 +5069,127 @@ Future<Response<dynamic>> _retryRequestWithFreshAuth(
   );
 }
 
+bool _isFailedHostLookup(DioException err) {
+  if (err.type != DioExceptionType.connectionError &&
+      err.type != DioExceptionType.unknown) {
+    return false;
+  }
+  final text = [
+    err.message,
+    err.error,
+  ].whereType<Object>().map((item) => item.toString().toLowerCase()).join('\n');
+  return text.contains('failed host lookup') ||
+      text.contains('nodename nor servname provided') ||
+      text.contains('name or service not known');
+}
+
+String? _fallbackApiBaseForFailedLookup(String rawBaseUrl) {
+  final normalized = _resolveApiBaseUrl(rawBaseUrl);
+  final uri = Uri.tryParse(normalized);
+  final host = uri?.host.toLowerCase().trim() ?? '';
+  if (host == 'garphoenix.com') return _productionWwwApiBaseUrl;
+  if (host == 'www.garphoenix.com') return _productionPrimaryApiBaseUrl;
+  return null;
+}
+
+Future<Response<dynamic>> _retryRequestWithApiBase(
+  RequestOptions requestOptions,
+  String nextBaseUrl,
+) async {
+  final normalizedBase = _resolveApiBaseUrl(nextBaseUrl);
+  final previousBase = _runtimeApiBaseUrl;
+  final extra = Map<String, dynamic>.from(requestOptions.extra)
+    ..['host_lookup_retry_attempted'] = true;
+  final options = Options(
+    method: requestOptions.method,
+    headers: Map<String, dynamic>.from(requestOptions.headers),
+    responseType: requestOptions.responseType,
+    contentType: requestOptions.contentType,
+    followRedirects: requestOptions.followRedirects,
+    receiveDataWhenStatusError: requestOptions.receiveDataWhenStatusError,
+    sendTimeout: requestOptions.sendTimeout,
+    receiveTimeout: requestOptions.receiveTimeout,
+    extra: extra,
+    validateStatus: requestOptions.validateStatus,
+    listFormat: requestOptions.listFormat,
+  );
+
+  _setRuntimeApiBaseUrl(normalizedBase);
+  try {
+    return await dio.request<dynamic>(
+      requestOptions.path,
+      data: requestOptions.data,
+      queryParameters: requestOptions.queryParameters,
+      options: options,
+      cancelToken: requestOptions.cancelToken,
+      onReceiveProgress: requestOptions.onReceiveProgress,
+      onSendProgress: requestOptions.onSendProgress,
+    );
+  } catch (e) {
+    _setRuntimeApiBaseUrl(previousBase);
+    rethrow;
+  }
+}
+
+bool _isSafeTransientRetryMethod(String method) {
+  final normalized = method.trim().toUpperCase();
+  return normalized == 'GET' || normalized == 'HEAD' || normalized == 'OPTIONS';
+}
+
+bool _isTransientBackendFailure(DioException err) {
+  final status = err.response?.statusCode;
+  if (status == 502 || status == 503 || status == 504 || status == 408) {
+    return true;
+  }
+  if (status != null) return false;
+  switch (err.type) {
+    case DioExceptionType.connectionTimeout:
+    case DioExceptionType.sendTimeout:
+    case DioExceptionType.receiveTimeout:
+    case DioExceptionType.connectionError:
+      return true;
+    case DioExceptionType.badCertificate:
+    case DioExceptionType.badResponse:
+    case DioExceptionType.cancel:
+    case DioExceptionType.unknown:
+      return false;
+  }
+}
+
+Future<Response<dynamic>> _retryRequestAfterTransientFailure(
+  RequestOptions requestOptions,
+) async {
+  final status = requestOptions.extra['transient_retry_status'];
+  final delay = status == 502 || status == 503 || status == 504
+      ? const Duration(milliseconds: 650)
+      : const Duration(milliseconds: 350);
+  await Future.delayed(delay);
+  final extra = Map<String, dynamic>.from(requestOptions.extra)
+    ..['transient_retry_attempted'] = true;
+  final options = Options(
+    method: requestOptions.method,
+    headers: Map<String, dynamic>.from(requestOptions.headers),
+    responseType: requestOptions.responseType,
+    contentType: requestOptions.contentType,
+    followRedirects: requestOptions.followRedirects,
+    receiveDataWhenStatusError: requestOptions.receiveDataWhenStatusError,
+    sendTimeout: requestOptions.sendTimeout,
+    receiveTimeout: requestOptions.receiveTimeout,
+    extra: extra,
+    validateStatus: requestOptions.validateStatus,
+    listFormat: requestOptions.listFormat,
+  );
+  return dio.request<dynamic>(
+    requestOptions.path,
+    data: requestOptions.data,
+    queryParameters: requestOptions.queryParameters,
+    options: options,
+    cancelToken: requestOptions.cancelToken,
+    onReceiveProgress: requestOptions.onReceiveProgress,
+    onSendProgress: requestOptions.onSendProgress,
+  );
+}
+
 void _removeHeaderIgnoreCase(Map<String, dynamic> headers, String name) {
   final target = name.toLowerCase();
   final toDelete = <String>[];
@@ -4882,6 +5267,7 @@ void _attachAuthInterceptor() {
               options.headers['X-Tenant-Code'] = creatorTenantCode;
             }
           }
+          await _attachAppVersionHeaders(options);
           // На macOS/http не-ASCII заголовки вызывают FormatException.
           _dropInvalidHeaderValues(options.headers);
           return handler.next(options);
@@ -4915,6 +5301,51 @@ void _attachAuthInterceptor() {
         final hasBearerToken =
             authHeader.toLowerCase().startsWith('bearer ') &&
             authHeader.length > 7;
+        final responseData = err.response?.data;
+        final responseCode = responseData is Map
+            ? (responseData['code'] ?? '').toString().trim()
+            : '';
+        if (status == 426 &&
+            responseCode == 'app_update_required' &&
+            req.extra['skip_android_update_required_handler'] != true) {
+          unawaited(_handleAndroidUpdateRequiredFromApi());
+          return handler.next(err);
+        }
+        if (status == null &&
+            req.extra['host_lookup_retry_attempted'] != true &&
+            _isFailedHostLookup(err)) {
+          final fallbackBase = _fallbackApiBaseForFailedLookup(req.baseUrl);
+          if (fallbackBase != null && fallbackBase != _runtimeApiBaseUrl) {
+            try {
+              debugPrint(
+                '_attachAuthInterceptor: host lookup failed for ${req.baseUrl}, retrying via $fallbackBase',
+              );
+              final retryResponse = await _retryRequestWithApiBase(
+                req,
+                fallbackBase,
+              );
+              return handler.resolve(retryResponse);
+            } catch (retryErr, retrySt) {
+              debugPrint(
+                '_attachAuthInterceptor: host lookup fallback failed: $retryErr\n$retrySt',
+              );
+            }
+          }
+        }
+
+        if (req.extra['transient_retry_attempted'] != true &&
+            _isSafeTransientRetryMethod(req.method) &&
+            _isTransientBackendFailure(err)) {
+          try {
+            req.extra['transient_retry_status'] = status;
+            final retryResponse = await _retryRequestAfterTransientFailure(req);
+            return handler.resolve(retryResponse);
+          } catch (retryErr, retrySt) {
+            debugPrint(
+              '_attachAuthInterceptor: transient retry failed: $retryErr\n$retrySt',
+            );
+          }
+        }
 
         // Обрабатываем только реальные auth-failure запросы:
         // - 401 (403 = ошибка прав, не разлогиниваем)
@@ -5042,18 +5473,16 @@ Future<void> _initSocket() async {
     await disconnectSocket();
     final socketAuth = <String, dynamic>{'token': token};
     final socketHeaders = <String, dynamic>{'Authorization': 'Bearer $token'};
-    final socketQuery = <String, dynamic>{'token': token};
+    final socketQuery = <String, dynamic>{};
     if (currentRole == 'creator' && viewRole != null && viewRole.isNotEmpty) {
       socketAuth['view_role'] = viewRole;
       socketHeaders['X-View-Role'] = viewRole;
-      socketQuery['view_role'] = viewRole;
     }
     if (currentRole == 'creator' &&
         creatorTenantCode != null &&
         creatorTenantCode.isNotEmpty) {
       socketAuth['tenant_code'] = creatorTenantCode;
       socketHeaders['X-Tenant-Code'] = creatorTenantCode;
-      socketQuery['tenant_code'] = creatorTenantCode;
     }
 
     // Build options
@@ -5164,6 +5593,7 @@ Future<void> _initSocket() async {
       _socketVerboseLog('📬 Socket event chat:message -> $data');
       if (!_shouldDispatchSocketEvent('chat:message', data)) return;
       chatEventsController.add({'type': 'chat:message', 'data': data});
+      _bumpChatUnreadBadgeForIncomingMessage(data);
       _scheduleWebPushBadgeSync();
       _maybePlayIncomingMessageSound(data);
     });
@@ -5172,6 +5602,7 @@ Future<void> _initSocket() async {
       _socketVerboseLog('📬 Socket event chat:message:deleted -> $data');
       if (!_shouldDispatchSocketEvent('chat:message:deleted', data)) return;
       chatEventsController.add({'type': 'chat:message:deleted', 'data': data});
+      unawaited(refreshNotificationBadgeCount());
       _scheduleWebPushBadgeSync();
     });
 
@@ -5184,6 +5615,7 @@ Future<void> _initSocket() async {
     socket?.on('chat:message:read', (data) {
       _socketVerboseLog('📬 Socket event chat:message:read -> $data');
       _dispatchSocketEvent('chat:message:read', data);
+      unawaited(refreshNotificationBadgeCount());
       _scheduleWebPushBadgeSync();
     });
 
@@ -5345,6 +5777,7 @@ Future<void> _initSocket() async {
       _socketVerboseLog('📬 Socket event chat:message:global -> $data');
       if (!_shouldDispatchSocketEvent('chat:message:global', data)) return;
       chatEventsController.add({'type': 'chat:message:global', 'data': data});
+      _bumpChatUnreadBadgeForIncomingMessage(data);
       _scheduleWebPushBadgeSync();
       _maybePlayIncomingMessageSound(data);
     });
@@ -5607,7 +6040,8 @@ class DiagnosticBootstrap extends StatefulWidget {
   State<DiagnosticBootstrap> createState() => _DiagnosticBootstrapState();
 }
 
-class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
+class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
+    with WidgetsBindingObserver {
   Widget? _home;
   StreamSubscription<User?>? _authSub;
   Timer? _subscriptionProbeTimer;
@@ -5667,6 +6101,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _startInit();
   }
 
@@ -5679,7 +6114,16 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap> {
     _phoneAccessProbeTimer?.cancel();
     _offlinePurchaseProbeTimer?.cancel();
     _appUpdateProbeTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state != AppLifecycleState.resumed) return;
+    if (authService.currentUser == null) return;
+    unawaited(refreshNotificationBadgeCount());
   }
 
   void _restartSubscriptionProbe() {

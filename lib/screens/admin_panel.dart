@@ -26,6 +26,22 @@ import '../widgets/adaptive_network_image.dart';
 import '../widgets/delivery_address_picker_dialog.dart';
 import '../widgets/input_language_badge.dart';
 
+Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
+  final path = (file.path ?? '').trim();
+  if (path.isNotEmpty && !kIsWeb) {
+    try {
+      return await File(path).readAsBytes();
+    } catch (_) {
+      return null;
+    }
+  }
+  try {
+    return await file.readAsBytes();
+  } catch (_) {
+    return null;
+  }
+}
+
 const String _defaultMapLightTiles =
     'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
 const String _mapTileLightUrl = String.fromEnvironment(
@@ -122,6 +138,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final _roleTemplateDescriptionCtrl = TextEditingController();
   final _roleUserSearchCtrl = TextEditingController();
   final _clientCartSearchCtrl = TextEditingController();
+  final _groupRulesCtrl = TextEditingController();
 
   bool _loading = true;
   bool _saving = false;
@@ -165,6 +182,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _roleTemplateSaving = false;
   bool _roleAssignBusy = false;
   bool _roleUsersLoading = false;
+  bool _groupRulesLoading = false;
+  bool _groupRulesSaving = false;
   StreamSubscription? _eventsSub;
 
   String _message = '';
@@ -380,6 +399,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     _roleTemplateDescriptionCtrl.dispose();
     _roleUserSearchCtrl.dispose();
     _clientCartSearchCtrl.dispose();
+    _groupRulesCtrl.dispose();
     super.dispose();
   }
 
@@ -562,6 +582,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return _hasAnyPermission(const ['delivery.manage', 'tenant.users.manage']);
   }
 
+  bool _canViewRulesTab() {
+    if (_isCreatorBase()) return true;
+    return authService.effectiveRole.toLowerCase().trim() == 'tenant';
+  }
+
   bool _canViewPromotionsTab() {
     return _isAdminViewRole();
   }
@@ -609,6 +634,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           label: 'Доставка',
           icon: Icons.local_shipping_outlined,
           builder: _buildDeliveryTab,
+        ),
+      if (_canViewRulesTab())
+        _AdminTabSpec(
+          id: 'rules',
+          label: 'Правила',
+          icon: Icons.rule_folder_outlined,
+          builder: _buildRulesTab,
         ),
       if (_canViewSupportTab())
         _AdminTabSpec(
@@ -1001,6 +1033,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         return;
       case 'delivery':
         await _loadDeliveryDashboard();
+        return;
+      case 'rules':
+        await _loadGroupRules(silent: silent);
         return;
       case 'support':
         await _loadSupportTickets(silent: silent);
@@ -2572,19 +2607,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (bytes == null || bytes.isEmpty) {
         throw Exception('Пустой CSV');
       }
-      final path = await FilePicker.platform.saveFile(
+      final path = await FilePicker.saveFile(
         dialogTitle: 'Сохранить CSV журнала',
         fileName: 'audit_log.csv',
         type: FileType.custom,
         allowedExtensions: const ['csv'],
+        bytes: Uint8List.fromList(bytes),
       );
       if (path == null || path.trim().isEmpty) {
         setState(() => _message = 'Сохранение CSV отменено');
         return;
       }
-      final file = File(path);
-      await file.parent.create(recursive: true);
-      await file.writeAsBytes(bytes, flush: true);
       if (mounted) {
         setState(() => _message = 'CSV сохранен: $path');
       }
@@ -3496,6 +3529,36 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     );
   }
 
+  Future<void> _processSelectedCartItem(Map<String, dynamic> item) async {
+    final itemId = (item['id'] ?? '').toString().trim();
+    final userId = (_selectedClientCartUser?['id'] ?? '').toString().trim();
+    if (itemId.isEmpty || userId.isEmpty || _clientCartActionBusy) {
+      return;
+    }
+
+    setState(() {
+      _clientCartActionBusy = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post('/api/cart/admin/cart-items/$itemId/process');
+      if (!mounted) return;
+      setState(() => _message = 'Товар отмечен обработанным');
+      await _reloadClientCartIfStillSelected(userId);
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка обработки товара: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _clientCartActionBusy = false);
+      } else {
+        _clientCartActionBusy = false;
+      }
+    }
+  }
+
   Future<void> _removeSelectedCartItem(Map<String, dynamic> item) async {
     final itemId = (item['id'] ?? '').toString().trim();
     final title = (item['title'] ?? 'Товар').toString().trim();
@@ -3775,13 +3838,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         throw Exception('Экспорт сейчас доступен в desktop версии');
       }
       final ext = format == 'pdf' ? 'pdf' : 'xlsx';
-      final filePath = await FilePicker.platform.saveFile(
+      final filePath = await FilePicker.saveFile(
         dialogTitle: 'Сохранить документ',
         fileName: kind == 'finance_summary'
             ? 'finance_summary.$ext'
             : '${kind}_$batchId.$ext',
         type: FileType.custom,
         allowedExtensions: [ext],
+        bytes: Uint8List.fromList(bytes),
       );
       if (filePath == null || filePath.trim().isEmpty) {
         if (mounted) {
@@ -3789,9 +3853,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         }
         return false;
       }
-      final file = File(filePath);
-      await file.parent.create(recursive: true);
-      await file.writeAsBytes(bytes, flush: true);
       if (mounted) {
         setState(() => _message = 'Документ сохранен: $filePath');
       }
@@ -3845,8 +3906,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
               height: 480,
               child: ReorderableListView.builder(
                 itemCount: local.length,
-                onReorder: (oldIndex, newIndex) {
-                  if (newIndex > oldIndex) newIndex -= 1;
+                onReorderItem: (oldIndex, newIndex) {
                   final item = local.removeAt(oldIndex);
                   local.insert(newIndex, item);
                   setLocalState(() {});
@@ -4426,12 +4486,22 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           ? Map<String, dynamic>.from(data['data'])
           : <String, dynamic>{};
       if (!mounted) return;
-      final processedCount = _toInt(payload['processed_count']);
+      final clients = _asMapList(payload['clients']);
+      final reservedCount = clients.fold<int>(0, (sum, client) {
+        final reserved = _toInt(client['reserved_count']);
+        if (reserved > 0) return sum + reserved;
+        return sum + _asMapList(client['products']).length;
+      });
+      final newlyProcessedCount = _toInt(payload['newly_processed_count']);
+      final alreadyProcessedCount = _toInt(payload['already_processed_count']);
       final skippedCount = _toInt(payload['skipped_count']);
       setState(() {
         _deliveryManualPhonesResult = payload;
         _message =
-            'Ручная обработка: обработано $processedCount товаров'
+            'Ручная выгрузка: найдено $reservedCount товаров, '
+            'необработанных обработано $newlyProcessedCount, '
+            'уже обработанных $alreadyProcessedCount. '
+            'Корзины не удалялись и не переносились в самовывоз'
             '${skippedCount > 0 ? ', пропущено $skippedCount номеров' : ''}';
       });
       unawaited(_loadDeliveryDashboard());
@@ -4463,7 +4533,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             ),
             const SizedBox(height: 8),
             Text(
-              'Вставьте полные номера клиентов, каждый с новой строки. Все найденные необработанные товары будут отмечены как обработанные вручную.',
+              'Вставьте полные номера клиентов, каждый с новой строки. Будут показаны все товары в корзине клиента: уже обработанные и необработанные. Необработанные товары будут обработаны вручную, но корзина останется на месте. После проверки администратор сам вводит последние 4 цифры в "Админ -> Корзины" и нажимает "Самовывоз".',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
               ),
@@ -4546,6 +4616,14 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           final products = _asMapList(client['products']);
           final found = client['found'] == true;
           final hasProducts = products.isNotEmpty;
+          final reservedCount = _toInt(client['reserved_count']);
+          final newlyProcessedCount = _toInt(client['newly_processed_count']);
+          final alreadyProcessedCount = _toInt(
+            client['already_processed_count'],
+          );
+          final existingDeliveryCount = _toInt(
+            client['existing_delivery_count'],
+          );
           final phone = (client['phone'] ?? client['raw_phone'] ?? '')
               .toString()
               .trim();
@@ -4585,7 +4663,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     Chip(
                       label: Text(
                         hasProducts
-                            ? 'Обработано: ${products.length}'
+                            ? 'Всего: ${reservedCount > 0 ? reservedCount : products.length}'
                             : found
                             ? 'Пропущено: нет товаров'
                             : 'Пропущено: нет клиента',
@@ -4593,15 +4671,33 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     ),
                   ],
                 ),
+                if (hasProducts) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'Необработанные: $newlyProcessedCount • уже обработанные: $alreadyProcessedCount',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
                 if (found && products.isEmpty) ...[
                   const SizedBox(height: 8),
                   Text(
-                    'Необработанных товаров у клиента нет.',
+                    'Забронированных обработанных или необработанных товаров у клиента нет.',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ] else if (products.isNotEmpty) ...[
+                  if (existingDeliveryCount > 0) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Уже были в доставке: $existingDeliveryCount. Эти товары не переносились повторно.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   ...products.map(_buildDeliveryManualPhoneProductTile),
                 ],
@@ -4613,12 +4709,35 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     );
   }
 
+  String _deliveryManualPhoneProductStatusLabel(Map<String, dynamic> product) {
+    final previousStatus =
+        (product['previous_status'] ?? product['status'] ?? '')
+            .toString()
+            .trim();
+    final newlyProcessed = product['newly_processed'] == true;
+    final alreadyProcessed = product['already_processed'] == true;
+    if (newlyProcessed ||
+        previousStatus == 'pending_processing' ||
+        previousStatus == 'pending') {
+      return 'Был необработан';
+    }
+    if (alreadyProcessed || previousStatus == 'processed') {
+      return 'Был обработан';
+    }
+    return 'Был статус: ${_clientCartStatusLabel(previousStatus)}';
+  }
+
   Widget _buildDeliveryManualPhoneProductTile(Map<String, dynamic> product) {
     final theme = Theme.of(context);
     final imageUrl = _resolveImageUrl((product['image_url'] ?? '').toString());
     final productCode = product['product_code'];
     final shelfNumber = product['product_shelf_number'];
     final title = (product['title'] ?? 'Товар').toString();
+    final statusLabel = _deliveryManualPhoneProductStatusLabel(product);
+    final newlyProcessed = product['newly_processed'] == true;
+    final alreadyProcessed = product['already_processed'] == true;
+    final pickupAdded = product['pickup_added'] == true;
+    final existingDelivery = product['existing_delivery'] == true;
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Row(
@@ -4656,7 +4775,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   children: [
                     Chip(label: Text('ID товара: ${productCode ?? '—'}')),
                     Chip(label: Text('Полка: ${shelfNumber ?? '—'}')),
-                    const Chip(label: Text('Ручное')),
+                    Chip(label: Text(statusLabel)),
+                    if (newlyProcessed)
+                      const Chip(label: Text('Обработан вручную')),
+                    if (alreadyProcessed)
+                      const Chip(label: Text('Уже был обработан')),
+                    if (pickupAdded)
+                      const Chip(label: Text('Самовывоз завтра')),
+                    if (existingDelivery)
+                      const Chip(label: Text('Уже был в доставке')),
                   ],
                 ),
               ],
@@ -6350,11 +6477,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (kIsWeb) {
         throw Exception('Excel-экспорт сейчас доступен в desktop версии');
       }
-      final filePath = await FilePicker.platform.saveFile(
+      final filePath = await FilePicker.saveFile(
         dialogTitle: 'Сохранить Excel доставки',
         fileName: 'delivery_$batchId.xlsx',
         type: FileType.custom,
         allowedExtensions: const ['xlsx'],
+        bytes: Uint8List.fromList(bytes),
       );
       if (filePath == null || filePath.trim().isEmpty) {
         if (mounted) {
@@ -6362,9 +6490,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         }
         return false;
       }
-      final file = File(filePath);
-      await file.parent.create(recursive: true);
-      await file.writeAsBytes(bytes, flush: true);
       if (mounted) {
         setState(() => _message = 'Excel сохранен: $filePath');
       }
@@ -6379,6 +6504,412 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         setState(() => _deliverySaving = false);
       }
     }
+  }
+
+  Future<void> _openDeliveryArchiveDialog() async {
+    final dateCtrl = TextEditingController(
+      text: DateTime.now().toIso8601String().substring(0, 10),
+    );
+    String archiveType = 'all';
+    bool loading = false;
+    String error = '';
+    Map<String, dynamic>? archive;
+
+    Future<void> loadArchive(StateSetter dialogSetState) async {
+      dialogSetState(() {
+        loading = true;
+        error = '';
+      });
+      try {
+        final resp = await authService.dio.get(
+          '/api/admin/delivery/archive',
+          queryParameters: {'date': dateCtrl.text.trim(), 'type': archiveType},
+        );
+        final data = resp.data;
+        dialogSetState(() {
+          archive = data is Map && data['data'] is Map
+              ? Map<String, dynamic>.from(data['data'])
+              : <String, dynamic>{};
+        });
+      } catch (e) {
+        dialogSetState(() {
+          error = _extractDioError(e);
+        });
+      } finally {
+        dialogSetState(() => loading = false);
+      }
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, dialogSetState) {
+            final batches = _asMapList(archive?['batches']);
+            return AlertDialog(
+              title: const Text('Архив доставки'),
+              content: SizedBox(
+                width: math.min(MediaQuery.of(context).size.width * 0.92, 820),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: dateCtrl,
+                              decoration: const InputDecoration(
+                                labelText: 'Дата',
+                                hintText: 'YYYY-MM-DD',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            onPressed: loading
+                                ? null
+                                : () async {
+                                    final now = DateTime.now();
+                                    final picked = await showDatePicker(
+                                      context: context,
+                                      initialDate: now,
+                                      firstDate: now.subtract(
+                                        const Duration(days: 365),
+                                      ),
+                                      lastDate: now.add(
+                                        const Duration(days: 30),
+                                      ),
+                                    );
+                                    if (picked != null) {
+                                      dateCtrl.text = picked
+                                          .toIso8601String()
+                                          .substring(0, 10);
+                                    }
+                                  },
+                            icon: const Icon(Icons.calendar_month_outlined),
+                            label: const Text('Выбрать'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(value: 'all', label: Text('Все')),
+                          ButtonSegment(
+                            value: 'delivery',
+                            label: Text('Доставка'),
+                          ),
+                          ButtonSegment(
+                            value: 'self_pickup',
+                            label: Text('Самовывоз'),
+                          ),
+                        ],
+                        selected: {archiveType},
+                        onSelectionChanged: loading
+                            ? null
+                            : (selection) {
+                                dialogSetState(
+                                  () => archiveType = selection.first,
+                                );
+                              },
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(
+                        onPressed: loading
+                            ? null
+                            : () => loadArchive(dialogSetState),
+                        icon: loading
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.search_outlined),
+                        label: Text(loading ? 'Загрузка...' : 'Показать'),
+                      ),
+                      if (error.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          error,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                      if (archive != null) ...[
+                        const SizedBox(height: 16),
+                        if (batches.isEmpty)
+                          const Text('За выбранную дату данных нет.')
+                        else
+                          ...batches.map((batch) {
+                            final customers = _asMapList(batch['customers']);
+                            return Card(
+                              child: ExpansionTile(
+                                title: Text(
+                                  (batch['delivery_label'] ?? 'Лист доставки')
+                                      .toString(),
+                                ),
+                                subtitle: Text(
+                                  'Клиентов: ${customers.length} · '
+                                  'Статус: ${_deliveryBatchStatusLabel((batch['status'] ?? '').toString())}',
+                                ),
+                                children: customers.map((customer) {
+                                  final items = _asMapList(customer['items']);
+                                  final selfPickup =
+                                      customer['self_pickup'] == true;
+                                  return ListTile(
+                                    title: Text(
+                                      '${customer['customer_name'] ?? 'Клиент'} · ${customer['customer_phone'] ?? ''}',
+                                    ),
+                                    subtitle: Text(
+                                      [
+                                        selfPickup ? 'Самовывоз' : 'Доставка',
+                                        'Сумма: ${_formatMoney(customer['agreed_sum'] ?? customer['processed_sum'])}',
+                                        'Товаров: ${items.length}',
+                                        ...items
+                                            .take(6)
+                                            .map(
+                                              (item) =>
+                                                  '• ${item['product_title'] ?? 'Товар'} · ID ${item['product_code'] ?? '—'} · ${_formatMoney(item['line_total'])}',
+                                            ),
+                                      ].join('\n'),
+                                    ),
+                                  );
+                                }).toList(),
+                              ),
+                            );
+                          }),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Закрыть'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    dateCtrl.dispose();
+  }
+
+  Future<void> _openDeliveryBatchDetails(Map<String, dynamic> batch) async {
+    final batchId = (batch['id'] ?? '').toString().trim();
+    if (batchId.isEmpty) return;
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.get(
+        '/api/admin/delivery/batches/$batchId',
+      );
+      final data = resp.data;
+      final payload = data is Map ? _asMap(data['data']) : <String, dynamic>{};
+      final detail = _asMap(payload['batch'] ?? payload['active_batch']);
+      if (detail.isEmpty) {
+        throw Exception('Лист доставки не найден');
+      }
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) {
+          final customers = _asMapList(detail['customers']);
+          return Dialog(
+            insetPadding: const EdgeInsets.all(18),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 960,
+                maxHeight: MediaQuery.of(dialogContext).size.height * 0.88,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                (detail['delivery_label'] ?? 'Лист доставки')
+                                    .toString(),
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 20,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                [
+                                  'Дата: ${_formatDateTimeLabel(detail['delivery_date'])}',
+                                  'Статус: ${_deliveryBatchStatusLabel((detail['status'] ?? '').toString())}',
+                                  'Клиентов: ${customers.length}',
+                                ].join(' · '),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.of(dialogContext).pop(),
+                          icon: const Icon(Icons.close),
+                          tooltip: 'Закрыть',
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Expanded(
+                      child: customers.isEmpty
+                          ? const Center(
+                              child: Text('В этом листе нет клиентов.'),
+                            )
+                          : ListView.separated(
+                              itemCount: customers.length,
+                              separatorBuilder: (context, index) =>
+                                  const SizedBox(height: 10),
+                              itemBuilder: (context, index) {
+                                return _buildDeliveryBatchCustomerPreview(
+                                  customers[index],
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка листа доставки: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Widget _buildDeliveryBatchCustomerPreview(Map<String, dynamic> customer) {
+    final items = _asMapList(customer['items']);
+    final isSelfPickup =
+        customer['self_pickup'] == true || customer['route_excluded'] == true;
+    final address = (customer['address_text'] ?? '').toString().trim();
+    final courier = (customer['courier_name'] ?? '').toString().trim();
+    final name = (customer['customer_name'] ?? 'Клиент').toString().trim();
+    final phone = _displayPhone(
+      (customer['customer_phone'] ?? '').toString(),
+      fallback: '',
+    );
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Wrap(
+              spacing: 10,
+              runSpacing: 6,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  [name, if (phone.isNotEmpty) phone].join(' · '),
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+                Chip(
+                  visualDensity: VisualDensity.compact,
+                  label: Text(isSelfPickup ? 'Самовывоз' : 'Доставка'),
+                ),
+                Chip(
+                  visualDensity: VisualDensity.compact,
+                  label: Text(
+                    _deliveryCustomerStatusLabel(
+                      (customer['call_status'] ?? '').toString(),
+                    ),
+                  ),
+                ),
+                Chip(
+                  visualDensity: VisualDensity.compact,
+                  label: Text(
+                    _deliveryAssemblyStatusLabel(
+                      (customer['assembly_status'] ?? '').toString(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              [
+                'Сумма: ${_formatMoney(customer['agreed_sum'] ?? customer['processed_sum'])}',
+                'Адрес: ${isSelfPickup ? 'Самовывоз' : (address.isEmpty ? 'не указан' : address)}',
+                if (courier.isNotEmpty) 'Курьер: $courier',
+                'Мест: ${_toInt(customer['package_places'], fallback: 1)}',
+                'Габаритных: ${_toInt(customer['bulky_places'], fallback: 0)}',
+              ].join('\n'),
+            ),
+            const Divider(height: 22),
+            if (items.isEmpty)
+              const Text('Товары в этом листе не найдены.')
+            else
+              ...items.map((item) {
+                final title = (item['product_title'] ?? 'Товар').toString();
+                final code = (item['product_code'] ?? '—').toString();
+                final qty = _toInt(item['quantity'], fallback: 1);
+                final shelf =
+                    (item['manual_shelf_label'] ??
+                            item['product_shelf_number'] ??
+                            '')
+                        .toString()
+                        .trim();
+                final floor = (item['shelf_floor'] ?? '').toString().trim();
+                final shelfText = [
+                  if (shelf.isNotEmpty && shelf != 'null') shelf,
+                  if (floor.isNotEmpty && floor != 'null') 'этаж $floor',
+                ].join(' · ');
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.inventory_2_outlined, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          [
+                            '$title · ID $code · x$qty · ${_formatMoney(item['line_total'])}',
+                            if (shelfText.isNotEmpty) 'Полка: $shelfText',
+                          ].join('\n'),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _reassignDeliveryCustomer(
@@ -6535,12 +7066,19 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       _message = '';
     });
     try {
-      await authService.dio.post(
+      final resp = await authService.dio.post(
         '/api/admin/delivery/batches/$batchId/confirm-handoff',
       );
+      final data = resp.data;
+      final payload = data is Map ? _asMap(data['data']) : <String, dynamic>{};
+      final selfPickupCompleted = payload['self_pickup_completed'] == true;
       await _loadDeliveryDashboard();
       if (mounted) {
-        setState(() => _message = 'Лист доставки передан курьерам');
+        setState(
+          () => _message = selfPickupCompleted
+              ? 'Самовывозный лист завершен'
+              : 'Лист доставки передан курьерам',
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -6645,6 +7183,66 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         setState(
           () =>
               _message = 'Ошибка возврата из маршрута: ${_extractDioError(e)}',
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _deliverySaving = false);
+      }
+    }
+  }
+
+  Future<void> _returnDeliveryCustomerToRoute(
+    String batchId,
+    Map<String, dynamic> customer,
+  ) async {
+    if (!_ensurePermission(
+      'delivery.manage',
+      'Недостаточно прав для изменения маршрута',
+    )) {
+      return;
+    }
+    final customerId = (customer['id'] ?? '').toString().trim();
+    if (customerId.isEmpty) return;
+    final name = (customer['customer_name'] ?? 'клиента').toString();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Вернуть на маршрут'),
+        content: Text(
+          'Вернуть $name в доставку?\n'
+          'Клиент снова появится в маршруте, и можно будет начать сборку.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Вернуть на маршрут'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() {
+      _deliverySaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.post(
+        '/api/admin/delivery/batches/$batchId/customers/$customerId/return-to-route',
+      );
+      await _loadDeliveryDashboard();
+      if (mounted) {
+        setState(() => _message = 'Клиент возвращен на маршрут');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка возврата на маршрут: ${_extractDioError(e)}',
         );
       }
     } finally {
@@ -7146,16 +7744,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final systemKey = (settings['system_key'] ?? '').toString().trim();
     final isSystemChannel = systemKey.isNotEmpty;
 
-    final picked = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      allowMultiple: false,
-      withData: kIsWeb,
-    );
-    if (picked == null || picked.files.isEmpty) return;
-    final pickedFile = picked.files.single;
+    final pickedFile = await FilePicker.pickFile(type: FileType.image);
+    if (pickedFile == null) return;
 
     if (kIsWeb) {
-      final bytes = pickedFile.bytes;
+      final bytes = await _readPickedPlatformFileBytes(pickedFile);
       if (bytes == null || bytes.isEmpty) {
         if (mounted) {
           setState(() => _message = 'Не удалось прочитать выбранный файл');
@@ -7420,6 +8013,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       if (data is Map) {
         final text = (data['error'] ?? data['message'] ?? '').toString().trim();
         if (text.isNotEmpty) return text;
+      }
+      final rawError = [e.message, e.error]
+          .whereType<Object>()
+          .map((item) => item.toString().toLowerCase())
+          .join('\n');
+      if (rawError.contains('failed host lookup') ||
+          rawError.contains('nodename nor servname provided') ||
+          rawError.contains('name or service not known')) {
+        return 'телефон не смог найти сервер garphoenix.com. Проверьте интернет и повторите действие.';
       }
       return e.message ?? 'Ошибка запроса';
     }
@@ -8851,6 +9453,122 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Future<void> _loadGroupRules({bool silent = true}) async {
+    if (!_canViewRulesTab()) return;
+    if (mounted && !silent) {
+      setState(() {
+        _groupRulesLoading = true;
+        _message = '';
+      });
+    } else {
+      _groupRulesLoading = true;
+    }
+    try {
+      final resp = await authService.dio.get('/api/admin/tenant/rules');
+      final data = resp.data;
+      if (!mounted) return;
+      if (data is Map && data['ok'] == true && data['data'] is Map) {
+        _groupRulesCtrl.text = (data['data']['rules_text'] ?? '')
+            .toString()
+            .trim();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка загрузки правил: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _groupRulesLoading = false);
+      } else {
+        _groupRulesLoading = false;
+      }
+    }
+  }
+
+  Future<void> _saveGroupRules() async {
+    if (!_canViewRulesTab() || _groupRulesSaving) return;
+    setState(() {
+      _groupRulesSaving = true;
+      _message = '';
+    });
+    try {
+      await authService.dio.patch(
+        '/api/admin/tenant/rules',
+        data: {'rules_text': _groupRulesCtrl.text.trim()},
+      );
+      if (!mounted) return;
+      setState(() => _message = 'Правила сохранены');
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () => _message = 'Ошибка сохранения правил: ${_extractDioError(e)}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _groupRulesSaving = false);
+      } else {
+        _groupRulesSaving = false;
+      }
+    }
+  }
+
+  Widget _buildRulesTab() {
+    final theme = Theme.of(context);
+    final canEdit = _canViewRulesTab();
+    return RefreshIndicator(
+      onRefresh: () => _loadGroupRules(silent: false),
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text(
+            'Правила группы',
+            style: theme.textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Этот текст видят клиенты по кнопке "Правила" в чатах. '
+            'Изменять его могут только Создатель и Арендатор.',
+            style: theme.textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 12),
+          if (_groupRulesLoading) const LinearProgressIndicator(),
+          TextField(
+            controller: _groupRulesCtrl,
+            enabled: canEdit && !_groupRulesSaving,
+            minLines: 10,
+            maxLines: 22,
+            decoration: withInputLanguageBadge(
+              const InputDecoration(
+                labelText: 'Текст правил',
+                hintText: 'Напишите правила группы для клиентов',
+                border: OutlineInputBorder(),
+              ),
+              controller: _groupRulesCtrl,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FilledButton.icon(
+              onPressed: canEdit && !_groupRulesSaving ? _saveGroupRules : null,
+              icon: _groupRulesSaving
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.save_outlined),
+              label: Text(_groupRulesSaving ? 'Сохранение...' : 'Сохранить'),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -12070,11 +12788,45 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 final qty = _toInt(item['quantity']);
                 final status = (item['status'] ?? '').toString().trim();
                 final statusLabel = _clientCartStatusLabel(status);
+                final canProcessItem = !const {
+                  'processed',
+                  'preparing_delivery',
+                  'handing_to_courier',
+                  'in_delivery',
+                  'delivered',
+                  'cancelled',
+                }.contains(status);
                 final price = _toDouble(item['price']);
                 final lineTotal = _toDouble(item['line_total']) > 0
                     ? _toDouble(item['line_total'])
                     : price * qty;
                 final linkedToDelivery = item['linked_to_delivery'] == true;
+                final imageUrl = _resolveImageUrl(
+                  (item['image_url'] ?? '').toString(),
+                );
+                final productCode = (item['product_code'] ?? '')
+                    .toString()
+                    .trim();
+                final postCreatedAt = _formatDateTimeLabel(
+                  item['product_created_at'] ?? item['created_at'],
+                );
+                final processedAt = _formatDateTimeLabel(item['processed_at']);
+                final manualShelfLabel = (item['manual_shelf_label'] ?? '')
+                    .toString()
+                    .trim();
+                final shelfFloor = (item['shelf_floor'] ?? '')
+                    .toString()
+                    .trim();
+                final shelf = _displayShelfValue(
+                  manualShelfLabel.isNotEmpty
+                      ? manualShelfLabel
+                      : item['shelf_label'],
+                  item['product_shelf_number'],
+                );
+                final shelfText = [
+                  shelf,
+                  if (shelfFloor.isNotEmpty) 'этаж $shelfFloor',
+                ].join(' · ');
                 return Card(
                   margin: const EdgeInsets.only(bottom: 10),
                   child: Padding(
@@ -12082,14 +12834,75 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          title,
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                        const SizedBox(height: 4),
-                        Text('Количество: $qty • Статус: $statusLabel'),
-                        Text(
-                          'Цена: ${_formatMoney(price)} • Сумма: ${_formatMoney(lineTotal)}',
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(12),
+                              child: imageUrl == null || imageUrl.isEmpty
+                                  ? Container(
+                                      width: 86,
+                                      height: 86,
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.surfaceContainerHighest,
+                                      child: const Icon(
+                                        Icons.image_not_supported_outlined,
+                                      ),
+                                    )
+                                  : Image.network(
+                                      imageUrl,
+                                      width: 86,
+                                      height: 86,
+                                      fit: BoxFit.cover,
+                                      errorBuilder:
+                                          (context, error, stackTrace) =>
+                                              Container(
+                                                width: 86,
+                                                height: 86,
+                                                color: Theme.of(context)
+                                                    .colorScheme
+                                                    .surfaceContainerHighest,
+                                                child: const Icon(
+                                                  Icons.broken_image_outlined,
+                                                ),
+                                              ),
+                                    ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    title,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    [
+                                      if (productCode.isNotEmpty)
+                                        'ID товара: $productCode',
+                                      'Цена: ${_formatMoney(price)}',
+                                      'Сумма: ${_formatMoney(lineTotal)}',
+                                    ].join(' • '),
+                                  ),
+                                  Text(
+                                    'Количество: $qty • Статус: $statusLabel',
+                                  ),
+                                  Text('Полка товара: $shelfText'),
+                                  Text(
+                                    'Пост создан: ${postCreatedAt.isEmpty ? '—' : postCreatedAt}',
+                                  ),
+                                  Text(
+                                    'Обработан: ${processedAt.isEmpty ? 'не обработан' : processedAt}',
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
                         ),
                         if (linkedToDelivery)
                           const Padding(
@@ -12107,6 +12920,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           spacing: 8,
                           runSpacing: 8,
                           children: [
+                            OutlinedButton.icon(
+                              onPressed:
+                                  _clientCartActionBusy ||
+                                      _clientCartUndoPending ||
+                                      linkedToDelivery ||
+                                      !canProcessItem
+                                  ? null
+                                  : () => _processSelectedCartItem(item),
+                              icon: const Icon(Icons.check_circle_outline),
+                              label: const Text('Обработано'),
+                            ),
                             OutlinedButton.icon(
                               onPressed:
                                   _clientCartActionBusy ||
@@ -13305,6 +14129,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         callStatus == 'accepted' &&
         batchStatus != 'completed' &&
         batchStatus != 'cancelled';
+    final canReturnToRoute =
+        callStatus == 'declined' && batchStatus != 'completed';
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       child: Padding(
@@ -13497,6 +14323,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     icon: const Icon(Icons.swap_horiz_outlined),
                     label: const Text('Курьер'),
                   ),
+                  if (canReturnToRoute)
+                    FilledButton.icon(
+                      onPressed: _deliverySaving
+                          ? null
+                          : () => _returnDeliveryCustomerToRoute(
+                              batchId,
+                              customer,
+                            ),
+                      icon: const Icon(Icons.redo_outlined),
+                      label: const Text('Вернуть на маршрут'),
+                    ),
                   if (canRemoveFromRoute)
                     OutlinedButton.icon(
                       onPressed: _deliverySaving
@@ -13724,6 +14561,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                 icon: const Icon(Icons.delete_sweep_outlined),
                 label: const Text('Очистить доставку'),
               ),
+              TextButton.icon(
+                onPressed: _deliverySaving ? null : _openDeliveryArchiveDialog,
+                icon: const Icon(Icons.history_outlined),
+                label: const Text('Архив доставки'),
+              ),
             ],
           ),
           if (_deliveryEligiblePreview != null) ...[
@@ -13938,6 +14780,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             ..._deliveryBatches.map((batch) {
               return Card(
                 child: ListTile(
+                  onTap: _deliverySaving
+                      ? null
+                      : () => _openDeliveryBatchDetails(batch),
                   title: Text(
                     (batch['delivery_label'] ?? 'Лист доставки').toString(),
                   ),
@@ -13947,6 +14792,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                     'Клиентов: ${(batch['customers_total'] ?? 0).toString()}',
                   ),
                   isThreeLine: true,
+                  trailing: const Icon(Icons.chevron_right),
                 ),
               );
             }),
