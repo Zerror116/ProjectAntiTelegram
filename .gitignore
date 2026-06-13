@@ -29,6 +29,7 @@ server/audit/*.json
 flutter_verbose.log
 docker/flutter_verbose.log
 docker/docker-compose.yml.bak
+AGENTS.md
 
 files_with_raw_sql.txt
 node_backend_code.txt
