@@ -155,7 +155,6 @@ function buildChannelClientExcelRow(row) {
     address_tag: row.saved_address_tag,
   });
   const effectiveAddress = deliveryAddress || savedAddress || "";
-  const deliverySum = Number(row.delivery_sum || 0);
   const cartSum = Number(row.cart_sum || 0);
   const deliveryShelfLabel = String(row.delivery_shelf_label || "").trim();
   const deliveryShelfNumber = row.delivery_shelf_number == null
@@ -167,7 +166,7 @@ function buildChannelClientExcelRow(row) {
   const bulkyText = String(row.delivery_bulky_note || row.cart_bulky_titles || "").trim();
   const hasDeliveryRow = row.delivery_customer_id != null;
   return {
-    total_sum: Number.isFinite(deliverySum) && deliverySum > 0 ? deliverySum : cartSum,
+    total_sum: Number.isFinite(cartSum) ? cartSum : 0,
     delivery_address_text: deliveryAddress,
     saved_address_text: savedAddress,
     effective_address_text: effectiveAddress,
@@ -3130,7 +3129,7 @@ router.get(
              FROM cart_items ci
              JOIN products p ON p.id = ci.product_id
              WHERE ci.user_id = u.id
-               AND ci.status IN ('processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
+               AND ci.status NOT IN ('delivered', 'cancelled')
            ) AS cart_summary ON true
            LEFT JOIN LATERAL (
              SELECT a.address_text,
@@ -3147,6 +3146,7 @@ router.get(
              FROM delivery_batch_customers dbc
              JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
              WHERE dbc.user_id = u.id
+               AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
              ORDER BY
                CASE dbt.status
                  WHEN 'calling' THEN 0
@@ -3207,7 +3207,7 @@ router.get(
              FROM cart_items ci
              JOIN products p ON p.id = ci.product_id
              WHERE ci.user_id = u.id
-               AND ci.status IN ('processed', 'preparing_delivery', 'handing_to_courier', 'in_delivery')
+               AND ci.status NOT IN ('delivered', 'cancelled')
            ) AS cart_summary ON true
            LEFT JOIN LATERAL (
              SELECT a.address_text,
@@ -3224,6 +3224,7 @@ router.get(
              FROM delivery_batch_customers dbc
              JOIN delivery_batches dbt ON dbt.id = dbc.batch_id
              WHERE dbc.user_id = u.id
+               AND dbt.status IN ('calling', 'couriers_assigned', 'handed_off')
              ORDER BY
                CASE dbt.status
                  WHEN 'calling' THEN 0

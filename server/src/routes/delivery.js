@@ -3668,7 +3668,7 @@ async function createManualPhoneSelfPickupArchive(
      FROM delivery_batches b
      WHERE b.delivery_date = $1::date
        AND b.delivery_label = $2
-       AND COALESCE(b.status, '') = 'completed'
+       AND COALESCE(b.status, '') IN ('calling', 'couriers_assigned')
        AND (
          $3::uuid IS NULL
          OR EXISTS (
@@ -3703,9 +3703,9 @@ async function createManualPhoneSelfPickupArchive(
          handed_off_at, completed_at, created_at, updated_at
        )
        VALUES (
-         $1, $2::date, $3, $4, 'completed',
+         $1, $2::date, $3, $4, 'calling',
          0, '[]'::jsonb, $5, now(),
-         now(), now(), now(), now()
+         NULL, NULL, now(), now()
        )
        RETURNING id`,
       [
@@ -3779,23 +3779,32 @@ async function createManualPhoneSelfPickupArchive(
          bulky_note, notes, accepted_at, assembly_status,
          assembly_started_at, assembly_started_by, assembly_completed_at,
          assembly_completed_by, client_city, delivery_threshold_amount,
-         delivery_fee_amount, created_at, updated_at
+         delivery_fee_amount, address_text, self_pickup, route_excluded,
+         pickup_label, created_at, updated_at
        )
        VALUES (
          $1, $2, $3, $4, $5,
          $6, $6, 0, 0,
          0, $7, $8,
-         'accepted', 'completed', 1, 0,
-         NULL, $9, now(), 'assembled',
-         now(), $10, now(),
-         $10, NULLIF($11, ''), $12,
-         $13, now(), now()
+         'accepted', 'preparing_delivery', 1, 0,
+         NULL, $9, now(), 'not_started',
+         NULL, NULL, NULL,
+         NULL, NULLIF($10::text, ''), $11::numeric,
+         $12::numeric, 'Самовывоз', true, true,
+         $9, now(), now()
        )
        ON CONFLICT (batch_id, user_id) DO UPDATE
        SET customer_name = EXCLUDED.customer_name,
            customer_phone = EXCLUDED.customer_phone,
+           processed_sum = EXCLUDED.processed_sum,
+           agreed_sum = EXCLUDED.agreed_sum,
+           claim_return_sum = 0,
+           claim_discount_sum = 0,
+           claims_total = 0,
+           processed_items_count = EXCLUDED.processed_items_count,
+           shelf_number = EXCLUDED.shelf_number,
            call_status = 'accepted',
-           delivery_status = 'completed',
+           delivery_status = 'preparing_delivery',
            package_places = GREATEST(delivery_batch_customers.package_places, 1),
            bulky_places = 0,
            bulky_note = NULL,
@@ -3805,14 +3814,18 @@ async function createManualPhoneSelfPickupArchive(
              ELSE CONCAT(delivery_batch_customers.notes, E'\n', EXCLUDED.notes)
            END,
            accepted_at = COALESCE(delivery_batch_customers.accepted_at, now()),
-           assembly_status = 'assembled',
-           assembly_started_at = COALESCE(delivery_batch_customers.assembly_started_at, now()),
-           assembly_started_by = COALESCE(delivery_batch_customers.assembly_started_by, $10),
-           assembly_completed_at = now(),
-           assembly_completed_by = $10,
+           assembly_status = 'not_started',
+           assembly_started_at = NULL,
+           assembly_started_by = NULL,
+           assembly_completed_at = NULL,
+           assembly_completed_by = NULL,
            client_city = EXCLUDED.client_city,
            delivery_threshold_amount = EXCLUDED.delivery_threshold_amount,
            delivery_fee_amount = EXCLUDED.delivery_fee_amount,
+           address_text = 'Самовывоз',
+           self_pickup = true,
+           route_excluded = true,
+           pickup_label = EXCLUDED.pickup_label,
            updated_at = now()
        RETURNING id`,
       [
@@ -3825,7 +3838,6 @@ async function createManualPhoneSelfPickupArchive(
         itemCount,
         shelfNumber,
         pickupNote,
-        actorUserId || null,
         clientCity,
         toMoney(rules.threshold_amount, settings.threshold_amount),
         toMoney(rules.delivery_fee_amount, 0),
@@ -3845,7 +3857,7 @@ async function createManualPhoneSelfPickupArchive(
          VALUES (
            $1, $2, $3, $4, $5, $6,
            $7, $8, $9, $10, $11,
-           $12, $13, 'collected',
+           $12, $13, 'pending',
            $14, NULLIF(BTRIM($15::text), ''), NULL, NULL, NULL, now()
          )
          ON CONFLICT (cart_item_id) DO NOTHING
@@ -3897,10 +3909,10 @@ async function createManualPhoneSelfPickupArchive(
 
   await queryable.query(
     `UPDATE delivery_batches
-     SET status = 'completed',
+     SET status = CASE WHEN status = 'completed' THEN 'calling' ELSE status END,
          confirmed_at = COALESCE(confirmed_at, now()),
-         handed_off_at = COALESCE(handed_off_at, now()),
-         completed_at = COALESCE(completed_at, now()),
+         handed_off_at = NULL,
+         completed_at = NULL,
          updated_at = now()
      WHERE id = $1`,
     [batchId],
@@ -4087,6 +4099,29 @@ router.post(
         updatedMessages = updatedMessagesQ.rows;
       }
 
+      const pickupNote = buildSelfPickupDeliveryLabel(new Date());
+      const pickupArchive = await createManualPhoneSelfPickupArchive(client, {
+        actorUserId: req.user?.id || null,
+        tenantId,
+        deliveryDate: new Date(),
+        pickupNote,
+        rows: itemRows,
+      });
+      const pickupCartItemIdSet = new Set(
+        (pickupArchive.archivedCartItemIds || [])
+          .map((value) => String(value || "").trim())
+          .filter(Boolean),
+      );
+      if (pickupCartItemIdSet.size > 0) {
+        await client.query(
+          `UPDATE cart_items
+           SET status = 'preparing_delivery',
+               updated_at = now()
+           WHERE id = ANY($1::uuid[])`,
+          [Array.from(pickupCartItemIdSet)],
+        );
+      }
+
       const itemsByUserId = new Map();
       const processedCartItemIdSet = new Set(cartItemIdsToProcess);
       for (const row of itemRows) {
@@ -4095,6 +4130,7 @@ router.post(
         const cartItemId = String(row.cart_item_id || "").trim();
         const previousStatus = String(row.status || "").trim();
         const newlyProcessed = processedCartItemIdSet.has(cartItemId);
+        const pickupAdded = pickupCartItemIdSet.has(cartItemId);
         const existingDeliveryItemId = String(row.existing_delivery_item_id || "").trim();
         itemsByUserId.get(userId).push({
           cart_item_id: cartItemId,
@@ -4110,12 +4146,12 @@ router.post(
           price: row.product_price,
           quantity: Number(row.quantity) || 1,
           previous_status: previousStatus,
-          status: newlyProcessed ? "processed" : previousStatus,
+          status: pickupAdded ? "preparing_delivery" : newlyProcessed ? "processed" : previousStatus,
           processing_mode: newlyProcessed ? "manual" : row.processing_mode,
           shelf_label: "ручное",
           newly_processed: newlyProcessed,
           already_processed: previousStatus === "processed",
-          pickup_added: false,
+          pickup_added: pickupAdded,
           existing_delivery: Boolean(existingDeliveryItemId),
           existing_delivery_item_id: existingDeliveryItemId || null,
           existing_delivery_batch_id:
@@ -4146,7 +4182,7 @@ router.post(
           newly_processed_count: products.filter((product) => product.newly_processed).length,
           already_processed_count: products.filter((product) => product.already_processed).length,
           existing_delivery_count: products.filter((product) => product.existing_delivery).length,
-          pickup_added_count: 0,
+          pickup_added_count: products.filter((product) => product.pickup_added).length,
           products,
         };
       });
@@ -4167,10 +4203,11 @@ router.post(
         );
         for (const userId of affectedUserIds) {
           emitCartUpdated(io, userId, {
-            status: "processed",
+            status: pickupCartItemIdSet.size > 0 ? "preparing_delivery" : "processed",
             processing_mode: "manual",
             shelf_label: "ручное",
             reason: "manual_phone_processing",
+            self_pickup: pickupCartItemIdSet.size > 0,
           });
         }
         for (const message of updatedMessages) {
@@ -4182,7 +4219,7 @@ router.post(
             chatId: message.chat_id,
           });
         }
-        emitDeliveryUpdated(io, "manual-phone-processing", tenantId);
+        emitDeliveryUpdated(io, pickupArchive.batchId || "manual-phone-processing", tenantId);
       }
 
       return res.json({
@@ -4196,17 +4233,17 @@ router.post(
           already_processed_count: itemRows.filter(
             (row) => String(row.status || "").trim() === "processed",
           ).length,
-          pickup_added_count: 0,
+          pickup_added_count: pickupCartItemIdSet.size,
           existing_delivery_count: itemRows.filter(
             (row) => String(row.existing_delivery_item_id || "").trim(),
           ).length,
           skipped_count: skippedNoItems.length + notFound.length,
           skipped_no_items_count: skippedNoItems.length,
           not_found_count: notFound.length,
-          delivery_batch_id: null,
-          delivery_date: null,
-          delivery_label: null,
-          pickup_note: null,
+          delivery_batch_id: pickupArchive.batchId || null,
+          delivery_date: pickupArchive.deliveryDate || null,
+          delivery_label: pickupArchive.deliveryLabel || null,
+          pickup_note: pickupNote,
           clients: responseClients,
           skipped_no_items: skippedNoItems,
           not_found: notFound,

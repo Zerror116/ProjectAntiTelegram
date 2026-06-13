@@ -223,7 +223,10 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (price <= 0) return null;
     final discounted = price * (1 - percent / 100);
     final roundedDown = (discounted / 50).floor() * 50;
-    final safe = roundedDown < 50 ? 50 : roundedDown;
+    final minimumPrice = _autoRevisionMinimumPrice < 1
+        ? 50
+        : _autoRevisionMinimumPrice;
+    final safe = roundedDown < minimumPrice ? minimumPrice : roundedDown;
     return safe.toInt();
   }
 
@@ -359,6 +362,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   Map<String, dynamic> _tenantFeatureSettings = <String, dynamic>{};
   Map<String, dynamic>? _deliveryActiveBatch;
   int? _selectedRevisionShelfNumber;
+  int _autoRevisionMinimumPrice = 50;
   bool _pickupOnly = false;
   bool _isBulkyProduct = false;
 
@@ -1603,6 +1607,10 @@ class _WorkerPanelState extends State<WorkerPanel>
             ? List<Map<String, dynamic>>.from(payload['posts'])
             : <Map<String, dynamic>>[];
         final responseShelf = _toIntValue(payload['shelf_number'], selected);
+        final minimumPrice = _toIntValue(
+          payload['auto_revision_minimum_price'],
+          50,
+        );
         final nextSelected = responseShelf >= 1 && responseShelf <= 10
             ? responseShelf
             : selected;
@@ -1610,6 +1618,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         setState(() {
           _revisionPosts = posts;
           _selectedRevisionShelfNumber = nextSelected;
+          _autoRevisionMinimumPrice = minimumPrice < 1 ? 50 : minimumPrice;
         });
       } else {
         if (!mounted) return;
@@ -4987,32 +4996,28 @@ class _WorkerPanelState extends State<WorkerPanel>
         ),
       ),
       body: SafeArea(
-        child: GestureDetector(
-          behavior: HitTestBehavior.translucent,
-          onTap: _dismissKeyboard,
-          child: Column(
-            children: [
-              if (_message.isNotEmpty)
-                Padding(
-                  padding: EdgeInsets.fromLTRB(
-                    compact ? 10 : 16,
-                    12,
-                    compact ? 10 : 16,
-                    0,
-                  ),
-                  child: Text(
-                    _message,
-                    style: TextStyle(
-                      color: _messageColor(Theme.of(context)),
-                      fontWeight: FontWeight.w600,
-                    ),
+        child: Column(
+          children: [
+            if (_message.isNotEmpty)
+              Padding(
+                padding: EdgeInsets.fromLTRB(
+                  compact ? 10 : 16,
+                  12,
+                  compact ? 10 : 16,
+                  0,
+                ),
+                child: Text(
+                  _message,
+                  style: TextStyle(
+                    color: _messageColor(Theme.of(context)),
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
-              Expanded(
-                child: TabBarView(controller: controller, children: tabViews),
               ),
-            ],
-          ),
+            Expanded(
+              child: TabBarView(controller: controller, children: tabViews),
+            ),
+          ],
         ),
       ),
     );

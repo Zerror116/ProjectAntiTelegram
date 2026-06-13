@@ -213,9 +213,10 @@
 
       function serializeCredential(credential) {
         const response = credential.response || {};
+        const rawId = toBase64Url(credential.rawId);
         const payload = {
-          id: credential.id,
-          rawId: toBase64Url(credential.rawId),
+          id: rawId,
+          rawId: rawId,
           type: credential.type,
           authenticatorAttachment: credential.authenticatorAttachment || undefined,
           clientExtensionResults: credential.getClientExtensionResults
@@ -278,9 +279,11 @@
       const buildVersionKey = 'projectphoenix-web-build-version';
       const reloadOnceKey = 'projectphoenix-web-reload-once';
       const versionPollTimerKey = 'projectphoenix-web-version-poll';
+      const runtimeErrorReloadKey = 'projectphoenix-web-runtime-error-reload';
       const bootstrapTimeoutMs = 28000;
       const bootstrapExtendedTimeoutMs = 45000;
       let bootstrapTimeoutId = null;
+      let bootstrapReady = false;
 
       const shell = document.getElementById('bootstrap-shell');
       const statusNode = document.getElementById('bootstrap-status');
@@ -303,6 +306,9 @@
           window.clearTimeout(bootstrapTimeoutId);
           bootstrapTimeoutId = null;
         }
+        if (shell) {
+          shell.classList.remove('is-hidden');
+        }
         if (spinnerNode) {
           spinnerNode.style.display = 'none';
         }
@@ -315,13 +321,74 @@
       }
 
       function markBootstrapReady() {
+        bootstrapReady = true;
         if (bootstrapTimeoutId) {
           window.clearTimeout(bootstrapTimeoutId);
           bootstrapTimeoutId = null;
         }
+        try {
+          sessionStorage.removeItem(runtimeErrorReloadKey);
+        } catch (_) {}
         if (shell) {
           shell.classList.add('is-hidden');
         }
+      }
+
+      function stringifyRuntimeError(error) {
+        if (!error) return '';
+        if (typeof error === 'string') return error;
+        if (typeof error.message === 'string' && error.message.trim()) {
+          return error.message.trim();
+        }
+        try {
+          return JSON.stringify(error);
+        } catch (_) {
+          return String(error);
+        }
+      }
+
+      function isBootstrapRuntimeErrorEvent(event) {
+        if (!event) return true;
+        const target = event.target || null;
+        const tagName = target && target.tagName ? String(target.tagName).toUpperCase() : '';
+        if (tagName && tagName !== 'SCRIPT') return false;
+        const filename = String(event.filename || (target && target.src ? target.src : '') || '');
+        if (!filename) return Boolean(event.message || event.error);
+        return (
+          filename.startsWith(window.location.origin) ||
+          !/^https?:\/\//i.test(filename) ||
+          filename.includes('flutter_bootstrap') ||
+          filename.includes('main.dart') ||
+          filename.includes('canvaskit')
+        );
+      }
+
+      function handleEarlyRuntimeError(source, error, event) {
+        if (bootstrapReady || !isBootstrapRuntimeErrorEvent(event)) return;
+        const details = stringifyRuntimeError(error);
+        setBootstrapFailure('Феникс не смог запуститься на этом устройстве.');
+        if (subtitleNode) {
+          subtitleNode.textContent = details
+            ? `Ошибка запуска: ${details.slice(0, 180)}. Попробуем мягко обновить загрузчик без выхода из аккаунта.`
+            : 'Попробуем мягко обновить загрузчик без выхода из аккаунта.';
+        }
+
+        let alreadyRecovered = false;
+        try {
+          alreadyRecovered = sessionStorage.getItem(runtimeErrorReloadKey) === '1';
+        } catch (_) {}
+        if (alreadyRecovered) return;
+
+        try {
+          sessionStorage.setItem(runtimeErrorReloadKey, '1');
+        } catch (_) {}
+        window.setTimeout(function () {
+          refreshWebShellOnly()
+            .then(function () {
+              navigateToFreshBuild(Date.now().toString());
+            })
+            .catch(function () {});
+        }, 900);
       }
 
       async function restartWithCacheReset() {
@@ -340,6 +407,13 @@
           setBootstrapFailure(text || 'Запуск Феникс завершился ошибкой.');
         },
       };
+
+      window.addEventListener('error', function (event) {
+        handleEarlyRuntimeError('error', event.error || event.message, event);
+      });
+      window.addEventListener('unhandledrejection', function (event) {
+        handleEarlyRuntimeError('unhandledrejection', event.reason, event);
+      });
 
       if (retryButton) {
         retryButton.addEventListener('click', function () {
@@ -423,9 +497,11 @@
         const version = (data && data.version ? String(data.version) : '').trim();
         const buildNumber =
           (data && data.build_number ? String(data.build_number) : '').trim();
+        const webBuildToken =
+          (data && data.web_build_token ? String(data.web_build_token) : '').trim();
         const etag = (resp.headers.get('etag') || '').trim();
         const lastModified = (resp.headers.get('last-modified') || '').trim();
-        return [version, buildNumber, etag, lastModified]
+        return [version, buildNumber, webBuildToken, etag, lastModified]
           .filter((value) => Boolean(value))
           .join('|')
           .trim();
@@ -464,8 +540,18 @@
       function navigateToFreshBuild(versionToken) {
         try {
           const nextUrl = new URL(window.location.href);
-          nextUrl.searchParams.set('v', (versionToken || '').toString().trim() || Date.now().toString());
-          window.location.replace(nextUrl.toString());
+          const normalizedToken = String(versionToken || '').trim();
+          if (normalizedToken) {
+            nextUrl.searchParams.set('v', normalizedToken);
+          } else {
+            nextUrl.searchParams.delete('v');
+          }
+          const nextHref = nextUrl.toString();
+          if (nextHref !== window.location.href) {
+            window.location.replace(nextHref);
+          } else {
+            window.location.reload();
+          }
         } catch (_) {
           window.location.reload();
         }

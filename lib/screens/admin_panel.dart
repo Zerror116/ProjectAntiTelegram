@@ -140,7 +140,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   final _clientCartSearchCtrl = TextEditingController();
   final _groupRulesCtrl = TextEditingController();
 
-  bool _loading = true;
+  bool _loading = false;
   bool _saving = false;
   bool _publishing = false;
   bool _pendingPostsLoading = false;
@@ -188,7 +188,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   String _message = '';
   String _newChannelVisibility = 'public';
-  String _deliveryViewMode = 'map';
+  String _deliveryViewMode = 'list';
   String _deliveryOriginLabel = 'Точка отправки';
   String _financePeriod = 'month';
   String _smartNotifyType = 'order';
@@ -479,11 +479,6 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return baseRole == 'creator';
   }
 
-  bool _isAdminBase() {
-    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
-    return baseRole == 'admin';
-  }
-
   bool _isAdminViewRole() {
     return authService.effectiveRole.toLowerCase().trim() == 'admin';
   }
@@ -715,8 +710,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   void _handleActiveTabChanged() {
     final controller = _tabController;
-    if (controller == null || controller.indexIsChanging) return;
-    unawaited(_loadActiveTabData(silent: true));
+    if (controller == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _isDisposed) return;
+      unawaited(_loadActiveTabData(silent: true));
+    });
   }
 
   int _toInt(dynamic value, {int fallback = 0}) {
@@ -1015,7 +1013,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   }) async {
     final tabId = _activeTabId();
     if (tabId.isEmpty) return;
-    if (!force && _loadedTabs.contains(tabId)) return;
+    if (!force && _loadedTabs.contains(tabId)) {
+      final shouldRetryEmptyChannels =
+          tabId == 'channels' && _channels.isEmpty && !_loading;
+      if (!shouldRetryEmptyChannels) return;
+    }
     _loadedTabs.add(tabId);
     switch (tabId) {
       case 'client_carts':
@@ -1447,7 +1449,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     });
 
     try {
-      final resp = await authService.dio.get('/api/admin/channels');
+      final resp = await authService.dio
+          .get('/api/admin/channels')
+          .timeout(const Duration(seconds: 18));
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         final channels = List<Map<String, dynamic>>.from(data['data']);
@@ -1472,9 +1476,10 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       }
     } catch (e) {
       if (mounted) {
-        setState(
-          () => _message = 'Ошибка загрузки каналов: ${_extractDioError(e)}',
-        );
+        final message = e is TimeoutException
+            ? 'сервер долго не отвечает, попробуйте ещё раз'
+            : _extractDioError(e);
+        setState(() => _message = 'Ошибка загрузки каналов: $message');
       }
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -1511,9 +1516,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
 
     try {
-      final resp = await authService.dio.get(
-        '/api/admin/channels/$channelId/overview',
-      );
+      final resp = await authService.dio
+          .get('/api/admin/channels/$channelId/overview')
+          .timeout(const Duration(seconds: 18));
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         final map = Map<String, dynamic>.from(data['data']);
@@ -1542,11 +1547,15 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
 
   Future<void> _loadPendingPosts() async {
     if (_pendingPostsLoading) return;
-    _pendingPostsLoading = true;
+    if (mounted) {
+      setState(() => _pendingPostsLoading = true);
+    } else {
+      _pendingPostsLoading = true;
+    }
     try {
-      final resp = await authService.dio.get(
-        '/api/admin/channels/pending_posts',
-      );
+      final resp = await authService.dio
+          .get('/api/admin/channels/pending_posts')
+          .timeout(const Duration(seconds: 18));
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         if (mounted) {
@@ -1563,12 +1572,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       }
     } catch (e) {
       if (mounted) {
-        setState(
-          () => _message = 'Ошибка загрузки очереди: ${_extractDioError(e)}',
-        );
+        final message = e is TimeoutException
+            ? 'сервер долго не отвечает, попробуйте ещё раз'
+            : _extractDioError(e);
+        setState(() => _message = 'Ошибка загрузки очереди: $message');
       }
     } finally {
-      _pendingPostsLoading = false;
+      if (mounted) {
+        setState(() => _pendingPostsLoading = false);
+      } else {
+        _pendingPostsLoading = false;
+      }
     }
   }
 
@@ -4494,6 +4508,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       });
       final newlyProcessedCount = _toInt(payload['newly_processed_count']);
       final alreadyProcessedCount = _toInt(payload['already_processed_count']);
+      final pickupAddedCount = _toInt(payload['pickup_added_count']);
       final skippedCount = _toInt(payload['skipped_count']);
       setState(() {
         _deliveryManualPhonesResult = payload;
@@ -4501,7 +4516,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             'Ручная выгрузка: найдено $reservedCount товаров, '
             'необработанных обработано $newlyProcessedCount, '
             'уже обработанных $alreadyProcessedCount. '
-            'Корзины не удалялись и не переносились в самовывоз'
+            'В самовывоз добавлено $pickupAddedCount товаров'
             '${skippedCount > 0 ? ', пропущено $skippedCount номеров' : ''}';
       });
       unawaited(_loadDeliveryDashboard());
@@ -4533,7 +4548,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             ),
             const SizedBox(height: 8),
             Text(
-              'Вставьте полные номера клиентов, каждый с новой строки. Будут показаны все товары в корзине клиента: уже обработанные и необработанные. Необработанные товары будут обработаны вручную, но корзина останется на месте. После проверки администратор сам вводит последние 4 цифры в "Админ -> Корзины" и нажимает "Самовывоз".',
+              'Вставьте полные номера клиентов, каждый с новой строки. Будут показаны все товары в корзине клиента: уже обработанные и необработанные. Необработанные товары будут обработаны вручную, а найденные корзины автоматически попадут в самовывоз в "Админ -> Доставка" для обычной сборки.',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
               ),
@@ -4732,6 +4747,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final imageUrl = _resolveImageUrl((product['image_url'] ?? '').toString());
     final productCode = product['product_code'];
     final shelfNumber = product['product_shelf_number'];
+    final quantity = _toInt(product['quantity'], fallback: 1);
+    final unitPrice = product['price'];
+    final lineTotal =
+        ((unitPrice is num)
+            ? unitPrice.toDouble()
+            : double.tryParse('$unitPrice') ?? 0) *
+        quantity;
     final title = (product['title'] ?? 'Товар').toString();
     final statusLabel = _deliveryManualPhoneProductStatusLabel(product);
     final newlyProcessed = product['newly_processed'] == true;
@@ -4775,13 +4797,16 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   children: [
                     Chip(label: Text('ID товара: ${productCode ?? '—'}')),
                     Chip(label: Text('Полка: ${shelfNumber ?? '—'}')),
+                    Chip(label: Text('Цена за 1: ${_formatMoney(unitPrice)}')),
+                    Chip(label: Text('Количество: $quantity')),
+                    Chip(label: Text('Итого: ${_formatMoney(lineTotal)}')),
                     Chip(label: Text(statusLabel)),
                     if (newlyProcessed)
                       const Chip(label: Text('Обработан вручную')),
                     if (alreadyProcessed)
                       const Chip(label: Text('Уже был обработан')),
                     if (pickupAdded)
-                      const Chip(label: Text('Самовывоз завтра')),
+                      const Chip(label: Text('Добавлен в самовывоз')),
                     if (existingDelivery)
                       const Chip(label: Text('Уже был в доставке')),
                   ],
@@ -6815,6 +6840,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         customer['self_pickup'] == true || customer['route_excluded'] == true;
     final address = (customer['address_text'] ?? '').toString().trim();
     final courier = (customer['courier_name'] ?? '').toString().trim();
+    final city = _normalizeDeliveryCityName(customer['client_city']);
     final name = (customer['customer_name'] ?? 'Клиент').toString().trim();
     final phone = _displayPhone(
       (customer['customer_phone'] ?? '').toString(),
@@ -6862,6 +6888,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             Text(
               [
                 'Сумма: ${_formatMoney(customer['agreed_sum'] ?? customer['processed_sum'])}',
+                'Город: ${city.isEmpty ? 'не указан' : city}',
                 'Адрес: ${isSelfPickup ? 'Самовывоз' : (address.isEmpty ? 'не указан' : address)}',
                 if (courier.isNotEmpty) 'Курьер: $courier',
                 'Мест: ${_toInt(customer['package_places'], fallback: 1)}',
@@ -8736,6 +8763,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         return _displayName(client, fallback: 'Клиент');
       case 'sum':
         return _formatMoney(client['total_sum']);
+      case 'city':
+        return (client['client_city'] ?? '').toString().trim();
       case 'address':
         return (client['effective_address_text'] ??
                 client['delivery_address_text'] ??
@@ -8810,6 +8839,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       'phone': TextEditingController(),
       'name': TextEditingController(),
       'sum': TextEditingController(),
+      'city': TextEditingController(),
       'address': TextEditingController(),
       'courier': TextEditingController(),
       'locality': TextEditingController(),
@@ -8894,6 +8924,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                           ),
                           const SizedBox(width: 8),
                           _buildExcelFilterField(
+                            controller: filters['city']!,
+                            label: 'Город',
+                            onChanged: refreshFilters,
+                            width: 120,
+                          ),
+                          const SizedBox(width: 8),
+                          _buildExcelFilterField(
                             controller: filters['address']!,
                             label: 'Адрес',
                             onChanged: refreshFilters,
@@ -8968,6 +9005,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                   DataColumn(label: Text('Телефон')),
                                   DataColumn(label: Text('Имя')),
                                   DataColumn(label: Text('Сумма')),
+                                  DataColumn(label: Text('Город')),
                                   DataColumn(label: Text('Адрес')),
                                   DataColumn(label: Text('Курьер')),
                                   DataColumn(label: Text('НП')),
@@ -9011,6 +9049,18 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                           _channelClientExcelText(
                                             client,
                                             'sum',
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        SizedBox(
+                                          width: 120,
+                                          child: Text(
+                                            _channelClientExcelText(
+                                              client,
+                                              'city',
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
                                           ),
                                         ),
                                       ),
@@ -10092,9 +10142,52 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final compact = MediaQuery.of(context).size.width < 640;
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_channels.isEmpty) {
-      if (!_isAdminBase()) {
-        return const Center(child: Text('Каналы пока не созданы'));
-      }
+      final hasError = _message.trim().isNotEmpty;
+      return RefreshIndicator(
+        onRefresh: _loadChannels,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: EdgeInsets.all(compact ? 16 : 24),
+          children: [
+            SizedBox(height: compact ? 80 : 140),
+            Icon(
+              hasError
+                  ? Icons.wifi_tethering_error_rounded
+                  : Icons.campaign_outlined,
+              size: 48,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(height: 14),
+            Text(
+              hasError
+                  ? 'Не удалось загрузить каналы'
+                  : 'Каналы пока не созданы',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              hasError
+                  ? 'Проверьте соединение и повторите загрузку.'
+                  : 'Потяните экран вниз или нажмите кнопку, чтобы повторить загрузку.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Center(
+              child: FilledButton.icon(
+                onPressed: _loadChannels,
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('Повторить'),
+              ),
+            ),
+          ],
+        ),
+      );
     }
 
     return RefreshIndicator(
@@ -14081,6 +14174,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final sum = _formatMoney(
       customer['agreed_sum'] ?? customer['processed_sum'],
     );
+    final city = _normalizeDeliveryCityName(customer['client_city']);
     final shelf = _displayShelfValue(
       customer['shelf_label'],
       customer['shelf_number'],
@@ -14147,6 +14241,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
             const SizedBox(height: 4),
             Text('Телефон: $phone'),
             Text('Сумма в доставке: $sum'),
+            Text('Город: ${city.isEmpty ? 'не указан' : city}'),
             Text('Полка: $shelf'),
             Text('Статус доставки: $status'),
             Text('Ответ после рассылки: ${_deliveryCallStatusLabel(customer)}'),
@@ -15088,6 +15183,12 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
           tabAlignment: compact ? TabAlignment.start : null,
           labelPadding: EdgeInsets.symmetric(horizontal: compact ? 10 : 14),
           indicatorSize: TabBarIndicatorSize.tab,
+          onTap: (_) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted || _isDisposed) return;
+              unawaited(_loadActiveTabData(silent: true));
+            });
+          },
         ),
       ),
       body: SafeArea(

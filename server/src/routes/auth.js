@@ -1570,7 +1570,22 @@ async function buildSuccessfulAuthResponse({
 
 function resolvePasskeyRp(req) {
   const configuredOrigin = String(process.env.AUTH_PASSKEY_ORIGIN || '').trim();
-  const fallbackOrigin = `${req.protocol}://${req.get('host')}`;
+  const forwardedProto = String(req.get('x-forwarded-proto') || '')
+    .split(',')[0]
+    .trim();
+  const forwardedHost = String(req.get('x-forwarded-host') || '')
+    .split(',')[0]
+    .trim();
+  const host = forwardedHost || String(req.get('host') || '').trim();
+  let protocol = forwardedProto || String(req.protocol || '').trim() || 'https';
+  if (
+    process.env.NODE_ENV === 'production' &&
+    protocol === 'http' &&
+    /(^|\.)garphoenix\.com(?::\d+)?$/i.test(host)
+  ) {
+    protocol = 'https';
+  }
+  const fallbackOrigin = `${protocol}://${host}`;
   const origin = (configuredOrigin || fallbackOrigin).replace(/\/+$/, '');
   let hostname = '';
   try {
@@ -1582,9 +1597,18 @@ function resolvePasskeyRp(req) {
   }
   const rpID =
     String(process.env.AUTH_PASSKEY_RP_ID || '').trim() ||
+    (/(^|\.)garphoenix\.com$/i.test(hostname) ? 'garphoenix.com' : '') ||
     hostname ||
     'localhost';
-  return { rpName: PASSKEY_RP_NAME, rpID, origin };
+  const origins = [origin];
+  if (rpID === 'garphoenix.com') {
+    origins.push('https://garphoenix.com', 'https://www.garphoenix.com');
+  }
+  return {
+    rpName: PASSKEY_RP_NAME,
+    rpID,
+    origin: Array.from(new Set(origins.map((item) => item.replace(/\/+$/, '')))),
+  };
 }
 
 function passkeyChallengeKey(kind, value) {
@@ -1615,6 +1639,25 @@ function normalizeCredentialTransports(raw) {
     .map((item) => String(item || '').trim())
     .filter(Boolean)
     .slice(0, 12);
+}
+
+function normalizePasskeyCredentialResponse(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+  const credential = {
+    ...raw,
+    response:
+      raw.response && typeof raw.response === 'object' && !Array.isArray(raw.response)
+        ? { ...raw.response }
+        : raw.response,
+  };
+  const rawId = String(credential.rawId || '').trim();
+  const id = String(credential.id || '').trim();
+  if (rawId) {
+    credential.id = rawId;
+  } else if (id) {
+    credential.rawId = id;
+  }
+  return credential;
 }
 
 function isCreatorIdentity(user) {
@@ -3435,7 +3478,9 @@ router.post('/passkeys/register/verify', authMiddleware, async (req, res) => {
         error: 'Passkey доступен только создателю',
       });
     }
-    const response = req.body?.credential || req.body?.response;
+    const response = normalizePasskeyCredentialResponse(
+      req.body?.credential || req.body?.response,
+    );
     if (!response || typeof response !== 'object') {
       return res.status(400).json({ ok: false, error: 'Нет ответа passkey' });
     }
@@ -3583,7 +3628,9 @@ router.post('/passkeys/login/verify', async (req, res) => {
         error: 'Passkey доступен только создателю',
       });
     }
-    const response = req.body?.credential || req.body?.response;
+    const response = normalizePasskeyCredentialResponse(
+      req.body?.credential || req.body?.response,
+    );
     if (!response || typeof response !== 'object') {
       return res.status(400).json({ ok: false, error: 'Нет ответа passkey' });
     }
@@ -3601,13 +3648,13 @@ router.post('/passkeys/login/verify', async (req, res) => {
 
     const authResult = await db.runWithPlatform(async () => {
       const credentialQ = await db.query(
-        `SELECT p.id,
+        `SELECT p.id AS passkey_id,
                 p.user_id,
                 p.credential_id,
                 p.credential_public_key,
                 p.counter,
                 p.transports,
-                u.id AS auth_user_id,
+                u.id,
                 u.email,
                 u.name,
                 u.role,
@@ -3653,7 +3700,7 @@ router.post('/passkeys/login/verify', async (req, res) => {
            SET counter = $2,
                last_used_at = now()
            WHERE id = $1`,
-          [row.id, Number(verification.authenticationInfo?.newCounter || row.counter || 0)],
+          [row.passkey_id, Number(verification.authenticationInfo?.newCounter || row.counter || 0)],
         );
         const session = await createAuthenticatedSession({
           client,

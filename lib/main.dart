@@ -5917,121 +5917,206 @@ void _logClientRuntimeErrorToConsole(
 }
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  if (kIsWeb && kReleaseMode) {
-    debugPrint = (String? message, {int? wrapWidth}) {};
-  }
-  if (kIsWeb) {
-    try {
-      await BrowserContextMenu.disableContextMenu();
-    } catch (_) {}
-  }
-
-  FlutterError.onError = (FlutterErrorDetails details) {
-    if (_isDuplicateKeyDownKeyboardAssert(details.exception)) {
-      try {
-        unawaited(HardwareKeyboard.instance.syncKeyboardState());
-        if (!_keyboardAssertRecoveredRecently) {
-          _keyboardAssertRecoveredRecently = true;
-          debugPrint(
-            'Recovered from duplicate KeyDownEvent assert by resetting HardwareKeyboard state.',
+  await runZonedGuarded<Future<void>>(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      if (kIsWeb && kReleaseMode) {
+        debugPrint = (String? message, {int? wrapWidth}) {};
+      }
+      if (kIsWeb) {
+        try {
+          await BrowserContextMenu.disableContextMenu().timeout(
+            const Duration(seconds: 1),
+            onTimeout: () {},
           );
-          Future<void>.delayed(const Duration(seconds: 2), () {
-            _keyboardAssertRecoveredRecently = false;
-          });
+        } catch (_) {}
+      }
+
+      FlutterError.onError = (FlutterErrorDetails details) {
+        if (_isDuplicateKeyDownKeyboardAssert(details.exception)) {
+          try {
+            unawaited(HardwareKeyboard.instance.syncKeyboardState());
+            if (!_keyboardAssertRecoveredRecently) {
+              _keyboardAssertRecoveredRecently = true;
+              debugPrint(
+                'Recovered from duplicate KeyDownEvent assert by resetting HardwareKeyboard state.',
+              );
+              Future<void>.delayed(const Duration(seconds: 2), () {
+                _keyboardAssertRecoveredRecently = false;
+              });
+            }
+          } catch (_) {}
+          return;
         }
-      } catch (_) {}
-      return;
-    }
-    if (!_shouldSilenceReleaseWebConsoleErrors()) {
-      FlutterError.presentError(details);
-    }
-    _logClientRuntimeErrorToConsole(
-      'FlutterError caught',
-      details.exception,
-      details.stack,
-    );
-    unawaited(
-      MonitoringService.captureError(
-        details.exception,
-        details.stack,
-        subsystem: 'client',
-        code: 'flutter_error',
-        details: <String, dynamic>{
-          'library': details.library,
-          'context': details.context?.toDescription(),
-        },
-      ),
-    );
-  };
+        if (!_shouldSilenceReleaseWebConsoleErrors()) {
+          FlutterError.presentError(details);
+        }
+        _logClientRuntimeErrorToConsole(
+          'FlutterError caught',
+          details.exception,
+          details.stack,
+        );
+        unawaited(
+          MonitoringService.captureError(
+            details.exception,
+            details.stack,
+            subsystem: 'client',
+            code: 'flutter_error',
+            details: <String, dynamic>{
+              'library': details.library,
+              'context': details.context?.toDescription(),
+            },
+          ),
+        );
+      };
 
-  PlatformDispatcher.instance.onError = (Object error, StackTrace stackTrace) {
-    _logClientRuntimeErrorToConsole(
-      'PlatformDispatcher.onError',
-      error,
-      stackTrace,
-    );
-    unawaited(
-      MonitoringService.captureError(
-        error,
-        stackTrace,
-        subsystem: 'client',
-        code: 'platform_dispatcher_error',
-      ),
-    );
-    return _shouldSilenceReleaseWebConsoleErrors();
-  };
+      PlatformDispatcher.instance.onError =
+          (Object error, StackTrace stackTrace) {
+            _logClientRuntimeErrorToConsole(
+              'PlatformDispatcher.onError',
+              error,
+              stackTrace,
+            );
+            unawaited(
+              MonitoringService.captureError(
+                error,
+                stackTrace,
+                subsystem: 'client',
+                code: 'platform_dispatcher_error',
+              ),
+            );
+            return _shouldSilenceReleaseWebConsoleErrors();
+          };
 
-  ErrorWidget.builder = (FlutterErrorDetails details) {
-    final exception = details.exception;
-    final stack = details.stack;
-    final errorTheme = themeModeNotifier.value == ThemeMode.dark
-        ? _buildDarkTheme()
-        : _buildLightTheme();
-    return MaterialApp(
-      home: Scaffold(
-        body: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.error_outline,
-                  color: errorTheme.colorScheme.error,
-                  size: 64,
+      ErrorWidget.builder = (FlutterErrorDetails details) {
+        final exception = details.exception;
+        final stack = details.stack;
+        final errorTheme = themeModeNotifier.value == ThemeMode.dark
+            ? _buildDarkTheme()
+            : _buildLightTheme();
+        return MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.error_outline,
+                      color: errorTheme.colorScheme.error,
+                      size: 64,
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Произошла ошибка',
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      exception.toString(),
+                      style: TextStyle(color: errorTheme.colorScheme.onSurface),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      stack?.toString() ?? '',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: errorTheme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 12),
-                const Text(
-                  'Произошла ошибка',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  exception.toString(),
-                  style: TextStyle(color: errorTheme.colorScheme.onSurface),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  stack?.toString() ?? '',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: errorTheme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
+          debugShowCheckedModeBanner: false,
+          theme: _buildLightTheme(),
+          darkTheme: _buildDarkTheme(),
+          themeMode: themeModeNotifier.value,
+        );
+      };
+
+      runApp(const DiagnosticBootstrap());
+    },
+    (Object error, StackTrace stackTrace) {
+      _logClientRuntimeErrorToConsole(
+        'Fatal startup zone error',
+        error,
+        stackTrace,
+      );
+      try {
+        StartupBootstrapBridge.showError(
+          'Феникс не смог запуститься. Обновите страницу и попробуйте ещё раз.',
+        );
+      } catch (_) {}
+      unawaited(
+        MonitoringService.captureError(
+          error,
+          stackTrace,
+          subsystem: 'client',
+          code: 'fatal_startup_zone_error',
         ),
-      ),
+      );
+      try {
+        runApp(_FatalStartupFallback(error: error));
+      } catch (_) {}
+    },
+  );
+}
+
+class _FatalStartupFallback extends StatelessWidget {
+  const _FatalStartupFallback({required this.error});
+
+  final Object error;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: _buildLightTheme(),
       darkTheme: _buildDarkTheme(),
       themeMode: themeModeNotifier.value,
+      home: Scaffold(
+        body: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 520),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline_rounded, size: 56),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Феникс не смог запуститься',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Обновите страницу. Если ошибка повторится, сообщите администратору.',
+                    textAlign: TextAlign.center,
+                  ),
+                  if (kDebugMode) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      error.toString(),
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
-  };
-
-  runApp(const DiagnosticBootstrap());
+  }
 }
 
 class DiagnosticBootstrap extends StatefulWidget {
@@ -6614,9 +6699,21 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
       );
     }
 
-    final dbReady = shouldBlockOnServerHealth
-        ? await ensureDatabaseExists()
-        : true;
+    bool dbReady;
+    try {
+      dbReady = shouldBlockOnServerHealth
+          ? await ensureDatabaseExists().timeout(
+              const Duration(seconds: 12),
+              onTimeout: () => false,
+            )
+          : true;
+    } catch (e, st) {
+      debugPrint('DiagnosticBootstrap.ensureDatabaseExists failed: $e\n$st');
+      StartupBootstrapBridge.setStatus(
+        'Сервер временно недоступен. Показываем безопасный экран.',
+      );
+      dbReady = false;
+    }
     if (!shouldBlockOnServerHealth) {
       unawaited(ensureDatabaseExists(attempts: 1));
     }
@@ -6636,7 +6733,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
     }
     _updateSubscriptionUiState();
     unawaited(_probePendingPhoneAccessRequests());
-    await refreshUserPreferences();
 
     debugPrint(
       'DiagnosticBootstrap: initial widget determined: ${initial.runtimeType}',
@@ -6651,7 +6747,6 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
   @override
   Widget build(BuildContext context) {
     if (_home == null) {
-      _markBootstrapReadyAfterFrame();
       return AnimatedBuilder(
         animation: Listenable.merge([
           themeModeNotifier,

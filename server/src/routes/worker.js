@@ -255,6 +255,23 @@ function roundAutoRevisionPrice(originalValue, discountPercent, step = 50, min =
   return Math.max(min, roundedDown);
 }
 
+async function resolveAutoRevisionMinimumPrice(client, user) {
+  const tenantCode = String(user?.tenant_code || '').trim().toLowerCase();
+  if (tenantCode === 'default') return 100;
+
+  const tenantId = String(user?.tenant_id || '').trim();
+  if (!tenantId) return 50;
+
+  const tenantQ = await client.query(
+    `SELECT lower(code) AS code
+     FROM tenants
+     WHERE id = $1::uuid
+     LIMIT 1`,
+    [tenantId],
+  );
+  return String(tenantQ.rows[0]?.code || '').trim() === 'default' ? 100 : 50;
+}
+
 function toShelfNumber(value, fallback = 1) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
@@ -2698,6 +2715,7 @@ router.get(
             },
       );
       const enrichedPosts = await attachProductMediaToRows(client, posts);
+      const autoRevisionMinimumPrice = await resolveAutoRevisionMinimumPrice(client, req.user);
       await client.query('COMMIT');
       try {
         const io = req.app.get('io');
@@ -2722,6 +2740,7 @@ router.get(
           shelf_number: selectedShelfNumber,
           shelves,
           posts: enrichedPosts,
+          auto_revision_minimum_price: autoRevisionMinimumPrice,
         },
       });
     } catch (err) {
@@ -3210,6 +3229,7 @@ router.post(
       const queuedItems = [];
       let reusedPendingCount = 0;
       const hiddenMessagesById = new Map();
+      const autoRevisionMinimumPrice = await resolveAutoRevisionMinimumPrice(client, req.user);
 
       for (const post of keepPosts) {
         const productId = String(post.product_id || '').trim();
@@ -3217,7 +3237,12 @@ router.post(
         const basePrice = Number(post.price || 0);
         if (!Number.isFinite(basePrice) || basePrice <= 0) continue;
 
-        const revisedPrice = roundAutoRevisionPrice(basePrice, discountPercent, 50, 50);
+        const revisedPrice = roundAutoRevisionPrice(
+          basePrice,
+          discountPercent,
+          50,
+          autoRevisionMinimumPrice,
+        );
         const nextQuantity = toPositiveInteger(post.quantity, 1);
         const nextRevisionShelfNumber = toShelfNumber(post.revision_shelf_number, 1);
         const nextProductShelfNumber = toShelfNumber(
