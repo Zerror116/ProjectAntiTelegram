@@ -48,6 +48,18 @@ const CART_RETENTION_ACTIVE_STATUSES = [
   'handing_to_courier',
   'in_delivery',
 ];
+const ACTIVE_DELIVERY_BATCH_STATUSES = [
+  'calling',
+  'couriers_assigned',
+  'handed_off',
+];
+const ACTIVE_DELIVERY_CUSTOMER_STATUSES = [
+  'awaiting_call',
+  'offer_sent',
+  'preparing_delivery',
+  'handing_to_courier',
+  'in_delivery',
+];
 
 const claimsUploadsDir = uploadsPath('claims');
 fs.mkdirSync(claimsUploadsDir, { recursive: true });
@@ -979,10 +991,15 @@ async function adjustCartItemByAdmin(client, { cartItemId, tenantId, requestedQu
   const linkedToDeliveryBatchQ = await client.query(
     `SELECT di.id
      FROM delivery_batch_items di
+     JOIN delivery_batch_customers dbc ON dbc.id = di.batch_customer_id
+     JOIN delivery_batches dbt ON dbt.id = di.batch_id
      WHERE di.cart_item_id = $1
+       AND dbt.status = ANY($2::text[])
+       AND COALESCE(dbc.delivery_status, '') = ANY($3::text[])
+       AND COALESCE(dbc.call_status, '') <> 'removed'
      LIMIT 1
      FOR UPDATE`,
-    [cartItemId],
+    [cartItemId, ACTIVE_DELIVERY_BATCH_STATUSES, ACTIVE_DELIVERY_CUSTOMER_STATUSES],
   );
   if (linkedToDeliveryBatchQ.rowCount > 0) {
     return { ok: false, error: 'in_delivery_batch' };
@@ -2237,14 +2254,19 @@ router.get(
                 EXISTS (
                   SELECT 1
                   FROM delivery_batch_items di
+                  JOIN delivery_batch_customers dbc ON dbc.id = di.batch_customer_id
+                  JOIN delivery_batches dbt ON dbt.id = di.batch_id
                   WHERE di.cart_item_id = c.id
+                    AND dbt.status = ANY($2::text[])
+                    AND COALESCE(dbc.delivery_status, '') = ANY($3::text[])
+                    AND COALESCE(dbc.call_status, '') <> 'removed'
                 ) AS linked_to_delivery
          FROM cart_items c
          JOIN products p ON p.id = c.product_id
          WHERE c.user_id = $1
            AND c.status NOT IN ('delivered', 'cancelled')
          ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC`,
-        [cartOwnerId],
+        [cartOwnerId, ACTIVE_DELIVERY_BATCH_STATUSES, ACTIVE_DELIVERY_CUSTOMER_STATUSES],
       );
 
       const items = itemsQ.rows.map((row) => {
