@@ -665,6 +665,10 @@ List<String> _buildApiBaseCandidates() {
         out.add('$scheme://$candidateHost:$candidatePort$pathPart');
       }
     }
+    if (kReleaseMode) {
+      out.add(_productionPrimaryApiBaseUrl);
+      out.add(_productionWwwApiBaseUrl);
+    }
   }
 
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
@@ -1756,8 +1760,8 @@ String _extractApiErrorMessage(DioException err) {
     final raw = (data['error'] ?? data['message'] ?? '').toString().trim();
     if (raw.isNotEmpty) return raw;
   }
-  if (_isFailedHostLookup(err)) {
-    return 'Не удалось подключиться к серверу: телефон не смог найти garphoenix.com. Проверьте интернет и повторите.';
+  if (_isRecoverableApiConnectivityFailure(err)) {
+    return 'Не удалось подключиться к серверу garphoenix.com. Проверьте интернет и повторите действие.';
   }
   return (err.message ?? '').trim();
 }
@@ -5069,27 +5073,86 @@ Future<Response<dynamic>> _retryRequestWithFreshAuth(
   );
 }
 
+String _dioConnectivityErrorText(DioException err) {
+  return [
+    err.message,
+    err.error,
+  ].whereType<Object>().map((item) => item.toString().toLowerCase()).join('\n');
+}
+
 bool _isFailedHostLookup(DioException err) {
   if (err.type != DioExceptionType.connectionError &&
       err.type != DioExceptionType.unknown) {
     return false;
   }
-  final text = [
-    err.message,
-    err.error,
-  ].whereType<Object>().map((item) => item.toString().toLowerCase()).join('\n');
+  final text = _dioConnectivityErrorText(err);
   return text.contains('failed host lookup') ||
       text.contains('nodename nor servname provided') ||
       text.contains('name or service not known');
 }
 
-String? _fallbackApiBaseForFailedLookup(String rawBaseUrl) {
+bool _isConnectionRefusedLike(DioException err) {
+  if (err.type != DioExceptionType.connectionError &&
+      err.type != DioExceptionType.unknown) {
+    return false;
+  }
+  final text = _dioConnectivityErrorText(err);
+  return text.contains('connection refused') ||
+      text.contains('connection errored') ||
+      text.contains('connection failed') ||
+      text.contains('connection reset') ||
+      text.contains('network is unreachable') ||
+      text.contains('no route to host') ||
+      text.contains('software caused connection abort');
+}
+
+bool _isRecoverableApiConnectivityFailure(DioException err) {
+  if (err.response?.statusCode != null) return false;
+  switch (err.type) {
+    case DioExceptionType.connectionError:
+    case DioExceptionType.unknown:
+      return _isFailedHostLookup(err) || _isConnectionRefusedLike(err);
+    case DioExceptionType.connectionTimeout:
+    case DioExceptionType.sendTimeout:
+    case DioExceptionType.receiveTimeout:
+      return true;
+    case DioExceptionType.badCertificate:
+    case DioExceptionType.badResponse:
+    case DioExceptionType.cancel:
+      return false;
+  }
+}
+
+bool _canRetryRequestAfterConnectivityFailure(
+  RequestOptions requestOptions,
+  DioException err,
+) {
+  if (_isSafeTransientRetryMethod(requestOptions.method)) return true;
+  return _isFailedHostLookup(err) || _isConnectionRefusedLike(err);
+}
+
+String? _fallbackApiBaseForConnectivityFailure(String rawBaseUrl) {
   final normalized = _resolveApiBaseUrl(rawBaseUrl);
   final uri = Uri.tryParse(normalized);
   final host = uri?.host.toLowerCase().trim() ?? '';
   if (host == 'garphoenix.com') return _productionWwwApiBaseUrl;
   if (host == 'www.garphoenix.com') return _productionPrimaryApiBaseUrl;
+  if (kReleaseMode && _isLoopbackApiBase(normalized)) {
+    return _productionPrimaryApiBaseUrl;
+  }
   return null;
+}
+
+@visibleForTesting
+bool debugIsRecoverableApiConnectivityFailureForTesting(DioException err) {
+  return _isRecoverableApiConnectivityFailure(err);
+}
+
+@visibleForTesting
+String? debugFallbackApiBaseForConnectivityFailureForTesting(
+  String rawBaseUrl,
+) {
+  return _fallbackApiBaseForConnectivityFailure(rawBaseUrl);
 }
 
 Future<Response<dynamic>> _retryRequestWithApiBase(
@@ -5099,7 +5162,7 @@ Future<Response<dynamic>> _retryRequestWithApiBase(
   final normalizedBase = _resolveApiBaseUrl(nextBaseUrl);
   final previousBase = _runtimeApiBaseUrl;
   final extra = Map<String, dynamic>.from(requestOptions.extra)
-    ..['host_lookup_retry_attempted'] = true;
+    ..['api_base_connectivity_retry_attempted'] = true;
   final options = Options(
     method: requestOptions.method,
     headers: Map<String, dynamic>.from(requestOptions.headers),
@@ -5312,13 +5375,18 @@ void _attachAuthInterceptor() {
           return handler.next(err);
         }
         if (status == null &&
-            req.extra['host_lookup_retry_attempted'] != true &&
-            _isFailedHostLookup(err)) {
-          final fallbackBase = _fallbackApiBaseForFailedLookup(req.baseUrl);
-          if (fallbackBase != null && fallbackBase != _runtimeApiBaseUrl) {
+            req.extra['api_base_connectivity_retry_attempted'] != true &&
+            _isRecoverableApiConnectivityFailure(err)) {
+          final fallbackBase = _fallbackApiBaseForConnectivityFailure(
+            req.baseUrl,
+          );
+          final requestBase = _resolveApiBaseUrl(req.baseUrl);
+          if (fallbackBase != null &&
+              fallbackBase != requestBase &&
+              _canRetryRequestAfterConnectivityFailure(req, err)) {
             try {
               debugPrint(
-                '_attachAuthInterceptor: host lookup failed for ${req.baseUrl}, retrying via $fallbackBase',
+                '_attachAuthInterceptor: API base connectivity failed for ${req.baseUrl}, retrying via $fallbackBase',
               );
               final retryResponse = await _retryRequestWithApiBase(
                 req,
@@ -5327,7 +5395,7 @@ void _attachAuthInterceptor() {
               return handler.resolve(retryResponse);
             } catch (retryErr, retrySt) {
               debugPrint(
-                '_attachAuthInterceptor: host lookup fallback failed: $retryErr\n$retrySt',
+                '_attachAuthInterceptor: API base connectivity fallback failed: $retryErr\n$retrySt',
               );
             }
           }

@@ -274,10 +274,29 @@ class _WorkerPanelState extends State<WorkerPanel>
         final raw = (data['error'] ?? data['message'] ?? '').toString().trim();
         if (raw.isNotEmpty) return raw;
       }
+      if (_isConnectivityRequestError(error)) {
+        return 'Не удалось подключиться к серверу. Проверьте интернет и повторите действие.';
+      }
       final message = (error.message ?? '').trim();
       if (message.isNotEmpty) return message;
     }
     return error.toString();
+  }
+
+  bool _isConnectivityRequestError(DioException error) {
+    if (error.response?.statusCode != null) return false;
+    switch (error.type) {
+      case DioExceptionType.connectionError:
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.unknown:
+        return true;
+      case DioExceptionType.badCertificate:
+      case DioExceptionType.badResponse:
+      case DioExceptionType.cancel:
+        return false;
+    }
   }
 
   int _resolveShelfNumberFromValue(dynamic value, {int fallback = 1}) {
