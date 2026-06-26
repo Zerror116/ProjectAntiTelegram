@@ -830,6 +830,117 @@ async function resolveTenantByUserEmail(email) {
   return matchedTenant;
 }
 
+async function resolveExistingClientIdentityForInviteJoin({
+  email,
+  password,
+  excludeTenantId,
+}) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail || typeof password !== 'string' || !password) {
+    return null;
+  }
+
+  const excluded = String(excludeTenantId || '').trim();
+  const tenantsById = new Map();
+  try {
+    const indexed = await db.platformQuery(
+      `SELECT t.id,
+              t.code,
+              t.name,
+              t.status,
+              t.subscription_expires_at,
+              t.db_mode,
+              t.db_url,
+              t.db_name,
+              t.db_schema
+       FROM tenant_user_index tui
+       JOIN tenants t ON t.id = tui.tenant_id
+       WHERE lower(tui.email) = $1
+         AND tui.is_active = true
+         AND COALESCE(t.status, 'active') <> 'deleted'
+       ORDER BY tui.updated_at DESC, tui.created_at DESC
+       LIMIT 50`,
+      [normalizedEmail],
+    );
+    for (const row of indexed.rows || []) {
+      const tenantId = String(row?.id || '').trim();
+      if (!tenantId || tenantId === excluded) continue;
+      tenantsById.set(tenantId, row);
+    }
+  } catch (err) {
+    if (String(err?.code || '') !== '42P01') {
+      throw err;
+    }
+  }
+
+  const fallback = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            db_mode,
+            db_url,
+            db_name,
+            db_schema
+     FROM tenants
+     WHERE COALESCE(status, 'active') <> 'deleted'
+     ORDER BY created_at DESC
+     LIMIT 200`,
+  );
+  for (const row of fallback.rows || []) {
+    const tenantId = String(row?.id || '').trim();
+    if (!tenantId || tenantId === excluded || tenantsById.has(tenantId)) {
+      continue;
+    }
+    tenantsById.set(tenantId, row);
+  }
+
+  for (const tenantRow of tenantsById.values()) {
+    try {
+      const matched = await db.runWithTenantRow(tenantRow, async () => {
+        const q = await db.query(
+          `SELECT u.id,
+                  u.email,
+                  u.name,
+                  u.role,
+                  u.password_hash,
+                  u.is_active,
+                  u.block_reason,
+                  u.tenant_id,
+                  p.phone
+           FROM users u
+           LEFT JOIN phones p ON p.user_id = u.id
+           WHERE lower(u.email) = $1
+             AND u.is_active = true
+           ORDER BY u.created_at ASC
+           LIMIT 1`,
+          [normalizedEmail],
+        );
+        const user = q.rows[0];
+        if (!user) return null;
+        const role = String(user.role || '').toLowerCase().trim();
+        if (role !== 'client') return null;
+        const ok = await bcrypt.compare(password, String(user.password_hash || ''));
+        if (!ok) return null;
+        return {
+          tenant: tenantRow,
+          user,
+          phoneDigits: normalizePhoneDigits(user.phone),
+        };
+      });
+      if (matched) return matched;
+    } catch (err) {
+      console.error('auth.joinInvite identity lookup error', {
+        tenant_id: tenantRow?.id || null,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  return null;
+}
+
 async function loadPlatformTenantInviteByCode(normalizedInviteCode) {
   return await db.platformQuery(
     `SELECT i.id,
@@ -2034,6 +2145,341 @@ async function handleInviteResolve(req, res) {
 router.get('/invite/resolve', handleInviteResolve);
 router.get('/invite/resolve/:inviteCode', handleInviteResolve);
 router.post('/invite/resolve', handleInviteResolve);
+
+router.post('/join-invite', async (req, res) => {
+  try {
+    const {
+      email,
+      password,
+      name,
+      phone,
+      device_fingerprint,
+      access_key,
+      invite_code,
+      client_city,
+    } = req.body || {};
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Введите email и пароль' });
+    }
+
+    const normalizedEmail = validator.normalizeEmail(email);
+    if (!normalizedEmail || !validator.isEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Введите корректный email' });
+    }
+    if (typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'Пароль должен быть не менее 8 символов' });
+    }
+    if (normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase()) {
+      return res.status(403).json({ error: 'Создатель переключает группы через профиль' });
+    }
+
+    const requiredDeviceFingerprint = ensureDeviceFingerprint(device_fingerprint);
+    const tenantCodeHint = extractTenantCodeHint(req);
+    const rawInviteCode = normalizeInviteCode(invite_code || access_key);
+    if (!rawInviteCode) {
+      return res.status(400).json({ error: 'Введите код приглашения' });
+    }
+
+    const invite = await resolveTenantInviteByCode(rawInviteCode, {
+      tenantCodeHint,
+    });
+    if (!invite) {
+      return res.status(403).json({ error: 'Код приглашения не найден' });
+    }
+    if (invite.is_active !== true) {
+      return res.status(403).json({ error: 'Ссылка приглашения недействительна' });
+    }
+    if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
+      return res.status(403).json({ error: 'Ссылка приглашения недействительна' });
+    }
+    const maxUses = Number(invite.max_uses);
+    const usedCount = Number(invite.used_count || 0);
+    if (Number.isFinite(maxUses) && maxUses > 0 && usedCount >= maxUses) {
+      return res.status(403).json({ error: 'Ссылка приглашения недействительна' });
+    }
+
+    const tenant = {
+      id: invite.tenant_id,
+      code: invite.tenant_code,
+      name: invite.tenant_name,
+      status: invite.status,
+      subscription_expires_at: invite.subscription_expires_at,
+      db_mode: invite.db_mode || 'shared',
+      db_url: invite.db_url || null,
+      db_name: invite.db_name || null,
+      db_schema: invite.db_schema || null,
+    };
+    const tenantState = isTenantActive(tenant);
+    if (!tenantState.ok) {
+      return res.status(tenantState.reason === 'tenant_expired' ? 402 : 403).json({
+        error: normalizeInvitePublicError(tenantState.error, tenantState.reason),
+      });
+    }
+
+    const clientCityOptions = await getClientCityOptionsForInvite(invite);
+    let clientCity = null;
+    if (clientCityOptions.length > 0) {
+      clientCity = normalizeClientCityFromOptions(clientCityOptions, client_city);
+      if (!clientCity) {
+        return res.status(400).json({ error: 'Выберите город из списка' });
+      }
+    }
+
+    const sourceIdentity = await resolveExistingClientIdentityForInviteJoin({
+      email: normalizedEmail,
+      password,
+      excludeTenantId: tenant.id,
+    });
+
+    const joinInScope = async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        let user = null;
+        let createdUser = false;
+        const existing = await client.query(
+          `SELECT u.id,
+                  u.email,
+                  u.name,
+                  u.role,
+                  u.password_hash,
+                  u.is_active,
+                  u.block_reason,
+                  u.tenant_id,
+                  u.client_city
+           FROM users u
+           WHERE lower(u.email) = $1
+           LIMIT 1`,
+          [normalizedEmail.toLowerCase()],
+        );
+
+        if (existing.rowCount > 0) {
+          user = existing.rows[0];
+          const role = String(user.role || '').toLowerCase().trim();
+          if (role !== 'client') {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 403,
+              error: 'Этот аккаунт не является клиентским',
+            };
+          }
+          const ok = await bcrypt.compare(password, String(user.password_hash || ''));
+          if (!ok) {
+            await client.query('ROLLBACK');
+            return { ok: false, status: 401, error: 'Неверные данные' };
+          }
+          if (user.is_active === false) {
+            await client.query('ROLLBACK');
+            const blockReason = String(user.block_reason || '').trim();
+            return {
+              ok: false,
+              status: 403,
+              error: blockReason || 'Вас заблокировали за нарушение правил',
+            };
+          }
+          if (!user.tenant_id && tenant?.id) {
+            const patched = await client.query(
+              `UPDATE users
+               SET tenant_id = $1
+               WHERE id = $2
+                 AND tenant_id IS NULL
+               RETURNING tenant_id`,
+              [tenant.id, user.id],
+            );
+            if (patched.rowCount > 0) {
+              user.tenant_id = patched.rows[0]?.tenant_id || tenant.id;
+            }
+          }
+          if (
+            tenant?.id &&
+            user.tenant_id &&
+            String(user.tenant_id) !== String(tenant.id)
+          ) {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 409,
+              error:
+                'Этот аккаунт уже привязан к другой группе. Обратитесь к владельцу группы.',
+            };
+          }
+        } else {
+          if (!sourceIdentity?.user?.password_hash) {
+            await client.query('ROLLBACK');
+            return { ok: false, status: 401, error: 'Неверные данные' };
+          }
+
+          await assertDeviceAccountLimit(
+            client,
+            requiredDeviceFingerprint,
+            null,
+            tenant?.id || null,
+          );
+
+          const requestedPhone = normalizePhoneDigits(phone);
+          const inheritedPhone = normalizePhoneDigits(sourceIdentity.phoneDigits);
+          const normalizedPhone = requestedPhone || inheritedPhone;
+          if (phone && requestedPhone.length < 10) {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 400,
+              error: 'Введите корректный номер телефона',
+            };
+          }
+
+          let duplicatePhoneOwner = null;
+          if (tenant?.id && normalizedPhone.length >= 10) {
+            duplicatePhoneOwner = await findOldestPhoneOwner(client, {
+              tenantId: tenant.id,
+              phoneDigits: normalizedPhone,
+            });
+          }
+
+          const insertUser = await client.query(
+            `INSERT INTO users (email, password_hash, name, role, tenant_id, client_city, created_at)
+             VALUES ($1, $2, $3, 'client', $4, $5, now())
+             RETURNING id, email, name, role, tenant_id, client_city`,
+            [
+              normalizedEmail,
+              sourceIdentity.user.password_hash,
+              name || sourceIdentity.user.name || null,
+              tenant?.id || null,
+              clientCity,
+            ],
+          );
+          user = insertUser.rows[0];
+          createdUser = true;
+
+          if (normalizedPhone.length >= 10) {
+            await client.query(
+              `INSERT INTO phones (user_id, phone, status, created_at)
+               VALUES ($1, $2, 'pending_verification', now())
+               ON CONFLICT (user_id) DO UPDATE
+                 SET phone = $2, status = 'pending_verification', created_at = now()`,
+              [user.id, normalizedPhone],
+            );
+            if (
+              duplicatePhoneOwner &&
+              String(duplicatePhoneOwner.id || '') !== String(user.id || '')
+            ) {
+              await createPhoneAccessRequest(client, {
+                tenantId: tenant?.id || null,
+                phoneDigits: normalizedPhone,
+                ownerUserId: duplicatePhoneOwner.id,
+                requesterUserId: user.id,
+              });
+            }
+          }
+        }
+
+        await assertDeviceAccountLimit(
+          client,
+          requiredDeviceFingerprint,
+          user.id,
+          user.tenant_id || tenant?.id || null,
+        );
+        await upsertDevice(client, user.id, requiredDeviceFingerprint);
+
+        const sessionId = uuidv4();
+        const sessionExpiresAt = buildSessionExpiry();
+        const refreshToken = buildRefreshToken(
+          resolveRefreshScopeKey({
+            user,
+            tenant,
+            isPlatformCreator: false,
+          }),
+        );
+        await createUserSession({
+          queryable: client,
+          userId: user.id,
+          sessionId,
+          sessionPublicId: sessionId,
+          refreshTokenHash: hashOpaqueToken(refreshToken),
+          refreshLastUsedAt: new Date(),
+          deviceFingerprint: requiredDeviceFingerprint,
+          userAgent: req.get('user-agent') || '',
+          ipAddress:
+            req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+            req.ip ||
+            '',
+          expiresAt: sessionExpiresAt,
+        });
+
+        await client.query('COMMIT');
+        return {
+          ok: true,
+          user,
+          sessionId,
+          sessionExpiresAt,
+          refreshToken,
+          createdUser,
+        };
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    };
+
+    const result = await db.runWithTenantRow(tenant, joinInScope);
+    if (!result?.ok) {
+      return res.status(result?.status || 500).json({
+        error: result?.error || 'Ошибка сервера',
+      });
+    }
+
+    try {
+      await db.platformQuery(
+        `UPDATE tenant_invites
+         SET used_count = used_count + 1,
+             is_active = CASE
+               WHEN max_uses IS NOT NULL AND used_count + 1 >= max_uses THEN false
+               ELSE is_active
+             END,
+             last_used_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [invite.id],
+      );
+    } catch (err) {
+      console.error('auth.joinInvite usage update error', err);
+    }
+
+    try {
+      await upsertTenantUserIndex({
+        tenantId: result.user?.tenant_id || tenant?.id || null,
+        userId: result.user?.id || null,
+        email: result.user?.email || normalizedEmail,
+        role: result.user?.role || 'client',
+        isActive: true,
+      });
+    } catch (err) {
+      console.error('auth.joinInvite tenantUserIndex error', err);
+    }
+
+    const payload = await buildSuccessfulAuthResponse({
+      req,
+      user: result.user,
+      tenant,
+      sessionId: result.sessionId,
+      refreshToken: result.refreshToken,
+      sessionExpiresAt: result.sessionExpiresAt,
+      isPlatformCreator: false,
+    });
+    payload.joined_existing_account = result.createdUser === true;
+    return res.status(result.createdUser ? 201 : 200).json(payload);
+  } catch (err) {
+    console.error('auth.joinInvite error', err);
+    return res.status(err.statusCode || 500).json({
+      error: err.message || 'Ошибка сервера',
+    });
+  }
+});
 
 /**
  * POST /api/auth/register

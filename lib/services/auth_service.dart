@@ -1339,6 +1339,50 @@ class AuthService {
     };
   }
 
+  Future<Map<String, dynamic>> joinClientGroupByInvite({
+    required String email,
+    required String password,
+    required String inviteCode,
+    String? tenantCode,
+    String? name,
+    String? phone,
+    String? clientCity,
+  }) async {
+    final normalizedTenant = _normalizeTenantCodeScope(tenantCode);
+    if (normalizedTenant.isNotEmpty) {
+      await setTenantCode(normalizedTenant);
+    }
+    final fingerprint = await _getDeviceFingerprintSafe();
+    final resp = await dio.post(
+      '/api/auth/join-invite',
+      data: {
+        'email': email.trim(),
+        'password': password,
+        'invite_code': inviteCode.trim(),
+        'access_key': inviteCode.trim(),
+        if (normalizedTenant.isNotEmpty) 'tenant_code': normalizedTenant,
+        if (name != null && name.trim().isNotEmpty) 'name': name.trim(),
+        if (phone != null && phone.trim().isNotEmpty) 'phone': phone.trim(),
+        if (clientCity != null && clientCity.trim().isNotEmpty)
+          'client_city': clientCity.trim(),
+        'device_fingerprint': fingerprint,
+      },
+    );
+
+    await _processAuthResponse(resp);
+
+    pendingEmail = null;
+    pendingPassword = null;
+    pendingAccessKey = null;
+    pendingRegistrationEmailToken = null;
+    return {
+      'access': resp.data['token'] ?? resp.data['access'],
+      'user': _currentUser?.toMap(),
+      'tenant': resp.data['tenant'],
+      'joined_existing_account': resp.data['joined_existing_account'] == true,
+    };
+  }
+
   Future<Map<String, dynamic>> getTwoFactorStatus() async {
     final resp = await dio.get('/api/auth/2fa/status');
     final data = resp.data;

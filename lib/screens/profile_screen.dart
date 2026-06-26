@@ -68,6 +68,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   bool _passkeyBusy = false;
   bool _switchingSession = false;
   bool _addGroupBusy = false;
+  bool _addGroupSwitchAfterJoin = false;
   bool _creatorTenantsLoading = false;
   bool _creatorTenantScopeBusy = false;
   final _addGroupCodeCtrl = TextEditingController();
@@ -81,18 +82,30 @@ class _ProfileScreenState extends State<ProfileScreen> {
   List<Map<String, dynamic>> _savedTenantSessions = const [];
   List<Map<String, dynamic>> _creatorTenants = const [];
   String _creatorTenantScopeCode = '';
+  String _addGroupTenantHint = '';
+  String _addGroupTenantHintInvite = '';
+  VoidCallback? _pendingClientInviteListener;
 
   @override
   void initState() {
     super.initState();
     _viewMode = authService.viewRole ?? 'creator';
+    _pendingClientInviteListener = _applyPendingClientGroupInvite;
+    pendingClientGroupInviteVersion.addListener(_pendingClientInviteListener!);
     _load();
     _loadPasskeySupport();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _applyPendingClientGroupInvite();
+    });
   }
 
   @override
   void dispose() {
     _tenantClientSearchDebounce?.cancel();
+    final pendingListener = _pendingClientInviteListener;
+    if (pendingListener != null) {
+      pendingClientGroupInviteVersion.removeListener(pendingListener);
+    }
     _addGroupCodeCtrl.dispose();
     _addGroupPasswordCtrl.dispose();
     _tenantClientSearchCtrl.dispose();
@@ -504,6 +517,33 @@ class _ProfileScreenState extends State<ProfileScreen> {
     return {'invite': invite, 'tenant': tenant};
   }
 
+  String _normalizeInviteCode(Object? value) {
+    return value
+            ?.toString()
+            .toUpperCase()
+            .replaceAll(RegExp(r'[^A-Z0-9-]'), '')
+            .trim() ??
+        '';
+  }
+
+  void _applyPendingClientGroupInvite() {
+    if (!mounted || !_isClientAccount) return;
+    final pending = consumePendingClientGroupInvite();
+    if (pending == null) return;
+    final inviteCode = _normalizeInviteCode(pending.inviteCode);
+    if (inviteCode.isEmpty) return;
+    final tenantCode = _normalizeTenantCode(pending.tenantCode);
+    setState(() {
+      _addGroupCodeCtrl.text = inviteCode;
+      _addGroupPasswordCtrl.clear();
+      _addGroupSwitchAfterJoin = true;
+      _addGroupTenantHint = tenantCode;
+      _addGroupTenantHintInvite = inviteCode;
+      _message =
+          'Ссылка приглашения открыта. Введите пароль и добавьте группу.';
+    });
+  }
+
   Future<String> _resolveTenantCodeByInvite(String inviteCode) async {
     final normalized = inviteCode.trim();
     if (normalized.isEmpty) return '';
@@ -525,8 +565,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
     if (_addGroupBusy || !_isClientAccount) return;
 
     final invitePayload = _extractInvitePayload(_addGroupCodeCtrl.text);
-    final inviteCode = (invitePayload['invite'] ?? '').trim();
+    final inviteCode = _normalizeInviteCode(invitePayload['invite']);
     var tenantCode = (invitePayload['tenant'] ?? '').trim().toLowerCase();
+    if (tenantCode.isEmpty && inviteCode == _addGroupTenantHintInvite) {
+      tenantCode = _addGroupTenantHint;
+    }
     final password = _addGroupPasswordCtrl.text.trim();
 
     if (inviteCode.isEmpty) {
@@ -562,48 +605,38 @@ class _ProfileScreenState extends State<ProfileScreen> {
         await authService.setTenantCode(tenantCode);
       }
 
-      var joined = false;
-      try {
-        await authService.register(
-          email: email,
-          password: password,
-          name: name.isEmpty ? null : name,
-          phone: phone.isEmpty ? null : phone,
-          accessKey: inviteCode,
-        );
-        joined = true;
-      } catch (e) {
-        final text = _extractDioMessage(e).toLowerCase();
-        final alreadyRegistered =
-            text.contains('email already registered') ||
-            text.contains('уже зарегистр');
-        if (alreadyRegistered && tenantCode.isNotEmpty) {
-          await authService.login(email: email, password: password);
-          joined = true;
-        } else {
-          rethrow;
-        }
-      }
-
-      if (!joined) {
-        throw Exception('Не удалось добавить группу');
-      }
+      await authService.joinClientGroupByInvite(
+        email: email,
+        password: password,
+        inviteCode: inviteCode,
+        tenantCode: tenantCode,
+        name: name.isEmpty ? null : name,
+        phone: phone.isEmpty ? null : phone,
+      );
 
       var switchedBack = true;
-      if (previousSessionId.isNotEmpty) {
+      if (!_addGroupSwitchAfterJoin && previousSessionId.isNotEmpty) {
         switchedBack = await authService.switchToSavedTenantSession(
           previousSessionId,
         );
       }
-      if (previousTenantCode.isNotEmpty) {
+      if (!_addGroupSwitchAfterJoin && previousTenantCode.isNotEmpty) {
         await authService.setTenantCode(previousTenantCode);
       }
 
       _addGroupCodeCtrl.clear();
       _addGroupPasswordCtrl.clear();
+      _addGroupTenantHint = '';
+      _addGroupTenantHintInvite = '';
       await _loadSavedSessions();
       await _load();
       if (!mounted) return;
+      if (_addGroupSwitchAfterJoin) {
+        Navigator.of(
+          context,
+        ).pushNamedAndRemoveUntil('/main', (route) => false);
+        return;
+      }
       setState(() {
         _message = switchedBack
             ? 'Группа добавлена. Теперь можно переключаться в "Мои группы".'
@@ -2111,6 +2144,23 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               controller: _addGroupPasswordCtrl,
                             ),
                           ),
+                          CheckboxListTile(
+                            dense: true,
+                            contentPadding: EdgeInsets.zero,
+                            value: _addGroupSwitchAfterJoin,
+                            onChanged: _addGroupBusy
+                                ? null
+                                : (value) {
+                                    setState(
+                                      () => _addGroupSwitchAfterJoin =
+                                          value == true,
+                                    );
+                                  },
+                            title: const Text('Сразу перейти в эту группу'),
+                            subtitle: const Text(
+                              'Если выключено, группа просто появится в списке ниже.',
+                            ),
+                          ),
                           const SizedBox(height: 10),
                           SizedBox(
                             width: double.infinity,
@@ -2130,7 +2180,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               label: Text(
                                 _addGroupBusy
                                     ? 'Добавление...'
-                                    : 'Добавить группу',
+                                    : (_addGroupSwitchAfterJoin
+                                          ? 'Добавить и перейти'
+                                          : 'Добавить группу'),
                               ),
                             ),
                           ),

@@ -20,6 +20,7 @@ import 'screens/main_shell.dart';
 import 'services/auth_service.dart';
 import 'services/android_update_report_service.dart';
 import 'services/app_audio_session_service.dart';
+import 'services/deep_link_service.dart';
 import 'services/input_language_service.dart';
 import 'services/native_push_service.dart';
 import 'services/native_update_installer.dart';
@@ -829,6 +830,53 @@ final ValueNotifier<Set<String>> _supportQueueDismissedNotifier =
 final ValueNotifier<String> activeShellSectionNotifier = ValueNotifier<String>(
   '',
 );
+final ValueNotifier<int> pendingClientGroupInviteVersion = ValueNotifier<int>(
+  0,
+);
+
+class PendingClientGroupInvite {
+  const PendingClientGroupInvite({
+    required this.inviteCode,
+    this.tenantCode = '',
+    this.source = '',
+  });
+
+  final String inviteCode;
+  final String tenantCode;
+  final String source;
+}
+
+PendingClientGroupInvite? _pendingClientGroupInvite;
+String _lastQueuedClientGroupInviteKey = '';
+
+PendingClientGroupInvite? peekPendingClientGroupInvite() {
+  return _pendingClientGroupInvite;
+}
+
+PendingClientGroupInvite? consumePendingClientGroupInvite() {
+  final pending = _pendingClientGroupInvite;
+  _pendingClientGroupInvite = null;
+  return pending;
+}
+
+void queuePendingClientGroupInvite(PendingClientGroupInvite pending) {
+  final invite = pending.inviteCode.trim();
+  if (invite.isEmpty) return;
+  final tenant = pending.tenantCode.trim().toLowerCase();
+  final key = '$tenant::$invite';
+  if (key == _lastQueuedClientGroupInviteKey &&
+      _pendingClientGroupInvite != null) {
+    return;
+  }
+  _lastQueuedClientGroupInviteKey = key;
+  _pendingClientGroupInvite = PendingClientGroupInvite(
+    inviteCode: invite,
+    tenantCode: tenant,
+    source: pending.source,
+  );
+  pendingClientGroupInviteVersion.value += 1;
+  activeShellSectionNotifier.value = 'profile';
+}
 
 bool _canCurrentUserObserveSupportQueueAlerts() {
   final user = authService.currentUser;
@@ -5860,6 +5908,108 @@ Future<void> _initSocket() async {
   }
 }
 
+String _normalizeClientInviteCode(String raw) {
+  return raw.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9-]'), '').trim();
+}
+
+String _normalizeClientInviteTenantCode(String raw) {
+  final value = raw.trim().toLowerCase();
+  if (value.isEmpty) return '';
+  if (!RegExp(r'^[a-z0-9][a-z0-9_-]{1,63}$').hasMatch(value)) return '';
+  return value;
+}
+
+PendingClientGroupInvite? _extractClientGroupInviteFromUri(
+  Uri uri, {
+  String source = '',
+}) {
+  try {
+    var invite = '';
+    var tenant = '';
+    final pathSegments = uri.pathSegments
+        .map((segment) => Uri.decodeComponent(segment).trim())
+        .where((segment) => segment.isNotEmpty)
+        .toList();
+    if (uri.scheme.toLowerCase() == 'phoenix' &&
+        uri.host.toLowerCase() == 'join' &&
+        pathSegments.isNotEmpty) {
+      invite = pathSegments.first;
+    }
+    final joinIndex = pathSegments.indexWhere(
+      (segment) => segment.toLowerCase() == 'join',
+    );
+    if (invite.isEmpty &&
+        joinIndex >= 0 &&
+        joinIndex + 1 < pathSegments.length) {
+      invite = pathSegments[joinIndex + 1];
+    }
+    if (invite.isEmpty) {
+      invite =
+          uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '';
+    }
+    tenant =
+        uri.queryParameters['tenant'] ??
+        uri.queryParameters['tenant_code'] ??
+        '';
+    if (uri.fragment.isNotEmpty) {
+      final fragment = uri.fragment;
+      final qIndex = fragment.indexOf('?');
+      if (qIndex >= 0 && qIndex + 1 < fragment.length) {
+        final inFragment = Uri.splitQueryString(fragment.substring(qIndex + 1));
+        if (invite.isEmpty) {
+          invite = inFragment['invite'] ?? inFragment['code'] ?? '';
+        }
+        if (tenant.isEmpty) {
+          tenant = inFragment['tenant'] ?? inFragment['tenant_code'] ?? '';
+        }
+      }
+    }
+    final normalizedInvite = _normalizeClientInviteCode(invite);
+    if (!normalizedInvite.startsWith('INV-')) return null;
+    return PendingClientGroupInvite(
+      inviteCode: normalizedInvite,
+      tenantCode: _normalizeClientInviteTenantCode(tenant),
+      source: source,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+bool _canQueueClientGroupInviteForCurrentUser() {
+  final user = authService.currentUser;
+  if (user == null) return false;
+  return user.role.toLowerCase().trim() == 'client';
+}
+
+void _queueClientGroupInviteFromUri(Uri uri, {String source = ''}) {
+  if (!_canQueueClientGroupInviteForCurrentUser()) return;
+  final pending = _extractClientGroupInviteFromUri(uri, source: source);
+  if (pending == null) return;
+  queuePendingClientGroupInvite(pending);
+}
+
+Future<void> _queueInitialClientGroupInviteIfNeeded() async {
+  if (!_canQueueClientGroupInviteForCurrentUser()) return;
+  if (kIsWeb) {
+    _queueClientGroupInviteFromUri(Uri.base, source: 'web-startup');
+    return;
+  }
+  final uri =
+      await DeepLinkService.getInitialUri() ??
+      await DeepLinkService.consumeLatestUri();
+  if (uri == null) return;
+  _queueClientGroupInviteFromUri(uri, source: 'native-startup');
+}
+
+Future<void> _queueLatestClientGroupInviteIfNeeded() async {
+  if (!_canQueueClientGroupInviteForCurrentUser()) return;
+  if (kIsWeb) return;
+  final uri = await DeepLinkService.consumeLatestUri();
+  if (uri == null) return;
+  _queueClientGroupInviteFromUri(uri, source: 'native-resume');
+}
+
 Widget _buildInitialScreenFromRestoredUser(User? restoredUser) {
   if (restoredUser == null) {
     return const MainShell();
@@ -5920,6 +6070,7 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
           authService.currentUser != null &&
           !authService.lastStartupRefreshUsedFallback) {
         _handlingAuthFailure = false;
+        await _queueInitialClientGroupInviteIfNeeded();
         return _buildInitialScreenFromRestoredUser(authService.currentUser);
       }
       debugPrint(
@@ -5933,6 +6084,7 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
     );
     unawaited(authService.tryRefreshOnStartup());
     _handlingAuthFailure = false;
+    await _queueInitialClientGroupInviteIfNeeded();
     return _buildInitialScreenFromRestoredUser(localUser);
   }
 
@@ -5952,6 +6104,7 @@ Future<Widget> determineInitialScreen(bool dbReady) async {
 
   if (logged) {
     _handlingAuthFailure = false;
+    await _queueInitialClientGroupInviteIfNeeded();
   }
 
   if (!logged) {
@@ -6277,6 +6430,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
     if (state != AppLifecycleState.resumed) return;
     if (authService.currentUser == null) return;
     unawaited(refreshNotificationBadgeCount());
+    unawaited(_queueLatestClientGroupInviteIfNeeded());
   }
 
   void _restartSubscriptionProbe() {

@@ -1313,12 +1313,28 @@ class _AuthScreenState extends State<AuthScreen> {
           });
           return;
         }
+        final isClientInviteRegistration = _looksLikeInviteCode(accessKey);
         if (!_emailRecoveryStatusLoaded) {
           await _loadEmailRecoveryAvailability();
         }
         // Сначала проверяем, занят ли email
         final exists = await _checkEmailExists(email);
         if (exists) {
+          if (isClientInviteRegistration) {
+            await _authService.joinClientGroupByInvite(
+              email: email,
+              password: password,
+              inviteCode: accessKey,
+              tenantCode: _tenantCodeFromLink,
+              name: _nameController.text.trim(),
+              phone: _phoneController.text.trim(),
+              clientCity: requiredCities.isNotEmpty
+                  ? _selectedClientCity.trim()
+                  : null,
+            );
+            await _navigateAfterSuccessfulAuth();
+            return;
+          }
           setState(() {
             _message = 'Email уже занят';
             _loading = false;
@@ -1804,6 +1820,11 @@ class _AuthScreenState extends State<AuthScreen> {
                                   ),
                                   validator: (v) {
                                     if (!_isRegister) return null;
+                                    if (_looksLikeInviteCode(
+                                      _accessKeyController.text,
+                                    )) {
+                                      return null;
+                                    }
                                     if ((v ?? '').trim().length < 2) {
                                       return 'Введите имя';
                                     }
@@ -1823,6 +1844,11 @@ class _AuthScreenState extends State<AuthScreen> {
                                   keyboardType: TextInputType.phone,
                                   validator: (v) {
                                     if (!_isRegister) return null;
+                                    if (_looksLikeInviteCode(
+                                      _accessKeyController.text,
+                                    )) {
+                                      return null;
+                                    }
                                     final digits = (v ?? '').replaceAll(
                                       RegExp(r'\D+'),
                                       '',

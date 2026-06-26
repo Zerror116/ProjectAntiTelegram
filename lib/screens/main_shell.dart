@@ -78,6 +78,17 @@ class _MainShellState extends State<MainShell> {
     _lastEffectiveRole = authService.effectiveRole;
     _lastCreatorTenantScope = authService.creatorTenantScopeCode ?? '';
     final initialIds = _destinationIdsForRole(_lastEffectiveRole);
+    final hasPendingClientInvite =
+        peekPendingClientGroupInvite() != null &&
+        ((authService.currentUser?.role ?? '').toLowerCase().trim() ==
+            'client');
+    if (hasPendingClientInvite) {
+      final profileIndex = initialIds.indexOf('profile');
+      if (profileIndex >= 0) {
+        _index = profileIndex;
+        _activatedDestinations.add('profile');
+      }
+    }
     if (initialIds.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
