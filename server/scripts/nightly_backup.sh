@@ -33,6 +33,17 @@ LAST_LINK="$STORAGE_DIR/latest"
 
 mkdir -p "$PG_DIR" "$STORAGE_DIR"
 
+cleanup_tmp_storage() {
+  if [[ -n "${TMP_STORAGE_DIR:-}" && -d "$TMP_STORAGE_DIR" ]]; then
+    rm -rf "$TMP_STORAGE_DIR"
+  fi
+}
+
+trap cleanup_tmp_storage ERR INT TERM
+
+# Failed rsync runs can leave a full temporary copy and fill the 40G system disk.
+find "$STORAGE_DIR" -mindepth 1 -maxdepth 1 -type d -name '.tmp-*' -mtime +0 -exec rm -rf {} + || true
+
 echo "[nightly_backup] postgres dump -> $PG_DIR/$TIMESTAMP.dump"
 DATABASE_NAME="$(extract_database_name "$DATABASE_URL_VALUE")"
 if command -v sudo >/dev/null 2>&1 && id postgres >/dev/null 2>&1 && sudo -u postgres psql -d "$DATABASE_NAME" -Atqc 'select 1' >/dev/null 2>&1; then
@@ -48,11 +59,13 @@ echo "[nightly_backup] storage snapshot -> $FINAL_STORAGE_DIR"
 mkdir -p "$TMP_STORAGE_DIR"
 if [[ -L "$LAST_LINK" && -d "$(readlink "$LAST_LINK")" ]]; then
   PREVIOUS="$(readlink "$LAST_LINK")"
-  rsync -a --delete --link-dest="$PREVIOUS" "$STORAGE_ROOT/" "$TMP_STORAGE_DIR/"
+  rsync -a --delete --exclude '/downloads/' --link-dest="$PREVIOUS" "$STORAGE_ROOT/" "$TMP_STORAGE_DIR/"
 else
-  rsync -a --delete "$STORAGE_ROOT/" "$TMP_STORAGE_DIR/"
+  rsync -a --delete --exclude '/downloads/' "$STORAGE_ROOT/" "$TMP_STORAGE_DIR/"
 fi
 mv "$TMP_STORAGE_DIR" "$FINAL_STORAGE_DIR"
+# rsync -a preserves the source directory mtime; keep retention based on snapshot time.
+touch "$FINAL_STORAGE_DIR"
 ln -sfn "$FINAL_STORAGE_DIR" "$LAST_LINK"
 
 echo "[nightly_backup] retention keep_days=$KEEP_DAYS"
