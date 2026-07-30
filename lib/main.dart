@@ -875,7 +875,7 @@ void queuePendingClientGroupInvite(PendingClientGroupInvite pending) {
     source: pending.source,
   );
   pendingClientGroupInviteVersion.value += 1;
-  activeShellSectionNotifier.value = 'profile';
+  activeShellSectionNotifier.value = 'groups';
 }
 
 bool _canCurrentUserObserveSupportQueueAlerts() {

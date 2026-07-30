@@ -199,6 +199,43 @@ class _WorkerPanelState extends State<WorkerPanel>
     return 'не назначена';
   }
 
+  String _revisionShelfKeyOf(Map<String, dynamic> item) {
+    final explicit = (item['shelf_key'] ?? item['revision_shelf_key'] ?? '')
+        .toString()
+        .trim();
+    if (explicit.isNotEmpty) return explicit;
+    final shelf = _toIntValue(item['shelf_number'], 0);
+    return shelf > 0 ? shelf.toString() : '';
+  }
+
+  String _revisionShelfLabelOf(Map<String, dynamic> item) {
+    final label =
+        (item['shelf_label'] ?? item['revision_shelf_label'] ?? '')
+            .toString()
+            .trim();
+    if (label.isNotEmpty) return label;
+    final shelf = _toIntValue(item['shelf_number'], 0);
+    return shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+  }
+
+  String _revisionShelfDisplayOfPost(Map<String, dynamic> post) {
+    final label =
+        (post['revision_shelf_label'] ??
+                post['shelf_label'] ??
+                post['manual_shelf_label'] ??
+                '')
+            .toString()
+            .trim();
+    if (label.isNotEmpty) return label;
+    final shelf = _toIntValue(
+      post['revision_shelf_number'] ??
+          post['shelf_number'] ??
+          post['source_product_shelf_number'],
+      0,
+    );
+    return shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
+  }
+
   bool get _manualShelfEnabled =>
       _toBoolValue(_tenantFeatureSettings['manual_shelf_enabled']);
 
@@ -381,6 +418,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   Map<String, dynamic> _tenantFeatureSettings = <String, dynamic>{};
   Map<String, dynamic>? _deliveryActiveBatch;
   int? _selectedRevisionShelfNumber;
+  String? _selectedRevisionShelfKey;
   int _autoRevisionMinimumPrice = 50;
   bool _pickupOnly = false;
   bool _isBulkyProduct = false;
@@ -990,10 +1028,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (!hasImage) {
       return 'Добавьте фото товара';
     }
-    if (description.isEmpty) {
-      return 'Введите описание товара';
-    }
-    if (_countLetterRunes(description) < 2) {
+    if (description.isNotEmpty && _countLetterRunes(description) < 2) {
       return 'Описание должно содержать минимум 2 буквы, а не только цифры';
     }
     if (price == null || price <= 0) {
@@ -1554,33 +1589,45 @@ class _WorkerPanelState extends State<WorkerPanel>
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is List) {
         final shelves = List<Map<String, dynamic>>.from(data['data']);
-        final availableShelves = shelves
-            .map((e) => _toIntValue(e['shelf_number'], 0))
-            .where((e) => e >= 1 && e <= 10)
+        final availableShelfKeys = shelves
+            .map(_revisionShelfKeyOf)
+            .where((e) => e.isNotEmpty)
             .toList();
         final firstWithPosts = shelves
             .where((e) => _toIntValue(e['posts'], 0) > 0)
-            .map((e) => _toIntValue(e['shelf_number'], 0))
-            .where((e) => e >= 1 && e <= 10)
-            .cast<int?>()
+            .map(_revisionShelfKeyOf)
+            .where((e) => e.isNotEmpty)
+            .cast<String?>()
             .firstWhere((_) => true, orElse: () => null);
-        final nextSelected =
-            (_selectedRevisionShelfNumber != null &&
-                availableShelves.contains(_selectedRevisionShelfNumber))
-            ? _selectedRevisionShelfNumber
+        final nextSelectedKey =
+            (_selectedRevisionShelfKey != null &&
+                availableShelfKeys.contains(_selectedRevisionShelfKey))
+            ? _selectedRevisionShelfKey
             : (firstWithPosts ??
-                  (availableShelves.isNotEmpty ? availableShelves.first : 1));
+                  (availableShelfKeys.isNotEmpty
+                      ? availableShelfKeys.first
+                      : null));
+        final selectedRow = nextSelectedKey == null
+            ? null
+            : shelves
+                  .where((item) => _revisionShelfKeyOf(item) == nextSelectedKey)
+                  .cast<Map<String, dynamic>?>()
+                  .firstWhere((_) => true, orElse: () => null);
         if (!mounted) return;
         setState(() {
           _revisionShelves = shelves;
-          _selectedRevisionShelfNumber = nextSelected;
+          _selectedRevisionShelfKey = nextSelectedKey;
+          _selectedRevisionShelfNumber = selectedRow == null
+              ? null
+              : _toIntValue(selectedRow['shelf_number'], 0);
         });
         await _loadRevisionPosts();
       } else {
         if (!mounted) return;
         setState(() {
           _revisionShelves = [];
-          _selectedRevisionShelfNumber = 1;
+          _selectedRevisionShelfKey = null;
+          _selectedRevisionShelfNumber = null;
           _revisionPosts = [];
         });
       }
@@ -1610,12 +1657,16 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _loadingRevisionPosts = true);
     }
     try {
+      final selectedKey = (_selectedRevisionShelfKey ?? '').trim();
       final selected = _selectedRevisionShelfNumber ?? 1;
       final productSearch = _revisionProductIdSearchCtrl.text.trim();
       final resp = await authService.dio.get(
         '/api/worker/revision/posts',
         queryParameters: {
-          'shelf_number': selected,
+          if (_manualShelfEnabled && selectedKey.isNotEmpty)
+            'shelf_key': selectedKey,
+          if (!_manualShelfEnabled || selectedKey.isEmpty)
+            'shelf_number': selected,
           if (productSearch.isNotEmpty) 'product_id': productSearch,
         },
       );
@@ -1625,18 +1676,27 @@ class _WorkerPanelState extends State<WorkerPanel>
         final posts = payload['posts'] is List
             ? List<Map<String, dynamic>>.from(payload['posts'])
             : <Map<String, dynamic>>[];
+        final responseShelfKey =
+            (payload['shelf_key'] ?? payload['revision_shelf_key'] ?? '')
+                .toString()
+                .trim();
         final responseShelf = _toIntValue(payload['shelf_number'], selected);
         final minimumPrice = _toIntValue(
           payload['auto_revision_minimum_price'],
           50,
         );
-        final nextSelected = responseShelf >= 1 && responseShelf <= 10
-            ? responseShelf
-            : selected;
+        final nextSelectedKey = responseShelfKey.isNotEmpty
+            ? responseShelfKey
+            : selectedKey;
         if (!mounted) return;
         setState(() {
           _revisionPosts = posts;
-          _selectedRevisionShelfNumber = nextSelected;
+          _selectedRevisionShelfKey = nextSelectedKey.isEmpty
+              ? _selectedRevisionShelfKey
+              : nextSelectedKey;
+          _selectedRevisionShelfNumber = responseShelf > 0
+              ? responseShelf
+              : _selectedRevisionShelfNumber;
           _autoRevisionMinimumPrice = minimumPrice < 1 ? 50 : minimumPrice;
         });
       } else {
@@ -1653,14 +1713,19 @@ class _WorkerPanelState extends State<WorkerPanel>
     }
   }
 
-  int _revisionShelfOf(Map<String, dynamic> post) {
+  String _revisionShelfKeyOfPost(Map<String, dynamic> post) {
+    final explicit =
+        (post['revision_shelf_key'] ?? post['shelf_key'] ?? '')
+            .toString()
+            .trim();
+    if (explicit.isNotEmpty) return explicit;
     final shelf = _toIntValue(
       post['revision_shelf_number'] ??
           post['shelf_number'] ??
           post['source_product_shelf_number'],
       0,
     );
-    return shelf >= 1 && shelf <= 10 ? shelf : 0;
+    return shelf > 0 ? shelf.toString() : '';
   }
 
   bool _isRevisionBlocked(Map<String, dynamic> post) {
@@ -1692,38 +1757,45 @@ class _WorkerPanelState extends State<WorkerPanel>
           ),
         )
         .toList();
-    final countsByShelf = <int, int>{};
+    final countsByShelf = <String, int>{};
     for (final post in remainingPosts) {
-      final shelf = _revisionShelfOf(post);
-      if (shelf <= 0) continue;
+      final shelf = _revisionShelfKeyOfPost(post);
+      if (shelf.isEmpty) continue;
       countsByShelf.update(shelf, (value) => value + 1, ifAbsent: () => 1);
     }
 
     final nextShelves = <Map<String, dynamic>>[];
     for (final item in _revisionShelves) {
       final copy = Map<String, dynamic>.from(item);
-      final shelf = _toIntValue(copy['shelf_number'], 0);
+      final shelf = _revisionShelfKeyOf(copy);
       final nextCount = countsByShelf[shelf] ?? 0;
       copy['posts'] = nextCount;
       nextShelves.add(copy);
     }
 
     final nextSelected =
-        (_selectedRevisionShelfNumber != null &&
+        (_selectedRevisionShelfKey != null &&
             nextShelves.any(
-              (item) =>
-                  _toIntValue(item['shelf_number'], 0) ==
-                  _selectedRevisionShelfNumber,
+              (item) => _revisionShelfKeyOf(item) == _selectedRevisionShelfKey,
             ))
-        ? _selectedRevisionShelfNumber
+        ? _selectedRevisionShelfKey
         : (nextShelves.isNotEmpty
-              ? _toIntValue(nextShelves.first['shelf_number'], 1)
-              : 1);
+              ? _revisionShelfKeyOf(nextShelves.first)
+              : null);
+    final selectedRow = nextSelected == null
+        ? null
+        : nextShelves
+              .where((item) => _revisionShelfKeyOf(item) == nextSelected)
+              .cast<Map<String, dynamic>?>()
+              .firstWhere((_) => true, orElse: () => null);
 
     setState(() {
       _revisionPosts = remainingPosts;
       _revisionShelves = nextShelves;
-      _selectedRevisionShelfNumber = nextSelected;
+      _selectedRevisionShelfKey = nextSelected;
+      _selectedRevisionShelfNumber = selectedRow == null
+          ? null
+          : _toIntValue(selectedRow['shelf_number'], 0);
     });
   }
 
@@ -1787,11 +1859,21 @@ class _WorkerPanelState extends State<WorkerPanel>
     setState(() => _ownQueuedPosts = nextItems);
   }
 
-  Future<void> _selectRevisionShelf(int shelfNumber) async {
-    if (shelfNumber < 1 || shelfNumber > 10) return;
-    if (_selectedRevisionShelfNumber == shelfNumber) return;
+  Future<void> _selectRevisionShelf(String shelfKey) async {
+    final normalizedKey = shelfKey.trim();
+    if (normalizedKey.isEmpty) return;
+    if (_selectedRevisionShelfKey == normalizedKey) return;
     if (!mounted) return;
-    setState(() => _selectedRevisionShelfNumber = shelfNumber);
+    final selectedRow = _revisionShelves
+        .where((item) => _revisionShelfKeyOf(item) == normalizedKey)
+        .cast<Map<String, dynamic>?>()
+        .firstWhere((_) => true, orElse: () => null);
+    setState(() {
+      _selectedRevisionShelfKey = normalizedKey;
+      _selectedRevisionShelfNumber = selectedRow == null
+          ? null
+          : _toIntValue(selectedRow['shelf_number'], 0);
+    });
     await _loadRevisionPosts();
   }
 
@@ -1809,8 +1891,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       return;
     }
     final percent = enteredPercent.abs();
+    final selectedShelfKey = (_selectedRevisionShelfKey ?? '').trim();
     final selectedShelf = _selectedRevisionShelfNumber ?? 0;
-    if (selectedShelf < 1 || selectedShelf > 10) {
+    if (selectedShelfKey.isEmpty && selectedShelf <= 0) {
       setState(() => _message = 'Выберите полку ревизии');
       return;
     }
@@ -1844,7 +1927,10 @@ class _WorkerPanelState extends State<WorkerPanel>
       final resp = await authService.dio.post(
         '/api/worker/revision/auto',
         data: {
-          'shelf_number': selectedShelf,
+          if (_manualShelfEnabled && selectedShelfKey.isNotEmpty)
+            'shelf_key': selectedShelfKey,
+          if (!_manualShelfEnabled || selectedShelfKey.isEmpty)
+            'shelf_number': selectedShelf,
           'percent': percent,
           'hide_old_versions': _autoHideOldRevisionPosts,
         },
@@ -1975,7 +2061,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                         maxLines: 5,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
-                            labelText: 'Описание',
+                            labelText: 'Описание (необязательно)',
                             border: OutlineInputBorder(),
                           ),
                           controller: descriptionCtrl,
@@ -2152,6 +2238,12 @@ class _WorkerPanelState extends State<WorkerPanel>
             post['shelf_number'],
         'revision_shelf_number':
             post['revision_shelf_number'] ?? post['shelf_number'],
+        'revision_shelf_key':
+            (post['revision_shelf_key'] ?? post['shelf_key'] ?? '')
+                .toString(),
+        'revision_shelf_label': _revisionShelfDisplayOfPost(post),
+        'manual_shelf_label': (post['manual_shelf_label'] ?? '').toString(),
+        'shelf_floor': (post['shelf_floor'] ?? '').toString(),
         'image_url': revisionImage == null ? existingRevisionImageUrl : '',
       };
       final Object requestData;
@@ -2972,7 +3064,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                 maxLines: 5,
                 decoration: withInputLanguageBadge(
                   const InputDecoration(
-                    labelText: 'Описание',
+                    labelText: 'Описание (необязательно)',
                     border: OutlineInputBorder(),
                   ),
                   controller: _descriptionCtrl,
@@ -3356,92 +3448,218 @@ class _WorkerPanelState extends State<WorkerPanel>
     final quantityCtrl = TextEditingController(
       text: (post['product_quantity'] ?? '1').toString(),
     );
+    final manualShelfLabelCtrl = TextEditingController(
+      text: (post['manual_shelf_label'] ?? '').toString(),
+    );
+    final shelfFloorCtrl = TextEditingController(
+      text: (post['shelf_floor'] ?? '').toString(),
+    );
+    _RevisionPickedImage? pickedImage;
 
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Изменить свой пост'),
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 520),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: titleCtrl,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Название товара',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: titleCtrl,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: descriptionCtrl,
-                  minLines: 3,
-                  maxLines: 5,
-                  decoration: withInputLanguageBadge(
-                    const InputDecoration(
-                      labelText: 'Описание',
-                      border: OutlineInputBorder(),
-                    ),
-                    controller: descriptionCtrl,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 12,
-                  runSpacing: 12,
-                  children: [
-                    SizedBox(
-                      width: 180,
-                      child: TextField(
-                        controller: priceCtrl,
-                        keyboardType: const TextInputType.numberWithOptions(
-                          decimal: true,
-                        ),
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final theme = Theme.of(context);
+            final resolvedExistingImage = _resolveImageUrl(
+              (post['product_image_url'] ?? '').toString(),
+            );
+            final hasSelectedImage = pickedImage != null;
+            final hasImage = hasSelectedImage || resolvedExistingImage != null;
+            return AlertDialog(
+              title: const Text('Изменить свой пост'),
+              content: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 560),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      TextField(
+                        controller: titleCtrl,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
-                            labelText: 'Цена',
+                            labelText: 'Название товара',
                             border: OutlineInputBorder(),
                           ),
-                          controller: priceCtrl,
+                          controller: titleCtrl,
                         ),
                       ),
-                    ),
-                    SizedBox(
-                      width: 140,
-                      child: TextField(
-                        controller: quantityCtrl,
-                        keyboardType: TextInputType.number,
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: descriptionCtrl,
+                        minLines: 3,
+                        maxLines: 5,
                         decoration: withInputLanguageBadge(
                           const InputDecoration(
-                            labelText: 'Кол-во',
+                            labelText: 'Описание (необязательно)',
                             border: OutlineInputBorder(),
                           ),
-                          controller: quantityCtrl,
+                          controller: descriptionCtrl,
                         ),
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 12,
+                        runSpacing: 12,
+                        children: [
+                          SizedBox(
+                            width: 180,
+                            child: TextField(
+                              controller: priceCtrl,
+                              keyboardType:
+                                  const TextInputType.numberWithOptions(
+                                    decimal: true,
+                                  ),
+                              decoration: withInputLanguageBadge(
+                                const InputDecoration(
+                                  labelText: 'Цена',
+                                  border: OutlineInputBorder(),
+                                ),
+                                controller: priceCtrl,
+                              ),
+                            ),
+                          ),
+                          SizedBox(
+                            width: 140,
+                            child: TextField(
+                              controller: quantityCtrl,
+                              keyboardType: TextInputType.number,
+                              decoration: withInputLanguageBadge(
+                                const InputDecoration(
+                                  labelText: 'Кол-во',
+                                  border: OutlineInputBorder(),
+                                ),
+                                controller: quantityCtrl,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (_manualShelfEnabled) ...[
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: manualShelfLabelCtrl,
+                                decoration: withInputLanguageBadge(
+                                  InputDecoration(
+                                    labelText: _placementShelfInputLabel,
+                                    hintText: _placementShelfInputHint,
+                                    border: const OutlineInputBorder(),
+                                  ),
+                                  controller: manualShelfLabelCtrl,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: TextField(
+                                controller: shelfFloorCtrl,
+                                decoration: withInputLanguageBadge(
+                                  InputDecoration(
+                                    labelText: _placementBoxInputLabel,
+                                    hintText: _placementBoxInputHint,
+                                    border: const OutlineInputBorder(),
+                                  ),
+                                  controller: shelfFloorCtrl,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                      const SizedBox(height: 16),
+                      Text(
+                        'Фото товара',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      if (pickedImage != null)
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: SizedBox(
+                            height: 220,
+                            child: Image.memory(
+                              pickedImage!.bytes,
+                              width: double.infinity,
+                              fit: BoxFit.cover,
+                              filterQuality: FilterQuality.high,
+                            ),
+                          ),
+                        )
+                      else
+                        ProductMediaGallery(
+                          coverImageUrl: resolvedExistingImage,
+                          media: resolvedExistingImage != null
+                              ? [
+                                  <String, dynamic>{
+                                    'card_url': resolvedExistingImage,
+                                    'detail_url': resolvedExistingImage,
+                                    'original_url': resolvedExistingImage,
+                                  },
+                                ]
+                              : const <Map<String, dynamic>>[],
+                          height: 220,
+                          heroLabel: hasImage ? 'Фото' : 'Нет фото',
+                          fit: BoxFit.contain,
+                        ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              icon: const Icon(Icons.attach_file),
+                              label: Text(
+                                hasImage ? 'Изменить фото' : 'Добавить фото',
+                              ),
+                              onPressed: () async {
+                                await _openRevisionImagePickerSheet(
+                                  onChanged: (picked) {
+                                    setDialogState(() {
+                                      pickedImage = picked;
+                                    });
+                                  },
+                                );
+                              },
+                            ),
+                          ),
+                          if (pickedImage != null) ...[
+                            const SizedBox(width: 8),
+                            IconButton(
+                              tooltip: 'Вернуть прежнее фото',
+                              onPressed: () {
+                                setDialogState(() {
+                                  pickedImage = null;
+                                });
+                              },
+                              icon: const Icon(Icons.undo_rounded),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Отмена'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('Сохранить'),
                 ),
               ],
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Сохранить'),
-          ),
-        ],
-      ),
+            );
+          },
+        );
+      },
     );
 
     if (confirmed != true) return;
@@ -3450,10 +3668,9 @@ class _WorkerPanelState extends State<WorkerPanel>
     final description = descriptionCtrl.text.trim();
     final price = double.tryParse(priceCtrl.text.trim().replaceAll(',', '.'));
     final quantity = int.tryParse(quantityCtrl.text.trim()) ?? 0;
-    final hasImage = ((post['product_image_url'] ?? '')
-        .toString()
-        .trim()
-        .isNotEmpty);
+    final hasImage =
+        pickedImage != null ||
+        ((post['product_image_url'] ?? '').toString().trim().isNotEmpty);
     final validationError = _validateProductFields(
       title: title,
       description: description,
@@ -3471,14 +3688,27 @@ class _WorkerPanelState extends State<WorkerPanel>
       setState(() => _savingOwnPost = true);
     }
     try {
+      final payload = <String, dynamic>{
+        'title': title,
+        'description': description,
+        'price': price,
+        'quantity': quantity,
+      };
+      if (_manualShelfEnabled) {
+        payload['manual_shelf_label'] = manualShelfLabelCtrl.text.trim();
+        payload['shelf_floor'] = shelfFloorCtrl.text.trim();
+      }
+      final selectedImage = pickedImage;
+      final Object requestData;
+      if (selectedImage != null) {
+        payload['image'] = await _buildRevisionImageMultipart(selectedImage);
+        requestData = FormData.fromMap(payload);
+      } else {
+        requestData = payload;
+      }
       await authService.dio.patch(
         '/api/worker/queue/${post['id']}',
-        data: {
-          'title': title,
-          'description': description,
-          'price': price,
-          'quantity': quantity,
-        },
+        data: requestData,
       );
       await _loadOwnQueuedPosts();
       if (!mounted) return;
@@ -3724,11 +3954,14 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   Widget _buildRevisionTab() {
     final theme = Theme.of(context);
-    final selectedShelf = _selectedRevisionShelfNumber ?? 1;
+    final selectedShelfKey = (_selectedRevisionShelfKey ?? '').trim();
     final selectedShelfData = _revisionShelves
-        .where((item) => _toIntValue(item['shelf_number'], 0) == selectedShelf)
+        .where((item) => _revisionShelfKeyOf(item) == selectedShelfKey)
         .cast<Map<String, dynamic>?>()
         .firstWhere((_) => true, orElse: () => null);
+    final selectedShelfLabel = selectedShelfData == null
+        ? (selectedShelfKey.isEmpty ? '—' : selectedShelfKey)
+        : _revisionShelfLabelOf(selectedShelfData);
     final selectedShelfPosts = _toIntValue(selectedShelfData?['posts'], 0);
     final revisionProductSearch = _revisionProductIdSearchCtrl.text.trim();
     final revisionPostsCount = _revisionPosts.length;
@@ -3741,17 +3974,19 @@ class _WorkerPanelState extends State<WorkerPanel>
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
-          const AppSurfaceCard(
+          AppSurfaceCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
+                const Text(
                   'Ревизия',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
                 ),
-                SizedBox(height: 6),
+                const SizedBox(height: 6),
                 Text(
-                  'Выберите нужную полку от 01 до 10. Ревизия покажет товары только с этой полки и не зависит от дат, выходных или воскресенья.',
+                  _manualShelfEnabled
+                      ? 'Выберите ручную полку. Ревизия покажет товары только с выбранной полки и не зависит от дат, выходных или воскресенья.'
+                      : 'Выберите нужную полку от 01 до 10. Ревизия покажет товары только с этой полки и не зависит от дат, выходных или воскресенья.',
                 ),
               ],
             ),
@@ -3774,24 +4009,20 @@ class _WorkerPanelState extends State<WorkerPanel>
           else
             AppSurfaceCard(
               compact: true,
-              child: DropdownButtonFormField<int>(
-                key: ValueKey('revision-shelf-$selectedShelf'),
-                initialValue: selectedShelf,
+              child: DropdownButtonFormField<String>(
+                key: ValueKey('revision-shelf-$selectedShelfKey'),
+                initialValue: selectedShelfKey.isEmpty ? null : selectedShelfKey,
                 isExpanded: true,
                 decoration: const InputDecoration(
                   labelText: 'Полка для ревизии',
                   border: OutlineInputBorder(),
                 ),
                 items: _revisionShelves.map((item) {
-                  final shelf = _toIntValue(item['shelf_number'], 1);
-                  final shelfLabel =
-                      (item['shelf_label'] ??
-                              item['revision_shelf_label'] ??
-                              shelf.toString().padLeft(2, '0'))
-                          .toString();
+                  final shelfKey = _revisionShelfKeyOf(item);
+                  final shelfLabel = _revisionShelfLabelOf(item);
                   final count = _toIntValue(item['posts'], 0);
-                  return DropdownMenuItem<int>(
-                    value: shelf,
+                  return DropdownMenuItem<String>(
+                    value: shelfKey,
                     child: Text('Полка $shelfLabel · $count товаров'),
                   );
                 }).toList(),
@@ -3841,8 +4072,8 @@ class _WorkerPanelState extends State<WorkerPanel>
           const SizedBox(height: 8),
           _statChip(
             revisionProductSearch.isEmpty
-                ? "Выбрана полка ${selectedShelf.toString().padLeft(2, '0')} · $selectedShelfPosts товаров"
-                : "Выбрана полка ${selectedShelf.toString().padLeft(2, '0')} · найдено $revisionPostsCount из $selectedShelfPosts",
+                ? "Выбрана полка $selectedShelfLabel · $selectedShelfPosts товаров"
+                : "Выбрана полка $selectedShelfLabel · найдено $revisionPostsCount из $selectedShelfPosts",
           ),
           const SizedBox(height: 14),
           AppSurfaceCard(
@@ -3970,10 +4201,14 @@ class _WorkerPanelState extends State<WorkerPanel>
                 post['revision_shelf_number'] ?? post['shelf_number'],
                 1,
               );
+              final revisionShelfDisplay = _revisionShelfDisplayOfPost(post);
               final previewPrice = _previewRevisionPrice(post['price']);
               final productLabel = _formatProductLabel(
                 post['product_code'],
-                revisionShelfNumber,
+                post['source_product_shelf_number'] ??
+                    post['product_shelf_number'] ??
+                    revisionShelfNumber,
+                manualShelfLabel: post['manual_shelf_label'],
               );
               final createdAt = (post['created_at'] ?? '').toString();
               final createdAtShort = createdAt.length >= 16
@@ -4043,9 +4278,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                             runSpacing: 6,
                             children: [
                               _statChip('ID $productLabel'),
-                              _statChip(
-                                'Полка ${revisionShelfNumber.toString().padLeft(2, '0')}',
-                              ),
+                              _statChip('Полка $revisionShelfDisplay'),
                               _statChip(
                                 '${_toDoubleValue(post['price']).toStringAsFixed(0)} ₽',
                               ),

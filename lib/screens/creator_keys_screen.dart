@@ -43,8 +43,16 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   bool _tenantPickupOnlyEnabled = false;
   bool _tenantCartDeliveryReadyEnabled = false;
   bool _tenantDeliverySnapshotOnAdminApprove = false;
+  bool _tenantClientCancelAnytimeEnabled = false;
   bool _tenantRevisionDeleteApprovalEnabled = false;
   bool _tenantDefectStatsEnabled = false;
+  bool _tenantClientGroupSwitcherEnabled = true;
+  bool _tenantQrExistingClientJoinEnabled = true;
+  bool _tenantOperationsMenuEnabled = false;
+  bool _tenantDangerousActionAuditEnabled = true;
+  bool _tenantProductChangeHistoryEnabled = false;
+  bool _tenantNotificationDiagnosticsEnabled = true;
+  bool _tenantBootstrapMonitoringEnabled = true;
 
   String _message = '';
   String _lastGeneratedTenantKey = '';
@@ -132,6 +140,21 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         normalized == 'да';
   }
 
+  bool _toBoolValueOr(dynamic value, bool fallback) {
+    if (value == null) return fallback;
+    if (value is bool) return value;
+    final normalized = value.toString().trim().toLowerCase();
+    if (normalized.isEmpty) return fallback;
+    if (normalized == 'false' ||
+        normalized == '0' ||
+        normalized == 'no' ||
+        normalized == 'off' ||
+        normalized == 'нет') {
+      return false;
+    }
+    return _toBoolValue(value);
+  }
+
   int _parseIntValue(
     String raw, {
     required int fallback,
@@ -173,6 +196,27 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     return _stringListFromText((raw ?? '').toString());
   }
 
+  List<String> _cityOptionsFromSettings(Map<String, dynamic> settings) {
+    final workflowSettings = _asMap(settings['workflow_settings']);
+    final featureSettings = _asMap(settings['feature_settings']);
+    final nestedSettings = _asMap(settings['settings']);
+    final candidates = <dynamic>[
+      _asMap(settings['registration'])['client_city_options'],
+      settings['client_city_options'],
+      _asMap(workflowSettings['registration'])['client_city_options'],
+      workflowSettings['client_city_options'],
+      _asMap(featureSettings['registration'])['client_city_options'],
+      featureSettings['client_city_options'],
+      _asMap(nestedSettings['registration'])['client_city_options'],
+      nestedSettings['client_city_options'],
+    ];
+    for (final candidate in candidates) {
+      final cities = _stringListFromSettings(candidate);
+      if (cities.isNotEmpty) return cities;
+    }
+    return const <String>[];
+  }
+
   Map<String, dynamic> _tenantWorkflowPayload({
     required TextEditingController publicationSecondsCtrl,
     required TextEditingController autoDelayCtrl,
@@ -189,8 +233,16 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     required bool pickupOnlyEnabled,
     required bool deliveryReadyEnabled,
     required bool deliverySnapshotOnAdminApprove,
+    required bool clientCancelAnytimeEnabled,
     required bool revisionDeleteApprovalEnabled,
     required bool defectStatsEnabled,
+    bool clientGroupSwitcherEnabled = true,
+    bool qrExistingClientJoinEnabled = true,
+    bool tenantOperationsMenuEnabled = false,
+    bool dangerousActionAuditEnabled = true,
+    bool productChangeHistoryEnabled = false,
+    bool creatorNotificationDiagnosticsEnabled = true,
+    bool creatorBootstrapMonitoringEnabled = true,
   }) {
     final publicationSeconds = _parseIntValue(
       publicationSecondsCtrl.text,
@@ -243,6 +295,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         'min_amount': minAmount,
         'snapshot_on_admin_approve': deliverySnapshotOnAdminApprove,
         'cart_retention_days': cartRetentionDays,
+        'client_cancel_anytime_enabled': clientCancelAnytimeEnabled,
       },
       'worker': {
         'manual_shelf_enabled': manualShelfEnabled,
@@ -259,10 +312,33 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       'registration': {'client_city_options': cities},
       'analytics': {'defect_stats_enabled': defectStatsEnabled},
       'rules': {'group_rules_text': rulesTextCtrl.text.trim()},
+      'client': {
+        'group_switcher_enabled': clientGroupSwitcherEnabled,
+        'qr_existing_client_join_enabled': qrExistingClientJoinEnabled,
+      },
+      'tenant_console': {
+        'operations_menu_enabled': tenantOperationsMenuEnabled,
+        'dangerous_action_audit_enabled': dangerousActionAuditEnabled,
+        'product_change_history_enabled': productChangeHistoryEnabled,
+      },
+      'diagnostics': {
+        'notification_diagnostics_enabled':
+            creatorNotificationDiagnosticsEnabled,
+        'bootstrap_monitoring_enabled': creatorBootstrapMonitoringEnabled,
+      },
     };
     return {
       'workflow_settings': workflowSettings,
       'client_city_options': cities,
+      'client_group_switcher_enabled': clientGroupSwitcherEnabled,
+      'qr_existing_client_join_enabled': qrExistingClientJoinEnabled,
+      'tenant_operations_menu_enabled': tenantOperationsMenuEnabled,
+      'dangerous_action_audit_enabled': dangerousActionAuditEnabled,
+      'product_change_history_enabled': productChangeHistoryEnabled,
+      'client_cancel_anytime_enabled': clientCancelAnytimeEnabled,
+      'creator_notification_diagnostics_enabled':
+          creatorNotificationDiagnosticsEnabled,
+      'creator_bootstrap_monitoring_enabled': creatorBootstrapMonitoringEnabled,
     };
   }
 
@@ -283,8 +359,17 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       pickupOnlyEnabled: _tenantPickupOnlyEnabled,
       deliveryReadyEnabled: _tenantCartDeliveryReadyEnabled,
       deliverySnapshotOnAdminApprove: _tenantDeliverySnapshotOnAdminApprove,
+      clientCancelAnytimeEnabled: _tenantClientCancelAnytimeEnabled,
       revisionDeleteApprovalEnabled: _tenantRevisionDeleteApprovalEnabled,
       defectStatsEnabled: _tenantDefectStatsEnabled,
+      clientGroupSwitcherEnabled: _tenantClientGroupSwitcherEnabled,
+      qrExistingClientJoinEnabled: _tenantQrExistingClientJoinEnabled,
+      tenantOperationsMenuEnabled: _tenantOperationsMenuEnabled,
+      dangerousActionAuditEnabled: _tenantDangerousActionAuditEnabled,
+      productChangeHistoryEnabled: _tenantProductChangeHistoryEnabled,
+      creatorNotificationDiagnosticsEnabled:
+          _tenantNotificationDiagnosticsEnabled,
+      creatorBootstrapMonitoringEnabled: _tenantBootstrapMonitoringEnabled,
     );
   }
 
@@ -304,8 +389,16 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantPickupOnlyEnabled = false;
     _tenantCartDeliveryReadyEnabled = false;
     _tenantDeliverySnapshotOnAdminApprove = false;
+    _tenantClientCancelAnytimeEnabled = false;
     _tenantRevisionDeleteApprovalEnabled = false;
     _tenantDefectStatsEnabled = false;
+    _tenantClientGroupSwitcherEnabled = true;
+    _tenantQrExistingClientJoinEnabled = true;
+    _tenantOperationsMenuEnabled = false;
+    _tenantDangerousActionAuditEnabled = true;
+    _tenantProductChangeHistoryEnabled = false;
+    _tenantNotificationDiagnosticsEnabled = true;
+    _tenantBootstrapMonitoringEnabled = true;
   }
 
   Future<void> _reloadAll() async {
@@ -771,6 +864,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     final channels = _asMap(initialSettings['channels']);
     final registration = _asMap(initialSettings['registration']);
     final analytics = _asMap(initialSettings['analytics']);
+    final client = _asMap(initialSettings['client']);
+    final tenantConsole = _asMap(initialSettings['tenant_console']);
+    final diagnostics = _asMap(initialSettings['diagnostics']);
 
     final publicationMs = _parseIntValue(
       (channels['publication_interval_ms'] ??
@@ -813,10 +909,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
               .toString(),
     );
     final citiesCtrl = TextEditingController(
-      text: _stringListFromSettings(
-        registration['client_city_options'] ??
-            initialSettings['client_city_options'],
-      ).join('\n'),
+      text: _cityOptionsFromSettings({
+        ...initialSettings,
+        'registration': registration,
+      }).join('\n'),
     );
     final shelfFieldLabelCtrl = TextEditingController(
       text:
@@ -865,6 +961,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       delivery['snapshot_on_admin_approve'] ??
           initialSettings['delivery_snapshot_on_admin_approve'],
     );
+    var clientCancelAnytimeEnabled = _toBoolValue(
+      delivery['client_cancel_anytime_enabled'] ??
+          initialSettings['client_cancel_anytime_enabled'],
+    );
     var revisionDeleteApprovalEnabled = _toBoolValue(
       worker['revision_delete_approval_enabled'] ??
           initialSettings['revision_delete_approval_enabled'],
@@ -872,6 +972,39 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     var defectStatsEnabled = _toBoolValue(
       analytics['defect_stats_enabled'] ??
           initialSettings['defect_stats_enabled'],
+    );
+    var clientGroupSwitcherEnabled = _toBoolValueOr(
+      client['group_switcher_enabled'] ??
+          initialSettings['client_group_switcher_enabled'],
+      true,
+    );
+    var qrExistingClientJoinEnabled = _toBoolValueOr(
+      client['qr_existing_client_join_enabled'] ??
+          initialSettings['qr_existing_client_join_enabled'],
+      true,
+    );
+    var tenantOperationsMenuEnabled = _toBoolValue(
+      tenantConsole['operations_menu_enabled'] ??
+          initialSettings['tenant_operations_menu_enabled'],
+    );
+    var dangerousActionAuditEnabled = _toBoolValueOr(
+      tenantConsole['dangerous_action_audit_enabled'] ??
+          initialSettings['dangerous_action_audit_enabled'],
+      true,
+    );
+    var productChangeHistoryEnabled = _toBoolValue(
+      tenantConsole['product_change_history_enabled'] ??
+          initialSettings['product_change_history_enabled'],
+    );
+    var notificationDiagnosticsEnabled = _toBoolValueOr(
+      diagnostics['notification_diagnostics_enabled'] ??
+          initialSettings['creator_notification_diagnostics_enabled'],
+      true,
+    );
+    var bootstrapMonitoringEnabled = _toBoolValueOr(
+      diagnostics['bootstrap_monitoring_enabled'] ??
+          initialSettings['creator_bootstrap_monitoring_enabled'],
+      true,
     );
 
     try {
@@ -950,6 +1083,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                         () => deliverySnapshotOnAdminApprove = value,
                       ),
                     ),
+                    _settingsSwitchTile(
+                      title: 'Отказ клиента после обработки',
+                      subtitle:
+                          'Клиент сможет отказаться от товара до попадания в доставку.',
+                      value: clientCancelAnytimeEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => clientCancelAnytimeEnabled = value,
+                      ),
+                    ),
                     _settingsSectionTitle('Рабочий'),
                     _settingsSwitchTile(
                       title: 'Ручная полка у рабочего',
@@ -1009,6 +1151,25 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                         controller: citiesCtrl,
                       ),
                     ),
+                    _settingsSectionTitle('Клиент'),
+                    _settingsSwitchTile(
+                      title: 'Переключатель групп',
+                      subtitle:
+                          'Клиент сможет видеть свои группы и удобно переключаться.',
+                      value: clientGroupSwitcherEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => clientGroupSwitcherEnabled = value,
+                      ),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'QR для существующего клиента',
+                      subtitle:
+                          'QR добавит новую группу к профилю без повторной регистрации.',
+                      value: qrExistingClientJoinEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => qrExistingClientJoinEnabled = value,
+                      ),
+                    ),
                     _settingsSectionTitle('Правила'),
                     TextField(
                       controller: rulesTextCtrl,
@@ -1023,6 +1184,34 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                         controller: rulesTextCtrl,
                       ),
                     ),
+                    _settingsSectionTitle('Арендатор'),
+                    _settingsSwitchTile(
+                      title: 'Отдельное меню арендатора',
+                      subtitle:
+                          'Включает рабочую панель с клиентами, каналами и операционными показателями.',
+                      value: tenantOperationsMenuEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => tenantOperationsMenuEnabled = value,
+                      ),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Аудит опасных действий',
+                      subtitle:
+                          'Записывает удаления, изменения прав и другие критичные операции.',
+                      value: dangerousActionAuditEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => dangerousActionAuditEnabled = value,
+                      ),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'История изменений товара',
+                      subtitle:
+                          'Позволяет включить журнал изменений названия, цены, фото, полки и этажа.',
+                      value: productChangeHistoryEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => productChangeHistoryEnabled = value,
+                      ),
+                    ),
                     _settingsSectionTitle('Статистика'),
                     _settingsSwitchTile(
                       title: 'Статистика брака',
@@ -1030,6 +1219,25 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       value: defectStatsEnabled,
                       onChanged: (value) =>
                           setDialogState(() => defectStatsEnabled = value),
+                    ),
+                    _settingsSectionTitle('Диагностика'),
+                    _settingsSwitchTile(
+                      title: 'Диагностика уведомлений',
+                      subtitle:
+                          'Показывает внутреннюю статистику очереди и ошибок уведомлений.',
+                      value: notificationDiagnosticsEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => notificationDiagnosticsEnabled = value,
+                      ),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Мониторинг белого экрана',
+                      subtitle:
+                          'Позволяет собирать клиентские ошибки запуска для внутреннего просмотра.',
+                      value: bootstrapMonitoringEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => bootstrapMonitoringEnabled = value,
+                      ),
                     ),
                   ],
                 ),
@@ -1061,9 +1269,19 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       deliveryReadyEnabled: deliveryReadyEnabled,
                       deliverySnapshotOnAdminApprove:
                           deliverySnapshotOnAdminApprove,
+                      clientCancelAnytimeEnabled: clientCancelAnytimeEnabled,
                       revisionDeleteApprovalEnabled:
                           revisionDeleteApprovalEnabled,
                       defectStatsEnabled: defectStatsEnabled,
+                      clientGroupSwitcherEnabled: clientGroupSwitcherEnabled,
+                      qrExistingClientJoinEnabled: qrExistingClientJoinEnabled,
+                      tenantOperationsMenuEnabled: tenantOperationsMenuEnabled,
+                      dangerousActionAuditEnabled: dangerousActionAuditEnabled,
+                      productChangeHistoryEnabled: productChangeHistoryEnabled,
+                      creatorNotificationDiagnosticsEnabled:
+                          notificationDiagnosticsEnabled,
+                      creatorBootstrapMonitoringEnabled:
+                          bootstrapMonitoringEnabled,
                     ),
                   );
                 },
@@ -1210,6 +1428,14 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             onChanged: (value) =>
                 setState(() => _tenantDeliverySnapshotOnAdminApprove = value),
           ),
+          _settingsSwitchTile(
+            title: 'Отказ клиента после обработки',
+            subtitle:
+                'Клиент сможет отказаться от товара до попадания в доставку.',
+            value: _tenantClientCancelAnytimeEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantClientCancelAnytimeEnabled = value),
+          ),
           _settingsSectionTitle('Рабочий'),
           _settingsSwitchTile(
             title: 'Ручная полка у рабочего',
@@ -1268,6 +1494,23 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
               controller: _tenantClientCitiesCtrl,
             ),
           ),
+          _settingsSectionTitle('Клиент'),
+          _settingsSwitchTile(
+            title: 'Переключатель групп',
+            subtitle:
+                'Клиент сможет видеть свои группы и удобно переключаться.',
+            value: _tenantClientGroupSwitcherEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantClientGroupSwitcherEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'QR для существующего клиента',
+            subtitle:
+                'QR добавит новую группу к профилю без повторной регистрации.',
+            value: _tenantQrExistingClientJoinEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantQrExistingClientJoinEnabled = value),
+          ),
           _settingsSectionTitle('Правила'),
           TextField(
             controller: _tenantRulesTextCtrl,
@@ -1282,6 +1525,31 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
               controller: _tenantRulesTextCtrl,
             ),
           ),
+          _settingsSectionTitle('Арендатор'),
+          _settingsSwitchTile(
+            title: 'Отдельное меню арендатора',
+            subtitle:
+                'Включает рабочую панель с клиентами, каналами и показателями.',
+            value: _tenantOperationsMenuEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantOperationsMenuEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Аудит опасных действий',
+            subtitle:
+                'Записывает удаления, изменения прав и другие критичные операции.',
+            value: _tenantDangerousActionAuditEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantDangerousActionAuditEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'История изменений товара',
+            subtitle:
+                'Позволяет включить журнал изменений названия, цены, фото, полки и этажа.',
+            value: _tenantProductChangeHistoryEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantProductChangeHistoryEnabled = value),
+          ),
           _settingsSectionTitle('Статистика'),
           _settingsSwitchTile(
             title: 'Статистика брака',
@@ -1289,6 +1557,23 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             value: _tenantDefectStatsEnabled,
             onChanged: (value) =>
                 setState(() => _tenantDefectStatsEnabled = value),
+          ),
+          _settingsSectionTitle('Диагностика'),
+          _settingsSwitchTile(
+            title: 'Диагностика уведомлений',
+            subtitle:
+                'Показывает внутреннюю статистику очереди и ошибок уведомлений.',
+            value: _tenantNotificationDiagnosticsEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantNotificationDiagnosticsEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Мониторинг белого экрана',
+            subtitle:
+                'Позволяет собирать клиентские ошибки запуска для внутреннего просмотра.',
+            value: _tenantBootstrapMonitoringEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantBootstrapMonitoringEnabled = value),
           ),
         ],
       ),

@@ -551,6 +551,13 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     return effectiveRole == 'tenant' || baseRole == 'tenant';
   }
 
+  bool _canFullyDeleteClients() {
+    if (_isCreatorBase()) return true;
+    final effectiveRole = authService.effectiveRole.toLowerCase().trim();
+    final baseRole = (authService.currentUser?.role ?? '').toLowerCase().trim();
+    return effectiveRole == 'tenant' || baseRole == 'tenant';
+  }
+
   bool _canViewSupportTab() {
     if (_isCreatorBase()) return true;
     final role = authService.effectiveRole;
@@ -8217,7 +8224,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                   maxLines: 5,
                   decoration: withInputLanguageBadge(
                     const InputDecoration(
-                      labelText: 'Описание',
+                      labelText: 'Описание (необязательно)',
                       border: OutlineInputBorder(),
                     ),
                     controller: descriptionCtrl,
@@ -8298,7 +8305,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       setState(() => _message = 'Название товара обязательно');
       return;
     }
-    if (description.length < 2) {
+    if (description.isNotEmpty && description.length < 2) {
       setState(() => _message = 'Описание должно быть осмысленным');
       return;
     }
@@ -8653,106 +8660,322 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     }
   }
 
+  Future<Map<String, dynamic>?> _deleteChannelClientFully(
+    String channelId,
+    Map<String, dynamic> client,
+  ) async {
+    if (!_canFullyDeleteClients()) {
+      if (mounted) {
+        setState(
+          () => _message =
+              'Полное удаление клиента доступно только арендатору или создателю',
+        );
+      }
+      return null;
+    }
+
+    final userId = (client['user_id'] ?? '').toString().trim();
+    if (userId.isEmpty) return null;
+    final displayName = _displayName(client, fallback: 'Клиент');
+    final phone = (client['phone'] ?? '').toString().trim();
+    final email = (client['email'] ?? '').toString().trim();
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Удалить клиента полностью?'),
+        content: Text(
+          [
+            'Клиент "$displayName" будет полностью удалён из базы этой группы.',
+            if (phone.isNotEmpty) 'Телефон: $phone',
+            if (email.isNotEmpty) 'Почта: $email',
+            '',
+            'Телефон, почта, сессии, адреса, полка и привязки к чатам будут очищены. Активные товары из заказов вернутся обратно на канал.',
+          ].join('\n'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: FilledButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return null;
+
+    setState(() {
+      _saving = true;
+      _message = '';
+    });
+    try {
+      final resp = await authService.dio.delete(
+        '/api/admin/channels/$channelId/clients/$userId/full',
+      );
+      final data = resp.data;
+      if (data is! Map || data['ok'] != true || data['data'] is! Map) {
+        return null;
+      }
+      final result = Map<String, dynamic>.from(data['data']);
+      final overview = _channelOverviews[channelId];
+      if (overview != null) {
+        final clients = _asMapList(overview['clients'])
+            .where((item) => (item['user_id'] ?? '').toString() != userId)
+            .toList();
+        final stats = _asMap(overview['stats']);
+        final total = _toInt(stats['clients_total']);
+        setState(() {
+          _channelOverviews[channelId] = {
+            ...overview,
+            'clients': clients,
+            'stats': {...stats, 'clients_total': total > 0 ? total - 1 : 0},
+          };
+        });
+      }
+
+      final returnedUnits = _toInt(result['returned_units_count']);
+      if (mounted) {
+        setState(
+          () => _message = returnedUnits > 0
+              ? 'Клиент удалён, товаров возвращено: $returnedUnits'
+              : 'Клиент удалён',
+        );
+      }
+      return result;
+    } catch (e) {
+      if (mounted) {
+        setState(
+          () => _message = 'Ошибка удаления клиента: ${_extractDioError(e)}',
+        );
+      }
+      return null;
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      }
+    }
+  }
+
   Future<void> _openClientsDialog(String channelId, String channelTitle) async {
     final overview = await _loadChannelOverview(channelId, force: true);
     if (!mounted || overview == null) return;
 
     var clients = _asMapList(overview['clients']);
-    final stats = _asMap(overview['stats']);
+    final searchCtrl = TextEditingController();
+    var searchQuery = '';
+    var stats = _asMap(overview['stats']);
+    final canDeleteClientsFully = _canFullyDeleteClients();
 
     await showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: Text('Клиенты канала "$channelTitle"'),
-          content: SizedBox(
-            width: 620,
-            height: 460,
-            child: clients.isEmpty
-                ? const Center(child: Text('Клиенты не найдены'))
-                : Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Всего клиентов: ${_toInt(stats['clients_total'])}',
-                        style: const TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                      const SizedBox(height: 8),
-                      Expanded(
-                        child: ListView.separated(
-                          itemCount: clients.length,
-                          separatorBuilder: (context, index) =>
-                              const Divider(height: 1),
-                          itemBuilder: (context, index) {
-                            final c = clients[index];
-                            final blocked = c['is_blacklisted'] == true;
-                            final phone = (c['phone'] ?? '').toString().trim();
-                            final city = (c['client_city'] ?? '')
-                                .toString()
-                                .trim();
-                            final displayName = _displayName(
-                              c,
-                              fallback: 'Клиент',
-                            );
-                            return ListTile(
-                              dense: true,
-                              leading: CircleAvatar(
-                                child: Text(displayName[0].toUpperCase()),
-                              ),
-                              title: Text(displayName),
-                              subtitle: Text(
-                                [
-                                  (c['email'] ?? '').toString(),
-                                  if (phone.isNotEmpty) 'Тел: $phone',
-                                  if (city.isNotEmpty) 'Город: $city',
-                                ].where((v) => v.trim().isNotEmpty).join('\n'),
-                              ),
-                              isThreeLine: phone.isNotEmpty || city.isNotEmpty,
-                              trailing: Wrap(
-                                spacing: 4,
-                                children: [
-                                  if (blocked)
-                                    const Icon(Icons.block, color: Colors.red),
-                                  IconButton(
-                                    tooltip: 'Изменить имя',
-                                    onPressed: () async {
-                                      final updated =
-                                          await _editChannelClientName(
-                                            channelId,
-                                            c,
-                                          );
-                                      if (updated == null) return;
-                                      setDialogState(() {
-                                        clients =
-                                            List<Map<String, dynamic>>.from(
-                                              clients,
-                                            );
-                                        clients[index] = {
-                                          ...clients[index],
-                                          ...updated,
-                                        };
-                                      });
-                                    },
-                                    icon: const Icon(Icons.edit_outlined),
-                                  ),
-                                ],
-                              ),
-                            );
+        builder: (context, setDialogState) {
+          final normalizedQuery = searchQuery.trim().toLowerCase();
+          final queryDigits = normalizedQuery.replaceAll(RegExp(r'\D'), '');
+          final filteredClients = normalizedQuery.isEmpty
+              ? clients
+              : clients.where((client) {
+                  final displayName = _displayName(client, fallback: 'Клиент');
+                  final email = (client['email'] ?? '').toString();
+                  final phone = (client['phone'] ?? '').toString();
+                  final haystack = '$displayName $email $phone'.toLowerCase();
+                  final phoneDigits = phone.replaceAll(RegExp(r'\D'), '');
+                  return haystack.contains(normalizedQuery) ||
+                      (queryDigits.isNotEmpty &&
+                          phoneDigits.contains(queryDigits));
+                }).toList();
+          return AlertDialog(
+            title: Text('Клиенты канала "$channelTitle"'),
+            content: SizedBox(
+              width: 680,
+              height: 520,
+              child: clients.isEmpty
+                  ? const Center(child: Text('Клиенты не найдены'))
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Всего клиентов: ${_toInt(stats['clients_total'])}',
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 8),
+                        TextField(
+                          controller: searchCtrl,
+                          decoration: const InputDecoration(
+                            labelText: 'Поиск по имени, телефону или почте',
+                            prefixIcon: Icon(Icons.search_rounded),
+                            border: OutlineInputBorder(),
+                          ),
+                          onChanged: (value) {
+                            setDialogState(() => searchQuery = value);
                           },
                         ),
-                      ),
-                    ],
-                  ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('Закрыть'),
+                        const SizedBox(height: 8),
+                        Expanded(
+                          child: filteredClients.isEmpty
+                              ? const Center(child: Text('Клиенты не найдены'))
+                              : ListView.separated(
+                                  itemCount: filteredClients.length,
+                                  separatorBuilder: (context, index) =>
+                                      const Divider(height: 1),
+                                  itemBuilder: (context, index) {
+                                    final c = filteredClients[index];
+                                    final blocked = c['is_blacklisted'] == true;
+                                    final phone = (c['phone'] ?? '')
+                                        .toString()
+                                        .trim();
+                                    final city = (c['client_city'] ?? '')
+                                        .toString()
+                                        .trim();
+                                    final displayName = _displayName(
+                                      c,
+                                      fallback: 'Клиент',
+                                    );
+                                    return ListTile(
+                                      dense: true,
+                                      leading: CircleAvatar(
+                                        child: Text(
+                                          displayName[0].toUpperCase(),
+                                        ),
+                                      ),
+                                      title: Text(displayName),
+                                      subtitle: Text(
+                                        [
+                                              (c['email'] ?? '').toString(),
+                                              if (phone.isNotEmpty)
+                                                'Тел: $phone',
+                                              if (city.isNotEmpty)
+                                                'Город: $city',
+                                            ]
+                                            .where((v) => v.trim().isNotEmpty)
+                                            .join('\n'),
+                                      ),
+                                      isThreeLine:
+                                          phone.isNotEmpty || city.isNotEmpty,
+                                      trailing: Wrap(
+                                        spacing: 4,
+                                        children: [
+                                          if (blocked)
+                                            const Icon(
+                                              Icons.block,
+                                              color: Colors.red,
+                                            ),
+                                          IconButton(
+                                            tooltip: 'Написать клиенту',
+                                            onPressed: () {
+                                              Navigator.of(ctx).pop();
+                                              unawaited(
+                                                _openDirectChatWithUser({
+                                                  ...c,
+                                                  'customer_email': c['email'],
+                                                  'customer_phone': c['phone'],
+                                                }),
+                                              );
+                                            },
+                                            icon: const Icon(
+                                              Icons.chat_bubble_outline,
+                                            ),
+                                          ),
+                                          IconButton(
+                                            tooltip: 'Изменить имя',
+                                            onPressed: () async {
+                                              final updated =
+                                                  await _editChannelClientName(
+                                                    channelId,
+                                                    c,
+                                                  );
+                                              if (updated == null) return;
+                                              final sourceIndex = clients
+                                                  .indexWhere(
+                                                    (item) =>
+                                                        (item['user_id'] ?? '')
+                                                            .toString() ==
+                                                        (c['user_id'] ?? '')
+                                                            .toString(),
+                                                  );
+                                              setDialogState(() {
+                                                clients =
+                                                    List<
+                                                      Map<String, dynamic>
+                                                    >.from(clients);
+                                                if (sourceIndex >= 0) {
+                                                  clients[sourceIndex] = {
+                                                    ...clients[sourceIndex],
+                                                    ...updated,
+                                                  };
+                                                }
+                                              });
+                                            },
+                                            icon: const Icon(
+                                              Icons.edit_outlined,
+                                            ),
+                                          ),
+                                          if (canDeleteClientsFully)
+                                            IconButton(
+                                              tooltip:
+                                                  'Удалить клиента полностью',
+                                              onPressed: () async {
+                                                final result =
+                                                    await _deleteChannelClientFully(
+                                                      channelId,
+                                                      c,
+                                                    );
+                                                if (result == null) return;
+                                                final deletedUserId =
+                                                    (c['user_id'] ?? '')
+                                                        .toString();
+                                                setDialogState(() {
+                                                  clients =
+                                                      List<
+                                                          Map<String, dynamic>
+                                                        >.from(clients)
+                                                        ..removeWhere(
+                                                          (item) =>
+                                                              (item['user_id'] ??
+                                                                      '')
+                                                                  .toString() ==
+                                                              deletedUserId,
+                                                        );
+                                                  final total = _toInt(
+                                                    stats['clients_total'],
+                                                  );
+                                                  stats = {
+                                                    ...stats,
+                                                    'clients_total': total > 0
+                                                        ? total - 1
+                                                        : 0,
+                                                  };
+                                                });
+                                              },
+                                              icon: const Icon(
+                                                Icons.delete_forever_outlined,
+                                                color: Colors.red,
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                        ),
+                      ],
+                    ),
             ),
-          ],
-        ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('Закрыть'),
+              ),
+            ],
+          );
+        },
       ),
     );
+    searchCtrl.dispose();
   }
 
   String _channelClientExcelText(Map<String, dynamic> client, String field) {
@@ -10898,6 +11121,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
                                     ),
                                   if (shelfFloor.isNotEmpty)
                                     _buildModerationChip('Этаж: $shelfFloor'),
+                                  _buildModerationChip('Выложил: $workerName'),
                                   if (pickupOnly)
                                     _buildModerationChip('Самовывоз'),
                                   Container(

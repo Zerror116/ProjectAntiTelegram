@@ -899,6 +899,9 @@ async function resolveExistingClientIdentityForInviteJoin({
   for (const tenantRow of tenantsById.values()) {
     try {
       const matched = await db.runWithTenantRow(tenantRow, async () => {
+        const tenantId = String(tenantRow?.id || '').trim();
+        const allowLegacyNullTenantRows =
+          db.isIsolatedTenantRow(tenantRow) || db.isSchemaIsolatedTenantRow(tenantRow);
         const q = await db.query(
           `SELECT u.id,
                   u.email,
@@ -912,10 +915,14 @@ async function resolveExistingClientIdentityForInviteJoin({
            FROM users u
            LEFT JOIN phones p ON p.user_id = u.id
            WHERE lower(u.email) = $1
+             AND (
+               u.tenant_id = $2::uuid
+               OR ($3::boolean = true AND u.tenant_id IS NULL)
+             )
              AND u.is_active = true
            ORDER BY u.created_at ASC
            LIMIT 1`,
-          [normalizedEmail],
+          [normalizedEmail, tenantId || null, allowLegacyNullTenantRows],
         );
         const user = q.rows[0];
         if (!user) return null;
@@ -1623,6 +1630,21 @@ async function buildSuccessfulAuthResponse({
     tenant: responseTenant,
     isPlatformCreator,
   });
+  const featureSettings = responseTenant?.id
+    ? await getTenantFeatureSettings(responseTenant.id)
+    : await getTenantFeatureSettings(null);
+  const publicClientFeatures = {
+    client_group_switcher_enabled:
+      featureSettings.client_group_switcher_enabled !== false,
+    qr_existing_client_join_enabled:
+      featureSettings.qr_existing_client_join_enabled !== false,
+    client: {
+      group_switcher_enabled:
+        featureSettings.client?.group_switcher_enabled !== false,
+      qr_existing_client_join_enabled:
+        featureSettings.client?.qr_existing_client_join_enabled !== false,
+    },
+  };
   const effectiveTenantCode = responseTenant?.code || user?.tenant_code || null;
   const accessExpiresAt = buildAccessExpiry();
   const token = signToken({
@@ -1663,6 +1685,7 @@ async function buildSuccessfulAuthResponse({
         null,
       phone_access_state: phoneAccess.state || 'none',
       phone_access: phoneAccess,
+      feature_settings: publicClientFeatures,
     },
     tenant: responseTenant || user.tenant_id
       ? {
@@ -2216,6 +2239,9 @@ router.post('/join-invite', async (req, res) => {
         error: normalizeInvitePublicError(tenantState.error, tenantState.reason),
       });
     }
+    const featureSettings = await getTenantFeatureSettings(tenant.id);
+    const allowExistingClientInviteJoin =
+      featureSettings.qr_existing_client_join_enabled !== false;
 
     const clientCityOptions = await getClientCityOptionsForInvite(invite);
     let clientCity = null;
@@ -2226,16 +2252,20 @@ router.post('/join-invite', async (req, res) => {
       }
     }
 
-    const sourceIdentity = await resolveExistingClientIdentityForInviteJoin({
-      email: normalizedEmail,
-      password,
-      excludeTenantId: tenant.id,
-    });
+    const sourceIdentity = allowExistingClientInviteJoin
+      ? await resolveExistingClientIdentityForInviteJoin({
+          email: normalizedEmail,
+          password,
+          excludeTenantId: tenant.id,
+        })
+      : null;
 
     const joinInScope = async () => {
       const client = await db.pool.connect();
       try {
         await client.query('BEGIN');
+        const allowLegacyNullTenantRows =
+          db.isIsolatedTenantRow(tenant) || db.isSchemaIsolatedTenantRow(tenant);
 
         let user = null;
         let createdUser = false;
@@ -2251,8 +2281,12 @@ router.post('/join-invite', async (req, res) => {
                   u.client_city
            FROM users u
            WHERE lower(u.email) = $1
+             AND (
+               u.tenant_id = $2::uuid
+               OR ($3::boolean = true AND u.tenant_id IS NULL)
+             )
            LIMIT 1`,
-          [normalizedEmail.toLowerCase()],
+          [normalizedEmail.toLowerCase(), tenant.id, allowLegacyNullTenantRows],
         );
 
         if (existing.rowCount > 0) {
@@ -2307,6 +2341,14 @@ router.post('/join-invite', async (req, res) => {
             };
           }
         } else {
+          if (!allowExistingClientInviteJoin) {
+            await client.query('ROLLBACK');
+            return {
+              ok: false,
+              status: 403,
+              error: 'QR-переход для существующего клиента отключен в этой группе',
+            };
+          }
           if (!sourceIdentity?.user?.password_hash) {
             await client.query('ROLLBACK');
             return { ok: false, status: 401, error: 'Неверные данные' };
@@ -2637,8 +2679,24 @@ router.post('/register', async (req, res) => {
       const client = await db.pool.connect();
       try {
         await client.query('BEGIN');
+        const allowLegacyNullTenantRows =
+          db.isIsolatedTenantRow(tenant) || db.isSchemaIsolatedTenantRow(tenant);
 
-        const existing = await client.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
+        const existing = await client.query(
+          `SELECT id
+           FROM users
+           WHERE lower(email) = $1
+             AND (
+               tenant_id = $2::uuid
+               OR ($3::boolean = true AND tenant_id IS NULL)
+             )
+           LIMIT 1`,
+          [
+            normalizedEmail.toLowerCase(),
+            tenant?.id || null,
+            allowLegacyNullTenantRows,
+          ],
+        );
         if (existing.rowCount > 0) {
           await client.query('ROLLBACK');
           return {
@@ -2979,9 +3037,9 @@ router.post('/login', async (req, res) => {
                   t.subscription_expires_at
            FROM users u
            LEFT JOIN tenants t ON t.id = u.tenant_id
-           WHERE u.email = $1
+           WHERE lower(u.email) = $1
            LIMIT 1`,
-          [normalizedEmail],
+          [normalizedEmail.toLowerCase()],
         );
         const user = userRes.rows[0];
         if (!user) {
@@ -2989,7 +3047,7 @@ router.post('/login', async (req, res) => {
           return { ok: false, status: 401, error: 'Неверные данные' };
         }
 
-        const ok = await bcrypt.compare(password, user.password_hash);
+        const ok = await bcrypt.compare(password, String(user.password_hash || ''));
         if (!ok) {
           await client.query('ROLLBACK');
           return { ok: false, status: 401, error: 'Неверные данные' };

@@ -1400,8 +1400,14 @@ class _AuthScreenState extends State<AuthScreen> {
         });
         friendly =
             'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator или резервный код.';
-      } else if (status == 401 || status == 403) {
+      } else if (status == 401) {
         friendly = 'Неверный email, пароль или код подтверждения';
+      } else if (status == 403) {
+        final serverMessage =
+            (bodyMap?['error'] ?? bodyMap?['message'])?.toString().trim();
+        friendly = serverMessage == null || serverMessage.isEmpty
+            ? 'Нет доступа к аккаунту'
+            : serverMessage;
       } else if (e.type == DioExceptionType.connectionTimeout ||
           e.type == DioExceptionType.sendTimeout ||
           e.type == DioExceptionType.receiveTimeout) {

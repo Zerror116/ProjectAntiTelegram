@@ -8,6 +8,7 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   cart_delivery_ready_enabled: false,
   cart_delivery_ready_min_amount: 1500,
   cart_retention_days: 30,
+  client_cancel_anytime_enabled: false,
   revision_delete_approval_enabled: false,
   defect_stats_enabled: false,
   auto_publish_enabled: false,
@@ -15,6 +16,13 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   shelf_field_label: "Полка",
   floor_field_label: "Этаж",
   group_rules_text: "",
+  client_group_switcher_enabled: true,
+  qr_existing_client_join_enabled: true,
+  tenant_operations_menu_enabled: false,
+  dangerous_action_audit_enabled: true,
+  product_change_history_enabled: false,
+  creator_notification_diagnostics_enabled: true,
+  creator_bootstrap_monitoring_enabled: true,
 });
 
 const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
@@ -28,6 +36,7 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
     client_ready_button: false,
     min_amount: 1500,
     cart_retention_days: 30,
+    client_cancel_anytime_enabled: false,
     snapshot_on_admin_approve: false,
   }),
   worker: Object.freeze({
@@ -50,6 +59,19 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
   }),
   rules: Object.freeze({
     group_rules_text: "",
+  }),
+  client: Object.freeze({
+    group_switcher_enabled: true,
+    qr_existing_client_join_enabled: true,
+  }),
+  tenant_console: Object.freeze({
+    operations_menu_enabled: false,
+    dangerous_action_audit_enabled: true,
+    product_change_history_enabled: false,
+  }),
+  diagnostics: Object.freeze({
+    notification_diagnostics_enabled: true,
+    bootstrap_monitoring_enabled: true,
   }),
 });
 
@@ -123,6 +145,9 @@ function normalizeTenantFeatureSettings(raw = {}) {
   const registrationSource = sectionOf(source, "registration");
   const analyticsSource = sectionOf(source, "analytics");
   const rulesSource = sectionOf(source, "rules");
+  const clientSource = sectionOf(source, "client");
+  const tenantConsoleSource = sectionOf(source, "tenant_console");
+  const diagnosticsSource = sectionOf(source, "diagnostics");
 
   const publicationIntervalMs = Math.round(
     clampNumber(
@@ -157,6 +182,11 @@ function normalizeTenantFeatureSettings(raw = {}) {
       365,
       DEFAULT_TENANT_FEATURE_SETTINGS.cart_retention_days,
     ),
+  );
+  const clientCancelAnytimeEnabled = parseBoolean(
+    deliverySource.client_cancel_anytime_enabled ??
+      source.client_cancel_anytime_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.client_cancel_anytime_enabled,
   );
   const revisionDeleteApprovalEnabled = parseBoolean(
     workerSource.revision_delete_approval_enabled ??
@@ -223,6 +253,41 @@ function normalizeTenantFeatureSettings(raw = {}) {
     .replace(/\r\n/g, "\n")
     .trim()
     .slice(0, 12000);
+  const clientGroupSwitcherEnabled = parseBoolean(
+    clientSource.group_switcher_enabled ??
+      source.client_group_switcher_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.client_group_switcher_enabled,
+  );
+  const qrExistingClientJoinEnabled = parseBoolean(
+    clientSource.qr_existing_client_join_enabled ??
+      source.qr_existing_client_join_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.qr_existing_client_join_enabled,
+  );
+  const tenantOperationsMenuEnabled = parseBoolean(
+    tenantConsoleSource.operations_menu_enabled ??
+      source.tenant_operations_menu_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.tenant_operations_menu_enabled,
+  );
+  const dangerousActionAuditEnabled = parseBoolean(
+    tenantConsoleSource.dangerous_action_audit_enabled ??
+      source.dangerous_action_audit_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.dangerous_action_audit_enabled,
+  );
+  const productChangeHistoryEnabled = parseBoolean(
+    tenantConsoleSource.product_change_history_enabled ??
+      source.product_change_history_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.product_change_history_enabled,
+  );
+  const creatorNotificationDiagnosticsEnabled = parseBoolean(
+    diagnosticsSource.notification_diagnostics_enabled ??
+      source.creator_notification_diagnostics_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.creator_notification_diagnostics_enabled,
+  );
+  const creatorBootstrapMonitoringEnabled = parseBoolean(
+    diagnosticsSource.bootstrap_monitoring_enabled ??
+      source.creator_bootstrap_monitoring_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.creator_bootstrap_monitoring_enabled,
+  );
   const customWorkflowsEnabled =
     parseBoolean(source.custom_workflows_enabled, false) ||
     productProcessingMode !==
@@ -233,6 +298,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     pickupOnlyEnabled === true ||
     cartDeliveryReadyEnabled === true ||
     cartRetentionDays !== DEFAULT_TENANT_FEATURE_SETTINGS.cart_retention_days ||
+    clientCancelAnytimeEnabled === true ||
     revisionDeleteApprovalEnabled === true ||
     defectStatsEnabled === true ||
     clientCityOptions.length > 0 ||
@@ -241,7 +307,19 @@ function normalizeTenantFeatureSettings(raw = {}) {
       DEFAULT_TENANT_FEATURE_SETTINGS.auto_publish_delay_minutes ||
     shelfFieldLabel !== DEFAULT_TENANT_FEATURE_SETTINGS.shelf_field_label ||
     floorFieldLabel !== DEFAULT_TENANT_FEATURE_SETTINGS.floor_field_label ||
-    groupRulesText.length > 0;
+    groupRulesText.length > 0 ||
+    clientGroupSwitcherEnabled !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.client_group_switcher_enabled ||
+    qrExistingClientJoinEnabled !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.qr_existing_client_join_enabled ||
+    tenantOperationsMenuEnabled === true ||
+    dangerousActionAuditEnabled !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.dangerous_action_audit_enabled ||
+    productChangeHistoryEnabled === true ||
+    creatorNotificationDiagnosticsEnabled !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.creator_notification_diagnostics_enabled ||
+    creatorBootstrapMonitoringEnabled !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.creator_bootstrap_monitoring_enabled;
 
   return {
     version: 1,
@@ -254,6 +332,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
       client_ready_button: cartDeliveryReadyEnabled,
       min_amount: cartDeliveryReadyMinAmount,
       cart_retention_days: cartRetentionDays,
+      client_cancel_anytime_enabled: clientCancelAnytimeEnabled,
       snapshot_on_admin_approve: snapshotOnAdminApprove,
     },
     worker: {
@@ -277,6 +356,19 @@ function normalizeTenantFeatureSettings(raw = {}) {
     rules: {
       group_rules_text: groupRulesText,
     },
+    client: {
+      group_switcher_enabled: clientGroupSwitcherEnabled,
+      qr_existing_client_join_enabled: qrExistingClientJoinEnabled,
+    },
+    tenant_console: {
+      operations_menu_enabled: tenantOperationsMenuEnabled,
+      dangerous_action_audit_enabled: dangerousActionAuditEnabled,
+      product_change_history_enabled: productChangeHistoryEnabled,
+    },
+    diagnostics: {
+      notification_diagnostics_enabled: creatorNotificationDiagnosticsEnabled,
+      bootstrap_monitoring_enabled: creatorBootstrapMonitoringEnabled,
+    },
     ...DEFAULT_TENANT_FEATURE_SETTINGS,
     custom_workflows_enabled: customWorkflowsEnabled,
     publication_interval_ms: publicationIntervalMs,
@@ -285,6 +377,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     cart_delivery_ready_enabled: cartDeliveryReadyEnabled,
     cart_delivery_ready_min_amount: cartDeliveryReadyMinAmount,
     cart_retention_days: cartRetentionDays,
+    client_cancel_anytime_enabled: clientCancelAnytimeEnabled,
     revision_delete_approval_enabled: revisionDeleteApprovalEnabled,
     defect_stats_enabled: defectStatsEnabled,
     client_city_options: clientCityOptions,
@@ -299,6 +392,14 @@ function normalizeTenantFeatureSettings(raw = {}) {
     auto_product_processing_delay_minutes: autoDelayMinutes,
     delivery_mode: deliveryMode,
     delivery_snapshot_on_admin_approve: snapshotOnAdminApprove,
+    client_group_switcher_enabled: clientGroupSwitcherEnabled,
+    qr_existing_client_join_enabled: qrExistingClientJoinEnabled,
+    tenant_operations_menu_enabled: tenantOperationsMenuEnabled,
+    dangerous_action_audit_enabled: dangerousActionAuditEnabled,
+    product_change_history_enabled: productChangeHistoryEnabled,
+    creator_notification_diagnostics_enabled:
+      creatorNotificationDiagnosticsEnabled,
+    creator_bootstrap_monitoring_enabled: creatorBootstrapMonitoringEnabled,
   };
 }
 

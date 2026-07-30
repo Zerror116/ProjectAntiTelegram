@@ -63,51 +63,30 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _viewMode = 'creator';
   Map<String, dynamic> _stats = const {};
   bool _statsExpanded = false;
-  bool _sessionsBusy = false;
   bool _passkeySupported = false;
   bool _passkeyBusy = false;
-  bool _switchingSession = false;
-  bool _addGroupBusy = false;
-  bool _addGroupSwitchAfterJoin = false;
   bool _creatorTenantsLoading = false;
   bool _creatorTenantScopeBusy = false;
-  final _addGroupCodeCtrl = TextEditingController();
-  final _addGroupPasswordCtrl = TextEditingController();
   final _tenantClientSearchCtrl = TextEditingController();
   Timer? _tenantClientSearchDebounce;
   bool _tenantClientsLoading = false;
   bool _tenantClientsRequested = false;
   List<Map<String, dynamic>> _tenantClients = const [];
   String _tenantRoleUpdateUserId = '';
-  List<Map<String, dynamic>> _savedTenantSessions = const [];
   List<Map<String, dynamic>> _creatorTenants = const [];
   String _creatorTenantScopeCode = '';
-  String _addGroupTenantHint = '';
-  String _addGroupTenantHintInvite = '';
-  VoidCallback? _pendingClientInviteListener;
 
   @override
   void initState() {
     super.initState();
     _viewMode = authService.viewRole ?? 'creator';
-    _pendingClientInviteListener = _applyPendingClientGroupInvite;
-    pendingClientGroupInviteVersion.addListener(_pendingClientInviteListener!);
     _load();
     _loadPasskeySupport();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _applyPendingClientGroupInvite();
-    });
   }
 
   @override
   void dispose() {
     _tenantClientSearchDebounce?.cancel();
-    final pendingListener = _pendingClientInviteListener;
-    if (pendingListener != null) {
-      pendingClientGroupInviteVersion.removeListener(pendingListener);
-    }
-    _addGroupCodeCtrl.dispose();
-    _addGroupPasswordCtrl.dispose();
     _tenantClientSearchCtrl.dispose();
     super.dispose();
   }
@@ -135,8 +114,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   String get _effectiveRole => (authService.effectiveRole).toLowerCase().trim();
-
-  bool get _isClientAccount => _effectiveRole == 'client';
 
   bool get _canManageTenantUsers {
     final effectiveRole = _effectiveRole;
@@ -212,14 +189,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _avatarZoom = _toAvatarZoom(u['avatar_zoom']);
   }
 
-  String get _currentSessionId {
-    final user = authService.currentUser;
-    if (user == null) return '';
-    final email = user.email.trim().toLowerCase();
-    final tenant = (user.tenantCode ?? '').trim().toLowerCase();
-    return '$email::$tenant';
-  }
-
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -247,7 +216,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       setState(() => _message = _extractDioMessage(e));
     } finally {
       if (mounted) setState(() => _loading = false);
-      unawaited(_loadSavedSessions());
       unawaited(_loadCreatorTenants(silent: true));
     }
   }
@@ -267,48 +235,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       if (!mounted) return;
       unawaited(_loadTenantClients(searchOverride: query));
     });
-  }
-
-  Future<void> _loadSavedSessions() async {
-    if (_sessionsBusy) return;
-    _sessionsBusy = true;
-    try {
-      final sessionsRaw = await authService.listSavedTenantSessions();
-      List<Map<String, dynamic>> sessions = const [];
-      if (_isClientAccount) {
-        final currentEmail = (authService.currentUser?.email ?? '')
-            .trim()
-            .toLowerCase();
-        final filtered = sessionsRaw.where((row) {
-          final email = (row['email'] ?? '').toString().trim().toLowerCase();
-          final role = (row['role'] ?? '').toString().trim().toLowerCase();
-          final tenantCode = (row['tenant_code'] ?? '')
-              .toString()
-              .trim()
-              .toLowerCase();
-          return email == currentEmail &&
-              role == 'client' &&
-              tenantCode.isNotEmpty;
-        });
-        final seenTenantCodes = <String>{};
-        sessions = filtered.where((row) {
-          final tenantCode = (row['tenant_code'] ?? '')
-              .toString()
-              .trim()
-              .toLowerCase();
-          if (tenantCode.isEmpty) return false;
-          if (seenTenantCodes.contains(tenantCode)) return false;
-          seenTenantCodes.add(tenantCode);
-          return true;
-        }).toList();
-      }
-      if (!mounted) return;
-      setState(() {
-        _savedTenantSessions = sessions;
-      });
-    } finally {
-      _sessionsBusy = false;
-    }
   }
 
   Future<void> _loadCreatorTenants({bool silent = false}) async {
@@ -440,250 +366,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
-  String _sessionTenantLabel(Map<String, dynamic> row) {
-    final tenantName = (row['tenant_name'] ?? '').toString().trim();
-    if (tenantName.isNotEmpty) return tenantName;
-    final tenantCode = (row['tenant_code'] ?? '').toString().trim();
-    if (tenantCode.isNotEmpty) return tenantCode;
-    return 'Неизвестная группа';
-  }
-
   String _normalizeTenantCode(Object? value) =>
       value?.toString().trim().toLowerCase() ?? '';
-
-  Map<String, String> _extractInvitePayload(String raw) {
-    final source = raw.trim();
-    if (source.isEmpty) {
-      return const {'invite': '', 'tenant': ''};
-    }
-
-    String invite = '';
-    String tenant = '';
-
-    void extractFromUri(Uri uri) {
-      final segments = uri.pathSegments
-          .map((segment) => Uri.decodeComponent(segment).trim())
-          .where((segment) => segment.isNotEmpty)
-          .toList();
-      final joinIndex = segments.indexWhere(
-        (segment) => segment.toLowerCase() == 'join',
-      );
-      if (invite.isEmpty && joinIndex >= 0 && joinIndex + 1 < segments.length) {
-        invite = segments[joinIndex + 1].trim();
-      }
-      if (invite.isEmpty) {
-        invite =
-            (uri.queryParameters['invite'] ?? uri.queryParameters['code'] ?? '')
-                .trim();
-      }
-      if (tenant.isEmpty) {
-        tenant =
-            (uri.queryParameters['tenant'] ??
-                    uri.queryParameters['tenant_code'] ??
-                    '')
-                .trim()
-                .toLowerCase();
-      }
-      if (uri.fragment.isNotEmpty) {
-        final fragment = uri.fragment;
-        final qIndex = fragment.indexOf('?');
-        if (qIndex >= 0 && qIndex + 1 < fragment.length) {
-          final inFragment = Uri.splitQueryString(
-            fragment.substring(qIndex + 1),
-          );
-          if (invite.isEmpty) {
-            invite = (inFragment['invite'] ?? inFragment['code'] ?? '').trim();
-          }
-          if (tenant.isEmpty) {
-            tenant = (inFragment['tenant'] ?? inFragment['tenant_code'] ?? '')
-                .trim()
-                .toLowerCase();
-          }
-        }
-      }
-    }
-
-    try {
-      final uri = Uri.parse(source);
-      if (uri.hasScheme || source.contains('?') || source.contains('#')) {
-        extractFromUri(uri);
-      }
-    } catch (_) {}
-
-    if (invite.isEmpty) {
-      invite = source;
-    }
-
-    return {'invite': invite, 'tenant': tenant};
-  }
-
-  String _normalizeInviteCode(Object? value) {
-    return value
-            ?.toString()
-            .toUpperCase()
-            .replaceAll(RegExp(r'[^A-Z0-9-]'), '')
-            .trim() ??
-        '';
-  }
-
-  void _applyPendingClientGroupInvite() {
-    if (!mounted || !_isClientAccount) return;
-    final pending = consumePendingClientGroupInvite();
-    if (pending == null) return;
-    final inviteCode = _normalizeInviteCode(pending.inviteCode);
-    if (inviteCode.isEmpty) return;
-    final tenantCode = _normalizeTenantCode(pending.tenantCode);
-    setState(() {
-      _addGroupCodeCtrl.text = inviteCode;
-      _addGroupPasswordCtrl.clear();
-      _addGroupSwitchAfterJoin = true;
-      _addGroupTenantHint = tenantCode;
-      _addGroupTenantHintInvite = inviteCode;
-      _message =
-          'Ссылка приглашения открыта. Введите пароль и добавьте группу.';
-    });
-  }
-
-  Future<String> _resolveTenantCodeByInvite(String inviteCode) async {
-    final normalized = inviteCode.trim();
-    if (normalized.isEmpty) return '';
-    try {
-      final resp = await authService.dio.post(
-        '/api/auth/invite/resolve',
-        data: {'invite_code': normalized},
-      );
-      final data = resp.data;
-      if (data is Map && data['ok'] == true && data['data'] is Map) {
-        final row = Map<String, dynamic>.from(data['data']);
-        return (row['tenant_code'] ?? '').toString().trim().toLowerCase();
-      }
-    } catch (_) {}
-    return '';
-  }
-
-  Future<void> _addGroupByInvite() async {
-    if (_addGroupBusy || !_isClientAccount) return;
-
-    final invitePayload = _extractInvitePayload(_addGroupCodeCtrl.text);
-    final inviteCode = _normalizeInviteCode(invitePayload['invite']);
-    var tenantCode = (invitePayload['tenant'] ?? '').trim().toLowerCase();
-    if (tenantCode.isEmpty && inviteCode == _addGroupTenantHintInvite) {
-      tenantCode = _addGroupTenantHint;
-    }
-    final password = _addGroupPasswordCtrl.text.trim();
-
-    if (inviteCode.isEmpty) {
-      setState(() => _message = 'Введите код или ссылку приглашения');
-      return;
-    }
-    if (password.length < 8) {
-      setState(() => _message = 'Введите пароль (минимум 8 символов)');
-      return;
-    }
-
-    final current = authService.currentUser;
-    if (current == null || current.email.trim().isEmpty) {
-      setState(() => _message = 'Сессия не найдена. Перезайдите в аккаунт');
-      return;
-    }
-
-    final previousSessionId = _currentSessionId;
-    final previousTenantCode = (current.tenantCode ?? '').trim();
-    final email = current.email.trim();
-    final name = (_name.isNotEmpty ? _name : (current.name ?? '')).trim();
-    final phone = (current.phone ?? '').toString().trim();
-
-    setState(() {
-      _addGroupBusy = true;
-      _message = '';
-    });
-    try {
-      if (tenantCode.isEmpty) {
-        tenantCode = await _resolveTenantCodeByInvite(inviteCode);
-      }
-      if (tenantCode.isNotEmpty) {
-        await authService.setTenantCode(tenantCode);
-      }
-
-      await authService.joinClientGroupByInvite(
-        email: email,
-        password: password,
-        inviteCode: inviteCode,
-        tenantCode: tenantCode,
-        name: name.isEmpty ? null : name,
-        phone: phone.isEmpty ? null : phone,
-      );
-
-      var switchedBack = true;
-      if (!_addGroupSwitchAfterJoin && previousSessionId.isNotEmpty) {
-        switchedBack = await authService.switchToSavedTenantSession(
-          previousSessionId,
-        );
-      }
-      if (!_addGroupSwitchAfterJoin && previousTenantCode.isNotEmpty) {
-        await authService.setTenantCode(previousTenantCode);
-      }
-
-      _addGroupCodeCtrl.clear();
-      _addGroupPasswordCtrl.clear();
-      _addGroupTenantHint = '';
-      _addGroupTenantHintInvite = '';
-      await _loadSavedSessions();
-      await _load();
-      if (!mounted) return;
-      if (_addGroupSwitchAfterJoin) {
-        Navigator.of(
-          context,
-        ).pushNamedAndRemoveUntil('/main', (route) => false);
-        return;
-      }
-      setState(() {
-        _message = switchedBack
-            ? 'Группа добавлена. Теперь можно переключаться в "Мои группы".'
-            : 'Группа добавлена, но не удалось вернуться в прошлую группу автоматически.';
-      });
-    } catch (e) {
-      if (previousTenantCode.isNotEmpty) {
-        await authService.setTenantCode(previousTenantCode);
-      }
-      if (!mounted) return;
-      final text = _extractDioMessage(e);
-      setState(() => _message = 'Ошибка добавления группы: $text');
-    } finally {
-      if (mounted) setState(() => _addGroupBusy = false);
-    }
-  }
-
-  Future<void> _switchToSession(Map<String, dynamic> row) async {
-    if (_switchingSession) return;
-    final sessionId = (row['id'] ?? '').toString().trim();
-    if (sessionId.isEmpty) return;
-    setState(() => _switchingSession = true);
-    try {
-      final ok = await authService.switchToSavedTenantSession(sessionId);
-      if (!mounted) return;
-      if (!ok) {
-        setState(() => _message = 'Не удалось переключить группу');
-        await _loadSavedSessions();
-        return;
-      }
-      Navigator.of(context).pushNamedAndRemoveUntil('/main', (route) => false);
-    } catch (e) {
-      if (!mounted) return;
-      setState(
-        () => _message = 'Ошибка переключения: ${_extractDioMessage(e)}',
-      );
-    } finally {
-      if (mounted) setState(() => _switchingSession = false);
-    }
-  }
-
-  Future<void> _removeSavedSession(Map<String, dynamic> row) async {
-    final sessionId = (row['id'] ?? '').toString().trim();
-    if (sessionId.isEmpty || sessionId == _currentSessionId) return;
-    await authService.removeSavedTenantSession(sessionId);
-    await _loadSavedSessions();
-  }
 
   Future<void> _pickAndUploadAvatar() async {
     if (_avatarBusy) return;
@@ -1229,14 +913,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
     EdgeInsetsGeometry padding = const EdgeInsets.all(18),
   }) {
     final theme = Theme.of(context);
-    return Container(
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
+    return Material(
+      color: theme.colorScheme.surface,
+      shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: theme.colorScheme.outlineVariant),
+        side: BorderSide(color: theme.colorScheme.outlineVariant),
       ),
-      padding: padding,
-      child: child,
+      clipBehavior: Clip.antiAlias,
+      child: Padding(padding: padding, child: child),
     );
   }
 
@@ -2095,209 +1779,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                         : const Icon(Icons.manage_accounts),
                                   ),
                                 ],
-                              ),
-                            );
-                          }),
-                        ],
-                      ),
-                    ),
-                  ],
-                  if (_isClientAccount) ...[
-                    const SizedBox(height: 16),
-                    _sectionCard(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Мои группы',
-                            style: theme.textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Здесь отображаются только ваши клиентские группы. Добавьте новую по коду приглашения.',
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _addGroupCodeCtrl,
-                            decoration: withInputLanguageBadge(
-                              const InputDecoration(
-                                labelText: 'Код или ссылка приглашения',
-                                border: OutlineInputBorder(),
-                              ),
-                              controller: _addGroupCodeCtrl,
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          TextField(
-                            controller: _addGroupPasswordCtrl,
-                            obscureText: true,
-                            decoration: withInputLanguageBadge(
-                              const InputDecoration(
-                                labelText: 'Пароль аккаунта в новой группе',
-                                border: OutlineInputBorder(),
-                              ),
-                              controller: _addGroupPasswordCtrl,
-                            ),
-                          ),
-                          CheckboxListTile(
-                            dense: true,
-                            contentPadding: EdgeInsets.zero,
-                            value: _addGroupSwitchAfterJoin,
-                            onChanged: _addGroupBusy
-                                ? null
-                                : (value) {
-                                    setState(
-                                      () => _addGroupSwitchAfterJoin =
-                                          value == true,
-                                    );
-                                  },
-                            title: const Text('Сразу перейти в эту группу'),
-                            subtitle: const Text(
-                              'Если выключено, группа просто появится в списке ниже.',
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          SizedBox(
-                            width: double.infinity,
-                            child: FilledButton.icon(
-                              onPressed: _addGroupBusy
-                                  ? null
-                                  : _addGroupByInvite,
-                              icon: _addGroupBusy
-                                  ? const SizedBox(
-                                      width: 14,
-                                      height: 14,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(Icons.group_add_outlined),
-                              label: Text(
-                                _addGroupBusy
-                                    ? 'Добавление...'
-                                    : (_addGroupSwitchAfterJoin
-                                          ? 'Добавить и перейти'
-                                          : 'Добавить группу'),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          if (_savedTenantSessions.isEmpty)
-                            Text(
-                              'Пока доступна только текущая группа.',
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ..._savedTenantSessions.map((row) {
-                            final sessionId = (row['id'] ?? '').toString();
-                            final active = sessionId == _currentSessionId;
-                            final tenantLabel = _sessionTenantLabel(row);
-                            final roleLabel = _roleLabel(
-                              (row['role'] ?? 'client').toString(),
-                            );
-                            final email = (row['email'] ?? '').toString();
-                            return Container(
-                              margin: const EdgeInsets.only(bottom: 10),
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: active
-                                    ? theme.colorScheme.primaryContainer
-                                    : theme.colorScheme.surfaceContainerLow,
-                                borderRadius: BorderRadius.circular(16),
-                                border: Border.all(
-                                  color: active
-                                      ? theme.colorScheme.primary
-                                      : theme.colorScheme.outlineVariant,
-                                ),
-                              ),
-                              child: LayoutBuilder(
-                                builder: (context, constraints) {
-                                  final compact = constraints.maxWidth < 420;
-                                  final actions = <Widget>[
-                                    if (active)
-                                      const Icon(Icons.check_circle_outline)
-                                    else
-                                      FilledButton.tonal(
-                                        onPressed: _switchingSession
-                                            ? null
-                                            : () => _switchToSession(row),
-                                        child: const Text('Выбрать'),
-                                      ),
-                                    if (!active)
-                                      IconButton(
-                                        tooltip: 'Убрать из списка',
-                                        onPressed: _switchingSession
-                                            ? null
-                                            : () => _removeSavedSession(row),
-                                        icon: const Icon(Icons.delete_outline),
-                                      ),
-                                  ];
-
-                                  final details = Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        tenantLabel,
-                                        style: theme.textTheme.titleSmall
-                                            ?.copyWith(
-                                              fontWeight: FontWeight.w800,
-                                            ),
-                                      ),
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        '$roleLabel • $email',
-                                        style: theme.textTheme.bodySmall
-                                            ?.copyWith(
-                                              color: theme
-                                                  .colorScheme
-                                                  .onSurfaceVariant,
-                                            ),
-                                      ),
-                                    ],
-                                  );
-
-                                  if (compact) {
-                                    return Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        details,
-                                        const SizedBox(height: 8),
-                                        Align(
-                                          alignment: Alignment.centerRight,
-                                          child: Wrap(
-                                            spacing: 6,
-                                            runSpacing: 6,
-                                            crossAxisAlignment:
-                                                WrapCrossAlignment.center,
-                                            alignment: WrapAlignment.end,
-                                            children: actions,
-                                          ),
-                                        ),
-                                      ],
-                                    );
-                                  }
-
-                                  return Row(
-                                    children: [
-                                      Expanded(child: details),
-                                      const SizedBox(width: 8),
-                                      Wrap(
-                                        spacing: 6,
-                                        crossAxisAlignment:
-                                            WrapCrossAlignment.center,
-                                        children: actions,
-                                      ),
-                                    ],
-                                  );
-                                },
                               ),
                             );
                           }),

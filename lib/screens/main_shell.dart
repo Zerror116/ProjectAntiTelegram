@@ -20,6 +20,7 @@ import 'admin_panel.dart';
 import 'auth_screen.dart';
 import 'cart_screen.dart';
 import 'chats_screen.dart';
+import 'client_groups_screen.dart';
 import 'profile_screen.dart';
 import 'pwa_guide_screen.dart';
 import 'settings_screen.dart';
@@ -51,6 +52,8 @@ class _MainShellState extends State<MainShell> {
   static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
   static const String _webNotificationsBannerDismissedKey =
       'web_notifications_banner_dismissed_v1';
+  static const String _firstNotificationPromptSeenPrefix =
+      'first_notification_permission_prompt_seen_v1';
   int _index = 0;
   StreamSubscription<User?>? _authSub;
   String _lastEffectiveRole = '';
@@ -62,6 +65,7 @@ class _MainShellState extends State<MainShell> {
   bool _webNotificationStatusLoaded = false;
   bool _webNotificationBannerDismissed = false;
   bool _webNotificationRequestInProgress = false;
+  bool _webNotificationFirstPromptInFlight = false;
   bool _nativeNotificationPromptInFlight = false;
   String? _nativeNotificationPromptedUserId;
   Timer? _supportQueueRefreshTimer;
@@ -83,10 +87,10 @@ class _MainShellState extends State<MainShell> {
         ((authService.currentUser?.role ?? '').toLowerCase().trim() ==
             'client');
     if (hasPendingClientInvite) {
-      final profileIndex = initialIds.indexOf('profile');
-      if (profileIndex >= 0) {
-        _index = profileIndex;
-        _activatedDestinations.add('profile');
+      final groupsIndex = initialIds.indexOf('groups');
+      if (groupsIndex >= 0) {
+        _index = groupsIndex;
+        _activatedDestinations.add('groups');
       }
     }
     if (initialIds.isNotEmpty) {
@@ -106,6 +110,7 @@ class _MainShellState extends State<MainShell> {
         chatUnreadBadgeCountNotifier.value = 0;
         _nativeNotificationPromptedUserId = null;
       } else {
+        unawaited(_maybeShowFirstWebNotificationPrompt());
         unawaited(_maybeRequestNativeNotificationAccess());
         unawaited(_syncNotificationRuntime());
         unawaited(_maybeHandleInitialNotificationDeepLink());
@@ -136,6 +141,7 @@ class _MainShellState extends State<MainShell> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _maybeShowIosAddToHomeHint();
+      unawaited(_maybeShowFirstWebNotificationPrompt());
       unawaited(_maybeRequestNativeNotificationAccess());
       unawaited(_maybeHandleInitialNotificationDeepLink());
     });
@@ -176,6 +182,32 @@ class _MainShellState extends State<MainShell> {
     return baseRole == 'creator' && effectiveRole == 'creator';
   }
 
+  bool _boolFeatureValue(dynamic value, bool fallback) {
+    if (value is bool) return value;
+    final normalized = (value ?? '').toString().toLowerCase().trim();
+    if (const {'1', 'true', 'yes', 'on', 'да'}.contains(normalized)) {
+      return true;
+    }
+    if (const {'0', 'false', 'no', 'off', 'нет'}.contains(normalized)) {
+      return false;
+    }
+    return fallback;
+  }
+
+  bool _clientGroupSwitcherEnabledForRole(String role) {
+    if (role.toLowerCase().trim() != 'client') return false;
+    final user = authService.currentUser;
+    final settings = user?.featureSettings ?? const <String, dynamic>{};
+    final client = settings['client'] is Map
+        ? Map<String, dynamic>.from(settings['client'] as Map)
+        : const <String, dynamic>{};
+    return _boolFeatureValue(
+      client['group_switcher_enabled'] ??
+          settings['client_group_switcher_enabled'],
+      true,
+    );
+  }
+
   List<String> _destinationIdsForRole(String role) {
     final normalized = role.toLowerCase().trim();
     final showAdmin =
@@ -187,6 +219,7 @@ class _MainShellState extends State<MainShell> {
         normalized == 'worker' ||
         normalized == 'tenant' ||
         normalized == 'creator';
+    final clientGroupsEnabled = _clientGroupSwitcherEnabledForRole(normalized);
     return <String>[
       'chats',
       'cart',
@@ -194,6 +227,7 @@ class _MainShellState extends State<MainShell> {
       if (showWorker) 'worker',
       if (showStats) 'stats',
       'profile',
+      if (normalized == 'client' && clientGroupsEnabled) 'groups',
       'settings',
     ];
   }
@@ -371,6 +405,7 @@ class _MainShellState extends State<MainShell> {
           enabled) {
         unawaited(_syncNotificationRuntime());
       }
+      unawaited(_maybeShowFirstWebNotificationPrompt());
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -501,6 +536,61 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  String _firstNotificationPromptSeenKey(String userId) {
+    return '$_firstNotificationPromptSeenPrefix:$userId';
+  }
+
+  Future<void> _maybeShowFirstWebNotificationPrompt() async {
+    if (!kIsWeb) return;
+    if (_webNotificationFirstPromptInFlight) return;
+    _webNotificationFirstPromptInFlight = true;
+    try {
+      if (_webNotificationRequestInProgress) return;
+      final user = authService.currentUser;
+      if (user == null || user.id.trim().isEmpty) return;
+      final permission = await WebNotificationService.getPermissionState();
+      if (permission != WebNotificationPermissionState.defaultState) return;
+      final prefs = await SharedPreferences.getInstance();
+      final seenKey = _firstNotificationPromptSeenKey(user.id);
+      if (prefs.getBool(seenKey) == true) return;
+      if (!mounted) return;
+
+      await prefs.setBool(seenKey, true);
+      if (!mounted) return;
+      final accepted =
+          await showDialog<bool>(
+            context: context,
+            builder: (dialogContext) {
+              return AlertDialog(
+                title: const Text('Разрешить уведомления Феникс?'),
+                content: const Text(
+                  'Мы будем присылать только важные уведомления: сообщения, поддержку, безопасность, обновления и выбранные вами акции.',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    child: const Text('Не сейчас'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(true),
+                    child: const Text('Разрешить'),
+                  ),
+                ],
+              );
+            },
+          ) ??
+          false;
+      if (accepted && mounted) {
+        await _requestWebNotificationAccess();
+      } else if (mounted) {
+        final refreshed = await WebNotificationService.getPermissionState();
+        setState(() => _webNotificationPermissionState = refreshed);
+      }
+    } finally {
+      _webNotificationFirstPromptInFlight = false;
+    }
+  }
+
   Future<void> _maybeRequestNativeNotificationAccess() async {
     if (kIsWeb || !NativePushService.isSupported) return;
     final user = authService.currentUser;
@@ -512,6 +602,11 @@ class _MainShellState extends State<MainShell> {
     _nativeNotificationPromptInFlight = true;
     _nativeNotificationPromptedUserId = user.id;
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final seenKey = _firstNotificationPromptSeenKey(user.id);
+      if (prefs.getBool(seenKey) == true) return;
+      await prefs.setBool(seenKey, true);
+      if (!mounted) return;
       final granted = await NativePushService.ensurePermissionInContext(
         context,
       );
@@ -634,6 +729,14 @@ class _MainShellState extends State<MainShell> {
         icon: Icons.person_outline_rounded,
         builder: _buildProfileScreen,
       ),
+      if (_effectiveRole().toLowerCase().trim() == 'client' &&
+          _clientGroupSwitcherEnabledForRole(_effectiveRole()))
+        const _ShellDestination(
+          id: 'groups',
+          label: 'Группы',
+          icon: Icons.grid_view_rounded,
+          builder: _buildClientGroupsScreen,
+        ),
       _ShellDestination(
         id: 'settings',
         label: 'Настройки',
@@ -645,6 +748,8 @@ class _MainShellState extends State<MainShell> {
 
   static Widget _buildChatsScreen(BuildContext context) => const ChatsScreen();
   static Widget _buildCartScreen(BuildContext context) => const CartScreen();
+  static Widget _buildClientGroupsScreen(BuildContext context) =>
+      const ClientGroupsScreen();
   static Widget _buildAdminScreen(BuildContext context) => const AdminPanel();
   static Widget _buildWorkerScreen(BuildContext context) => const WorkerPanel();
   static Widget _buildStatsScreen(BuildContext context) =>

@@ -390,14 +390,22 @@ class _NotificationPreferencesScreenState
       curve: Curves.easeOutCubic,
       margin: const EdgeInsets.only(bottom: 10),
       decoration: _softCapsuleDecoration(enabled: enabled, accent: accent),
-      child: SwitchListTile.adaptive(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-        value: value,
-        onChanged: enabled ? onChanged : null,
-        title: Text(title),
-        subtitle: subtitle == null ? null : Text(subtitle),
-        secondary: trailing,
+      child: Material(
+        type: MaterialType.transparency,
+        child: SwitchListTile.adaptive(
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 4,
+          ),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(30),
+          ),
+          value: value,
+          onChanged: enabled ? onChanged : null,
+          title: Text(title),
+          subtitle: subtitle == null ? null : Text(subtitle),
+          secondary: trailing,
+        ),
       ),
     );
   }
@@ -410,29 +418,37 @@ class _NotificationPreferencesScreenState
         enabled: true,
         accent: theme.colorScheme.tertiary,
       ),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-        leading: Container(
-          width: 38,
-          height: 38,
-          decoration: BoxDecoration(
-            color: theme.colorScheme.tertiary.withValues(alpha: 0.13),
-            shape: BoxShape.circle,
+      child: Material(
+        type: MaterialType.transparency,
+        child: ListTile(
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 4,
           ),
-          child: Icon(
-            Icons.lock_outline_rounded,
-            color: theme.colorScheme.tertiary,
-            size: 20,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(30),
           ),
-        ),
-        title: Text(title),
-        subtitle: Text(subtitle),
-        trailing: Text(
-          'Всегда включено',
-          style: theme.textTheme.labelMedium?.copyWith(
-            color: theme.colorScheme.primary,
-            fontWeight: FontWeight.w700,
+          leading: Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: theme.colorScheme.tertiary.withValues(alpha: 0.13),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(
+              Icons.lock_outline_rounded,
+              color: theme.colorScheme.tertiary,
+              size: 20,
+            ),
+          ),
+          title: Text(title),
+          subtitle: Text(subtitle),
+          trailing: Text(
+            'Всегда включено',
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: theme.colorScheme.primary,
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
       ),
@@ -567,15 +583,18 @@ class _NotificationPreferencesScreenState
             ),
             const SizedBox(height: 12),
             ..._channelLabels.entries.map((entry) {
-              return SwitchListTile.adaptive(
-                contentPadding: EdgeInsets.zero,
-                title: Text(entry.value),
-                value: _channels[entry.key] ?? false,
-                onChanged: (value) {
-                  setState(() {
-                    _channels[entry.key] = value;
-                  });
-                },
+              return Material(
+                type: MaterialType.transparency,
+                child: SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(entry.value),
+                  value: _channels[entry.key] ?? false,
+                  onChanged: (value) {
+                    setState(() {
+                      _channels[entry.key] = value;
+                    });
+                  },
+                ),
               );
             }),
           ],

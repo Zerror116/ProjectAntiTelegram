@@ -370,7 +370,10 @@ class _CartScreenState extends State<CartScreen> {
     }
   }
 
-  bool _canCancel(String status) {
+  bool _canCancel(Map<String, dynamic> item) {
+    final explicit = item['can_cancel'];
+    if (explicit is bool) return explicit;
+    final status = (item['status'] ?? '').toString();
     return status == 'pending_processing';
   }
 
@@ -518,8 +521,7 @@ class _CartScreenState extends State<CartScreen> {
   }
 
   Future<void> _cancelItem(Map<String, dynamic> item) async {
-    final status = (item['status'] ?? '').toString();
-    if (!_canCancel(status)) {
+    if (!_canCancel(item)) {
       showAppNotice(
         context,
         'Отказ невозможен: товар уже обработан',
@@ -1271,7 +1273,7 @@ class _CartScreenState extends State<CartScreen> {
         : double.tryParse('${item['line_total'] ?? 0}') ?? 0;
     final imageUrl = _resolveImageUrl((item['image_url'] ?? '').toString());
     final statusColor = _statusColor(statusRaw);
-    final canCancel = _canCancel(statusRaw);
+    final canCancel = _canCancel(item);
     final itemId = (item['id'] ?? '').toString().trim();
     final recentlyChanged = _recentlyChangedItemIds.contains(itemId);
     final reducedMotion =

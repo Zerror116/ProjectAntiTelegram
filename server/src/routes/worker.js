@@ -30,6 +30,7 @@ const productUploadsDir = uploadsPath('products');
 fs.mkdirSync(productUploadsDir, { recursive: true });
 const SAMARA_TZ = 'Europe/Samara';
 const CREATOR_MISSING_PHOTO_REVISION_SHELF = 7;
+const REVISION_UNASSIGNED_SHELF_LABEL = 'Без полки';
 const productImageMaxMb = Math.max(
   1,
   Number.parseInt(String(process.env.PRODUCT_IMAGE_MAX_MB || '8').trim(), 10) || 8,
@@ -212,6 +213,11 @@ function parseRevisionShelfNumber(value) {
   return Math.floor(shelf);
 }
 
+function normalizeRevisionShelfKey(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return normalizeFreeShelfText(raw, 160);
+}
+
 function normalizeRevisionProductIdSearch(value) {
   const raw = Array.isArray(value) ? value[0] : value;
   return String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
@@ -359,6 +365,28 @@ function formatShelfLabel(shelfNumber, fallback = '—') {
   const shelf = toShelfNumber(shelfNumber, 0);
   if (shelf <= 0) return fallback;
   return String(shelf).padStart(2, '0');
+}
+
+function manualRevisionShelfLabelSql(alias = 'p') {
+  return `COALESCE(
+    NULLIF(BTRIM(${alias}.manual_shelf_label), ''),
+    CASE
+      WHEN ${alias}.shelf_number IS NOT NULL THEN LPAD(${alias}.shelf_number::text, 2, '0')
+      ELSE '${REVISION_UNASSIGNED_SHELF_LABEL}'
+    END
+  )`;
+}
+
+function normalizeRevisionShelfKeyForCompare(value) {
+  return normalizeRevisionShelfKey(value).toLocaleLowerCase('ru-RU');
+}
+
+function revisionShelfLabelFromValues({ manualShelfEnabled, manualShelfLabel, shelfNumber }) {
+  const manualShelf = normalizeFreeShelfText(manualShelfLabel);
+  if (manualShelfEnabled && manualShelf) return manualShelf;
+  const numeric = toPositiveShelfNumberOrNull(shelfNumber);
+  if (numeric != null) return formatShelfLabel(numeric);
+  return REVISION_UNASSIGNED_SHELF_LABEL;
 }
 
 function revisionDayToTimestamp(day) {
@@ -530,6 +558,12 @@ function normalizeRevisionEntry(raw) {
     quantity,
     shelf_number: shelfNumber,
     revision_shelf_number: revisionShelfNumber,
+    revision_shelf_key: normalizeRevisionShelfKey(item.revision_shelf_key ?? item.shelf_key),
+    revision_shelf_label: normalizeFreeShelfText(
+      item.revision_shelf_label ?? item.shelf_label,
+    ),
+    manual_shelf_label: normalizeFreeShelfText(item.manual_shelf_label),
+    shelf_floor: normalizeFreeShelfText(item.shelf_floor),
     image_url: normalizeImageUrl(item.image_url),
   };
 }
@@ -557,6 +591,17 @@ function compareNullableStringsAsc(a, b) {
 }
 
 function compareRevisionPosts(a, b) {
+  const shelfKeyCompare = compareNullableStringsAsc(
+    a.revision_shelf_key ?? a.shelf_key ?? a.revision_shelf_label,
+    b.revision_shelf_key ?? b.shelf_key ?? b.revision_shelf_label,
+  );
+  if (
+    shelfKeyCompare !== 0 &&
+    (a.revision_shelf_key || a.shelf_key || b.revision_shelf_key || b.shelf_key)
+  ) {
+    return shelfKeyCompare;
+  }
+
   const shelfCompare =
     toShelfNumber(
       a.revision_shelf_number ?? a.shelf_number,
@@ -776,10 +821,18 @@ async function hideCatalogMessagesMissingPhoto(client, channelId, messageIds, ac
 async function sanitizeRevisionVisibleCatalogMessages(
   client,
   channelId,
-  { actorUserId = null, selectedDates = [], selectedShelfNumber = null } = {},
+  {
+    actorUserId = null,
+    selectedDates = [],
+    selectedShelfNumber = null,
+    selectedShelfKey = '',
+    manualShelfEnabled = false,
+  } = {},
 ) {
   const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
   const shelfFilter = parseRevisionShelfNumber(selectedShelfNumber);
+  const shelfKeyFilter = normalizeRevisionShelfKeyForCompare(selectedShelfKey);
+  const manualShelfSql = manualRevisionShelfLabelSql('p');
   const q = await client.query(
     `SELECT m.id AS message_id,
             m.chat_id,
@@ -788,6 +841,7 @@ async function sanitizeRevisionVisibleCatalogMessages(
             m.meta,
             m.created_at,
             p.shelf_number AS product_shelf_number,
+            ${manualShelfSql} AS product_shelf_label,
             p.image_url AS product_image_url
      FROM messages m
      LEFT JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
@@ -801,8 +855,20 @@ async function sanitizeRevisionVisibleCatalogMessages(
        AND (
          $4::int IS NULL
          OR p.shelf_number = $4::int
+       )
+       AND (
+         $5::boolean = false
+         OR $6::text = ''
+         OR lower(${manualShelfSql}) = $6::text
        )`,
-    [channelId, dateFilter, SAMARA_TZ, shelfFilter],
+    [
+      channelId,
+      dateFilter,
+      SAMARA_TZ,
+      manualShelfEnabled ? null : shelfFilter,
+      manualShelfEnabled === true,
+      shelfKeyFilter,
+    ],
   );
   const messageIdsToHide = [];
   for (const row of q.rows) {
@@ -837,6 +903,8 @@ async function fetchRevisionTarget(client, channelId, item) {
               p.id AS product_id,
               p.product_code,
               p.shelf_number AS product_shelf_number,
+              p.manual_shelf_label AS product_manual_shelf_label,
+              p.shelf_floor AS product_shelf_floor,
               p.title AS product_title,
               p.description AS product_description,
               p.price AS product_price,
@@ -864,6 +932,8 @@ async function fetchRevisionTarget(client, channelId, item) {
             p.id AS product_id,
             p.product_code,
             p.shelf_number AS product_shelf_number,
+            p.manual_shelf_label AS product_manual_shelf_label,
+            p.shelf_floor AS product_shelf_floor,
             p.title AS product_title,
             p.description AS product_description,
             p.price AS product_price,
@@ -939,6 +1009,10 @@ function buildRevisionQueuePayload({
   shelfNumber,
   productShelfNumber,
   revisionShelfNumber,
+  revisionShelfKey = '',
+  revisionShelfLabel = '',
+  manualShelfLabel = '',
+  shelfFloor = '',
   imageUrl,
   selectedDates = [],
   sourceMessageIds = [],
@@ -955,6 +1029,21 @@ function buildRevisionQueuePayload({
     revisionShelfNumber ?? previous.revision_shelf_number ?? shelfNumber,
     resolvedProductShelfNumber,
   );
+  const resolvedManualShelfLabel =
+    normalizeFreeShelfText(manualShelfLabel) ||
+    normalizeFreeShelfText(previous.manual_shelf_label);
+  const resolvedRevisionShelfLabel =
+    normalizeFreeShelfText(revisionShelfLabel) ||
+    normalizeFreeShelfText(previous.revision_shelf_label) ||
+    revisionShelfLabelFromValues({
+      manualShelfEnabled: Boolean(resolvedManualShelfLabel),
+      manualShelfLabel: resolvedManualShelfLabel,
+      shelfNumber: resolvedRevisionShelfNumber,
+    });
+  const resolvedRevisionShelfKey =
+    normalizeRevisionShelfKey(revisionShelfKey) ||
+    normalizeRevisionShelfKey(previous.revision_shelf_key) ||
+    normalizeRevisionShelfKeyForCompare(resolvedRevisionShelfLabel);
   const mergedSourceMessageIds = uniqStrings([
     ...extractSourceMessageIdsFromPayload(previous),
     ...sourceMessageIds,
@@ -967,6 +1056,13 @@ function buildRevisionQueuePayload({
     quantity,
     shelf_number: resolvedProductShelfNumber,
     revision_shelf_number: resolvedRevisionShelfNumber,
+    revision_shelf_key: resolvedRevisionShelfKey,
+    revision_shelf_label: resolvedRevisionShelfLabel,
+    manual_shelf_label: resolvedManualShelfLabel || null,
+    shelf_floor:
+      normalizeFreeShelfText(shelfFloor) ||
+      normalizeFreeShelfText(previous.shelf_floor) ||
+      null,
     image_url: imageUrl,
     revision_manual: manual,
     revision_auto: auto,
@@ -1085,6 +1181,91 @@ async function fetchRevisionDays(client, channelId, limit = 2) {
 }
 
 async function fetchRevisionShelves(client, channelId, options = {}) {
+  if (options.manualShelfEnabled === true) {
+    const includeHiddenMissingPhoto = options.includeHiddenMissingPhoto === true;
+    const manualShelfSql = manualRevisionShelfLabelSql('p');
+    const q = await client.query(
+      `WITH revision_catalog AS (
+         SELECT m.id AS message_id,
+                p.id AS product_id,
+                p.shelf_number AS product_shelf_number,
+                ${manualShelfSql} AS shelf_label,
+                lower(${manualShelfSql}) AS shelf_key
+         FROM messages m
+         JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+         WHERE m.chat_id = $1
+           AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+           AND (
+             COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+             OR (
+               $3::boolean = true
+               AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = true
+               AND COALESCE((m.meta->>'hidden_missing_photo')::boolean, false) = true
+             )
+           )
+       ),
+       queue_state AS (
+         SELECT q.product_id,
+                true AS has_pending
+         FROM product_publication_queue q
+         WHERE q.channel_id = $1
+           AND q.status = 'pending'
+           AND COALESCE(q.is_sent, false) = false
+         GROUP BY q.product_id
+       ),
+       cart_state AS (
+         SELECT ci.product_id,
+                BOOL_OR(ci.status = ANY($2::text[])) AS has_processed_delivery
+         FROM cart_items ci
+         GROUP BY ci.product_id
+       ),
+       reservation_state AS (
+         SELECT r.product_id,
+                BOOL_OR(r.is_fulfilled = true) AS has_fulfilled_reservation
+         FROM reservations r
+         GROUP BY r.product_id
+       )
+       SELECT vc.shelf_key,
+              MIN(vc.shelf_label) AS shelf_label,
+              MIN(vc.product_shelf_number)::int AS shelf_number,
+              COUNT(*)::int AS posts
+       FROM revision_catalog vc
+       LEFT JOIN queue_state qs ON qs.product_id = vc.product_id
+       LEFT JOIN cart_state cs ON cs.product_id = vc.product_id
+       LEFT JOIN reservation_state rs ON rs.product_id = vc.product_id
+       WHERE COALESCE(qs.has_pending, false) = false
+         AND NOT (
+           COALESCE(cs.has_processed_delivery, false) = true
+           OR COALESCE(rs.has_fulfilled_reservation, false) = true
+         )
+       GROUP BY vc.shelf_key
+       ORDER BY MIN(vc.shelf_label) ASC`,
+      [
+        channelId,
+        REVISION_COMPLETED_CART_STATUSES,
+        includeHiddenMissingPhoto,
+      ],
+    );
+    return q.rows.map((row, index) => {
+      const shelfLabel = String(row.shelf_label || REVISION_UNASSIGNED_SHELF_LABEL).trim();
+      const shelfKey =
+        normalizeRevisionShelfKey(row.shelf_key) ||
+        normalizeRevisionShelfKeyForCompare(shelfLabel);
+      const fallbackNumber = toShelfNumber(row.shelf_number, index + 1);
+      return {
+        shelf_key: shelfKey,
+        revision_shelf_key: shelfKey,
+        shelf_number: fallbackNumber,
+        shelf_label: shelfLabel,
+        revision_shelf_number: fallbackNumber,
+        revision_shelf_label: shelfLabel,
+        label: `Полка ${shelfLabel}`,
+        day: `shelf-${shelfKey}`,
+        posts: Number(row.posts || 0),
+      };
+    });
+  }
+
   const includeHiddenMissingPhotoShelf = parseRevisionShelfNumber(
     options.includeHiddenMissingPhotoShelfNumber,
   );
@@ -1189,12 +1370,21 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
   const shelfFilter = parseRevisionShelfNumber(
     Array.isArray(selection) ? null : selection.selectedShelfNumber,
   );
+  const manualShelfEnabled =
+    !Array.isArray(selection) && selection.manualShelfEnabled === true;
+  const shelfKeyFilter = normalizeRevisionShelfKeyForCompare(
+    Array.isArray(selection) ? '' : selection.selectedShelfKey,
+  );
   const includeHiddenMissingPhotoShelf = parseRevisionShelfNumber(
     Array.isArray(selection) ? null : selection.includeHiddenMissingPhotoShelfNumber,
   );
   const includeHiddenMissingPhotoRows =
-    includeHiddenMissingPhotoShelf != null &&
-    shelfFilter === includeHiddenMissingPhotoShelf;
+    manualShelfEnabled
+      ? !Array.isArray(selection) &&
+        selection.includeHiddenMissingPhoto === true &&
+        shelfKeyFilter !== ''
+      : includeHiddenMissingPhotoShelf != null &&
+        shelfFilter === includeHiddenMissingPhotoShelf;
   const productSearch = normalizeRevisionProductIdSearch(
     Array.isArray(selection) ? '' : selection.productIdSearch,
   ).toLowerCase();
@@ -1205,13 +1395,16 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
   const productCodeSearchLike = productCodeSearch
     ? `%${escapeLikePattern(productCodeSearch)}%`
     : productSearchLike;
-  const revisionDaySequence = await fetchRevisionDaySequence(client, channelId);
+  const revisionDaySequence = manualShelfEnabled
+    ? []
+    : await fetchRevisionDaySequence(client, channelId);
   const revisionShelfCache = new Map(
     revisionDaySequence.map((item) => [
       String(item.day || '').trim(),
       toShelfNumber(item.revision_shelf_number, 1),
     ]),
   );
+  const manualShelfSql = manualRevisionShelfLabelSql('p');
   const rows = await client.query(
     `WITH visible_catalog AS (
        SELECT m.id AS message_id,
@@ -1222,6 +1415,10 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
               p.id AS product_id,
               p.product_code,
               p.shelf_number AS product_shelf_number,
+              p.manual_shelf_label AS product_manual_shelf_label,
+              p.shelf_floor AS product_shelf_floor,
+              ${manualShelfSql} AS revision_shelf_label,
+              lower(${manualShelfSql}) AS revision_shelf_key,
               p.title AS product_title,
               p.description AS product_description,
               p.price AS product_price,
@@ -1239,7 +1436,6 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
              $10::boolean = true
              AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = true
              AND COALESCE((m.meta->>'hidden_missing_photo')::boolean, false) = true
-             AND p.shelf_number = $4::int
            )
          )
          AND (
@@ -1247,9 +1443,14 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
            OR to_char((m.created_at AT TIME ZONE $3), 'YYYY-MM-DD') = ANY($2::text[])
          )
          AND (
-           $4::int IS NULL
-           OR p.shelf_number = $4::int
-         )
+         $4::int IS NULL
+         OR p.shelf_number = $4::int
+       )
+       AND (
+         $11::boolean = false
+         OR $12::text = ''
+         OR lower(${manualShelfSql}) = $12::text
+       )
          AND (
            $7::text = ''
            OR lower(COALESCE(p.product_code::text, '')) = $8::text
@@ -1289,6 +1490,10 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
             vc.product_id,
             vc.product_code,
             vc.product_shelf_number,
+            vc.product_manual_shelf_label,
+            vc.product_shelf_floor,
+            vc.revision_shelf_label,
+            vc.revision_shelf_key,
             vc.product_title,
             vc.product_description,
             vc.product_price,
@@ -1323,6 +1528,8 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       productCodeSearch,
       productCodeSearchLike,
       includeHiddenMissingPhotoRows,
+      manualShelfEnabled,
+      shelfKeyFilter,
     ]
   );
   const mapped = [];
@@ -1333,6 +1540,12 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
     const fallbackImage = normalizeImageUrl(meta.image_url);
     const state = normalizeRevisionState(row);
     const day = String(row.day || '').trim();
+    const manualShelfLabel =
+      normalizeFreeShelfText(row.product_manual_shelf_label) ||
+      normalizeFreeShelfText(meta.manual_shelf_label);
+    const shelfFloor =
+      normalizeFreeShelfText(row.product_shelf_floor) ||
+      normalizeFreeShelfText(meta.shelf_floor);
     const sourceProductShelfNumber =
       toPositiveShelfNumberOrNull(row.product_shelf_number ?? meta.shelf_number) ?? 1;
     let revisionShelfNumber = shelfFilter ?? revisionShelfCache.get(day);
@@ -1340,6 +1553,18 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       revisionShelfNumber = sourceProductShelfNumber;
       revisionShelfCache.set(day, revisionShelfNumber);
     }
+    const revisionShelfLabel = manualShelfEnabled
+      ? revisionShelfLabelFromValues({
+          manualShelfEnabled: true,
+          manualShelfLabel:
+            row.revision_shelf_label || manualShelfLabel || meta.revision_shelf_label,
+          shelfNumber: sourceProductShelfNumber,
+        })
+      : formatShelfLabel(revisionShelfNumber);
+    const revisionShelfKey = manualShelfEnabled
+      ? normalizeRevisionShelfKey(row.revision_shelf_key) ||
+        normalizeRevisionShelfKeyForCompare(revisionShelfLabel)
+      : String(revisionShelfNumber);
     mapped.push({
       message_id: row.message_id,
       chat_id: row.chat_id,
@@ -1352,8 +1577,13 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       product_code: row.product_code ?? meta.product_code ?? null,
       shelf_number: revisionShelfNumber,
       revision_shelf_number: revisionShelfNumber,
-      revision_shelf_label: formatShelfLabel(revisionShelfNumber),
+      revision_shelf_key: revisionShelfKey,
+      shelf_key: revisionShelfKey,
+      revision_shelf_label: revisionShelfLabel,
+      shelf_label: revisionShelfLabel,
       source_product_shelf_number: sourceProductShelfNumber,
+      manual_shelf_label: manualShelfLabel || null,
+      shelf_floor: shelfFloor || null,
       title: String(row.product_title || '').trim(),
       description: String(row.product_description || '').trim(),
       price: Number(row.product_price ?? fallbackPrice),
@@ -1688,7 +1918,7 @@ router.post(
             1
           );
           const normalizedDescription = String(description || '').trim();
-          if (!hasAtLeastTwoLetters(normalizedDescription)) {
+          if (normalizedDescription && !hasAtLeastTwoLetters(normalizedDescription)) {
             removeUploadedFile(req.file);
             return res.status(400).json({
               ok: false,
@@ -1938,7 +2168,7 @@ router.post(
             removeUploadedFile(req.file);
             return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
           }
-          if (!hasAtLeastTwoLetters(nextDescription)) {
+          if (nextDescription && !hasAtLeastTwoLetters(nextDescription)) {
             removeUploadedFile(req.file);
             return res.status(400).json({
               ok: false,
@@ -2343,8 +2573,16 @@ router.get(
 	                  c.title AS channel_title,
 	                  p.product_code,
 	                  p.shelf_number AS product_shelf_number,
-	                  p.manual_shelf_label,
-	                  p.shelf_floor,
+	                  CASE
+	                    WHEN q.payload ? 'manual_shelf_label'
+	                    THEN BTRIM(q.payload->>'manual_shelf_label')
+	                    ELSE p.manual_shelf_label
+	                  END AS manual_shelf_label,
+	                  CASE
+	                    WHEN q.payload ? 'shelf_floor'
+	                    THEN BTRIM(q.payload->>'shelf_floor')
+	                    ELSE p.shelf_floor
+	                  END AS shelf_floor,
 	                  COALESCE(q.pickup_only, p.pickup_only, false) AS pickup_only,
 	                  COALESCE(NULLIF(BTRIM(q.payload->>'title'), ''), p.title) AS product_title,
                   COALESCE(NULLIF(BTRIM(q.payload->>'description'), ''), p.description) AS product_description,
@@ -2377,8 +2615,10 @@ router.patch(
   '/queue/:queueId',
   authMiddleware,
   requireRole('worker', 'admin', 'tenant', 'creator'),
+  uploadProductImage,
   async (req, res) => {
     const queueId = String(req.params.queueId || '').trim();
+    const body = req.body || {};
     const title = normalizeCatalogTitle(req.body?.title || '');
     const description = String(req.body?.description || '').trim();
     const price = Number(req.body?.price);
@@ -2390,25 +2630,47 @@ router.patch(
         : null;
 
     if (!queueId) {
+      removeUploadedFile(req.file);
       return res.status(400).json({ ok: false, error: 'queueId обязателен' });
     }
     if (!title) {
+      removeUploadedFile(req.file);
       return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
     }
-    if (!hasAtLeastTwoLetters(description)) {
+    if (description && !hasAtLeastTwoLetters(description)) {
+      removeUploadedFile(req.file);
       return res.status(400).json({
         ok: false,
         error: 'Описание должно содержать минимум 2 буквы',
       });
     }
     if (!Number.isFinite(price) || price <= 0) {
+      removeUploadedFile(req.file);
       return res.status(400).json({ ok: false, error: 'Цена должна быть больше нуля' });
     }
     if (!Number.isFinite(quantity) || quantity <= 0) {
+      removeUploadedFile(req.file);
       return res.status(400).json({ ok: false, error: 'Количество должно быть больше нуля' });
     }
 
     try {
+      const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+      const canEditManualShelf = tenantSettings.manual_shelf_enabled === true;
+      const hasManualShelfLabel =
+        canEditManualShelf &&
+        Object.prototype.hasOwnProperty.call(body, 'manual_shelf_label');
+      const hasShelfFloor =
+        canEditManualShelf &&
+        Object.prototype.hasOwnProperty.call(body, 'shelf_floor');
+      const manualShelfLabel = hasManualShelfLabel
+        ? normalizeFreeShelfText(body.manual_shelf_label)
+        : null;
+      const shelfFloor = hasShelfFloor ? normalizeFreeShelfText(body.shelf_floor) : null;
+      const imageUrl = req.file
+        ? toAbsoluteImageUrl(req, req.file)
+        : Object.prototype.hasOwnProperty.call(body, 'image_url')
+            ? normalizeImageUrl(body.image_url)
+            : null;
       const result = await runInRequestTenantScope(req, async () => {
         const actorUserId = await resolveActorUserId(db, req.user);
         return db.query(
@@ -2421,7 +2683,17 @@ router.patch(
                    'price', $5::numeric,
                    'quantity', $6::int,
                    'shelf_number', COALESCE($7::int, NULLIF(q.payload->>'shelf_number', '')::int),
-                   'image_url', NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), '')
+                   'manual_shelf_label',
+                     CASE
+                       WHEN $8::boolean THEN $9::text
+                       ELSE q.payload->>'manual_shelf_label'
+                     END,
+                   'shelf_floor',
+                     CASE
+                       WHEN $10::boolean THEN $11::text
+                       ELSE q.payload->>'shelf_floor'
+                     END,
+                   'image_url', COALESCE($12::text, NULLIF(BTRIM(COALESCE(q.payload->>'image_url', '')), ''))
                  )
                )
            WHERE q.id = $1
@@ -2438,10 +2710,16 @@ router.patch(
             price,
             Math.floor(quantity),
             shelfNumber,
+            hasManualShelfLabel,
+            manualShelfLabel,
+            hasShelfFloor,
+            shelfFloor,
+            imageUrl,
           ]
         );
       });
       if (result.rowCount === 0) {
+        removeUploadedFile(req.file);
         const stateQ = await runInRequestTenantScope(req, async () => {
           const actorUserId = await resolveActorUserId(db, req.user);
           return db.query(
@@ -2478,6 +2756,7 @@ router.patch(
       }
       return res.json({ ok: true });
     } catch (err) {
+      removeUploadedFile(req.file);
       console.error('worker.queue.patch error', err);
       return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
     }
@@ -2619,10 +2898,15 @@ router.get(
         actorUserId,
         req.user.tenant_id || null
       );
+      const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
+        manualShelfEnabled,
       });
       const shelves = await fetchRevisionShelves(client, mainChannel.id, {
+        manualShelfEnabled,
+        includeHiddenMissingPhoto: canSeeMissingPhotoRevisionItems(req.user),
         includeHiddenMissingPhotoShelfNumber: canSeeMissingPhotoRevisionItems(req.user)
           ? CREATOR_MISSING_PHOTO_REVISION_SHELF
           : null,
@@ -2665,6 +2949,9 @@ router.get(
     const requestedShelfNumber = parseRevisionShelfNumber(
       req.query?.shelf_number ?? req.query?.shelf,
     );
+    const requestedShelfKey = normalizeRevisionShelfKeyForCompare(
+      req.query?.shelf_key ?? req.query?.revision_shelf_key ?? req.query?.shelf_label,
+    );
     const selectedDates = parseRevisionDates(req.query?.dates);
     const productIdSearch = normalizeRevisionProductIdSearch(
       req.query?.product_id ?? req.query?.product_code ?? req.query?.search ?? req.query?.q,
@@ -2684,21 +2971,42 @@ router.get(
         actorUserId,
         req.user.tenant_id || null
       );
+      const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
         selectedDates: requestedShelfNumber == null ? selectedDates : [],
-        selectedShelfNumber: requestedShelfNumber,
+        selectedShelfNumber: manualShelfEnabled ? null : requestedShelfNumber,
+        selectedShelfKey: manualShelfEnabled ? requestedShelfKey : '',
+        manualShelfEnabled,
       });
       const creatorMissingPhotoShelfNumber = canSeeMissingPhotoRevisionItems(req.user)
         ? CREATOR_MISSING_PHOTO_REVISION_SHELF
         : null;
       const shelves = await fetchRevisionShelves(client, mainChannel.id, {
+        manualShelfEnabled,
+        includeHiddenMissingPhoto: canSeeMissingPhotoRevisionItems(req.user),
         includeHiddenMissingPhotoShelfNumber: creatorMissingPhotoShelfNumber,
       });
-      const selectedShelfNumber =
-        requestedShelfNumber ??
-        shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
-        1;
+      const selectedShelf =
+        manualShelfEnabled
+          ? (
+              (requestedShelfKey
+                ? shelves.find((item) => String(item.shelf_key || '') === requestedShelfKey)
+                : null) ||
+              shelves.find((item) => Number(item.posts || 0) > 0) ||
+              shelves[0] ||
+              null
+            )
+          : null;
+      const selectedShelfNumber = manualShelfEnabled
+        ? selectedShelf?.shelf_number ?? null
+        : requestedShelfNumber ??
+          shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
+          1;
+      const selectedShelfKey = manualShelfEnabled
+        ? String(selectedShelf?.shelf_key || requestedShelfKey || '').trim()
+        : '';
       const fallbackDays =
         requestedShelfNumber == null && selectedDates.length > 0
           ? selectedDates
@@ -2710,6 +3018,9 @@ router.get(
           ? { selectedDates: fallbackDays, productIdSearch }
           : {
               selectedShelfNumber,
+              selectedShelfKey,
+              manualShelfEnabled,
+              includeHiddenMissingPhoto: canSeeMissingPhotoRevisionItems(req.user),
               productIdSearch,
               includeHiddenMissingPhotoShelfNumber: creatorMissingPhotoShelfNumber,
             },
@@ -2738,6 +3049,8 @@ router.get(
         data: {
           dates: fallbackDays,
           shelf_number: selectedShelfNumber,
+          shelf_key: selectedShelfKey,
+          revision_shelf_key: selectedShelfKey,
           shelves,
           posts: enrichedPosts,
           auto_revision_minimum_price: autoRevisionMinimumPrice,
@@ -2919,7 +3232,7 @@ router.post(
         removeUploadedFile(req.file);
         return res.status(400).json({ ok: false, error: 'Название товара обязательно' });
       }
-      if (!hasAtLeastTwoLetters(item.description)) {
+      if (item.description && !hasAtLeastTwoLetters(item.description)) {
         removeUploadedFile(req.file);
         return res.status(400).json({
           ok: false,
@@ -2949,6 +3262,8 @@ router.post(
         actorUserId,
         req.user.tenant_id || null
       );
+      const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
 
       const hiddenMessagesById = new Map();
       const queuedItems = [];
@@ -3005,6 +3320,34 @@ router.post(
           toShelfNumber(target.product_shelf_number, 1),
         );
         const nextProductShelfNumber = toShelfNumber(target.product_shelf_number, 1);
+        const nextManualShelfLabel = manualShelfEnabled
+          ? normalizeFreeShelfText(
+              item.manual_shelf_label ||
+                target.product_manual_shelf_label ||
+                targetMeta.manual_shelf_label,
+            )
+          : '';
+        const nextShelfFloor = manualShelfEnabled
+          ? normalizeFreeShelfText(
+              item.shelf_floor ||
+                target.product_shelf_floor ||
+                targetMeta.shelf_floor,
+            )
+          : '';
+        const nextRevisionShelfLabel = manualShelfEnabled
+          ? revisionShelfLabelFromValues({
+              manualShelfEnabled: true,
+              manualShelfLabel:
+                item.revision_shelf_label ||
+                nextManualShelfLabel ||
+                targetMeta.revision_shelf_label,
+              shelfNumber: nextProductShelfNumber,
+            })
+          : formatShelfLabel(nextRevisionShelfNumber);
+        const nextRevisionShelfKey = manualShelfEnabled
+          ? normalizeRevisionShelfKey(item.revision_shelf_key) ||
+            normalizeRevisionShelfKeyForCompare(nextRevisionShelfLabel)
+          : String(nextRevisionShelfNumber);
         const nextPrice = Number(item.price);
         const nextImageUrl = item.image_url || normalizeImageUrl(target.product_image_url) || null;
         if (req.file && nextImageUrl) {
@@ -3027,6 +3370,10 @@ router.post(
           shelfNumber: nextProductShelfNumber,
           productShelfNumber: nextProductShelfNumber,
           revisionShelfNumber: nextRevisionShelfNumber,
+          revisionShelfKey: nextRevisionShelfKey,
+          revisionShelfLabel: nextRevisionShelfLabel,
+          manualShelfLabel: nextManualShelfLabel,
+          shelfFloor: nextShelfFloor,
           imageUrl: nextImageUrl,
           selectedDates: [],
           sourceMessageIds,
@@ -3092,6 +3439,10 @@ router.post(
           product_code: target.product_code,
           product_shelf_number: nextProductShelfNumber,
           revision_shelf_number: nextRevisionShelfNumber,
+          revision_shelf_key: nextRevisionShelfKey,
+          revision_shelf_label: nextRevisionShelfLabel,
+          manual_shelf_label: nextManualShelfLabel || null,
+          shelf_floor: nextShelfFloor || null,
           product_title: item.title,
           product_description: item.description,
           product_price: nextPrice,
@@ -3162,6 +3513,9 @@ router.post(
     const requestedShelfNumber = parseRevisionShelfNumber(
       req.body?.shelf_number ?? req.body?.shelf,
     );
+    const requestedShelfKey = normalizeRevisionShelfKeyForCompare(
+      req.body?.shelf_key ?? req.body?.revision_shelf_key ?? req.body?.shelf_label,
+    );
     const dates = parseRevisionDates(req.body?.dates);
     if (requestedShelfNumber == null && dates.length > 1) {
       return res.status(400).json({
@@ -3188,26 +3542,51 @@ router.post(
         actorUserId,
         req.user.tenant_id || null
       );
+      const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
       await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
         selectedDates: requestedShelfNumber == null ? dates : [],
-        selectedShelfNumber: requestedShelfNumber,
+        selectedShelfNumber: manualShelfEnabled ? null : requestedShelfNumber,
+        selectedShelfKey: manualShelfEnabled ? requestedShelfKey : '',
+        manualShelfEnabled,
       });
-      const shelves = await fetchRevisionShelves(client, mainChannel.id);
-      const selectedShelfNumber =
-        requestedShelfNumber ??
-        shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
-        null;
+      const shelves = await fetchRevisionShelves(client, mainChannel.id, {
+        manualShelfEnabled,
+      });
+      const selectedShelf =
+        manualShelfEnabled
+          ? (
+              (requestedShelfKey
+                ? shelves.find((item) => String(item.shelf_key || '') === requestedShelfKey)
+                : null) ||
+              shelves.find((item) => Number(item.posts || 0) > 0) ||
+              shelves[0] ||
+              null
+            )
+          : null;
+      const selectedShelfNumber = manualShelfEnabled
+        ? selectedShelf?.shelf_number ?? null
+        : requestedShelfNumber ??
+          shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
+          null;
+      const selectedShelfKey = manualShelfEnabled
+        ? String(selectedShelf?.shelf_key || requestedShelfKey || '').trim()
+        : '';
       const selectedDates =
         requestedShelfNumber == null && dates.length > 0 ? dates : [];
       const posts =
-        selectedShelfNumber != null || selectedDates.length > 0
+        selectedShelfNumber != null || selectedShelfKey || selectedDates.length > 0
           ? await fetchRevisionPosts(
               client,
               mainChannel.id,
               selectedDates.length > 0
                 ? { selectedDates }
-                : { selectedShelfNumber },
+                : {
+                    selectedShelfNumber: manualShelfEnabled ? null : selectedShelfNumber,
+                    selectedShelfKey,
+                    manualShelfEnabled,
+                  },
             )
           : [];
 
@@ -3249,6 +3628,18 @@ router.post(
           post.source_product_shelf_number ?? post.product_shelf_number,
           1,
         );
+        const nextManualShelfLabel = normalizeFreeShelfText(post.manual_shelf_label);
+        const nextShelfFloor = normalizeFreeShelfText(post.shelf_floor);
+        const nextRevisionShelfLabel = normalizeFreeShelfText(post.revision_shelf_label) ||
+          revisionShelfLabelFromValues({
+            manualShelfEnabled,
+            manualShelfLabel: nextManualShelfLabel,
+            shelfNumber: nextProductShelfNumber,
+          });
+        const nextRevisionShelfKey = manualShelfEnabled
+          ? normalizeRevisionShelfKey(post.revision_shelf_key) ||
+            normalizeRevisionShelfKeyForCompare(nextRevisionShelfLabel)
+          : String(nextRevisionShelfNumber);
         const title = String(post.title || '').trim();
         if (!title) continue;
         const description = String(post.description || '').trim();
@@ -3273,6 +3664,10 @@ router.post(
           shelfNumber: nextProductShelfNumber,
           productShelfNumber: nextProductShelfNumber,
           revisionShelfNumber: nextRevisionShelfNumber,
+          revisionShelfKey: nextRevisionShelfKey,
+          revisionShelfLabel: nextRevisionShelfLabel,
+          manualShelfLabel: nextManualShelfLabel,
+          shelfFloor: nextShelfFloor,
           imageUrl,
           selectedDates,
           sourceMessageIds,
@@ -3367,6 +3762,8 @@ router.post(
         data: {
           dates: selectedDates,
           shelf_number: selectedShelfNumber,
+          shelf_key: selectedShelfKey,
+          revision_shelf_key: selectedShelfKey,
           percent: discountPercent,
           updated_count: queuedItems.length,
           hidden_old_count: hiddenMessagesById.size,

@@ -35,6 +35,7 @@ const {
 const { readEncryptedText } = require("../utils/secureData");
 const { runInRequestTenantScope } = require("../utils/requestScope");
 const { uploadsPath } = require("../utils/storagePaths");
+const { logAudit } = require("../utils/audit");
 const { registerPublicImageUpload } = require("../utils/publicMediaRegistration");
 const { toOriginalPublicMediaUrl } = require("../utils/mediaAssets");
 const { normalizeCatalogTitle } = require("../utils/catalogTitle");
@@ -901,6 +902,37 @@ function buildTenantWorkflowSettingsPayload(body = {}) {
     ["auto_publish_enabled", "channels", "auto_publish_enabled"],
     ["auto_publish_delay_minutes", "channels", "auto_publish_delay_minutes"],
     ["group_rules_text", "rules", "group_rules_text"],
+    ["client_group_switcher_enabled", "client", "group_switcher_enabled"],
+    [
+      "qr_existing_client_join_enabled",
+      "client",
+      "qr_existing_client_join_enabled",
+    ],
+    [
+      "tenant_operations_menu_enabled",
+      "tenant_console",
+      "operations_menu_enabled",
+    ],
+    [
+      "dangerous_action_audit_enabled",
+      "tenant_console",
+      "dangerous_action_audit_enabled",
+    ],
+    [
+      "product_change_history_enabled",
+      "tenant_console",
+      "product_change_history_enabled",
+    ],
+    [
+      "creator_notification_diagnostics_enabled",
+      "diagnostics",
+      "notification_diagnostics_enabled",
+    ],
+    [
+      "creator_bootstrap_monitoring_enabled",
+      "diagnostics",
+      "bootstrap_monitoring_enabled",
+    ],
   ];
   for (const [sourceKey, sectionKey, targetKey] of directMap) {
     if (!Object.prototype.hasOwnProperty.call(source, sourceKey)) continue;
@@ -1005,6 +1037,139 @@ function productMessageText(product) {
     'Нажмите "Купить", чтобы добавить в корзину',
   ].filter(Boolean);
   return lines.join("\n");
+}
+
+function canFullyDeleteClient(req) {
+  const role = String(req.user?.role || "").toLowerCase().trim();
+  const baseRole = String(req.user?.base_role || req.user?.role || "")
+    .toLowerCase()
+    .trim();
+  return role === "tenant" || role === "creator" || baseRole === "tenant" || baseRole === "creator";
+}
+
+function normalizeMessageMeta(rawMeta) {
+  if (rawMeta && typeof rawMeta === "object" && !Array.isArray(rawMeta)) {
+    return { ...rawMeta };
+  }
+  if (typeof rawMeta === "string" && rawMeta.trim()) {
+    try {
+      const parsed = JSON.parse(rawMeta);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return { ...parsed };
+      }
+    } catch (_) {}
+  }
+  return {};
+}
+
+async function markReservedMessageClientDeleted(client, messageId) {
+  const normalizedMessageId = String(messageId || "").trim();
+  if (!normalizedMessageId) return null;
+
+  const currentQ = await client.query(
+    `SELECT id, chat_id, sender_id, text, meta, created_at
+     FROM messages
+     WHERE id = $1
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedMessageId],
+  );
+  if (currentQ.rowCount === 0) return null;
+
+  const nextMeta = normalizeMessageMeta(currentQ.rows[0].meta);
+  nextMeta.client_cancelled = true;
+  nextMeta.client_deleted = true;
+  nextMeta.cancelled_reason = "client_full_delete";
+  nextMeta.cancelled_at = new Date().toISOString();
+  nextMeta.remaining_quantity = 0;
+  nextMeta.placed = false;
+
+  const updatedQ = await client.query(
+    `UPDATE messages
+     SET meta = $2::jsonb
+     WHERE id = $1
+     RETURNING id, chat_id, sender_id, text, meta, created_at`,
+    [normalizedMessageId, JSON.stringify(nextMeta)],
+  );
+  return updatedQ.rows[0] || null;
+}
+
+async function restoreCatalogProductAfterClientDelete(client, product, tenantId = null) {
+  const productIdText = String(product?.id || "").trim();
+  if (!productIdText) {
+    return { updatedProduct: product, updatedCatalogMessages: [] };
+  }
+
+  let updatedProduct = product;
+  if (
+    (Number(product?.quantity) || 0) > 0 &&
+    String(product?.status || "").trim() === "archived"
+  ) {
+    const republishedQ = await client.query(
+      `UPDATE products
+       SET status = 'published',
+           reusable_at = NULL,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, product_code, title, description, price, quantity, image_url, status`,
+      [productIdText],
+    );
+    if (republishedQ.rowCount > 0) {
+      updatedProduct = republishedQ.rows[0];
+    }
+  }
+
+  const messageText = productMessageText(updatedProduct);
+  const updatedCatalogMessagesQ = await client.query(
+    `UPDATE messages m
+     SET text = $1,
+         meta = jsonb_set(
+           jsonb_set(
+             (COALESCE(m.meta, '{}'::jsonb) - 'archived_after_cart_dismantle' - 'sold_out_processed'),
+             '{hidden_for_all}',
+             'false'::jsonb,
+             true
+           ),
+           '{quantity}',
+           to_jsonb($2::int),
+           true
+         )
+     FROM chats c
+     WHERE c.id = m.chat_id
+       AND COALESCE(m.meta->>'kind', '') = 'catalog_product'
+       AND COALESCE(m.meta->>'product_id', '') = $3
+       AND ($4::uuid IS NULL OR c.tenant_id = $4::uuid)
+       AND (
+         COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         OR COALESCE((m.meta->>'archived_after_cart_dismantle')::boolean, false) = true
+         OR COALESCE((m.meta->>'sold_out_processed')::boolean, false) = true
+       )
+     RETURNING m.id, m.chat_id, m.sender_id, m.text, m.meta, m.created_at`,
+    [
+      encryptMessageText(messageText),
+      Number(updatedProduct.quantity) || 0,
+      productIdText,
+      tenantId || null,
+    ],
+  );
+
+  for (const message of updatedCatalogMessagesQ.rows) {
+    await upsertMessageSearchDocument({
+      queryable: client,
+      messageId: message.id,
+      chatId: message.chat_id,
+      tenantId: tenantId || null,
+      senderId: message.sender_id,
+      text: messageText,
+      meta: message.meta,
+      createdAt: message.created_at,
+    });
+  }
+
+  return {
+    updatedProduct,
+    updatedCatalogMessages: updatedCatalogMessagesQ.rows || [],
+  };
 }
 
 function formatProductLabel(productCode, shelfNumber, manualShelfLabel = "") {
@@ -3446,6 +3611,409 @@ router.patch(
   },
 );
 
+// Полное удаление клиента из текущей группы с возвратом активных товаров в канал
+router.delete(
+  "/channels/:id/clients/:userId/full",
+  requireAuth,
+  async (req, res) => {
+    const { id, userId } = req.params;
+    if (!isUuidLike(id) || !isUuidLike(userId)) {
+      return res.status(400).json({ ok: false, error: "Некорректный id" });
+    }
+    if (!canFullyDeleteClient(req)) {
+      return res.status(403).json({
+        ok: false,
+        error: "Полное удаление клиента доступно только арендатору или создателю",
+      });
+    }
+
+    const tenantId = tenantIdFromRequest(req);
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: "Группа не выбрана" });
+    }
+
+    try {
+      const result = await runInRequestTenantScope(req, async () => {
+        const client = await db.pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1), 0)",
+            [`client-full-delete:${tenantId}:${userId}`],
+          );
+
+          const channelQ = await client.query(
+            `SELECT id, title, type, settings
+             FROM chats
+             WHERE id = $1
+               AND type = 'channel'
+               AND tenant_id = $2
+             LIMIT 1
+             FOR UPDATE`,
+            [id, tenantId],
+          );
+          if (channelQ.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return { ok: false, status: 404, error: "Канал не найден" };
+          }
+          const channel = channelQ.rows[0];
+          const settings = normalizeSettings(channel.settings);
+          if (isChannelReadOnlySystemChannel(channel, settings)) {
+            await client.query("ROLLBACK");
+            return {
+              ok: false,
+              status: 403,
+              error: "Системный канал недоступен для удаления клиентов",
+            };
+          }
+
+          const userQ = await client.query(
+            `SELECT id::text AS user_id, email, name, role, tenant_id::text AS tenant_id
+             FROM users
+             WHERE id = $1
+               AND tenant_id = $2
+               AND role = 'client'
+             LIMIT 1
+             FOR UPDATE`,
+            [userId, tenantId],
+          );
+          if (userQ.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return { ok: false, status: 404, error: "Клиент не найден" };
+          }
+          const targetUser = userQ.rows[0];
+
+          const cartItemsQ = await client.query(
+            `SELECT c.id::text AS id,
+                    c.product_id::text AS product_id,
+                    c.quantity,
+                    c.status,
+                    p.product_code,
+                    p.title,
+                    p.description,
+                    p.price,
+                    p.quantity AS product_quantity,
+                    p.image_url,
+                    p.status AS product_status
+             FROM cart_items c
+             JOIN products p ON p.id = c.product_id
+             WHERE c.user_id = $1
+             ORDER BY c.created_at ASC
+             FOR UPDATE OF c, p`,
+            [userId],
+          );
+
+          const reservationsQ = await client.query(
+            `SELECT id::text AS id,
+                    product_id::text AS product_id,
+                    cart_item_id::text AS cart_item_id,
+                    quantity,
+                    is_fulfilled,
+                    reserved_channel_message_id::text AS reserved_channel_message_id
+             FROM reservations
+             WHERE user_id = $1
+             ORDER BY created_at ASC
+             FOR UPDATE`,
+            [userId],
+          );
+
+          const productTotals = new Map();
+          const returnedCartItemIds = new Set();
+          let returnedItemsCount = 0;
+          let returnedUnitsCount = 0;
+          const addReturnQuantity = (productId, quantity) => {
+            const normalizedProductId = String(productId || "").trim();
+            const normalizedQuantity = Number(quantity) || 0;
+            if (!normalizedProductId || normalizedQuantity <= 0) return;
+            productTotals.set(
+              normalizedProductId,
+              (productTotals.get(normalizedProductId) || 0) + normalizedQuantity,
+            );
+            returnedUnitsCount += normalizedQuantity;
+          };
+
+          for (const item of cartItemsQ.rows) {
+            const status = String(item.status || "").toLowerCase().trim();
+            if (status === "delivered" || status === "cancelled") continue;
+            const quantity = Number(item.quantity) || 0;
+            if (quantity <= 0) continue;
+            returnedItemsCount += 1;
+            returnedCartItemIds.add(String(item.id));
+            addReturnQuantity(item.product_id, quantity);
+          }
+
+          for (const reservation of reservationsQ.rows) {
+            const cartItemId = String(reservation.cart_item_id || "").trim();
+            if (
+              reservation.is_fulfilled !== true &&
+              (!cartItemId || !returnedCartItemIds.has(cartItemId))
+            ) {
+              addReturnQuantity(reservation.product_id, reservation.quantity);
+            }
+          }
+
+          const updatedReservedMessages = [];
+          for (const reservation of reservationsQ.rows) {
+            const reservedMessageId = String(
+              reservation.reserved_channel_message_id || "",
+            ).trim();
+            if (!reservedMessageId) continue;
+            const updatedMessage = await markReservedMessageClientDeleted(
+              client,
+              reservedMessageId,
+            );
+            if (updatedMessage) {
+              updatedReservedMessages.push({
+                ...updatedMessage,
+                reservation_id: reservation.id,
+                cart_item_id: reservation.cart_item_id || null,
+              });
+            }
+          }
+
+          const deliveryItemsQ = await client.query(
+            `DELETE FROM delivery_batch_items
+             WHERE user_id = $1
+             RETURNING id::text AS id, batch_id::text AS batch_id`,
+            [userId],
+          );
+          const deliveryCustomersQ = await client.query(
+            `DELETE FROM delivery_batch_customers
+             WHERE user_id = $1
+             RETURNING id::text AS id, batch_id::text AS batch_id`,
+            [userId],
+          );
+
+          const touchedDeliveryBatchIds = Array.from(
+            new Set(
+              [...deliveryItemsQ.rows, ...deliveryCustomersQ.rows]
+                .map((row) => String(row.batch_id || "").trim())
+                .filter(Boolean),
+            ),
+          );
+          if (touchedDeliveryBatchIds.length > 0) {
+            await client.query(
+              `DELETE FROM delivery_batches b
+               WHERE b.id = ANY($1::uuid[])
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM delivery_batch_customers c
+                   WHERE c.batch_id = b.id
+                 )`,
+              [touchedDeliveryBatchIds],
+            );
+          }
+
+          const deletedReservationsQ = await client.query(
+            `DELETE FROM reservations
+             WHERE user_id = $1
+             RETURNING id::text AS id`,
+            [userId],
+          );
+
+          const restoredProducts = [];
+          const updatedCatalogMessages = [];
+          for (const [productId, quantity] of productTotals.entries()) {
+            const restoredQ = await client.query(
+              `UPDATE products
+               SET quantity = quantity + $1,
+                   updated_at = now()
+               WHERE id = $2
+               RETURNING id, product_code, title, description, price, quantity, image_url, status`,
+              [quantity, productId],
+            );
+            if (restoredQ.rowCount === 0) continue;
+            const restoreResult = await restoreCatalogProductAfterClientDelete(
+              client,
+              restoredQ.rows[0],
+              tenantId,
+            );
+            restoredProducts.push(restoreResult.updatedProduct);
+            updatedCatalogMessages.push(
+              ...(restoreResult.updatedCatalogMessages || []),
+            );
+          }
+
+          const deletedCartItemsQ = await client.query(
+            `DELETE FROM cart_items
+             WHERE user_id = $1
+             RETURNING id::text AS id`,
+            [userId],
+          );
+
+          const deletedUserQ = await client.query(
+            `DELETE FROM users
+             WHERE id = $1
+               AND tenant_id = $2
+               AND role = 'client'
+             RETURNING id::text AS user_id, email, name`,
+            [userId, tenantId],
+          );
+          if (deletedUserQ.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return { ok: false, status: 404, error: "Клиент не найден" };
+          }
+
+          await client.query("COMMIT");
+          return {
+            ok: true,
+            tenant_id: tenantId,
+            channel,
+            target_user: targetUser,
+            deleted_user: deletedUserQ.rows[0],
+            returned_items_count: returnedItemsCount,
+            returned_units_count: returnedUnitsCount,
+            restored_products: restoredProducts,
+            updated_catalog_messages: updatedCatalogMessages,
+            updated_reserved_messages: updatedReservedMessages,
+            deleted_cart_items_count: deletedCartItemsQ.rowCount,
+            deleted_reservations_count: deletedReservationsQ.rowCount,
+            removed_delivery_items_count: deliveryItemsQ.rowCount,
+            removed_delivery_customers_count: deliveryCustomersQ.rowCount,
+            touched_delivery_batch_ids: touchedDeliveryBatchIds,
+          };
+        } catch (err) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (_) {}
+          throw err;
+        } finally {
+          client.release();
+        }
+      });
+
+      if (!result?.ok) {
+        return res
+          .status(result?.status || 500)
+          .json({ ok: false, error: result?.error || "Ошибка сервера" });
+      }
+
+      try {
+        await db.platformQuery(
+          `DELETE FROM tenant_user_index
+           WHERE tenant_id = $1
+             AND (
+               user_id = $2
+               OR ($3::text <> '' AND lower(email) = lower($3::text))
+             )`,
+          [
+            tenantId,
+            userId,
+            String(result.target_user?.email || result.deleted_user?.email || "").trim(),
+          ],
+        );
+      } catch (cleanupErr) {
+        if (String(cleanupErr?.code || "") !== "42P01") {
+          console.error("admin.channels.clientFullDelete tenant index cleanup error", cleanupErr);
+        }
+      }
+
+      try {
+        const featureSettings = await getTenantFeatureSettings(tenantId);
+        if (featureSettings.dangerous_action_audit_enabled !== false) {
+          await logAudit({
+            tenantId,
+            actorUserId: req.user?.id || null,
+            actorRole: req.user?.role || null,
+            action: "client.full_delete",
+            entityType: "client",
+            entityId: userId,
+            before: {
+              user_id: userId,
+              role: "client",
+              tenant_id: tenantId,
+              channel_id: id,
+            },
+            after: {
+              deleted: true,
+              returned_units_count: result.returned_units_count,
+              restored_products_count: result.restored_products.length,
+            },
+            meta: {
+              returned_items_count: result.returned_items_count,
+              deleted_cart_items_count: result.deleted_cart_items_count,
+              deleted_reservations_count: result.deleted_reservations_count,
+              removed_delivery_items_count: result.removed_delivery_items_count,
+              removed_delivery_customers_count:
+                result.removed_delivery_customers_count,
+              touched_delivery_batch_ids: result.touched_delivery_batch_ids,
+            },
+          });
+        }
+      } catch (auditErr) {
+        console.error("admin.channels.clientFullDelete audit error", auditErr);
+      }
+
+      const io = req.app.get("io");
+      if (io) {
+        for (const message of result.updated_catalog_messages) {
+          const chatId = String(message.chat_id || "").trim();
+          if (!chatId) continue;
+          io.to(`chat:${chatId}`).emit("chat:message", {
+            chatId,
+            message: decryptMessageRow(message),
+          });
+          emitChannelUpdated(io, tenantId, chatId, {
+            action: "product_restored_after_client_delete",
+          });
+        }
+
+        for (const message of result.updated_reserved_messages) {
+          const chatId = String(message.chat_id || "").trim();
+          if (!chatId) continue;
+          io.to(`chat:${chatId}`).emit("chat:message", {
+            chatId,
+            message: decryptMessageRow(message),
+          });
+          emitReservedOrderUpdated(io, tenantId, chatId, {
+            action: "client_deleted",
+            message_id: message.id,
+            reservation_id: message.reservation_id || null,
+            cart_item_id: message.cart_item_id || null,
+            user_id: userId,
+          });
+        }
+
+        emitChannelMembersUpdated(io, tenantId, id, {
+          action: "client_full_deleted",
+          user_id: userId,
+        });
+        emitToTenant(io, tenantId, "cart:updated", {
+          userId,
+          reason: "client_full_deleted",
+        });
+        if (
+          result.removed_delivery_items_count > 0 ||
+          result.removed_delivery_customers_count > 0
+        ) {
+          emitToTenant(io, tenantId, "delivery:updated", {
+            batchId: "client_full_deleted",
+            user_id: userId,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      }
+
+      return res.json({
+        ok: true,
+        data: {
+          user_id: userId,
+          returned_items_count: result.returned_items_count,
+          returned_units_count: result.returned_units_count,
+          restored_products_count: result.restored_products.length,
+          deleted_cart_items_count: result.deleted_cart_items_count,
+          deleted_reservations_count: result.deleted_reservations_count,
+          removed_delivery_items_count: result.removed_delivery_items_count,
+          removed_delivery_customers_count: result.removed_delivery_customers_count,
+        },
+      });
+    } catch (err) {
+      console.error("admin.channels.clientFullDelete error", err);
+      return res.status(500).json({ ok: false, error: "Ошибка сервера" });
+    }
+  },
+);
+
 // Добавить пользователя в blacklist канала
 router.post(
   "/channels/:id/blacklist",
@@ -3919,8 +4487,16 @@ router.get(
                   COALESCE(NULLIF(q.payload->>'price', '')::numeric, p.price) AS product_price,
                   COALESCE(NULLIF(q.payload->>'quantity', '')::int, p.quantity) AS product_quantity,
                   p.shelf_number AS product_shelf_number,
-                  COALESCE(NULLIF(BTRIM(q.payload->>'manual_shelf_label'), ''), p.manual_shelf_label) AS manual_shelf_label,
-                  COALESCE(NULLIF(BTRIM(q.payload->>'shelf_floor'), ''), p.shelf_floor) AS shelf_floor,
+                  CASE
+                    WHEN q.payload ? 'manual_shelf_label'
+                    THEN BTRIM(q.payload->>'manual_shelf_label')
+                    ELSE p.manual_shelf_label
+                  END AS manual_shelf_label,
+                  CASE
+                    WHEN q.payload ? 'shelf_floor'
+                    THEN BTRIM(q.payload->>'shelf_floor')
+                    ELSE p.shelf_floor
+                  END AS shelf_floor,
                   COALESCE(q.pickup_only, p.pickup_only, false) AS pickup_only,
                   COALESCE(NULLIF(BTRIM(q.payload->>'image_url'), ''), p.image_url) AS product_image_url,
                   p.product_code,
@@ -4025,7 +4601,7 @@ router.patch(
         .status(400)
         .json({ ok: false, error: "Название товара обязательно" });
     }
-    if (!description || description.length < 2) {
+    if (description && description.length < 2) {
       return res.status(400).json({
         ok: false,
         error: "Описание должно содержать минимум 2 символа",
@@ -5832,7 +6408,7 @@ router.patch(
     if (!title) {
       return res.status(400).json({ ok: false, error: "Название товара обязательно" });
     }
-    if (!description || description.length < 2) {
+    if (description && description.length < 2) {
       return res.status(400).json({
         ok: false,
         error: "Описание должно содержать минимум 2 символа",
@@ -6354,6 +6930,16 @@ function tenantVisibilitySql(column = "tenant_id", tenantParamIndex = 1, allowNu
   return `(${column} = $${tenantParamIndex}::uuid OR ($${allowNullParamIndex}::boolean = true AND ${column} IS NULL))`;
 }
 
+async function rejectCreatorBootstrapMonitoringDisabled(req, res) {
+  const settings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+  if (settings.creator_bootstrap_monitoring_enabled !== false) return false;
+  res.status(404).json({
+    ok: false,
+    error: "Мониторинг запуска отключен в настройках ключей",
+  });
+  return true;
+}
+
 router.get(
   "/role-templates",
   requireAuth,
@@ -6619,6 +7205,7 @@ router.get("/problem-report", requireAuth, async (req, res) => {
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: "Доступ только создателю" });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const tenantId = req.user.tenant_id || null;
     const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
 
@@ -6787,6 +7374,7 @@ router.patch("/monitoring/events/:id/resolve", requireAuth, async (req, res) => 
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: "Доступ только создателю" });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const id = String(req.params?.id || "").trim();
     if (!isUuidLike(id)) {
       return res.status(400).json({ ok: false, error: "Некорректный id события" });

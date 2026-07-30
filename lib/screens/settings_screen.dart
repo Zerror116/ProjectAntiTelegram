@@ -1924,9 +1924,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }) {
     final theme = Theme.of(context);
     final radius = BorderRadius.circular(softCapsule ? 999 : 18);
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
         color: softCapsule
             ? Color.lerp(
                 theme.colorScheme.surfaceContainerLow,
@@ -1934,33 +1934,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 theme.brightness == Brightness.dark ? 0.08 : 0.04,
               )
             : theme.colorScheme.surfaceContainerLow,
-        borderRadius: radius,
-        border: softCapsule
-            ? Border.all(
-                color: theme.colorScheme.primary.withValues(alpha: 0.14),
-              )
-            : null,
-      ),
-      child: ListTile(
-        contentPadding: softCapsule
-            ? const EdgeInsets.symmetric(horizontal: 14, vertical: 4)
-            : null,
-        shape: RoundedRectangleBorder(borderRadius: radius),
-        leading: softCapsule
-            ? Container(
-                width: 38,
-                height: 38,
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.primary.withValues(alpha: 0.13),
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(icon, color: theme.colorScheme.primary, size: 20),
-              )
-            : Icon(icon, color: theme.colorScheme.primary),
-        title: Text(title),
-        subtitle: Text(subtitle),
-        trailing: trailing ?? const Icon(Icons.chevron_right_rounded, size: 20),
-        onTap: onTap,
+        shape: RoundedRectangleBorder(
+          borderRadius: radius,
+          side: softCapsule
+              ? BorderSide(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.14),
+                )
+              : BorderSide.none,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: ListTile(
+          contentPadding: softCapsule
+              ? const EdgeInsets.symmetric(horizontal: 14, vertical: 4)
+              : null,
+          shape: RoundedRectangleBorder(borderRadius: radius),
+          leading: softCapsule
+              ? Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.primary.withValues(alpha: 0.13),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: theme.colorScheme.primary, size: 20),
+                )
+              : Icon(icon, color: theme.colorScheme.primary),
+          title: Text(title),
+          subtitle: Text(subtitle),
+          trailing:
+              trailing ?? const Icon(Icons.chevron_right_rounded, size: 20),
+          onTap: onTap,
+        ),
       ),
     );
   }
@@ -2224,18 +2228,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ? 'Личные сообщения, поддержка, акции и системные разрешения.'
                   : 'Личные сообщения, поддержка, акции, системные разрешения и служебная диагностика.',
               children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: Color.lerp(
-                      theme.colorScheme.surfaceContainerLow,
-                      theme.colorScheme.primary,
-                      theme.brightness == Brightness.dark ? 0.08 : 0.04,
-                    ),
-                    borderRadius: BorderRadius.circular(999),
-                    border: Border.all(
+                Material(
+                  color: Color.lerp(
+                    theme.colorScheme.surfaceContainerLow,
+                    theme.colorScheme.primary,
+                    theme.brightness == Brightness.dark ? 0.08 : 0.04,
+                  ),
+                  shape: StadiumBorder(
+                    side: BorderSide(
                       color: theme.colorScheme.primary.withValues(alpha: 0.14),
                     ),
                   ),
+                  clipBehavior: Clip.antiAlias,
                   child: SwitchListTile.adaptive(
                     contentPadding: const EdgeInsets.symmetric(
                       horizontal: 14,
@@ -2287,11 +2291,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               subtitle:
                   'Тема, производительность и инструменты, связанные с работой приложения.',
               children: [
-                Container(
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerLow,
+                Material(
+                  color: theme.colorScheme.surfaceContainerLow,
+                  shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(18),
                   ),
+                  clipBehavior: Clip.antiAlias,
                   child: SwitchListTile.adaptive(
                     value: _darkMode,
                     onChanged: _toggleDarkMode,
@@ -2302,11 +2307,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 10),
-                Container(
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerLow,
+                Material(
+                  color: theme.colorScheme.surfaceContainerLow,
+                  shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(18),
                   ),
+                  clipBehavior: Clip.antiAlias,
                   child: SwitchListTile.adaptive(
                     value: _performanceMode,
                     onChanged: _togglePerformanceMode,

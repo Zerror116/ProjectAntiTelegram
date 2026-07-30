@@ -260,6 +260,31 @@ class NativePushService {
     if (defaultTargetPlatform == TargetPlatform.android) {
       final alreadyAllowed = await NativeUpdateInstaller.canPostNotifications();
       if (alreadyAllowed) return true;
+      if (!context.mounted) return false;
+      final accepted =
+          await showDialog<bool>(
+            context: context,
+            builder: (dialogContext) {
+              return AlertDialog(
+                title: const Text('Разрешить уведомления Феникс?'),
+                content: const Text(
+                  'Мы будем присылать только важные уведомления: сообщения, поддержку, безопасность, обновления и выбранные вами акции.',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    child: const Text('Не сейчас'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(true),
+                    child: const Text('Разрешить'),
+                  ),
+                ],
+              );
+            },
+          ) ??
+          false;
+      if (!accepted) return false;
       final granted =
           await NativeUpdateInstaller.requestNotificationPermission();
       if (granted) {

@@ -26,6 +26,7 @@ class User {
   final String? tenantStatus;
   final String? subscriptionExpiresAt;
   final Map<String, dynamic> permissions;
+  final Map<String, dynamic> featureSettings;
 
   User({
     required this.id,
@@ -40,6 +41,7 @@ class User {
     this.tenantStatus,
     this.subscriptionExpiresAt,
     this.permissions = const <String, dynamic>{},
+    this.featureSettings = const <String, dynamic>{},
   });
 
   factory User.fromMap(Map<String, dynamic> m) {
@@ -90,6 +92,12 @@ class User {
         if (raw is Map) return Map<String, dynamic>.from(raw);
         return const <String, dynamic>{};
       })(),
+      featureSettings: (() {
+        final raw = m['feature_settings'] ?? m['featureSettings'];
+        if (raw is Map<String, dynamic>) return raw;
+        if (raw is Map) return Map<String, dynamic>.from(raw);
+        return const <String, dynamic>{};
+      })(),
     );
   }
 
@@ -107,6 +115,7 @@ class User {
       'tenant_status': tenantStatus,
       'subscription_expires_at': subscriptionExpiresAt,
       'permissions': permissions,
+      'feature_settings': featureSettings,
     };
   }
 }
@@ -1043,6 +1052,7 @@ class AuthService {
           ? null
           : subscriptionExpiresAt?.trim(),
       permissions: user.permissions,
+      featureSettings: user.featureSettings,
     );
   }
 
@@ -1348,6 +1358,10 @@ class AuthService {
     String? phone,
     String? clientCity,
   }) async {
+    final currentToken = await getToken();
+    if (currentToken != null && currentToken.trim().isNotEmpty) {
+      await _upsertSavedSession(currentToken, _currentUser);
+    }
     final normalizedTenant = _normalizeTenantCodeScope(tenantCode);
     if (normalizedTenant.isNotEmpty) {
       await setTenantCode(normalizedTenant);
@@ -1707,6 +1721,12 @@ class AuthService {
       if ((nextPermissions is! Map || nextPermissions.isEmpty) &&
           current.permissions.isNotEmpty) {
         merged['permissions'] = current.permissions;
+      }
+      final nextFeatureSettings =
+          merged['feature_settings'] ?? merged['featureSettings'];
+      if ((nextFeatureSettings is! Map || nextFeatureSettings.isEmpty) &&
+          current.featureSettings.isNotEmpty) {
+        merged['feature_settings'] = current.featureSettings;
       }
     }
 

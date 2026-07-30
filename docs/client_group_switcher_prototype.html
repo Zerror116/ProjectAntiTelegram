@@ -1,0 +1,976 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Прототип групп</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --surface: #0b1017;
+      --surface-lowest: #060a0f;
+      --surface-low: #101720;
+      --surface-panel: #15131d;
+      --surface-card: rgba(10, 12, 22, .72);
+      --surface-tab: rgba(36, 42, 52, .78);
+      --surface-nav: #18171f;
+      --primary: #c7b8ff;
+      --primary-strong: #8b5cff;
+      --primary-chip: #554b8e;
+      --on-primary: #1f1b3d;
+      --text: #f4f7fb;
+      --muted: #b5b0c4;
+      --muted-soft: #908b9d;
+      --outline: #3e4050;
+      --outline-strong: #555869;
+      --cyan: #26e7f2;
+      --fire: #ff6b1a;
+      --gold: #ffd166;
+      --blue: #4a7dff;
+      --radius-card: 24px;
+      --shadow: rgba(0, 0, 0, .28);
+      font-family: Manrope, Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      min-height: 100%;
+      margin: 0;
+      background: #0a0d15;
+      color: var(--text);
+      overflow: hidden;
+    }
+
+    button {
+      font: inherit;
+      color: inherit;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .shell {
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 12% 17%, rgba(74, 125, 255, .13), transparent 26%),
+        radial-gradient(circle at 83% 83%, rgba(255, 107, 26, .13), transparent 30%),
+        linear-gradient(135deg, rgba(7, 10, 31, .88), rgba(18, 12, 24, .96) 58%, rgba(16, 13, 18, .98)),
+        var(--surface);
+    }
+
+    .ambient {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      opacity: .88;
+    }
+
+    .ambient svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .ambient path {
+      fill: none;
+      stroke-linecap: round;
+      opacity: .36;
+    }
+
+    .ambient .cyan {
+      stroke: var(--cyan);
+      stroke-width: 1.2;
+      opacity: .28;
+    }
+
+    .ambient .blue {
+      stroke: var(--blue);
+      stroke-width: 1.35;
+      opacity: .28;
+    }
+
+    .ambient .fire {
+      stroke: var(--fire);
+      stroke-width: 1.45;
+      opacity: .30;
+    }
+
+    .spark {
+      position: absolute;
+      width: 4px;
+      height: 4px;
+      border-radius: 999px;
+      background: var(--fire);
+      opacity: .26;
+      box-shadow: 0 0 14px currentColor;
+    }
+
+    .spark.cyan {
+      background: var(--cyan);
+      color: var(--cyan);
+    }
+
+    .spark.blue {
+      background: var(--blue);
+      color: var(--blue);
+    }
+
+    .top {
+      height: 68px;
+      position: relative;
+      z-index: 2;
+      display: grid;
+      place-items: center;
+      border-bottom: 1px solid rgba(39, 53, 70, .24);
+      background: linear-gradient(90deg, rgba(11, 16, 23, .78), rgba(18, 15, 27, .86));
+    }
+
+    .top h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 900;
+      letter-spacing: -.25px;
+      color: #eeeaf8;
+    }
+
+    .mode-switch {
+      position: absolute;
+      left: 16px;
+      top: 15px;
+      height: 38px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .mode-switch button {
+      height: 34px;
+      min-width: 96px;
+      padding: 0 14px;
+      border: 1px solid rgba(85, 88, 105, .72);
+      border-radius: 999px;
+      background: rgba(36, 42, 52, .56);
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
+    .mode-switch button.active {
+      background: var(--primary);
+      color: var(--on-primary);
+      border-color: rgba(199, 184, 255, .64);
+      box-shadow: 0 10px 24px rgba(139, 92, 255, .20);
+    }
+
+    .tenant-pill {
+      position: absolute;
+      right: 16px;
+      top: 13px;
+      height: 40px;
+      border: 1px solid rgba(85, 88, 105, .72);
+      border-radius: 999px;
+      background: rgba(36, 42, 52, .54);
+      color: var(--muted);
+      padding: 0 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
+    .main {
+      height: calc(100vh - 68px - 82px);
+      position: relative;
+      z-index: 1;
+      overflow: hidden;
+      padding: 12px 16px 0;
+    }
+
+    .folder-tabs {
+      height: 58px;
+      padding: 4px;
+      border: 1px solid rgba(85, 88, 105, .76);
+      border-radius: 999px;
+      background: rgba(36, 42, 52, .72);
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 4px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05);
+      margin: 0 0 22px;
+    }
+
+    .folder-tabs button {
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
+    .folder-tabs button.active {
+      background: var(--primary);
+      color: var(--on-primary);
+      box-shadow: 0 10px 28px rgba(139, 92, 255, .28);
+    }
+
+    .scene {
+      display: none;
+      height: calc(100% - 80px);
+      overflow: auto;
+      padding-bottom: 22px;
+    }
+
+    .scene.active {
+      display: block;
+    }
+
+    .chat-list {
+      display: grid;
+      gap: 14px;
+    }
+
+    .chat-card {
+      min-height: 132px;
+      border: 1px solid rgba(85, 88, 105, .78);
+      border-radius: var(--radius-card);
+      background: linear-gradient(135deg, rgba(16, 23, 32, .74), rgba(8, 8, 16, .72));
+      box-shadow: 0 14px 30px var(--shadow);
+      padding: 16px;
+      display: grid;
+      grid-template-columns: 68px 1fr auto;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .avatar {
+      width: 62px;
+      height: 62px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #333844;
+      color: #ece9f8;
+      font-weight: 900;
+      font-size: 22px;
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05);
+    }
+
+    .avatar.discount {
+      background:
+        radial-gradient(circle at 30% 32%, #ffefe0, transparent 24%),
+        linear-gradient(135deg, #df3939, #273d9d 62%, #ef8731);
+      font-size: 9px;
+      text-align: center;
+      line-height: 1.05;
+      transform: rotate(-8deg);
+    }
+
+    .chat-body {
+      min-width: 0;
+    }
+
+    .chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+
+    .chip {
+      height: 32px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(142, 126, 216, .48);
+      background: rgba(85, 75, 142, .78);
+      color: #d9d2ff;
+      font-size: 13px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .chip.neutral {
+      background: rgba(36, 42, 52, .82);
+      border-color: rgba(85, 88, 105, .72);
+      color: var(--muted);
+    }
+
+    .chat-title {
+      margin: 0 0 10px;
+      color: #f0edf8;
+      font-size: 20px;
+      line-height: 1.12;
+      font-weight: 900;
+      letter-spacing: -.25px;
+    }
+
+    .preview {
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.35;
+      font-weight: 800;
+      margin: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .time {
+      padding-top: 4px;
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 800;
+      white-space: nowrap;
+      align-self: start;
+    }
+
+    .group-card {
+      min-height: 148px;
+      border: 1px solid rgba(85, 88, 105, .78);
+      border-radius: var(--radius-card);
+      background: linear-gradient(135deg, rgba(16, 23, 32, .78), rgba(8, 8, 16, .76));
+      box-shadow: 0 14px 30px var(--shadow);
+      padding: 18px;
+      display: grid;
+      grid-template-columns: 70px 1fr auto;
+      gap: 16px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+
+    .group-card.active {
+      border-color: rgba(199, 184, 255, .72);
+      box-shadow: 0 14px 36px rgba(139, 92, 255, .22);
+    }
+
+    .group-card h2 {
+      margin: 0 0 8px;
+      font-size: 21px;
+      line-height: 1.1;
+      font-weight: 900;
+      letter-spacing: -.3px;
+    }
+
+    .group-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.35;
+      font-weight: 800;
+    }
+
+    .group-action {
+      min-width: 150px;
+      height: 46px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--primary);
+      color: var(--on-primary);
+      font-weight: 900;
+      cursor: pointer;
+      box-shadow: 0 10px 24px rgba(139, 92, 255, .24);
+    }
+
+    .group-action.secondary {
+      background: rgba(36, 42, 52, .82);
+      color: var(--muted);
+      border: 1px solid rgba(85, 88, 105, .72);
+      box-shadow: none;
+    }
+
+    .qr-layout {
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .qr-box {
+      border: 1px solid rgba(85, 88, 105, .78);
+      border-radius: 28px;
+      background: linear-gradient(135deg, rgba(16, 23, 32, .80), rgba(8, 8, 16, .74));
+      padding: 24px;
+      box-shadow: 0 14px 30px var(--shadow);
+    }
+
+    .qr-code {
+      width: 176px;
+      height: 176px;
+      margin: 0 auto 22px;
+      border: 14px solid #ece9f8;
+      border-radius: 22px;
+      background:
+        linear-gradient(90deg, #ece9f8 12px, transparent 12px 28px, #ece9f8 28px 42px, transparent 42px),
+        linear-gradient(#ece9f8 12px, transparent 12px 28px, #ece9f8 28px 42px, transparent 42px),
+        #11131b;
+      background-size: 52px 52px;
+      box-shadow: 0 0 42px rgba(199, 184, 255, .18);
+    }
+
+    .qr-box h2,
+    .ops-panel h2 {
+      margin: 0 0 12px;
+      font-size: 24px;
+      line-height: 1.1;
+      font-weight: 900;
+      letter-spacing: -.35px;
+    }
+
+    .qr-box p,
+    .ops-panel p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.42;
+      font-weight: 800;
+    }
+
+    .actions {
+      display: grid;
+      gap: 10px;
+    }
+
+    .actions button {
+      height: 50px;
+      border-radius: 999px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
+    .filled {
+      border: 0;
+      background: var(--primary);
+      color: var(--on-primary);
+    }
+
+    .outlined {
+      border: 1px solid rgba(85, 88, 105, .72);
+      background: rgba(36, 42, 52, .72);
+      color: var(--muted);
+    }
+
+    .ops-panel {
+      border: 1px solid rgba(85, 88, 105, .78);
+      border-radius: 28px;
+      background: linear-gradient(135deg, rgba(16, 23, 32, .80), rgba(8, 8, 16, .74));
+      padding: 22px;
+      box-shadow: 0 14px 30px var(--shadow);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .metric {
+      min-height: 104px;
+      border: 1px solid rgba(85, 88, 105, .70);
+      border-radius: 22px;
+      background: rgba(36, 42, 52, .46);
+      padding: 16px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 30px;
+      line-height: 1;
+      font-weight: 900;
+      color: #f1edff;
+      margin-bottom: 10px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.25;
+      font-weight: 800;
+    }
+
+    .tenant-menu {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .tenant-tile {
+      min-height: 136px;
+      border: 1px solid rgba(85, 88, 105, .72);
+      border-radius: 24px;
+      background: rgba(36, 42, 52, .50);
+      padding: 18px;
+    }
+
+    .tenant-tile h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      line-height: 1.14;
+      font-weight: 900;
+    }
+
+    .tenant-tile p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.35;
+      font-weight: 800;
+    }
+
+    .floating-help,
+    .floating-profile {
+      position: fixed;
+      z-index: 4;
+      bottom: 102px;
+      width: 54px;
+      height: 54px;
+      border: 0;
+      border-radius: 18px;
+      background: var(--primary);
+      color: var(--on-primary);
+      font-size: 19px;
+      font-weight: 900;
+      box-shadow: 0 14px 28px rgba(0, 0, 0, .26);
+      cursor: pointer;
+    }
+
+    .floating-help {
+      left: 16px;
+    }
+
+    .floating-profile {
+      right: 16px;
+    }
+
+    .nav {
+      height: 82px;
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 3;
+      background: var(--surface-nav);
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      border-top: 1px solid rgba(39, 53, 70, .14);
+    }
+
+    .nav button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+      align-content: center;
+      gap: 6px;
+      font-size: 13px;
+      line-height: 1;
+      font-weight: 900;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    .nav-icon {
+      min-width: 76px;
+      height: 38px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+    }
+
+    .nav button.active {
+      color: #eee8ff;
+    }
+
+    .nav button.active .nav-icon {
+      background: rgba(139, 92, 255, .62);
+      color: #f2edff;
+    }
+
+    .sheet-scrim {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .38);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .18s ease;
+      z-index: 8;
+    }
+
+    .sheet-scrim.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .bottom-sheet {
+      position: fixed;
+      left: 16px;
+      right: 16px;
+      bottom: 92px;
+      max-height: min(680px, calc(100vh - 140px));
+      overflow: auto;
+      transform: translateY(calc(100% + 120px));
+      transition: transform .22s ease;
+      z-index: 9;
+      border: 1px solid rgba(85, 88, 105, .84);
+      border-radius: 30px;
+      background: rgba(16, 18, 28, .98);
+      box-shadow: 0 28px 70px rgba(0, 0, 0, .44);
+      padding: 12px 16px 18px;
+    }
+
+    .bottom-sheet.open {
+      transform: translateY(0);
+    }
+
+    .handle {
+      width: 48px;
+      height: 5px;
+      border-radius: 999px;
+      background: rgba(181, 176, 196, .48);
+      margin: 0 auto 16px;
+    }
+
+    .sheet-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .sheet-title h2 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.1;
+      font-weight: 900;
+    }
+
+    .close {
+      width: 42px;
+      height: 42px;
+      border: 0;
+      border-radius: 14px;
+      background: rgba(36, 42, 52, .72);
+      color: var(--muted);
+      font-size: 24px;
+      cursor: pointer;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    @media (max-width: 760px) {
+      .mode-switch {
+        position: static;
+        padding: 10px 14px 0;
+        height: auto;
+        overflow-x: auto;
+      }
+
+      .top {
+        height: 112px;
+        align-content: start;
+      }
+
+      .top h1 {
+        padding-top: 14px;
+      }
+
+      .tenant-pill {
+        display: none;
+      }
+
+      .main {
+        height: calc(100vh - 112px - 82px);
+        padding: 10px 10px 0;
+      }
+
+      .folder-tabs button {
+        font-size: 13px;
+      }
+
+      .chat-card,
+      .group-card {
+        grid-template-columns: 56px 1fr;
+      }
+
+      .time,
+      .group-action {
+        grid-column: 2;
+        justify-self: start;
+      }
+
+      .preview {
+        white-space: normal;
+      }
+
+      .qr-layout,
+      .tenant-menu,
+      .metrics {
+        grid-template-columns: 1fr;
+      }
+
+      .nav-icon {
+        min-width: 58px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="ambient" aria-hidden="true">
+      <svg viewBox="0 0 1600 900" preserveAspectRatio="none">
+        <path class="cyan" d="M-60 206 C260 166 454 284 820 238 C1030 212 1248 174 1660 222"></path>
+        <path class="blue" d="M720 360 C920 398 1130 372 1330 332 C1450 308 1540 298 1680 326"></path>
+        <path class="fire" d="M-80 444 C188 406 468 520 880 484"></path>
+        <path class="cyan" d="M720 594 C940 640 1130 586 1305 560 C1454 537 1540 544 1684 594"></path>
+        <path class="fire" d="M-50 708 C224 646 478 748 880 728"></path>
+      </svg>
+      <span class="spark cyan" style="left: 60%; top: 20%"></span>
+      <span class="spark" style="left: 48%; top: 26%"></span>
+      <span class="spark blue" style="left: 80%; top: 35%"></span>
+      <span class="spark" style="left: 74%; top: 44%"></span>
+      <span class="spark cyan" style="left: 69%; top: 84%"></span>
+      <span class="spark" style="left: 24%; top: 58%"></span>
+      <span class="spark blue" style="left: 18%; top: 18%"></span>
+      <span class="spark" style="left: 94%; top: 78%"></span>
+    </div>
+
+    <header class="top">
+      <div class="mode-switch" aria-label="Сценарии">
+        <button class="active" type="button" data-mode="groups">Группы</button>
+        <button type="button" data-mode="qr">QR-вход</button>
+        <button type="button" data-mode="tenant">Арендатор</button>
+      </div>
+      <h1 id="title">Чаты</h1>
+      <button class="tenant-pill" id="open-sheet-top" type="button">Мои группы ▾</button>
+    </header>
+
+    <section class="main">
+      <nav class="folder-tabs" aria-label="Папки">
+        <button class="active" type="button" data-folder="primary">Основные 2</button>
+        <button type="button" data-folder="work">Работа 6</button>
+        <button type="button" data-folder="direct">ЛС 4</button>
+      </nav>
+
+      <section class="scene active" id="groups-scene">
+        <div class="chat-list">
+          <article class="chat-card">
+            <div class="avatar discount">КАНАЛ<br>A</div>
+            <div class="chat-body">
+              <div class="chips">
+                <span class="chip">⚑ Основной</span>
+                <span class="chip">📌 Закреплён</span>
+              </div>
+              <h2 class="chat-title">Основной канал</h2>
+              <p class="preview">🛒 Коннектор для шланга, ABS пластик. Цена: 250.00 ₽ Количество в наличии: 0</p>
+            </div>
+            <time class="time">26.06.2026 15:55</time>
+          </article>
+
+          <article class="chat-card">
+            <div class="avatar">О</div>
+            <div class="chat-body">
+              <div class="chips">
+                <span class="chip neutral">♙ ЛС</span>
+              </div>
+              <h2 class="chat-title">Обсуждения</h2>
+              <p class="preview">Пользователь пишет, что приложение не помогает, когда внешний сервис тоже недоступен.</p>
+            </div>
+            <time class="time">25.06.2026 10:05</time>
+          </article>
+        </div>
+      </section>
+
+      <section class="scene" id="qr-scene">
+        <div class="qr-layout">
+          <article class="qr-box">
+            <div class="qr-code"></div>
+            <h2>Добавить новую группу?</h2>
+            <p>Профиль уже найден. Новая группа добавится в список, а текущая останется доступной.</p>
+            <div class="actions">
+              <button class="filled" type="button" id="join-open">Добавить и открыть</button>
+              <button class="outlined" type="button" id="join-later">Добавить, остаться здесь</button>
+              <button class="outlined" type="button">Отмена</button>
+            </div>
+          </article>
+
+          <article class="group-card active">
+            <div class="avatar">D</div>
+            <div>
+              <div class="chips">
+                <span class="chip">Новая группа</span>
+                <span class="chip neutral">Профиль сохранён</span>
+              </div>
+              <h2>Группа D</h2>
+              <p>После подтверждения появится в “Мои группы”. Повторная регистрация не нужна.</p>
+            </div>
+            <button class="group-action" type="button">Выбрать</button>
+          </article>
+        </div>
+      </section>
+
+      <section class="scene" id="tenant-scene">
+        <article class="ops-panel">
+          <h2>Меню арендатора</h2>
+          <p>Так может выглядеть отдельный рабочий раздел в текущем темном стиле проекта.</p>
+          <div class="metrics">
+            <div class="metric"><strong>24</strong><span>товара в работе</span></div>
+            <div class="metric"><strong>7</strong><span>активных резервов</span></div>
+            <div class="metric"><strong>3</strong><span>доставки сегодня</span></div>
+            <div class="metric"><strong>2</strong><span>ошибки уведомлений</span></div>
+          </div>
+        </article>
+        <div class="tenant-menu">
+          <article class="tenant-tile">
+            <h3>Клиенты</h3>
+            <p>Поиск, карточки, безопасные действия.</p>
+          </article>
+          <article class="tenant-tile">
+            <h3>Каналы</h3>
+            <p>Публикации, очередь, ошибки.</p>
+          </article>
+          <article class="tenant-tile">
+            <h3>Настройки группы</h3>
+            <p>Feature flags и история изменений.</p>
+          </article>
+        </div>
+      </section>
+    </section>
+
+    <button class="floating-help" type="button">?!</button>
+    <button class="floating-profile" id="open-sheet-fab" type="button">♙</button>
+
+    <nav class="nav" aria-label="Нижняя навигация">
+      <button class="active" type="button">
+        <span class="nav-icon">▱</span>
+        <span>Чаты</span>
+      </button>
+      <button type="button">
+        <span class="nav-icon">▢</span>
+        <span>Корзина</span>
+      </button>
+      <button type="button">
+        <span class="nav-icon">◈</span>
+        <span>Рабочий</span>
+      </button>
+      <button type="button">
+        <span class="nav-icon">▤</span>
+        <span>Посты</span>
+      </button>
+      <button type="button" id="open-sheet-nav">
+        <span class="nav-icon">▦</span>
+        <span>Группы</span>
+      </button>
+    </nav>
+  </main>
+
+  <div class="sheet-scrim" id="sheet-scrim"></div>
+  <aside class="bottom-sheet" id="groups-sheet" aria-label="Мои группы">
+    <div class="handle"></div>
+    <div class="sheet-title">
+      <h2>Мои группы</h2>
+      <button class="close" id="close-sheet" type="button">×</button>
+    </div>
+
+    <article class="group-card active">
+      <div class="avatar">A</div>
+      <div>
+        <div class="chips">
+          <span class="chip">Активна</span>
+          <span class="chip neutral">корзина 2</span>
+          <span class="chip neutral">чат 1</span>
+        </div>
+        <h2>Группа A</h2>
+        <p>Текущая группа. Все товары, корзина и чаты показываются в её контексте.</p>
+      </div>
+      <button class="group-action secondary" type="button">Открыта</button>
+    </article>
+
+    <article class="group-card">
+      <div class="avatar">B</div>
+      <div>
+        <div class="chips">
+          <span class="chip neutral">заказ 1</span>
+        </div>
+        <h2>Группа B</h2>
+        <p>Можно переключиться, не теряя доступ к текущей группе.</p>
+      </div>
+      <button class="group-action" type="button">Перейти</button>
+    </article>
+
+    <article class="group-card">
+      <div class="avatar">C</div>
+      <div>
+        <div class="chips">
+          <span class="chip neutral">спокойно</span>
+        </div>
+        <h2>Группа C</h2>
+        <p>Нет активных действий, но группа остается в списке.</p>
+      </div>
+      <button class="group-action" type="button">Перейти</button>
+    </article>
+  </aside>
+
+  <script>
+    const title = document.getElementById('title');
+    const scenes = {
+      groups: document.getElementById('groups-scene'),
+      qr: document.getElementById('qr-scene'),
+      tenant: document.getElementById('tenant-scene'),
+    };
+    const titles = {
+      groups: 'Чаты',
+      qr: 'QR-вход',
+      tenant: 'Меню арендатора',
+    };
+    const modeButtons = document.querySelectorAll('.mode-switch button');
+    const sheet = document.getElementById('groups-sheet');
+    const scrim = document.getElementById('sheet-scrim');
+
+    function setMode(mode) {
+      modeButtons.forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
+      Object.entries(scenes).forEach(([key, node]) => node.classList.toggle('active', key === mode));
+      title.textContent = titles[mode];
+      closeSheet();
+    }
+
+    function openSheet() {
+      sheet.classList.add('open');
+      scrim.classList.add('open');
+    }
+
+    function closeSheet() {
+      sheet.classList.remove('open');
+      scrim.classList.remove('open');
+    }
+
+    modeButtons.forEach((button) => button.addEventListener('click', () => setMode(button.dataset.mode)));
+    document.getElementById('open-sheet-top').addEventListener('click', openSheet);
+    document.getElementById('open-sheet-nav').addEventListener('click', openSheet);
+    document.getElementById('open-sheet-fab').addEventListener('click', openSheet);
+    document.getElementById('close-sheet').addEventListener('click', closeSheet);
+    scrim.addEventListener('click', closeSheet);
+    document.getElementById('join-open').addEventListener('click', () => {
+      setMode('groups');
+      openSheet();
+    });
+    document.getElementById('join-later').addEventListener('click', () => setMode('groups'));
+  </script>
+</body>
+</html>

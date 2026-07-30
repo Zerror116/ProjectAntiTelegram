@@ -7945,12 +7945,18 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
       });
     }
 
-    const knownConnection = await areUsersConnectedByContact(
+    const requesterRole = normalizeRole(req.user?.base_role || req.user?.role);
+    const peerRole = normalizeRole(peer.role);
+    const staffCanWriteClient =
+      (requesterRole === "admin" || requesterRole === "creator") &&
+      peerRole === "client";
+    const knownConnectionByContact = await areUsersConnectedByContact(
       client,
       req.user.tenant_id || null,
       req.user.id,
       peer.id,
     );
+    const knownConnection = staffCanWriteClient || knownConnectionByContact;
     const peerPreferences = await getMessengerPreferencesForUser(peer.id);
 
     const existing = await client.query(
@@ -7981,6 +7987,7 @@ router.post("/direct/open", requireAuth, directOpenRateGuard, async (req, res) =
       chat = existing.rows[0];
       requestRecord = await findDirectRequestByChatId(client, chat.id);
       if (
+        !staffCanWriteClient &&
         requestRecord &&
         requestRecord.status === "declined" &&
         String(requestRecord.requester_id || "").trim() === String(req.user.id || "").trim() &&

@@ -122,6 +122,22 @@ function isTenantManager(user) {
   return baseRole === "tenant" || baseRole === "creator";
 }
 
+async function loadPublicClientFeatureSettings(tenantId) {
+  const settings = await getTenantFeatureSettings(tenantId || null);
+  return {
+    client_group_switcher_enabled:
+      settings.client_group_switcher_enabled !== false,
+    qr_existing_client_join_enabled:
+      settings.qr_existing_client_join_enabled !== false,
+    client: {
+      group_switcher_enabled:
+        settings.client?.group_switcher_enabled !== false,
+      qr_existing_client_join_enabled:
+        settings.client?.qr_existing_client_join_enabled !== false,
+    },
+  };
+}
+
 function buildInviteLink(req, inviteCode, tenantCode = "") {
   const base = String(process.env.INVITE_LINK_BASE || "").trim();
   const encodedInvite = encodeURIComponent(String(inviteCode || "").trim());
@@ -1379,6 +1395,10 @@ router.get("/", authMiddleware, async (req, res) => {
           }
         : user;
 
+    const featureSettings = await loadPublicClientFeatureSettings(
+      responseUser?.tenant_id || req.user?.tenant_id || null,
+    );
+
     return res.json({
       ok: true,
       user: {
@@ -1395,8 +1415,9 @@ router.get("/", authMiddleware, async (req, res) => {
           typeof resolvedPermissions.permissions === "object"
             ? resolvedPermissions.permissions
             : {},
-        permission_source: resolvedPermissions?.source || "default_map",
-      },
+	        permission_source: resolvedPermissions?.source || "default_map",
+	        feature_settings: featureSettings,
+	      },
       stats,
     });
   } catch (err) {

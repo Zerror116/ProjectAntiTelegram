@@ -36,6 +36,7 @@ const {
   buildSupportTicketStatusLabel,
   decorateSupportTicketRow,
 } = require('../utils/supportTicketPresentation');
+const { getTenantFeatureSettings } = require('../utils/tenantFeatureSettings');
 
 const router = express.Router();
 const requireSupportWritePermission = requirePermission('chat.write.support');
@@ -168,6 +169,31 @@ function tenantVisibilitySql(column = 'tenant_id', tenantParamIndex = 1, allowNu
 
 function rejectMonitoringDisabled(res) {
   return res.status(404).json({ ok: false, error: 'Мониторинг отключен' });
+}
+
+async function rejectCreatorNotificationDiagnosticsDisabled(req, res) {
+  const settings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+  if (settings.creator_notification_diagnostics_enabled !== false) return false;
+  res.status(404).json({
+    ok: false,
+    error: 'Диагностика уведомлений отключена в настройках ключей',
+  });
+  return true;
+}
+
+async function rejectCreatorBootstrapMonitoringDisabled(req, res) {
+  const settings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+  if (settings.creator_bootstrap_monitoring_enabled !== false) return false;
+  res.status(404).json({
+    ok: false,
+    error: 'Мониторинг запуска отключен в настройках ключей',
+  });
+  return true;
+}
+
+async function isBootstrapMonitoringDisabledForRequest(req) {
+  const settings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+  return settings.creator_bootstrap_monitoring_enabled === false;
 }
 
 function periodStartExpression(period) {
@@ -1088,6 +1114,7 @@ router.get('/notifications/settings', requireAuth, requireRole('creator'), async
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorNotificationDiagnosticsDisabled(req, res)) return;
     const q = await db.query(
       `SELECT enabled_types,
               priorities,
@@ -1125,6 +1152,7 @@ router.put('/notifications/settings', requireAuth, requireRole('creator'), async
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorNotificationDiagnosticsDisabled(req, res)) return;
 
     const enabledTypesRaw =
       req.body?.enabled_types &&
@@ -1215,6 +1243,7 @@ router.get('/notifications/history', requireAuth, requireRole('creator'), async 
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorNotificationDiagnosticsDisabled(req, res)) return;
     const rawType = String(req.query?.type || '').trim().toLowerCase();
     const rawPriority = String(req.query?.priority || '').trim().toLowerCase();
     const type = rawType ? normalizeType(rawType) : '';
@@ -1251,6 +1280,7 @@ router.post('/notifications/test', requireAuth, requireRole('creator'), async (r
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorNotificationDiagnosticsDisabled(req, res)) return;
 
     const type = normalizeType(req.body?.type);
     const priority = normalizePriority(req.body?.priority);
@@ -1358,6 +1388,7 @@ router.get('/diagnostics/center', requireAuth, requireRole('creator'), async (re
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     return res.json({ ok: true, data: await loadMonitoringCenterPayload(req) });
   } catch (err) {
     console.error('ops.diagnostics.center error', err);
@@ -1368,6 +1399,9 @@ router.get('/diagnostics/center', requireAuth, requireRole('creator'), async (re
 router.post('/monitoring/events', requireAuth, async (req, res) => {
   try {
     if (!monitoringEnabled()) {
+      return res.status(202).json({ ok: true, disabled: true });
+    }
+    if (await isBootstrapMonitoringDisabledForRequest(req)) {
       return res.status(202).json({ ok: true, disabled: true });
     }
     const body =
@@ -1438,6 +1472,7 @@ router.get('/monitoring/center', requireAuth, requireRole('creator'), async (req
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     return res.json({ ok: true, data: await loadMonitoringCenterPayload(req) });
   } catch (err) {
     console.error('ops.monitoring.center error', err);
@@ -1453,6 +1488,7 @@ router.get('/monitoring/events', requireAuth, requireRole('creator'), async (req
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const tenantId = req.user?.tenant_id || null;
     const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const limit = safeLimit(req.query?.limit, 120);
@@ -1505,6 +1541,7 @@ router.get('/monitoring/releases', requireAuth, requireRole('creator'), async (r
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const data = await loadReleaseSummary(
       req.user?.tenant_id || null,
       canAccessPlatformGlobalRows(req.user),
@@ -1524,6 +1561,7 @@ router.get('/monitoring/realtime', requireAuth, requireRole('creator'), async (r
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const tenantId = req.user?.tenant_id || null;
     const allowNullTenantRows = canAccessPlatformGlobalRows(req.user);
     const recentEvents = await db.query(
@@ -1562,6 +1600,7 @@ router.patch('/monitoring/events/:id/resolve', requireAuth, requireRole('creator
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const id = String(req.params?.id || '').trim();
     if (!isUuidLike(id)) {
       return res.status(400).json({ ok: false, error: 'Некорректный id события' });
@@ -1594,6 +1633,7 @@ router.post('/monitoring/releases', requireAuth, requireRole('creator'), async (
     if (!isCreatorBase(req.user)) {
       return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
     }
+    if (await rejectCreatorBootstrapMonitoringDisabled(req, res)) return;
     const body =
       req.body && typeof req.body === 'object' && !Array.isArray(req.body)
         ? req.body

@@ -61,6 +61,19 @@ const ACTIVE_DELIVERY_CUSTOMER_STATUSES = [
   'in_delivery',
 ];
 
+function clientCancelAnytimeEnabled(settings) {
+  return settings?.client_cancel_anytime_enabled === true ||
+    settings?.delivery?.client_cancel_anytime_enabled === true;
+}
+
+function canClientCancelCartItemStatus(status, settings, hasDeliveryLink = false) {
+  const normalized = String(status || '').trim();
+  if (normalized === 'pending_processing') return true;
+  if (!clientCancelAnytimeEnabled(settings)) return false;
+  if (hasDeliveryLink) return false;
+  return normalized === 'processed' || normalized === 'preparing_delivery';
+}
+
 const claimsUploadsDir = uploadsPath('claims');
 fs.mkdirSync(claimsUploadsDir, { recursive: true });
 
@@ -1389,7 +1402,15 @@ router.get('/', authMiddleware, async (req, res) => {
               delivery.courier_code,
               delivery.eta_from,
               delivery.eta_to,
-              delivery.delivery_status AS delivery_batch_status
+              delivery.delivery_status AS delivery_batch_status,
+              EXISTS (
+                SELECT 1
+                FROM delivery_batch_items di_any
+                JOIN delivery_batch_customers cst_any ON cst_any.id = di_any.batch_customer_id
+                WHERE di_any.cart_item_id = c.id
+                  AND COALESCE(cst_any.call_status, '') <> 'removed'
+                LIMIT 1
+              ) AS has_delivery_batch_link
        FROM cart_items c
        JOIN products p ON p.id = c.product_id
        LEFT JOIN LATERAL (
@@ -1583,6 +1604,13 @@ router.get('/', authMiddleware, async (req, res) => {
       const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
       return bTime - aTime;
     });
+    for (const item of items) {
+      item.can_cancel = canClientCancelCartItemStatus(
+        item.status,
+        tenantSettings,
+        Boolean(item.has_delivery_batch_link),
+      );
+    }
 
     const totalSum = items.reduce((sum, item) => sum + item.line_total, 0);
     const processedStatuses = new Set([
@@ -1792,7 +1820,7 @@ router.post('/ready-for-delivery', authMiddleware, async (req, res) => {
   }
 });
 
-// Отказ от товара пользователем (только пока не обработан)
+// Отказ от товара пользователем
 router.delete('/items/:id', authMiddleware, async (req, res) => {
   const client = await db.pool.connect();
   try {
@@ -1839,11 +1867,36 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       return res.status(403).json({ ok: false, error: 'Это не ваша позиция корзины' });
     }
 
-    if (String(item.status) !== 'pending_processing') {
+    const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
+    const status = String(item.status || '').trim();
+    const linkedToDeliveryBatchQ = await client.query(
+      `SELECT di.id
+       FROM delivery_batch_items di
+       JOIN delivery_batch_customers dbc ON dbc.id = di.batch_customer_id
+       JOIN delivery_batches dbt ON dbt.id = di.batch_id
+       WHERE di.cart_item_id = $1
+         AND COALESCE(dbc.call_status, '') <> 'removed'
+       LIMIT 1
+       FOR UPDATE`,
+      [cartItemId],
+    );
+    const hasDeliveryLink = linkedToDeliveryBatchQ.rowCount > 0;
+    if (!canClientCancelCartItemStatus(status, tenantSettings, hasDeliveryLink)) {
       await client.query('ROLLBACK');
+      if (hasDeliveryLink) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            'Отказ невозможен: товар уже находится в доставке',
+          data: { status: item.status },
+        });
+      }
       return res.status(400).json({
         ok: false,
-        error: 'Отказ невозможен: товар уже обработан',
+        error:
+          status === 'delivered'
+            ? 'Отказ невозможен: товар уже доставлен'
+            : 'Отказ невозможен: товар уже обработан',
         data: { status: item.status },
       });
     }
