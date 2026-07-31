@@ -1810,12 +1810,7 @@ class AuthService {
     try {
       final sessionExpiry = await getSessionExpiry();
       if (_isExpired(sessionExpiry, skew: Duration.zero)) {
-        await setPendingAuthNotice(
-          'Срок входа истек, пожалуйста, войдите снова',
-        );
-        await clearToken();
-        completer.complete(false);
-        return false;
+        await _removeSecret(_sessionExpiresAtKey);
       }
 
       final refreshToken = await getRefreshToken();
@@ -1853,10 +1848,7 @@ class AuthService {
           }
         }
         if (status == 401) {
-          await setPendingAuthNotice(
-            'Срок входа истек, пожалуйста, войдите снова',
-          );
-          await clearToken();
+          _setSessionDegraded(true, reason: 'refresh_session_auth_rejected');
           completer.complete(false);
           return false;
         }
@@ -1890,9 +1882,7 @@ class AuthService {
 
     final sessionExpiry = await getSessionExpiry();
     if (_isExpired(sessionExpiry, skew: Duration.zero)) {
-      await setPendingAuthNotice('Срок входа истек, пожалуйста, войдите снова');
-      await clearToken();
-      return false;
+      await _removeSecret(_sessionExpiresAtKey);
     }
 
     final accessExpiry =
@@ -1964,8 +1954,13 @@ class AuthService {
       if (resp.statusCode == 401) {
         final refreshed = await refreshSession(allowBootstrap: true);
         if (!refreshed) {
-          await clearToken();
-          return false;
+          final restored = await _restoreLocalSessionFallback(token: token);
+          _lastStartupRefreshUsedFallback = restored;
+          _setSessionDegraded(
+            restored,
+            reason: 'startup_profile_auth_rejected',
+          );
+          return restored;
         }
         resp = await dio.get(
           '/api/profile',
@@ -2000,13 +1995,12 @@ class AuthService {
       return false;
     } on DioException catch (e) {
       final status = e.response?.statusCode;
-      // Временная недоступность сервера не должна выбрасывать пользователя из сессии.
-      // Очищаем токен только если сервер явно вернул auth-ошибку.
       if (status == 401) {
         debugPrint('❌ tryRefreshOnStartup auth error: $e');
-        _lastStartupRefreshUsedFallback = false;
-        await clearToken();
-        return false;
+        final restored = await _restoreLocalSessionFallback(token: token);
+        _lastStartupRefreshUsedFallback = restored;
+        _setSessionDegraded(restored, reason: 'startup_profile_auth_rejected');
+        return restored;
       }
       if (_isTransientNetworkOrServerError(e)) {
         _setSessionDegraded(true, reason: 'startup_refresh_transient_error');

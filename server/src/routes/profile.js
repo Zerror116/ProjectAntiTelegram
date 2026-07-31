@@ -129,11 +129,15 @@ async function loadPublicClientFeatureSettings(tenantId) {
       settings.client_group_switcher_enabled !== false,
     qr_existing_client_join_enabled:
       settings.qr_existing_client_join_enabled !== false,
+    phone_access_approval_enabled:
+      settings.phone_access_approval_enabled !== false,
     client: {
       group_switcher_enabled:
         settings.client?.group_switcher_enabled !== false,
       qr_existing_client_join_enabled:
         settings.client?.qr_existing_client_join_enabled !== false,
+      phone_access_approval_enabled:
+        settings.client?.phone_access_approval_enabled !== false,
     },
   };
 }

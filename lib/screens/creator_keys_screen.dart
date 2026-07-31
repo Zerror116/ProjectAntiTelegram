@@ -48,6 +48,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   bool _tenantDefectStatsEnabled = false;
   bool _tenantClientGroupSwitcherEnabled = true;
   bool _tenantQrExistingClientJoinEnabled = true;
+  bool _tenantPhoneAccessApprovalEnabled = true;
   bool _tenantOperationsMenuEnabled = false;
   bool _tenantDangerousActionAuditEnabled = true;
   bool _tenantProductChangeHistoryEnabled = false;
@@ -238,6 +239,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     required bool defectStatsEnabled,
     bool clientGroupSwitcherEnabled = true,
     bool qrExistingClientJoinEnabled = true,
+    bool phoneAccessApprovalEnabled = true,
     bool tenantOperationsMenuEnabled = false,
     bool dangerousActionAuditEnabled = true,
     bool productChangeHistoryEnabled = false,
@@ -315,6 +317,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       'client': {
         'group_switcher_enabled': clientGroupSwitcherEnabled,
         'qr_existing_client_join_enabled': qrExistingClientJoinEnabled,
+        'phone_access_approval_enabled': phoneAccessApprovalEnabled,
       },
       'tenant_console': {
         'operations_menu_enabled': tenantOperationsMenuEnabled,
@@ -332,6 +335,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       'client_city_options': cities,
       'client_group_switcher_enabled': clientGroupSwitcherEnabled,
       'qr_existing_client_join_enabled': qrExistingClientJoinEnabled,
+      'phone_access_approval_enabled': phoneAccessApprovalEnabled,
       'tenant_operations_menu_enabled': tenantOperationsMenuEnabled,
       'dangerous_action_audit_enabled': dangerousActionAuditEnabled,
       'product_change_history_enabled': productChangeHistoryEnabled,
@@ -364,6 +368,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       defectStatsEnabled: _tenantDefectStatsEnabled,
       clientGroupSwitcherEnabled: _tenantClientGroupSwitcherEnabled,
       qrExistingClientJoinEnabled: _tenantQrExistingClientJoinEnabled,
+      phoneAccessApprovalEnabled: _tenantPhoneAccessApprovalEnabled,
       tenantOperationsMenuEnabled: _tenantOperationsMenuEnabled,
       dangerousActionAuditEnabled: _tenantDangerousActionAuditEnabled,
       productChangeHistoryEnabled: _tenantProductChangeHistoryEnabled,
@@ -394,6 +399,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantDefectStatsEnabled = false;
     _tenantClientGroupSwitcherEnabled = true;
     _tenantQrExistingClientJoinEnabled = true;
+    _tenantPhoneAccessApprovalEnabled = true;
     _tenantOperationsMenuEnabled = false;
     _tenantDangerousActionAuditEnabled = true;
     _tenantProductChangeHistoryEnabled = false;
@@ -983,6 +989,11 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           initialSettings['qr_existing_client_join_enabled'],
       true,
     );
+    var phoneAccessApprovalEnabled = _toBoolValueOr(
+      client['phone_access_approval_enabled'] ??
+          initialSettings['phone_access_approval_enabled'],
+      true,
+    );
     var tenantOperationsMenuEnabled = _toBoolValue(
       tenantConsole['operations_menu_enabled'] ??
           initialSettings['tenant_operations_menu_enabled'],
@@ -1170,6 +1181,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                         () => qrExistingClientJoinEnabled = value,
                       ),
                     ),
+                    _settingsSwitchTile(
+                      title: 'Подтверждение одинакового номера',
+                      subtitle:
+                          'Если включено, новый клиент с уже занятым номером ждёт разрешения первого владельца.',
+                      value: phoneAccessApprovalEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => phoneAccessApprovalEnabled = value,
+                      ),
+                    ),
                     _settingsSectionTitle('Правила'),
                     TextField(
                       controller: rulesTextCtrl,
@@ -1275,6 +1295,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       defectStatsEnabled: defectStatsEnabled,
                       clientGroupSwitcherEnabled: clientGroupSwitcherEnabled,
                       qrExistingClientJoinEnabled: qrExistingClientJoinEnabled,
+                      phoneAccessApprovalEnabled: phoneAccessApprovalEnabled,
                       tenantOperationsMenuEnabled: tenantOperationsMenuEnabled,
                       dangerousActionAuditEnabled: dangerousActionAuditEnabled,
                       productChangeHistoryEnabled: productChangeHistoryEnabled,
@@ -1510,6 +1531,14 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             value: _tenantQrExistingClientJoinEnabled,
             onChanged: (value) =>
                 setState(() => _tenantQrExistingClientJoinEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Подтверждение одинакового номера',
+            subtitle:
+                'Если включено, новый клиент с уже занятым номером ждёт разрешения первого владельца.',
+            value: _tenantPhoneAccessApprovalEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantPhoneAccessApprovalEnabled = value),
           ),
           _settingsSectionTitle('Правила'),
           TextField(

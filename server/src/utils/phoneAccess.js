@@ -1,4 +1,5 @@
 const { v4: uuidv4 } = require('uuid');
+const { getTenantFeatureSettings } = require('./tenantFeatureSettings');
 
 function normalizePhoneDigits(raw) {
   return String(raw || '').replace(/\D/g, '').slice(0, 20);
@@ -256,6 +257,16 @@ async function resolveSharedCartOwnerId(
   queryable,
   { requesterUserId = '', tenantId = null } = {},
 ) {
+  const normalizedTenantId = String(tenantId || '').trim();
+  if (normalizedTenantId) {
+    const settings = await getTenantFeatureSettings(normalizedTenantId);
+    if (
+      settings.phone_access_approval_enabled === false ||
+      settings.client?.phone_access_approval_enabled === false
+    ) {
+      return String(requesterUserId || '').trim();
+    }
+  }
   const state = await resolvePhoneAccessState(queryable, {
     requesterUserId,
     tenantId,

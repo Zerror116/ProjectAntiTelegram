@@ -16,6 +16,8 @@ function testDefaults() {
   assert.equal(settings.product_change_history_enabled, false);
   assert.equal(settings.client_cancel_anytime_enabled, false);
   assert.equal(settings.delivery.client_cancel_anytime_enabled, false);
+  assert.equal(settings.phone_access_approval_enabled, true);
+  assert.equal(settings.client.phone_access_approval_enabled, true);
   assert.equal(settings.creator_notification_diagnostics_enabled, true);
   assert.equal(settings.creator_bootstrap_monitoring_enabled, true);
   assert.deepEqual(settings.client_city_options, []);
@@ -39,6 +41,7 @@ function testTopLevelAndNestedFlags() {
   const settings = normalizeTenantFeatureSettings({
     client_group_switcher_enabled: false,
     qr_existing_client_join_enabled: "0",
+    phone_access_approval_enabled: "нет",
     tenant_console: {
       operations_menu_enabled: "yes",
       product_change_history_enabled: true,
@@ -56,6 +59,8 @@ function testTopLevelAndNestedFlags() {
   assert.equal(settings.client.group_switcher_enabled, false);
   assert.equal(settings.qr_existing_client_join_enabled, false);
   assert.equal(settings.client.qr_existing_client_join_enabled, false);
+  assert.equal(settings.phone_access_approval_enabled, false);
+  assert.equal(settings.client.phone_access_approval_enabled, false);
   assert.equal(settings.tenant_operations_menu_enabled, true);
   assert.equal(settings.tenant_console.operations_menu_enabled, true);
   assert.equal(settings.dangerous_action_audit_enabled, false);
@@ -78,6 +83,7 @@ function testWorkflowPayloadCompatibility() {
     client: {
       group_switcher_enabled: true,
       qr_existing_client_join_enabled: true,
+      phone_access_approval_enabled: false,
     },
     tenant_console: {
       dangerous_action_audit_enabled: true,
@@ -86,6 +92,7 @@ function testWorkflowPayloadCompatibility() {
   });
   assert.equal(settings.client_group_switcher_enabled, true);
   assert.equal(settings.qr_existing_client_join_enabled, true);
+  assert.equal(settings.phone_access_approval_enabled, false);
   assert.equal(settings.dangerous_action_audit_enabled, true);
   assert.equal(settings.product_change_history_enabled, true);
 }

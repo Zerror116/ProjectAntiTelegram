@@ -101,6 +101,9 @@ const SESSION_TTL_DAYS = Math.max(
   Math.min(Number(process.env.AUTH_SESSION_TTL_DAYS || 60) || 60, 365),
 );
 const SESSION_TTL_MS = SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
+const SESSION_AUTO_EXPIRY_ENABLED = parseBooleanFlag(
+  process.env.AUTH_SESSION_AUTO_EXPIRY_ENABLED,
+);
 const ACCESS_TOKEN_TTL_MS = parseDurationMs(ACCESS_TOKEN_TTL, 24 * 60 * 60 * 1000);
 const PASSKEY_CHALLENGE_TTL_MS = Math.max(
   60 * 1000,
@@ -162,6 +165,14 @@ async function getClientCityOptionsForInvite(invite) {
     : [];
 }
 
+async function isPhoneAccessApprovalEnabledForTenant(tenantId) {
+  const normalizedTenantId = String(tenantId || "").trim();
+  if (!normalizedTenantId) return true;
+  const settings = await getTenantFeatureSettings(normalizedTenantId);
+  return settings.phone_access_approval_enabled !== false &&
+    settings.client?.phone_access_approval_enabled !== false;
+}
+
 function buildAccessExpiry(now = Date.now()) {
   return new Date(now + ACCESS_TOKEN_TTL_MS);
 }
@@ -207,6 +218,7 @@ async function createSecurityInboxNotification({
 }
 
 function buildSessionExpiry() {
+  if (!SESSION_AUTO_EXPIRY_ENABLED) return null;
   return new Date(Date.now() + SESSION_TTL_MS);
 }
 
@@ -1469,6 +1481,10 @@ async function resolvePhoneAccessForUser({
   let phoneAccess = { state: 'none' };
   if (!isPlatformCreator && user?.tenant_id) {
     try {
+      const enabled = await isPhoneAccessApprovalEnabledForTenant(
+        user.tenant_id || tenant?.id || null,
+      );
+      if (!enabled) return phoneAccess;
       phoneAccess = await db.runWithTenantRow(tenant, async () =>
         await resolvePhoneAccessState(db, {
           requesterUserId: user.id,
@@ -1638,11 +1654,15 @@ async function buildSuccessfulAuthResponse({
       featureSettings.client_group_switcher_enabled !== false,
     qr_existing_client_join_enabled:
       featureSettings.qr_existing_client_join_enabled !== false,
+    phone_access_approval_enabled:
+      featureSettings.phone_access_approval_enabled !== false,
     client: {
       group_switcher_enabled:
         featureSettings.client?.group_switcher_enabled !== false,
       qr_existing_client_join_enabled:
         featureSettings.client?.qr_existing_client_join_enabled !== false,
+      phone_access_approval_enabled:
+        featureSettings.client?.phone_access_approval_enabled !== false,
     },
   };
   const effectiveTenantCode = responseTenant?.code || user?.tenant_code || null;
@@ -2242,6 +2262,9 @@ router.post('/join-invite', async (req, res) => {
     const featureSettings = await getTenantFeatureSettings(tenant.id);
     const allowExistingClientInviteJoin =
       featureSettings.qr_existing_client_join_enabled !== false;
+    const phoneAccessApprovalEnabled =
+      featureSettings.phone_access_approval_enabled !== false &&
+      featureSettings.client?.phone_access_approval_enabled !== false;
 
     const clientCityOptions = await getClientCityOptionsForInvite(invite);
     let clientCity = null;
@@ -2374,7 +2397,11 @@ router.post('/join-invite', async (req, res) => {
           }
 
           let duplicatePhoneOwner = null;
-          if (tenant?.id && normalizedPhone.length >= 10) {
+          if (
+            phoneAccessApprovalEnabled &&
+            tenant?.id &&
+            normalizedPhone.length >= 10
+          ) {
             duplicatePhoneOwner = await findOldestPhoneOwner(client, {
               tenantId: tenant.id,
               phoneDigits: normalizedPhone,
@@ -2405,6 +2432,7 @@ router.post('/join-invite', async (req, res) => {
               [user.id, normalizedPhone],
             );
             if (
+              phoneAccessApprovalEnabled &&
               duplicatePhoneOwner &&
               String(duplicatePhoneOwner.id || '') !== String(user.id || '')
             ) {
@@ -2675,6 +2703,13 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    const featureSettings = !isPlatformCreator && tenant?.id
+      ? await getTenantFeatureSettings(tenant.id)
+      : await getTenantFeatureSettings(null);
+    const phoneAccessApprovalEnabled =
+      featureSettings.phone_access_approval_enabled !== false &&
+      featureSettings.client?.phone_access_approval_enabled !== false;
+
     const registerInScope = async () => {
       const client = await db.pool.connect();
       try {
@@ -2719,7 +2754,12 @@ router.post('/register', async (req, res) => {
           return { ok: false, status: 400, error: 'Введите корректный номер телефона' };
         }
         let duplicatePhoneOwner = null;
-        if (role === 'client' && tenant?.id && normalizedPhone.length >= 10) {
+        if (
+          phoneAccessApprovalEnabled &&
+          role === 'client' &&
+          tenant?.id &&
+          normalizedPhone.length >= 10
+        ) {
           duplicatePhoneOwner = await findOldestPhoneOwner(client, {
             tenantId: tenant.id,
             phoneDigits: normalizedPhone,
@@ -2752,6 +2792,7 @@ router.post('/register', async (req, res) => {
             [user.id, normalizedPhone],
           );
           if (
+            phoneAccessApprovalEnabled &&
             duplicatePhoneOwner &&
             String(duplicatePhoneOwner.id || '') !== String(user.id || '')
           ) {
@@ -2892,7 +2933,11 @@ router.post('/register', async (req, res) => {
     }
 
     let phoneAccess = { state: 'none' };
-    if (!isPlatformCreator && registration.user?.tenant_id) {
+    if (
+      phoneAccessApprovalEnabled &&
+      !isPlatformCreator &&
+      registration.user?.tenant_id
+    ) {
       try {
         phoneAccess = await db.runWithTenantRow(tenant, async () =>
           await resolvePhoneAccessState(db, {
@@ -3341,6 +3386,7 @@ router.post('/refresh', async (req, res) => {
           sessionPublicId: sessionId,
           refreshTokenHash: hashOpaqueToken(nextRefreshToken),
           refreshLastUsedAt: new Date(),
+          expiresAt: buildSessionExpiry(),
         });
         const payload = await buildSuccessfulAuthResponse({
           req,
@@ -3348,7 +3394,7 @@ router.post('/refresh', async (req, res) => {
           tenant,
           sessionId,
           refreshToken: nextRefreshToken,
-          sessionExpiresAt: session.expires_at || buildSessionExpiry(),
+          sessionExpiresAt: buildSessionExpiry(),
           isPlatformCreator,
         });
         await client.query('COMMIT');
@@ -3415,20 +3461,7 @@ router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
               subscription_expires_at: user.subscription_expires_at || null,
             }
           : null;
-        const targetExpiry = (() => {
-          const candidate = buildSessionExpiry();
-          const currentExpiry = session.expires_at
-            ? new Date(session.expires_at)
-            : null;
-          if (
-            currentExpiry instanceof Date &&
-            !Number.isNaN(currentExpiry.getTime()) &&
-            currentExpiry.getTime() > candidate.getTime()
-          ) {
-            return currentExpiry;
-          }
-          return candidate;
-        })();
+        const targetExpiry = buildSessionExpiry();
         const nextRefreshToken = buildRefreshToken(
           resolveRefreshScopeKey({
             user,
@@ -3796,6 +3829,12 @@ router.post('/password-reset/confirm', async (req, res) => {
 
 router.get('/phone-access/status', authMiddleware, async (req, res) => {
   try {
+    const enabled = await isPhoneAccessApprovalEnabledForTenant(
+      req.user?.tenant_id || null,
+    );
+    if (!enabled) {
+      return res.json({ ok: true, data: { state: 'none' } });
+    }
     await rebalancePendingPhoneRequestOwners(db, {
       tenantId: req.user?.tenant_id || null,
     });
@@ -3815,6 +3854,12 @@ router.get('/phone-access/status', authMiddleware, async (req, res) => {
 
 router.get('/phone-access/requests', authMiddleware, async (req, res) => {
   try {
+    const enabled = await isPhoneAccessApprovalEnabledForTenant(
+      req.user?.tenant_id || null,
+    );
+    if (!enabled) {
+      return res.json({ ok: true, data: [] });
+    }
     await rebalancePendingPhoneRequestOwners(db, {
       tenantId: req.user?.tenant_id || null,
     });
@@ -3844,6 +3889,15 @@ router.get('/phone-access/requests', authMiddleware, async (req, res) => {
 router.post('/phone-access/requests/:id/decision', authMiddleware, async (req, res) => {
   const client = await db.pool.connect();
   try {
+    const enabled = await isPhoneAccessApprovalEnabledForTenant(
+      req.user?.tenant_id || null,
+    );
+    if (!enabled) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Подтверждение номера отключено в этой группе',
+      });
+    }
     const requestId = String(req.params?.id || '').trim();
     const decision = String(req.body?.decision || '').trim().toLowerCase();
     const note = String(req.body?.note || '').trim();

@@ -180,6 +180,10 @@ async function main() {
         true,
       ),
       defect_stats_enabled: parseBoolean(process.env.DEFECT_STATS_ENABLED, true),
+      phone_access_approval_enabled: parseBoolean(
+        process.env.PHONE_ACCESS_APPROVAL_ENABLED,
+        true,
+      ),
     };
 
     await client.query(

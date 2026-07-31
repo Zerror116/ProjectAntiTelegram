@@ -103,7 +103,6 @@ async function touchUserSession({ queryable = db, sessionId }) {
      SET last_seen_at = now()
      WHERE session_token_hash = $1
        AND is_active = true
-       AND (expires_at IS NULL OR expires_at > now())
      RETURNING id`,
     [hash],
   );
@@ -154,7 +153,6 @@ async function findUserSessionByRefreshToken({ queryable = db, refreshToken }) {
      FROM user_sessions
      WHERE refresh_token_hash = $1
        AND is_active = true
-       AND (expires_at IS NULL OR expires_at > now())
      LIMIT 1`,
     [refreshTokenHash],
   );

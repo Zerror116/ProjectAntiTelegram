@@ -4,6 +4,7 @@ const db = require('../db');
 const { isTenantActive, isPlatformCreatorEmail } = require('./tenants');
 const { touchUserSession } = require('./sessions');
 const { resolvePhoneAccessState } = require('./phoneAccess');
+const { getTenantFeatureSettings } = require('./tenantFeatureSettings');
 const {
   ensurePlatformDiscussionUserShadow,
   ensurePlatformDiscussionsChat,
@@ -103,6 +104,14 @@ function isProfileProbeRequest(req) {
 function isPhoneAccessRestrictionState(state) {
   const normalized = String(state || '').toLowerCase().trim();
   return normalized === 'pending' || normalized === 'rejected';
+}
+
+async function isPhoneAccessApprovalEnabledForTenant(tenantId) {
+  const normalizedTenantId = String(tenantId || '').trim();
+  if (!normalizedTenantId) return true;
+  const settings = await getTenantFeatureSettings(normalizedTenantId);
+  return settings.phone_access_approval_enabled !== false &&
+    settings.client?.phone_access_approval_enabled !== false;
 }
 
 function isPhoneAccessBypassRequest(req) {
@@ -478,17 +487,24 @@ async function resolveAuthContextFromToken(
 
   if (!isPlatformCreator && baseRole === 'client' && row.tenant_id) {
     try {
-      const readPhoneAccess = async () =>
-        await resolvePhoneAccessState(db, {
-          requesterUserId: row.id,
-          tenantId: row.tenant_id || null,
-        });
-      const phoneAccessState = tenantRegistry
-        ? await db.runWithTenantRow(tenantRegistry, readPhoneAccess)
-        : await db.runWithPlatform(readPhoneAccess);
-      if (phoneAccessState && phoneAccessState.state) {
-        user.phone_access_state = phoneAccessState.state;
-        user.phone_access = phoneAccessState;
+      const phoneAccessApprovalEnabled =
+        await isPhoneAccessApprovalEnabledForTenant(row.tenant_id);
+      if (phoneAccessApprovalEnabled) {
+        const readPhoneAccess = async () =>
+          await resolvePhoneAccessState(db, {
+            requesterUserId: row.id,
+            tenantId: row.tenant_id || null,
+          });
+        const phoneAccessState = tenantRegistry
+          ? await db.runWithTenantRow(tenantRegistry, readPhoneAccess)
+          : await db.runWithPlatform(readPhoneAccess);
+        if (phoneAccessState && phoneAccessState.state) {
+          user.phone_access_state = phoneAccessState.state;
+          user.phone_access = phoneAccessState;
+        }
+      } else {
+        user.phone_access_state = 'none';
+        user.phone_access = { state: 'none' };
       }
     } catch (err) {
       if (NODE_ENV !== 'production') {

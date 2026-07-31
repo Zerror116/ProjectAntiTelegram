@@ -18,6 +18,7 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   group_rules_text: "",
   client_group_switcher_enabled: true,
   qr_existing_client_join_enabled: true,
+  phone_access_approval_enabled: true,
   tenant_operations_menu_enabled: false,
   dangerous_action_audit_enabled: true,
   product_change_history_enabled: false,
@@ -63,6 +64,7 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
   client: Object.freeze({
     group_switcher_enabled: true,
     qr_existing_client_join_enabled: true,
+    phone_access_approval_enabled: true,
   }),
   tenant_console: Object.freeze({
     operations_menu_enabled: false,
@@ -263,6 +265,11 @@ function normalizeTenantFeatureSettings(raw = {}) {
       source.qr_existing_client_join_enabled,
     DEFAULT_TENANT_FEATURE_SETTINGS.qr_existing_client_join_enabled,
   );
+  const phoneAccessApprovalEnabled = parseBoolean(
+    clientSource.phone_access_approval_enabled ??
+      source.phone_access_approval_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.phone_access_approval_enabled,
+  );
   const tenantOperationsMenuEnabled = parseBoolean(
     tenantConsoleSource.operations_menu_enabled ??
       source.tenant_operations_menu_enabled,
@@ -312,6 +319,8 @@ function normalizeTenantFeatureSettings(raw = {}) {
       DEFAULT_TENANT_FEATURE_SETTINGS.client_group_switcher_enabled ||
     qrExistingClientJoinEnabled !==
       DEFAULT_TENANT_FEATURE_SETTINGS.qr_existing_client_join_enabled ||
+    phoneAccessApprovalEnabled !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.phone_access_approval_enabled ||
     tenantOperationsMenuEnabled === true ||
     dangerousActionAuditEnabled !==
       DEFAULT_TENANT_FEATURE_SETTINGS.dangerous_action_audit_enabled ||
@@ -359,6 +368,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     client: {
       group_switcher_enabled: clientGroupSwitcherEnabled,
       qr_existing_client_join_enabled: qrExistingClientJoinEnabled,
+      phone_access_approval_enabled: phoneAccessApprovalEnabled,
     },
     tenant_console: {
       operations_menu_enabled: tenantOperationsMenuEnabled,
@@ -394,6 +404,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     delivery_snapshot_on_admin_approve: snapshotOnAdminApprove,
     client_group_switcher_enabled: clientGroupSwitcherEnabled,
     qr_existing_client_join_enabled: qrExistingClientJoinEnabled,
+    phone_access_approval_enabled: phoneAccessApprovalEnabled,
     tenant_operations_menu_enabled: tenantOperationsMenuEnabled,
     dangerous_action_audit_enabled: dangerousActionAuditEnabled,
     product_change_history_enabled: productChangeHistoryEnabled,
