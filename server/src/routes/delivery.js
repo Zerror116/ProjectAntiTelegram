@@ -67,6 +67,9 @@ const CART_INACTIVITY_SWEEP_STATUSES = [
 ];
 const DEMO_USER_EMAIL_PREFIX = "phantom.delivery.";
 const DEMO_PRODUCT_TITLE_PREFIX = "[DEMO DELIVERY]";
+function buildDemoDeliveryPhone(seedId, index) {
+  return `000${String(seedId).slice(-5)}${String(index).padStart(3, "0")}`;
+}
 const GEOCODER_SEARCH_URL =
   String(process.env.GEOCODER_SEARCH_URL || "").trim() ||
   "https://nominatim.openstreetmap.org/search";
@@ -5829,7 +5832,7 @@ router.post(
       for (let i = 0; i < count; i += 1) {
         const point = DEMO_SAMARA_POINTS[i % DEMO_SAMARA_POINTS.length];
         const email = `${DEMO_USER_EMAIL_PREFIX}${seedId}.${i}@phoenix.local`;
-        const phone = `7999${String(seedId).slice(-4)}${String(i + 10).padStart(3, "0")}`;
+        const phone = buildDemoDeliveryPhone(seedId, i + 10);
         const userInsert = await client.query(
           `INSERT INTO users (
              id, email, password_hash, name, role, tenant_id, created_at, updated_at

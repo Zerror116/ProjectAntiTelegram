@@ -1,6 +1,8 @@
 const express = require('express');
+const { randomBytes } = require('crypto');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcryptjs');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 
@@ -42,6 +44,7 @@ const router = express.Router();
 const requireSupportWritePermission = requirePermission('chat.write.support');
 const requireDeliveryManagePermission = requirePermission('delivery.manage');
 const requireTenantUsersManagePermission = requirePermission('tenant.users.manage');
+const DEMO_PASSWORD_SALT_ROUNDS = 10;
 
 const MONEY_STATUSES = [
   'in_delivery',
@@ -123,6 +126,30 @@ function parsePositiveInt(raw, fallback, min, max) {
   if (!Number.isFinite(parsed)) return fallback;
   const normalized = Math.trunc(parsed);
   return Math.max(min, Math.min(max, normalized));
+}
+
+function parseBooleanEnv(rawValue, fallback = false) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return fallback;
+  }
+  const normalized = String(rawValue).toLowerCase().trim();
+  if (['1', 'true', 'yes', 'on', 'y', 'да'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off', 'n', 'нет'].includes(normalized)) return false;
+  return fallback;
+}
+
+function isDemoSeedEnabled() {
+  return parseBooleanEnv(
+    process.env.OPS_DEMO_SEED_ENABLED,
+    String(process.env.NODE_ENV || '').toLowerCase().trim() !== 'production',
+  );
+}
+
+function buildDemoPhone(tenantCode, index) {
+  const hash = String(tenantCode || 'tenant')
+    .split('')
+    .reduce((acc, char) => (acc + char.charCodeAt(0)) % 1000, 0);
+  return `000${String(hash).padStart(3, '0')}${String(index).padStart(5, '0')}`;
 }
 
 function phoneTail(raw) {
@@ -3859,13 +3886,17 @@ async function ensureDemoUsers(client, {
   for (let i = 1; i <= count; i += 1) {
     const email = `demo.client.${tenantCode || 'tenant'}.${i}@fenix.local`;
     const name = `Демо клиент ${i}`;
-    const passwordHash = '$2b$10$z7dN5Vuj4OVwOB1p5MNDOe4Qw7P3R6Y1V0M8T7bQq3z9g8dY7q0iS';
+    const passwordHash = await bcrypt.hash(
+      randomBytes(24).toString('base64url'),
+      DEMO_PASSWORD_SALT_ROUNDS,
+    );
 
     const inserted = await client.query(
       `INSERT INTO users (id, email, password_hash, role, name, is_active, tenant_id, created_at)
        VALUES (gen_random_uuid(), $1, $2, 'client', $3, true, $4, now())
        ON CONFLICT (email) DO UPDATE
-         SET tenant_id = EXCLUDED.tenant_id,
+         SET password_hash = EXCLUDED.password_hash,
+             tenant_id = EXCLUDED.tenant_id,
              role = 'client',
              name = COALESCE(NULLIF(users.name, ''), EXCLUDED.name)
        RETURNING id, email, name`,
@@ -3875,7 +3906,7 @@ async function ensureDemoUsers(client, {
     const row = inserted.rows[0];
     users.push(row);
 
-    const phone = `79${String(900000000 + i).slice(0, 9)}`;
+    const phone = buildDemoPhone(tenantCode, i);
     await client.query(
       `INSERT INTO phones (id, user_id, phone, status, created_at, verified_at)
        VALUES (gen_random_uuid(), $1, $2, 'verified', now(), now())
@@ -3891,6 +3922,13 @@ async function ensureDemoUsers(client, {
 }
 
 router.post('/demo-mode/seed', requireAuth, requireRole('creator'), async (req, res) => {
+  if (!isDemoSeedEnabled()) {
+    return res.status(403).json({
+      ok: false,
+      error: 'Демо-заполнение отключено на сервере',
+    });
+  }
+
   if (!isCreatorBase(req.user)) {
     return res.status(403).json({ ok: false, error: 'Доступ только создателю' });
   }

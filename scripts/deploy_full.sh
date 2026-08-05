@@ -40,7 +40,7 @@ What it does:
 
 Important env vars:
   SERVER=root@89.23.99.18
-  SSH_PASSWORD=anubis              # optional; requires sshpass
+  SSH_PASSWORD=...                 # optional; requires sshpass
   REMOTE_PROJECT_DIR=/opt/fenix
   REMOTE_WEB_ROOT=/var/www/garphoenix.com
   REMOTE_DOWNLOADS_DIR=/opt/fenix/server/downloads
@@ -53,7 +53,7 @@ Important env vars:
   APK_SOURCE=build/app/outputs/flutter-apk/app-release.apk
 
 Examples:
-  SSH_PASSWORD=anubis ./scripts/deploy_full.sh -m "web+api deploy"
+  SSH_PASSWORD='***' ./scripts/deploy_full.sh -m "web+api deploy"
   ./scripts/deploy_full.sh --skip-build --no-commit
 EOF
 }

@@ -121,7 +121,7 @@ function checkSecretKeyrings() {
     }
     if (keyCount < 2) {
       addFinding(
-        "warn",
+        IS_PRODUCTION ? "warn" : "info",
         `secret.${ring.name}.single_key`,
         `Keyring "${ring.name}" has only one key version (rotation grace is not armed)`,
       );
@@ -151,7 +151,7 @@ function checkTransportHardening() {
   } else if (enforceHttps) {
     addFinding("info", "transport.https.enabled", "HTTPS enforcement is enabled");
   } else {
-    addFinding("warn", "transport.https.disabled_dev", "HTTPS enforcement is disabled");
+    addFinding("info", "transport.https.disabled_dev", "HTTPS enforcement is disabled in development");
   }
 
   if (enforceHttps && trustProxyHops <= 0) {
@@ -343,6 +343,14 @@ async function checkNotificationQueueHealth() {
 
 function checkBackupFreshness() {
   try {
+    if (!IS_PRODUCTION && !process.env.FENIX_BACKUP_ROOT) {
+      addFinding(
+        "info",
+        "backup.skipped_dev",
+        "Backup freshness check skipped outside production",
+      );
+      return;
+    }
     const backupRoot = process.env.FENIX_BACKUP_ROOT || '/opt/fenix-backups/postgres';
     const targetDir = backupRoot.endsWith('/postgres')
       ? backupRoot
