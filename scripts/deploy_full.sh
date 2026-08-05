@@ -13,6 +13,7 @@ REMOTE_SERVICE="${REMOTE_SERVICE:-auto}"
 BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
+RUN_TENANT_MAINTENANCE="${RUN_TENANT_MAINTENANCE:-1}"
 HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
 APK_DEFAULT_FILE_NAME="${APK_DEFAULT_FILE_NAME:-}"
 APK_SOURCE="${APK_SOURCE:-}"
@@ -46,6 +47,7 @@ Important env vars:
   BRANCH=master
   REMOTE_SERVICE=auto              # or explicit, e.g. fenix-api.service
   RUN_ANALYZE=1                    # set 0 to skip flutter analyze
+  RUN_TENANT_MAINTENANCE=1         # run tenant migrations and user-index sync
   UPLOAD_APK=1                     # set 0 to skip APK upload when APK did not change
   APK_DEFAULT_FILE_NAME=fenix-<app-version>.apk
   APK_SOURCE=build/app/outputs/flutter-apk/app-release.apk
@@ -293,6 +295,7 @@ run_ssh "$SERVER" \
   REMOTE_WEB_ROOT="$REMOTE_WEB_ROOT" \
   REMOTE_DOWNLOADS_DIR="$REMOTE_DOWNLOADS_DIR" \
   REMOTE_SERVICE="$REMOTE_SERVICE" \
+  RUN_TENANT_MAINTENANCE="$RUN_TENANT_MAINTENANCE" \
   APK_DEFAULT_FILE_NAME="$APK_DEFAULT_FILE_NAME" \
   APP_VERSION_NAME="$APP_VERSION_NAME" \
   APP_BUILD_NUMBER="$APP_BUILD_NUMBER" \
@@ -341,6 +344,12 @@ if [[ -d "$REMOTE_PROJECT_DIR/server" ]]; then
   fi
   if command -v npm >/dev/null 2>&1; then
     npm ci --omit=dev
+    if [[ "${RUN_TENANT_MAINTENANCE:-1}" == "1" ]]; then
+      npm run migrate:tenants
+      npm run sync:tenant-user-index
+    else
+      echo "[deploy_full][server] RUN_TENANT_MAINTENANCE=$RUN_TENANT_MAINTENANCE: skip tenant migrations and user-index sync"
+    fi
   fi
 fi
 
