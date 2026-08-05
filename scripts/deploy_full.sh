@@ -376,6 +376,7 @@ if [[ -n "$SERVICE" && "$SERVICE" != "manual" ]]; then
   mapfile -t PORT_3000_PIDS < <(
     ss -ltnp 2>/dev/null | grep ':3000' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
   )
+  STALE_PORT_3000_PIDS=()
   for PID in "${PORT_3000_PIDS[@]:-}"; do
     [[ -z "$PID" ]] && continue
     OWNER_SERVICE=""
@@ -386,10 +387,11 @@ if [[ -n "$SERVICE" && "$SERVICE" != "manual" ]]; then
       continue
     fi
     echo "[deploy_full][server] stopping stale process on :3000 pid=$PID service=${OWNER_SERVICE:-none}"
+    STALE_PORT_3000_PIDS+=("$PID")
     kill -TERM "$PID" || true
   done
   sleep 2
-  for PID in "${PORT_3000_PIDS[@]:-}"; do
+  for PID in "${STALE_PORT_3000_PIDS[@]:-}"; do
     [[ -z "$PID" ]] && continue
     if kill -0 "$PID" 2>/dev/null; then
       echo "[deploy_full][server] force stopping stale process on :3000 pid=$PID"
