@@ -1465,6 +1465,7 @@ async function findUserForEmailAuthRequest(req, normalizedEmail) {
         `SELECT u.id,
                 u.email,
                 u.name,
+                p.phone,
                 u.role,
                 u.is_active,
                 u.block_reason,
@@ -1476,6 +1477,7 @@ async function findUserForEmailAuthRequest(req, normalizedEmail) {
                 t.subscription_expires_at
          FROM users u
          LEFT JOIN tenants t ON t.id = u.tenant_id
+         LEFT JOIN phones p ON p.user_id = u.id
          WHERE lower(u.email) = $1
          LIMIT 1`,
         [normalizedEmail],
@@ -1514,6 +1516,39 @@ async function resolvePhoneAccessForUser({
     }
   }
   return phoneAccess;
+}
+
+async function resolveUserPhoneForAuthResponse({
+  user,
+  tenant,
+  isPlatformCreator = false,
+}) {
+  const existing = String(user?.phone || '').trim();
+  if (existing) return existing;
+  if (isPlatformCreator || !user?.id) return '';
+
+  try {
+    const readPhone = async () => {
+      const result = await db.query(
+        `SELECT phone
+         FROM phones
+         WHERE user_id = $1
+         ORDER BY
+           CASE WHEN status = 'verified' THEN 0 ELSE 1 END,
+           verified_at DESC NULLS LAST,
+           created_at DESC NULLS LAST
+         LIMIT 1`,
+        [user.id],
+      );
+      return String(result.rows[0]?.phone || '').trim();
+    };
+    return tenant ? await db.runWithTenantRow(tenant, readPhone) : await readPhone();
+  } catch (err) {
+    if (String(err?.code || '') !== '42P01') {
+      console.error('auth.phone resolve error', err);
+    }
+    return '';
+  }
 }
 
 async function createAuthenticatedSession({
@@ -1568,6 +1603,7 @@ async function fetchAuthUserWithTenant(queryable, userId) {
     `SELECT u.id,
             u.email,
             u.name,
+            p.phone,
             u.role,
             u.is_active,
             u.block_reason,
@@ -1578,6 +1614,7 @@ async function fetchAuthUserWithTenant(queryable, userId) {
             t.subscription_expires_at
      FROM users u
      LEFT JOIN tenants t ON t.id = u.tenant_id
+     LEFT JOIN phones p ON p.user_id = u.id
      WHERE u.id = $1
      LIMIT 1`,
     [userId],
@@ -1664,6 +1701,11 @@ async function buildSuccessfulAuthResponse({
     tenant: responseTenant,
     isPlatformCreator,
   });
+  const responsePhone = await resolveUserPhoneForAuthResponse({
+    user,
+    tenant: responseTenant,
+    isPlatformCreator,
+  });
   const featureSettings = responseTenant?.id
     ? await getTenantFeatureSettings(responseTenant.id)
     : await getTenantFeatureSettings(null);
@@ -1712,6 +1754,7 @@ async function buildSuccessfulAuthResponse({
       id: user.id,
       email: user.email,
       name: user.name || null,
+      phone: responsePhone || null,
       role: user.role,
       tenant_id: responseTenant?.id || user.tenant_id || null,
       tenant_code: effectiveTenantCode,
@@ -2507,6 +2550,7 @@ router.post('/join-invite', async (req, res) => {
                  SET phone = $2, status = 'pending_verification', created_at = now()`,
               [user.id, normalizedPhone],
             );
+            user.phone = normalizedPhone;
             if (
               phoneAccessApprovalEnabled &&
               duplicatePhoneOwner &&
@@ -2867,6 +2911,7 @@ router.post('/register', async (req, res) => {
                SET phone = $2, status = 'pending_verification', created_at = now()`,
             [user.id, normalizedPhone],
           );
+          user.phone = normalizedPhone;
           if (
             phoneAccessApprovalEnabled &&
             duplicatePhoneOwner &&
@@ -3074,6 +3119,7 @@ router.post('/register', async (req, res) => {
         id: registration.user.id,
         email: registration.user.email,
         name: registration.user.name,
+        phone: registration.user.phone || null,
         role: registration.user.role,
         tenant_id: registration.user.tenant_id || null,
         tenant_code: tenant?.code || null,
@@ -3176,13 +3222,14 @@ router.post('/login', async (req, res) => {
           ? [normalizedEmail.toLowerCase(), tenantIdForLogin]
           : [normalizedEmail.toLowerCase()];
         const userRes = await client.query(
-          `SELECT u.id, u.email, u.password_hash, u.role, u.is_active, u.block_reason, u.tenant_id,
+          `SELECT u.id, u.email, u.name, p.phone, u.password_hash, u.role, u.is_active, u.block_reason, u.tenant_id,
                   u.two_factor_enabled,
                   u.two_factor_secret,
                   t.code AS tenant_code, t.name AS tenant_name, t.status AS tenant_status,
                   t.subscription_expires_at
            FROM users u
            LEFT JOIN tenants t ON t.id = u.tenant_id
+           LEFT JOIN phones p ON p.user_id = u.id
            WHERE lower(u.email) = $1
              ${tenantFilter}
            ORDER BY
