@@ -4,6 +4,7 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   custom_workflows_enabled: false,
   publication_interval_ms: 2000,
   manual_shelf_enabled: false,
+  worker_delivery_assembly_enabled: false,
   pickup_only_enabled: false,
   cart_delivery_ready_enabled: false,
   cart_delivery_ready_min_amount: 1500,
@@ -42,6 +43,7 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
   }),
   worker: Object.freeze({
     manual_shelf_enabled: false,
+    delivery_assembly_enabled: false,
     pickup_only_enabled: false,
     revision_delete_approval_enabled: false,
     shelf_field_label: "Полка",
@@ -166,6 +168,11 @@ function normalizeTenantFeatureSettings(raw = {}) {
   const pickupOnlyEnabled = parseBoolean(
     workerSource.pickup_only_enabled ?? source.pickup_only_enabled,
     enabled,
+  );
+  const workerDeliveryAssemblyEnabled = parseBoolean(
+    workerSource.delivery_assembly_enabled ??
+      source.worker_delivery_assembly_enabled,
+    DEFAULT_TENANT_FEATURE_SETTINGS.worker_delivery_assembly_enabled,
   );
   const cartDeliveryReadyEnabled = parseBoolean(
     deliverySource.client_ready_button ?? source.cart_delivery_ready_enabled,
@@ -302,6 +309,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     publicationIntervalMs !==
       DEFAULT_TENANT_FEATURE_SETTINGS.publication_interval_ms ||
     manualShelfEnabled === true ||
+    workerDeliveryAssemblyEnabled === true ||
     pickupOnlyEnabled === true ||
     cartDeliveryReadyEnabled === true ||
     cartRetentionDays !== DEFAULT_TENANT_FEATURE_SETTINGS.cart_retention_days ||
@@ -346,6 +354,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     },
     worker: {
       manual_shelf_enabled: manualShelfEnabled,
+      delivery_assembly_enabled: workerDeliveryAssemblyEnabled,
       pickup_only_enabled: pickupOnlyEnabled,
       revision_delete_approval_enabled: revisionDeleteApprovalEnabled,
       shelf_field_label: shelfFieldLabel,
@@ -383,6 +392,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
     custom_workflows_enabled: customWorkflowsEnabled,
     publication_interval_ms: publicationIntervalMs,
     manual_shelf_enabled: manualShelfEnabled,
+    worker_delivery_assembly_enabled: workerDeliveryAssemblyEnabled,
     pickup_only_enabled: pickupOnlyEnabled,
     cart_delivery_ready_enabled: cartDeliveryReadyEnabled,
     cart_delivery_ready_min_amount: cartDeliveryReadyMinAmount,

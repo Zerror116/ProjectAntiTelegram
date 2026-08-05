@@ -14,7 +14,6 @@ class CreatorKeysScreen extends StatefulWidget {
 }
 
 class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
-  static const String _platformCreatorEmail = 'zerotwo02166@gmail.com';
   static final RegExp _tenantAccessKeyTemplateRegExp = RegExp(
     r'^[A-Z]{3}-[A-Z0-9]{1,32}-KEY$',
   );
@@ -40,6 +39,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   bool _tenantAutoProcessingEnabled = false;
   bool _tenantAutoPublishEnabled = false;
   bool _tenantManualShelfEnabled = false;
+  bool _tenantWorkerDeliveryAssemblyEnabled = false;
   bool _tenantPickupOnlyEnabled = false;
   bool _tenantCartDeliveryReadyEnabled = false;
   bool _tenantDeliverySnapshotOnAdminApprove = false;
@@ -63,9 +63,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   List<Map<String, dynamic>> _tenants = [];
 
   bool get _isPlatformCreator {
-    final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
-    final email = (authService.currentUser?.email ?? '').toLowerCase().trim();
-    return role == 'creator' && email == _platformCreatorEmail;
+    final user = authService.currentUser;
+    return user?.isPlatformCreator == true &&
+        (user?.role ?? '').toLowerCase().trim() == 'creator';
   }
 
   Options _creatorRequestOptions() {
@@ -231,6 +231,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     required bool autoProcessingEnabled,
     required bool autoPublishEnabled,
     required bool manualShelfEnabled,
+    required bool workerDeliveryAssemblyEnabled,
     required bool pickupOnlyEnabled,
     required bool deliveryReadyEnabled,
     required bool deliverySnapshotOnAdminApprove,
@@ -301,6 +302,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       },
       'worker': {
         'manual_shelf_enabled': manualShelfEnabled,
+        'delivery_assembly_enabled': workerDeliveryAssemblyEnabled,
         'pickup_only_enabled': pickupOnlyEnabled,
         'revision_delete_approval_enabled': revisionDeleteApprovalEnabled,
         'shelf_field_label': shelfFieldLabel,
@@ -336,6 +338,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       'client_group_switcher_enabled': clientGroupSwitcherEnabled,
       'qr_existing_client_join_enabled': qrExistingClientJoinEnabled,
       'phone_access_approval_enabled': phoneAccessApprovalEnabled,
+      'worker_delivery_assembly_enabled': workerDeliveryAssemblyEnabled,
       'tenant_operations_menu_enabled': tenantOperationsMenuEnabled,
       'dangerous_action_audit_enabled': dangerousActionAuditEnabled,
       'product_change_history_enabled': productChangeHistoryEnabled,
@@ -360,6 +363,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       autoProcessingEnabled: _tenantAutoProcessingEnabled,
       autoPublishEnabled: _tenantAutoPublishEnabled,
       manualShelfEnabled: _tenantManualShelfEnabled,
+      workerDeliveryAssemblyEnabled: _tenantWorkerDeliveryAssemblyEnabled,
       pickupOnlyEnabled: _tenantPickupOnlyEnabled,
       deliveryReadyEnabled: _tenantCartDeliveryReadyEnabled,
       deliverySnapshotOnAdminApprove: _tenantDeliverySnapshotOnAdminApprove,
@@ -391,6 +395,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantAutoProcessingEnabled = false;
     _tenantAutoPublishEnabled = false;
     _tenantManualShelfEnabled = false;
+    _tenantWorkerDeliveryAssemblyEnabled = false;
     _tenantPickupOnlyEnabled = false;
     _tenantCartDeliveryReadyEnabled = false;
     _tenantDeliverySnapshotOnAdminApprove = false;
@@ -952,6 +957,10 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     var manualShelfEnabled = _toBoolValue(
       worker['manual_shelf_enabled'] ?? initialSettings['manual_shelf_enabled'],
     );
+    var workerDeliveryAssemblyEnabled = _toBoolValue(
+      worker['delivery_assembly_enabled'] ??
+          initialSettings['worker_delivery_assembly_enabled'],
+    );
     var autoPublishEnabled = _toBoolValue(
       channels['auto_publish_enabled'] ??
           initialSettings['auto_publish_enabled'],
@@ -1110,6 +1119,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       value: manualShelfEnabled,
                       onChanged: (value) =>
                           setDialogState(() => manualShelfEnabled = value),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Сборка доставки для работника',
+                      subtitle:
+                          'Показывает работнику вкладку доставки и чек-лист сборки.',
+                      value: workerDeliveryAssemblyEnabled,
+                      onChanged: (value) => setDialogState(
+                        () => workerDeliveryAssemblyEnabled = value,
+                      ),
                     ),
                     TextField(
                       controller: shelfFieldLabelCtrl,
@@ -1285,6 +1303,8 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       autoProcessingEnabled: autoProcessingEnabled,
                       autoPublishEnabled: autoPublishEnabled,
                       manualShelfEnabled: manualShelfEnabled,
+                      workerDeliveryAssemblyEnabled:
+                          workerDeliveryAssemblyEnabled,
                       pickupOnlyEnabled: pickupOnlyEnabled,
                       deliveryReadyEnabled: deliveryReadyEnabled,
                       deliverySnapshotOnAdminApprove:
@@ -1464,6 +1484,14 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             value: _tenantManualShelfEnabled,
             onChanged: (value) =>
                 setState(() => _tenantManualShelfEnabled = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Сборка доставки для работника',
+            subtitle:
+                'Показывает работнику вкладку доставки и чек-лист сборки.',
+            value: _tenantWorkerDeliveryAssemblyEnabled,
+            onChanged: (value) =>
+                setState(() => _tenantWorkerDeliveryAssemblyEnabled = value),
           ),
           TextField(
             controller: _tenantShelfFieldLabelCtrl,

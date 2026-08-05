@@ -108,7 +108,7 @@ function isPhoneAccessRestrictionState(state) {
 
 async function isPhoneAccessApprovalEnabledForTenant(tenantId) {
   const normalizedTenantId = String(tenantId || '').trim();
-  if (!normalizedTenantId) return true;
+  if (!normalizedTenantId) return false;
   const settings = await getTenantFeatureSettings(normalizedTenantId);
   return settings.phone_access_approval_enabled !== false &&
     settings.client?.phone_access_approval_enabled !== false;

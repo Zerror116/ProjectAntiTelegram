@@ -166,6 +166,10 @@ async function main() {
         2000,
       ),
       manual_shelf_enabled: parseBoolean(process.env.MANUAL_SHELF_ENABLED, true),
+      worker_delivery_assembly_enabled: parseBoolean(
+        process.env.WORKER_DELIVERY_ASSEMBLY_ENABLED,
+        false,
+      ),
       pickup_only_enabled: parseBoolean(process.env.PICKUP_ONLY_ENABLED, true),
       cart_delivery_ready_enabled: parseBoolean(
         process.env.CART_DELIVERY_READY_ENABLED,

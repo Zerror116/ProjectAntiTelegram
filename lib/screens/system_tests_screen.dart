@@ -54,8 +54,6 @@ class SystemTestsScreen extends StatefulWidget {
 }
 
 class _SystemTestsScreenState extends State<SystemTestsScreen> {
-  static const String _platformCreatorEmail = 'zerotwo02166@gmail.com';
-
   String _messageStatus = 'sending';
   String _rolePreview = 'creator';
   bool _deliveryBusy = false;
@@ -257,11 +255,10 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
 
   bool get _isPlatformCreator {
     final role = (authService.currentUser?.role ?? '').toLowerCase().trim();
-    final email = (authService.currentUser?.email ?? '').toLowerCase().trim();
     final viewRole = authService.effectiveRole.toLowerCase().trim();
     return role == 'creator' &&
         viewRole == 'creator' &&
-        email == _platformCreatorEmail;
+        authService.currentUser?.isPlatformCreator == true;
   }
 
   String _formatDateTimeShort(dynamic raw) {

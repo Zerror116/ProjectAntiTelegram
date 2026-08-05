@@ -25,6 +25,7 @@ class User {
   final String? tenantName;
   final String? tenantStatus;
   final String? subscriptionExpiresAt;
+  final bool isPlatformCreator;
   final Map<String, dynamic> permissions;
   final Map<String, dynamic> featureSettings;
 
@@ -40,6 +41,7 @@ class User {
     this.tenantName,
     this.tenantStatus,
     this.subscriptionExpiresAt,
+    this.isPlatformCreator = false,
     this.permissions = const <String, dynamic>{},
     this.featureSettings = const <String, dynamic>{},
   });
@@ -86,6 +88,13 @@ class User {
                 .trim();
         return raw.isEmpty ? null : raw;
       })(),
+      isPlatformCreator: (() {
+        final raw = m['is_platform_creator'] ?? m['isPlatformCreator'];
+        if (raw is bool) return raw;
+        if (raw is num) return raw != 0;
+        final text = raw?.toString().trim().toLowerCase() ?? '';
+        return text == 'true' || text == '1' || text == 'yes';
+      })(),
       permissions: (() {
         final raw = m['permissions'];
         if (raw is Map<String, dynamic>) return raw;
@@ -114,6 +123,7 @@ class User {
       'tenant_name': tenantName,
       'tenant_status': tenantStatus,
       'subscription_expires_at': subscriptionExpiresAt,
+      'is_platform_creator': isPlatformCreator,
       'permissions': permissions,
       'feature_settings': featureSettings,
     };
@@ -1015,6 +1025,7 @@ class AuthService {
   }
 
   bool get canSelectCreatorTenantScope =>
+      _currentUser?.isPlatformCreator == true &&
       _currentUser?.role.toLowerCase().trim() == 'creator';
 
   String? get creatorTenantScopeCode =>
@@ -1051,6 +1062,7 @@ class AuthService {
       subscriptionExpiresAt: (subscriptionExpiresAt ?? '').trim().isEmpty
           ? null
           : subscriptionExpiresAt?.trim(),
+      isPlatformCreator: user.isPlatformCreator,
       permissions: user.permissions,
       featureSettings: user.featureSettings,
     );

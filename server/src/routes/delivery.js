@@ -27,7 +27,6 @@ const {
 const { getTenantFeatureSettings } = require("../utils/tenantFeatureSettings");
 
 const requireDeliveryManagePermission = requirePermission("delivery.manage");
-const KINEL_TENANT_CODE = "kinel-8997";
 
 const DEFAULT_ROUTE_ORIGIN = { lat: 55.751244, lng: 37.618423 };
 const DELIVERY_DAY_START_MINUTES = 10 * 60;
@@ -114,32 +113,30 @@ function normalizeRoleValue(value) {
   return String(value || "").toLowerCase().trim();
 }
 
-function isKinelTenantScope(user) {
-  const tenantCode = String(user?.tenant_code || "")
-    .toLowerCase()
-    .trim();
-  const tenantName = String(user?.tenant_name || "")
-    .toLowerCase()
-    .trim();
+async function isWorkerDeliveryAssemblyUser(user) {
+  if (normalizeRoleValue(user?.role) !== "worker") return false;
+  const tenantId = String(user?.tenant_id || "").trim();
+  if (!tenantId) return false;
+  const settings = await getTenantFeatureSettings(tenantId);
   return (
-    tenantCode === KINEL_TENANT_CODE ||
-    tenantCode.includes("kinel") ||
-    tenantName.includes("кинель")
+    settings.worker_delivery_assembly_enabled === true ||
+    settings.worker?.delivery_assembly_enabled === true
   );
 }
 
-function isKinelWorkerDeliveryAssemblyUser(user) {
-  return normalizeRoleValue(user?.role) === "worker" && isKinelTenantScope(user);
-}
-
-function requireDeliveryAssemblyAccess(req, res, next) {
+async function requireDeliveryAssemblyAccess(req, res, next) {
   if (!req.user) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
-  if (isKinelWorkerDeliveryAssemblyUser(req.user)) {
-    return next();
+  try {
+    if (await isWorkerDeliveryAssemblyUser(req.user)) {
+      return next();
+    }
+    return requireDeliveryManagePermission(req, res, next);
+  } catch (err) {
+    console.error("delivery.requireDeliveryAssemblyAccess error", err);
+    return res.status(500).json({ ok: false, error: "Ошибка сервера" });
   }
-  return requireDeliveryManagePermission(req, res, next);
 }
 
 function deliveryDialogWhere(alias = "c") {
@@ -4389,7 +4386,7 @@ router.get(
   async (req, res) => {
     try {
       const tenantId = req.user?.tenant_id || null;
-      const assemblyOnly = isKinelWorkerDeliveryAssemblyUser(req.user);
+      const assemblyOnly = await isWorkerDeliveryAssemblyUser(req.user);
       const settings = await getDeliverySettings(db, tenantId);
       const batches = await fetchBatchSummaries(db, tenantId);
       const eligiblePreview = assemblyOnly

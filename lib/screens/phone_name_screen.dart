@@ -241,9 +241,12 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
             'device_fingerprint': deviceFingerprint.trim(),
           if ((authService.pendingAccessKey ?? '').trim().isNotEmpty)
             'access_key': authService.pendingAccessKey!.trim(),
-          if ((authService.pendingRegistrationEmailToken ?? '').trim().isNotEmpty)
-            'registration_email_token':
-                authService.pendingRegistrationEmailToken!.trim(),
+          if ((authService.pendingRegistrationEmailToken ?? '')
+              .trim()
+              .isNotEmpty)
+            'registration_email_token': authService
+                .pendingRegistrationEmailToken!
+                .trim(),
         };
         if (_isCreatorPending) data['secret'] = secret;
         if (_isTenantKeyRegistration) {
@@ -360,7 +363,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
                 decoration: withInputLanguageBadge(
                   const InputDecoration(
                     labelText: 'Номер телефона',
-                    hintText: 'Например: +7 (123) 456-78-90 или 81234567890',
+                    hintText: 'Например: +7 (___) ___-__-__',
                   ),
                   controller: _phoneCtrl,
                 ),

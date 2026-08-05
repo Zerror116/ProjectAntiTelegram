@@ -899,6 +899,11 @@ function buildTenantWorkflowSettingsPayload(body = {}) {
     ["cart_retention_days", "delivery", "cart_retention_days"],
     ["shelf_field_label", "worker", "shelf_field_label"],
     ["floor_field_label", "worker", "floor_field_label"],
+    [
+      "worker_delivery_assembly_enabled",
+      "worker",
+      "delivery_assembly_enabled",
+    ],
     ["auto_publish_enabled", "channels", "auto_publish_enabled"],
     ["auto_publish_delay_minutes", "channels", "auto_publish_delay_minutes"],
     ["group_rules_text", "rules", "group_rules_text"],

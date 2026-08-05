@@ -209,10 +209,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   String _revisionShelfLabelOf(Map<String, dynamic> item) {
-    final label =
-        (item['shelf_label'] ?? item['revision_shelf_label'] ?? '')
-            .toString()
-            .trim();
+    final label = (item['shelf_label'] ?? item['revision_shelf_label'] ?? '')
+        .toString()
+        .trim();
     if (label.isNotEmpty) return label;
     final shelf = _toIntValue(item['shelf_number'], 0);
     return shelf > 0 ? shelf.toString().padLeft(2, '0') : '—';
@@ -244,6 +243,14 @@ class _WorkerPanelState extends State<WorkerPanel>
 
   bool get _revisionDeleteApprovalEnabled =>
       _toBoolValue(_tenantFeatureSettings['revision_delete_approval_enabled']);
+
+  bool get _workerDeliveryAssemblyEnabled {
+    final worker = _asMap(_tenantFeatureSettings['worker']);
+    return _toBoolValue(
+      _tenantFeatureSettings['worker_delivery_assembly_enabled'] ??
+          worker['delivery_assembly_enabled'],
+    );
+  }
 
   double? _parsedRevisionPercent() {
     final raw = _revisionPercentCtrl.text.trim().replaceAll(',', '.');
@@ -427,6 +434,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   void initState() {
     super.initState();
     _rebuildVisibleTabs(force: true, notify: false);
+    unawaited(_loadTenantFeatureSettings());
     _loadActiveTabData();
     _chatEventsSub = chatEventsController.stream.listen((event) {
       final type = event['type']?.toString() ?? '';
@@ -503,59 +511,32 @@ class _WorkerPanelState extends State<WorkerPanel>
     return role == 'creator' || role == 'tenant';
   }
 
-  bool _isKinelTenantScope() {
-    final user = authService.currentUser;
-    final tenantCode = (user?.tenantCode ?? '').toLowerCase().trim();
-    final tenantName = (user?.tenantName ?? '').toLowerCase().trim();
-    return tenantCode == 'kinel-8997' ||
-        tenantCode.contains('kinel') ||
-        tenantName.contains('кинель');
-  }
-
-  bool _isAnnaUtevskayaTenantScope() {
-    final user = authService.currentUser;
-    final tenantCode = [
-      authService.creatorTenantScopeCode,
-      user?.tenantCode,
-    ].whereType<String>().join(' ').toLowerCase().trim();
-    final tenantName = (user?.tenantName ?? '').toLowerCase().trim();
-    final compactCode = tenantCode.replaceAll(RegExp(r'[\s_-]+'), '');
-    final compactName = tenantName.replaceAll(RegExp(r'\s+'), ' ');
-    return tenantCode == 'anna-utevskaya-4898' ||
-        (compactCode.contains('anna') && compactCode.contains('utev')) ||
-        (compactName.contains('анна') && compactName.contains('утев')) ||
-        (compactName.contains('anna') && compactName.contains('utev'));
-  }
-
   String get _placementShelfInputLabel {
     final label = (_tenantFeatureSettings['shelf_field_label'] ?? '')
         .toString()
         .trim();
     if (label.isNotEmpty) return label;
-    return _isAnnaUtevskayaTenantScope() ? 'Стеллаж' : 'Номер / название полки';
+    return 'Номер / название полки';
   }
 
-  String get _placementShelfInputHint => _isAnnaUtevskayaTenantScope()
-      ? 'Например: 03 или A-2'
-      : 'Например: 03, A-2, верхняя';
+  String get _placementShelfInputHint => 'Например: 03, A-2, верхняя';
 
   String get _placementBoxInputLabel {
     final label = (_tenantFeatureSettings['floor_field_label'] ?? '')
         .toString()
         .trim();
     if (label.isNotEmpty) return label;
-    return _isAnnaUtevskayaTenantScope() ? 'Коробка' : 'Этаж / секция';
+    return 'Этаж / секция';
   }
 
-  String get _placementBoxInputHint =>
-      _isAnnaUtevskayaTenantScope() ? 'Номер коробки' : 'Любые символы';
+  String get _placementBoxInputHint => 'Любые символы';
 
   String get _placementShelfDisplayLabel {
     final label = (_tenantFeatureSettings['shelf_field_label'] ?? '')
         .toString()
         .trim();
     if (label.isNotEmpty) return label;
-    return _isAnnaUtevskayaTenantScope() ? 'Стеллаж' : 'Полка';
+    return 'Полка';
   }
 
   String get _placementBoxDisplayLabel {
@@ -563,7 +544,15 @@ class _WorkerPanelState extends State<WorkerPanel>
         .toString()
         .trim();
     if (label.isNotEmpty) return label;
-    return _isAnnaUtevskayaTenantScope() ? 'Коробка' : 'этаж';
+    return 'этаж';
+  }
+
+  bool get _usesStructuredPlacementLabels {
+    final shelfLabel = _placementShelfDisplayLabel.toLowerCase().trim();
+    final boxLabel = _placementBoxDisplayLabel.toLowerCase().trim();
+    return _manualShelfEnabled ||
+        shelfLabel != 'полка' ||
+        (boxLabel.isNotEmpty && boxLabel != 'этаж');
   }
 
   String _productShelfValue(dynamic shelfNumber, dynamic manualShelfLabel) {
@@ -581,7 +570,7 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   List<Widget> _ownPostIdentityChips(Map<String, dynamic> post) {
-    if (!_isAnnaUtevskayaTenantScope()) {
+    if (!_usesStructuredPlacementLabels) {
       return [
         _statChip(
           'ID ${_formatProductLabel(post['product_code'], post['product_shelf_number'], manualShelfLabel: post['manual_shelf_label'])}',
@@ -591,16 +580,19 @@ class _WorkerPanelState extends State<WorkerPanel>
     return [
       _statChip('ID товара: ${_productCodePart(post['product_code'])}'),
       _statChip(
-        'Стеллаж: ${_productShelfValue(post['product_shelf_number'], post['manual_shelf_label'])}',
+        '$_placementShelfDisplayLabel: ${_productShelfValue(post['product_shelf_number'], post['manual_shelf_label'])}',
       ),
-      _statChip('Коробка: ${_productBoxValue(post['shelf_floor'])}'),
+      _statChip(
+        '$_placementBoxDisplayLabel: ${_productBoxValue(post['shelf_floor'])}',
+      ),
     ];
   }
 
   bool _canViewDeliveryTab() {
     final role = authService.effectiveRole.toLowerCase().trim();
-    if (role == 'worker' && _isKinelTenantScope()) return true;
-    return false;
+    if (role != 'worker') return false;
+    if (_workerDeliveryAssemblyEnabled) return true;
+    return _hasAnyPermission(const ['delivery.manage']);
   }
 
   bool _canViewNewTab() {
@@ -771,11 +763,12 @@ class _WorkerPanelState extends State<WorkerPanel>
       final data = resp.data;
       if (data is Map && data['ok'] == true && data['data'] is Map) {
         if (!mounted) return;
+        final nextSettings = Map<String, dynamic>.from(data['data'] as Map);
         setState(() {
-          _tenantFeatureSettings = Map<String, dynamic>.from(
-            data['data'] as Map,
-          );
+          _tenantFeatureSettings = nextSettings;
         });
+        final changed = _rebuildVisibleTabs();
+        if (changed) _loadActiveTabData();
       }
     } catch (e) {
       if (!silent && mounted) {
@@ -1714,10 +1707,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   }
 
   String _revisionShelfKeyOfPost(Map<String, dynamic> post) {
-    final explicit =
-        (post['revision_shelf_key'] ?? post['shelf_key'] ?? '')
-            .toString()
-            .trim();
+    final explicit = (post['revision_shelf_key'] ?? post['shelf_key'] ?? '')
+        .toString()
+        .trim();
     if (explicit.isNotEmpty) return explicit;
     final shelf = _toIntValue(
       post['revision_shelf_number'] ??
@@ -2239,8 +2231,7 @@ class _WorkerPanelState extends State<WorkerPanel>
         'revision_shelf_number':
             post['revision_shelf_number'] ?? post['shelf_number'],
         'revision_shelf_key':
-            (post['revision_shelf_key'] ?? post['shelf_key'] ?? '')
-                .toString(),
+            (post['revision_shelf_key'] ?? post['shelf_key'] ?? '').toString(),
         'revision_shelf_label': _revisionShelfDisplayOfPost(post),
         'manual_shelf_label': (post['manual_shelf_label'] ?? '').toString(),
         'shelf_floor': (post['shelf_floor'] ?? '').toString(),
@@ -2997,9 +2988,7 @@ class _WorkerPanelState extends State<WorkerPanel>
               const SizedBox(height: 6),
               Text(
                 _manualShelfEnabled
-                    ? (_isAnnaUtevskayaTenantScope()
-                          ? 'Подготовьте карточку товара для очереди публикации. Для этой группы можно вручную указать стеллаж и коробку.'
-                          : 'Подготовьте карточку товара для очереди публикации. Для этой группы можно вручную указать полку и этаж.')
+                    ? 'Подготовьте карточку товара для очереди публикации. Для этой группы можно вручную указать ${_placementShelfDisplayLabel.toLowerCase()} и ${_placementBoxDisplayLabel.toLowerCase()}.'
                     : 'Подготовьте карточку товара для очереди публикации. Полка назначится автоматически по дате, а фото сразу станет обложкой поста.',
               ),
             ],
@@ -4011,7 +4000,9 @@ class _WorkerPanelState extends State<WorkerPanel>
               compact: true,
               child: DropdownButtonFormField<String>(
                 key: ValueKey('revision-shelf-$selectedShelfKey'),
-                initialValue: selectedShelfKey.isEmpty ? null : selectedShelfKey,
+                initialValue: selectedShelfKey.isEmpty
+                    ? null
+                    : selectedShelfKey,
                 isExpanded: true,
                 decoration: const InputDecoration(
                   labelText: 'Полка для ревизии',
@@ -4462,21 +4453,12 @@ class _WorkerPanelState extends State<WorkerPanel>
         item['product_shelf_number'] ?? item['shelf_number'],
         0,
       );
-      final shelfLabel = _isAnnaUtevskayaTenantScope()
-          ? [
-              if (manualShelf.isNotEmpty) manualShelf,
-              if (manualShelf.isEmpty && productShelf > 0)
-                productShelf.toString().padLeft(2, '0'),
-              if (shelfFloor.isNotEmpty)
-                '$_placementBoxDisplayLabel $shelfFloor',
-            ].join(' · ')
-          : [
-              if (manualShelf.isNotEmpty) manualShelf,
-              if (manualShelf.isEmpty && productShelf > 0)
-                'Полка ${productShelf.toString().padLeft(2, '0')}',
-              if (shelfFloor.isNotEmpty)
-                '$_placementBoxDisplayLabel $shelfFloor',
-            ].join(' · ');
+      final shelfLabel = [
+        if (manualShelf.isNotEmpty) manualShelf,
+        if (manualShelf.isEmpty && productShelf > 0)
+          '$_placementShelfDisplayLabel ${productShelf.toString().padLeft(2, '0')}',
+        if (shelfFloor.isNotEmpty) '$_placementBoxDisplayLabel $shelfFloor',
+      ].join(' · ');
       final assemblyStatus = (item['assembly_status'] ?? 'pending')
           .toString()
           .trim();

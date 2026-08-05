@@ -43,8 +43,6 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  static const String _platformCreatorEmail = 'zerotwo02166@gmail.com';
-
   bool _loading = true;
   bool _deletingAccount = false;
   bool _avatarBusy = false;
@@ -241,9 +239,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final actualRole = (authService.currentUser?.role ?? '')
         .toLowerCase()
         .trim();
-    final email = (authService.currentUser?.email ?? '').toLowerCase().trim();
     final isPlatformCreator =
-        actualRole == 'creator' && email == _platformCreatorEmail;
+        actualRole == 'creator' &&
+        authService.currentUser?.isPlatformCreator == true;
     if (!isPlatformCreator) {
       if (!mounted) return;
       setState(() {
@@ -1290,8 +1288,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final isPlatformCreator =
         actualRole.toLowerCase().trim() == 'creator' &&
         effectiveRole.toLowerCase().trim() == 'creator' &&
-        (authService.currentUser?.email ?? '').toLowerCase().trim() ==
-            _platformCreatorEmail;
+        authService.currentUser?.isPlatformCreator == true;
     final tenantLabel =
         (authService.currentUser?.tenantName ?? '').trim().isNotEmpty
         ? (authService.currentUser?.tenantName ?? '').trim()

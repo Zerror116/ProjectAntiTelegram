@@ -23,6 +23,11 @@ const {
   processNotificationQueueBatch,
   sweepDisabledEndpoints,
 } = require('./utils/notificationQueue');
+const {
+  loadTenantProcessingScopes,
+  runInTenantProcessingScope,
+  scopeLabel,
+} = require('./utils/tenantProcessingScopes');
 const { logMonitoringEvent } = require('./utils/monitoring');
 
 const WORKER_ID = process.env.FENIX_WORKER_ID || `${process.pid}`;
@@ -60,36 +65,78 @@ async function reportWorkerError(code, error, details = {}) {
 }
 
 async function runDigestSweep(reason) {
-  try {
-    await runNotificationDigestSweep();
-    console.log(`[worker] digest sweep completed (${reason})`);
-  } catch (error) {
-    await reportWorkerError('notification_digest_worker_error', error, { reason });
+  const scopes = await loadTenantProcessingScopes();
+  let completed = 0;
+  for (const scope of scopes) {
+    const label = scopeLabel(scope);
+    try {
+      await runInTenantProcessingScope(scope, () => runNotificationDigestSweep());
+      completed += 1;
+    } catch (error) {
+      await reportWorkerError('notification_digest_worker_error', error, {
+        reason,
+        tenant_code: label === 'platform' ? null : label,
+      });
+    }
   }
+  console.log(`[worker] digest sweep completed (${reason}, scopes=${completed}/${scopes.length})`);
 }
 
 async function runEndpointSweep(reason) {
+  const scopes = await loadTenantProcessingScopes();
+  let disabled = 0;
+  let completed = 0;
+  for (const scope of scopes) {
+    const label = scopeLabel(scope);
+    try {
+      disabled += await runInTenantProcessingScope(scope, () => sweepDisabledEndpoints());
+      completed += 1;
+    } catch (error) {
+      await reportWorkerError('notification_endpoint_sweep_error', error, {
+        reason,
+        tenant_code: label === 'platform' ? null : label,
+      });
+    }
+  }
   try {
-    const disabled = await sweepDisabledEndpoints();
     if (disabled > 0) {
-      console.log(`[worker] disabled stale endpoints=${disabled} (${reason})`);
+      console.log(`[worker] disabled stale endpoints=${disabled} (${reason}, scopes=${completed}/${scopes.length})`);
     }
   } catch (error) {
     await reportWorkerError('notification_endpoint_sweep_error', error, { reason });
   }
 }
 
+async function processNotificationQueueAcrossScopes() {
+  const scopes = await loadTenantProcessingScopes();
+  const processed = [];
+  for (const scope of scopes) {
+    const label = scopeLabel(scope);
+    try {
+      const scopedProcessed = await runInTenantProcessingScope(scope, () =>
+        processNotificationQueueBatch({
+          limit: BATCH_LIMIT,
+          workerId: label === 'platform' ? WORKER_ID : `${WORKER_ID}:${label}`,
+        }),
+      );
+      if (Array.isArray(scopedProcessed) && scopedProcessed.length > 0) {
+        processed.push(...scopedProcessed);
+        console.log(`[worker] processed deliveries=${scopedProcessed.length} scope=${label}`);
+      }
+    } catch (error) {
+      await reportWorkerError('notification_worker_scope_error', error, {
+        tenant_code: label === 'platform' ? null : label,
+      });
+    }
+  }
+  return processed;
+}
+
 async function workerLoop() {
   while (!stopping) {
     try {
-      const processed = await processNotificationQueueBatch({
-        limit: BATCH_LIMIT,
-        workerId: WORKER_ID,
-      });
+      const processed = await processNotificationQueueAcrossScopes();
       const count = Array.isArray(processed) ? processed.length : 0;
-      if (count > 0) {
-        console.log(`[worker] processed deliveries=${count}`);
-      }
       await new Promise((resolve) => setTimeout(resolve, count > 0 ? POLL_INTERVAL_MS : IDLE_INTERVAL_MS));
     } catch (error) {
       await reportWorkerError('notification_worker_loop_error', error);

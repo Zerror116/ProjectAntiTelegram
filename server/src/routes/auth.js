@@ -167,7 +167,7 @@ async function getClientCityOptionsForInvite(invite) {
 
 async function isPhoneAccessApprovalEnabledForTenant(tenantId) {
   const normalizedTenantId = String(tenantId || "").trim();
-  if (!normalizedTenantId) return true;
+  if (!normalizedTenantId) return false;
   const settings = await getTenantFeatureSettings(normalizedTenantId);
   return settings.phone_access_approval_enabled !== false &&
     settings.client?.phone_access_approval_enabled !== false;
@@ -1145,11 +1145,59 @@ function generateAuthEmailToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-function normalizeAuthEmailToken(rawValue) {
+function parseAuthEmailToken(rawValue) {
   const value = String(rawValue || '').trim();
-  if (!value) return '';
-  if (value.length < 32 || value.length > 200) return '';
-  return value;
+  if (!value || value.length < 32 || value.length > 220) {
+    return { token: '', scopeKey: '' };
+  }
+
+  const scopedMatch = value.match(/^([a-z0-9_-]{2,80})\.([a-f0-9]{32,128})$/i);
+  if (scopedMatch) {
+    return {
+      token: scopedMatch[2].toLowerCase(),
+      scopeKey: db.normalizeTenantCode(scopedMatch[1]) || 'platform',
+    };
+  }
+
+  if (/^[a-f0-9]{32,128}$/i.test(value)) {
+    return {
+      token: value.toLowerCase(),
+      scopeKey: 'platform',
+    };
+  }
+
+  return { token: '', scopeKey: '' };
+}
+
+function normalizeAuthEmailToken(rawValue) {
+  return parseAuthEmailToken(rawValue).token;
+}
+
+function resolveAuthEmailTokenScopeKey({ tenant = null, isPlatformCreator = false } = {}) {
+  if (isPlatformCreator) return 'platform';
+  return db.normalizeTenantCode(tenant?.code || '') || 'platform';
+}
+
+function encodeAuthEmailToken(rawToken, scopeKey = 'platform') {
+  const normalizedScope = db.normalizeTenantCode(scopeKey);
+  const token = normalizeAuthEmailToken(rawToken);
+  if (!token) return '';
+  if (!normalizedScope || normalizedScope === 'platform') return token;
+  return `${normalizedScope}.${token}`;
+}
+
+async function runWithAuthEmailTokenScope(scopeKey, fn) {
+  const normalizedScope = db.normalizeTenantCode(scopeKey);
+  if (!normalizedScope || normalizedScope === 'platform') {
+    return db.runWithPlatform(fn);
+  }
+  const tenantRow = await db.resolveTenantByCode(normalizedScope);
+  if (!tenantRow) {
+    const error = new Error('Ссылка недействительна или устарела');
+    error.statusCode = 400;
+    throw error;
+  }
+  return db.runWithTenantRow(tenantRow, fn);
 }
 
 function generateSixDigitCode() {
@@ -1238,10 +1286,10 @@ async function invalidateUnusedRegistrationCodes(queryable, email) {
 
 async function issueAuthEmailToken(
   queryable,
-  { userId, tenantId = null, email, kind, ttlMinutes, req },
+  { userId, tenantId = null, email, kind, ttlMinutes, req, scopeKey = 'platform' },
 ) {
-  const token = generateAuthEmailToken();
-  const tokenHash = sha256Hex(token);
+  const rawToken = generateAuthEmailToken();
+  const tokenHash = sha256Hex(rawToken);
   const safeTtlMinutes = Math.max(5, Math.min(Number(ttlMinutes) || 15, 60));
   await invalidateUnusedAuthEmailTokens(queryable, userId, kind);
   await queryable.query(
@@ -1280,7 +1328,7 @@ async function issueAuthEmailToken(
       safeTtlMinutes,
     ],
   );
-  return token;
+  return encodeAuthEmailToken(rawToken, scopeKey);
 }
 
 async function issueRegistrationEmailCode(queryable, { email, req }) {
@@ -1764,6 +1812,7 @@ async function buildSuccessfulAuthResponse({
         responseTenant?.subscription_expires_at ||
         user.subscription_expires_at ||
         null,
+      is_platform_creator: isPlatformCreator,
       phone_access_state: phoneAccess.state || 'none',
       phone_access: phoneAccess,
       feature_settings: publicClientFeatures,
@@ -3718,14 +3767,21 @@ router.post('/password-reset/request', async (req, res) => {
 
     const result = await findUserForEmailAuthRequest(req, normalizedEmail);
     if (result.user && result.user.is_active !== false) {
-      const token = await issueAuthEmailToken(db, {
-        userId: result.user.id,
-        tenantId: result.user.tenant_id || result.tenant?.id || null,
-        email: result.user.email,
-        kind: 'password_reset',
-        ttlMinutes: PASSWORD_RESET_TTL_MINUTES,
-        req,
-      });
+      const scopedTenant = result.isPlatformCreator ? null : result.tenant;
+      const token = await db.runWithTenantRow(scopedTenant, () =>
+        issueAuthEmailToken(db, {
+          userId: result.user.id,
+          tenantId: result.user.tenant_id || result.tenant?.id || null,
+          email: result.user.email,
+          kind: 'password_reset',
+          ttlMinutes: PASSWORD_RESET_TTL_MINUTES,
+          req,
+          scopeKey: resolveAuthEmailTokenScopeKey({
+            tenant: scopedTenant,
+            isPlatformCreator: result.isPlatformCreator,
+          }),
+        }),
+      );
       await sendMail({
         to: result.user.email,
         ...buildPasswordResetEmail({
@@ -3767,14 +3823,21 @@ router.post('/magic-link/request', async (req, res) => {
 
     const result = await findUserForEmailAuthRequest(req, normalizedEmail);
     if (result.user && result.user.is_active !== false) {
-      const token = await issueAuthEmailToken(db, {
-        userId: result.user.id,
-        tenantId: result.user.tenant_id || result.tenant?.id || null,
-        email: result.user.email,
-        kind: 'magic_login',
-        ttlMinutes: MAGIC_LINK_TTL_MINUTES,
-        req,
-      });
+      const scopedTenant = result.isPlatformCreator ? null : result.tenant;
+      const token = await db.runWithTenantRow(scopedTenant, () =>
+        issueAuthEmailToken(db, {
+          userId: result.user.id,
+          tenantId: result.user.tenant_id || result.tenant?.id || null,
+          email: result.user.email,
+          kind: 'magic_login',
+          ttlMinutes: MAGIC_LINK_TTL_MINUTES,
+          req,
+          scopeKey: resolveAuthEmailTokenScopeKey({
+            tenant: scopedTenant,
+            isPlatformCreator: result.isPlatformCreator,
+          }),
+        }),
+      );
       await sendMail({
         to: result.user.email,
         ...buildMagicLinkEmail({
@@ -3803,15 +3866,18 @@ router.post('/magic-link/consume', async (req, res) => {
   }
   const token = req.body?.token;
   const deviceFingerprint = req.body?.device_fingerprint;
-  if (!normalizeAuthEmailToken(token)) {
+  const parsedToken = parseAuthEmailToken(token);
+  if (!parsedToken.token) {
     return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
   }
 
-  const client = await db.pool.connect();
   try {
-    await client.query('BEGIN');
+    return await runWithAuthEmailTokenScope(parsedToken.scopeKey, async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
     const claimed = await claimAuthEmailToken(client, {
-      token,
+      token: parsedToken.token,
       kind: 'magic_login',
       req,
     });
@@ -3924,17 +3990,21 @@ router.post('/magic-link/consume', async (req, res) => {
 	      sourceId: session.sessionId,
 	      priority: 'high',
 	    });
-	    return res.json(payload);
+		    return res.json(payload);
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
+    });
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (_) {}
     console.error('auth.magicLink.consume error', err);
     return res
       .status(err.statusCode || 500)
       .json({ error: err.message || 'Ошибка сервера' });
-  } finally {
-    client.release();
   }
 });
 
@@ -3943,7 +4013,8 @@ router.post('/password-reset/confirm', async (req, res) => {
   const newPassword = String(
     req.body?.new_password || req.body?.password || '',
   );
-  if (!normalizeAuthEmailToken(token)) {
+  const parsedToken = parseAuthEmailToken(token);
+  if (!parsedToken.token) {
     return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
   }
   if (newPassword.trim().length < 8) {
@@ -3952,75 +4023,81 @@ router.post('/password-reset/confirm', async (req, res) => {
     });
   }
 
-  const client = await db.pool.connect();
   try {
-    await client.query('BEGIN');
-    const claimed = await claimAuthEmailToken(client, {
-      token,
-      kind: 'password_reset',
-      req,
-    });
-    if (!claimed) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
-    }
-    if (claimed.is_active === false) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({
-        error: String(claimed.block_reason || '').trim() ||
-          'Вас заблокировали за нарушение правил',
-      });
-    }
+    return await runWithAuthEmailTokenScope(parsedToken.scopeKey, async () => {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const claimed = await claimAuthEmailToken(client, {
+          token: parsedToken.token,
+          kind: 'password_reset',
+          req,
+        });
+        if (!claimed) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Ссылка недействительна или устарела' });
+        }
+        if (claimed.is_active === false) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({
+            error: String(claimed.block_reason || '').trim() ||
+              'Вас заблокировали за нарушение правил',
+          });
+        }
 
-    const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
-    await client.query(
-      `UPDATE users
-       SET password_hash = $2
-       WHERE id = $1`,
-      [claimed.id, passwordHash],
-    );
-    await revokeAllUserSessions({ queryable: client, userId: claimed.id });
-    await revokeAllTwoFactorTrustedDevices(client, claimed.id);
-    await client.query(
-      `UPDATE auth_email_tokens
-       SET used_at = COALESCE(used_at, now())
-       WHERE user_id = $1
-         AND used_at IS NULL`,
-      [claimed.id],
-    );
+        const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+        await client.query(
+          `UPDATE users
+           SET password_hash = $2
+           WHERE id = $1`,
+          [claimed.id, passwordHash],
+        );
+        await revokeAllUserSessions({ queryable: client, userId: claimed.id });
+        await revokeAllTwoFactorTrustedDevices(client, claimed.id);
+        await client.query(
+          `UPDATE auth_email_tokens
+           SET used_at = COALESCE(used_at, now())
+           WHERE user_id = $1
+             AND used_at IS NULL`,
+          [claimed.id],
+        );
 
-	    await client.query('COMMIT');
-	    await createSecurityInboxNotification({
-	      user: {
-	        id: claimed.id,
-	        role: claimed.role,
-	        tenant_id: claimed.user_tenant_id || null,
-	      },
-	      title: 'Пароль был сброшен',
-	      body: 'Пароль вашего аккаунта успешно обновлён. Если это были не вы, сразу обратитесь к администратору.',
-	      deepLink: '/notifications',
-	      payload: {
-	        event: 'password_reset_confirmed',
-	        email: claimed.user_email || claimed.email || null,
-	      },
-	      sourceType: 'auth_password_reset',
-	      sourceId: claimed.id,
-	      priority: 'critical',
-	    });
-	    return res.json({
-	      ok: true,
-	      message: 'Пароль обновлён. Теперь войдите с новым паролем.',
+        await client.query('COMMIT');
+        await createSecurityInboxNotification({
+          user: {
+            id: claimed.id,
+            role: claimed.role,
+            tenant_id: claimed.user_tenant_id || null,
+          },
+          title: 'Пароль был сброшен',
+          body: 'Пароль вашего аккаунта успешно обновлён. Если это были не вы, сразу обратитесь к администратору.',
+          deepLink: '/notifications',
+          payload: {
+            event: 'password_reset_confirmed',
+            email: claimed.user_email || claimed.email || null,
+          },
+          sourceType: 'auth_password_reset',
+          sourceId: claimed.id,
+          priority: 'critical',
+        });
+        return res.json({
+          ok: true,
+          message: 'Пароль обновлён. Теперь войдите с новым паролем.',
+        });
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        throw err;
+      } finally {
+        client.release();
+      }
     });
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (_) {}
     console.error('auth.passwordReset.confirm error', err);
     return res
       .status(err.statusCode || 500)
       .json({ error: err.message || 'Ошибка сервера' });
-  } finally {
-    client.release();
   }
 });
 

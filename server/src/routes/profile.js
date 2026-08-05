@@ -1409,6 +1409,7 @@ router.get("/", authMiddleware, async (req, res) => {
         ...responseUser,
         phone_access_state:
           String(req.user?.phone_access_state || '').trim() || 'none',
+        is_platform_creator: req.user?.is_platform_creator === true,
         phone_access:
           req.user?.phone_access && typeof req.user.phone_access === 'object'
             ? req.user.phone_access

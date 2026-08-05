@@ -9545,21 +9545,6 @@ class _ChatScreenState extends State<ChatScreen>
         title == 'забронированный товар';
   }
 
-  bool _isAnnaUtevskayaTenantScope() {
-    final user = authService.currentUser;
-    final tenantCode = [
-      authService.creatorTenantScopeCode,
-      user?.tenantCode,
-    ].whereType<String>().join(' ').toLowerCase().trim();
-    final tenantName = (user?.tenantName ?? '').toLowerCase().trim();
-    final compactCode = tenantCode.replaceAll(RegExp(r'[\s_-]+'), '');
-    final compactName = tenantName.replaceAll(RegExp(r'\s+'), ' ');
-    return tenantCode == 'anna-utevskaya-4898' ||
-        (compactCode.contains('anna') && compactCode.contains('utev')) ||
-        (compactName.contains('анна') && compactName.contains('утев')) ||
-        (compactName.contains('anna') && compactName.contains('utev'));
-  }
-
   bool _isBugReportsChat() {
     final settings = _effectiveChatSettings();
     final kind = (settings['kind'] ?? '').toString().toLowerCase().trim();
@@ -14716,7 +14701,6 @@ class _ChatScreenState extends State<ChatScreen>
         : (reservedShelfDisplay.isEmpty
               ? 'не назначена'
               : reservedShelfDisplay);
-    final useAnnaPlacementLabels = _isAnnaUtevskayaTenantScope();
     final reservedProductCode = _reservedProductCodeOf(message) ?? '—';
     final reservedProductShelfRaw = _reservedProductShelfDisplayOfMeta(metaMap);
     final reservedProductShelf = reservedProductShelfRaw.isEmpty
@@ -14726,6 +14710,8 @@ class _ChatScreenState extends State<ChatScreen>
     final reservedProductBox = reservedProductBoxRaw.isEmpty
         ? '—'
         : reservedProductBoxRaw;
+    final useStructuredPlacementLabels =
+        reservedProductShelfRaw.isNotEmpty || reservedProductBoxRaw.isNotEmpty;
     final reservedDescription = metaMap['description']?.toString().trim() ?? '';
     final clientName = metaMap['client_name']?.toString() ?? '—';
     final clientPhone = _formatDisplayPhone(
@@ -15439,27 +15425,29 @@ class _ChatScreenState extends State<ChatScreen>
                                 children: [
                                   _catalogMetaBadge(
                                     theme,
-                                    useAnnaPlacementLabels ? 'ID товара' : 'ID',
-                                    useAnnaPlacementLabels
+                                    useStructuredPlacementLabels
+                                        ? 'ID товара'
+                                        : 'ID',
+                                    useStructuredPlacementLabels
                                         ? reservedProductCode
                                         : productLabel,
                                     labelStyle: prominentBadgeLabelStyle,
                                     valueStyle: prominentBadgeValueStyle,
                                     padding: prominentBadgePadding,
                                   ),
-                                  if (useAnnaPlacementLabels)
+                                  if (useStructuredPlacementLabels)
                                     _catalogMetaBadge(
                                       theme,
-                                      'Стеллаж',
+                                      'Полка',
                                       reservedProductShelf,
                                       labelStyle: prominentBadgeLabelStyle,
                                       valueStyle: prominentBadgeValueStyle,
                                       padding: prominentBadgePadding,
                                     ),
-                                  if (useAnnaPlacementLabels)
+                                  if (useStructuredPlacementLabels)
                                     _catalogMetaBadge(
                                       theme,
-                                      'Коробка',
+                                      'Этаж',
                                       reservedProductBox,
                                       labelStyle: prominentBadgeLabelStyle,
                                       valueStyle: prominentBadgeValueStyle,
@@ -15483,7 +15471,7 @@ class _ChatScreenState extends State<ChatScreen>
                                   ),
                                   _catalogMetaBadge(
                                     theme,
-                                    useAnnaPlacementLabels
+                                    useStructuredPlacementLabels
                                         ? 'Полка клиента'
                                         : 'Полка',
                                     shelf,

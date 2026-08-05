@@ -35,7 +35,7 @@ run_local_checks() {
   print_section "Local Node Syntax + Security Audit"
   cd "$PROJECT_ROOT/server"
   find src -type f -name "*.js" -print0 | xargs -0 -n1 node --check
-  npm audit --omit=dev
+  npm audit --omit=dev --audit-level=high
   npm run audit:self
 }
 
@@ -52,30 +52,31 @@ run_remote_checks() {
     return
   fi
 
-  if ! command -v sshpass >/dev/null 2>&1; then
-    print_section "Remote Checks Skipped"
-    echo "sshpass not found; install it to run remote checks"
-    return
-  fi
-
-  if [[ -z "${SSH_PASSWORD:-}" ]]; then
-    print_section "Remote Checks Skipped"
-    echo "Set SSH_PASSWORD env to run remote checks"
-    return
-  fi
-
   print_section "Remote Service + Nginx Audit"
-  SSHPASS="$SSH_PASSWORD" sshpass -e ssh \
-    -o ConnectTimeout=10 \
-    -o PreferredAuthentications=password \
-    -o PubkeyAuthentication=no \
-    -o StrictHostKeyChecking=no \
-    "$SERVER" '
+  local ssh_cmd=(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no)
+  if [[ -n "${SSH_PASSWORD:-}" ]]; then
+    if ! command -v sshpass >/dev/null 2>&1; then
+      echo "SSH_PASSWORD is set, but sshpass is not installed" >&2
+      return 1
+    fi
+    ssh_cmd=(sshpass -e ssh -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=no)
+  else
+    ssh_cmd+=( -o BatchMode=yes )
+  fi
+
+  if [[ -n "${SSH_PASSWORD:-}" ]]; then
+    SSHPASS="$SSH_PASSWORD" "${ssh_cmd[@]}" "$SERVER" '
       set -euo pipefail
       hostname
       echo
       echo "== fenix-server.service =="
       systemctl is-active fenix-server.service || true
+      echo
+      echo "== fenix-worker.service =="
+      systemctl is-active fenix-worker.service || true
+      echo
+      echo "== nginx.service =="
+      systemctl is-active nginx.service || true
       systemctl status fenix-server.service --no-pager -l | sed -n "1,60p"
       echo
       echo "== listeners :3000 =="
@@ -92,7 +93,80 @@ run_remote_checks() {
       git rev-parse --short HEAD
       node -v
       npm -v
+      echo
+      echo "== address provider config =="
+      node - <<'"'"'NODE'"'"'
+require("dotenv").config();
+const configured = Boolean(
+  process.env.DELIVERY_ADDRESS_SUGGEST_URL ||
+  process.env.PHOTON_SEARCH_URL ||
+  String(process.env.DELIVERY_ADDRESS_PROVIDER || "").toLowerCase() === "nominatim"
+);
+const reverseConfigured = Boolean(
+  process.env.DELIVERY_ADDRESS_REVERSE_URL ||
+  process.env.PHOTON_REVERSE_URL ||
+  String(process.env.DELIVERY_ADDRESS_PROVIDER || "").toLowerCase() === "nominatim"
+);
+console.log(JSON.stringify({
+  provider: process.env.DELIVERY_ADDRESS_PROVIDER || "photon",
+  suggest_configured: configured,
+  reverse_configured: reverseConfigured
+}));
+if (!configured || !reverseConfigured) process.exit(2);
+NODE
     '
+  else
+    "${ssh_cmd[@]}" "$SERVER" '
+      set -euo pipefail
+      hostname
+      echo
+      echo "== fenix-server.service =="
+      systemctl is-active fenix-server.service || true
+      echo
+      echo "== fenix-worker.service =="
+      systemctl is-active fenix-worker.service || true
+      echo
+      echo "== nginx.service =="
+      systemctl is-active nginx.service || true
+      systemctl status fenix-server.service --no-pager -l | sed -n "1,60p"
+      echo
+      echo "== listeners :3000 =="
+      ss -ltnp | grep ":3000" || true
+      echo
+      echo "== nginx -t =="
+      nginx -t
+      echo
+      echo "== suspicious web files =="
+      find /var/www/garphoenix.com -maxdepth 3 \( -name ".DS_Store" -o -name ".env" \) -print
+      echo
+      echo "== deployed server revision =="
+      cd /opt/fenix/server
+      git rev-parse --short HEAD
+      node -v
+      npm -v
+      echo
+      echo "== address provider config =="
+      node - <<'"'"'NODE'"'"'
+require("dotenv").config();
+const configured = Boolean(
+  process.env.DELIVERY_ADDRESS_SUGGEST_URL ||
+  process.env.PHOTON_SEARCH_URL ||
+  String(process.env.DELIVERY_ADDRESS_PROVIDER || "").toLowerCase() === "nominatim"
+);
+const reverseConfigured = Boolean(
+  process.env.DELIVERY_ADDRESS_REVERSE_URL ||
+  process.env.PHOTON_REVERSE_URL ||
+  String(process.env.DELIVERY_ADDRESS_PROVIDER || "").toLowerCase() === "nominatim"
+);
+console.log(JSON.stringify({
+  provider: process.env.DELIVERY_ADDRESS_PROVIDER || "photon",
+  suggest_configured: configured,
+  reverse_configured: reverseConfigured
+}));
+if (!configured || !reverseConfigured) process.exit(2);
+NODE
+    '
+  fi
 }
 
 main() {
@@ -110,4 +184,3 @@ main() {
 }
 
 main "$@"
-

@@ -56,5 +56,5 @@ run_rsync -avz --delete \
 echo "[sync_server_code_safe] installing backend dependencies and reconciling tenant migrations"
 run_ssh "$SERVER" "cd '$REMOTE_PROJECT_DIR/server' && npm ci --omit=dev && npm run migrate:tenants && npm run sync:tenant-user-index"
 
-echo "[sync_server_code_safe] restarting backend"
-run_ssh "$SERVER" "systemctl restart fenix-server.service && systemctl is-active fenix-server.service"
+echo "[sync_server_code_safe] restarting backend and worker"
+run_ssh "$SERVER" "systemctl restart fenix-server.service && systemctl is-active fenix-server.service && if systemctl list-unit-files --type=service | awk '{print \$1}' | grep -Fxq fenix-worker.service; then systemctl restart fenix-worker.service && systemctl is-active fenix-worker.service; fi"
