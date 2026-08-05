@@ -51,27 +51,40 @@ function signJwt(payload, options = {}) {
   });
 }
 
-function verifyJwt(token) {
+function verifyJwtWithOptions(token, verifyOptions = {}) {
   if (!token) return null;
   const tokenKid = decodeJwtKid(token);
   const candidates = resolveSecretCandidates(JWT_KEYRING, tokenKid);
   for (const candidate of candidates) {
     try {
-      return jwt.verify(token, candidate.secret);
+      return jwt.verify(token, candidate.secret, verifyOptions);
     } catch (_) {
       // Try next key (supports rotation with grace period).
     }
   }
   try {
     // Last fallback for malformed/legacy tokens when no kid and candidates were empty.
-    return jwt.verify(token, JWT_KEYRING.currentSecret);
+    return jwt.verify(token, JWT_KEYRING.currentSecret, verifyOptions);
   } catch (err) {
     return null;
   }
+}
+
+function verifyJwt(token) {
+  return verifyJwtWithOptions(token);
+}
+
+function verifyJwtAllowExpired(token) {
+  return verifyJwtWithOptions(token, { ignoreExpiration: true });
 }
 
 function getJwtKeyringMeta() {
   return describeKeyring(JWT_KEYRING);
 }
 
-module.exports = { signJwt, verifyJwt, getJwtKeyringMeta };
+module.exports = {
+  signJwt,
+  verifyJwt,
+  verifyJwtAllowExpired,
+  getJwtKeyringMeta,
+};

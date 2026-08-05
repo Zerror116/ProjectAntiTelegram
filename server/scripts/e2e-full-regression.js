@@ -38,6 +38,12 @@ const checks = [
     requiredEnv: ['E2E_BASE_URL', 'E2E_OWNER_EMAIL', 'E2E_OWNER_PASSWORD', 'E2E_DUP_INVITE_CODE'],
   },
   {
+    id: 'auth_bootstrap',
+    title: 'Expired access token session bootstrap e2e',
+    command: ['node', 'scripts/e2e-session-bootstrap-flow.js'],
+    requiredEnv: ['E2E_BASE_URL', 'E2E_EMAIL', 'E2E_PASSWORD'],
+  },
+  {
     id: 'subscription_guard',
     title: 'Subscription guard e2e',
     command: ['node', 'scripts/e2e-subscription-guard-flow.js'],

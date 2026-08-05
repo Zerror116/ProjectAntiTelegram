@@ -1782,11 +1782,6 @@ class AuthService {
   Future<bool> _bootstrapLegacySession() async {
     final token = await getToken();
     if (token == null || token.trim().isEmpty) return false;
-    final accessExpiry =
-        await getAccessTokenExpiry() ?? _accessExpiryFromToken(token);
-    if (_isExpired(accessExpiry)) {
-      return false;
-    }
     try {
       final resp = await dio.post(
         '/api/auth/refresh/bootstrap',

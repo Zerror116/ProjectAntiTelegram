@@ -13,7 +13,7 @@ const {
 } = require('@simplewebauthn/server');
 const db = require('../db'); // предполагается, что db экспортирует функцию query
 const { authMiddleware } = require('../utils/auth');
-const { signJwt, verifyJwt } = require('../utils/jwt');
+const { signJwt, verifyJwt, verifyJwtAllowExpired } = require('../utils/jwt');
 const {
   PLATFORM_CREATOR_EMAIL,
   normalizeAccessKey,
@@ -247,6 +247,15 @@ function parseRefreshTokenScope(refreshToken) {
   const separator = normalized.indexOf('.');
   if (separator <= 0) return '';
   return db.normalizeTenantCode(normalized.slice(0, separator)) || '';
+}
+
+function getBearerTokenFromRequest(req) {
+  const value = String(req.get('authorization') || '').trim();
+  if (!value) return '';
+  if (value.toLowerCase().startsWith('bearer ')) {
+    return value.slice(7).trim();
+  }
+  return '';
 }
 
 async function runWithRefreshScope(scopeKey, fn) {
@@ -3662,20 +3671,38 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
-  const currentSessionId = String(req.user?.session_id || '').trim();
-  if (!currentSessionId) {
+router.post('/refresh/bootstrap', async (req, res) => {
+  const bearerToken = getBearerTokenFromRequest(req);
+  const payload = verifyJwtAllowExpired(bearerToken);
+  const currentSessionId = String(payload?.sid || payload?.session_id || '')
+    .trim();
+  const tokenUserId = String(
+    payload?.id || payload?.userId || payload?.sub || '',
+  ).trim();
+
+  if (!payload || !currentSessionId || !tokenUserId) {
     return res.status(401).json({ error: 'Текущая сессия не найдена' });
   }
 
   try {
-    const tenantScopeCode = db.normalizeTenantCode(req.user?.tenant_code || '');
-    const tenantScope = tenantScopeCode
-      ? await db.resolveTenantByCode(tenantScopeCode)
-      : null;
-    if (tenantScopeCode && !tenantScope) {
+    const tenantScopeCode = db.normalizeTenantCode(
+      payload?.tenant_code ||
+        payload?.tenantCode ||
+        req.get('x-tenant-code') ||
+        '',
+    );
+    const tenantScopeId = String(payload?.tenant_id || payload?.tenantId || '')
+      .trim();
+    let tenantScope = null;
+    if (tenantScopeCode) {
+      tenantScope = await db.resolveTenantByCode(tenantScopeCode);
+    } else if (tenantScopeId) {
+      tenantScope = await db.resolveTenantById(tenantScopeId);
+    }
+    if ((tenantScopeCode || tenantScopeId) && !tenantScope) {
       return res.status(401).json({ error: 'Арендатор сессии не найден' });
     }
+
     return await db.runWithTenantRow(tenantScope, async () => {
       const client = await db.pool.connect();
       try {
@@ -3690,7 +3717,25 @@ router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
               .status(401)
               .json({ error: 'Сессия истекла, войдите снова' });
         }
-        const user = await fetchAuthUserWithTenant(client, req.user.id);
+        if (String(session.user_id || '').trim() !== tokenUserId) {
+          await client.query('ROLLBACK');
+          return res
+            .status(401)
+            .json({ error: 'Сессия не соответствует пользователю' });
+        }
+        if (
+          SESSION_AUTO_EXPIRY_ENABLED &&
+          session.expires_at &&
+          new Date(session.expires_at).getTime() > 0 &&
+          new Date(session.expires_at).getTime() < Date.now()
+        ) {
+          await client.query('ROLLBACK');
+          return res
+            .status(401)
+            .json({ error: 'Сессия истекла, войдите снова' });
+        }
+
+        const user = await fetchAuthUserWithTenant(client, tokenUserId);
         if (!user) {
           await client.query('ROLLBACK');
           return res.status(401).json({ error: 'Пользователь не найден' });
@@ -3698,7 +3743,7 @@ router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
         const isPlatformCreator =
           String(user.email || '').trim().toLowerCase() ===
           CREATOR_EMAIL.toLowerCase();
-        const tenant = user.tenant_id
+        let tenant = user.tenant_id
           ? {
               id: user.tenant_id,
               code: user.tenant_code || null,
@@ -3707,6 +3752,16 @@ router.post('/refresh/bootstrap', authMiddleware, async (req, res) => {
               subscription_expires_at: user.subscription_expires_at || null,
             }
           : null;
+        if (!isPlatformCreator && !tenant && tenantScope) {
+          tenant = {
+            id: tenantScope.id,
+            code: tenantScope.code || null,
+            name: tenantScope.name || null,
+            status: tenantScope.status || null,
+            subscription_expires_at:
+              tenantScope.subscription_expires_at || null,
+          };
+        }
         const targetExpiry = buildSessionExpiry();
         const nextRefreshToken = buildRefreshToken(
           resolveRefreshScopeKey({
