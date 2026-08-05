@@ -172,6 +172,10 @@ main()
   })
   .finally(async () => {
     try {
-      await db.platformPool.end();
+      if (typeof db.closeAllPools === "function") {
+        await db.closeAllPools();
+      } else {
+        await db.platformPool.end();
+      }
     } catch (_) {}
   });

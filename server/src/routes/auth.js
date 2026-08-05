@@ -3157,6 +3157,24 @@ router.post('/login', async (req, res) => {
       const client = await db.pool.connect();
       try {
         await client.query('BEGIN');
+        const tenantIdForLogin =
+          !isPlatformCreator && tenant?.id ? String(tenant.id).trim() : '';
+        const shouldFilterTenant = tenantIdForLogin.length > 0;
+        const allowLegacyNullTenantRows =
+          shouldFilterTenant &&
+          (db.isIsolatedTenantRow(tenant) ||
+            db.isSchemaIsolatedTenantRow(tenant));
+        const tenantFilter = shouldFilterTenant
+          ? allowLegacyNullTenantRows
+            ? 'AND (u.tenant_id = $2::uuid OR u.tenant_id IS NULL)'
+            : 'AND u.tenant_id = $2::uuid'
+          : '';
+        const tenantPriority = shouldFilterTenant
+          ? 'CASE WHEN u.tenant_id = $2::uuid THEN 0 ELSE 1 END,'
+          : '';
+        const userParams = shouldFilterTenant
+          ? [normalizedEmail.toLowerCase(), tenantIdForLogin]
+          : [normalizedEmail.toLowerCase()];
         const userRes = await client.query(
           `SELECT u.id, u.email, u.password_hash, u.role, u.is_active, u.block_reason, u.tenant_id,
                   u.two_factor_enabled,
@@ -3166,11 +3184,18 @@ router.post('/login', async (req, res) => {
            FROM users u
            LEFT JOIN tenants t ON t.id = u.tenant_id
            WHERE lower(u.email) = $1
-           LIMIT 1`,
-          [normalizedEmail.toLowerCase()],
+             ${tenantFilter}
+           ORDER BY
+             CASE WHEN u.is_active = true THEN 0 ELSE 1 END,
+             ${tenantPriority}
+             u.updated_at DESC NULLS LAST,
+             u.created_at DESC NULLS LAST,
+             u.id DESC
+           LIMIT 20`,
+          userParams,
         );
-        const user = userRes.rows[0];
-        if (!user) {
+        const userCandidates = userRes.rows || [];
+        if (userCandidates.length === 0) {
           await client.query('ROLLBACK');
           return {
             ok: false,
@@ -3180,8 +3205,28 @@ router.post('/login', async (req, res) => {
           };
         }
 
-        const ok = await bcrypt.compare(password, String(user.password_hash || ''));
-        if (!ok) {
+        let user = null;
+        let inactiveUserWithMatchingPassword = null;
+        for (const candidate of userCandidates) {
+          const ok = await bcrypt.compare(
+            password,
+            String(candidate.password_hash || ''),
+          );
+          if (!ok) continue;
+          if (candidate.is_active === false) {
+            if (!inactiveUserWithMatchingPassword) {
+              inactiveUserWithMatchingPassword = candidate;
+            }
+            continue;
+          }
+          user = candidate;
+          break;
+        }
+
+        if (!user && inactiveUserWithMatchingPassword) {
+          user = inactiveUserWithMatchingPassword;
+        }
+        if (!user) {
           await client.query('ROLLBACK');
           return {
             ok: false,

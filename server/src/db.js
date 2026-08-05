@@ -269,6 +269,13 @@ function platformConnect() {
   return platformPool.connect();
 }
 
+async function closeAllPools() {
+  const tenantPools = [...tenantPoolCache.values()];
+  tenantPoolCache.clear();
+  await Promise.allSettled(tenantPools.map((pool) => pool.end()));
+  await platformPool.end();
+}
+
 const poolProxy = new Proxy(
   {},
   {
@@ -299,6 +306,7 @@ module.exports = {
   platformPool,
   platformQuery,
   platformConnect,
+  closeAllPools,
   applyClientContext,
 
   // Tenant helpers
