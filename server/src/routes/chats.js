@@ -3499,7 +3499,10 @@ async function loadPlatformDiscussionsChatForList(req) {
             COALESCE(pref.pinned, false) AS is_pinned,
             pref.pinned_at,
             last_msg.text AS last_message,
-            last_msg.created_at AS updated_at,
+            GREATEST(
+              COALESCE(last_msg.created_at, c.updated_at, c.created_at),
+              COALESCE(c.updated_at, c.created_at, last_msg.created_at)
+            ) AS updated_at,
             COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
             NULL::text AS support_ticket_status,
             NULL::text AS support_assignee_name,
@@ -3804,7 +3807,10 @@ async function listChatsHandler(req, res) {
               COALESCE(pref.pinned, false) AS is_pinned,
               pref.pinned_at,
               last_msg.text AS last_message,
-              last_msg.created_at AS updated_at,
+              GREATEST(
+                COALESCE(last_msg.created_at, c.updated_at, c.created_at),
+                COALESCE(c.updated_at, c.created_at, last_msg.created_at)
+              ) AS updated_at,
               COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
               st.status AS support_ticket_status,
               COALESCE(NULLIF(BTRIM(support_assignee.name), ''), NULLIF(BTRIM(support_assignee.email), ''), '') AS support_assignee_name,
@@ -4005,7 +4011,10 @@ async function listChatsHandler(req, res) {
               COALESCE(pref.pinned, false) AS is_pinned,
               pref.pinned_at,
               last_msg.text AS last_message,
-              last_msg.created_at AS updated_at,
+              GREATEST(
+                COALESCE(last_msg.created_at, c.updated_at, c.created_at),
+                COALESCE(c.updated_at, c.created_at, last_msg.created_at)
+              ) AS updated_at,
               COALESCE(unread_stats.unread_count, 0)::int AS unread_count,
               last_msg.sender_id AS last_message_sender_id,
               COALESCE(NULLIF(BTRIM(last_user.name), ''), NULLIF(BTRIM(last_user.email), ''), 'Система') AS last_message_sender_name,

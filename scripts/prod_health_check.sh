@@ -76,6 +76,19 @@ check_status "health /health" "$BASE_URL/health" "200"
 check_status "setup protected /api/setup" "$BASE_URL/api/setup" "401,403"
 check_status "dotfile blocked /.DS_Store" "$BASE_URL/.DS_Store" "403,404"
 check_status "app update /api/app/update" "$BASE_URL/api/app/update" "200"
+ANDROID_RELEASE_FILE="$(
+  node - "$tmp_body" <<'NODE' 2>/dev/null || true
+const fs = require('fs');
+const file = process.argv[2];
+try {
+  const root = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const value = root?.data?.android?.release_file;
+  if (typeof value === 'string' && value.trim()) {
+    process.stdout.write(value.trim());
+  }
+} catch (_) {}
+NODE
+)"
 check_status \
   "android apk blocked for non-android ua" \
   "$BASE_URL/api/app/update/android/apk" \
@@ -91,17 +104,21 @@ check_contains_header \
   "android apk content type" \
   "content-type" \
   "application/vnd.android.package-archive"
-check_status \
-  "direct /downloads apk path" \
-  "$BASE_URL/downloads/fenix-1.0.1.apk" \
-  "200,403,404" \
-  -I \
-  -A "Mozilla/5.0 (Linux; Android 14; Pixel 8)"
-if [[ "$LAST_STATUS_CODE" == "200" ]]; then
-  check_contains_header \
-    "direct /downloads content type" \
-    "content-type" \
-    "application/vnd.android.package-archive"
+if [[ -n "$ANDROID_RELEASE_FILE" ]]; then
+  check_status \
+    "direct /downloads apk path" \
+    "$BASE_URL/downloads/$ANDROID_RELEASE_FILE" \
+    "200,403,404" \
+    -I \
+    -A "Mozilla/5.0 (Linux; Android 14; Pixel 8)"
+  if [[ "$LAST_STATUS_CODE" == "200" ]]; then
+    check_contains_header \
+      "direct /downloads content type" \
+      "content-type" \
+      "application/vnd.android.package-archive"
+  fi
+else
+  echo "[warn] direct /downloads apk path skipped: release_file missing in /api/app/update"
 fi
 check_status "socket polling handshake" "$BASE_URL/socket.io/?EIO=4&transport=polling" "200"
 
