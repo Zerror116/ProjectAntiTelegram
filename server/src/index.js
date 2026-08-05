@@ -199,6 +199,10 @@ const REQUEST_LOGGING_ENABLED = parseBooleanEnv(
   process.env.REQUEST_LOGGING,
   !IS_PRODUCTION,
 );
+const MESSAGE_ENCRYPTION_STARTUP_BACKFILL_ENABLED = parseBooleanEnv(
+  process.env.MESSAGE_ENCRYPTION_STARTUP_BACKFILL_ENABLED,
+  !IS_PRODUCTION,
+);
 const BIND_HOST = String(
   process.env.BIND_HOST || (IS_PRODUCTION ? "127.0.0.1" : "0.0.0.0"),
 )
@@ -1337,9 +1341,13 @@ async function resolveChatActivityContext(user, chatId) {
       console.log(
         `🛡️ Security: trust_proxy=${TRUST_PROXY_HOPS}, enforce_https=${ENFORCE_HTTPS}`,
       );
-      void runMessageEncryptionBackfill({ logger: console }).catch((err) => {
-        console.error("message encryption backfill startup error:", err);
-      });
+      if (MESSAGE_ENCRYPTION_STARTUP_BACKFILL_ENABLED) {
+        void runMessageEncryptionBackfill({ logger: console }).catch((err) => {
+          console.error("message encryption backfill startup error:", err);
+        });
+      } else {
+        console.log("[message-encryption] startup backfill disabled");
+      }
       if (embeddedNotificationDigestEnabled) {
         setInterval(() => {
           void runNotificationDigestSweep().catch((err) => {
