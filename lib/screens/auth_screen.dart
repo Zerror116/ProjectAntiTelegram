@@ -1094,9 +1094,13 @@ class _AuthScreenState extends State<AuthScreen> {
 
   Future<String?> _requestRegistrationEmailVerification(String email) async {
     Future<void> sendCode({bool resent = false}) async {
+      final tenantCode = await _currentTenantCodeForAuthRequest();
       final resp = await _authService.dio.post(
         '/api/auth/register/email-code/request',
-        data: {'email': email},
+        data: {
+          'email': email,
+          if (tenantCode.isNotEmpty) 'tenant_code': tenantCode,
+        },
       );
       if (!mounted) return;
       showAppNotice(
@@ -1262,12 +1266,22 @@ class _AuthScreenState extends State<AuthScreen> {
     super.dispose();
   }
 
+  Future<String> _currentTenantCodeForAuthRequest() async {
+    final tenantFromLink = _normalizeTenantCode(_tenantCodeFromLink);
+    if (tenantFromLink.isNotEmpty) return tenantFromLink;
+    return _normalizeTenantCode((await _authService.getTenantCode()) ?? '');
+  }
+
   /// Проверяем занятость email на сервере
   Future<bool> _checkEmailExists(String email) async {
     try {
+      final tenantCode = await _currentTenantCodeForAuthRequest();
       final resp = await _authService.dio.post(
         '/api/auth/check_email',
-        data: {'email': email},
+        data: {
+          'email': email,
+          if (tenantCode.isNotEmpty) 'tenant_code': tenantCode,
+        },
       );
       // ожидаем { exists: true/false } или {exists:1/0}
       final data = resp.data;
@@ -1403,11 +1417,23 @@ class _AuthScreenState extends State<AuthScreen> {
       } else if (status == 401) {
         friendly = 'Неверный email, пароль или код подтверждения';
       } else if (status == 403) {
-        final serverMessage =
-            (bodyMap?['error'] ?? bodyMap?['message'])?.toString().trim();
+        final serverMessage = (bodyMap?['error'] ?? bodyMap?['message'])
+            ?.toString()
+            .trim();
         friendly = serverMessage == null || serverMessage.isEmpty
             ? 'Нет доступа к аккаунту'
             : serverMessage;
+      } else if (status == 409 && _isRegister) {
+        final serverMessage = (bodyMap?['error'] ?? bodyMap?['message'])
+            ?.toString()
+            .trim();
+        _isRegister = false;
+        _requiresTwoFactor = false;
+        _trustDeviceFor30Days = true;
+        _otpController.clear();
+        friendly = serverMessage == null || serverMessage.isEmpty
+            ? 'Аккаунт уже зарегистрирован. Введите пароль и нажмите «Войти».'
+            : '$serverMessage. Я переключил экран на вход.';
       } else if (e.type == DioExceptionType.connectionTimeout ||
           e.type == DioExceptionType.sendTimeout ||
           e.type == DioExceptionType.receiveTimeout) {

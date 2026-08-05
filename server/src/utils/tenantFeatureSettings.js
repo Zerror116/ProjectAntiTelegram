@@ -18,7 +18,7 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   group_rules_text: "",
   client_group_switcher_enabled: true,
   qr_existing_client_join_enabled: true,
-  phone_access_approval_enabled: true,
+  phone_access_approval_enabled: false,
   tenant_operations_menu_enabled: false,
   dangerous_action_audit_enabled: true,
   product_change_history_enabled: false,
@@ -64,7 +64,7 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
   client: Object.freeze({
     group_switcher_enabled: true,
     qr_existing_client_join_enabled: true,
-    phone_access_approval_enabled: true,
+    phone_access_approval_enabled: false,
   }),
   tenant_console: Object.freeze({
     operations_menu_enabled: false,

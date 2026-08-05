@@ -48,7 +48,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   bool _tenantDefectStatsEnabled = false;
   bool _tenantClientGroupSwitcherEnabled = true;
   bool _tenantQrExistingClientJoinEnabled = true;
-  bool _tenantPhoneAccessApprovalEnabled = true;
+  bool _tenantPhoneAccessApprovalEnabled = false;
   bool _tenantOperationsMenuEnabled = false;
   bool _tenantDangerousActionAuditEnabled = true;
   bool _tenantProductChangeHistoryEnabled = false;
@@ -239,7 +239,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     required bool defectStatsEnabled,
     bool clientGroupSwitcherEnabled = true,
     bool qrExistingClientJoinEnabled = true,
-    bool phoneAccessApprovalEnabled = true,
+    bool phoneAccessApprovalEnabled = false,
     bool tenantOperationsMenuEnabled = false,
     bool dangerousActionAuditEnabled = true,
     bool productChangeHistoryEnabled = false,
@@ -399,7 +399,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantDefectStatsEnabled = false;
     _tenantClientGroupSwitcherEnabled = true;
     _tenantQrExistingClientJoinEnabled = true;
-    _tenantPhoneAccessApprovalEnabled = true;
+    _tenantPhoneAccessApprovalEnabled = false;
     _tenantOperationsMenuEnabled = false;
     _tenantDangerousActionAuditEnabled = true;
     _tenantProductChangeHistoryEnabled = false;
@@ -992,7 +992,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     var phoneAccessApprovalEnabled = _toBoolValueOr(
       client['phone_access_approval_enabled'] ??
           initialSettings['phone_access_approval_enabled'],
-      true,
+      false,
     );
     var tenantOperationsMenuEnabled = _toBoolValue(
       tenantConsole['operations_menu_enabled'] ??

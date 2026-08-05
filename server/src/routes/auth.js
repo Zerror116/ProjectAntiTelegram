@@ -375,6 +375,24 @@ function extractTenantCodeHint(req) {
   return '';
 }
 
+function authIdentifierHash(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+  return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+}
+
+function logAuthDenied({ scope, email, tenantCode, status, reason }) {
+  try {
+    console.warn('auth.denied', {
+      scope: String(scope || '').trim() || 'unknown',
+      email_hash: authIdentifierHash(email),
+      tenant_code: String(tenantCode || '').trim() || null,
+      status: Number(status) || 0,
+      reason: String(reason || '').trim() || 'unknown',
+    });
+  } catch (_) {}
+}
+
 function buildInviteLink(req, inviteCode, tenantCode = '') {
   const base = String(process.env.INVITE_LINK_BASE || '').trim();
   const encodedInvite = encodeURIComponent(String(inviteCode || '').trim());
@@ -1965,14 +1983,42 @@ router.post('/check_email', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email' });
     }
 
+    const normalizedLower = normalizedEmail.toLowerCase();
     const tenantCodeHint = extractTenantCodeHint(req);
-    const existing = tenantCodeHint
-      ? await db.runWithTenantCode(
-          tenantCodeHint,
-          () => db.query('SELECT 1 FROM users WHERE email = $1', [normalizedEmail]),
-        )
-      : await db.platformQuery('SELECT 1 FROM users WHERE email = $1', [normalizedEmail]);
-    return res.json({ exists: existing.rowCount > 0 });
+    if (tenantCodeHint) {
+      const existing = await db.runWithTenantCode(
+        tenantCodeHint,
+        () =>
+          db.query('SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1', [
+            normalizedLower,
+          ]),
+      );
+      return res.json({ exists: existing.rowCount > 0 });
+    }
+
+    const platformExisting = await db.platformQuery(
+      'SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1',
+      [normalizedLower],
+    );
+    if (platformExisting.rowCount > 0) {
+      return res.json({ exists: true });
+    }
+
+    try {
+      const indexedExisting = await db.platformQuery(
+        `SELECT 1
+         FROM tenant_user_index
+         WHERE lower(email) = $1
+           AND is_active = true
+         LIMIT 1`,
+        [normalizedLower],
+      );
+      return res.json({ exists: indexedExisting.rowCount > 0 });
+    } catch (indexErr) {
+      if (String(indexErr?.code || '') !== '42P01') throw indexErr;
+    }
+
+    return res.json({ exists: false });
   } catch (err) {
     if (String(err?.code || '') === 'TENANT_NOT_FOUND') {
       return res.status(404).json({ exists: false, error: 'Арендатор не найден' });
@@ -2018,11 +2064,41 @@ router.post('/register/email-code/request', async (req, res) => {
       return res.status(400).json({ error: 'Введите корректный email' });
     }
 
-    const existing = await db.platformQuery(
-      'SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1',
-      [normalizedEmail],
-    );
-    if (existing.rowCount > 0) {
+    const normalizedLower = normalizedEmail.toLowerCase();
+    const tenantCodeHint = extractTenantCodeHint(req);
+    let emailAlreadyExists = false;
+    if (tenantCodeHint) {
+      const existing = await db.runWithTenantCode(
+        tenantCodeHint,
+        () =>
+          db.query('SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1', [
+            normalizedLower,
+          ]),
+      );
+      emailAlreadyExists = existing.rowCount > 0;
+    } else {
+      const existing = await db.platformQuery(
+        'SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1',
+        [normalizedLower],
+      );
+      emailAlreadyExists = existing.rowCount > 0;
+      if (!emailAlreadyExists) {
+        try {
+          const indexedExisting = await db.platformQuery(
+            `SELECT 1
+             FROM tenant_user_index
+             WHERE lower(email) = $1
+               AND is_active = true
+             LIMIT 1`,
+            [normalizedLower],
+          );
+          emailAlreadyExists = indexedExisting.rowCount > 0;
+        } catch (indexErr) {
+          if (String(indexErr?.code || '') !== '42P01') throw indexErr;
+        }
+      }
+    }
+    if (emailAlreadyExists) {
       return res.status(409).json({ error: 'Email уже занят' });
     }
 
@@ -3063,6 +3139,13 @@ router.post('/login', async (req, res) => {
       }
 
       if (!tenant) {
+        logAuthDenied({
+          scope: 'login',
+          email: normalizedEmail,
+          tenantCode: '',
+          status: 400,
+          reason: 'tenant_not_resolved',
+        });
         return res.status(400).json({
           error:
             'Не определен арендатор. Войдите по приглашению вашей группы или укажите код арендатора.',
@@ -3089,13 +3172,23 @@ router.post('/login', async (req, res) => {
         const user = userRes.rows[0];
         if (!user) {
           await client.query('ROLLBACK');
-          return { ok: false, status: 401, error: 'Неверные данные' };
+          return {
+            ok: false,
+            status: 401,
+            error: 'Неверные данные',
+            reason: 'user_not_found',
+          };
         }
 
         const ok = await bcrypt.compare(password, String(user.password_hash || ''));
         if (!ok) {
           await client.query('ROLLBACK');
-          return { ok: false, status: 401, error: 'Неверные данные' };
+          return {
+            ok: false,
+            status: 401,
+            error: 'Неверные данные',
+            reason: 'password_mismatch',
+          };
         }
         if (user.is_active === false) {
           await client.query('ROLLBACK');
@@ -3104,6 +3197,7 @@ router.post('/login', async (req, res) => {
             ok: false,
             status: 403,
             error: blockReason || 'Вас заблокировали за нарушение правил',
+            reason: 'inactive_user',
           };
         }
 
@@ -3127,6 +3221,7 @@ router.post('/login', async (req, res) => {
               ok: false,
               status: 403,
               error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
+              reason: 'user_without_tenant',
             };
           }
           const userRole = String(user.role || '').toLowerCase().trim();
@@ -3146,6 +3241,7 @@ router.post('/login', async (req, res) => {
                 ok: false,
                 status: tenantState.reason === 'tenant_expired' ? 402 : 403,
                 error: tenantState.error,
+                reason: tenantState.reason || 'tenant_unavailable',
               };
             }
           }
@@ -3168,6 +3264,7 @@ router.post('/login', async (req, res) => {
               ok: false,
               status: 403,
               error: '2FA включена, но ключ недоступен. Обратитесь к создателю приложения.',
+              reason: 'two_factor_secret_unavailable',
             };
           }
 
@@ -3205,6 +3302,7 @@ router.post('/login', async (req, res) => {
                 status: 401,
                 error: 'Требуется код 2FA (Google Authenticator или резервный код)',
                 twoFactorRequired: true,
+                reason: 'two_factor_required',
               };
             }
           }
@@ -3286,6 +3384,13 @@ router.post('/login', async (req, res) => {
       loginInScope,
     );
     if (!result?.ok) {
+      logAuthDenied({
+        scope: 'login',
+        email: normalizedEmail,
+        tenantCode: tenant?.code || '',
+        status: result?.status || 500,
+        reason: result?.reason || result?.error || 'unknown',
+      });
       const payload = {
         error: result?.error || 'Internal server error',
       };
