@@ -51,7 +51,8 @@ async function loadTenantUsers(tenant) {
     const allowLegacyNullTenantRows =
       db.isIsolatedTenantRow(tenant) || db.isSchemaIsolatedTenantRow(tenant);
     const q = await db.query(
-      `SELECT id,
+      `SELECT DISTINCT ON (lower(email))
+              id,
               lower(email) AS email,
               lower(trim(COALESCE(role, 'client'))) AS role,
               COALESCE(is_active, true) AS is_active,
@@ -62,7 +63,10 @@ async function loadTenantUsers(tenant) {
            tenant_id = $1::uuid
            OR ($2::boolean = true AND tenant_id IS NULL)
          )
-       ORDER BY created_at ASC, id ASC`,
+       ORDER BY lower(email),
+                COALESCE(is_active, true) DESC,
+                created_at DESC,
+                id ASC`,
       [tenantId, allowLegacyNullTenantRows],
     );
     return q.rows || [];
@@ -73,51 +77,54 @@ async function syncTenant(tenant, { prune = true } = {}) {
   const tenantId = String(tenant?.id || "").trim();
   const users = await loadTenantUsers(tenant);
   let upserted = 0;
-  for (const user of users) {
-    const userId = String(user?.id || "").trim();
-    const email = String(user?.email || "").trim().toLowerCase();
-    if (!tenantId || !userId || !email) continue;
-    const role = String(user?.role || "client").trim().toLowerCase() || "client";
-    await db.platformQuery(
-      `INSERT INTO tenant_user_index (
-         tenant_id,
-         user_id,
-         email,
-         role,
-         is_active,
-         created_at,
-         updated_at
-       )
-       VALUES ($1::uuid, $2::uuid, $3, $4, $5, COALESCE($6::timestamptz, now()), now())
-       ON CONFLICT (tenant_id, user_id)
-       DO UPDATE SET email = EXCLUDED.email,
-                     role = EXCLUDED.role,
-                     is_active = EXCLUDED.is_active,
-                     updated_at = now()`,
-      [
-        tenantId,
-        userId,
-        email,
-        role,
-        user.is_active === true,
-        user.created_at || null,
-      ],
-    );
-    upserted += 1;
-  }
-
+  const client = await db.platformConnect();
   let pruned = 0;
-  if (prune) {
-    const ids = users
-      .map((user) => String(user?.id || "").trim())
-      .filter(Boolean);
-    const pruneQ = await db.platformQuery(
-      `DELETE FROM tenant_user_index
-       WHERE tenant_id = $1::uuid
-         AND NOT (user_id = ANY($2::uuid[]))`,
-      [tenantId, ids],
-    );
-    pruned = pruneQ.rowCount || 0;
+  try {
+    await client.query("BEGIN");
+    if (prune) {
+      const pruneQ = await client.query(
+        `DELETE FROM tenant_user_index
+         WHERE tenant_id = $1::uuid`,
+        [tenantId],
+      );
+      pruned = pruneQ.rowCount || 0;
+    }
+    for (const user of users) {
+      const userId = String(user?.id || "").trim();
+      const email = String(user?.email || "").trim().toLowerCase();
+      if (!tenantId || !userId || !email) continue;
+      const role =
+        String(user?.role || "client").trim().toLowerCase() || "client";
+      await client.query(
+        `INSERT INTO tenant_user_index (
+           tenant_id,
+           user_id,
+           email,
+           role,
+           is_active,
+           created_at,
+           updated_at
+         )
+         VALUES ($1::uuid, $2::uuid, $3, $4, $5, COALESCE($6::timestamptz, now()), now())`,
+        [
+          tenantId,
+          userId,
+          email,
+          role,
+          user.is_active === true,
+          user.created_at || null,
+        ],
+      );
+      upserted += 1;
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {}
+    throw err;
+  } finally {
+    client.release();
   }
 
   return {
