@@ -16,6 +16,7 @@ RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
 HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
 APK_DEFAULT_FILE_NAME="${APK_DEFAULT_FILE_NAME:-}"
 APK_SOURCE="${APK_SOURCE:-}"
+UPLOAD_APK="${UPLOAD_APK:-1}"
 SKIP_BUILD="0"
 NO_COMMIT="0"
 APP_VERSION_NAME=""
@@ -45,6 +46,7 @@ Important env vars:
   BRANCH=master
   REMOTE_SERVICE=auto              # or explicit, e.g. fenix-api.service
   RUN_ANALYZE=1                    # set 0 to skip flutter analyze
+  UPLOAD_APK=1                     # set 0 to skip APK upload when APK did not change
   APK_DEFAULT_FILE_NAME=fenix-<app-version>.apk
   APK_SOURCE=build/app/outputs/flutter-apk/app-release.apk
 
@@ -264,7 +266,9 @@ install_static_web_extras
 normalize_web_build_permissions
 
 APK_SOURCE_RESOLVED=""
-if APK_SOURCE_RESOLVED="$(detect_apk_source)"; then
+if [[ "$UPLOAD_APK" != "1" ]]; then
+  echo "[deploy_full] UPLOAD_APK=$UPLOAD_APK: skip APK upload"
+elif APK_SOURCE_RESOLVED="$(detect_apk_source)"; then
   echo "[deploy_full] found APK: $APK_SOURCE_RESOLVED"
 else
   echo "[deploy_full] APK not found locally, skip APK upload"
@@ -348,21 +352,27 @@ fi
 SERVICE="$REMOTE_SERVICE"
 if [[ "$SERVICE" == "auto" ]]; then
   SERVICE=""
-  PID=$(ss -ltnp 2>/dev/null | awk -F'"'"'pid='"'"' '/:3000/{split($2,a,",");print a[1]; exit}')
-  if [[ -n "$PID" && -r "/proc/$PID/cgroup" ]]; then
-    SERVICE=$(grep -aoE '"'"'[^/]+\.service'"'"' "/proc/$PID/cgroup" | head -n1 || true)
-  fi
+  for CANDIDATE in fenix-server.service projectphoenix.service; do
+    if systemctl cat "$CANDIDATE" >/dev/null 2>&1; then
+      SERVICE="$CANDIDATE"
+      break
+    fi
+  done
   if [[ -z "$SERVICE" ]]; then
-    for CANDIDATE in fenix-server.service projectphoenix.service; do
-      if systemctl list-unit-files --type=service | awk '{print $1}' | grep -Fxq "$CANDIDATE"; then
+    PID=$(ss -ltnp 2>/dev/null | awk -F'"'"'pid='"'"' '/:3000/{split($2,a,",");print a[1]; exit}')
+    if [[ -n "$PID" && -r "/proc/$PID/cgroup" ]]; then
+      CANDIDATE=$(grep -aoE '[^/]+\.service' "/proc/$PID/cgroup" | head -n1 || true)
+      if [[ -n "$CANDIDATE" ]] && systemctl cat "$CANDIDATE" >/dev/null 2>&1; then
         SERVICE="$CANDIDATE"
-        break
       fi
-    done
+    fi
   fi
+elif [[ "$SERVICE" != "manual" ]] && ! systemctl cat "$SERVICE" >/dev/null 2>&1; then
+  echo "[deploy_full][server] ERROR: requested backend service not found: $SERVICE"
+  exit 1
 fi
 
-if [[ -n "$SERVICE" ]]; then
+if [[ -n "$SERVICE" && "$SERVICE" != "manual" ]]; then
   mapfile -t PORT_3000_PIDS < <(
     ss -ltnp 2>/dev/null | grep ':3000' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
   )
@@ -378,12 +388,27 @@ if [[ -n "$SERVICE" ]]; then
     echo "[deploy_full][server] stopping stale process on :3000 pid=$PID service=${OWNER_SERVICE:-none}"
     kill -TERM "$PID" || true
   done
-  sleep 1
+  sleep 2
+  for PID in "${PORT_3000_PIDS[@]:-}"; do
+    [[ -z "$PID" ]] && continue
+    if kill -0 "$PID" 2>/dev/null; then
+      echo "[deploy_full][server] force stopping stale process on :3000 pid=$PID"
+      kill -KILL "$PID" || true
+    fi
+  done
   systemctl daemon-reload || true
   systemctl restart "$SERVICE"
   systemctl is-active "$SERVICE"
+  if systemctl cat fenix-worker.service >/dev/null 2>&1; then
+    systemctl restart fenix-worker.service
+    systemctl is-active fenix-worker.service
+  fi
 else
-  echo "[deploy_full][server] WARNING: backend service not detected. Fallback to manual node restart."
+  if [[ "$SERVICE" != "manual" ]]; then
+    echo "[deploy_full][server] ERROR: backend service not detected. Refusing manual production restart."
+    exit 1
+  fi
+  echo "[deploy_full][server] WARNING: REMOTE_SERVICE=manual, using manual node restart."
   if [[ -d "$REMOTE_PROJECT_DIR/server" ]] && command -v npm >/dev/null 2>&1; then
     cd "$REMOTE_PROJECT_DIR/server"
     pkill -f "node src/index.js" || true
