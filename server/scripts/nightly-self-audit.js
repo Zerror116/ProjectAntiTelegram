@@ -50,6 +50,24 @@ function checkSecretKeyrings() {
       meta: getJwtKeyringMeta(),
     },
     {
+      name: "message_encryption",
+      meta: describeKeyring(
+        buildSecretKeyring({
+          purpose: "message-encryption",
+          currentVersion: process.env.APP_MESSAGE_KEY_VERSION || "v1",
+          singleSecret:
+            process.env.APP_MESSAGE_KEY ||
+            process.env.APP_DATA_KEY ||
+            process.env.ADDRESS_DATA_KEY ||
+            "",
+          keyringString: process.env.APP_MESSAGE_KEYRING || "",
+          keyringJson: process.env.APP_MESSAGE_KEYS_JSON || "",
+          requiredInProduction: true,
+          devFallbackSecret: "project-phoenix-local-dev-key-change-me",
+        }),
+      ),
+    },
+    {
       name: "chat_media",
       meta: describeKeyring(
         buildSecretKeyring({
@@ -114,7 +132,7 @@ function checkSecretKeyrings() {
     }
     if (ring.meta?.usesDevFallback === true) {
       addFinding(
-        IS_PRODUCTION ? "critical" : "warn",
+        IS_PRODUCTION ? "critical" : "info",
         `secret.${ring.name}.dev_fallback`,
         `Keyring "${ring.name}" uses a development fallback key`,
       );

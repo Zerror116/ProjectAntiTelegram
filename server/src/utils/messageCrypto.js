@@ -40,7 +40,7 @@ function parseKeyringString(raw) {
   const source = String(raw || "").trim();
   if (!source) return {};
   const out = {};
-  for (const chunk of source.split(",")) {
+  for (const chunk of source.split(/[,\n;]/)) {
     const pair = chunk.trim();
     if (!pair) continue;
     const sep = pair.indexOf(":");
