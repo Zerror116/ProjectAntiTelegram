@@ -3226,9 +3226,10 @@ router.post('/login', async (req, res) => {
 
     const isPlatformCreator = normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase();
     let tenant = null;
+    let tenantCodeHint = '';
 
     if (!isPlatformCreator) {
-      const tenantCodeHint = extractTenantCodeHint(req);
+      tenantCodeHint = extractTenantCodeHint(req);
       if (tenantCodeHint) {
         tenant = await db.resolveTenantByCode(tenantCodeHint);
       } else {
@@ -3529,10 +3530,24 @@ router.post('/login', async (req, res) => {
       }
     };
 
-    const result = await db.runWithTenantRow(
+    let result = await db.runWithTenantRow(
       isPlatformCreator ? null : tenant,
       loginInScope,
     );
+    if (
+      !isPlatformCreator &&
+      !result?.ok &&
+      result?.reason === 'user_not_found' &&
+      tenantCodeHint
+    ) {
+      const fallbackTenant = await resolveTenantByUserEmail(normalizedEmail);
+      const fallbackTenantId = String(fallbackTenant?.id || '').trim();
+      const currentTenantId = String(tenant?.id || '').trim();
+      if (fallbackTenantId && fallbackTenantId !== currentTenantId) {
+        tenant = fallbackTenant;
+        result = await db.runWithTenantRow(tenant, loginInScope);
+      }
+    }
     if (!result?.ok) {
       logAuthDenied({
         scope: 'login',
