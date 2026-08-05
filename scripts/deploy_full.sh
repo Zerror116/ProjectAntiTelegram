@@ -303,6 +303,30 @@ run_ssh "$SERVER" \
   'bash -s' <<'REMOTE_SCRIPT'
 set -euo pipefail
 
+restore_env_file_permissions_for_service() {
+  local service="$1"
+  local env_file="$REMOTE_PROJECT_DIR/server/.env"
+  [[ -f "$env_file" ]] || return 0
+
+  local service_user=""
+  local service_group=""
+  if [[ -n "$service" && "$service" != "manual" ]] && systemctl cat "$service" >/dev/null 2>&1; then
+    service_user="$(systemctl show -p User --value "$service" 2>/dev/null || true)"
+    service_group="$(systemctl show -p Group --value "$service" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$service_user" && "$service_user" != "root" ]]; then
+    if [[ -n "$service_group" ]]; then
+      chown "$service_user:$service_group" "$env_file"
+    else
+      chown "$service_user" "$env_file"
+    fi
+    chmod 600 "$env_file"
+  else
+    chmod 600 "$env_file"
+  fi
+}
+
 cd "$REMOTE_PROJECT_DIR"
 if [[ -n "$(git status --porcelain)" ]]; then
   STASH_NAME="autostash-before-deploy-$(date +%F-%H%M%S)"
@@ -407,6 +431,7 @@ if [[ -n "$SERVICE" && "$SERVICE" != "manual" ]]; then
       kill -KILL "$PID" || true
     fi
   done
+  restore_env_file_permissions_for_service "$SERVICE"
   systemctl daemon-reload || true
   systemctl restart "$SERVICE"
   systemctl is-active "$SERVICE"
