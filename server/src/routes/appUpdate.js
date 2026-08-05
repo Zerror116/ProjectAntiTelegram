@@ -176,8 +176,7 @@ function resolveManagedDownloadUrl(rawUrl, { routePath, defaultFile }) {
 function resolveAndroidDownloadUrl(rawUrl) {
   return resolveManagedDownloadUrl(rawUrl, {
     routePath: '/api/app/update/android/apk',
-    defaultFile:
-      process.env.APP_UPDATE_ANDROID_DEFAULT_FILE || 'fenix-1.0.1.apk',
+    defaultFile: resolveAndroidDefaultFileName(),
   });
 }
 
@@ -297,6 +296,10 @@ function resolveAndroidPackageName() {
     cleanString(process.env.APP_UPDATE_ANDROID_PACKAGE_NAME) ||
     'com.garphoenix.projectphoenix'
   );
+}
+
+function resolveAndroidDefaultFileName() {
+  return toSafeDownloadFileName(process.env.APP_UPDATE_ANDROID_DEFAULT_FILE);
 }
 
 function resolveAndroidManagedManifestMinBuild() {
@@ -423,9 +426,7 @@ async function getDownloadFileMetadata(absolutePath) {
 }
 
 function resolveEnvAndroidDownloadAbsolutePath() {
-  const fallbackFile = toSafeDownloadFileName(
-    process.env.APP_UPDATE_ANDROID_DEFAULT_FILE || 'fenix-1.0.1.apk',
-  );
+  const fallbackFile = resolveAndroidDefaultFileName();
   if (!fallbackFile) return null;
   return resolveDownloadAbsolutePath(fallbackFile);
 }
@@ -748,9 +749,7 @@ async function sendAndroidApk(req, res) {
     metadata = releaseState.apkMetadata;
   } else {
     const requestedFile = toSafeDownloadFileName(req.query?.file || '');
-    const fallbackFile = toSafeDownloadFileName(
-      process.env.APP_UPDATE_ANDROID_DEFAULT_FILE || 'fenix-1.0.1.apk',
-    );
+    const fallbackFile = resolveAndroidDefaultFileName();
     const targetFile = requestedFile || fallbackFile;
     absolute = resolveDownloadAbsolutePath(targetFile);
     if (!absolute) {

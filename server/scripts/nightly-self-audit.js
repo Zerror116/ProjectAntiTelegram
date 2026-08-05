@@ -10,6 +10,10 @@ const {
 } = require("../src/utils/secretKeyring");
 const { getJwtKeyringMeta } = require("../src/utils/jwt");
 const { logReleaseCheck } = require("../src/utils/monitoring");
+const { downloadsRoot } = require("../src/utils/storagePaths");
+const {
+  ANDROID_STABLE_RELEASE_FILE,
+} = require("../src/utils/androidStableRelease");
 
 const NODE_ENV = String(process.env.NODE_ENV || "development")
   .toLowerCase()
@@ -425,6 +429,133 @@ function checkBackupFreshness() {
   }
 }
 
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (err) {
+    return { __parse_error: String(err?.message || err) };
+  }
+}
+
+function toSafeFileName(rawValue) {
+  const candidate = String(rawValue || "").trim();
+  if (!candidate) return "";
+  const safeName = path.basename(candidate);
+  if (!safeName || safeName === "." || safeName === "..") return "";
+  return safeName;
+}
+
+function checkAndroidReleaseConfig() {
+  try {
+    const releasePath = path.join(downloadsRoot, ANDROID_STABLE_RELEASE_FILE);
+    if (fs.existsSync(releasePath)) {
+      const parsed = readJsonFile(releasePath);
+      if (parsed.__parse_error) {
+        addFinding(
+          "warn",
+          "android.release.invalid_json",
+          "Android stable release JSON is invalid",
+          {
+            release_file: releasePath,
+            error: parsed.__parse_error.slice(0, 300),
+          },
+        );
+        return;
+      }
+
+      const apkFile = toSafeFileName(parsed.apk_file);
+      const version = String(parsed.version || "").trim();
+      const build = Number.parseInt(String(parsed.build || "").trim(), 10);
+      if (!apkFile || !version || !Number.isFinite(build) || build <= 0) {
+        addFinding(
+          "warn",
+          "android.release.incomplete_json",
+          "Android stable release JSON is missing required fields",
+          {
+            release_file: releasePath,
+            has_apk_file: Boolean(apkFile),
+            has_version: Boolean(version),
+            build: Number.isFinite(build) ? build : null,
+          },
+        );
+        return;
+      }
+
+      const apkPath = path.join(downloadsRoot, apkFile);
+      if (!fs.existsSync(apkPath)) {
+        addFinding(
+          "warn",
+          "android.release.missing_apk",
+          "Android stable release APK from release JSON is missing",
+          {
+            release_file: releasePath,
+            apk_file: apkFile,
+          },
+        );
+        return;
+      }
+
+      const stat = fs.statSync(apkPath);
+      addFinding(
+        "info",
+        "android.release.ok",
+        `Android stable release is configured (${version}+${build})`,
+        {
+          release_file: releasePath,
+          apk_file: apkFile,
+          apk_size: stat.size,
+        },
+      );
+      return;
+    }
+
+    const defaultFile = toSafeFileName(process.env.APP_UPDATE_ANDROID_DEFAULT_FILE);
+    if (defaultFile) {
+      const defaultPath = path.join(downloadsRoot, defaultFile);
+      if (!fs.existsSync(defaultPath)) {
+        addFinding(
+          "warn",
+          "android.release.default_missing",
+          "APP_UPDATE_ANDROID_DEFAULT_FILE points to a missing APK",
+          { apk_file: defaultFile },
+        );
+        return;
+      }
+      addFinding(
+        "info",
+        "android.release.default_ok",
+        "Android default APK file is configured",
+        {
+          apk_file: defaultFile,
+          apk_size: fs.statSync(defaultPath).size,
+        },
+      );
+      return;
+    }
+
+    const androidUpdatesEnabled = parseBooleanEnv(
+      process.env.APP_UPDATE_ANDROID_ENABLED,
+      IS_PRODUCTION,
+    );
+    addFinding(
+      androidUpdatesEnabled ? "warn" : "info",
+      "android.release.not_configured",
+      androidUpdatesEnabled
+        ? "Android updates are enabled but no release JSON or default APK is configured"
+        : "Android release check skipped because updates are disabled",
+    );
+  } catch (err) {
+    addFinding(
+      "warn",
+      "android.release.check_failed",
+      "Android release configuration check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+      },
+    );
+  }
+}
+
 function buildMarkdownReport() {
   const now = new Date();
   const critical = findings.filter((f) => f.level === "critical").length;
@@ -485,6 +616,7 @@ async function main() {
   await checkMonitoringBacklog();
   await checkNotificationQueueHealth();
   checkBackupFreshness();
+  checkAndroidReleaseConfig();
 
   const summary = buildAuditSummary();
 
