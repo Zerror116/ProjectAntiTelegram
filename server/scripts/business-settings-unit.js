@@ -311,6 +311,24 @@ function testNightlyAuditChecksTenantMigrationDrift() {
   assert.match(source, /await checkTenantMigrationDrift\(\)/);
 }
 
+function testNightlyAuditChecksSchemaContractProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /const SHARED_SCHEMA_CONTRACT = \[/);
+  assert.match(source, /const PLATFORM_SCHEMA_CONTRACT = \[/);
+  assert.match(source, /async function checkDatabaseSchemaContract/);
+  assert.match(source, /schema\.contract_drift/);
+  assert.match(source, /schema\.contract_healthy/);
+  assert.match(source, /information_schema\.columns/);
+  assert.match(source, /missing_contract_items/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /normalizePgSchema\(tenant\?\.db_schema/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkDatabaseSchemaContract\(\)/);
+}
+
 function testNightlyAuditChecksTenantUserIndexDrift() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -889,6 +907,7 @@ testNightlyAuditChecksTenantFeaturePolicy();
 testNightlyAuditChecksNotificationQueueAcrossTenantScopes();
 testNightlyAuditChecksMonitoringBacklogAcrossTenantScopes();
 testNightlyAuditChecksTenantMigrationDrift();
+testNightlyAuditChecksSchemaContractProjectWide();
 testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();

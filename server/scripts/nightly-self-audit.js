@@ -72,6 +72,175 @@ function listExpectedMigrationFiles() {
     .sort();
 }
 
+const SHARED_SCHEMA_CONTRACT = [
+  {
+    table: "users",
+    columns: [
+      "id",
+      "email",
+      "password_hash",
+      "role",
+      "is_active",
+      "tenant_id",
+      "created_at",
+    ],
+  },
+  {
+    table: "phones",
+    columns: ["id", "user_id", "phone", "status", "created_at"],
+  },
+  {
+    table: "user_sessions",
+    columns: [
+      "id",
+      "user_id",
+      "session_public_id",
+      "refresh_token_hash",
+      "is_active",
+      "expires_at",
+    ],
+  },
+  {
+    table: "notification_endpoints",
+    columns: ["id", "tenant_id", "user_id", "platform", "transport", "is_active"],
+  },
+  {
+    table: "chats",
+    columns: ["id", "tenant_id", "title", "type", "settings", "updated_at"],
+  },
+  {
+    table: "chat_members",
+    columns: ["id", "chat_id", "user_id", "joined_at"],
+  },
+  {
+    table: "messages",
+    columns: ["id", "chat_id", "sender_id", "text", "meta", "created_at"],
+  },
+  {
+    table: "products",
+    columns: [
+      "id",
+      "title",
+      "description",
+      "price",
+      "quantity",
+      "image_url",
+      "status",
+      "manual_shelf_label",
+      "shelf_floor",
+      "pickup_only",
+      "is_bulky",
+      "deleted_at",
+    ],
+  },
+  {
+    table: "product_publication_queue",
+    columns: [
+      "id",
+      "product_id",
+      "channel_id",
+      "status",
+      "is_sent",
+      "publish_batch_id",
+      "publish_status",
+      "publish_started_at",
+      "publish_finished_at",
+      "pickup_only",
+      "is_bulky",
+    ],
+  },
+  {
+    table: "channel_publication_batches",
+    columns: [
+      "id",
+      "channel_id",
+      "status",
+      "total_count",
+      "published_count",
+      "failed_count",
+      "next_publish_at",
+      "updated_at",
+    ],
+  },
+  {
+    table: "cart_items",
+    columns: ["id", "user_id", "product_id", "quantity", "status", "updated_at"],
+  },
+  {
+    table: "reservations",
+    columns: [
+      "id",
+      "user_id",
+      "product_id",
+      "cart_item_id",
+      "quantity",
+      "is_fulfilled",
+      "is_sent",
+    ],
+  },
+  {
+    table: "delivery_batches",
+    columns: ["id", "delivery_date", "status", "threshold_amount", "updated_at"],
+  },
+  {
+    table: "delivery_batch_customers",
+    columns: [
+      "id",
+      "batch_id",
+      "user_id",
+      "processed_sum",
+      "delivery_status",
+      "assembly_status",
+    ],
+  },
+  {
+    table: "delivery_batch_items",
+    columns: [
+      "id",
+      "batch_id",
+      "batch_customer_id",
+      "cart_item_id",
+      "user_id",
+      "product_id",
+      "quantity",
+      "assembly_status",
+      "is_bulky",
+    ],
+  },
+  {
+    table: "tenant_feature_settings",
+    columns: ["tenant_id", "settings", "updated_at"],
+  },
+];
+
+const PLATFORM_SCHEMA_CONTRACT = [
+  {
+    table: "tenants",
+    columns: [
+      "id",
+      "code",
+      "name",
+      "status",
+      "subscription_expires_at",
+      "db_mode",
+      "db_url",
+      "db_schema",
+      "is_deleted",
+    ],
+  },
+  {
+    table: "tenant_user_index",
+    columns: [
+      "tenant_id",
+      "user_id",
+      "email",
+      "role",
+      "is_active",
+      "updated_at",
+    ],
+  },
+];
+
 async function readAppliedMigrationFiles(pool, schemaName = "public") {
   const normalizedSchema = normalizePgSchema(schemaName) || "public";
   const tableRef = `${quotePgIdentifier(normalizedSchema)}.schema_migrations`;
@@ -1300,6 +1469,201 @@ async function checkTenantMigrationDrift() {
   }
 }
 
+async function checkDatabaseSchemaContract() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    required_columns_checked: 0,
+    missing_tables: 0,
+    missing_columns: 0,
+    targets_with_schema_drift: 0,
+    missing_contract_items: [],
+  };
+  const missingItems = new Set();
+
+  async function readTargetStats(contracts, schemaName) {
+    return await db.query(
+      `WITH required AS (
+         SELECT lower(entry->>'table') AS table_name,
+                lower(column_name) AS column_name
+           FROM jsonb_array_elements($1::jsonb) AS entry
+           CROSS JOIN LATERAL jsonb_array_elements_text(entry->'columns') AS column_name
+       ),
+       required_tables AS (
+         SELECT DISTINCT table_name
+           FROM required
+       ),
+       present_tables AS (
+         SELECT lower(table_name) AS table_name
+           FROM information_schema.tables
+          WHERE table_schema = $2
+            AND table_type = 'BASE TABLE'
+       ),
+       present_columns AS (
+         SELECT lower(table_name) AS table_name,
+                lower(column_name) AS column_name
+           FROM information_schema.columns
+          WHERE table_schema = $2
+       ),
+       table_drift AS (
+         SELECT rt.table_name
+           FROM required_tables rt
+           LEFT JOIN present_tables pt ON pt.table_name = rt.table_name
+          WHERE pt.table_name IS NULL
+       ),
+       column_drift AS (
+         SELECT r.table_name,
+                r.column_name
+           FROM required r
+           JOIN present_tables pt ON pt.table_name = r.table_name
+           LEFT JOIN present_columns pc
+             ON pc.table_name = r.table_name
+            AND pc.column_name = r.column_name
+          WHERE pc.column_name IS NULL
+       ),
+       missing_items AS (
+         SELECT table_name AS item
+           FROM table_drift
+         UNION
+         SELECT table_name || '.' || column_name AS item
+           FROM column_drift
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM required) AS required_columns_checked,
+         (SELECT COUNT(*)::int FROM table_drift) AS missing_tables,
+         (SELECT COUNT(*)::int FROM column_drift) AS missing_columns,
+         ARRAY(
+           SELECT item
+             FROM missing_items
+            ORDER BY item
+            LIMIT 30
+         ) AS missing_contract_items`,
+      [JSON.stringify(contracts), schemaName],
+    );
+  }
+
+  async function inspectTarget({ mode, schemaName, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    const contracts =
+      mode === "platform"
+        ? SHARED_SCHEMA_CONTRACT.concat(PLATFORM_SCHEMA_CONTRACT)
+        : SHARED_SCHEMA_CONTRACT;
+
+    try {
+      const q = await run(() => readTargetStats(contracts, schemaName));
+      const row = q.rows?.[0] || {};
+      const missingTables = Number(row.missing_tables || 0) || 0;
+      const missingColumns = Number(row.missing_columns || 0) || 0;
+      totals.required_columns_checked +=
+        Number(row.required_columns_checked || 0) || 0;
+      totals.missing_tables += missingTables;
+      totals.missing_columns += missingColumns;
+      if (missingTables > 0 || missingColumns > 0) {
+        totals.targets_with_schema_drift += 1;
+      }
+      for (const item of row.missing_contract_items || []) {
+        if (item) missingItems.add(String(item));
+      }
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      schemaName: "public",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (mode === "schema_isolated") {
+        const schemaName = normalizePgSchema(tenant?.db_schema || "");
+        if (!schemaName) {
+          totals.targets_checked += 1;
+          totals.schema_isolated_targets += 1;
+          totals.unavailable_targets += 1;
+          continue;
+        }
+        await inspectTarget({
+          mode,
+          schemaName,
+          run: (fn) => db.runWithTenantRow(tenant, fn),
+        });
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        schemaName: "public",
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    totals.missing_contract_items = Array.from(missingItems).sort().slice(0, 30);
+    const driftCount =
+      totals.unavailable_targets +
+      totals.missing_tables +
+      totals.missing_columns;
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "schema.contract_drift",
+        "One or more database targets are missing required runtime tables or columns",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "schema.contract_healthy",
+      "Required runtime tables and columns are present across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "schema.contract_check_failed",
+      "Database schema contract check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 async function loadExpectedTenantIndexUsers(tenant) {
   return await db.runWithTenantRow(tenant, async () => {
     const tenantId = String(tenant?.id || "").trim();
@@ -2446,6 +2810,7 @@ async function main() {
   await checkAuthSessionHealth();
   await checkAuthIdentityIntegrity();
   await checkTenantMigrationDrift();
+  await checkDatabaseSchemaContract();
   await checkTenantUserIndexDrift();
   await checkProductCartIntegrity();
   await checkPublicationPipelineHealth();
