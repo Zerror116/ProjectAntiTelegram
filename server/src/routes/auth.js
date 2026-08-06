@@ -96,14 +96,6 @@ const MAGIC_LINK_LOGIN_ENABLED = parseBooleanFlag(
 );
 const ACCESS_TOKEN_TTL =
   String(process.env.AUTH_ACCESS_TOKEN_TTL || '24h').trim() || '24h';
-const SESSION_TTL_DAYS = Math.max(
-  1,
-  Math.min(Number(process.env.AUTH_SESSION_TTL_DAYS || 60) || 60, 365),
-);
-const SESSION_TTL_MS = SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
-const SESSION_AUTO_EXPIRY_ENABLED = parseBooleanFlag(
-  process.env.AUTH_SESSION_AUTO_EXPIRY_ENABLED,
-);
 const ACCESS_TOKEN_TTL_MS = parseDurationMs(ACCESS_TOKEN_TTL, 24 * 60 * 60 * 1000);
 const PASSKEY_CHALLENGE_TTL_MS = Math.max(
   60 * 1000,
@@ -218,8 +210,8 @@ async function createSecurityInboxNotification({
 }
 
 function buildSessionExpiry() {
-  if (!SESSION_AUTO_EXPIRY_ENABLED) return null;
-  return new Date(Date.now() + SESSION_TTL_MS);
+  // Product rule: accounts stay signed in until explicit logout or admin revoke.
+  return null;
 }
 
 function resolveRefreshScopeKey({
@@ -3814,13 +3806,14 @@ router.post('/refresh', async (req, res) => {
             isPlatformCreator,
           }),
         );
+        const targetExpiry = buildSessionExpiry();
         await updateUserSessionAuthState({
           queryable: client,
           sessionRecordId: session.id,
           sessionPublicId: sessionId,
           refreshTokenHash: hashOpaqueToken(nextRefreshToken),
           refreshLastUsedAt: new Date(),
-          expiresAt: buildSessionExpiry(),
+          expiresAt: targetExpiry,
         });
         const payload = await buildSuccessfulAuthResponse({
           req,
@@ -3828,7 +3821,7 @@ router.post('/refresh', async (req, res) => {
           tenant,
           sessionId,
           refreshToken: nextRefreshToken,
-          sessionExpiresAt: buildSessionExpiry(),
+          sessionExpiresAt: targetExpiry,
           isPlatformCreator,
         });
         await client.query('COMMIT');
@@ -3908,18 +3901,6 @@ router.post('/refresh/bootstrap', async (req, res) => {
             .status(401)
             .json({ error: 'Сессия не соответствует пользователю' });
         }
-        if (
-          SESSION_AUTO_EXPIRY_ENABLED &&
-          session.expires_at &&
-          new Date(session.expires_at).getTime() > 0 &&
-          new Date(session.expires_at).getTime() < Date.now()
-        ) {
-          await client.query('ROLLBACK');
-          return res
-            .status(401)
-            .json({ error: 'Сессия истекла, войдите снова' });
-        }
-
         const user = await fetchAuthUserWithTenant(client, tokenUserId);
         if (!user) {
           await client.query('ROLLBACK');

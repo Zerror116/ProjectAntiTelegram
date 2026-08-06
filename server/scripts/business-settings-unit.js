@@ -290,6 +290,46 @@ function testNightlyAuditChecksTenantUserIndexDrift() {
   assert.match(source, /await checkTenantUserIndexDrift\(\)/);
 }
 
+function testAuthSessionsArePersistentProjectWide() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  assert.match(
+    authRoute,
+    /function buildSessionExpiry\(\) \{[\s\S]{0,180}return null;[\s\S]{0,80}\}/,
+  );
+  assert.doesNotMatch(authRoute, /AUTH_SESSION_AUTO_EXPIRY_ENABLED/);
+  assert.doesNotMatch(authRoute, /SESSION_AUTO_EXPIRY_ENABLED/);
+  assert.doesNotMatch(authRoute, /SESSION_TTL_MS/);
+
+  const migration = fs.readFileSync(
+    path.resolve(
+      __dirname,
+      "../migrations/079_enforce_persistent_user_sessions.sql",
+    ),
+    "utf8",
+  );
+  assert.match(migration, /UPDATE user_sessions/);
+  assert.match(migration, /SET expires_at = NULL/);
+  assert.match(migration, /WHERE is_active = true/);
+}
+
+function testNightlyAuditChecksAuthSessionsProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkAuthSessionHealth/);
+  assert.match(source, /auth_sessions\.policy_drift/);
+  assert.match(source, /auth_sessions\.healthy/);
+  assert.match(source, /active_sessions_with_expiry/);
+  assert.match(source, /active_refresh_without_public_id/);
+  assert.match(source, /auth_session_auto_expiry_env_enabled/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /await checkAuthSessionHealth\(\)/);
+}
+
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const fullAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
@@ -647,6 +687,8 @@ testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
 testNightlyAuditChecksTenantMigrationDrift();
 testNightlyAuditChecksTenantUserIndexDrift();
+testAuthSessionsArePersistentProjectWide();
+testNightlyAuditChecksAuthSessionsProjectWide();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();

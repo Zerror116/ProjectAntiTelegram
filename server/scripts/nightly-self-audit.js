@@ -505,6 +505,163 @@ async function checkTenantFeaturePolicy() {
   }
 }
 
+async function checkAuthSessionHealth() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    active_sessions: 0,
+    active_sessions_with_expiry: 0,
+    active_expired_sessions: 0,
+    active_refresh_sessions: 0,
+    active_refresh_without_public_id: 0,
+    active_sessions_missing_user_id: 0,
+    auth_session_auto_expiry_env_enabled: parseBooleanEnv(
+      process.env.AUTH_SESSION_AUTO_EXPIRY_ENABLED,
+      false,
+    )
+      ? 1
+      : 0,
+  };
+
+  async function readTargetStats() {
+    return await db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE is_active = true)::int AS active_sessions,
+         COUNT(*) FILTER (
+           WHERE is_active = true
+             AND expires_at IS NOT NULL
+         )::int AS active_sessions_with_expiry,
+         COUNT(*) FILTER (
+           WHERE is_active = true
+             AND expires_at IS NOT NULL
+             AND expires_at <= now()
+         )::int AS active_expired_sessions,
+         COUNT(*) FILTER (
+           WHERE is_active = true
+             AND refresh_token_hash IS NOT NULL
+         )::int AS active_refresh_sessions,
+         COUNT(*) FILTER (
+           WHERE is_active = true
+             AND refresh_token_hash IS NOT NULL
+             AND NULLIF(BTRIM(session_public_id), '') IS NULL
+         )::int AS active_refresh_without_public_id,
+         COUNT(*) FILTER (
+           WHERE is_active = true
+             AND user_id IS NULL
+         )::int AS active_sessions_missing_user_id
+       FROM user_sessions`,
+    );
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      const row = q.rows?.[0] || {};
+      totals.active_sessions += Number(row.active_sessions || 0) || 0;
+      totals.active_sessions_with_expiry +=
+        Number(row.active_sessions_with_expiry || 0) || 0;
+      totals.active_expired_sessions +=
+        Number(row.active_expired_sessions || 0) || 0;
+      totals.active_refresh_sessions +=
+        Number(row.active_refresh_sessions || 0) || 0;
+      totals.active_refresh_without_public_id +=
+        Number(row.active_refresh_without_public_id || 0) || 0;
+      totals.active_sessions_missing_user_id +=
+        Number(row.active_sessions_missing_user_id || 0) || 0;
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    const driftCount =
+      totals.auth_session_auto_expiry_env_enabled +
+      totals.unavailable_targets +
+      totals.active_sessions_with_expiry +
+      totals.active_refresh_without_public_id +
+      totals.active_sessions_missing_user_id;
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "auth_sessions.policy_drift",
+        "Auth session state differs from persistent-session policy",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "auth_sessions.healthy",
+      "Auth sessions match persistent-session policy across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "auth_sessions.check_failed",
+      "Auth session health check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 async function checkTenantMigrationDrift() {
   const expected = listExpectedMigrationFiles();
   if (expected.length === 0) {
@@ -1051,6 +1208,7 @@ async function main() {
   await checkMonitoringBacklog();
   await checkNotificationQueueHealth();
   await checkTenantFeaturePolicy();
+  await checkAuthSessionHealth();
   await checkTenantMigrationDrift();
   await checkTenantUserIndexDrift();
   checkBackupFreshness();
