@@ -223,6 +223,19 @@ function testWorkerDeliveryAssemblyFeatureFlag() {
   assert.match(deliveryRoute, /delivery_assembly_enabled/);
 }
 
+function testDeliveryLocalityNormalizerIsGeneric() {
+  const deliveryRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/delivery.js"),
+    "utf8",
+  );
+  assert.match(deliveryRoute, /function toTitleCaseLocality/);
+  assert.match(deliveryRoute, /LOCALITY_ALIAS_RULES/);
+  assert.match(deliveryRoute, /canonical: "Новокуйбышевск"/);
+  assert.doesNotMatch(deliveryRoute, /value\.includes\("кинель"\)/);
+  assert.doesNotMatch(deliveryRoute, /value\.includes\("самара"\)/);
+  assert.doesNotMatch(deliveryRoute, /value\.includes\("тольят"\)/);
+}
+
 function testPlatformCreatorFlagIsReturnedToClient() {
   const authRoute = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/auth.js"),
@@ -332,6 +345,7 @@ testAuthRecoveryUsesScopedEmailTokens();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
+testDeliveryLocalityNormalizerIsGeneric();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testAndroidReleaseUsesProductionDownloadsRoot();

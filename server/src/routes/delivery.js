@@ -840,20 +840,34 @@ function stripAddressServiceParts(addressText) {
   return filtered.join(", ");
 }
 
+const LOCALITY_ALIAS_RULES = [
+  {
+    canonical: "Новокуйбышевск",
+    aliases: ["новик", "новак", "новокуйб"],
+  },
+];
+
+function toTitleCaseLocality(raw) {
+  const normalized = normalizeWhitespace(raw);
+  if (!normalized) return "";
+  return normalized
+    .split(/([\s-]+)/)
+    .map((part) => {
+      if (!part || /^[\s-]+$/.test(part)) return part;
+      return `${part.slice(0, 1).toUpperCase()}${part.slice(1).toLowerCase()}`;
+    })
+    .join("");
+}
+
 function normalizeLocalityName(raw) {
-  const value = normalizeWhitespace(raw).toLowerCase();
+  const normalized = normalizeWhitespace(raw);
+  const value = normalized.toLowerCase();
   if (!value) return "";
-  if (value.includes("новик")) return "Новокуйбышевск";
-  if (value.includes("новак")) return "Новокуйбышевск";
-  if (value.includes("Новик")) return "Новокуйбышевск";
-  if (value.includes("Новак")) return "Новокуйбышевск";
-  if (value.includes("новокуйб")) return "Новокуйбышевск";
-  if (value.includes("самара")) return "Самара";
-  if (value.includes("чапаевск")) return "Чапаевск";
-  if (value.includes("сызран")) return "Сызрань";
-  if (value.includes("кинель")) return "Кинель";
-  if (value.includes("тольят")) return "Тольятти";
-  return raw;
+  const aliasMatch = LOCALITY_ALIAS_RULES.find((rule) =>
+    rule.aliases.some((alias) => value.includes(alias)),
+  );
+  if (aliasMatch) return aliasMatch.canonical;
+  return toTitleCaseLocality(normalized);
 }
 
 function detectAddressLocality(addressText) {
