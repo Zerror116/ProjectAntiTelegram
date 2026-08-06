@@ -635,6 +635,169 @@ async function checkTenantMigrationDrift() {
   }
 }
 
+async function loadExpectedTenantIndexUsers(tenant) {
+  return await db.runWithTenantRow(tenant, async () => {
+    const tenantId = String(tenant?.id || "").trim();
+    const allowLegacyNullTenantRows =
+      db.isIsolatedTenantRow(tenant) || db.isSchemaIsolatedTenantRow(tenant);
+    const q = await db.query(
+      `SELECT DISTINCT ON (lower(email))
+              id,
+              lower(email) AS email,
+              lower(trim(COALESCE(role, 'client'))) AS role,
+              COALESCE(is_active, true) AS is_active
+       FROM users
+       WHERE NULLIF(BTRIM(email), '') IS NOT NULL
+         AND (
+           tenant_id = $1::uuid
+           OR ($2::boolean = true AND tenant_id IS NULL)
+         )
+       ORDER BY lower(email),
+                COALESCE(is_active, true) DESC,
+                created_at DESC,
+                id ASC`,
+      [tenantId, allowLegacyNullTenantRows],
+    );
+    return q.rows || [];
+  });
+}
+
+async function checkTenantUserIndexDrift() {
+  const totals = {
+    tenants_checked: 0,
+    expected_users: 0,
+    indexed_rows: 0,
+    drift_tenants: 0,
+    missing_index_rows: 0,
+    stale_index_rows: 0,
+    mismatched_index_rows: 0,
+    orphan_index_rows: 0,
+  };
+
+  try {
+    const orphanQ = await db.platformQuery(
+      `SELECT COUNT(*)::int AS count
+       FROM tenant_user_index tui
+       LEFT JOIN tenants t ON t.id = tui.tenant_id
+       WHERE t.id IS NULL
+          OR COALESCE(t.is_deleted, false) = true`,
+    );
+    totals.orphan_index_rows = Number(orphanQ.rows?.[0]?.count || 0) || 0;
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_name,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const tenantId = String(tenant?.id || "").trim();
+      if (!tenantId) continue;
+      totals.tenants_checked += 1;
+
+      const expectedUsers = await loadExpectedTenantIndexUsers(tenant);
+      const indexedQ = await db.platformQuery(
+        `SELECT user_id,
+                lower(email) AS email,
+                lower(trim(COALESCE(role, 'client'))) AS role,
+                COALESCE(is_active, true) AS is_active
+         FROM tenant_user_index
+         WHERE tenant_id = $1::uuid`,
+        [tenantId],
+      );
+
+      totals.expected_users += expectedUsers.length;
+      totals.indexed_rows += indexedQ.rowCount || 0;
+
+      const expectedByUserId = new Map();
+      for (const user of expectedUsers) {
+        const userId = String(user?.id || "").trim();
+        if (!userId) continue;
+        expectedByUserId.set(userId, {
+          email: String(user?.email || "").trim().toLowerCase(),
+          role: String(user?.role || "client").trim().toLowerCase() || "client",
+          isActive: user.is_active === true,
+        });
+      }
+
+      const indexedByUserId = new Map();
+      for (const row of indexedQ.rows || []) {
+        const userId = String(row?.user_id || "").trim();
+        if (!userId) continue;
+        indexedByUserId.set(userId, {
+          email: String(row?.email || "").trim().toLowerCase(),
+          role: String(row?.role || "client").trim().toLowerCase() || "client",
+          isActive: row.is_active === true,
+        });
+      }
+
+      let tenantHasDrift = false;
+      for (const [userId, expected] of expectedByUserId.entries()) {
+        const indexed = indexedByUserId.get(userId);
+        if (!indexed) {
+          totals.missing_index_rows += 1;
+          tenantHasDrift = true;
+          continue;
+        }
+        if (
+          indexed.email !== expected.email ||
+          indexed.role !== expected.role ||
+          indexed.isActive !== expected.isActive
+        ) {
+          totals.mismatched_index_rows += 1;
+          tenantHasDrift = true;
+        }
+      }
+
+      for (const userId of indexedByUserId.keys()) {
+        if (!expectedByUserId.has(userId)) {
+          totals.stale_index_rows += 1;
+          tenantHasDrift = true;
+        }
+      }
+
+      if (tenantHasDrift) totals.drift_tenants += 1;
+    }
+
+    const driftCount =
+      totals.missing_index_rows +
+      totals.stale_index_rows +
+      totals.mismatched_index_rows +
+      totals.orphan_index_rows;
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "tenant_user_index.drift",
+        "Tenant user index differs from tenant database users",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "tenant_user_index.synced",
+      "Tenant user index matches tenant database users",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "tenant_user_index.check_failed",
+      "Tenant user index drift check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        tenants_checked: totals.tenants_checked,
+      },
+    );
+  }
+}
+
 function checkBackupFreshness() {
   try {
     if (!IS_PRODUCTION && !process.env.FENIX_BACKUP_ROOT) {
@@ -889,6 +1052,7 @@ async function main() {
   await checkNotificationQueueHealth();
   await checkTenantFeaturePolicy();
   await checkTenantMigrationDrift();
+  await checkTenantUserIndexDrift();
   checkBackupFreshness();
   checkAndroidReleaseConfig();
 
