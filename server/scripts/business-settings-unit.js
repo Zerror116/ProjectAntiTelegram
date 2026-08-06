@@ -471,6 +471,26 @@ function testNightlyAuditChecksProductCartIntegrityProjectWide() {
   assert.match(source, /await checkProductCartIntegrity\(\)/);
 }
 
+function testNightlyAuditChecksPublicationPipelineProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkPublicationPipelineHealth/);
+  assert.match(source, /publication\.pipeline_stalled/);
+  assert.match(source, /publication\.pipeline_healthy/);
+  assert.match(source, /queued_queue_items_without_active_batch/);
+  assert.match(source, /publishing_queue_items_without_active_batch/);
+  assert.match(source, /stale_queued_queue_items/);
+  assert.match(source, /stale_publishing_queue_items/);
+  assert.match(source, /active_batches_without_active_items/);
+  assert.match(source, /active_batch_counter_drift/);
+  assert.match(source, /failed_queue_items/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkPublicationPipelineHealth\(\)/);
+}
+
 function testNightlyAuditChecksChatRecencyProjectWide() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -871,6 +891,7 @@ testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();
 testNightlyAuditChecksUploadRecoveryHealth();
 testNightlyAuditChecksProductCartIntegrityProjectWide();
+testNightlyAuditChecksPublicationPipelineProjectWide();
 testNightlyAuditChecksChatRecencyProjectWide();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubActionsHealthCheckExplainsRunnerStartupFailures();

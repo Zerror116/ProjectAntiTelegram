@@ -1675,6 +1675,308 @@ async function checkProductCartIntegrity() {
   }
 }
 
+async function checkPublicationPipelineHealth() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    due_pending_queue_items: 0,
+    failed_queue_items: 0,
+    queued_queue_items_without_active_batch: 0,
+    publishing_queue_items_without_active_batch: 0,
+    stale_queued_queue_items: 0,
+    stale_publishing_queue_items: 0,
+    due_active_batches: 0,
+    stale_active_batches: 0,
+    active_batches_without_active_items: 0,
+    active_batch_counter_drift: 0,
+    oldest_stuck_queue_created_at: null,
+    oldest_stuck_batch_updated_at: null,
+  };
+
+  const numericFields = [
+    "due_pending_queue_items",
+    "failed_queue_items",
+    "queued_queue_items_without_active_batch",
+    "publishing_queue_items_without_active_batch",
+    "stale_queued_queue_items",
+    "stale_publishing_queue_items",
+    "due_active_batches",
+    "stale_active_batches",
+    "active_batches_without_active_items",
+    "active_batch_counter_drift",
+  ];
+  const blockingFields = [
+    "queued_queue_items_without_active_batch",
+    "publishing_queue_items_without_active_batch",
+    "stale_queued_queue_items",
+    "stale_publishing_queue_items",
+    "stale_active_batches",
+    "active_batches_without_active_items",
+    "active_batch_counter_drift",
+  ];
+
+  function minDateIso(currentValue, nextValue) {
+    if (!nextValue) return currentValue || null;
+    const nextDate = new Date(nextValue);
+    if (!Number.isFinite(nextDate.getTime())) return currentValue || null;
+    if (!currentValue) return nextDate.toISOString();
+    const currentDate = new Date(currentValue);
+    if (!Number.isFinite(currentDate.getTime())) return nextDate.toISOString();
+    return nextDate < currentDate ? nextDate.toISOString() : currentValue;
+  }
+
+  async function readTargetStats() {
+    return await db.query(
+      `WITH active_queue AS (
+         SELECT q.id,
+                q.publish_batch_id,
+                COALESCE(q.publish_status, 'pending') AS publish_status,
+                q.publish_started_at,
+                q.publish_finished_at,
+                q.created_at AS queue_created_at,
+                b.status AS batch_status,
+                b.next_publish_at AS batch_next_publish_at,
+                b.updated_at AS batch_updated_at,
+                b.created_at AS batch_created_at
+           FROM product_publication_queue q
+           LEFT JOIN channel_publication_batches b ON b.id = q.publish_batch_id
+          WHERE q.status = 'pending'
+            AND COALESCE(q.is_sent, false) = false
+            AND COALESCE(q.publish_status, 'pending') IN ('pending', 'queued', 'publishing', 'failed')
+       ),
+       active_batches AS (
+         SELECT b.id,
+                b.status,
+                b.next_publish_at,
+                b.updated_at,
+                b.created_at,
+                b.total_count,
+                b.published_count,
+                b.failed_count
+           FROM channel_publication_batches b
+          WHERE b.status IN ('queued', 'running')
+       ),
+       active_batch_queue_counts AS (
+         SELECT b.id,
+                COUNT(q.id)::int AS queue_count,
+                COUNT(q.id) FILTER (
+                  WHERE q.status = 'pending'
+                    AND COALESCE(q.is_sent, false) = false
+                    AND COALESCE(q.publish_status, 'pending') IN ('queued', 'publishing')
+                )::int AS active_queue_count
+           FROM active_batches b
+           LEFT JOIN product_publication_queue q ON q.publish_batch_id = b.id
+          GROUP BY b.id
+       ),
+       stuck_queue AS (
+         SELECT queue_created_at
+           FROM active_queue
+          WHERE (
+              publish_status = 'queued'
+              AND (batch_status IS NULL OR batch_status NOT IN ('queued', 'running'))
+            )
+             OR (
+              publish_status = 'publishing'
+              AND (batch_status IS NULL OR batch_status NOT IN ('queued', 'running'))
+            )
+             OR (
+              publish_status = 'queued'
+              AND batch_status IN ('queued', 'running')
+              AND COALESCE(batch_next_publish_at, batch_updated_at, batch_created_at, queue_created_at)
+                    <= now() - ($1::text)::interval
+            )
+             OR (
+              publish_status = 'publishing'
+              AND COALESCE(publish_started_at, queue_created_at)
+                    <= now() - ($2::text)::interval
+            )
+       ),
+       stuck_batches AS (
+         SELECT b.updated_at
+           FROM active_batches b
+           LEFT JOIN active_batch_queue_counts c ON c.id = b.id
+          WHERE COALESCE(b.next_publish_at, b.updated_at, b.created_at)
+                  <= now() - ($1::text)::interval
+             OR COALESCE(c.active_queue_count, 0) = 0
+             OR COALESCE(b.total_count, 0) < 1
+             OR COALESCE(b.total_count, 0) < COALESCE(b.published_count, 0) + COALESCE(b.failed_count, 0)
+             OR COALESCE(b.total_count, 0) <> COALESCE(c.queue_count, 0)
+       )
+       SELECT
+         (
+           SELECT COUNT(*)::int
+             FROM active_queue
+            WHERE publish_status = 'pending'
+              AND queue_created_at <= now() - interval '24 hours'
+         ) AS due_pending_queue_items,
+         (
+           SELECT COUNT(*)::int
+             FROM active_queue
+            WHERE publish_status = 'failed'
+         ) AS failed_queue_items,
+         (
+           SELECT COUNT(*)::int
+             FROM active_queue
+            WHERE publish_status = 'queued'
+              AND (batch_status IS NULL OR batch_status NOT IN ('queued', 'running'))
+         ) AS queued_queue_items_without_active_batch,
+         (
+           SELECT COUNT(*)::int
+             FROM active_queue
+            WHERE publish_status = 'publishing'
+              AND (batch_status IS NULL OR batch_status NOT IN ('queued', 'running'))
+         ) AS publishing_queue_items_without_active_batch,
+         (
+           SELECT COUNT(*)::int
+             FROM active_queue
+            WHERE publish_status = 'queued'
+              AND batch_status IN ('queued', 'running')
+              AND COALESCE(batch_next_publish_at, batch_updated_at, batch_created_at, queue_created_at)
+                    <= now() - ($1::text)::interval
+         ) AS stale_queued_queue_items,
+         (
+           SELECT COUNT(*)::int
+             FROM active_queue
+            WHERE publish_status = 'publishing'
+              AND COALESCE(publish_started_at, queue_created_at)
+                    <= now() - ($2::text)::interval
+         ) AS stale_publishing_queue_items,
+         (
+           SELECT COUNT(*)::int
+             FROM active_batches
+            WHERE COALESCE(next_publish_at, updated_at, created_at) <= now()
+         ) AS due_active_batches,
+         (
+           SELECT COUNT(*)::int
+             FROM active_batches
+            WHERE COALESCE(next_publish_at, updated_at, created_at)
+                    <= now() - ($1::text)::interval
+         ) AS stale_active_batches,
+         (
+           SELECT COUNT(*)::int
+             FROM active_batch_queue_counts
+            WHERE active_queue_count = 0
+         ) AS active_batches_without_active_items,
+         (
+           SELECT COUNT(*)::int
+             FROM active_batches b
+             LEFT JOIN active_batch_queue_counts c ON c.id = b.id
+            WHERE COALESCE(b.total_count, 0) < 1
+               OR COALESCE(b.total_count, 0) < COALESCE(b.published_count, 0) + COALESCE(b.failed_count, 0)
+               OR COALESCE(b.total_count, 0) <> COALESCE(c.queue_count, 0)
+         ) AS active_batch_counter_drift,
+         (SELECT MIN(queue_created_at) FROM stuck_queue) AS oldest_stuck_queue_created_at,
+         (SELECT MIN(updated_at) FROM stuck_batches) AS oldest_stuck_batch_updated_at`,
+      ["15 minutes", "5 minutes"],
+    );
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      const row = q.rows?.[0] || {};
+      for (const field of numericFields) {
+        totals[field] += Number(row[field] || 0) || 0;
+      }
+      totals.oldest_stuck_queue_created_at = minDateIso(
+        totals.oldest_stuck_queue_created_at,
+        row.oldest_stuck_queue_created_at,
+      );
+      totals.oldest_stuck_batch_updated_at = minDateIso(
+        totals.oldest_stuck_batch_updated_at,
+        row.oldest_stuck_batch_updated_at,
+      );
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    const driftCount =
+      totals.unavailable_targets +
+      blockingFields.reduce((sum, field) => sum + totals[field], 0);
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "publication.pipeline_stalled",
+        "Product publication pipeline has stuck queue items or active batches across database targets",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "publication.pipeline_healthy",
+      "Product publication pipeline has no stuck queue items or active batches across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "publication.pipeline_check_failed",
+      "Product publication pipeline health check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 async function checkChatRecencyIntegrity() {
   const totals = {
     targets_checked: 0,
@@ -2114,6 +2416,7 @@ async function main() {
   await checkTenantMigrationDrift();
   await checkTenantUserIndexDrift();
   await checkProductCartIntegrity();
+  await checkPublicationPipelineHealth();
   await checkChatRecencyIntegrity();
   checkBackupFreshness();
   checkAndroidReleaseConfig();
