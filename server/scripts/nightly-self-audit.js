@@ -935,6 +935,10 @@ async function checkAuthIdentityIntegrity() {
     duplicate_active_email_users: 0,
     duplicate_active_phone_groups: 0,
     duplicate_active_phone_users: 0,
+    active_email_groups_without_valid_password: 0,
+    active_email_users_without_valid_password: 0,
+    active_users_missing_password_hash: 0,
+    active_users_invalid_password_hash: 0,
     phone_rows_without_user: 0,
     active_sessions_for_inactive_users: 0,
     active_notification_endpoints_for_inactive_users: 0,
@@ -947,6 +951,10 @@ async function checkAuthIdentityIntegrity() {
     "duplicate_active_email_users",
     "duplicate_active_phone_groups",
     "duplicate_active_phone_users",
+    "active_email_groups_without_valid_password",
+    "active_email_users_without_valid_password",
+    "active_users_missing_password_hash",
+    "active_users_invalid_password_hash",
     "phone_rows_without_user",
     "active_sessions_for_inactive_users",
     "active_notification_endpoints_for_inactive_users",
@@ -956,6 +964,7 @@ async function checkAuthIdentityIntegrity() {
   const hardDriftFields = [
     "duplicate_active_email_groups",
     "duplicate_active_email_users",
+    "active_users_invalid_password_hash",
     "phone_rows_without_user",
     "active_sessions_for_inactive_users",
     "active_notification_endpoints_for_inactive_users",
@@ -966,7 +975,8 @@ async function checkAuthIdentityIntegrity() {
       `WITH active_users AS (
          SELECT id,
                 COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) AS tenant_scope,
-                lower(NULLIF(BTRIM(email), '')) AS email_key
+                lower(NULLIF(BTRIM(email), '')) AS email_key,
+                COALESCE(password_hash, '') AS password_hash
            FROM users
           WHERE COALESCE(is_active, true) = true
        ),
@@ -978,6 +988,24 @@ async function checkAuthIdentityIntegrity() {
           WHERE email_key IS NOT NULL
           GROUP BY tenant_scope, email_key
          HAVING COUNT(*) > 1
+       ),
+       credential_email_groups AS (
+         SELECT tenant_scope,
+                email_key,
+                COUNT(*)::int AS user_count,
+                COUNT(*) FILTER (
+                  WHERE password_hash ~ '^\\$2[aby]\\$[0-9]{2}\\$.{53}$'
+                )::int AS valid_password_count,
+                COUNT(*) FILTER (
+                  WHERE NULLIF(BTRIM(password_hash), '') IS NULL
+                )::int AS missing_password_count,
+                COUNT(*) FILTER (
+                  WHERE NULLIF(BTRIM(password_hash), '') IS NOT NULL
+                    AND password_hash !~ '^\\$2[aby]\\$[0-9]{2}\\$.{53}$'
+                )::int AS invalid_password_count
+           FROM active_users
+          WHERE email_key IS NOT NULL
+          GROUP BY tenant_scope, email_key
        ),
        phone_rows AS (
          SELECT p.id,
@@ -1005,6 +1033,10 @@ async function checkAuthIdentityIntegrity() {
          COALESCE((SELECT SUM(user_count)::int FROM duplicate_email_groups), 0)::int AS duplicate_active_email_users,
          COALESCE((SELECT COUNT(*)::int FROM duplicate_phone_groups), 0)::int AS duplicate_active_phone_groups,
          COALESCE((SELECT SUM(user_count)::int FROM duplicate_phone_groups), 0)::int AS duplicate_active_phone_users,
+         COALESCE((SELECT COUNT(*)::int FROM credential_email_groups WHERE valid_password_count = 0), 0)::int AS active_email_groups_without_valid_password,
+         COALESCE((SELECT SUM(user_count)::int FROM credential_email_groups WHERE valid_password_count = 0), 0)::int AS active_email_users_without_valid_password,
+         COALESCE((SELECT SUM(missing_password_count)::int FROM credential_email_groups), 0)::int AS active_users_missing_password_hash,
+         COALESCE((SELECT SUM(invalid_password_count)::int FROM credential_email_groups), 0)::int AS active_users_invalid_password_hash,
          COALESCE((SELECT COUNT(*)::int FROM phone_rows WHERE has_user = false), 0)::int AS phone_rows_without_user,
          (
            SELECT COUNT(*)::int
