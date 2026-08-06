@@ -6,11 +6,18 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 DOMAIN="${DOMAIN:-garphoenix.com}"
 RUN_BUILD_AUDIT="${RUN_BUILD_AUDIT:-0}" # 1 => rebuild web/apk in audit phase
+RUN_E2E_AUDIT="${RUN_E2E_AUDIT:-1}" # 1 => require backend full E2E before deploy
+E2E_REQUIRE_FULL="${E2E_REQUIRE_FULL:-$RUN_E2E_AUDIT}"
 
 cd "$PROJECT_ROOT"
 
 echo "[release_with_audit] step 1/2: pre-deploy full cluster audit"
-RUN_BUILDS="$RUN_BUILD_AUDIT" RUN_REMOTE=1 DOMAIN="$DOMAIN" "$SCRIPT_DIR/full_cluster_audit.sh"
+RUN_BUILDS="$RUN_BUILD_AUDIT" \
+  RUN_E2E="$RUN_E2E_AUDIT" \
+  RUN_REMOTE=1 \
+  DOMAIN="$DOMAIN" \
+  E2E_REQUIRE_FULL="$E2E_REQUIRE_FULL" \
+  "$SCRIPT_DIR/full_cluster_audit.sh"
 
 echo "[release_with_audit] step 2/2: deploy"
 RUN_HEALTH_CHECK=1 "$SCRIPT_DIR/deploy_full.sh" --no-commit "$@"

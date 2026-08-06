@@ -7,6 +7,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DOMAIN="${DOMAIN:-garphoenix.com}"
 SERVER="${SERVER:-root@89.23.99.18}"
 RUN_BUILDS="${RUN_BUILDS:-0}" # 1 => include flutter build web/apk
+RUN_E2E="${RUN_E2E:-0}" # 1 => include backend full E2E regression
 RUN_REMOTE="${RUN_REMOTE:-1}" # 0 => skip SSH part
 
 print_section() {
@@ -40,6 +41,14 @@ run_local_checks() {
   npm audit --omit=dev --audit-level=high
   npm run audit:gate
   npm run audit:self
+
+  if [[ "$RUN_E2E" == "1" ]]; then
+    print_section "Local Backend Full E2E Regression"
+    E2E_REQUIRE_FULL="${E2E_REQUIRE_FULL:-1}" npm run test:e2e:full
+  else
+    print_section "Backend Full E2E Skipped"
+    echo "RUN_E2E=0, skip backend full E2E regression"
+  fi
 }
 
 run_prod_http_checks() {
@@ -189,6 +198,7 @@ main() {
   echo "project: $PROJECT_ROOT"
   echo "domain:  $DOMAIN"
   echo "server:  $SERVER"
+  echo "run_e2e: $RUN_E2E"
 
   run_local_checks
   run_prod_http_checks

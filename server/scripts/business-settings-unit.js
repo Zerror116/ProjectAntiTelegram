@@ -270,6 +270,8 @@ function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   assert.match(fullAudit, /npm run test:business:settings/);
   assert.match(fullAudit, /npm run lint/);
   assert.match(fullAudit, /npm run audit:gate/);
+  assert.match(fullAudit, /RUN_E2E="\$\{RUN_E2E:-0\}"/);
+  assert.match(fullAudit, /npm run test:e2e:full/);
   assert.match(fullAudit, /find src scripts -type f -name "\*\.js"/);
   assert.match(fullAudit, /== production self-audit ==/);
   const productionSelfAuditRuns =
@@ -287,6 +289,9 @@ function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const deployIndex = releaseWithAudit.indexOf("deploy_full.sh");
   assert.ok(auditIndex >= 0, "release_with_audit must run full_cluster_audit");
   assert.ok(deployIndex >= 0, "release_with_audit must run deploy_full");
+  assert.match(releaseWithAudit, /RUN_E2E_AUDIT="\$\{RUN_E2E_AUDIT:-1\}"/);
+  assert.match(releaseWithAudit, /RUN_E2E="\$RUN_E2E_AUDIT"/);
+  assert.match(releaseWithAudit, /E2E_REQUIRE_FULL="\$E2E_REQUIRE_FULL"/);
   assert.ok(
     auditIndex < deployIndex,
     "release_with_audit must run full_cluster_audit before deploy_full",
