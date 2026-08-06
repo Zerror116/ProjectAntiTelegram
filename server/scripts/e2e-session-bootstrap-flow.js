@@ -109,6 +109,24 @@ async function login() {
   return root;
 }
 
+function assertPersistentAuthPayload(root, context) {
+  const token = String(root?.token || '').trim();
+  const refreshToken = String(root?.refresh_token || '').trim();
+  if (!token || !refreshToken) {
+    throw new Error(`${context}: response did not return token pair`);
+  }
+  if (root.session_expires_at !== null && root.session_expires_at !== undefined) {
+    throw new Error(`${context}: session_expires_at must be null for persistent sessions`);
+  }
+  const decoded = jwt.decode(token);
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    throw new Error(`${context}: access token is not decodable`);
+  }
+  if (!String(decoded.sid || decoded.session_id || '').trim()) {
+    throw new Error(`${context}: access token does not contain session id`);
+  }
+}
+
 function buildExpiredAccessToken(sourceToken) {
   const decoded = jwt.decode(sourceToken);
   if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
@@ -131,7 +149,34 @@ async function run() {
 
   printStep('AUTH', 'login and create active server session');
   const loginPayload = await login();
-  const expiredToken = buildExpiredAccessToken(loginPayload.token);
+  assertPersistentAuthPayload(loginPayload, 'login');
+
+  printStep('CHECK', 'refresh token flow keeps persistent session');
+  const refresh = await requestJson('/api/auth/refresh', {
+    method: 'POST',
+    body: {
+      refresh_token: loginPayload.refresh_token,
+    },
+  });
+  if (!refresh.response.ok) {
+    throw new Error(
+      `refresh failed: HTTP ${refresh.response.status} ${JSON.stringify(refresh.data).slice(0, 700)}`,
+    );
+  }
+  const refreshRoot = asObject(refresh.data, 'refresh.root');
+  assertPersistentAuthPayload(refreshRoot, 'refresh');
+
+  printStep('CHECK', 'refreshed access token works for profile');
+  const refreshedProfile = await requestJson('/api/profile', {
+    token: refreshRoot.token,
+  });
+  if (!refreshedProfile.response.ok) {
+    throw new Error(
+      `/api/profile failed after refresh: HTTP ${refreshedProfile.response.status}`,
+    );
+  }
+
+  const expiredToken = buildExpiredAccessToken(refreshRoot.token);
 
   printStep('WAIT', 'let synthetic access token expire');
   await new Promise((resolve) => setTimeout(resolve, 1300));
@@ -152,6 +197,7 @@ async function run() {
   if (!nextToken || !nextRefresh) {
     throw new Error('bootstrap response did not return new token pair');
   }
+  assertPersistentAuthPayload(root, 'bootstrap');
 
   printStep('CHECK', 'new access token works for profile');
   const profile = await requestJson('/api/profile', { token: nextToken });

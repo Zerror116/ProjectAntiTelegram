@@ -330,6 +330,21 @@ function testNightlyAuditChecksAuthSessionsProjectWide() {
   assert.match(source, /await checkAuthSessionHealth\(\)/);
 }
 
+function testSessionBootstrapE2ECoversRefreshAndPersistentSessions() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "e2e-session-bootstrap-flow.js"),
+    "utf8",
+  );
+  assert.match(source, /function assertPersistentAuthPayload/);
+  assert.match(source, /session_expires_at must be null/);
+  assert.match(source, /\/api\/auth\/refresh/);
+  assert.match(source, /refresh token flow keeps persistent session/);
+  assert.match(source, /refresh\/bootstrap accepts expired signed access token/);
+  assert.match(source, /assertPersistentAuthPayload\(loginPayload, 'login'\)/);
+  assert.match(source, /assertPersistentAuthPayload\(refreshRoot, 'refresh'\)/);
+  assert.match(source, /assertPersistentAuthPayload\(root, 'bootstrap'\)/);
+}
+
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const fullAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
@@ -689,6 +704,7 @@ testNightlyAuditChecksTenantMigrationDrift();
 testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
+testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();
