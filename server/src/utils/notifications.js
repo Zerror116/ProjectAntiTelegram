@@ -1498,65 +1498,7 @@ async function createNotificationInboxItem({
     ...(normalizedDeepLink ? { deep_link: normalizedDeepLink } : {}),
   });
 
-  let row = null;
-  if (normalizedDedupeKey) {
-    const existing = await db.query(
-      `SELECT *
-         FROM notification_inbox_items
-        WHERE user_id = $1
-          AND dedupe_key = $2
-        LIMIT 1`,
-      [user.id, normalizedDedupeKey],
-    );
-    row = existing.rows[0] || null;
-  }
-
-  if (row) {
-    const updated = await db.query(
-      `UPDATE notification_inbox_items
-          SET title = $1,
-              body = $2,
-              deep_link = $3,
-              media = $4::jsonb,
-              payload = $5::jsonb,
-              priority = $6,
-              collapse_key = $7,
-              ttl_seconds = $8,
-              source_type = $9,
-              source_id = NULLIF($10, ''),
-              campaign_id = $11,
-              inbox_visibility = $12,
-              force_show = $13,
-              is_actionable = $14,
-              expires_at = $15::timestamptz,
-              updated_at = now(),
-              status = CASE WHEN status = 'dismissed' THEN status ELSE 'unread' END,
-              read_at = CASE WHEN status = 'dismissed' THEN read_at ELSE NULL END
-        WHERE id = $16
-        RETURNING *`,
-      [
-        normalizedTitle,
-        normalizedBody,
-        normalizedDeepLink,
-        mediaJson,
-        payloadJson,
-        normalizedPriority,
-        normalizedCollapseKey,
-        normalizedTtl,
-        String(sourceType || "generic").trim() || "generic",
-        String(sourceId || "").trim(),
-        campaignId,
-        effectiveInboxVisibility,
-        forceShow === true,
-        isActionable === true,
-        expiresAt,
-        row.id,
-      ],
-    );
-    row = updated.rows[0] || row;
-  } else {
-    const inserted = await db.query(
-      `INSERT INTO notification_inbox_items (
+  const insertSql = `INSERT INTO notification_inbox_items (
          tenant_id,
          user_id,
          category,
@@ -1582,33 +1524,64 @@ async function createNotificationInboxItem({
        )
        VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, NULLIF($11, ''), NULLIF($12, ''), $13, $14, NULLIF($15, ''), $16, $17, $18, $19, $20::timestamptz, now(), now()
-       )
-       RETURNING *`,
-      [
-        user?.tenant_id || null,
-        user.id,
-        normalizedCategory,
-        normalizedPriority,
-        String(channel || "mixed").trim() || "mixed",
-        normalizedTitle,
-        normalizedBody,
-        normalizedDeepLink,
-        mediaJson,
-        payloadJson,
-        normalizedDedupeKey,
-        normalizedCollapseKey,
-        normalizedTtl,
-        String(sourceType || "generic").trim() || "generic",
-        String(sourceId || "").trim(),
-        campaignId,
-        effectiveInboxVisibility,
-        forceShow === true,
-        isActionable === true,
-        expiresAt,
-      ],
-    );
-    row = inserted.rows[0] || null;
-  }
+       )`;
+  const upsertSql = normalizedDedupeKey
+    ? `${insertSql}
+       ON CONFLICT (user_id, dedupe_key)
+       WHERE dedupe_key IS NOT NULL AND btrim(dedupe_key) <> ''
+       DO UPDATE SET
+         title = EXCLUDED.title,
+         body = EXCLUDED.body,
+         deep_link = EXCLUDED.deep_link,
+         media = EXCLUDED.media,
+         payload = EXCLUDED.payload,
+         priority = EXCLUDED.priority,
+         collapse_key = EXCLUDED.collapse_key,
+         ttl_seconds = EXCLUDED.ttl_seconds,
+         source_type = EXCLUDED.source_type,
+         source_id = EXCLUDED.source_id,
+         campaign_id = EXCLUDED.campaign_id,
+         inbox_visibility = EXCLUDED.inbox_visibility,
+         force_show = EXCLUDED.force_show,
+         is_actionable = EXCLUDED.is_actionable,
+         expires_at = EXCLUDED.expires_at,
+         updated_at = now(),
+         status = CASE
+           WHEN notification_inbox_items.status = 'dismissed'
+             THEN notification_inbox_items.status
+           ELSE 'unread'
+         END,
+         read_at = CASE
+           WHEN notification_inbox_items.status = 'dismissed'
+             THEN notification_inbox_items.read_at
+           ELSE NULL
+         END
+       RETURNING *`
+    : `${insertSql}
+       RETURNING *`;
+  const inserted = await db.query(upsertSql, [
+    user?.tenant_id || null,
+    user.id,
+    normalizedCategory,
+    normalizedPriority,
+    String(channel || "mixed").trim() || "mixed",
+    normalizedTitle,
+    normalizedBody,
+    normalizedDeepLink,
+    mediaJson,
+    payloadJson,
+    normalizedDedupeKey,
+    normalizedCollapseKey,
+    normalizedTtl,
+    String(sourceType || "generic").trim() || "generic",
+    String(sourceId || "").trim(),
+    campaignId,
+    effectiveInboxVisibility,
+    forceShow === true,
+    isActionable === true,
+    expiresAt,
+  ]);
+  const row = inserted.rows[0] || null;
 
   if (!row) return null;
 

@@ -188,6 +188,20 @@ function testLegacyBootstrapScansTenantSessionScopes() {
   );
 }
 
+function testNotificationInboxDedupeIsAtomic() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/notifications.js"),
+    "utf8",
+  );
+  assert.match(source, /ON CONFLICT \(user_id, dedupe_key\)/);
+  assert.match(source, /WHERE dedupe_key IS NOT NULL AND btrim\(dedupe_key\) <> ''/);
+  assert.match(source, /DO UPDATE SET/);
+  assert.doesNotMatch(
+    source,
+    /FROM notification_inbox_items[\s\S]{0,160}WHERE user_id = \$1[\s\S]{0,160}AND dedupe_key = \$2[\s\S]{0,240}INSERT INTO notification_inbox_items/,
+  );
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -473,6 +487,7 @@ testInviteJoinUsesTenantScopedEmailLookup();
 testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
 testLegacyBootstrapScansTenantSessionScopes();
+testNotificationInboxDedupeIsAtomic();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
