@@ -117,6 +117,12 @@ console.log(JSON.stringify({
 }));
 if (!configured || !reverseConfigured) process.exit(2);
 NODE
+      echo
+      echo "== production self-audit =="
+      NODE_ENV=production npm run audit:self
+      if [ -f audit/nightly-self-audit.md ]; then
+        grep -nE "Findings:|tenant_features|backup|android.release|monitoring.unresolved|notifications.queue|critical|warn" audit/nightly-self-audit.md | head -100 || true
+      fi
     '
   else
     "${ssh_cmd[@]}" "$SERVER" '
@@ -168,6 +174,12 @@ console.log(JSON.stringify({
 }));
 if (!configured || !reverseConfigured) process.exit(2);
 NODE
+      echo
+      echo "== production self-audit =="
+      NODE_ENV=production npm run audit:self
+      if [ -f audit/nightly-self-audit.md ]; then
+        grep -nE "Findings:|tenant_features|backup|android.release|monitoring.unresolved|notifications.queue|critical|warn" audit/nightly-self-audit.md | head -100 || true
+      fi
     '
   fi
 }

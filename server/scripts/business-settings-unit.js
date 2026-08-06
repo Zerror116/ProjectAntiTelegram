@@ -271,6 +271,13 @@ function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   assert.match(fullAudit, /npm run lint/);
   assert.match(fullAudit, /npm run audit:gate/);
   assert.match(fullAudit, /find src scripts -type f -name "\*\.js"/);
+  assert.match(fullAudit, /== production self-audit ==/);
+  const productionSelfAuditRuns =
+    fullAudit.match(/NODE_ENV=production npm run audit:self/g) || [];
+  assert.ok(
+    productionSelfAuditRuns.length >= 2,
+    "full_cluster_audit must run production self-audit for both SSH auth branches",
+  );
 
   const releaseWithAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/release_with_audit.sh"),
