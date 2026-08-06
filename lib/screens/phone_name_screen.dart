@@ -360,7 +360,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
               ),
               const SizedBox(height: 8),
               Text(
-                'Важно: если номер будет недоступен при первом звонке, аккаунт будет удален автоматически.',
+                'Важно: укажите номер, по которому с вами смогут связаться по заказу.',
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.error,
                   fontWeight: FontWeight.w700,

@@ -249,6 +249,26 @@ function testPublicAuthErrorsUseNeutralSupportWording() {
   }
 }
 
+function testUnreachableFirstCallAutoDeleteDefaultsOff() {
+  const deliveryRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/delivery.js"),
+    "utf8",
+  );
+  const envExample = fs.readFileSync(
+    path.resolve(__dirname, "../.env.example"),
+    "utf8",
+  );
+  assert.match(
+    deliveryRoute,
+    /process\.env\.CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE \|\| "false"/,
+  );
+  assert.match(
+    deliveryRoute,
+    /CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE[\s\S]*?\.trim\(\) === "true"/,
+  );
+  assert.match(envExample, /^CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE=false$/m);
+}
+
 function testPlatformCreatorFlagIsReturnedToClient() {
   const authRoute = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/auth.js"),
@@ -360,6 +380,7 @@ testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
 testDeliveryLocalityNormalizerIsGeneric();
 testPublicAuthErrorsUseNeutralSupportWording();
+testUnreachableFirstCallAutoDeleteDefaultsOff();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testAndroidReleaseUsesProductionDownloadsRoot();

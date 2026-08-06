@@ -50,10 +50,10 @@ const CLIENT_RETENTION_CLEANUP_INTERVAL_MS = Math.max(
   Number(process.env.CLIENT_RETENTION_CLEANUP_INTERVAL_MS || 60 * 60 * 1000),
 );
 const CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE = String(
-  process.env.CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE || "true",
+  process.env.CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE || "false",
 )
   .toLowerCase()
-  .trim() !== "false";
+  .trim() === "true";
 const CART_ACTIVE_STATUSES_FOR_AUTO_DISMANTLE = [
   "pending_processing",
   "processed",
