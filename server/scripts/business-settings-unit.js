@@ -641,8 +641,51 @@ function testNoTenantSpecificWorkflowHardcode() {
   ];
   for (const file of files) {
     const source = fs.readFileSync(file, "utf8").toLowerCase();
-    assert.doesNotMatch(source, /kinel-8997|anna-utevskaya-4898/);
-    assert.doesNotMatch(source, /iskineltenantscope|isannaut/);
+    const blockedTenantCodes = [
+      ["ki", "nel-8997"].join(""),
+      ["anna-ut", "evskaya-4898"].join(""),
+    ];
+    const blockedHelperNames = [
+      ["is", "kinel", "tenantscope"].join(""),
+      ["is", "anna", "ut"].join(""),
+    ];
+    for (const code of blockedTenantCodes) {
+      assert.doesNotMatch(source, new RegExp(code, "i"));
+    }
+    for (const helperName of blockedHelperNames) {
+      assert.doesNotMatch(source, new RegExp(helperName, "i"));
+    }
+  }
+}
+
+function testNoRealPersonExamplesInDemoDataAndHints() {
+  const files = [
+    path.resolve(__dirname, "../src/routes/delivery.js"),
+    path.resolve(__dirname, "../../lib/screens/chats_screen.dart"),
+    path.resolve(__dirname, "../../docs/client_group_switcher_prototype.html"),
+  ];
+  const blockedNameParts = [
+    ["Ан", "на"],
+    ["Мак", "сим"],
+    ["Вал", "ерия"],
+    ["Бел", "оозер"],
+    ["Уте", "вск"],
+    ["Шку", "рова"],
+  ];
+  const blockedPatterns = [
+    ...blockedNameParts.map(
+      (parts) => new RegExp(parts.join(""), "i"),
+    ),
+    new RegExp(["890", "333", "47530"].join("")),
+    new RegExp(["vip", "-shkurova"].join(""), "i"),
+    new RegExp(["ki", "nel-8997"].join(""), "i"),
+    new RegExp(["anna-ut", "evskaya-4898"].join(""), "i"),
+  ];
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const pattern of blockedPatterns) {
+      assert.doesNotMatch(source, pattern, file);
+    }
   }
 }
 
@@ -924,6 +967,7 @@ testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
+testNoRealPersonExamplesInDemoDataAndHints();
 testWorkerDeliveryAssemblyFeatureFlag();
 testDeliveryLocalityNormalizerIsGeneric();
 testPublicAuthErrorsUseNeutralSupportWording();

@@ -3015,7 +3015,7 @@ class _DirectChatDialogState extends State<_DirectChatDialog> {
               autofocus: true,
               decoration: const InputDecoration(
                 labelText: 'Имя, email или номер',
-                hintText: 'Например: Ва, Анна, user@mail.com',
+                hintText: 'Начните вводить имя, email или номер',
                 border: OutlineInputBorder(),
               ),
               onSubmitted: (_) => _openDirectFromSelection(),
