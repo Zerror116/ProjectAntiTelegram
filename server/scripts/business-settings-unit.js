@@ -262,6 +262,20 @@ function testNightlyAuditChecksTenantFeaturePolicy() {
   assert.match(source, /await checkTenantFeaturePolicy\(\)/);
 }
 
+function testNightlyAuditChecksTenantMigrationDrift() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkTenantMigrationDrift/);
+  assert.match(source, /schema_migrations/);
+  assert.match(source, /tenant_migrations\.drift/);
+  assert.match(source, /tenant_migrations\.synced/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /pending_migration_files/);
+  assert.match(source, /await checkTenantMigrationDrift\(\)/);
+}
+
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const fullAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
@@ -617,6 +631,7 @@ testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
+testNightlyAuditChecksTenantMigrationDrift();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();

@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
+const { Pool } = require("pg");
 const db = require("../src/db");
 const {
   buildSecretKeyring,
@@ -48,6 +49,56 @@ function parseNumberEnv(rawValue, fallback = 0) {
   const parsed = Number(rawValue);
   if (!Number.isFinite(parsed)) return fallback;
   return parsed;
+}
+
+function quotePgIdentifier(identifier) {
+  return `"${String(identifier || "").replace(/"/g, '""')}"`;
+}
+
+function normalizePgSchema(rawValue) {
+  return String(rawValue || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48);
+}
+
+function listExpectedMigrationFiles() {
+  const migrationsDir = path.resolve(__dirname, "../migrations");
+  if (!fs.existsSync(migrationsDir)) return [];
+  return fs
+    .readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+}
+
+async function readAppliedMigrationFiles(pool, schemaName = "public") {
+  const normalizedSchema = normalizePgSchema(schemaName) || "public";
+  const tableRef = `${quotePgIdentifier(normalizedSchema)}.schema_migrations`;
+  try {
+    const result = await pool.query(
+      `SELECT filename
+       FROM ${tableRef}`,
+    );
+    return {
+      ok: true,
+      applied: new Set(
+        (result.rows || [])
+          .map((row) => String(row.filename || "").trim())
+          .filter(Boolean),
+      ),
+    };
+  } catch (err) {
+    const code = String(err?.code || "").trim();
+    if (code === "42P01" || code === "3F000") {
+      return {
+        ok: false,
+        applied: new Set(),
+        reason: code === "3F000" ? "schema_missing" : "schema_migrations_missing",
+      };
+    }
+    throw err;
+  }
 }
 
 function checkSecretKeyrings() {
@@ -454,6 +505,136 @@ async function checkTenantFeaturePolicy() {
   }
 }
 
+async function checkTenantMigrationDrift() {
+  const expected = listExpectedMigrationFiles();
+  if (expected.length === 0) {
+    addFinding(
+      "warn",
+      "tenant_migrations.no_migration_files",
+      "Migration drift check skipped because no migration files were found",
+    );
+    return;
+  }
+
+  const totals = {
+    expected_migrations: expected.length,
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    pending_targets: 0,
+    unavailable_targets: 0,
+    max_pending_migrations: 0,
+    pending_migration_files: [],
+  };
+  const pendingFileNames = new Set();
+
+  async function inspectTarget({ pool, schemaName, mode }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    const applied = await readAppliedMigrationFiles(pool, schemaName);
+    if (!applied.ok) {
+      totals.unavailable_targets += 1;
+    }
+    const missing = expected.filter((file) => !applied.applied.has(file));
+    if (missing.length > 0) {
+      totals.pending_targets += 1;
+      totals.max_pending_migrations = Math.max(
+        totals.max_pending_migrations,
+        missing.length,
+      );
+      for (const file of missing) pendingFileNames.add(file);
+    }
+  }
+
+  try {
+    await inspectTarget({
+      pool: db.platformPool,
+      schemaName: "public",
+      mode: "platform",
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated") {
+        const dbUrl = String(tenant?.db_url || "").trim();
+        if (!dbUrl) {
+          totals.targets_checked += 1;
+          totals.isolated_targets += 1;
+          totals.unavailable_targets += 1;
+          continue;
+        }
+        const pool = new Pool({ connectionString: dbUrl });
+        try {
+          await inspectTarget({ pool, schemaName: "public", mode });
+        } finally {
+          await pool.end();
+        }
+        continue;
+      }
+
+      if (mode === "schema_isolated") {
+        const schemaName = normalizePgSchema(tenant?.db_schema || "");
+        if (!schemaName) {
+          totals.targets_checked += 1;
+          totals.schema_isolated_targets += 1;
+          totals.unavailable_targets += 1;
+          continue;
+        }
+        await inspectTarget({
+          pool: db.platformPool,
+          schemaName,
+          mode,
+        });
+      }
+    }
+
+    totals.pending_migration_files = Array.from(pendingFileNames)
+      .sort()
+      .slice(0, 30);
+
+    if (totals.pending_targets > 0 || totals.unavailable_targets > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "tenant_migrations.drift",
+        "One or more database targets are missing expected migrations",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "tenant_migrations.synced",
+      "Platform and tenant database targets have all expected migrations",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "tenant_migrations.check_failed",
+      "Tenant migration drift check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 function checkBackupFreshness() {
   try {
     if (!IS_PRODUCTION && !process.env.FENIX_BACKUP_ROOT) {
@@ -707,6 +888,7 @@ async function main() {
   await checkMonitoringBacklog();
   await checkNotificationQueueHealth();
   await checkTenantFeaturePolicy();
+  await checkTenantMigrationDrift();
   checkBackupFreshness();
   checkAndroidReleaseConfig();
 
