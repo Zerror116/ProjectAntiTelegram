@@ -80,7 +80,7 @@ void main() {
         messengerBuildLastMessagePreview(
           rawText: 'Привет\nмир',
           senderId: 'u1',
-          senderName: 'Вазген',
+          senderName: 'Оператор',
           currentUserId: 'u1',
         ),
         'Вы: Привет мир',

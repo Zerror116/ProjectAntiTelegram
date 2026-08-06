@@ -3047,9 +3047,9 @@ bool _isSubscriptionErrorText(String message) {
 String _normalizeSubscriptionBlockedMessage(String source) {
   final normalized = source.toLowerCase();
   if (normalized.contains('ист') || normalized.contains('expired')) {
-    return 'Срок подписки истек. Свяжитесь с Вазгеном.';
+    return 'Срок подписки истек. Свяжитесь с ответственным администратором.';
   }
-  return 'Подписка отключена. Свяжитесь с Вазгеном.';
+  return 'Подписка отключена. Свяжитесь с ответственным администратором.';
 }
 
 void _updateSubscriptionUiState({
@@ -3132,7 +3132,7 @@ void _updateSubscriptionUiState({
         : 'Подписка отключена';
     blockedMessage = forced.isNotEmpty
         ? forced
-        : '${blockedByExpiry ? 'Срок подписки истек.' : 'Подписка отключена.'} Свяжитесь с Вазгеном.';
+        : '${blockedByExpiry ? 'Срок подписки истек.' : 'Подписка отключена.'} Свяжитесь с ответственным администратором.';
   }
 
   String? warningMessage;
@@ -4050,7 +4050,7 @@ class _GlobalNoticeHost extends StatelessWidget {
                               const SizedBox(height: 10),
                               Text(
                                 state.blockedMessage ??
-                                    'Подписка отключена. Свяжитесь с Вазгеном.',
+                                    'Подписка отключена. Свяжитесь с ответственным администратором.',
                                 textAlign: TextAlign.center,
                                 style: theme.textTheme.bodyMedium?.copyWith(
                                   color: theme.colorScheme.onSurfaceVariant,

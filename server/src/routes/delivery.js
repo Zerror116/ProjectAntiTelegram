@@ -37,6 +37,11 @@ const DELIVERY_STOP_BUFFER_MINUTES = 8;
 const DELIVERY_DIALOG_AUTO_DELETE_MS = 60 * 1000;
 const DELIVERY_DIALOG_CLEANUP_INTERVAL_MS = 15 * 1000;
 const CART_RETENTION_WARNING_DAYS = 30;
+const CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED = String(
+  process.env.CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED || "false",
+)
+  .toLowerCase()
+  .trim() === "true";
 const CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS = Math.max(
   30,
   Number(process.env.CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS || 180),
@@ -2062,57 +2067,59 @@ async function runClientRetentionSweepInScope(
     }
   }
 
-  const inactiveClients = await listInactiveClientAccounts(queryable, {
-    tenantId,
-    inactivityDays: CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS,
-    limit: CLIENT_RETENTION_SWEEP_LIMIT,
-  });
   let inactiveClientsDeleted = 0;
-  for (const row of inactiveClients) {
-    const userId = String(row.user_id || "").trim();
-    if (!userId) continue;
-    const client = await db.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const deletion = await deleteClientAccountByPolicy(client, {
-        userId,
-        tenantId,
-        reason: "inactive_180d",
-        source: "retention_sweep",
-      });
-      await client.query("COMMIT");
-      if (deletion.applied) {
-        inactiveClientsDeleted += 1;
-        emitToTenant(io, tenantId, "tenant:client:auto_deleted", {
-          user_id: deletion.user.id,
-          email: deletion.user.email,
-          phone: deletion.user.phone,
-          reason: "inactive_180d",
-          source: "retention_sweep",
-          at: new Date().toISOString(),
-        });
-        await emitToCreators(io, "creator:alert", {
-          type: "client_auto_deleted",
-          tenant_id: deletion.user.tenant_id || resolveTenantScopeId(tenantId),
-          user_id: deletion.user.id,
-          email: deletion.user.email,
-          phone: deletion.user.phone,
-          reason: "inactive_180d",
-          source: "retention_sweep",
-          at: new Date().toISOString(),
-        });
-      }
-    } catch (err) {
+  if (CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED) {
+    const inactiveClients = await listInactiveClientAccounts(queryable, {
+      tenantId,
+      inactivityDays: CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS,
+      limit: CLIENT_RETENTION_SWEEP_LIMIT,
+    });
+    for (const row of inactiveClients) {
+      const userId = String(row.user_id || "").trim();
+      if (!userId) continue;
+      const client = await db.pool.connect();
       try {
-        await client.query("ROLLBACK");
-      } catch (_) {}
-      console.error("delivery.retention inactive client cleanup error", {
-        userId,
-        scopeLabel,
-        error: err?.message || err,
-      });
-    } finally {
-      client.release();
+        await client.query("BEGIN");
+        const deletion = await deleteClientAccountByPolicy(client, {
+          userId,
+          tenantId,
+          reason: `inactive_${CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS}d`,
+          source: "retention_sweep",
+        });
+        await client.query("COMMIT");
+        if (deletion.applied) {
+          inactiveClientsDeleted += 1;
+          emitToTenant(io, tenantId, "tenant:client:auto_deleted", {
+            user_id: deletion.user.id,
+            email: deletion.user.email,
+            phone: deletion.user.phone,
+            reason: `inactive_${CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS}d`,
+            source: "retention_sweep",
+            at: new Date().toISOString(),
+          });
+          await emitToCreators(io, "creator:alert", {
+            type: "client_auto_deleted",
+            tenant_id: deletion.user.tenant_id || resolveTenantScopeId(tenantId),
+            user_id: deletion.user.id,
+            email: deletion.user.email,
+            phone: deletion.user.phone,
+            reason: `inactive_${CLIENT_INACTIVITY_ACCOUNT_DELETE_DAYS}d`,
+            source: "retention_sweep",
+            at: new Date().toISOString(),
+          });
+        }
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (_) {}
+        console.error("delivery.retention inactive client cleanup error", {
+          userId,
+          scopeLabel,
+          error: err?.message || err,
+        });
+      } finally {
+        client.release();
+      }
     }
   }
 

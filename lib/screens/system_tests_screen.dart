@@ -1078,7 +1078,7 @@ class _SystemTestsScreenState extends State<SystemTestsScreen> {
         return AlertDialog(
           title: const Text('Тест отключения подписки'),
           content: Text(
-            'Подписка отключена. Свяжитесь с Вазгеном.\n\n'
+            'Подписка отключена. Свяжитесь с ответственным администратором.\n\n'
             'Это тестовая плашка, её можно закрыть.',
             style: theme.textTheme.bodyMedium,
           ),

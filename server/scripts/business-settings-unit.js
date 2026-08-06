@@ -269,6 +269,40 @@ function testUnreachableFirstCallAutoDeleteDefaultsOff() {
   assert.match(envExample, /^CLIENT_UNREACHABLE_FIRST_CALL_AUTO_DELETE=false$/m);
 }
 
+function testInactiveClientAccountAutoDeleteDefaultsOff() {
+  const deliveryRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/delivery.js"),
+    "utf8",
+  );
+  const envExample = fs.readFileSync(
+    path.resolve(__dirname, "../.env.example"),
+    "utf8",
+  );
+  assert.match(
+    deliveryRoute,
+    /process\.env\.CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED \|\| "false"/,
+  );
+  assert.match(
+    deliveryRoute,
+    /if \(CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED\)/,
+  );
+  assert.doesNotMatch(deliveryRoute, /reason: "inactive_180d"/);
+  assert.match(envExample, /^CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED=false$/m);
+}
+
+function testNoPersonalSubscriptionContactName() {
+  const files = [
+    path.resolve(__dirname, "../../lib/main.dart"),
+    path.resolve(__dirname, "../../lib/screens/system_tests_screen.dart"),
+    path.resolve(__dirname, "../../test/messenger_ui_helpers_test.dart"),
+  ];
+  const blockedName = ["Ваз", "ген"].join("");
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(source, new RegExp(blockedName), file);
+  }
+}
+
 function testPlatformCreatorFlagIsReturnedToClient() {
   const authRoute = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/auth.js"),
@@ -381,6 +415,8 @@ testWorkerDeliveryAssemblyFeatureFlag();
 testDeliveryLocalityNormalizerIsGeneric();
 testPublicAuthErrorsUseNeutralSupportWording();
 testUnreachableFirstCallAutoDeleteDefaultsOff();
+testInactiveClientAccountAutoDeleteDefaultsOff();
+testNoPersonalSubscriptionContactName();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testAndroidReleaseUsesProductionDownloadsRoot();
