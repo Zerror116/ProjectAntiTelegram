@@ -9,7 +9,7 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   cart_delivery_ready_enabled: false,
   cart_delivery_ready_min_amount: 1500,
   cart_retention_days: 30,
-  client_cancel_anytime_enabled: false,
+  client_cancel_anytime_enabled: true,
   revision_delete_approval_enabled: false,
   defect_stats_enabled: false,
   auto_publish_enabled: false,
@@ -38,7 +38,7 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
     client_ready_button: false,
     min_amount: 1500,
     cart_retention_days: 30,
-    client_cancel_anytime_enabled: false,
+    client_cancel_anytime_enabled: true,
     snapshot_on_admin_approve: false,
   }),
   worker: Object.freeze({

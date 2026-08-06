@@ -60,18 +60,170 @@ const ACTIVE_DELIVERY_CUSTOMER_STATUSES = [
   'handing_to_courier',
   'in_delivery',
 ];
+const CLIENT_CANCEL_ANYTIME_STATUSES = new Set([
+  'processed',
+  'preparing_delivery',
+  'handing_to_courier',
+]);
 
 function clientCancelAnytimeEnabled(settings) {
   return settings?.client_cancel_anytime_enabled === true ||
     settings?.delivery?.client_cancel_anytime_enabled === true;
 }
 
-function canClientCancelCartItemStatus(status, settings, hasDeliveryLink = false) {
+function canClientCancelCartItemStatus(status, settings) {
   const normalized = String(status || '').trim();
   if (normalized === 'pending_processing') return true;
   if (!clientCancelAnytimeEnabled(settings)) return false;
-  if (hasDeliveryLink) return false;
-  return normalized === 'processed' || normalized === 'preparing_delivery';
+  return CLIENT_CANCEL_ANYTIME_STATUSES.has(normalized);
+}
+
+async function updateLinkedDeliveryBatchAfterCartCancel(
+  client,
+  {
+    cartItemId,
+    remainingQuantity,
+    actorUserId = null,
+  } = {},
+) {
+  const normalizedCartItemId = String(cartItemId || '').trim();
+  if (!normalizedCartItemId) {
+    return { hasActiveDeliveryLink: false, affectedBatchIds: [] };
+  }
+
+  const linkQ = await client.query(
+    `SELECT di.id,
+            di.batch_id,
+            di.batch_customer_id
+     FROM delivery_batch_items di
+     JOIN delivery_batch_customers dbc ON dbc.id = di.batch_customer_id
+     JOIN delivery_batches dbt ON dbt.id = di.batch_id
+     WHERE di.cart_item_id = $1
+       AND dbt.status = ANY($2::text[])
+       AND COALESCE(di.assembly_status, 'pending') <> 'removed'
+       AND COALESCE(dbc.call_status, '') <> 'removed'
+     ORDER BY dbt.updated_at DESC, dbt.created_at DESC
+     LIMIT 1
+     FOR UPDATE OF di, dbc, dbt`,
+    [normalizedCartItemId, ACTIVE_DELIVERY_BATCH_STATUSES],
+  );
+  if (linkQ.rowCount === 0) {
+    return { hasActiveDeliveryLink: false, affectedBatchIds: [] };
+  }
+
+  const link = linkQ.rows[0];
+  const deliveryItemId = String(link.id || '').trim();
+  const batchId = String(link.batch_id || '').trim();
+  const batchCustomerId = String(link.batch_customer_id || '').trim();
+  const safeRemainingQuantity = Math.max(
+    0,
+    Math.floor(Number(remainingQuantity) || 0),
+  );
+
+  if (safeRemainingQuantity <= 0) {
+    await client.query(
+      `UPDATE delivery_batch_items
+       SET assembly_status = 'removed',
+           removed_reason = COALESCE(NULLIF(removed_reason, ''), 'Клиент отказался от товара'),
+           removed_at = COALESCE(removed_at, now()),
+           removed_by = COALESCE(removed_by, $2::uuid)
+       WHERE id = $1`,
+      [deliveryItemId, actorUserId || null],
+    );
+  } else {
+    await client.query(
+      `UPDATE delivery_batch_items
+       SET quantity = $2,
+           line_total = ROUND((unit_price * $2::int)::numeric, 2)
+       WHERE id = $1`,
+      [deliveryItemId, safeRemainingQuantity],
+    );
+  }
+
+  const customerTotalsQ = await client.query(
+    `WITH totals AS (
+       SELECT COALESCE(SUM(line_total) FILTER (
+                WHERE COALESCE(assembly_status, 'pending') <> 'removed'
+              ), 0)::numeric AS processed_sum,
+              COALESCE(SUM(quantity) FILTER (
+                WHERE COALESCE(assembly_status, 'pending') <> 'removed'
+              ), 0)::int AS processed_items_count,
+              COALESCE(COUNT(*) FILTER (
+                WHERE COALESCE(assembly_status, 'pending') <> 'removed'
+                  AND is_bulky = true
+              ), 0)::int AS bulky_places,
+              COALESCE(COUNT(*) FILTER (
+                WHERE COALESCE(assembly_status, 'pending') <> 'removed'
+              ), 0)::int AS active_items_count
+       FROM delivery_batch_items
+       WHERE batch_customer_id = $1
+     )
+     UPDATE delivery_batch_customers c
+     SET processed_sum = totals.processed_sum,
+         processed_items_count = totals.processed_items_count,
+         bulky_places = totals.bulky_places,
+         call_status = CASE
+           WHEN totals.active_items_count <= 0 THEN 'removed'
+           ELSE c.call_status
+         END,
+         delivery_status = CASE
+           WHEN totals.active_items_count <= 0 THEN 'returned_to_cart'
+           ELSE c.delivery_status
+         END,
+         courier_slot = CASE
+           WHEN totals.active_items_count <= 0 THEN NULL
+           ELSE c.courier_slot
+         END,
+         courier_name = CASE
+           WHEN totals.active_items_count <= 0 THEN NULL
+           ELSE c.courier_name
+         END,
+         courier_code = CASE
+           WHEN totals.active_items_count <= 0 THEN NULL
+           ELSE c.courier_code
+         END,
+         route_order = CASE
+           WHEN totals.active_items_count <= 0 THEN NULL
+           ELSE c.route_order
+         END,
+         eta_from = CASE
+           WHEN totals.active_items_count <= 0 THEN NULL
+           ELSE c.eta_from
+         END,
+         eta_to = CASE
+           WHEN totals.active_items_count <= 0 THEN NULL
+           ELSE c.eta_to
+         END,
+         notes = CASE
+           WHEN totals.active_items_count <= 0 THEN CONCAT_WS(
+             E'\n',
+             NULLIF(c.notes, ''),
+             'Клиент отказался от всех товаров через корзину.'
+           )
+           ELSE c.notes
+         END,
+         updated_at = now()
+     FROM totals
+     WHERE c.id = $1
+     RETURNING c.batch_id, totals.active_items_count`,
+    [batchCustomerId],
+  );
+
+  if (batchId) {
+    await client.query(
+      `UPDATE delivery_batches
+       SET updated_at = now()
+       WHERE id = $1`,
+      [batchId],
+    );
+  }
+
+  return {
+    hasActiveDeliveryLink: true,
+    affectedBatchIds: batchId ? [batchId] : [],
+    deliveryCustomerRemoved:
+      Number(customerTotalsQ.rows[0]?.active_items_count || 0) <= 0,
+  };
 }
 
 const claimsUploadsDir = uploadsPath('claims');
@@ -1407,7 +1559,10 @@ router.get('/', authMiddleware, async (req, res) => {
                 SELECT 1
                 FROM delivery_batch_items di_any
                 JOIN delivery_batch_customers cst_any ON cst_any.id = di_any.batch_customer_id
+                JOIN delivery_batches dbt_any ON dbt_any.id = di_any.batch_id
                 WHERE di_any.cart_item_id = c.id
+                  AND dbt_any.status = ANY($2::text[])
+                  AND COALESCE(di_any.assembly_status, 'pending') <> 'removed'
                   AND COALESCE(cst_any.call_status, '') <> 'removed'
                 LIMIT 1
               ) AS has_delivery_batch_link
@@ -1445,7 +1600,7 @@ router.get('/', authMiddleware, async (req, res) => {
          END,
          c.updated_at DESC,
          c.created_at DESC`,
-      [userId]
+      [userId, ACTIVE_DELIVERY_BATCH_STATUSES],
     );
 
     const recentDeliveriesQ = await db.query(
@@ -1608,7 +1763,6 @@ router.get('/', authMiddleware, async (req, res) => {
       item.can_cancel = canClientCancelCartItemStatus(
         item.status,
         tenantSettings,
-        Boolean(item.has_delivery_batch_link),
       );
     }
 
@@ -1875,19 +2029,23 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
        JOIN delivery_batch_customers dbc ON dbc.id = di.batch_customer_id
        JOIN delivery_batches dbt ON dbt.id = di.batch_id
        WHERE di.cart_item_id = $1
+         AND dbt.status = ANY($2::text[])
+         AND COALESCE(di.assembly_status, 'pending') <> 'removed'
          AND COALESCE(dbc.call_status, '') <> 'removed'
        LIMIT 1
-       FOR UPDATE`,
-      [cartItemId],
+       FOR UPDATE OF di, dbc, dbt`,
+      [cartItemId, ACTIVE_DELIVERY_BATCH_STATUSES],
     );
     const hasDeliveryLink = linkedToDeliveryBatchQ.rowCount > 0;
-    if (!canClientCancelCartItemStatus(status, tenantSettings, hasDeliveryLink)) {
+    if (!canClientCancelCartItemStatus(status, tenantSettings)) {
       await client.query('ROLLBACK');
       if (hasDeliveryLink) {
         return res.status(409).json({
           ok: false,
           error:
-            'Отказ невозможен: товар уже находится в доставке',
+            status === 'in_delivery'
+              ? 'Отказ невозможен: товар уже передан курьеру'
+              : 'Отказ невозможен: товар уже находится в доставке',
           data: { status: item.status },
         });
       }
@@ -1920,6 +2078,14 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Некорректное количество для отказа' });
     }
     const remainingQuantity = Math.max(0, itemQuantity - cancelQuantity);
+    const deliveryCancelResult = await updateLinkedDeliveryBatchAfterCartCancel(
+      client,
+      {
+        cartItemId,
+        remainingQuantity,
+        actorUserId,
+      },
+    );
 
     const restored = await client.query(
       `UPDATE products
@@ -1968,7 +2134,15 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
       }
     }
 
-    if (remainingQuantity <= 0) {
+    if (remainingQuantity <= 0 && deliveryCancelResult.hasActiveDeliveryLink) {
+      await client.query(
+        `UPDATE cart_items
+         SET status = 'cancelled',
+             updated_at = now()
+         WHERE id = $1`,
+        [cartItemId],
+      );
+    } else if (remainingQuantity <= 0) {
       await client.query('DELETE FROM cart_items WHERE id = $1', [cartItemId]);
     } else {
       await client.query(
@@ -2014,6 +2188,15 @@ router.delete('/items/:id', authMiddleware, async (req, res) => {
         });
         emitToTenant(io, req.user?.tenant_id || null, 'chat:updated', {
           chatId: removedReservedMessage.chat_id,
+        });
+      }
+      for (const batchId of deliveryCancelResult.affectedBatchIds || []) {
+        emitToTenant(io, req.user?.tenant_id || null, 'delivery:updated', {
+          batchId,
+          updatedAt: new Date().toISOString(),
+          reason: deliveryCancelResult.deliveryCustomerRemoved
+            ? 'client_cancelled_delivery_customer'
+            : 'client_cancelled_delivery_item',
         });
       }
     }

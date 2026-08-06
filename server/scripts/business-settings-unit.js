@@ -34,8 +34,8 @@ function testDefaults() {
   assert.equal(settings.qr_existing_client_join_enabled, true);
   assert.equal(settings.dangerous_action_audit_enabled, true);
   assert.equal(settings.product_change_history_enabled, false);
-  assert.equal(settings.client_cancel_anytime_enabled, false);
-  assert.equal(settings.delivery.client_cancel_anytime_enabled, false);
+  assert.equal(settings.client_cancel_anytime_enabled, true);
+  assert.equal(settings.delivery.client_cancel_anytime_enabled, true);
   assert.equal(settings.worker_delivery_assembly_enabled, false);
   assert.equal(settings.worker.delivery_assembly_enabled, false);
   assert.equal(settings.phone_access_approval_enabled, false);
@@ -226,6 +226,26 @@ function testManualRevisionUsesManualShelfKeys() {
   const manualBranch = source.slice(manualBranchStart, fallbackBranchStart);
   assert.doesNotMatch(manualBranch, /Array\.from\(\{ length: 10 \}/);
   assert.doesNotMatch(manualBranch, /p\.shelf_number BETWEEN 1 AND 10/);
+}
+
+function testClientCancelAnytimeHandlesDeliveryBatchLinks() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/cart.js"),
+    "utf8",
+  );
+  assert.match(source, /const CLIENT_CANCEL_ANYTIME_STATUSES = new Set/);
+  assert.match(source, /'handing_to_courier'/);
+  assert.match(source, /async function updateLinkedDeliveryBatchAfterCartCancel/);
+  assert.match(source, /COALESCE\(di\.assembly_status, 'pending'\) <> 'removed'/);
+  assert.match(source, /dbt\.status = ANY\(\$2::text\[\]\)/);
+  assert.match(source, /delivery_status = CASE[\s\S]*'returned_to_cart'/);
+  assert.match(source, /processed_sum = totals\.processed_sum/);
+  assert.match(source, /processed_items_count = totals\.processed_items_count/);
+  assert.match(source, /status = 'cancelled'[\s\S]{0,180}WHERE id = \$1/);
+  assert.doesNotMatch(
+    source,
+    /if \(hasDeliveryLink\) return false/,
+  );
 }
 
 function testNotificationWorkerTenantScopes() {
@@ -515,6 +535,7 @@ testAuthRecoveryUsesScopedEmailTokens();
 testLegacyBootstrapScansTenantSessionScopes();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
+testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
