@@ -2470,7 +2470,9 @@ router.post('/join-invite', async (req, res) => {
       return res.status(400).json({ error: 'Пароль должен быть не менее 8 символов' });
     }
     if (normalizedEmail.toLowerCase() === CREATOR_EMAIL.toLowerCase()) {
-      return res.status(403).json({ error: 'Создатель переключает группы через профиль' });
+      return res.status(403).json({
+        error: 'Платформенный аккаунт переключает группы через профиль',
+      });
     }
 
     const requiredDeviceFingerprint = ensureDeviceFingerprint(device_fingerprint);
@@ -3079,7 +3081,7 @@ router.post('/register', async (req, res) => {
               ok: false,
               status: 409,
               error:
-                "Этот ключ арендатора уже активирован. Обратитесь к создателю за новым ключом.",
+                "Этот ключ арендатора уже активирован. Запросите новый ключ у ответственного администратора.",
             };
           }
 
@@ -3511,7 +3513,8 @@ router.post('/login', async (req, res) => {
             return {
               ok: false,
               status: 403,
-              error: '2FA включена, но ключ недоступен. Обратитесь к создателю приложения.',
+              error:
+                '2FA включена, но ключ недоступен. Обратитесь к ответственному администратору.',
               reason: 'two_factor_secret_unavailable',
             };
           }
@@ -3923,7 +3926,7 @@ router.post('/password-reset/request', async (req, res) => {
     if (!isMailConfigured()) {
       return res.status(503).json({
         error:
-          'Восстановление по почте пока не настроено на сервере. Обратитесь к создателю приложения.',
+          'Восстановление по почте пока не настроено на сервере. Обратитесь к ответственному администратору.',
       });
     }
 
@@ -3979,7 +3982,7 @@ router.post('/magic-link/request', async (req, res) => {
     if (!isMailConfigured()) {
       return res.status(503).json({
         error:
-          'Вход по ссылке пока не настроен на сервере. Обратитесь к создателю приложения.',
+          'Вход по ссылке пока не настроен на сервере. Обратитесь к ответственному администратору.',
       });
     }
 

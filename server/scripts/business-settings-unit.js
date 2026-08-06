@@ -236,6 +236,19 @@ function testDeliveryLocalityNormalizerIsGeneric() {
   assert.doesNotMatch(deliveryRoute, /value\.includes\("тольят"\)/);
 }
 
+function testPublicAuthErrorsUseNeutralSupportWording() {
+  const files = [
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    path.resolve(__dirname, "../src/utils/auth.js"),
+  ];
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(source, /Обратитесь к создателю/);
+    assert.doesNotMatch(source, /создателю приложения/);
+    assert.doesNotMatch(source, /создателю за новым ключом/);
+  }
+}
+
 function testPlatformCreatorFlagIsReturnedToClient() {
   const authRoute = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/auth.js"),
@@ -346,6 +359,7 @@ testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
 testDeliveryLocalityNormalizerIsGeneric();
+testPublicAuthErrorsUseNeutralSupportWording();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testAndroidReleaseUsesProductionDownloadsRoot();
