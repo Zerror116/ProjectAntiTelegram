@@ -74,7 +74,8 @@ Optional flags:
 ## 5. Source of truth on the server
 
 The current stable Android release is defined by:
-- `server/downloads/android-stable.release.json`
+- `/opt/fenix-data/downloads/android-stable.release.json` on production
+  (`DOWNLOADS_ROOT` for the backend).
 
 If this JSON exists but references a missing or broken APK, Android update endpoints fail closed.
 
