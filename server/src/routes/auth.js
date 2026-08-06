@@ -272,6 +272,70 @@ async function runWithRefreshScope(scopeKey, fn) {
   return db.runWithTenantRow(tenantRow, fn);
 }
 
+async function findLegacySessionTenantScope({ sessionId, userId }) {
+  const normalizedSessionId = String(sessionId || '').trim();
+  const normalizedUserId = String(userId || '').trim();
+  if (!normalizedSessionId || !normalizedUserId) return null;
+
+  const tenantsRes = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            db_mode,
+            db_url,
+            db_name,
+            db_schema
+     FROM tenants
+     WHERE COALESCE(is_deleted, false) = false
+       AND COALESCE(status, 'active') <> 'deleted'
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+     LIMIT 250`,
+  );
+
+  let matchedTenant = null;
+  for (const tenantRow of tenantsRes.rows || []) {
+    if (
+      !db.isIsolatedTenantRow(tenantRow) &&
+      !db.isSchemaIsolatedTenantRow(tenantRow)
+    ) {
+      continue;
+    }
+    const tenantId = String(tenantRow?.id || '').trim();
+    if (!tenantId) continue;
+
+    try {
+      const matched = await db.runWithTenantRow(tenantRow, async () => {
+        const session = await getUserSessionBySessionId({
+          queryable: db,
+          sessionId: normalizedSessionId,
+        });
+        if (!session || session.is_active === false) return false;
+        return String(session.user_id || '').trim() === normalizedUserId;
+      });
+      if (!matched) continue;
+      if (matchedTenant && String(matchedTenant.id || '') !== tenantId) {
+        console.warn('auth.refresh.bootstrap legacy session ambiguous', {
+          first_tenant_id: String(matchedTenant.id || '').trim() || null,
+          next_tenant_id: tenantId || null,
+        });
+        return null;
+      }
+      matchedTenant = tenantRow;
+    } catch (err) {
+      const code = String(err?.code || '').trim();
+      if (code === '42P01' || code === '3F000') continue;
+      console.error('auth.refresh.bootstrap tenant scan error', {
+        tenant_id: tenantId,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  return matchedTenant;
+}
+
 function constantTimeEquals(leftValue, rightValue) {
   const left = Buffer.from(String(leftValue || ''), 'utf8');
   const right = Buffer.from(String(rightValue || ''), 'utf8');
@@ -3813,6 +3877,12 @@ router.post('/refresh/bootstrap', async (req, res) => {
       tenantScope = await db.resolveTenantByCode(tenantScopeCode);
     } else if (tenantScopeId) {
       tenantScope = await db.resolveTenantById(tenantScopeId);
+    }
+    if (!tenantScope) {
+      tenantScope = await findLegacySessionTenantScope({
+        sessionId: currentSessionId,
+        userId: tokenUserId,
+      });
     }
     if ((tenantScopeCode || tenantScopeId) && !tenantScope) {
       return res.status(401).json({ error: 'Арендатор сессии не найден' });

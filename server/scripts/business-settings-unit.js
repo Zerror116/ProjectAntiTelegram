@@ -172,6 +172,22 @@ function testAuthRecoveryUsesScopedEmailTokens() {
   assert.match(source, /db\.runWithTenantRow\(scopedTenant/);
 }
 
+function testLegacyBootstrapScansTenantSessionScopes() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  assert.match(authRoute, /async function findLegacySessionTenantScope/);
+  assert.match(authRoute, /db\.isIsolatedTenantRow\(tenantRow\)/);
+  assert.match(authRoute, /db\.isSchemaIsolatedTenantRow\(tenantRow\)/);
+  assert.match(authRoute, /getUserSessionBySessionId\(\{\s*queryable: db,/);
+  assert.match(authRoute, /String\(session\.user_id \|\| ''\)\.trim\(\) === normalizedUserId/);
+  assert.match(
+    authRoute,
+    /router\.post\('\/refresh\/bootstrap'[\s\S]*findLegacySessionTenantScope/,
+  );
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -456,6 +472,7 @@ testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();
 testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
+testLegacyBootstrapScansTenantSessionScopes();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
