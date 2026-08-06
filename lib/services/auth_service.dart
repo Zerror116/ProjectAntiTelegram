@@ -564,6 +564,7 @@ class AuthService {
       'refresh_token': refreshToken,
       'access_expires_at': accessExpiresAt,
       'session_expires_at': sessionExpiresAt,
+      'user_id': user.id,
       'email': user.email,
       'name': user.name ?? '',
       'role': user.role,
@@ -614,12 +615,56 @@ class AuthService {
     );
     if (token.isEmpty) return false;
 
+    final previousToken = await getToken();
+    final previousRefreshToken = await getRefreshToken();
+    final previousAccessExpiresAt = await getAccessTokenExpiry();
+    final previousSessionExpiresAt = await getSessionExpiry();
+    final previousUser = _currentUser;
+
+    Future<void> restorePreviousSession() async {
+      final rollbackToken = previousToken?.trim() ?? '';
+      if (rollbackToken.isEmpty) {
+        await clearToken();
+        return;
+      }
+      await setSessionTokens(
+        accessToken: rollbackToken,
+        refreshToken: previousRefreshToken,
+        accessExpiresAt: previousAccessExpiresAt,
+        sessionExpiresAt: previousSessionExpiresAt,
+        user: previousUser,
+        keepExistingRefreshToken: false,
+      );
+    }
+
+    final pendingUser = User(
+      id: (found['user_id'] ?? '').toString().trim(),
+      email: (found['email'] ?? '').toString().trim(),
+      name: (() {
+        final value = (found['name'] ?? '').toString().trim();
+        return value.isEmpty ? null : value;
+      })(),
+      role: (found['role'] ?? 'client').toString().trim().isEmpty
+          ? 'client'
+          : (found['role'] ?? 'client').toString().trim(),
+      tenantCode: (() {
+        final value = (found['tenant_code'] ?? '').toString().trim();
+        return value.isEmpty ? null : value;
+      })(),
+      tenantName: (() {
+        final value = (found['tenant_name'] ?? '').toString().trim();
+        return value.isEmpty ? null : value;
+      })(),
+    );
+
     try {
       await setSessionTokens(
         accessToken: token,
         refreshToken: refreshToken.isEmpty ? null : refreshToken,
         accessExpiresAt: accessExpiresAt,
         sessionExpiresAt: sessionExpiresAt,
+        user: pendingUser,
+        keepExistingRefreshToken: false,
       );
       final refreshed = await ensureFreshSession(
         allowBootstrap: true,
@@ -627,6 +672,7 @@ class AuthService {
       );
       if (!refreshed) {
         await removeSavedTenantSession(id);
+        await restorePreviousSession();
         return false;
       }
       final resp = await dio.get('/api/profile');
@@ -655,9 +701,11 @@ class AuthService {
         return true;
       }
       await removeSavedTenantSession(id);
+      await restorePreviousSession();
       return false;
     } catch (_) {
       await removeSavedTenantSession(id);
+      await restorePreviousSession();
       return false;
     }
   }
@@ -1786,6 +1834,7 @@ class AuthService {
       final resp = await dio.post(
         '/api/auth/refresh/bootstrap',
         options: Options(
+          headers: {'Authorization': 'Bearer $token'},
           sendTimeout: const Duration(seconds: 8),
           receiveTimeout: const Duration(seconds: 8),
         ),
