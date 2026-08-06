@@ -8,7 +8,7 @@ SERVER="${SERVER:-root@89.23.99.18}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/opt/fenix}"
 REMOTE_TMP_DIR="${REMOTE_TMP_DIR:-/tmp/garphoenix-web}"
 REMOTE_WEB_ROOT="${REMOTE_WEB_ROOT:-/var/www/garphoenix.com}"
-REMOTE_DOWNLOADS_DIR="${REMOTE_DOWNLOADS_DIR:-$REMOTE_PROJECT_DIR/server/downloads}"
+REMOTE_DOWNLOADS_DIR="${REMOTE_DOWNLOADS_DIR:-/opt/fenix-data/downloads}"
 REMOTE_SERVICE="${REMOTE_SERVICE:-auto}"
 BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
@@ -43,7 +43,7 @@ Important env vars:
   SSH_PASSWORD=...                 # optional; requires sshpass
   REMOTE_PROJECT_DIR=/opt/fenix
   REMOTE_WEB_ROOT=/var/www/garphoenix.com
-  REMOTE_DOWNLOADS_DIR=/opt/fenix/server/downloads
+  REMOTE_DOWNLOADS_DIR=/opt/fenix-data/downloads
   BRANCH=master
   REMOTE_SERVICE=auto              # or explicit, e.g. fenix-api.service
   RUN_ANALYZE=1                    # set 0 to skip flutter analyze

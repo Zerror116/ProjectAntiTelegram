@@ -50,7 +50,7 @@ Usage:
 Env vars:
   SERVER=root@89.23.99.18
   REMOTE_PROJECT_DIR=/opt/fenix
-  REMOTE_DOWNLOADS_DIR=/opt/fenix/server/downloads
+  REMOTE_DOWNLOADS_DIR=/opt/fenix-data/downloads
   PUBLIC_BASE_URL=https://garphoenix.com
   SSH_PASSWORD=...                     # optional, requires sshpass
   FLUTTER_BIN=/opt/homebrew/bin/flutter
