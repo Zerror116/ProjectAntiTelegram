@@ -298,6 +298,24 @@ function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   );
 }
 
+function testGithubCiRunsReleaseGuards() {
+  const workflowPaths = [
+    path.resolve(__dirname, "../../.github/workflows/security-ci.yml"),
+    path.resolve(__dirname, "../../.github/workflows/nightly-self-audit.yml"),
+  ];
+
+  for (const workflowPath of workflowPaths) {
+    const workflow = fs.readFileSync(workflowPath, "utf8");
+    assert.match(
+      workflow,
+      /npm run --prefix server test:business:settings/,
+      workflowPath,
+    );
+    assert.match(workflow, /bash -n scripts\/full_cluster_audit\.sh/, workflowPath);
+    assert.match(workflow, /bash -n scripts\/release_with_audit\.sh/, workflowPath);
+  }
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -588,6 +606,7 @@ testManualRevisionUsesManualShelfKeys();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
+testGithubCiRunsReleaseGuards();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();

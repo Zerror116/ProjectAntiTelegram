@@ -60,8 +60,13 @@ jobs:
       - name: Shell syntax check
         run: |
           bash -n scripts/deploy_full.sh
+          bash -n scripts/full_cluster_audit.sh
+          bash -n scripts/release_with_audit.sh
           bash -n scripts/release_android_update.sh
           bash -n scripts/prod_health_check.sh
+
+      - name: Business guard checks
+        run: npm run --prefix server test:business:settings
 
       - name: NPM audit gate
         run: npm run --prefix server audit:gate
