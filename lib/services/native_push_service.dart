@@ -173,6 +173,9 @@ class NativePushService {
   static StreamSubscription<RemoteMessage>? _openedSub;
   static String? _cachedFcmToken;
   static bool _endpointSyncEnabled = true;
+  static String? _lastEndpointSyncUserId;
+  static Map<String, dynamic>? _lastEndpointRuntimePolicySnapshot;
+  static String? _lastEndpointDeviceProfile;
 
   static bool get isSupported {
     if (kIsWeb) return false;
@@ -209,7 +212,14 @@ class NativePushService {
         _cachedFcmToken = token.trim().isEmpty ? null : token.trim();
         final localDio = _dio;
         if (_endpointSyncEnabled && localDio != null) {
-          unawaited(syncCurrentEndpoint(localDio));
+          unawaited(
+            syncCurrentEndpoint(
+              localDio,
+              userId: _lastEndpointSyncUserId,
+              runtimePolicySnapshot: _lastEndpointRuntimePolicySnapshot,
+              deviceProfile: _lastEndpointDeviceProfile,
+            ),
+          );
         }
       });
       _foregroundSub = FirebaseMessaging.onMessage.listen((message) async {
@@ -392,6 +402,19 @@ class NativePushService {
     Map<String, dynamic>? runtimePolicySnapshot,
     String? deviceProfile,
   }) async {
+    if (userId != null ||
+        runtimePolicySnapshot != null ||
+        deviceProfile != null) {
+      _lastEndpointSyncUserId = userId;
+      _lastEndpointRuntimePolicySnapshot = runtimePolicySnapshot == null
+          ? null
+          : Map<String, dynamic>.from(runtimePolicySnapshot);
+      _lastEndpointDeviceProfile = deviceProfile;
+    }
+    final effectiveRuntimePolicySnapshot =
+        runtimePolicySnapshot ?? _lastEndpointRuntimePolicySnapshot;
+    final effectiveDeviceProfile = deviceProfile ?? _lastEndpointDeviceProfile;
+
     if (!isSupported) return;
     if (!_endpointSyncEnabled) return;
     await _ensureFirebaseInitialized();
@@ -414,10 +437,11 @@ class NativePushService {
           'permission_state': await _permissionState(),
           'capabilities': _capabilities(),
           'app_runtime_policy': _defaultRuntimePolicy(
-            enabled: runtimePolicySnapshot?['enabled'] != false,
-            snapshot: runtimePolicySnapshot,
+            enabled: effectiveRuntimePolicySnapshot?['enabled'] != false,
+            snapshot: effectiveRuntimePolicySnapshot,
           ),
-          'device_profile': (deviceProfile ?? _defaultDeviceProfile()).trim(),
+          'device_profile': (effectiveDeviceProfile ?? _defaultDeviceProfile())
+              .trim(),
           'app_version': '${packageInfo.version}+${packageInfo.buildNumber}',
           'locale': PlatformDispatcher.instance.locale.toLanguageTag(),
           'timezone': await resolveLocalTimeZoneId(),
@@ -432,6 +456,9 @@ class NativePushService {
     Dio dio, {
     String? userId,
   }) async {
+    _lastEndpointSyncUserId = null;
+    _lastEndpointRuntimePolicySnapshot = null;
+    _lastEndpointDeviceProfile = null;
     if (!isSupported) return;
     final token = _cachedFcmToken?.trim();
     if (token == null || token.isEmpty) return;

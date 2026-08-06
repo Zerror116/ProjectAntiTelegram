@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'notification_coordinator_service.dart';
@@ -77,7 +78,13 @@ class NotificationRuntimePolicy {
 class NotificationRuntimePreferenceService {
   const NotificationRuntimePreferenceService._();
 
-  static Future<NotificationRuntimePolicy>? _policyRefreshInFlight;
+  static final Map<String, Future<NotificationRuntimePolicy>>
+  _policyRefreshInFlightByScope = <String, Future<NotificationRuntimePolicy>>{};
+
+  @visibleForTesting
+  static void debugResetForTests() {
+    _policyRefreshInFlightByScope.clear();
+  }
 
   static String settingsScopeUserId(String? userId) {
     final normalized = (userId ?? '').trim();
@@ -157,7 +164,8 @@ class NotificationRuntimePreferenceService {
     Dio dio, {
     String? userId,
   }) async {
-    final inFlight = _policyRefreshInFlight;
+    final scope = settingsScopeUserId(userId);
+    final inFlight = _policyRefreshInFlightByScope[scope];
     if (inFlight != null) return inFlight;
     final future = (() async {
       try {
@@ -177,12 +185,12 @@ class NotificationRuntimePreferenceService {
         return getCachedPolicyForUser(userId);
       }
     })();
-    _policyRefreshInFlight = future;
+    _policyRefreshInFlightByScope[scope] = future;
     try {
       return await future;
     } finally {
-      if (identical(_policyRefreshInFlight, future)) {
-        _policyRefreshInFlight = null;
+      if (identical(_policyRefreshInFlightByScope[scope], future)) {
+        _policyRefreshInFlightByScope.remove(scope);
       }
     }
   }

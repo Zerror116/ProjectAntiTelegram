@@ -12,13 +12,20 @@ class NotificationDeviceService {
   const NotificationDeviceService._();
 
   static Future<void>? _syncInFlight;
-  static bool _syncRetryRequested = false;
+  static _NotificationDeviceSyncRequest? _pendingSyncRequest;
   static Map<String, dynamic> _lastSyncSnapshot = const <String, dynamic>{
     'status': 'idle',
   };
 
   static Map<String, dynamic> get lastSyncSnapshot =>
       Map<String, dynamic>.from(_lastSyncSnapshot);
+
+  @visibleForTesting
+  static void debugResetForTests() {
+    _syncInFlight = null;
+    _pendingSyncRequest = null;
+    _lastSyncSnapshot = const <String, dynamic>{'status': 'idle'};
+  }
 
   static String _platformName() {
     if (kIsWeb) return 'web';
@@ -152,19 +159,26 @@ class NotificationDeviceService {
     Map<String, dynamic>? runtimePolicySnapshot,
     String? deviceProfile,
   }) async {
+    _pendingSyncRequest = _NotificationDeviceSyncRequest(
+      dio: dio,
+      userId: userId,
+      runtimePolicySnapshot: runtimePolicySnapshot,
+      deviceProfile: deviceProfile,
+    );
     if (_syncInFlight != null) {
-      _syncRetryRequested = true;
       return _syncInFlight!;
     }
     final future = (() async {
-      do {
-        _syncRetryRequested = false;
+      while (true) {
+        final current = _pendingSyncRequest;
+        if (current == null) return;
+        _pendingSyncRequest = null;
         try {
           await _syncCurrentEndpointNow(
-            dio,
-            userId: userId,
-            runtimePolicySnapshot: runtimePolicySnapshot,
-            deviceProfile: deviceProfile,
+            current.dio,
+            userId: current.userId,
+            runtimePolicySnapshot: current.runtimePolicySnapshot,
+            deviceProfile: current.deviceProfile,
           );
         } catch (e) {
           _lastSyncSnapshot = <String, dynamic>{
@@ -177,7 +191,7 @@ class NotificationDeviceService {
             'NotificationDeviceService.syncCurrentEndpoint skipped: $e',
           );
         }
-      } while (_syncRetryRequested);
+      }
     })();
     _syncInFlight = future;
     try {
@@ -222,4 +236,18 @@ class NotificationDeviceService {
       );
     }
   }
+}
+
+class _NotificationDeviceSyncRequest {
+  const _NotificationDeviceSyncRequest({
+    required this.dio,
+    required this.userId,
+    required this.runtimePolicySnapshot,
+    required this.deviceProfile,
+  });
+
+  final Dio dio;
+  final String? userId;
+  final Map<String, dynamic>? runtimePolicySnapshot;
+  final String? deviceProfile;
 }

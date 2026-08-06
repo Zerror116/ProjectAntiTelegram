@@ -11,7 +11,13 @@ class NotificationCoordinatorService {
   const NotificationCoordinatorService._();
 
   static Future<void>? _reconcileInFlight;
-  static bool _nextEnabledState = true;
+  static _NotificationReconcileRequest? _pendingRequest;
+
+  @visibleForTesting
+  static void debugResetForTests() {
+    _reconcileInFlight = null;
+    _pendingRequest = null;
+  }
 
   static Future<void> reconcile(
     Dio dio, {
@@ -20,7 +26,13 @@ class NotificationCoordinatorService {
     Map<String, dynamic>? runtimePolicySnapshot,
     String? deviceProfile,
   }) async {
-    _nextEnabledState = enabled;
+    _pendingRequest = _NotificationReconcileRequest(
+      dio: dio,
+      enabled: enabled,
+      userId: userId,
+      runtimePolicySnapshot: runtimePolicySnapshot,
+      deviceProfile: deviceProfile,
+    );
     final inFlight = _reconcileInFlight;
     if (inFlight != null) {
       await inFlight;
@@ -28,17 +40,18 @@ class NotificationCoordinatorService {
     }
 
     final future = (() async {
-      bool currentEnabled;
-      do {
-        currentEnabled = _nextEnabledState;
+      while (true) {
+        final current = _pendingRequest;
+        if (current == null) return;
+        _pendingRequest = null;
         await _applyOnce(
-          dio,
-          enabled: currentEnabled,
-          userId: userId,
-          runtimePolicySnapshot: runtimePolicySnapshot,
-          deviceProfile: deviceProfile,
+          current.dio,
+          enabled: current.enabled,
+          userId: current.userId,
+          runtimePolicySnapshot: current.runtimePolicySnapshot,
+          deviceProfile: current.deviceProfile,
         );
-      } while (_nextEnabledState != currentEnabled);
+      }
     })();
 
     _reconcileInFlight = future;
@@ -117,4 +130,20 @@ class NotificationCoordinatorService {
       } catch (_) {}
     }
   }
+}
+
+class _NotificationReconcileRequest {
+  const _NotificationReconcileRequest({
+    required this.dio,
+    required this.enabled,
+    required this.userId,
+    required this.runtimePolicySnapshot,
+    required this.deviceProfile,
+  });
+
+  final Dio dio;
+  final bool enabled;
+  final String? userId;
+  final Map<String, dynamic>? runtimePolicySnapshot;
+  final String? deviceProfile;
 }
