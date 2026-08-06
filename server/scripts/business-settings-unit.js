@@ -352,6 +352,9 @@ function testUploadRecoveryScriptsAreTenantAware() {
   );
   assert.match(audit, /function scopeMetadata/);
   assert.match(audit, /scope_key/);
+  assert.match(audit, /summaryOnly/);
+  assert.match(audit, /--summary-only/);
+  assert.match(audit, /if \(!args\.summaryOnly\)/);
   assert.match(audit, /db_mode IN \('isolated', 'schema_isolated'\)/);
   assert.match(audit, /db\.runWithTenantRow\(scope\.tenantRow \|\| null/);
   assert.match(audit, /db\.closeAllPools\(\)/);
@@ -378,6 +381,22 @@ function testUploadRecoveryScriptsAreTenantAware() {
   assert.match(relink, /db\.runWithTenantRow\(tenantRow, fn\)/);
   assert.match(relink, /relinkEntriesInCurrentScope/);
   assert.doesNotMatch(relink, /db\.platformConnect\(\)/);
+}
+
+function testNightlyAuditChecksUploadRecoveryHealth() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /function checkUploadRecoveryHealth/);
+  assert.match(source, /uploads_recovery_audit\.js/);
+  assert.match(source, /--missing-only/);
+  assert.match(source, /--summary-only/);
+  assert.match(source, /uploads\.recovery\.missing_refs/);
+  assert.match(source, /uploads\.recovery\.healthy/);
+  assert.match(source, /scopes_checked/);
+  assert.match(source, /entries_checked/);
+  assert.match(source, /checkUploadRecoveryHealth\(\)/);
 }
 
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
@@ -741,6 +760,7 @@ testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();
+testNightlyAuditChecksUploadRecoveryHealth();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();

@@ -15,6 +15,7 @@ function parseArgs(argv) {
     output: path.resolve(process.cwd(), "tmp/uploads-recovery-manifest.json"),
     missingOnly: false,
     pretty: true,
+    summaryOnly: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -31,8 +32,13 @@ function parseArgs(argv) {
       args.pretty = false;
       continue;
     }
+    if (token === "--summary-only") {
+      args.summaryOnly = true;
+      args.pretty = false;
+      continue;
+    }
     if (token === "-h" || token === "--help") {
-      console.log(`Usage: node server/scripts/uploads_recovery_audit.js [--output FILE] [--missing-only] [--compact]`);
+      console.log(`Usage: node server/scripts/uploads_recovery_audit.js [--output FILE] [--missing-only] [--compact] [--summary-only]`);
       process.exit(0);
     }
   }
@@ -435,14 +441,17 @@ async function main() {
     generated_at: new Date().toISOString(),
     uploads_root: uploadsRoot,
     missing_only: args.missingOnly,
+    summary_only: args.summaryOnly,
     entry_count: filtered.length,
     skipped_count: skipped.length,
     scopes_checked: scopes.length,
     scopes: scopeStats,
     summary,
-    entries: filtered,
-    skipped,
   };
+  if (!args.summaryOnly) {
+    payload.entries = filtered;
+    payload.skipped = skipped;
+  }
 
   fs.mkdirSync(path.dirname(args.output), { recursive: true });
   fs.writeFileSync(

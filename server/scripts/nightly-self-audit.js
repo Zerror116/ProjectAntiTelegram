@@ -2,7 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 const { Pool } = require("pg");
 const db = require("../src/db");
 const {
@@ -312,6 +312,80 @@ function runMaintenanceCommand(command, successCode, failureCode, message) {
       stdout: String(err?.stdout || "").trim().slice(0, 1000),
       stderr: String(err?.stderr || "").trim().slice(0, 1000),
     });
+  }
+}
+
+function checkUploadRecoveryHealth() {
+  const serverDir = path.resolve(__dirname, "..");
+  const outputPath = path.resolve(
+    serverDir,
+    "audit/uploads-recovery-summary.json",
+  );
+  try {
+    execFileSync(
+      "node",
+      [
+        "scripts/uploads_recovery_audit.js",
+        "--missing-only",
+        "--summary-only",
+        "--output",
+        outputPath,
+      ],
+      {
+        cwd: serverDir,
+        stdio: "pipe",
+        encoding: "utf8",
+        maxBuffer: 32 * 1024 * 1024,
+      },
+    );
+    const parsed = readJsonFile(outputPath);
+    if (parsed.__parse_error) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "uploads.recovery.invalid_summary",
+        "Uploads recovery summary JSON could not be parsed",
+        {
+          error: parsed.__parse_error.slice(0, 300),
+        },
+      );
+      return;
+    }
+
+    const summary = parsed.summary || {};
+    const details = {
+      scopes_checked: Number(parsed.scopes_checked || 0) || 0,
+      entries_checked: (Array.isArray(parsed.scopes) ? parsed.scopes : [])
+        .reduce((sum, row) => sum + (Number(row?.entries || 0) || 0), 0),
+      missing: Number(summary.missing || 0) || 0,
+      skipped: Number(parsed.skipped_count || 0) || 0,
+      by_kind: summary.by_kind || {},
+    };
+
+    if (details.missing > 0 || details.skipped > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "uploads.recovery.missing_refs",
+        "One or more upload references are missing across database targets",
+        details,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "uploads.recovery.healthy",
+      "Upload references are present across database targets",
+      details,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "uploads.recovery.check_failed",
+      "Uploads recovery health check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+      },
+    );
   }
 }
 
@@ -1205,6 +1279,7 @@ async function main() {
     "perf.budget.failed",
     "Performance budget smoke",
   );
+  checkUploadRecoveryHealth();
   await checkMonitoringBacklog();
   await checkNotificationQueueHealth();
   await checkTenantFeaturePolicy();
