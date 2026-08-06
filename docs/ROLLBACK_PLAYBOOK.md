@@ -4,7 +4,7 @@
 This playbook covers rollback for:
 - backend code in `/opt/fenix/server`
 - web build in `/var/www/garphoenix.com`
-- Android update manifest under `/opt/fenix/server/downloads`
+- Android update manifest under `/opt/fenix-data/downloads`
 
 It explicitly does **not** delete or rewrite `/opt/fenix-data`.
 
@@ -35,8 +35,11 @@ Restore only by copying files from `/opt/fenix-backups/storage/<timestamp>/` bac
 Do not delete current storage during restore.
 
 ## Android manifest rollback
-1. Restore the previous manifest and APK file from `/opt/fenix/server/downloads` backup.
-2. Re-run `scripts/prod_health_check.sh`.
+1. Restore only the previous `android-stable.release.json` and referenced APK
+   from `/opt/fenix-backups/storage/<timestamp>/downloads/` into
+   `/opt/fenix-data/downloads/`.
+2. Keep file ownership readable by the `fenix` service user.
+3. Re-run `scripts/prod_health_check.sh`.
 
 ## Hard rules
 - Never run destructive sync against `/opt/fenix-data`.

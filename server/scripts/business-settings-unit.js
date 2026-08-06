@@ -223,6 +223,44 @@ function testPhoneAccessDefaultDoesNotRestrictMissingTenant() {
   assert.match(authUtil, /if \(!normalizedTenantId\) return false/);
 }
 
+function testAndroidReleaseUsesProductionDownloadsRoot() {
+  const files = [
+    path.resolve(__dirname, "../../scripts/deploy_full.sh"),
+    path.resolve(__dirname, "../../scripts/release_android_update.sh"),
+    path.resolve(__dirname, "../../scripts/ANDROID_UPDATE_RELEASE.md"),
+    path.resolve(__dirname, "../../docs/ROLLBACK_PLAYBOOK.md"),
+    path.resolve(__dirname, "../.env.example"),
+    path.resolve(__dirname, "../.env.local.example"),
+  ];
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(source, /\/opt\/fenix\/server\/downloads/);
+    assert.doesNotMatch(source, /fenix-1\.0\.1\.apk/);
+  }
+
+  const deployFull = fs.readFileSync(
+    path.resolve(__dirname, "../../scripts/deploy_full.sh"),
+    "utf8",
+  );
+  const releaseAndroid = fs.readFileSync(
+    path.resolve(__dirname, "../../scripts/release_android_update.sh"),
+    "utf8",
+  );
+  const rollbackPlaybook = fs.readFileSync(
+    path.resolve(__dirname, "../../docs/ROLLBACK_PLAYBOOK.md"),
+    "utf8",
+  );
+  assert.match(
+    deployFull,
+    /REMOTE_DOWNLOADS_DIR="\$\{REMOTE_DOWNLOADS_DIR:-\/opt\/fenix-data\/downloads\}"/,
+  );
+  assert.match(
+    releaseAndroid,
+    /REMOTE_DOWNLOADS_DIR="\$\{REMOTE_DOWNLOADS_DIR:-\/opt\/fenix-data\/downloads\}"/,
+  );
+  assert.match(rollbackPlaybook, /\/opt\/fenix-data\/downloads/);
+}
+
 testDefaults();
 testCityListPersistence();
 testTopLevelAndNestedFlags();
@@ -235,5 +273,6 @@ testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
+testAndroidReleaseUsesProductionDownloadsRoot();
 
 console.log("business-settings-unit: ok");
