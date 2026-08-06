@@ -924,6 +924,220 @@ async function checkAuthSessionHealth() {
   }
 }
 
+async function checkAuthIdentityIntegrity() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    duplicate_active_email_groups: 0,
+    duplicate_active_email_users: 0,
+    duplicate_active_phone_groups: 0,
+    duplicate_active_phone_users: 0,
+    phone_rows_without_user: 0,
+    active_sessions_for_inactive_users: 0,
+    active_notification_endpoints_for_inactive_users: 0,
+    pending_phone_requests_without_active_owner: 0,
+    pending_phone_requests_without_active_requester: 0,
+  };
+
+  const numericFields = [
+    "duplicate_active_email_groups",
+    "duplicate_active_email_users",
+    "duplicate_active_phone_groups",
+    "duplicate_active_phone_users",
+    "phone_rows_without_user",
+    "active_sessions_for_inactive_users",
+    "active_notification_endpoints_for_inactive_users",
+    "pending_phone_requests_without_active_owner",
+    "pending_phone_requests_without_active_requester",
+  ];
+  const hardDriftFields = [
+    "duplicate_active_email_groups",
+    "duplicate_active_email_users",
+    "phone_rows_without_user",
+    "active_sessions_for_inactive_users",
+    "active_notification_endpoints_for_inactive_users",
+  ];
+
+  async function readTargetStats() {
+    return await db.query(
+      `WITH active_users AS (
+         SELECT id,
+                COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) AS tenant_scope,
+                lower(NULLIF(BTRIM(email), '')) AS email_key
+           FROM users
+          WHERE COALESCE(is_active, true) = true
+       ),
+       duplicate_email_groups AS (
+         SELECT tenant_scope,
+                email_key,
+                COUNT(*)::int AS user_count
+           FROM active_users
+          WHERE email_key IS NOT NULL
+          GROUP BY tenant_scope, email_key
+         HAVING COUNT(*) > 1
+       ),
+       phone_rows AS (
+         SELECT p.id,
+                p.user_id,
+                COALESCE(u.tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) AS tenant_scope,
+                u.id IS NOT NULL AS has_user,
+                COALESCE(u.is_active, false) AS user_is_active,
+                RIGHT(regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g'), 10) AS phone_core10
+           FROM phones p
+           LEFT JOIN users u ON u.id = p.user_id
+       ),
+       duplicate_phone_groups AS (
+         SELECT tenant_scope,
+                phone_core10,
+                COUNT(DISTINCT user_id)::int AS user_count
+           FROM phone_rows
+          WHERE has_user = true
+            AND user_is_active = true
+            AND length(phone_core10) = 10
+          GROUP BY tenant_scope, phone_core10
+         HAVING COUNT(DISTINCT user_id) > 1
+       )
+       SELECT
+         COALESCE((SELECT COUNT(*)::int FROM duplicate_email_groups), 0)::int AS duplicate_active_email_groups,
+         COALESCE((SELECT SUM(user_count)::int FROM duplicate_email_groups), 0)::int AS duplicate_active_email_users,
+         COALESCE((SELECT COUNT(*)::int FROM duplicate_phone_groups), 0)::int AS duplicate_active_phone_groups,
+         COALESCE((SELECT SUM(user_count)::int FROM duplicate_phone_groups), 0)::int AS duplicate_active_phone_users,
+         COALESCE((SELECT COUNT(*)::int FROM phone_rows WHERE has_user = false), 0)::int AS phone_rows_without_user,
+         (
+           SELECT COUNT(*)::int
+             FROM user_sessions s
+             JOIN users u ON u.id = s.user_id
+            WHERE s.is_active = true
+              AND COALESCE(u.is_active, true) = false
+         ) AS active_sessions_for_inactive_users,
+         (
+           SELECT COUNT(*)::int
+             FROM notification_endpoints e
+             JOIN users u ON u.id = e.user_id
+            WHERE e.is_active = true
+              AND COALESCE(u.is_active, true) = false
+         ) AS active_notification_endpoints_for_inactive_users,
+         (
+           SELECT COUNT(*)::int
+             FROM phone_registration_requests r
+             LEFT JOIN users owner_user ON owner_user.id = r.owner_user_id
+            WHERE r.status = 'pending'
+              AND (
+                owner_user.id IS NULL
+                OR COALESCE(owner_user.is_active, true) = false
+              )
+         ) AS pending_phone_requests_without_active_owner,
+         (
+           SELECT COUNT(*)::int
+             FROM phone_registration_requests r
+             LEFT JOIN users requester_user ON requester_user.id = r.requester_user_id
+            WHERE r.status = 'pending'
+              AND (
+                requester_user.id IS NULL
+                OR COALESCE(requester_user.is_active, true) = false
+              )
+         ) AS pending_phone_requests_without_active_requester`,
+    );
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      const row = q.rows?.[0] || {};
+      for (const field of numericFields) {
+        totals[field] += Number(row[field] || 0) || 0;
+      }
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    const driftCount =
+      totals.unavailable_targets +
+      hardDriftFields.reduce((sum, field) => sum + totals[field], 0);
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "auth_identity.integrity_drift",
+        "Auth identity data has hard duplicate or stale active references",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "auth_identity.healthy",
+      "Auth identity hard references are healthy across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "auth_identity.check_failed",
+      "Auth identity integrity check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 async function checkTenantMigrationDrift() {
   const expected = listExpectedMigrationFiles();
   if (expected.length === 0) {
@@ -1896,6 +2110,7 @@ async function main() {
   await checkNotificationQueueHealth();
   await checkTenantFeaturePolicy();
   await checkAuthSessionHealth();
+  await checkAuthIdentityIntegrity();
   await checkTenantMigrationDrift();
   await checkTenantUserIndexDrift();
   await checkProductCartIntegrity();

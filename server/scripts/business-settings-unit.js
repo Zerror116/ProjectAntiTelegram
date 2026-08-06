@@ -364,6 +364,25 @@ function testNightlyAuditChecksAuthSessionsProjectWide() {
   assert.match(source, /await checkAuthSessionHealth\(\)/);
 }
 
+function testNightlyAuditChecksAuthIdentityProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkAuthIdentityIntegrity/);
+  assert.match(source, /auth_identity\.integrity_drift/);
+  assert.match(source, /auth_identity\.healthy/);
+  assert.match(source, /duplicate_active_email_groups/);
+  assert.match(source, /duplicate_active_phone_groups/);
+  assert.match(source, /const hardDriftFields = \[/);
+  assert.match(source, /active_sessions_for_inactive_users/);
+  assert.match(source, /active_notification_endpoints_for_inactive_users/);
+  assert.match(source, /pending_phone_requests_without_active_owner/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkAuthIdentityIntegrity\(\)/);
+}
+
 function testSessionBootstrapE2ECoversRefreshAndPersistentSessions() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "e2e-session-bootstrap-flow.js"),
@@ -847,6 +866,7 @@ testNightlyAuditChecksTenantMigrationDrift();
 testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
+testNightlyAuditChecksAuthIdentityProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();
 testNightlyAuditChecksUploadRecoveryHealth();
