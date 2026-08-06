@@ -390,35 +390,120 @@ function checkUploadRecoveryHealth() {
 }
 
 async function checkMonitoringBacklog() {
-  try {
-    const unresolvedCritical = await db.query(
-      `SELECT COUNT(*)::int AS count
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    unresolved_recent: 0,
+  };
+
+  async function readTargetStats() {
+    return await db.query(
+      `SELECT COUNT(*)::int AS unresolved_recent
        FROM monitoring_events
        WHERE resolved = false
          AND level IN ('critical', 'error')
          AND created_at >= now() - interval '24 hours'`,
     );
-    const count = Number(unresolvedCritical.rows?.[0]?.count || 0);
-    if (count > 0) {
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      totals.unresolved_recent +=
+        Number(q.rows?.[0]?.unresolved_recent || 0) || 0;
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND COALESCE(status, 'active') = 'active'
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    if (totals.unavailable_targets > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "monitoring.unavailable_targets",
+        "Monitoring backlog check could not inspect every database target",
+        totals,
+      );
+      return;
+    }
+
+    if (totals.unresolved_recent > 0) {
       addFinding(
         "warn",
         "monitoring.unresolved_recent",
-        `There are ${count} unresolved monitoring events (error/critical) in the last 24h`,
+        `There are ${totals.unresolved_recent} unresolved monitoring events (error/critical) in the last 24h`,
+        totals,
       );
     } else {
       addFinding(
         "info",
         "monitoring.unresolved_recent",
         "No unresolved error/critical monitoring events in the last 24h",
+        totals,
       );
     }
   } catch (err) {
     addFinding(
-      "warn",
-      "monitoring.check_unavailable",
-      "Monitoring backlog check skipped (database unavailable)",
+      IS_PRODUCTION ? "critical" : "warn",
+      "monitoring.check_failed",
+      "Monitoring backlog check failed",
       {
         error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
       },
     );
   }

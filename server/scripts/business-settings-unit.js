@@ -278,6 +278,22 @@ function testNightlyAuditChecksNotificationQueueAcrossTenantScopes() {
   assert.match(source, /await checkNotificationQueueHealth\(\)/);
 }
 
+function testNightlyAuditChecksMonitoringBacklogAcrossTenantScopes() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkMonitoringBacklog/);
+  assert.match(source, /monitoring\.unresolved_recent/);
+  assert.match(source, /monitoring\.unavailable_targets/);
+  assert.match(source, /monitoring\.check_failed/);
+  assert.match(source, /unresolved_recent/);
+  assert.match(source, /unavailable_targets/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkMonitoringBacklog\(\)/);
+}
+
 function testNightlyAuditChecksTenantMigrationDrift() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -790,6 +806,7 @@ testManualRevisionUsesManualShelfKeys();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
 testNightlyAuditChecksNotificationQueueAcrossTenantScopes();
+testNightlyAuditChecksMonitoringBacklogAcrossTenantScopes();
 testNightlyAuditChecksTenantMigrationDrift();
 testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
