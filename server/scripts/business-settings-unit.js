@@ -345,6 +345,41 @@ function testSessionBootstrapE2ECoversRefreshAndPersistentSessions() {
   assert.match(source, /assertPersistentAuthPayload\(root, 'bootstrap'\)/);
 }
 
+function testUploadRecoveryScriptsAreTenantAware() {
+  const audit = fs.readFileSync(
+    path.resolve(__dirname, "uploads_recovery_audit.js"),
+    "utf8",
+  );
+  assert.match(audit, /function scopeMetadata/);
+  assert.match(audit, /scope_key/);
+  assert.match(audit, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(audit, /db\.runWithTenantRow\(scope\.tenantRow \|\| null/);
+  assert.match(audit, /db\.closeAllPools\(\)/);
+  assert.doesNotMatch(audit, /db\.platformQuery\(sql\)/);
+
+  const placeholders = fs.readFileSync(
+    path.resolve(__dirname, "uploads_recovery_apply_placeholders.js"),
+    "utf8",
+  );
+  assert.match(placeholders, /function groupEntriesByScope/);
+  assert.match(placeholders, /async function runWithManifestScope/);
+  assert.match(placeholders, /db\.resolveTenantById\(tenantId\)/);
+  assert.match(placeholders, /db\.runWithTenantRow\(tenantRow, fn\)/);
+  assert.match(placeholders, /applyPlaceholderEntriesInCurrentScope/);
+  assert.doesNotMatch(placeholders, /db\.platformConnect\(\)/);
+
+  const relink = fs.readFileSync(
+    path.resolve(__dirname, "uploads_recovery_relink_restored.js"),
+    "utf8",
+  );
+  assert.match(relink, /function groupEntriesByScope/);
+  assert.match(relink, /async function runWithManifestScope/);
+  assert.match(relink, /db\.resolveTenantById\(tenantId\)/);
+  assert.match(relink, /db\.runWithTenantRow\(tenantRow, fn\)/);
+  assert.match(relink, /relinkEntriesInCurrentScope/);
+  assert.doesNotMatch(relink, /db\.platformConnect\(\)/);
+}
+
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const fullAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
@@ -705,6 +740,7 @@ testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
+testUploadRecoveryScriptsAreTenantAware();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();

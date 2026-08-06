@@ -51,7 +51,7 @@ function productLikeMessageKindExpression() {
 
 async function queryRows(sql, label) {
   try {
-    const result = await db.platformQuery(sql);
+    const result = await db.query(sql);
     return result.rows || [];
   } catch (err) {
     console.error(`[uploads_recovery_audit] skipped ${label}: ${err.message}`);
@@ -59,10 +59,21 @@ async function queryRows(sql, label) {
   }
 }
 
-function pushEntry(entries, skipped, payload) {
+function scopeMetadata(scope) {
+  const scopeKey = cleanString(scope?.scopeKey) || "platform";
+  return {
+    scope_key: scopeKey,
+    scope_type: cleanString(scope?.scopeType) || "platform",
+    tenant_id: cleanString(scope?.tenantId) || null,
+    db_mode: cleanString(scope?.dbMode) || "platform",
+  };
+}
+
+function pushEntry(entries, skipped, scope, payload) {
   const entry = buildManifestEntry(payload);
   if (!entry) {
     skipped.push({
+      ...scopeMetadata(scope),
       kind: cleanString(payload.kind),
       record_id: cleanString(payload.recordId),
       field: cleanString(payload.field),
@@ -71,14 +82,13 @@ function pushEntry(entries, skipped, payload) {
     });
     return;
   }
-  entries.push(entry);
+  entries.push({
+    ...scopeMetadata(scope),
+    ...entry,
+  });
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const entries = [];
-  const skipped = [];
-
+async function collectScopeEntries(scope, entries, skipped) {
   const productRows = await queryRows(
     `SELECT id::text AS record_id,
             image_url AS original_url
@@ -87,7 +97,7 @@ async function main() {
     "products.image_url",
   );
   for (const row of productRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "product_image",
       recordId: row.record_id,
       field: "image_url",
@@ -103,7 +113,7 @@ async function main() {
     "users.avatar_url",
   );
   for (const row of userAvatarRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "user_avatar",
       recordId: row.record_id,
       field: "avatar_url",
@@ -119,7 +129,7 @@ async function main() {
     "chats.settings.avatar_url",
   );
   for (const row of chatAvatarRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "chat_avatar",
       recordId: row.record_id,
       field: "settings.avatar_url",
@@ -135,7 +145,7 @@ async function main() {
     "customer_claims.image_url",
   );
   for (const row of claimRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "claim_image",
       recordId: row.record_id,
       field: "image_url",
@@ -156,7 +166,7 @@ async function main() {
     "message_attachments.storage_url",
   );
   for (const row of attachmentStorageRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "attachment_storage",
       recordId: row.record_id,
       field: "storage_url",
@@ -180,7 +190,7 @@ async function main() {
     "message_attachments.preview_image_url",
   );
   for (const row of attachmentPreviewRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "attachment_preview",
       recordId: row.record_id,
       field: "preview_image_url",
@@ -200,7 +210,7 @@ async function main() {
     "messages.meta.product_image_url",
   );
   for (const row of messageProductImageRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "message_product_image",
       recordId: row.record_id,
       field: "meta.product_image_url",
@@ -221,7 +231,7 @@ async function main() {
     "messages.meta.image_url",
   );
   for (const row of messageImageRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: row.is_product_like ? "message_product_image" : "message_chat_image",
       recordId: row.record_id,
       field: "meta.image_url",
@@ -242,7 +252,7 @@ async function main() {
     "messages.meta.preview_image_url",
   );
   for (const row of messagePreviewRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "message_preview_image",
       recordId: row.record_id,
       field: "meta.preview_image_url",
@@ -262,7 +272,7 @@ async function main() {
     "messages.meta.video_preview_image_url",
   );
   for (const row of messageVideoPreviewRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "message_video_preview_image",
       recordId: row.record_id,
       field: "meta.video_preview_image_url",
@@ -282,7 +292,7 @@ async function main() {
     "messages.meta.voice_url",
   );
   for (const row of messageVoiceRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "message_voice_media",
       recordId: row.record_id,
       field: "meta.voice_url",
@@ -302,7 +312,7 @@ async function main() {
     "messages.meta.video_url",
   );
   for (const row of messageVideoRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "message_video_media",
       recordId: row.record_id,
       field: "meta.video_url",
@@ -322,7 +332,7 @@ async function main() {
     "messages.meta.file_url",
   );
   for (const row of messageFileRows) {
-    pushEntry(entries, skipped, {
+    pushEntry(entries, skipped, scope, {
       kind: "message_file_media",
       recordId: row.record_id,
       field: "meta.file_url",
@@ -332,11 +342,86 @@ async function main() {
       },
     });
   }
+}
+
+async function loadTenantScopes() {
+  const result = await db.platformQuery(
+    `SELECT id,
+            db_mode,
+            db_url,
+            db_name,
+            db_schema
+     FROM tenants
+     WHERE COALESCE(is_deleted, false) = false
+       AND db_mode IN ('isolated', 'schema_isolated')
+     ORDER BY created_at`,
+  );
+  return (result.rows || [])
+    .map((tenant) => {
+      const tenantId = cleanString(tenant?.id);
+      const dbMode = cleanString(tenant?.db_mode).toLowerCase();
+      if (!tenantId || !dbMode) return null;
+      return {
+        scopeKey: `tenant:${tenantId}`,
+        scopeType: "tenant",
+        tenantId,
+        dbMode,
+        tenantRow: tenant,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const entries = [];
+  const skipped = [];
+  const scopeStats = [];
+
+  const platformScope = {
+    scopeKey: "platform",
+    scopeType: "platform",
+    tenantId: null,
+    dbMode: "platform",
+    tenantRow: null,
+  };
+  const scopes = [platformScope, ...(await loadTenantScopes())];
+
+  for (const scope of scopes) {
+    const beforeEntries = entries.length;
+    const beforeSkipped = skipped.length;
+    try {
+      await db.runWithTenantRow(scope.tenantRow || null, async () => {
+        await collectScopeEntries(scope, entries, skipped);
+      });
+    } catch (err) {
+      skipped.push({
+        ...scopeMetadata(scope),
+        kind: "scope",
+        record_id: "",
+        field: "",
+        original_url: "",
+        reason: "scope_unavailable",
+        error: cleanString(err?.message || err).slice(0, 300),
+      });
+    }
+    scopeStats.push({
+      ...scopeMetadata(scope),
+      entries: entries.length - beforeEntries,
+      skipped: skipped.length - beforeSkipped,
+    });
+  }
 
   const deduped = [];
   const seen = new Set();
   for (const entry of entries) {
-    const key = [entry.kind, entry.record_id, entry.field, entry.original_url].join("|");
+    const key = [
+      entry.scope_key,
+      entry.kind,
+      entry.record_id,
+      entry.field,
+      entry.original_url,
+    ].join("|");
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(entry);
@@ -352,6 +437,8 @@ async function main() {
     missing_only: args.missingOnly,
     entry_count: filtered.length,
     skipped_count: skipped.length,
+    scopes_checked: scopes.length,
+    scopes: scopeStats,
     summary,
     entries: filtered,
     skipped,
@@ -377,6 +464,6 @@ main()
   })
   .finally(async () => {
     try {
-      await db.platformPool.end();
+      await db.closeAllPools();
     } catch (_) {}
   });

@@ -59,6 +59,39 @@ function loadManifest(filePath) {
   throw new Error(`Unsupported manifest format: ${filePath}`);
 }
 
+function scopeKeyForEntry(entry) {
+  return cleanString(entry?.scope_key) || "platform";
+}
+
+function groupEntriesByScope(entries) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const scopeKey = scopeKeyForEntry(entry);
+    const current = groups.get(scopeKey) || [];
+    current.push(entry);
+    groups.set(scopeKey, current);
+  }
+  return groups;
+}
+
+async function runWithManifestScope(scopeKey, entries, fn) {
+  if (scopeKey === "platform") {
+    return db.runWithPlatform(fn);
+  }
+  const tenantId = cleanString(
+    entries.find((entry) => cleanString(entry?.tenant_id))?.tenant_id ||
+      scopeKey.replace(/^tenant:/, ""),
+  );
+  if (!tenantId) {
+    throw new Error(`Manifest scope ${scopeKey} has no tenant_id`);
+  }
+  const tenantRow = await db.resolveTenantById(tenantId);
+  if (!tenantRow) {
+    throw new Error(`Manifest tenant scope not found: ${tenantId}`);
+  }
+  return db.runWithTenantRow(tenantRow, fn);
+}
+
 function jsonClone(value) {
   return value && typeof value === "object"
     ? JSON.parse(JSON.stringify(value))
@@ -163,16 +196,8 @@ async function applyMessageMetaFallbacks(client, entries, placeholders, dryRun) 
   return changed;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const manifest = loadManifest(args.manifest);
-  const unresolved = (manifest.entries || []).filter(
-    (entry) => cleanString(entry.status) === "missing",
-  );
-
-  const placeholders = ensurePlaceholderAssets(args.publicBaseUrl);
-  const client = await db.platformConnect();
-  const stats = {
+function emptyStats() {
+  return {
     product_images: 0,
     user_avatars: 0,
     chat_avatars: 0,
@@ -180,11 +205,22 @@ async function main() {
     attachment_rows: 0,
     message_meta_rows: 0,
   };
+}
+
+function addStats(target, source) {
+  for (const key of Object.keys(emptyStats())) {
+    target[key] += Number(source[key] || 0) || 0;
+  }
+}
+
+async function applyPlaceholderEntriesInCurrentScope(entries, placeholders, dryRun) {
+  const client = await db.connect();
+  const stats = emptyStats();
 
   try {
     await client.query("BEGIN");
 
-    for (const entry of unresolved) {
+    for (const entry of entries) {
       const kind = cleanString(entry.kind);
       const recordId = cleanString(entry.record_id);
       const originalUrl = cleanString(entry.original_url);
@@ -245,7 +281,7 @@ async function main() {
 
     const attachmentIds = Array.from(
       new Set(
-        unresolved
+        entries
           .filter((entry) => ["attachment_storage", "attachment_preview"].includes(cleanString(entry.kind)))
           .map((entry) => cleanString(entry.record_id))
           .filter(Boolean),
@@ -270,12 +306,12 @@ async function main() {
 
     stats.message_meta_rows = await applyMessageMetaFallbacks(
       client,
-      unresolved.filter((entry) => cleanString(entry.field).startsWith("meta.")),
+      entries.filter((entry) => cleanString(entry.field).startsWith("meta.")),
       placeholders,
-      args.dryRun,
+      dryRun,
     );
 
-    if (args.dryRun) {
+    if (dryRun) {
       await client.query("ROLLBACK");
     } else {
       await client.query("COMMIT");
@@ -287,11 +323,44 @@ async function main() {
     client.release();
   }
 
+  return stats;
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const manifest = loadManifest(args.manifest);
+  const unresolved = (manifest.entries || []).filter(
+    (entry) => cleanString(entry.status) === "missing",
+  );
+
+  const placeholders = ensurePlaceholderAssets(args.publicBaseUrl);
+  const stats = emptyStats();
+  const scopeRuns = [];
+  const groups = groupEntriesByScope(unresolved);
+
+  for (const [scopeKey, entries] of groups.entries()) {
+    const scopeStats = await runWithManifestScope(scopeKey, entries, () =>
+      applyPlaceholderEntriesInCurrentScope(
+        entries,
+        placeholders,
+        args.dryRun,
+      ),
+    );
+    addStats(stats, scopeStats);
+    scopeRuns.push({
+      scope_key: scopeKey,
+      tenant_id: cleanString(entries[0]?.tenant_id) || null,
+      entries: entries.length,
+      applied: scopeStats,
+    });
+  }
+
   manifest.generated_at = new Date().toISOString();
   manifest.placeholder_run = {
     dry_run: args.dryRun,
     public_base_url: args.publicBaseUrl,
     placeholders,
+    scopes: scopeRuns,
     summary_before: summaryFromManifest(manifest.entries || []),
     applied: stats,
   };
@@ -308,6 +377,6 @@ main()
   })
   .finally(async () => {
     try {
-      await db.platformPool.end();
+      await db.closeAllPools();
     } catch (_) {}
   });

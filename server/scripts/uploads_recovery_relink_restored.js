@@ -44,6 +44,39 @@ function loadManifest(filePath) {
   throw new Error(`Unsupported manifest format: ${filePath}`);
 }
 
+function scopeKeyForEntry(entry) {
+  return cleanString(entry?.scope_key) || "platform";
+}
+
+function groupEntriesByScope(entries) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const scopeKey = scopeKeyForEntry(entry);
+    const current = groups.get(scopeKey) || [];
+    current.push(entry);
+    groups.set(scopeKey, current);
+  }
+  return groups;
+}
+
+async function runWithManifestScope(scopeKey, entries, fn) {
+  if (scopeKey === "platform") {
+    return db.runWithPlatform(fn);
+  }
+  const tenantId = cleanString(
+    entries.find((entry) => cleanString(entry?.tenant_id))?.tenant_id ||
+      scopeKey.replace(/^tenant:/, ""),
+  );
+  if (!tenantId) {
+    throw new Error(`Manifest scope ${scopeKey} has no tenant_id`);
+  }
+  const tenantRow = await db.resolveTenantById(tenantId);
+  if (!tenantRow) {
+    throw new Error(`Manifest tenant scope not found: ${tenantId}`);
+  }
+  return db.runWithTenantRow(tenantRow, fn);
+}
+
 function jsonClone(value) {
   return value && typeof value === "object" ? JSON.parse(JSON.stringify(value)) : {};
 }
@@ -92,11 +125,8 @@ async function relinkMessageMeta(client, entries, dryRun) {
   return changed;
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const manifest = loadManifest(args.manifest);
-  const entries = (manifest.entries || []).filter((entry) => fileExists(cleanString(entry.expected_path)));
-  const stats = {
+function emptyStats() {
+  return {
     product_images: 0,
     user_avatars: 0,
     chat_avatars: 0,
@@ -104,8 +134,18 @@ async function main() {
     attachment_rows: 0,
     message_meta_rows: 0,
   };
+}
 
-  const client = await db.platformConnect();
+function addStats(target, source) {
+  for (const key of Object.keys(emptyStats())) {
+    target[key] += Number(source[key] || 0) || 0;
+  }
+}
+
+async function relinkEntriesInCurrentScope(entries, dryRun) {
+  const stats = emptyStats();
+  const client = await db.connect();
+
   try {
     await client.query("BEGIN");
 
@@ -150,7 +190,7 @@ async function main() {
     }
     for (const [attachmentId, payload] of attachmentMap.entries()) {
       stats.attachment_rows += 1;
-      if (!args.dryRun) {
+      if (!dryRun) {
         await client.query(
           `UPDATE message_attachments
            SET storage_url = COALESCE($2, storage_url),
@@ -166,10 +206,10 @@ async function main() {
     stats.message_meta_rows = await relinkMessageMeta(
       client,
       entries.filter((entry) => cleanString(entry.field).startsWith('meta.')),
-      args.dryRun,
+      dryRun,
     );
 
-    if (args.dryRun) {
+    if (dryRun) {
       await client.query("ROLLBACK");
     } else {
       await client.query("COMMIT");
@@ -181,9 +221,34 @@ async function main() {
     client.release();
   }
 
+  return stats;
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const manifest = loadManifest(args.manifest);
+  const entries = (manifest.entries || []).filter((entry) => fileExists(cleanString(entry.expected_path)));
+  const stats = emptyStats();
+  const scopeRuns = [];
+  const groups = groupEntriesByScope(entries);
+
+  for (const [scopeKey, scopedEntries] of groups.entries()) {
+    const scopeStats = await runWithManifestScope(scopeKey, scopedEntries, () =>
+      relinkEntriesInCurrentScope(scopedEntries, args.dryRun),
+    );
+    addStats(stats, scopeStats);
+    scopeRuns.push({
+      scope_key: scopeKey,
+      tenant_id: cleanString(scopedEntries[0]?.tenant_id) || null,
+      entries: scopedEntries.length,
+      relinked: scopeStats,
+    });
+  }
+
   manifest.generated_at = new Date().toISOString();
   manifest.relink_run = {
     dry_run: args.dryRun,
+    scopes: scopeRuns,
     relinked: stats,
   };
   fs.writeFileSync(args.output, JSON.stringify(manifest, null, 2));
@@ -197,5 +262,5 @@ main()
     process.exit(1);
   })
   .finally(async () => {
-    try { await db.platformPool.end(); } catch (_) {}
+    try { await db.closeAllPools(); } catch (_) {}
   });
