@@ -425,7 +425,19 @@ async function checkMonitoringBacklog() {
 }
 
 async function checkNotificationQueueHealth() {
-  try {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    ready_count: 0,
+    stale_processing_count: 0,
+    failed_last_24h: 0,
+    failing_endpoints: 0,
+  };
+
+  async function readTargetStats() {
     const queueQ = await db.query(
       `SELECT
          COUNT(*) FILTER (
@@ -434,6 +446,13 @@ async function checkNotificationQueueHealth() {
              AND state IN ('queued', 'failed')
              AND COALESCE(next_attempt_at, now()) <= now()
          )::int AS ready_count,
+         COUNT(*) FILTER (
+           WHERE channel = 'push'
+             AND queue_name = 'push'
+             AND state IN ('queued', 'failed')
+             AND processing_started_at IS NOT NULL
+             AND processing_started_at < now() - interval '5 minutes'
+         )::int AS stale_processing_count,
          COUNT(*) FILTER (
            WHERE channel = 'push'
              AND state = 'failed'
@@ -447,45 +466,129 @@ async function checkNotificationQueueHealth() {
         WHERE is_active = true
           AND COALESCE(consecutive_failures, 0) > 0`,
     );
-    const readyCount = Number(queueQ.rows?.[0]?.ready_count || 0) || 0;
-    const failedLast24h = Number(queueQ.rows?.[0]?.failed_last_24h || 0) || 0;
-    const failingEndpoints =
-      Number(endpointQ.rows?.[0]?.failing_endpoints || 0) || 0;
+    return {
+      ready_count: Number(queueQ.rows?.[0]?.ready_count || 0) || 0,
+      stale_processing_count:
+        Number(queueQ.rows?.[0]?.stale_processing_count || 0) || 0,
+      failed_last_24h: Number(queueQ.rows?.[0]?.failed_last_24h || 0) || 0,
+      failing_endpoints:
+        Number(endpointQ.rows?.[0]?.failing_endpoints || 0) || 0,
+    };
+  }
 
-    if (readyCount > 250) {
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const stats = await run(readTargetStats);
+      totals.ready_count += Number(stats.ready_count || 0) || 0;
+      totals.stale_processing_count +=
+        Number(stats.stale_processing_count || 0) || 0;
+      totals.failed_last_24h += Number(stats.failed_last_24h || 0) || 0;
+      totals.failing_endpoints += Number(stats.failing_endpoints || 0) || 0;
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND COALESCE(status, 'active') = 'active'
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    if (totals.unavailable_targets > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "notifications.queue.unavailable",
+        "Notification queue health check could not inspect every database target",
+        totals,
+      );
+      return;
+    }
+
+    if (totals.ready_count > 250 || totals.stale_processing_count > 0) {
       addFinding(
         "warn",
         "notifications.queue.backlog",
-        `Notification queue backlog is elevated (${readyCount} ready deliveries)`,
+        `Notification queue backlog is elevated (ready=${totals.ready_count}, stale_processing=${totals.stale_processing_count})`,
+        totals,
       );
     } else {
       addFinding(
         "info",
         "notifications.queue.backlog",
-        `Notification queue ready deliveries: ${readyCount}`,
+        `Notification queue ready deliveries: ${totals.ready_count}`,
+        totals,
       );
     }
 
-    if (failedLast24h > 0 || failingEndpoints > 0) {
+    if (totals.failed_last_24h > 0 || totals.failing_endpoints > 0) {
       addFinding(
         "warn",
         "notifications.queue.failures",
-        `Notification queue has failures (deliveries_24h=${failedLast24h}, endpoints=${failingEndpoints})`,
+        `Notification queue has failures (deliveries_24h=${totals.failed_last_24h}, endpoints=${totals.failing_endpoints})`,
+        totals,
       );
     } else {
       addFinding(
         "info",
         "notifications.queue.failures",
         "Notification queue has no active failures",
+        totals,
       );
     }
   } catch (err) {
     addFinding(
-      "warn",
-      "notifications.queue.unavailable",
-      "Notification queue health check skipped",
+      IS_PRODUCTION ? "critical" : "warn",
+      "notifications.queue.check_failed",
+      "Notification queue health check failed",
       {
         error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
       },
     );
   }
