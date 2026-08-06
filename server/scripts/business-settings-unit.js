@@ -318,6 +318,16 @@ function testGithubCiRunsReleaseGuards() {
   }
 }
 
+function testGithubWorkflowSecretsAreCheckedInsideSteps() {
+  const workflow = fs.readFileSync(
+    path.resolve(__dirname, "../../.github/workflows/critical-integration.yml"),
+    "utf8",
+  );
+  assert.doesNotMatch(workflow, /critical_e2e:[\s\S]{0,160}\n\s+if:\s*\$\{\{\s*secrets\./);
+  assert.match(workflow, /if \[ -z "\$\{E2E_BASE_URL\}" \]/);
+  assert.match(workflow, /Skip critical integration checks/);
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -609,6 +619,7 @@ testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
+testGithubWorkflowSecretsAreCheckedInsideSteps();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
