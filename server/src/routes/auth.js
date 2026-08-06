@@ -3693,15 +3693,38 @@ router.post('/login', async (req, res) => {
     if (
       !isPlatformCreator &&
       !result?.ok &&
-      result?.reason === 'user_not_found' &&
-      tenantCodeHint
+      tenantCodeHint &&
+      (result?.reason === 'user_not_found' ||
+        result?.reason === 'password_mismatch')
     ) {
-      const fallbackTenant = await resolveTenantByUserEmail(normalizedEmail);
-      const fallbackTenantId = String(fallbackTenant?.id || '').trim();
       const currentTenantId = String(tenant?.id || '').trim();
-      if (fallbackTenantId && fallbackTenantId !== currentTenantId) {
-        tenant = fallbackTenant;
+      const passwordMatchedTenants = (
+        await findLoginTenantCandidatesByPassword({
+          email: normalizedEmail,
+          password,
+        })
+      ).filter(
+        (row) => String(row?.id || '').trim() !== currentTenantId,
+      );
+      if (passwordMatchedTenants.length === 1) {
+        tenant = passwordMatchedTenants[0];
         result = await db.runWithTenantRow(tenant, loginInScope);
+      } else if (passwordMatchedTenants.length > 1) {
+        const publicTenants = passwordMatchedTenants
+          .map(buildPublicLoginTenantOption)
+          .filter(Boolean);
+        return res.status(409).json({
+          error: 'Выберите группу для входа',
+          tenant_selection_required: true,
+          tenants: publicTenants,
+        });
+      } else if (result?.reason === 'user_not_found') {
+        const fallbackTenant = await resolveTenantByUserEmail(normalizedEmail);
+        const fallbackTenantId = String(fallbackTenant?.id || '').trim();
+        if (fallbackTenantId && fallbackTenantId !== currentTenantId) {
+          tenant = fallbackTenant;
+          result = await db.runWithTenantRow(tenant, loginInScope);
+        }
       }
     }
     if (!result?.ok) {

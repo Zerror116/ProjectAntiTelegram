@@ -157,6 +157,8 @@ function testAmbiguousLoginRequestsTenantSelection() {
   assert.match(authRoute, /findLoginTenantCandidatesByPassword/);
   assert.match(authRoute, /tenant_selection_required: true/);
   assert.match(authRoute, /buildPublicLoginTenantOption/);
+  assert.match(authRoute, /result\?\.reason === 'password_mismatch'/);
+  assert.match(authRoute, /passwordMatchedTenants\.length === 1/);
   assert.match(authScreen, /_showLoginTenantSelection/);
   assert.match(authScreen, /tenant_selection_required/);
   assert.match(authScreen, /_retryLoginWithTenantSelection/);
