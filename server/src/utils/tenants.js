@@ -1,7 +1,7 @@
 const crypto = require("crypto");
 
 const PLATFORM_CREATOR_EMAIL = String(
-  process.env.CREATOR_EMAIL || "zerotwo02166@gmail.com",
+  process.env.CREATOR_EMAIL || "",
 )
   .toLowerCase()
   .trim();
@@ -159,9 +159,10 @@ function isTenantActive(tenantRow) {
 }
 
 function isPlatformCreatorEmail(email) {
-  return String(email || "")
+  const normalized = String(email || "")
     .toLowerCase()
-    .trim() === PLATFORM_CREATOR_EMAIL;
+    .trim();
+  return normalized.length > 0 && PLATFORM_CREATOR_EMAIL.length > 0 && normalized === PLATFORM_CREATOR_EMAIL;
 }
 
 module.exports = {

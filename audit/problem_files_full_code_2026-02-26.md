@@ -480,16 +480,16 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   bool _loading = false;
   String _message = '';
 
-  static const String _creatorEmail = 'zerotwo02166@gmail.com';
+  static const String _platformOwnerEmail = 'platform-owner@example.com';
 
   bool get _isCreatorPending {
     final pending = authService.pendingEmail;
-    return pending != null && pending.toLowerCase() == _creatorEmail.toLowerCase();
+    return pending != null && pending.toLowerCase() == _platformOwnerEmail.toLowerCase();
   }
 
   bool get _isCreatorCurrentUser {
     final email = authService.currentUser?.email;
-    return email != null && email.toLowerCase() == _creatorEmail.toLowerCase();
+    return email != null && email.toLowerCase() == _platformOwnerEmail.toLowerCase();
   }
 
   bool get _shouldShowSecretField => widget.isRegisterFlow ? _isCreatorPending : _isCreatorCurrentUser;
@@ -894,7 +894,7 @@ app.use((err, req, res, next) => {
  */
 async function ensureCreator() {
   try {
-    const creatorEmail = process.env.CREATOR_EMAIL || 'zerotwo02166@gmail.com';
+    const creatorEmail = process.env.CREATOR_EMAIL || 'platform-owner@example.com';
     console.log(`Checking for creator: ${creatorEmail}`);
 
     const res = await db.query(
@@ -1418,7 +1418,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change_me_long_secret';
 const SALT_ROUNDS = parseInt(process.env.SALT_ROUNDS || '10', 10);
 
 // Настройки для Creator
-const CREATOR_EMAIL = 'zerotwo02166@gmail.com';
+const CREATOR_EMAIL = 'platform-owner@example.com';
 const CREATOR_SECRET = process.env.CREATOR_SECRET || 'Макарова Лиза';
 
 function signToken(payload) {

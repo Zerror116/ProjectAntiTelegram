@@ -28,7 +28,6 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
-  static const String _creatorEmail = 'zerotwo02166@gmail.com';
   static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
@@ -748,11 +747,8 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   Future<bool> _prepareTenantScopeForRegistration({
-    required String email,
     required String accessKey,
   }) async {
-    final normalizedEmail = email.trim().toLowerCase();
-    if (normalizedEmail == _creatorEmail.toLowerCase()) return true;
     if (!_looksLikeInviteCode(accessKey)) return true;
 
     try {
@@ -1438,7 +1434,6 @@ class _AuthScreenState extends State<AuthScreen> {
     try {
       if (_isRegister) {
         final tenantScopeReady = await _prepareTenantScopeForRegistration(
-          email: email,
           accessKey: accessKey,
         );
         if (!tenantScopeReady) {
@@ -1595,11 +1590,9 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   Future<void> _loginWithPasskey() async {
-    final email = _emailController.text.trim().isEmpty
-        ? _creatorEmail
-        : _emailController.text.trim();
-    if (email.toLowerCase() != _creatorEmail.toLowerCase()) {
-      setState(() => _message = 'Passkey доступен только создателю');
+    final email = _emailController.text.trim();
+    if (email.isEmpty) {
+      setState(() => _message = 'Введите email для входа по passkey');
       return;
     }
     setState(() {
@@ -1796,8 +1789,6 @@ class _AuthScreenState extends State<AuthScreen> {
       );
     }
 
-    final currentEmail = _emailController.text.trim().toLowerCase();
-    final isCreatorEmail = currentEmail == _creatorEmail.toLowerCase();
     final accessCode = _accessKeyController.text.trim();
     final inviteFromLink =
         _looksLikeInviteCode(accessCode) &&
@@ -1805,9 +1796,13 @@ class _AuthScreenState extends State<AuthScreen> {
             _tenantNameFromInvite.trim().isNotEmpty);
     final clientCityOptions = _clientCitiesForInvite(accessCode);
     final requiresClientCity =
-        _isRegister && !isCreatorEmail && clientCityOptions.isNotEmpty;
+        _isRegister &&
+        _looksLikeInviteCode(accessCode) &&
+        clientCityOptions.isNotEmpty;
     final looksLikeTenantAccessKey =
         accessCode.toUpperCase().startsWith('PHX-') && !inviteFromLink;
+    final isPlatformRegistrationAttempt =
+        _isRegister && accessCode.trim().isEmpty;
     final theme = Theme.of(context);
     final authBackgroundAsset = theme.brightness == Brightness.dark
         ? PhoenixAssets.authLoginBackgroundDark
@@ -2069,12 +2064,9 @@ class _AuthScreenState extends State<AuthScreen> {
                                       controller: _accessKeyController,
                                     ),
                                     validator: (v) {
-                                      final isCreator =
-                                          _emailController.text
-                                              .trim()
-                                              .toLowerCase() ==
-                                          _creatorEmail.toLowerCase();
-                                      if (isCreator) return null;
+                                      if (isPlatformRegistrationAttempt) {
+                                        return null;
+                                      }
                                       if (v == null || v.trim().isEmpty) {
                                         return 'Введите код группы';
                                       }
@@ -2184,21 +2176,23 @@ class _AuthScreenState extends State<AuthScreen> {
                                     },
                                   ),
                                 ],
-                                if (isCreatorEmail) ...[
+                                if (isPlatformRegistrationAttempt) ...[
                                   const SizedBox(height: 12),
                                   TextFormField(
                                     controller: _creatorSecretController,
                                     decoration: withInputLanguageBadge(
                                       const InputDecoration(
-                                        labelText: 'Секрет создателя',
+                                        labelText: 'Секрет платформы',
                                       ),
                                       controller: _creatorSecretController,
                                     ),
                                     obscureText: true,
                                     validator: (v) {
-                                      if (!isCreatorEmail) return null;
+                                      if (!isPlatformRegistrationAttempt) {
+                                        return null;
+                                      }
                                       if ((v ?? '').trim().isEmpty) {
-                                        return 'Введите секрет создателя';
+                                        return 'Введите секрет платформы';
                                       }
                                       return null;
                                     },
@@ -2229,9 +2223,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                         ),
                                 ),
                               ),
-                              if (!_isRegister &&
-                                  _passkeySupported &&
-                                  isCreatorEmail) ...[
+                              if (!_isRegister && _passkeySupported) ...[
                                 const SizedBox(height: 8),
                                 SizedBox(
                                   width: double.infinity,

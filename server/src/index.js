@@ -98,6 +98,7 @@ const {
 const {
   startAutoProductProcessing,
 } = require("./utils/autoProductProcessing");
+const { PLATFORM_CREATOR_EMAIL } = require("./utils/tenants");
 
 if (!global.__fenixProcessMonitoringHooksInstalled) {
   global.__fenixProcessMonitoringHooksInstalled = true;
@@ -756,8 +757,12 @@ app.use((err, req, res, next) => {
  */
 async function ensureCreator() {
   try {
-    const creatorEmail = process.env.CREATOR_EMAIL || "zerotwo02166@gmail.com";
-    console.log(`Checking for creator: ${creatorEmail}`);
+    const creatorEmail = PLATFORM_CREATOR_EMAIL;
+    if (!creatorEmail) {
+      console.log("Creator bootstrap skipped: CREATOR_EMAIL is not configured");
+      return;
+    }
+    console.log("Checking configured creator account");
 
     const res = await db.query("SELECT id, role FROM users WHERE email = $1", [
       creatorEmail,
@@ -768,9 +773,9 @@ async function ensureCreator() {
         "creator",
         res.rows[0].id,
       ]);
-      console.log(`✅ Marked user ${creatorEmail} as creator`);
+      console.log("✅ Marked configured user as creator");
     } else if (res.rowCount === 0) {
-      console.log(`⚠️ Creator user not found: ${creatorEmail}`);
+      console.log("⚠️ Configured creator user not found");
     }
   } catch (err) {
     console.error("ensureCreator error:", err);

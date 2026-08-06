@@ -1549,7 +1549,7 @@ class AuthService {
     String? phone,
     String? accessKey,
     String? clientCity,
-    String? secret, // для special creator email
+    String? secret, // для платформенной регистрации
     String? groupName,
     String? mainChannelTitle,
     String? registrationEmailToken,

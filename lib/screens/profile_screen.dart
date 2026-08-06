@@ -690,7 +690,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               obscureText: true,
               decoration: const InputDecoration(
                 labelText: 'Текущий пароль',
-                helperText: 'Passkey доступен только создателю',
+                helperText: 'Passkey доступен только платформенному аккаунту',
               ),
               autofocus: true,
             ),
@@ -1443,7 +1443,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Passkey создателя',
+                            'Passkey платформенного аккаунта',
                             style: theme.textTheme.titleMedium?.copyWith(
                               fontWeight: FontWeight.w800,
                             ),

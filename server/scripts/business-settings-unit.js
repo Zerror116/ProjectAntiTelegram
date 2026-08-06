@@ -13,6 +13,21 @@ const {
   scopeLabel,
 } = require("../src/utils/tenantProcessingScopes");
 
+function listFilesRecursive(root) {
+  const files = [];
+  if (!fs.existsSync(root)) return files;
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules" || entry.name === ".dart_tool") continue;
+      files.push(...listFilesRecursive(fullPath));
+      continue;
+    }
+    if (entry.isFile()) files.push(fullPath);
+  }
+  return files;
+}
+
 function testDefaults() {
   const settings = normalizeTenantFeatureSettings();
   assert.equal(settings.client_group_switcher_enabled, true);
@@ -278,6 +293,34 @@ function testAndroidReleaseUsesProductionDownloadsRoot() {
   assert.match(rollbackPlaybook, /\/opt\/fenix-data\/downloads/);
 }
 
+function testNoHardcodedPlatformOwnerIdentity() {
+  const roots = [
+    path.resolve(__dirname, "../../lib"),
+    path.resolve(__dirname, "../src"),
+    path.resolve(__dirname, "../scripts"),
+    path.resolve(__dirname, "../../audit"),
+  ];
+  const files = [
+    ...roots.flatMap(listFilesRecursive),
+    path.resolve(__dirname, "../.env.example"),
+  ].filter((file) => /\.(dart|js|md|example)$/.test(file));
+  const blockedEmail = ["zerotwo02166", "gmail.com"].join("@");
+  const blockedCreatorField = ["_creator", "Email"].join("");
+  const blockedCreatorComment = ["special creator", "email"].join(" ");
+  const blockedPatterns = [
+    new RegExp(blockedEmail.replace(".", "\\."), "i"),
+    new RegExp(blockedCreatorField),
+    new RegExp(blockedCreatorComment, "i"),
+  ];
+
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const pattern of blockedPatterns) {
+      assert.doesNotMatch(source, pattern, file);
+    }
+  }
+}
+
 testDefaults();
 testCityListPersistence();
 testTopLevelAndNestedFlags();
@@ -292,5 +335,6 @@ testWorkerDeliveryAssemblyFeatureFlag();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testAndroidReleaseUsesProductionDownloadsRoot();
+testNoHardcodedPlatformOwnerIdentity();
 
 console.log("business-settings-unit: ok");

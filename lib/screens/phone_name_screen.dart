@@ -35,20 +35,6 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
   bool _loading = false;
   String _message = '';
 
-  static const String _creatorEmail = 'zerotwo02166@gmail.com';
-
-  bool get _isCreatorPending {
-    final pending = (widget.registrationEmail ?? authService.pendingEmail)
-        ?.trim();
-    return pending != null &&
-        pending.toLowerCase() == _creatorEmail.toLowerCase();
-  }
-
-  bool get _isCreatorCurrentUser {
-    final email = authService.currentUser?.email;
-    return email != null && email.toLowerCase() == _creatorEmail.toLowerCase();
-  }
-
   Future<void> _goNextAfterProfileCheck() async {
     try {
       final profileResp = await authService.dio.get('/api/profile');
@@ -76,9 +62,6 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
     Navigator.of(context).pushNamedAndRemoveUntil('/main', (route) => false);
   }
 
-  bool get _shouldShowSecretField =>
-      widget.isRegisterFlow ? _isCreatorPending : _isCreatorCurrentUser;
-
   String get _normalizedPendingAccessKey {
     return (authService.pendingAccessKey ?? '')
         .toUpperCase()
@@ -88,9 +71,16 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
 
   bool get _isTenantKeyRegistration {
     if (!widget.isRegisterFlow) return false;
-    if (_isCreatorPending) return false;
+    if (_isPlatformRegistrationPending) return false;
     return _normalizedPendingAccessKey.startsWith('PHX');
   }
+
+  bool get _isPlatformRegistrationPending {
+    if (!widget.isRegisterFlow) return false;
+    return _normalizedPendingAccessKey.isEmpty;
+  }
+
+  bool get _shouldShowSecretField => _isPlatformRegistrationPending;
 
   Future<void> _handleBack() async {
     if (_loading) return;
@@ -248,7 +238,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
                 .pendingRegistrationEmailToken!
                 .trim(),
         };
-        if (_isCreatorPending) data['secret'] = secret;
+        if (_isPlatformRegistrationPending) data['secret'] = secret;
         if (_isTenantKeyRegistration) {
           data['group_name'] = groupName;
           data['main_channel_title'] = mainChannelTitle;
@@ -290,7 +280,6 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
         return;
       } else {
         final profileData = {'name': name};
-        if (_isCreatorCurrentUser) profileData['secret'] = secret;
 
         final p1 = authService.dio.post(
           '/api/profile/update',

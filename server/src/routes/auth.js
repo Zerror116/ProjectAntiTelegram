@@ -2868,11 +2868,11 @@ router.post('/register', async (req, res) => {
       if (!CREATOR_SECRET && !CREATOR_SECRET_HASH) {
         return res.status(503).json({
           error:
-            'Регистрация создателя временно отключена: на сервере не задан секрет создателя.',
+            'Платформенная регистрация временно отключена: на сервере не задан секрет платформы.',
         });
       }
       if (!isValidCreatorSecret(secret)) {
-        return res.status(403).json({ error: 'Неверный секрет создателя' });
+        return res.status(403).json({ error: 'Неверный секрет платформы' });
       }
       role = 'creator';
       tenant = await resolveDefaultTenant();
@@ -4402,7 +4402,7 @@ router.post('/passkeys/register/options', authMiddleware, async (req, res) => {
     if (!isCreatorIdentity(req.user)) {
       return res.status(403).json({
         ok: false,
-        error: 'Passkey доступен только создателю',
+        error: 'Passkey доступен только платформенному аккаунту',
       });
     }
     const password = String(req.body?.password || '');
@@ -4474,7 +4474,7 @@ router.post('/passkeys/register/verify', authMiddleware, async (req, res) => {
     if (!isCreatorIdentity(req.user)) {
       return res.status(403).json({
         ok: false,
-        error: 'Passkey доступен только создателю',
+        error: 'Passkey доступен только платформенному аккаунту',
       });
     }
     const response = normalizePasskeyCredentialResponse(
@@ -4558,7 +4558,7 @@ router.post('/passkeys/login/options', async (req, res) => {
     ) {
       return res.status(403).json({
         ok: false,
-        error: 'Passkey доступен только создателю',
+        error: 'Passkey доступен только платформенному аккаунту',
       });
     }
     const user = await db.runWithPlatform(async () =>
@@ -4624,7 +4624,7 @@ router.post('/passkeys/login/verify', async (req, res) => {
     ) {
       return res.status(403).json({
         ok: false,
-        error: 'Passkey доступен только создателю',
+        error: 'Passkey доступен только платформенному аккаунту',
       });
     }
     const response = normalizePasskeyCredentialResponse(
@@ -4669,7 +4669,11 @@ router.post('/passkeys/login/verify', async (req, res) => {
       );
       const row = credentialQ.rows[0] || null;
       if (!row || !isCreatorIdentity(row)) {
-        return { ok: false, status: 403, error: 'Passkey доступен только создателю' };
+        return {
+          ok: false,
+          status: 403,
+          error: 'Passkey доступен только платформенному аккаунту',
+        };
       }
       if (row.is_active === false) {
         return {
@@ -4762,7 +4766,7 @@ router.get('/tenant/public-invite', authMiddleware, async (req, res) => {
     if (req.user?.is_platform_creator === true) {
       return res.status(403).json({
         ok: false,
-        error: 'Для создателя ссылка приглашения не требуется',
+        error: 'Для платформенного аккаунта ссылка приглашения не требуется',
       });
     }
 
