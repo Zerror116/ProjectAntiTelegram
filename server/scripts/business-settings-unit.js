@@ -303,6 +303,8 @@ function testGithubCiRunsReleaseGuards() {
     path.resolve(__dirname, "../../.github/workflows/security-ci.yml"),
     path.resolve(__dirname, "../../.github/workflows/nightly-self-audit.yml"),
   ];
+  const securityCi = fs.readFileSync(workflowPaths[0], "utf8");
+  assert.match(securityCi, /workflow_dispatch:/);
 
   for (const workflowPath of workflowPaths) {
     const workflow = fs.readFileSync(workflowPath, "utf8");
