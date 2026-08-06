@@ -15,6 +15,7 @@ echo "[release_with_audit] step 1/2: pre-deploy full cluster audit"
 RUN_BUILDS="$RUN_BUILD_AUDIT" \
   RUN_E2E="$RUN_E2E_AUDIT" \
   RUN_REMOTE=1 \
+  RUN_GITHUB_ACTIONS=1 \
   DOMAIN="$DOMAIN" \
   E2E_REQUIRE_FULL="$E2E_REQUIRE_FULL" \
   "$SCRIPT_DIR/full_cluster_audit.sh"

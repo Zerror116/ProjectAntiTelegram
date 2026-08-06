@@ -9,6 +9,7 @@ SERVER="${SERVER:-root@89.23.99.18}"
 RUN_BUILDS="${RUN_BUILDS:-0}" # 1 => include flutter build web/apk
 RUN_E2E="${RUN_E2E:-0}" # 1 => include backend full E2E regression
 RUN_REMOTE="${RUN_REMOTE:-1}" # 0 => skip SSH part
+RUN_GITHUB_ACTIONS="${RUN_GITHUB_ACTIONS:-0}" # 1 => require latest Security CI run to pass for current HEAD
 
 print_section() {
   printf "\n===== %s =====\n" "$1"
@@ -55,6 +56,23 @@ run_prod_http_checks() {
   print_section "Production HTTP/TLS Health"
   cd "$PROJECT_ROOT"
   bash "$SCRIPT_DIR/prod_health_check.sh" "$DOMAIN"
+}
+
+run_github_actions_checks() {
+  if [[ "$RUN_GITHUB_ACTIONS" != "1" ]]; then
+    print_section "GitHub Actions Health Skipped"
+    echo "RUN_GITHUB_ACTIONS=0, skip GitHub Actions status check"
+    return
+  fi
+
+  print_section "GitHub Actions Health"
+  cd "$PROJECT_ROOT"
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  node "$SCRIPT_DIR/github_actions_health_check.js" \
+    --workflow "Security CI" \
+    --branch "$branch" \
+    --require-current-head
 }
 
 run_remote_checks() {
@@ -199,8 +217,10 @@ main() {
   echo "domain:  $DOMAIN"
   echo "server:  $SERVER"
   echo "run_e2e: $RUN_E2E"
+  echo "github_actions: $RUN_GITHUB_ACTIONS"
 
   run_local_checks
+  run_github_actions_checks
   run_prod_http_checks
   run_remote_checks
 
