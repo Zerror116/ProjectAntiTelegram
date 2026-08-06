@@ -225,6 +225,135 @@ class _AuthScreenState extends State<AuthScreen> {
     return fallback;
   }
 
+  List<Map<String, String>> _loginTenantOptionsFromBody(
+    Map<String, dynamic>? bodyMap,
+  ) {
+    final rows = bodyMap?['tenants'];
+    if (rows is! List) return const <Map<String, String>>[];
+    final seen = <String>{};
+    final options = <Map<String, String>>[];
+    for (final row in rows) {
+      if (row is! Map) continue;
+      final code = (row['code'] ?? row['tenant_code'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (code.isEmpty || !seen.add(code)) continue;
+      final name = (row['name'] ?? row['tenant_name'] ?? '')
+          .toString()
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      options.add({'code': code, 'name': name.isEmpty ? 'Группа' : name});
+    }
+    return options;
+  }
+
+  Future<String?> _showLoginTenantSelection(
+    List<Map<String, String>> tenants,
+  ) async {
+    if (tenants.isEmpty) return null;
+    if (tenants.length == 1) return tenants.first['code'];
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        final theme = Theme.of(dialogContext);
+        return AlertDialog(
+          title: const Text('Выберите группу'),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420, maxHeight: 360),
+            child: ListView.separated(
+              shrinkWrap: true,
+              itemCount: tenants.length,
+              separatorBuilder: (context, index) => const SizedBox(height: 6),
+              itemBuilder: (context, index) {
+                final row = tenants[index];
+                final code = row['code'] ?? '';
+                final name = row['name'] ?? 'Группа';
+                return Material(
+                  color: theme.colorScheme.surfaceContainerHighest.withValues(
+                    alpha: 0.55,
+                  ),
+                  borderRadius: BorderRadius.circular(14),
+                  child: ListTile(
+                    leading: const Icon(Icons.groups_2_outlined),
+                    title: Text(
+                      name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: code.isEmpty
+                        ? null
+                        : () => Navigator.of(dialogContext).pop(code),
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Отмена'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<bool> _retryLoginWithTenantSelection({
+    required Map<String, dynamic>? bodyMap,
+    required String email,
+    required String password,
+  }) async {
+    final options = _loginTenantOptionsFromBody(bodyMap);
+    if (options.isEmpty) return false;
+    final selectedTenantCode = await _showLoginTenantSelection(options);
+    if (!mounted) return true;
+    if (selectedTenantCode == null || selectedTenantCode.trim().isEmpty) {
+      setState(() => _message = 'Выберите группу для входа');
+      return true;
+    }
+
+    await _authService.setTenantCode(selectedTenantCode);
+    try {
+      await _authService.login(
+        email: email,
+        password: password,
+        otpCode: _requiresTwoFactor ? _otpController.text.trim() : null,
+        trustDevice: _requiresTwoFactor ? _trustDeviceFor30Days : false,
+      );
+      _requiresTwoFactor = false;
+      await _navigateAfterSuccessfulAuth();
+      return true;
+    } on DioException catch (error) {
+      final retryBody = error.response?.data;
+      final retryBodyMap = retryBody is Map
+          ? Map<String, dynamic>.from(retryBody)
+          : null;
+      final twoFactorRequired =
+          retryBodyMap?['two_factor_required'] == true ||
+          retryBodyMap?['twoFactorRequired'] == true;
+      if (twoFactorRequired) {
+        _otpController.clear();
+        setState(() {
+          _requiresTwoFactor = true;
+          _trustDeviceFor30Days = true;
+          _message =
+              'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator или резервный код.';
+        });
+      } else {
+        setState(
+          () => _message = _extractServerMessage(
+            error,
+            fallback: 'Не удалось войти в выбранную группу',
+          ),
+        );
+      }
+      return true;
+    }
+  }
+
   Future<void> _loadApkDownloadUrl() async {
     if (!kIsWeb) return;
     setState(() {
@@ -1414,6 +1543,16 @@ class _AuthScreenState extends State<AuthScreen> {
         });
         friendly =
             'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator или резервный код.';
+      } else if (!_isRegister &&
+          status == 409 &&
+          bodyMap?['tenant_selection_required'] == true) {
+        final handled = await _retryLoginWithTenantSelection(
+          bodyMap: bodyMap,
+          email: email,
+          password: password,
+        );
+        if (handled) return;
+        friendly = 'Выберите группу для входа';
       } else if (status == 401) {
         friendly = 'Неверный email, пароль или код подтверждения';
       } else if (status == 403) {

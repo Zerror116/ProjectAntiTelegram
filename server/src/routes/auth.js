@@ -869,6 +869,85 @@ async function resolveTenantByUserEmail(email) {
   return matchedTenant;
 }
 
+function buildPublicLoginTenantOption(tenantRow) {
+  const code = db.normalizeTenantCode(tenantRow?.code || '');
+  if (!code) return null;
+  return {
+    code,
+    name: String(tenantRow?.name || '').replace(/\s+/g, ' ').trim() || code,
+  };
+}
+
+async function findLoginTenantCandidatesByPassword({ email, password }) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail || typeof password !== 'string' || !password) {
+    return [];
+  }
+
+  const tenantsRes = await db.platformQuery(
+    `SELECT id,
+            code,
+            name,
+            status,
+            subscription_expires_at,
+            db_mode,
+            db_url,
+            db_name,
+            db_schema
+     FROM tenants
+     WHERE COALESCE(status, 'active') <> 'deleted'
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+     LIMIT 200`,
+  );
+
+  const matches = [];
+  for (const tenantRow of tenantsRes.rows || []) {
+    const tenantId = String(tenantRow?.id || '').trim();
+    if (!tenantId) continue;
+    try {
+      const matched = await db.runWithTenantRow(tenantRow, async () => {
+        const allowLegacyNullTenantRows =
+          db.isIsolatedTenantRow(tenantRow) ||
+          db.isSchemaIsolatedTenantRow(tenantRow);
+        const q = await db.query(
+          `SELECT u.password_hash,
+                  u.is_active,
+                  u.tenant_id
+           FROM users u
+           WHERE lower(u.email) = $1
+             AND (
+               u.tenant_id = $2::uuid
+               OR ($3::boolean = true AND u.tenant_id IS NULL)
+             )
+           ORDER BY
+             CASE WHEN u.is_active = true THEN 0 ELSE 1 END,
+             u.updated_at DESC NULLS LAST,
+             u.created_at DESC NULLS LAST
+           LIMIT 5`,
+          [normalizedEmail, tenantId, allowLegacyNullTenantRows],
+        );
+        for (const row of q.rows || []) {
+          if (row.is_active === false) continue;
+          const ok = await bcrypt.compare(
+            password,
+            String(row.password_hash || ''),
+          );
+          if (ok) return true;
+        }
+        return false;
+      });
+      if (matched) matches.push(tenantRow);
+    } catch (err) {
+      console.error('auth.login tenant candidate scan error', {
+        tenant_id: tenantId,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  return matches;
+}
+
 async function resolveExistingClientIdentityForInviteJoin({
   email,
   password,
@@ -3244,16 +3323,34 @@ router.post('/login', async (req, res) => {
       }
 
       if (!tenant) {
+        const candidates = await findLoginTenantCandidatesByPassword({
+          email: normalizedEmail,
+          password,
+        });
+        if (candidates.length === 1) {
+          tenant = candidates[0];
+        } else if (candidates.length > 1) {
+          const publicTenants = candidates
+            .map(buildPublicLoginTenantOption)
+            .filter(Boolean);
+          return res.status(409).json({
+            error: 'Выберите группу для входа',
+            tenant_selection_required: true,
+            tenants: publicTenants,
+          });
+        }
+      }
+
+      if (!tenant) {
         logAuthDenied({
           scope: 'login',
           email: normalizedEmail,
           tenantCode: '',
-          status: 400,
+          status: 401,
           reason: 'tenant_not_resolved',
         });
-        return res.status(400).json({
-          error:
-            'Не определен арендатор. Войдите по приглашению вашей группы или укажите код арендатора.',
+        return res.status(401).json({
+          error: 'Неверные данные',
         });
       }
     }

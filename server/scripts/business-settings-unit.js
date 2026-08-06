@@ -130,6 +130,23 @@ function testInviteJoinUsesTenantScopedEmailLookup() {
   assert.match(source, /allowLegacyNullTenantRows/);
 }
 
+function testAmbiguousLoginRequestsTenantSelection() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  const authScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/auth_screen.dart"),
+    "utf8",
+  );
+  assert.match(authRoute, /findLoginTenantCandidatesByPassword/);
+  assert.match(authRoute, /tenant_selection_required: true/);
+  assert.match(authRoute, /buildPublicLoginTenantOption/);
+  assert.match(authScreen, /_showLoginTenantSelection/);
+  assert.match(authScreen, /tenant_selection_required/);
+  assert.match(authScreen, /_retryLoginWithTenantSelection/);
+}
+
 function testAuthRecoveryUsesScopedEmailTokens() {
   const routePath = path.resolve(__dirname, "../src/routes/auth.js");
   const source = fs.readFileSync(routePath, "utf8");
@@ -267,6 +284,7 @@ testTopLevelAndNestedFlags();
 testWorkflowPayloadCompatibility();
 testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();
+testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
