@@ -107,6 +107,7 @@ const _appBackgroundEffectPrefPrefix = 'app_background_effect_';
 const _chatBackgroundEffectPrefPrefix = 'chat_background_effect_';
 String? _lastPlayedMessageId;
 bool _handlingAuthFailure = false;
+bool _handlingPhoneAccessRestriction = false;
 String? _activePhoneAccessDialogRequestId;
 final AudioPlayer _appSoundPlayer = AudioPlayer();
 final AudioContext _appUiSoundAudioContext = AudioContext(
@@ -1549,6 +1550,87 @@ void showGlobalAppNotice(
 bool _isPhoneAccessRestrictedState(String state) {
   final normalized = state.toLowerCase().trim();
   return normalized == 'pending' || normalized == 'rejected';
+}
+
+bool? _readBoolFlag(Map<String, dynamic> source, String key) {
+  final value = source[key];
+  if (value is bool) return value;
+  if (value is num) {
+    if (value == 1) return true;
+    if (value == 0) return false;
+  }
+  final normalized = value?.toString().toLowerCase().trim() ?? '';
+  if (normalized == 'true' || normalized == 'yes' || normalized == '1') {
+    return true;
+  }
+  if (normalized == 'false' || normalized == 'no' || normalized == '0') {
+    return false;
+  }
+  return null;
+}
+
+bool _isPhoneAccessApprovalExplicitlyEnabledForUser(User? user) {
+  final settings = user?.featureSettings ?? const <String, dynamic>{};
+  if (settings.isEmpty) return false;
+  final root = _readBoolFlag(settings, 'phone_access_approval_enabled');
+  final clientRaw = settings['client'];
+  final client = clientRaw is Map
+      ? _readBoolFlag(
+          Map<String, dynamic>.from(clientRaw),
+          'phone_access_approval_enabled',
+        )
+      : null;
+  if (root == false || client == false) return false;
+  return root == true || client == true;
+}
+
+bool _shouldShowPhoneAccessPendingForUser(User? user) {
+  final state = (user?.phoneAccessState ?? '').trim().toLowerCase();
+  return _isPhoneAccessRestrictedState(state) &&
+      _isPhoneAccessApprovalExplicitlyEnabledForUser(user);
+}
+
+@visibleForTesting
+bool debugShouldShowPhoneAccessPendingForTesting(
+  Map<String, dynamic> userMap,
+) {
+  return _shouldShowPhoneAccessPendingForUser(User.fromMap(userMap));
+}
+
+bool _isPhoneAccessRestrictionError(DioException err) {
+  if (err.response?.statusCode != 423) return false;
+  final data = err.response?.data;
+  if (data is! Map) return true;
+  final code = (data['code'] ?? '').toString().toLowerCase().trim();
+  if (code.startsWith('phone_access_')) return true;
+  final access = data['phone_access'];
+  if (access is Map) {
+    final state = (access['state'] ?? '').toString().toLowerCase().trim();
+    return _isPhoneAccessRestrictedState(state);
+  }
+  return true;
+}
+
+@visibleForTesting
+bool debugIsPhoneAccessRestrictionErrorForTesting(DioException err) {
+  return _isPhoneAccessRestrictionError(err);
+}
+
+void _showPhoneAccessPendingScreen() {
+  if (_handlingPhoneAccessRestriction) return;
+  _handlingPhoneAccessRestriction = true;
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    try {
+      navigatorKey.currentState?.pushNamedAndRemoveUntil(
+        '/phone_access_pending',
+        (route) => false,
+      );
+    } finally {
+      Future<void>.delayed(const Duration(seconds: 1), () {
+        _handlingPhoneAccessRestriction = false;
+      });
+    }
+  });
 }
 
 bool _isDuplicateKeyDownKeyboardAssert(Object error) {
@@ -5422,6 +5504,12 @@ void _attachAuthInterceptor() {
           unawaited(_handleAndroidUpdateRequiredFromApi());
           return handler.next(err);
         }
+        if (_isPhoneAccessRestrictionError(err) &&
+            !_isAuthEndpoint(req) &&
+            hasBearerToken) {
+          _showPhoneAccessPendingScreen();
+          return handler.next(err);
+        }
         if (status == null &&
             req.extra['api_base_connectivity_retry_attempted'] != true &&
             _isRecoverableApiConnectivityFailure(err)) {
@@ -6016,11 +6104,8 @@ Widget _buildInitialScreenFromRestoredUser(User? restoredUser) {
   }
   final name = restoredUser.name;
   final phone = restoredUser.phone;
-  final phoneAccessState = (restoredUser.phoneAccessState ?? '')
-      .trim()
-      .toLowerCase();
   debugPrint('determineInitialScreen: restored user name=$name phone=$phone');
-  if (_isPhoneAccessRestrictedState(phoneAccessState)) {
+  if (_shouldShowPhoneAccessPendingForUser(restoredUser)) {
     return const PhoneAccessPendingScreen();
   }
   if (name == null || phone == null || phone.trim().isEmpty) {
@@ -6035,7 +6120,7 @@ bool _restoredUserNeedsProfileCompletion(User? restoredUser) {
       .trim()
       .toLowerCase();
   if (_isPhoneAccessRestrictedState(phoneAccessState)) {
-    return false;
+    return !_isPhoneAccessApprovalExplicitlyEnabledForUser(restoredUser);
   }
   final name = (restoredUser.name ?? '').trim();
   final phone = (restoredUser.phone ?? '').trim();
@@ -6886,6 +6971,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
           // Пользователь вышел — отключаем socket
           await disconnectSocket();
           _lastPlayedMessageId = null;
+          _handlingPhoneAccessRestriction = false;
           activeChatIdNotifier.value = null;
           phoneAccessOwnerRequestNotifier.value = null;
           _offlinePurchaseProbeTimer?.cancel();
@@ -6908,6 +6994,9 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
             }
           }
           unawaited(_probePendingPhoneAccessRequests());
+          if (_shouldShowPhoneAccessPendingForUser(user)) {
+            _showPhoneAccessPendingScreen();
+          }
           _restartOfflinePurchaseProbe();
           await refreshUserPreferences();
           _updateSubscriptionUiState();

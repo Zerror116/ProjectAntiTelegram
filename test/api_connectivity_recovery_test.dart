@@ -42,4 +42,51 @@ void main() {
       );
     });
   });
+
+  group('phone access routing', () {
+    test('does not trust stale pending state when feature flag is missing', () {
+      expect(
+        app.debugShouldShowPhoneAccessPendingForTesting({
+          'id': 'client-1',
+          'email': 'client@example.test',
+          'role': 'client',
+          'phone_access_state': 'pending',
+        }),
+        isFalse,
+      );
+    });
+
+    test('uses pending route when phone access approval is enabled', () {
+      expect(
+        app.debugShouldShowPhoneAccessPendingForTesting({
+          'id': 'client-1',
+          'email': 'client@example.test',
+          'role': 'client',
+          'phone_access_state': 'pending',
+          'feature_settings': {
+            'phone_access_approval_enabled': true,
+            'client': {'phone_access_approval_enabled': true},
+          },
+        }),
+        isTrue,
+      );
+    });
+
+    test('recognizes server phone access restriction response', () {
+      final error = DioException(
+        requestOptions: RequestOptions(path: '/api/cart'),
+        response: Response<dynamic>(
+          requestOptions: RequestOptions(path: '/api/cart'),
+          statusCode: 423,
+          data: {
+            'code': 'phone_access_pending',
+            'phone_access': {'state': 'pending'},
+          },
+        ),
+        type: DioExceptionType.badResponse,
+      );
+
+      expect(app.debugIsPhoneAccessRestrictionErrorForTesting(error), isTrue);
+    });
+  });
 }
