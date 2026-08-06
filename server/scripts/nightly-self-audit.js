@@ -1029,6 +1029,250 @@ async function checkTenantUserIndexDrift() {
   }
 }
 
+async function checkProductCartIntegrity() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    active_cart_deleted_products: 0,
+    active_cart_missing_products: 0,
+    active_reservation_deleted_products: 0,
+    active_reservation_missing_products: 0,
+    active_queue_deleted_products: 0,
+    active_queue_missing_products: 0,
+    active_publication_batch_deleted_products: 0,
+    active_delivery_deleted_products: 0,
+    active_delivery_missing_products: 0,
+    visible_deleted_product_messages: 0,
+    visible_missing_product_messages: 0,
+    invalid_product_amounts: 0,
+  };
+
+  const numericFields = [
+    "active_cart_deleted_products",
+    "active_cart_missing_products",
+    "active_reservation_deleted_products",
+    "active_reservation_missing_products",
+    "active_queue_deleted_products",
+    "active_queue_missing_products",
+    "active_publication_batch_deleted_products",
+    "active_delivery_deleted_products",
+    "active_delivery_missing_products",
+    "visible_deleted_product_messages",
+    "visible_missing_product_messages",
+    "invalid_product_amounts",
+  ];
+
+  async function readTargetStats() {
+    return await db.query(
+      `WITH deleted_products AS (
+         SELECT id
+         FROM products
+         WHERE status = 'deleted'
+            OR deleted_at IS NOT NULL
+       )
+       SELECT
+         (
+           SELECT COUNT(*)::int
+           FROM cart_items ci
+           JOIN deleted_products dp ON dp.id = ci.product_id
+           WHERE ci.status NOT IN ('cancelled', 'delivered')
+         ) AS active_cart_deleted_products,
+         (
+           SELECT COUNT(*)::int
+           FROM cart_items ci
+           LEFT JOIN products p ON p.id = ci.product_id
+           WHERE p.id IS NULL
+             AND ci.status NOT IN ('cancelled', 'delivered')
+         ) AS active_cart_missing_products,
+         (
+           SELECT COUNT(*)::int
+           FROM reservations r
+           JOIN deleted_products dp ON dp.id = r.product_id
+           WHERE COALESCE(r.is_fulfilled, false) = false
+         ) AS active_reservation_deleted_products,
+         (
+           SELECT COUNT(*)::int
+           FROM reservations r
+           LEFT JOIN products p ON p.id = r.product_id
+           WHERE p.id IS NULL
+             AND COALESCE(r.is_fulfilled, false) = false
+         ) AS active_reservation_missing_products,
+         (
+           SELECT COUNT(*)::int
+           FROM product_publication_queue q
+           JOIN deleted_products dp ON dp.id = q.product_id
+           WHERE COALESCE(q.status, 'pending') <> 'deleted'
+             AND (
+               q.status = 'pending'
+               OR COALESCE(q.publish_status, 'pending') IN ('pending', 'queued', 'publishing', 'failed')
+             )
+         ) AS active_queue_deleted_products,
+         (
+           SELECT COUNT(*)::int
+           FROM product_publication_queue q
+           LEFT JOIN products p ON p.id = q.product_id
+           WHERE p.id IS NULL
+             AND COALESCE(q.status, 'pending') <> 'deleted'
+             AND (
+               q.status = 'pending'
+               OR COALESCE(q.publish_status, 'pending') IN ('pending', 'queued', 'publishing', 'failed')
+             )
+         ) AS active_queue_missing_products,
+         (
+           SELECT COUNT(*)::int
+           FROM channel_publication_batches b
+           JOIN deleted_products dp ON dp.id = b.current_product_id
+           WHERE b.status IN ('queued', 'running')
+         ) AS active_publication_batch_deleted_products,
+         (
+           SELECT COUNT(*)::int
+           FROM delivery_batch_items i
+           JOIN delivery_batches b ON b.id = i.batch_id
+           JOIN deleted_products dp ON dp.id = i.product_id
+           WHERE b.status IN ('calling', 'couriers_assigned', 'handed_off')
+             AND COALESCE(i.assembly_status, 'pending') <> 'removed'
+         ) AS active_delivery_deleted_products,
+         (
+           SELECT COUNT(*)::int
+           FROM delivery_batch_items i
+           JOIN delivery_batches b ON b.id = i.batch_id
+           LEFT JOIN products p ON p.id = i.product_id
+           WHERE p.id IS NULL
+             AND b.status IN ('calling', 'couriers_assigned', 'handed_off')
+             AND COALESCE(i.assembly_status, 'pending') <> 'removed'
+         ) AS active_delivery_missing_products,
+         (
+           SELECT COUNT(*)::int
+           FROM messages m
+           JOIN products p ON p.id::text = COALESCE(m.meta->>'product_id', '')
+           WHERE COALESCE(m.meta->>'kind', '') IN ('catalog_product', 'reserved_order_item')
+             AND (p.status = 'deleted' OR p.deleted_at IS NOT NULL)
+             AND lower(COALESCE(m.meta->>'hidden_for_all', 'false')) NOT IN ('true', '1', 'yes', 'on')
+             AND lower(COALESCE(m.meta->>'client_cancelled', 'false')) NOT IN ('true', '1', 'yes', 'on')
+         ) AS visible_deleted_product_messages,
+         (
+           SELECT COUNT(*)::int
+           FROM messages m
+           WHERE COALESCE(m.meta->>'kind', '') IN ('catalog_product', 'reserved_order_item')
+             AND NULLIF(BTRIM(COALESCE(m.meta->>'product_id', '')), '') IS NOT NULL
+             AND lower(COALESCE(m.meta->>'hidden_for_all', 'false')) NOT IN ('true', '1', 'yes', 'on')
+             AND lower(COALESCE(m.meta->>'client_cancelled', 'false')) NOT IN ('true', '1', 'yes', 'on')
+             AND NOT EXISTS (
+               SELECT 1
+               FROM products p
+               WHERE p.id::text = COALESCE(m.meta->>'product_id', '')
+             )
+         ) AS visible_missing_product_messages,
+         (
+           SELECT COUNT(*)::int
+           FROM products p
+           WHERE COALESCE(p.status, '') <> 'deleted'
+             AND (
+               COALESCE(p.quantity, 0) < 0
+               OR COALESCE(p.price, 0) < 0
+             )
+         ) AS invalid_product_amounts`,
+    );
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      const row = q.rows?.[0] || {};
+      for (const field of numericFields) {
+        totals[field] += Number(row[field] || 0) || 0;
+      }
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    const driftCount =
+      totals.unavailable_targets +
+      numericFields.reduce((sum, field) => sum + totals[field], 0);
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "products.integrity_drift",
+        "Product, cart, reservation, delivery or channel state has inconsistent active references",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "products.integrity_healthy",
+      "Product, cart, reservation, delivery and channel state are consistent across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "products.integrity_check_failed",
+      "Product/cart integrity check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 function checkBackupFreshness() {
   try {
     if (!IS_PRODUCTION && !process.env.FENIX_BACKUP_ROOT) {
@@ -1286,6 +1530,7 @@ async function main() {
   await checkAuthSessionHealth();
   await checkTenantMigrationDrift();
   await checkTenantUserIndexDrift();
+  await checkProductCartIntegrity();
   checkBackupFreshness();
   checkAndroidReleaseConfig();
 

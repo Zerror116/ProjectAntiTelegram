@@ -399,6 +399,25 @@ function testNightlyAuditChecksUploadRecoveryHealth() {
   assert.match(source, /checkUploadRecoveryHealth\(\)/);
 }
 
+function testNightlyAuditChecksProductCartIntegrityProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkProductCartIntegrity/);
+  assert.match(source, /products\.integrity_drift/);
+  assert.match(source, /products\.integrity_healthy/);
+  assert.match(source, /active_cart_deleted_products/);
+  assert.match(source, /active_reservation_deleted_products/);
+  assert.match(source, /active_queue_deleted_products/);
+  assert.match(source, /active_delivery_deleted_products/);
+  assert.match(source, /visible_deleted_product_messages/);
+  assert.match(source, /visible_missing_product_messages/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkProductCartIntegrity\(\)/);
+}
+
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const fullAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
@@ -761,6 +780,7 @@ testNightlyAuditChecksAuthSessionsProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();
 testNightlyAuditChecksUploadRecoveryHealth();
+testNightlyAuditChecksProductCartIntegrityProjectWide();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();
