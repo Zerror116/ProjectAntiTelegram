@@ -452,6 +452,22 @@ function testNightlyAuditChecksProductCartIntegrityProjectWide() {
   assert.match(source, /await checkProductCartIntegrity\(\)/);
 }
 
+function testNightlyAuditChecksChatRecencyProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkChatRecencyIntegrity/);
+  assert.match(source, /chats\.recency_drift/);
+  assert.match(source, /chats\.recency_healthy/);
+  assert.match(source, /latest_message_at > chat_updated_at/);
+  assert.match(source, /stale_main_channel_count/);
+  assert.match(source, /stale_system_channel_count/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkChatRecencyIntegrity\(\)/);
+}
+
 function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   const fullAudit = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
@@ -817,6 +833,7 @@ testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();
 testNightlyAuditChecksUploadRecoveryHealth();
 testNightlyAuditChecksProductCartIntegrityProjectWide();
+testNightlyAuditChecksChatRecencyProjectWide();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();

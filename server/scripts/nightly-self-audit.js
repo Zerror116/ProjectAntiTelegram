@@ -1461,6 +1461,186 @@ async function checkProductCartIntegrity() {
   }
 }
 
+async function checkChatRecencyIntegrity() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    stale_chat_count: 0,
+    stale_channel_count: 0,
+    stale_main_channel_count: 0,
+    stale_system_channel_count: 0,
+    newest_message_at: null,
+    oldest_stale_chat_updated_at: null,
+  };
+
+  const numericFields = [
+    "stale_chat_count",
+    "stale_channel_count",
+    "stale_main_channel_count",
+    "stale_system_channel_count",
+  ];
+
+  function maxDateIso(currentValue, nextValue) {
+    if (!nextValue) return currentValue || null;
+    const nextDate = new Date(nextValue);
+    if (!Number.isFinite(nextDate.getTime())) return currentValue || null;
+    if (!currentValue) return nextDate.toISOString();
+    const currentDate = new Date(currentValue);
+    if (!Number.isFinite(currentDate.getTime())) return nextDate.toISOString();
+    return nextDate > currentDate ? nextDate.toISOString() : currentValue;
+  }
+
+  function minDateIso(currentValue, nextValue) {
+    if (!nextValue) return currentValue || null;
+    const nextDate = new Date(nextValue);
+    if (!Number.isFinite(nextDate.getTime())) return currentValue || null;
+    if (!currentValue) return nextDate.toISOString();
+    const currentDate = new Date(currentValue);
+    if (!Number.isFinite(currentDate.getTime())) return nextDate.toISOString();
+    return nextDate < currentDate ? nextDate.toISOString() : currentValue;
+  }
+
+  async function readTargetStats() {
+    return await db.query(
+      `WITH latest_visible_messages AS (
+         SELECT c.id AS chat_id,
+                lower(COALESCE(c.type, '')) AS chat_type,
+                lower(COALESCE(c.settings->>'system_key', c.settings->>'kind', '')) AS system_key,
+                c.updated_at AS chat_updated_at,
+                latest.created_at AS latest_message_at
+           FROM chats c
+           JOIN LATERAL (
+             SELECT m.created_at
+               FROM messages m
+              WHERE m.chat_id = c.id
+                AND lower(COALESCE(m.meta->>'hidden_for_all', 'false')) NOT IN ('true', '1', 'yes', 'on')
+              ORDER BY m.created_at DESC, m.id DESC
+              LIMIT 1
+           ) latest ON true
+       ),
+       stale_chats AS (
+         SELECT *
+           FROM latest_visible_messages
+          WHERE chat_updated_at IS NULL
+             OR latest_message_at > chat_updated_at + interval '2 seconds'
+       )
+       SELECT
+         COUNT(*)::int AS stale_chat_count,
+         COUNT(*) FILTER (WHERE chat_type = 'channel')::int AS stale_channel_count,
+         COUNT(*) FILTER (WHERE system_key = 'main_channel')::int AS stale_main_channel_count,
+         COUNT(*) FILTER (WHERE system_key <> '')::int AS stale_system_channel_count,
+         MAX(latest_message_at) AS newest_message_at,
+         MIN(chat_updated_at) AS oldest_stale_chat_updated_at
+       FROM stale_chats`,
+    );
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      const row = q.rows?.[0] || {};
+      for (const field of numericFields) {
+        totals[field] += Number(row[field] || 0) || 0;
+      }
+      totals.newest_message_at = maxDateIso(
+        totals.newest_message_at,
+        row.newest_message_at,
+      );
+      totals.oldest_stale_chat_updated_at = minDateIso(
+        totals.oldest_stale_chat_updated_at,
+        row.oldest_stale_chat_updated_at,
+      );
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    const driftCount =
+      totals.unavailable_targets +
+      numericFields.reduce((sum, field) => sum + totals[field], 0);
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "chats.recency_drift",
+        "One or more chats have an older updated_at than their latest visible message",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "chats.recency_healthy",
+      "Chat recency is consistent with latest visible messages across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "chats.recency_check_failed",
+      "Chat recency integrity check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
 function checkBackupFreshness() {
   try {
     if (!IS_PRODUCTION && !process.env.FENIX_BACKUP_ROOT) {
@@ -1719,6 +1899,7 @@ async function main() {
   await checkTenantMigrationDrift();
   await checkTenantUserIndexDrift();
   await checkProductCartIntegrity();
+  await checkChatRecencyIntegrity();
   checkBackupFreshness();
   checkAndroidReleaseConfig();
 
