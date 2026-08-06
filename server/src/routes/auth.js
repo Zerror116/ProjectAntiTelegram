@@ -3693,7 +3693,6 @@ router.post('/login', async (req, res) => {
     if (
       !isPlatformCreator &&
       !result?.ok &&
-      tenantCodeHint &&
       (result?.reason === 'user_not_found' ||
         result?.reason === 'password_mismatch')
     ) {
