@@ -14,6 +14,9 @@ const { downloadsRoot } = require("../src/utils/storagePaths");
 const {
   ANDROID_STABLE_RELEASE_FILE,
 } = require("../src/utils/androidStableRelease");
+const {
+  getTenantFeatureSettings,
+} = require("../src/utils/tenantFeatureSettings");
 
 const NODE_ENV = String(process.env.NODE_ENV || "development")
   .toLowerCase()
@@ -363,6 +366,94 @@ async function checkNotificationQueueHealth() {
   }
 }
 
+async function checkTenantFeaturePolicy() {
+  try {
+    const tenantsQ = await db.platformQuery(
+      `SELECT id
+       FROM tenants
+       ORDER BY created_at`,
+    );
+    const totals = {
+      tenants_checked: 0,
+      phone_access_approval_enabled: 0,
+      group_switcher_disabled: 0,
+      qr_existing_client_join_disabled: 0,
+      client_cancel_anytime_disabled: 0,
+    };
+
+    for (const row of tenantsQ.rows || []) {
+      const tenantId = String(row.id || "").trim();
+      if (!tenantId) continue;
+      totals.tenants_checked += 1;
+      const settings = await getTenantFeatureSettings(tenantId);
+      if (
+        settings.phone_access_approval_enabled !== false ||
+        settings.client?.phone_access_approval_enabled !== false
+      ) {
+        totals.phone_access_approval_enabled += 1;
+      }
+      if (
+        settings.client_group_switcher_enabled !== true ||
+        settings.client?.group_switcher_enabled !== true
+      ) {
+        totals.group_switcher_disabled += 1;
+      }
+      if (
+        settings.qr_existing_client_join_enabled !== true ||
+        settings.client?.qr_existing_client_join_enabled !== true
+      ) {
+        totals.qr_existing_client_join_disabled += 1;
+      }
+      if (
+        settings.client_cancel_anytime_enabled !== true ||
+        settings.delivery?.client_cancel_anytime_enabled !== true
+      ) {
+        totals.client_cancel_anytime_disabled += 1;
+      }
+    }
+
+    if (totals.phone_access_approval_enabled > 0) {
+      addFinding(
+        "critical",
+        "tenant_features.phone_access_enabled",
+        "Phone access approval is enabled for at least one tenant",
+        totals,
+      );
+      return;
+    }
+
+    const driftCount =
+      totals.group_switcher_disabled +
+      totals.qr_existing_client_join_disabled +
+      totals.client_cancel_anytime_disabled;
+    if (driftCount > 0) {
+      addFinding(
+        "warn",
+        "tenant_features.policy_drift",
+        "Tenant feature settings drift from current platform defaults",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "tenant_features.policy_ok",
+      "Tenant feature settings match current platform policy",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      "warn",
+      "tenant_features.check_unavailable",
+      "Tenant feature policy check skipped",
+      {
+        error: String(err?.message || err).slice(0, 300),
+      },
+    );
+  }
+}
+
 function checkBackupFreshness() {
   try {
     if (!IS_PRODUCTION && !process.env.FENIX_BACKUP_ROOT) {
@@ -615,6 +706,7 @@ async function main() {
   );
   await checkMonitoringBacklog();
   await checkNotificationQueueHealth();
+  await checkTenantFeaturePolicy();
   checkBackupFreshness();
   checkAndroidReleaseConfig();
 

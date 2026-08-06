@@ -248,6 +248,20 @@ function testClientCancelAnytimeHandlesDeliveryBatchLinks() {
   );
 }
 
+function testNightlyAuditChecksTenantFeaturePolicy() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkTenantFeaturePolicy/);
+  assert.match(source, /getTenantFeatureSettings/);
+  assert.match(source, /phone_access_approval_enabled/);
+  assert.match(source, /tenant_features\.phone_access_enabled/);
+  assert.match(source, /tenant_features\.policy_drift/);
+  assert.match(source, /client_cancel_anytime_disabled/);
+  assert.match(source, /await checkTenantFeaturePolicy\(\)/);
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -536,6 +550,7 @@ testLegacyBootstrapScansTenantSessionScopes();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();
+testNightlyAuditChecksTenantFeaturePolicy();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
