@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/test/test_flutter_secure_storage_platform.dart';
 import 'package:flutter_secure_storage_platform_interface/flutter_secure_storage_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -35,6 +35,11 @@ ResponseBody _jsonResponse(int statusCode, Map<String, dynamic> body) {
       Headers.contentTypeHeader: [Headers.jsonContentType],
     },
   );
+}
+
+bool _isNotificationEndpointLifecycleRequest(RequestOptions options) {
+  return options.path == '/api/notifications/endpoints/unregister' ||
+      options.path == '/api/notifications/endpoints/refresh';
 }
 
 User _user({
@@ -177,9 +182,24 @@ void main() {
   );
 
   test('failed saved tenant switch restores previous session', () async {
+    final previousDebugPrint = debugPrint;
+    final debugMessages = <String>[];
+    debugPrint = (String? message, {int? wrapWidth}) {
+      if (message != null) debugMessages.add(message);
+    };
+    addTearDown(() {
+      debugPrint = previousDebugPrint;
+    });
+
     final bootstrapAuthHeaders = <String>[];
     final dio = Dio();
     dio.httpClientAdapter = _FakeDioAdapter((options) {
+      if (_isNotificationEndpointLifecycleRequest(options)) {
+        return _jsonResponse(200, {
+          'ok': true,
+          'data': {'deactivated': true},
+        });
+      }
       if (options.path == '/api/auth/refresh/bootstrap') {
         bootstrapAuthHeaders.add(
           (options.headers['Authorization'] ?? '').toString(),
@@ -206,6 +226,14 @@ void main() {
         (row) => (row['id'] ?? '').toString() == 'target@example.test::target',
       ),
       isFalse,
+    );
+    expect(
+      debugMessages.where(
+        (message) =>
+            message.contains('unregisterCurrentEndpoint skipped') ||
+            message.contains('DioException [bad response]'),
+      ),
+      isEmpty,
     );
   });
 
