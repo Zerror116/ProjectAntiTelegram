@@ -32,10 +32,13 @@ run_local_checks() {
     echo "RUN_BUILDS=0, skip flutter build web/apk"
   fi
 
-  print_section "Local Node Syntax + Security Audit"
+  print_section "Local Node Syntax + Business Guards + Security Audit"
   cd "$PROJECT_ROOT/server"
-  find src -type f -name "*.js" -print0 | xargs -0 -n1 node --check
+  find src scripts -type f -name "*.js" -print0 | xargs -0 -n1 node --check
+  npm run test:business:settings
+  npm run lint
   npm audit --omit=dev --audit-level=high
+  npm run audit:gate
   npm run audit:self
 }
 

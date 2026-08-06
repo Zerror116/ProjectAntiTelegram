@@ -262,6 +262,30 @@ function testNightlyAuditChecksTenantFeaturePolicy() {
   assert.match(source, /await checkTenantFeaturePolicy\(\)/);
 }
 
+function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
+  const fullAudit = fs.readFileSync(
+    path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
+    "utf8",
+  );
+  assert.match(fullAudit, /npm run test:business:settings/);
+  assert.match(fullAudit, /npm run lint/);
+  assert.match(fullAudit, /npm run audit:gate/);
+  assert.match(fullAudit, /find src scripts -type f -name "\*\.js"/);
+
+  const releaseWithAudit = fs.readFileSync(
+    path.resolve(__dirname, "../../scripts/release_with_audit.sh"),
+    "utf8",
+  );
+  const auditIndex = releaseWithAudit.indexOf("full_cluster_audit.sh");
+  const deployIndex = releaseWithAudit.indexOf("deploy_full.sh");
+  assert.ok(auditIndex >= 0, "release_with_audit must run full_cluster_audit");
+  assert.ok(deployIndex >= 0, "release_with_audit must run deploy_full");
+  assert.ok(
+    auditIndex < deployIndex,
+    "release_with_audit must run full_cluster_audit before deploy_full",
+  );
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -551,6 +575,7 @@ testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
+testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
