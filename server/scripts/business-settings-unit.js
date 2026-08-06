@@ -202,6 +202,32 @@ function testNotificationInboxDedupeIsAtomic() {
   );
 }
 
+function testManualRevisionUsesManualShelfKeys() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/worker.js"),
+    "utf8",
+  );
+  assert.match(source, /async function fetchRevisionShelves/);
+  assert.match(source, /if \(options\.manualShelfEnabled === true\)/);
+  assert.match(source, /manualRevisionShelfLabelSql\('p'\)/);
+  assert.match(source, /lower\(\$\{manualShelfSql\}\) AS shelf_key/);
+  assert.match(source, /GROUP BY vc\.shelf_key/);
+  assert.match(source, /selectedShelfKey: manualShelfEnabled \? requestedShelfKey : ''/);
+  assert.match(source, /selectedShelfNumber: manualShelfEnabled \? null : selectedShelfNumber/);
+  assert.match(source, /manualShelfEnabled[\s\S]{0,300}normalizeRevisionShelfKey\(post\.revision_shelf_key\)/);
+
+  const manualBranchStart = source.indexOf("if (options.manualShelfEnabled === true)");
+  const fallbackBranchStart = source.indexOf(
+    "const includeHiddenMissingPhotoShelf",
+    manualBranchStart,
+  );
+  assert.ok(manualBranchStart >= 0);
+  assert.ok(fallbackBranchStart > manualBranchStart);
+  const manualBranch = source.slice(manualBranchStart, fallbackBranchStart);
+  assert.doesNotMatch(manualBranch, /Array\.from\(\{ length: 10 \}/);
+  assert.doesNotMatch(manualBranch, /p\.shelf_number BETWEEN 1 AND 10/);
+}
+
 function testNotificationWorkerTenantScopes() {
   const tenantRows = [
     { code: "alpha", db_mode: "isolated" },
@@ -488,6 +514,7 @@ testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
 testLegacyBootstrapScansTenantSessionScopes();
 testNotificationInboxDedupeIsAtomic();
+testManualRevisionUsesManualShelfKeys();
 testNotificationWorkerTenantScopes();
 testNoTenantSpecificWorkflowHardcode();
 testWorkerDeliveryAssemblyFeatureFlag();
