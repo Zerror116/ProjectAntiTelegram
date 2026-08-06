@@ -231,6 +231,75 @@ function testManualRevisionUsesManualShelfKeys() {
   assert.doesNotMatch(manualBranch, /p\.shelf_number BETWEEN 1 AND 10/);
 }
 
+function testProductDescriptionOptionalProjectWide() {
+  const workerRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/worker.js"),
+    "utf8",
+  );
+  const adminRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/admin.js"),
+    "utf8",
+  );
+  const workerPanel = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/worker_panel.dart"),
+    "utf8",
+  );
+  const adminPanel = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/admin_panel.dart"),
+    "utf8",
+  );
+
+  assert.match(workerPanel, /labelText: 'Описание \(необязательно\)'/);
+  assert.match(adminPanel, /labelText: 'Описание \(необязательно\)'/);
+  assert.match(
+    workerPanel,
+    /description\.isNotEmpty && _countLetterRunes\(description\) < 2/,
+  );
+  assert.match(adminPanel, /description\.isNotEmpty && description\.length < 2/);
+  assert.match(workerRoute, /if \(normalizedDescription && !hasAtLeastTwoLetters/);
+  assert.match(workerRoute, /if \(nextDescription && !hasAtLeastTwoLetters/);
+  assert.match(workerRoute, /if \(description && !hasAtLeastTwoLetters\(description\)\)/);
+  assert.match(adminRoute, /if \(description && description\.length < 2\)/);
+  assert.doesNotMatch(workerRoute, /Описание товара обязательно/);
+  assert.doesNotMatch(adminRoute, /Описание товара обязательно/);
+
+  const requeueStart = workerPanel.indexOf("Future<void> _requeueProduct");
+  const requeueEnd = workerPanel.indexOf(
+    "Future<void> _quickDuplicateProduct",
+    requeueStart,
+  );
+  assert.ok(requeueStart >= 0, "_requeueProduct must exist");
+  assert.ok(requeueEnd > requeueStart, "_quickDuplicateProduct must follow _requeueProduct");
+  const requeueBlock = workerPanel.slice(requeueStart, requeueEnd);
+  assert.match(
+    requeueBlock,
+    /final description = \(product\['description'\] \?\? ''\)\.toString\(\)\.trim\(\);/,
+  );
+  assert.doesNotMatch(requeueBlock, /_descriptionCtrl\.text\.trim\(\)\.isNotEmpty/);
+  assert.doesNotMatch(requeueBlock, /_titleCtrl\.text\.trim\(\)\.isNotEmpty/);
+  assert.doesNotMatch(requeueBlock, /_pickedImage/);
+  assert.doesNotMatch(requeueBlock, /_existingImageUrl/);
+  assert.doesNotMatch(requeueBlock, /_removeImageOnSubmit/);
+  assert.match(requeueBlock, /imageUrl: existingImage/);
+
+  const payloadStart = workerPanel.indexOf("FormData _buildRequeuePayload");
+  const payloadEnd = workerPanel.indexOf("Future<void> _loadChannels", payloadStart);
+  assert.ok(payloadStart >= 0, "_buildRequeuePayload must be synchronous");
+  assert.ok(payloadEnd > payloadStart, "_buildRequeuePayload block must be bounded");
+  const payloadBlock = workerPanel.slice(payloadStart, payloadEnd);
+  assert.match(payloadBlock, /required String imageUrl/);
+  assert.match(payloadBlock, /map\['image_url'\] = imageUrl/);
+  assert.doesNotMatch(payloadBlock, /_pickedImage/);
+  assert.doesNotMatch(payloadBlock, /_existingImageUrl/);
+  assert.doesNotMatch(payloadBlock, /_removeImageOnSubmit/);
+
+  assert.match(workerRoute, /const hasDescriptionField = Object\.prototype\.hasOwnProperty\.call/);
+  assert.match(
+    workerRoute,
+    /const nextDescription = hasDescriptionField\s*\?\s*String\(description \|\| ''\)\.trim\(\)\s*:\s*String\(current\.description \|\| ''\)\.trim\(\);/,
+  );
+}
+
 function testClientCancelAnytimeHandlesDeliveryBatchLinks() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/cart.js"),
@@ -964,6 +1033,7 @@ testAuthRecoveryUsesScopedEmailTokens();
 testLegacyBootstrapScansTenantSessionScopes();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
+testProductDescriptionOptionalProjectWide();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();
 testNightlyAuditChecksTenantFeaturePolicy();
 testNightlyAuditChecksNotificationQueueAcrossTenantScopes();

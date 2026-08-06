@@ -2129,8 +2129,14 @@ router.post(
             });
           }
 
+          const hasDescriptionField = Object.prototype.hasOwnProperty.call(
+            req.body || {},
+            'description',
+          );
           const nextTitle = normalizeCatalogTitle(title || current.title || '');
-          const nextDescription = String(description ?? current.description ?? '').trim();
+          const nextDescription = hasDescriptionField
+            ? String(description || '').trim()
+            : String(current.description || '').trim();
           const nextPrice = price != null ? toPositiveNumber(price, -1) : Number(current.price);
           const nextQuantity =
             quantity != null && quantity !== ''

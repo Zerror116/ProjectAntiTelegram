@@ -1476,44 +1476,35 @@ class _WorkerPanelState extends State<WorkerPanel>
     return FormData.fromMap(map);
   }
 
-  Future<FormData> _buildRequeuePayload({
-    required Map<String, dynamic> product,
+  FormData _buildRequeuePayload({
     required String channelId,
     required String title,
     required String description,
     required double price,
     required int quantity,
-  }) async {
+    required String imageUrl,
+    required String manualShelfLabel,
+    required String shelfFloor,
+    required bool pickupOnly,
+    required bool isBulky,
+  }) {
     final map = <String, dynamic>{
       'channel_id': channelId,
       'title': title,
       'description': description,
       'price': price,
       'quantity': quantity,
-      'is_bulky': _isBulkyProduct ? 'true' : 'false',
+      'is_bulky': isBulky ? 'true' : 'false',
     };
     if (_manualShelfEnabled) {
-      map['manual_shelf_label'] = _manualShelfLabelCtrl.text.trim();
-      map['shelf_floor'] = _shelfFloorCtrl.text.trim();
+      map['manual_shelf_label'] = manualShelfLabel;
+      map['shelf_floor'] = shelfFloor;
     }
     if (_pickupOnlyEnabled) {
-      map['pickup_only'] = _pickupOnly ? 'true' : 'false';
+      map['pickup_only'] = pickupOnly ? 'true' : 'false';
     }
-
-    if (_pickedImage != null || (_pickedImageBytes?.isNotEmpty ?? false)) {
-      final imageFile = await _buildPickedImageMultipart();
-      if (imageFile != null) {
-        map['image'] = imageFile;
-      }
-    } else if (_removeImageOnSubmit) {
-      map['image_url'] = '';
-    } else {
-      final imageUrl = _normalizedImageUrlFromForm();
-      if (imageUrl != null) {
-        map['image_url'] = imageUrl;
-      } else if ((product['image_url'] ?? '').toString().trim().isNotEmpty) {
-        map['image_url'] = (product['image_url'] ?? '').toString().trim();
-      }
+    if (imageUrl.isNotEmpty) {
+      map['image_url'] = imageUrl;
     }
 
     return FormData.fromMap(map);
@@ -2600,39 +2591,18 @@ class _WorkerPanelState extends State<WorkerPanel>
     final productId = product['id']?.toString();
     if (productId == null || productId.isEmpty) return;
 
-    final title = _titleCtrl.text.trim().isNotEmpty
-        ? _titleCtrl.text.trim()
-        : (product['title'] ?? '').toString();
-    final description = _descriptionCtrl.text.trim().isNotEmpty
-        ? _descriptionCtrl.text.trim()
-        : (product['description'] ?? '').toString();
-
-    final rawPriceInput = _priceCtrl.text.trim().replaceAll(',', '.');
-    final editedPrice = rawPriceInput.isNotEmpty
-        ? double.tryParse(rawPriceInput)
-        : null;
-    if (rawPriceInput.isNotEmpty && editedPrice == null) {
-      setState(() => _message = 'Введите корректную цену');
-      return;
-    }
-    final fallbackPrice = _toDoubleValue(product['price'], 0);
-    final price = editedPrice ?? fallbackPrice;
-
-    final rawQtyInput = _quantityCtrl.text.trim();
-    final editedQty = rawQtyInput.isNotEmpty ? int.tryParse(rawQtyInput) : null;
-    if (rawQtyInput.isNotEmpty && (editedQty == null || editedQty <= 0)) {
-      setState(() => _message = 'Количество должно быть больше нуля');
-      return;
-    }
-    final fallbackQty = _toIntValue(product['quantity'], 1);
-    final quantity = editedQty ?? fallbackQty;
+    final title = (product['title'] ?? '').toString().trim();
+    final description = (product['description'] ?? '').toString().trim();
+    final price = _toDoubleValue(product['price'], 0);
+    final quantity = math.max(_toIntValue(product['quantity'], 1), 1);
+    final manualShelfLabel = (product['manual_shelf_label'] ?? '')
+        .toString()
+        .trim();
+    final shelfFloor = (product['shelf_floor'] ?? '').toString().trim();
+    final pickupOnly = _toBoolValue(product['pickup_only']);
+    final isBulky = _toBoolValue(product['is_bulky']);
     final existingImage = (product['image_url'] ?? '').toString().trim();
-    final hasImage =
-        _pickedImage != null ||
-        (_pickedImageBytes?.isNotEmpty ?? false) ||
-        ((_existingImageUrl?.trim().isNotEmpty ?? false) &&
-            !_removeImageOnSubmit) ||
-        (existingImage.isNotEmpty && !_removeImageOnSubmit);
+    final hasImage = existingImage.isNotEmpty;
     final validationError = _validateProductFields(
       title: title,
       description: description,
@@ -2650,13 +2620,17 @@ class _WorkerPanelState extends State<WorkerPanel>
       _message = '';
     });
     try {
-      final payload = await _buildRequeuePayload(
-        product: product,
+      final payload = _buildRequeuePayload(
         channelId: channelId,
         title: title,
         description: description,
         price: price,
         quantity: quantity,
+        imageUrl: existingImage,
+        manualShelfLabel: manualShelfLabel,
+        shelfFloor: shelfFloor,
+        pickupOnly: pickupOnly,
+        isBulky: isBulky,
       );
 
       final resp = await authService.dio.post(
@@ -2697,7 +2671,6 @@ class _WorkerPanelState extends State<WorkerPanel>
                     ? 'Старый товар отправлен в очередь. ID товара: $productLabel. Полка: $placementShelfLabel'
                     : 'Старый товар отправлен в очередь. ID товара: $productLabel')
               : 'Старый товар отправлен в очередь повторно';
-          _removeImageOnSubmit = false;
         });
         _loadOwnQueuedPosts();
         if (mounted) {
