@@ -318,6 +318,7 @@ function testNightlyAuditChecksSchemaContractProjectWide() {
   );
   assert.match(source, /const SHARED_SCHEMA_CONTRACT = \[/);
   assert.match(source, /const PLATFORM_SCHEMA_CONTRACT = \[/);
+  assert.match(source, /table: "auth_email_tokens"/);
   assert.match(source, /async function checkDatabaseSchemaContract/);
   assert.match(source, /schema\.contract_drift/);
   assert.match(source, /schema\.contract_healthy/);
@@ -405,6 +406,24 @@ function testNightlyAuditChecksAuthIdentityProjectWide() {
   assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
   assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
   assert.match(source, /await checkAuthIdentityIntegrity\(\)/);
+}
+
+function testNightlyAuditChecksAuthEmailTokensProjectWide() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "nightly-self-audit.js"),
+    "utf8",
+  );
+  assert.match(source, /async function checkAuthEmailTokenIntegrity/);
+  assert.match(source, /auth_email_tokens\.integrity_drift/);
+  assert.match(source, /auth_email_tokens\.healthy/);
+  assert.match(source, /unexpired_tokens_missing_user/);
+  assert.match(source, /unexpired_tokens_inactive_user/);
+  assert.match(source, /unexpired_tokens_email_mismatch/);
+  assert.match(source, /unexpired_tokens_tenant_mismatch/);
+  assert.match(source, /duplicate_unexpired_user_kind_groups/);
+  assert.match(source, /db_mode IN \('isolated', 'schema_isolated'\)/);
+  assert.match(source, /db\.runWithTenantRow\(tenant, fn\)/);
+  assert.match(source, /await checkAuthEmailTokenIntegrity\(\)/);
 }
 
 function testSessionBootstrapE2ECoversRefreshAndPersistentSessions() {
@@ -955,6 +974,7 @@ testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
 testNightlyAuditChecksAuthIdentityProjectWide();
+testNightlyAuditChecksAuthEmailTokensProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();
 testNightlyAuditChecksUploadRecoveryHealth();

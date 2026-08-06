@@ -101,6 +101,20 @@ const SHARED_SCHEMA_CONTRACT = [
     ],
   },
   {
+    table: "auth_email_tokens",
+    columns: [
+      "id",
+      "user_id",
+      "tenant_id",
+      "email",
+      "kind",
+      "token_hash",
+      "expires_at",
+      "used_at",
+      "created_at",
+    ],
+  },
+  {
     table: "notification_endpoints",
     columns: ["id", "tenant_id", "user_id", "platform", "transport", "is_active"],
   },
@@ -1331,6 +1345,233 @@ async function checkAuthIdentityIntegrity() {
       IS_PRODUCTION ? "critical" : "warn",
       "auth_identity.check_failed",
       "Auth identity integrity check failed",
+      {
+        error: String(err?.message || err).slice(0, 300),
+        targets_checked: totals.targets_checked,
+      },
+    );
+  }
+}
+
+async function checkAuthEmailTokenIntegrity() {
+  const totals = {
+    targets_checked: 0,
+    platform_targets: 0,
+    isolated_targets: 0,
+    schema_isolated_targets: 0,
+    unavailable_targets: 0,
+    unused_tokens: 0,
+    unexpired_unused_tokens: 0,
+    expired_unused_tokens: 0,
+    unexpired_tokens_missing_user: 0,
+    unexpired_tokens_inactive_user: 0,
+    unexpired_tokens_invalid_email: 0,
+    unexpired_tokens_email_mismatch: 0,
+    unexpired_tokens_invalid_hash: 0,
+    unexpired_tokens_unknown_kind: 0,
+    unexpired_tokens_tenant_mismatch: 0,
+    duplicate_unexpired_user_kind_groups: 0,
+    duplicate_unexpired_user_kind_tokens: 0,
+  };
+
+  const numericFields = [
+    "unused_tokens",
+    "unexpired_unused_tokens",
+    "expired_unused_tokens",
+    "unexpired_tokens_missing_user",
+    "unexpired_tokens_inactive_user",
+    "unexpired_tokens_invalid_email",
+    "unexpired_tokens_email_mismatch",
+    "unexpired_tokens_invalid_hash",
+    "unexpired_tokens_unknown_kind",
+    "unexpired_tokens_tenant_mismatch",
+    "duplicate_unexpired_user_kind_groups",
+    "duplicate_unexpired_user_kind_tokens",
+  ];
+  const hardDriftFields = [
+    "unexpired_tokens_missing_user",
+    "unexpired_tokens_inactive_user",
+    "unexpired_tokens_invalid_email",
+    "unexpired_tokens_email_mismatch",
+    "unexpired_tokens_invalid_hash",
+    "unexpired_tokens_unknown_kind",
+    "unexpired_tokens_tenant_mismatch",
+    "duplicate_unexpired_user_kind_groups",
+    "duplicate_unexpired_user_kind_tokens",
+  ];
+
+  async function readTargetStats() {
+    return await db.query(
+      `WITH unused_tokens AS (
+         SELECT t.id,
+                t.user_id,
+                t.tenant_id,
+                lower(NULLIF(BTRIM(t.email), '')) AS token_email,
+                COALESCE(t.kind, '') AS kind,
+                COALESCE(t.token_hash, '') AS token_hash,
+                t.expires_at,
+                u.id AS existing_user_id,
+                lower(NULLIF(BTRIM(u.email), '')) AS user_email,
+                u.tenant_id AS user_tenant_id,
+                COALESCE(u.is_active, true) AS user_is_active
+           FROM auth_email_tokens t
+           LEFT JOIN users u ON u.id = t.user_id
+          WHERE t.used_at IS NULL
+       ),
+       unexpired_tokens AS (
+         SELECT *
+           FROM unused_tokens
+          WHERE expires_at > now()
+       ),
+       duplicate_user_kind AS (
+         SELECT user_id,
+                kind,
+                COUNT(*)::int AS token_count
+           FROM unexpired_tokens
+          WHERE user_id IS NOT NULL
+            AND kind IN ('password_reset', 'magic_login')
+          GROUP BY user_id, kind
+         HAVING COUNT(*) > 1
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM unused_tokens) AS unused_tokens,
+         (SELECT COUNT(*)::int FROM unexpired_tokens) AS unexpired_unused_tokens,
+         (
+           SELECT COUNT(*)::int
+             FROM unused_tokens
+            WHERE expires_at <= now()
+         ) AS expired_unused_tokens,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE existing_user_id IS NULL
+         ) AS unexpired_tokens_missing_user,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE existing_user_id IS NOT NULL
+              AND user_is_active = false
+         ) AS unexpired_tokens_inactive_user,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE token_email IS NULL
+               OR token_email !~ '^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$'
+         ) AS unexpired_tokens_invalid_email,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE existing_user_id IS NOT NULL
+              AND token_email IS DISTINCT FROM user_email
+         ) AS unexpired_tokens_email_mismatch,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE token_hash !~ '^[0-9a-f]{64}$'
+         ) AS unexpired_tokens_invalid_hash,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE kind NOT IN ('password_reset', 'magic_login')
+         ) AS unexpired_tokens_unknown_kind,
+         (
+           SELECT COUNT(*)::int
+             FROM unexpired_tokens
+            WHERE existing_user_id IS NOT NULL
+              AND tenant_id IS DISTINCT FROM user_tenant_id
+         ) AS unexpired_tokens_tenant_mismatch,
+         COALESCE((SELECT COUNT(*)::int FROM duplicate_user_kind), 0)::int AS duplicate_unexpired_user_kind_groups,
+         COALESCE((SELECT SUM(token_count)::int FROM duplicate_user_kind), 0)::int AS duplicate_unexpired_user_kind_tokens`,
+    );
+  }
+
+  async function inspectTarget({ mode, run }) {
+    totals.targets_checked += 1;
+    if (mode === "platform") totals.platform_targets += 1;
+    if (mode === "isolated") totals.isolated_targets += 1;
+    if (mode === "schema_isolated") totals.schema_isolated_targets += 1;
+
+    try {
+      const q = await run(readTargetStats);
+      const row = q.rows?.[0] || {};
+      for (const field of numericFields) {
+        totals[field] += Number(row[field] || 0) || 0;
+      }
+    } catch (err) {
+      const code = String(err?.code || "").trim();
+      if (code === "42P01" || code === "42703" || code === "3F000") {
+        totals.unavailable_targets += 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  try {
+    await inspectTarget({
+      mode: "platform",
+      run: (fn) => db.runWithPlatform(fn),
+    });
+
+    const tenantsQ = await db.platformQuery(
+      `SELECT id,
+              db_mode,
+              db_url,
+              db_schema
+       FROM tenants
+       WHERE COALESCE(is_deleted, false) = false
+         AND db_mode IN ('isolated', 'schema_isolated')
+       ORDER BY created_at`,
+    );
+
+    for (const tenant of tenantsQ.rows || []) {
+      const mode = String(tenant?.db_mode || "").toLowerCase().trim();
+      if (mode === "isolated" && !String(tenant?.db_url || "").trim()) {
+        totals.targets_checked += 1;
+        totals.isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+      if (
+        mode === "schema_isolated" &&
+        !String(tenant?.db_schema || "").trim()
+      ) {
+        totals.targets_checked += 1;
+        totals.schema_isolated_targets += 1;
+        totals.unavailable_targets += 1;
+        continue;
+      }
+
+      await inspectTarget({
+        mode,
+        run: (fn) => db.runWithTenantRow(tenant, fn),
+      });
+    }
+
+    const driftCount =
+      totals.unavailable_targets +
+      hardDriftFields.reduce((sum, field) => sum + totals[field], 0);
+    if (driftCount > 0) {
+      addFinding(
+        IS_PRODUCTION ? "critical" : "warn",
+        "auth_email_tokens.integrity_drift",
+        "Auth email recovery tokens have stale or inconsistent active references",
+        totals,
+      );
+      return;
+    }
+
+    addFinding(
+      "info",
+      "auth_email_tokens.healthy",
+      "Auth email recovery tokens are consistent across database targets",
+      totals,
+    );
+  } catch (err) {
+    addFinding(
+      IS_PRODUCTION ? "critical" : "warn",
+      "auth_email_tokens.check_failed",
+      "Auth email recovery token integrity check failed",
       {
         error: String(err?.message || err).slice(0, 300),
         targets_checked: totals.targets_checked,
@@ -2809,6 +3050,7 @@ async function main() {
   await checkTenantFeaturePolicy();
   await checkAuthSessionHealth();
   await checkAuthIdentityIntegrity();
+  await checkAuthEmailTokenIntegrity();
   await checkTenantMigrationDrift();
   await checkDatabaseSchemaContract();
   await checkTenantUserIndexDrift();
