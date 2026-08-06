@@ -19,8 +19,7 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
   bool _loading = true;
   bool _busy = false;
   String _state = 'pending';
-  String _message = 'Ожидается решение первого владельца номера';
-  String _ownerName = '';
+  String _message = 'Номер уже используется. Ожидается подтверждение доступа.';
 
   @override
   void initState() {
@@ -62,7 +61,6 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
           : const <String, dynamic>{};
       final nextState = (data['state'] ?? 'none').toString().trim();
       final nextMessage = (data['message'] ?? '').toString().trim();
-      final nextOwner = (data['owner_name'] ?? '').toString().trim();
 
       if (!mounted) return;
       if (nextState == 'approved' || nextState == 'none') {
@@ -75,9 +73,8 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
       setState(() {
         _state = nextState.isEmpty ? 'pending' : nextState;
         _message = nextMessage.isEmpty
-            ? 'Ожидается решение первого владельца номера'
+            ? 'Номер уже используется. Ожидается подтверждение доступа.'
             : nextMessage;
-        _ownerName = nextOwner;
       });
     } on DioException catch (e) {
       final responseData = e.response?.data;
@@ -144,15 +141,6 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
                     ),
                     const SizedBox(height: 12),
                     Text(_message),
-                    if (_ownerName.isNotEmpty) ...[
-                      const SizedBox(height: 10),
-                      Text(
-                        'Владелец номера: $_ownerName',
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
                     if (_loading) ...[
                       const SizedBox(height: 16),
                       const LinearProgressIndicator(minHeight: 3),

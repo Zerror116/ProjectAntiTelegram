@@ -405,7 +405,7 @@ async function resolveAuthContextFromToken(
       return {
         ok: false,
         status: 403,
-        error: 'Аккаунт не привязан к арендатору. Обратитесь к владельцу приложения.',
+        error: 'Аккаунт не привязан к арендатору. Обратитесь к ответственному администратору.',
       };
     }
 
@@ -420,7 +420,7 @@ async function resolveAuthContextFromToken(
       return {
         ok: false,
         status: 403,
-        error: 'Арендатор не найден. Обратитесь к владельцу приложения.',
+        error: 'Арендатор не найден. Обратитесь к ответственному администратору.',
       };
     }
     tenantRegistry = tenantRes.rows[0];
@@ -574,8 +574,8 @@ async function authMiddleware(req, res, next) {
       const state = String(req.user?.phone_access_state || '').trim();
       const message =
         state === 'rejected'
-          ? 'Владелец номера отклонил запрос. Обновите номер телефона в профиле.'
-          : 'Ожидается разрешение первого владельца номера.';
+          ? 'Запрос на использование номера отклонён. Обновите номер телефона в профиле.'
+          : 'Номер уже используется. Ожидается подтверждение доступа.';
       return res.status(423).json({
         error: message,
         code: `phone_access_${state || 'restricted'}`,

@@ -246,7 +246,14 @@ function testPublicAuthErrorsUseNeutralSupportWording() {
     assert.doesNotMatch(source, /Обратитесь к создателю/);
     assert.doesNotMatch(source, /создателю приложения/);
     assert.doesNotMatch(source, /создателю за новым ключом/);
+    assert.doesNotMatch(source, /владельцу приложения/);
   }
+
+  const tenantUtils = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/tenants.js"),
+    "utf8",
+  );
+  assert.doesNotMatch(tenantUtils, /владельцу приложения|владельцем приложения/);
 }
 
 function testUnreachableFirstCallAutoDeleteDefaultsOff() {
@@ -335,6 +342,46 @@ function testPhoneAccessDefaultDoesNotRestrictMissingTenant() {
   assert.match(authUtil, /if \(!normalizedTenantId\) return false/);
 }
 
+function testPhoneAccessDoesNotExposeFirstOwnerIdentity() {
+  const files = [
+    path.resolve(__dirname, "../src/utils/phoneAccess.js"),
+    path.resolve(__dirname, "../src/utils/auth.js"),
+    path.resolve(__dirname, "../../lib/main.dart"),
+    path.resolve(__dirname, "../../lib/screens/main_shell.dart"),
+    path.resolve(__dirname, "../../lib/screens/phone_access_pending_screen.dart"),
+    path.resolve(__dirname, "../../lib/screens/creator_keys_screen.dart"),
+  ];
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(source, /owner_name|owner_email/, file);
+    assert.doesNotMatch(source, /первого владельца|Владелец номера/, file);
+    assert.doesNotMatch(source, /доступ к вашей корзине/, file);
+  }
+}
+
+function testAuthHydrationClearsMissingPhoneAccessState() {
+  const authService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/auth_service.dart"),
+    "utf8",
+  );
+  assert.match(authService, /final hasPhoneAccessState =/);
+  assert.match(authService, /merged\['phone_access_state'\] = 'none'/);
+  assert.doesNotMatch(
+    authService,
+    /merged\['phone_access_state'\]\s*=\s*current\.phoneAccessState/,
+  );
+}
+
+function testFullDeployStampsWebBuildVersion() {
+  const deployFull = fs.readFileSync(
+    path.resolve(__dirname, "../../scripts/deploy_full.sh"),
+    "utf8",
+  );
+  assert.match(deployFull, /install_web_build_version_marker\(\)/);
+  assert.match(deployFull, /web_build_token/);
+  assert.match(deployFull, /WEB_DEPLOYED_AT/);
+}
+
 function testAndroidReleaseUsesProductionDownloadsRoot() {
   const files = [
     path.resolve(__dirname, "../../scripts/deploy_full.sh"),
@@ -419,6 +466,9 @@ testInactiveClientAccountAutoDeleteDefaultsOff();
 testNoPersonalSubscriptionContactName();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
+testPhoneAccessDoesNotExposeFirstOwnerIdentity();
+testAuthHydrationClearsMissingPhoneAccessState();
+testFullDeployStampsWebBuildVersion();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 

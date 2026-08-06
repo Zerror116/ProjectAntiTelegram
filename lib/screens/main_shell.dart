@@ -968,7 +968,7 @@ class _MainShellState extends State<MainShell> {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Пользователь "${request.requesterLabel}" запросил доступ к вашей корзине'
+                    'Пользователь "${request.requesterLabel}" запросил подтверждение доступа к номеру'
                     '${request.phone.isNotEmpty ? ' (${request.phone})' : ''}.',
                     style: theme.textTheme.bodyMedium?.copyWith(
                       color: theme.colorScheme.onErrorContainer,

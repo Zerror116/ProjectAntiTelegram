@@ -223,6 +223,26 @@ install_static_web_extras() {
   chmod 644 "$reset_target"
 }
 
+install_web_build_version_marker() {
+  local version_file="$PROJECT_ROOT/build/web/version.json"
+  [[ -f "$version_file" ]] || return 0
+  local git_sha build_token deployed_at
+  git_sha="$(git -C "$PROJECT_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  deployed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  build_token="${WEB_BUILD_TOKEN:-${deployed_at}-${git_sha}}"
+  WEB_BUILD_TOKEN="$build_token" WEB_DEPLOYED_AT="$deployed_at" node - "$version_file" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+const raw = fs.readFileSync(file, 'utf8');
+const data = JSON.parse(raw);
+data.web_build_token = process.env.WEB_BUILD_TOKEN;
+data.web_deployed_at = process.env.WEB_DEPLOYED_AT;
+fs.writeFileSync(file, `${JSON.stringify(data)}\n`);
+NODE
+  chmod 644 "$version_file"
+  echo "[deploy_full] web build token: $build_token"
+}
+
 cd "$PROJECT_ROOT"
 
 if [[ "$NO_COMMIT" != "1" ]]; then
@@ -265,6 +285,7 @@ fi
 strip_web_debug_artifacts
 install_custom_service_worker
 install_static_web_extras
+install_web_build_version_marker
 normalize_web_build_permissions
 
 APK_SOURCE_RESOLVED=""

@@ -1202,7 +1202,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                     _settingsSwitchTile(
                       title: 'Подтверждение одинакового номера',
                       subtitle:
-                          'Если включено, новый клиент с уже занятым номером ждёт разрешения первого владельца.',
+                          'Если включено, новый клиент с уже занятым номером ждёт подтверждения доступа.',
                       value: phoneAccessApprovalEnabled,
                       onChanged: (value) => setDialogState(
                         () => phoneAccessApprovalEnabled = value,
@@ -1563,7 +1563,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           _settingsSwitchTile(
             title: 'Подтверждение одинакового номера',
             subtitle:
-                'Если включено, новый клиент с уже занятым номером ждёт разрешения первого владельца.',
+                'Если включено, новый клиент с уже занятым номером ждёт подтверждения доступа.',
             value: _tenantPhoneAccessApprovalEnabled,
             onChanged: (value) =>
                 setState(() => _tenantPhoneAccessApprovalEnabled = value),

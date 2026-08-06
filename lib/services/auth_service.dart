@@ -1773,9 +1773,11 @@ class AuthService {
           (merged['phone_access_state'] ?? merged['phoneAccessState'] ?? '')
               .toString()
               .trim();
-      if (nextPhoneAccessState.isEmpty &&
-          (current.phoneAccessState ?? '').trim().isNotEmpty) {
-        merged['phone_access_state'] = current.phoneAccessState;
+      final hasPhoneAccessState =
+          merged.containsKey('phone_access_state') ||
+          merged.containsKey('phoneAccessState');
+      if (!hasPhoneAccessState || nextPhoneAccessState.isEmpty) {
+        merged['phone_access_state'] = 'none';
       }
       final nextPermissions = merged['permissions'];
       if ((nextPermissions is! Map || nextPermissions.isEmpty) &&

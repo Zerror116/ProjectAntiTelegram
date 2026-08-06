@@ -1568,7 +1568,7 @@ Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
 
   final requesterLabel = request.requesterLabel;
   showGlobalAppNotice(
-    'Новый запрос на общий доступ к корзине ($requesterLabel)',
+    'Новый запрос на подтверждение номера ($requesterLabel)',
     title: 'Подтверждение номера',
     tone: AppNoticeTone.warning,
   );
@@ -1584,9 +1584,9 @@ Future<void> _handlePhoneAccessRequestEvent(dynamic data) async {
         return AlertDialog(
           title: const Text('Запрос на общий номер'),
           content: Text(
-            'Пользователь "$requesterLabel" хочет зарегистрироваться на ваш номер'
+            'Пользователь "$requesterLabel" указал уже используемый номер'
             '${request.phone.isNotEmpty ? ' (${request.phone})' : ''}.\n\n'
-            'Разрешить доступ к вашей корзине?',
+            'Подтвердить доступ к этому номеру?',
           ),
           actions: [
             TextButton(
@@ -5795,13 +5795,13 @@ Future<void> _initSocket() async {
       final status = (map?['status'] ?? '').toString().trim().toLowerCase();
       if (status == 'approved') {
         showGlobalAppNotice(
-          'Владелец номера разрешил доступ к корзине',
+          'Доступ к номеру подтверждён',
           title: 'Подтверждение номера',
           tone: AppNoticeTone.success,
         );
       } else if (status == 'rejected') {
         showGlobalAppNotice(
-          'Владелец номера отклонил запрос',
+          'Запрос на использование номера отклонён',
           title: 'Подтверждение номера',
           tone: AppNoticeTone.error,
         );

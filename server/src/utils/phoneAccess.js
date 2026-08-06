@@ -198,10 +198,8 @@ async function resolvePhoneAccessState(
             r.requested_at,
             r.decided_at,
             r.decided_by,
-            owner.name AS owner_name,
-            owner.email AS owner_email
+            r.owner_user_id IS NOT NULL AS has_owner
      FROM phone_registration_requests r
-     LEFT JOIN users owner ON owner.id = r.owner_user_id
      WHERE r.requester_user_id = $1
        AND ($2::uuid IS NULL OR r.tenant_id = $2::uuid)
      ORDER BY CASE r.status
@@ -226,8 +224,7 @@ async function resolvePhoneAccessState(
     tenant_id: row.tenant_id || null,
     phone: row.phone || '',
     owner_user_id: row.owner_user_id || null,
-    owner_name: row.owner_name || '',
-    owner_email: row.owner_email || '',
+    has_owner: row.has_owner === true,
     requested_at: row.requested_at || null,
     decided_at: row.decided_at || null,
   };
@@ -241,13 +238,13 @@ async function resolvePhoneAccessState(
   if (state === 'rejected') {
     return {
       ...base,
-      message: 'Владелец номера отклонил запрос на общий доступ',
+      message: 'Запрос на использование номера отклонён. Укажите другой номер в профиле.',
     };
   }
   if (state === 'pending') {
     return {
       ...base,
-      message: 'Ожидается решение первого владельца номера',
+      message: 'Номер уже используется. Ожидается подтверждение доступа.',
     };
   }
   return { state: 'none' };

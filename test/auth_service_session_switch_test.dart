@@ -42,6 +42,7 @@ User _user({
   required String email,
   required String tenantCode,
   required String tenantName,
+  String? phoneAccessState,
 }) {
   return User(
     id: id,
@@ -50,6 +51,7 @@ User _user({
     role: 'client',
     tenantCode: tenantCode,
     tenantName: tenantName,
+    phoneAccessState: phoneAccessState,
   );
 }
 
@@ -206,4 +208,35 @@ void main() {
       isFalse,
     );
   });
+
+  test(
+    'fresh profile without phone access state clears stale local pending',
+    () async {
+      final dio = Dio();
+      final auth = AuthService(dio: dio);
+      await auth.setSessionTokens(
+        accessToken: 'client-token',
+        accessExpiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+        user: _user(
+          id: 'client-user',
+          email: 'client@example.test',
+          tenantCode: 'tenant',
+          tenantName: 'Tenant',
+          phoneAccessState: 'pending',
+        ),
+        keepExistingRefreshToken: false,
+      );
+
+      auth.updateCurrentUserFromMap(
+        _userMap(
+          id: 'client-user',
+          email: 'client@example.test',
+          tenantCode: 'tenant',
+          tenantName: 'Tenant',
+        ),
+      );
+
+      expect(auth.currentUser?.phoneAccessState, 'none');
+    },
+  );
 }
