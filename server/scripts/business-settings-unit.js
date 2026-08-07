@@ -304,6 +304,30 @@ function testAuthMiddlewareHydratesLegacyTenantNullUsers() {
   );
 }
 
+function testSocketRecoveryAlwaysReauthenticatesTenantScope() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../src/index.js"),
+    "utf8",
+  );
+  assert.match(source, /connectionStateRecovery:\s*\{/);
+  assert.match(
+    source,
+    /connectionStateRecovery:\s*\{[\s\S]{0,360}skipMiddlewares:\s*false/,
+  );
+  assert.doesNotMatch(
+    source,
+    /connectionStateRecovery:\s*\{[\s\S]{0,360}skipMiddlewares:\s*true/,
+  );
+  assert.match(
+    source,
+    /requestedTenantCode:[\s\S]{0,220}socket\.handshake\.auth\?\.tenant_code/,
+  );
+  assert.match(
+    source,
+    /socket\.tenantScope = context\.tenantScope \|\| null/,
+  );
+}
+
 function testNotificationInboxDedupeIsAtomic() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../src/utils/notifications.js"),
@@ -1147,6 +1171,7 @@ testAuthRecoveryAndEmailPreflightAreTenantScoped();
 testLegacyBootstrapScansTenantSessionScopes();
 testRefreshHydratesLegacyTenantNullUsers();
 testAuthMiddlewareHydratesLegacyTenantNullUsers();
+testSocketRecoveryAlwaysReauthenticatesTenantScope();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testProductDescriptionOptionalProjectWide();

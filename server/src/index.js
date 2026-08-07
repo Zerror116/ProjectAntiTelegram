@@ -1013,7 +1013,9 @@ async function resolveChatActivityContext(user, chatId) {
       connectTimeout: 45000,
       connectionStateRecovery: {
         maxDisconnectionDuration: 2 * 60 * 1000,
-        skipMiddlewares: true,
+        // Re-run auth on recovered connections so revoked sessions and changed
+        // tenant scopes cannot keep using a stale socket context.
+        skipMiddlewares: false,
       },
     });
 
