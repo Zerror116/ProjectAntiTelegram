@@ -267,6 +267,47 @@ void main() {
     expect(saved['refresh_token'], 'tenant-refresh-token');
   });
 
+  test('logout sends refresh token before clearing local session', () async {
+    Map<String, dynamic>? logoutPayload;
+    String logoutAuthHeader = '';
+    final dio = Dio();
+    dio.httpClientAdapter = _FakeDioAdapter((options) {
+      if (options.path == '/api/auth/logout') {
+        logoutAuthHeader = (options.headers['Authorization'] ?? '').toString();
+        final data = options.data;
+        if (data is Map) {
+          logoutPayload = Map<String, dynamic>.from(data);
+        }
+        return _jsonResponse(200, {'ok': true, 'revoked': true});
+      }
+      if (_isNotificationEndpointLifecycleRequest(options)) {
+        return _jsonResponse(200, {'ok': true});
+      }
+      return _jsonResponse(200, <String, dynamic>{});
+    });
+    final auth = AuthService(dio: dio);
+    await auth.setSessionTokens(
+      accessToken: 'logout-access-token',
+      refreshToken: 'logout-refresh-token',
+      accessExpiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      user: _user(
+        id: 'logout-user',
+        email: 'logout@example.test',
+        tenantCode: 'logout',
+        tenantName: 'Logout',
+      ),
+      keepExistingRefreshToken: false,
+    );
+
+    await auth.logout();
+
+    expect(logoutAuthHeader, 'Bearer logout-access-token');
+    expect(logoutPayload?['refresh_token'], 'logout-refresh-token');
+    expect(await auth.getToken(), isNull);
+    expect(await auth.getRefreshToken(), isNull);
+    expect(auth.currentUser, isNull);
+  });
+
   test('failed saved tenant switch restores previous session', () async {
     final previousDebugPrint = debugPrint;
     final debugMessages = <String>[];

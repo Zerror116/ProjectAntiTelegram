@@ -650,6 +650,38 @@ function testSavedTenantSwitchKeepsSessionsOnTransientFailure() {
   );
 }
 
+function testLogoutRevokesRefreshSessionWhenAccessExpired() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  const authService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/auth_service.dart"),
+    "utf8",
+  );
+  const authTests = fs.readFileSync(
+    path.resolve(__dirname, "../../test/auth_service_session_switch_test.dart"),
+    "utf8",
+  );
+  assert.match(authRoute, /async function revokeLogoutSessionFromAccessToken/);
+  assert.match(authRoute, /verifyJwtAllowExpired\(accessToken\)/);
+  assert.match(authRoute, /async function revokeLogoutSessionFromRefreshToken/);
+  assert.match(authRoute, /findUserSessionByRefreshToken/);
+  assert.match(authRoute, /revokeSessionByRecordId/);
+  assert.match(authRoute, /router\.post\('\/logout', async \(req, res\) =>/);
+  assert.doesNotMatch(authRoute, /router\.post\('\/logout', authMiddleware/);
+  assert.match(authRoute, /req\.body\?\.refresh_token/);
+  assert.match(authRoute, /revoked, message: 'Logged out'/);
+  assert.match(
+    authService,
+    /await dio\.post\(\s*'\/api\/auth\/logout',[\s\S]{0,220}'refresh_token': refreshToken\.trim\(\)/,
+  );
+  assert.match(
+    authTests,
+    /logout sends refresh token before clearing local session/,
+  );
+}
+
 function testNightlyAuditChecksAuthSessionsProjectWide() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -1289,5 +1321,6 @@ testFullDeployStampsWebBuildVersion();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();
+testLogoutRevokesRefreshSessionWhenAccessExpired();
 
 console.log("business-settings-unit: ok");

@@ -2226,7 +2226,13 @@ class AuthService {
     try {
       debugPrint('🚪 AuthService.logout -> starting logout');
       try {
-        await dio.post('/api/auth/logout');
+        final refreshToken = await getRefreshToken();
+        await dio.post(
+          '/api/auth/logout',
+          data: (refreshToken == null || refreshToken.trim().isEmpty)
+              ? null
+              : {'refresh_token': refreshToken.trim()},
+        );
         debugPrint('✅ Logout API call succeeded');
       } catch (e) {
         debugPrint('⚠️ logout API call failed (ignoring): $e');

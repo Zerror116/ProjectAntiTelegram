@@ -250,6 +250,47 @@ function getBearerTokenFromRequest(req) {
   return '';
 }
 
+async function revokeLogoutSessionFromAccessToken(accessToken) {
+  const payload = verifyJwtAllowExpired(accessToken);
+  const sessionId = String(payload?.sid || payload?.session_id || '').trim();
+  if (!payload || !sessionId) return false;
+  const tenantScopeCode = db.normalizeTenantCode(
+    payload?.tenant_code || payload?.tenantCode || '',
+  );
+  const tenantScopeId = String(payload?.tenant_id || payload?.tenantId || '')
+    .trim();
+  let tenantScope = null;
+  if (tenantScopeCode) {
+    tenantScope = await db.resolveTenantByCode(tenantScopeCode);
+  } else if (tenantScopeId) {
+    tenantScope = await db.resolveTenantById(tenantScopeId);
+  }
+  const revoke = async () =>
+    await revokeUserSession({ queryable: db, sessionId });
+  return tenantScope
+    ? await db.runWithTenantRow(tenantScope, revoke)
+    : await db.runWithPlatform(revoke);
+}
+
+async function revokeLogoutSessionFromRefreshToken(refreshToken) {
+  const normalized = String(refreshToken || '').trim();
+  if (!normalized) return false;
+  const scopeKey = parseRefreshTokenScope(normalized);
+  if (!scopeKey) return false;
+  return await runWithRefreshScope(scopeKey, async () => {
+    const session = await findUserSessionByRefreshToken({
+      queryable: db,
+      refreshToken: normalized,
+    });
+    if (!session?.id || !session?.user_id) return false;
+    return await revokeSessionByRecordId({
+      queryable: db,
+      userId: session.user_id,
+      sessionRecordId: session.id,
+    });
+  });
+}
+
 async function runWithRefreshScope(scopeKey, fn) {
   const normalizedScope = db.normalizeTenantCode(scopeKey);
   if (!normalizedScope || normalizedScope === 'platform') {
@@ -5142,13 +5183,29 @@ router.get('/tenant/public-invite', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/logout', authMiddleware, async (req, res) => {
+router.post('/logout', async (req, res) => {
   try {
-    const currentSessionId = req.user?.session_id || null;
-    if (currentSessionId) {
-      await revokeUserSession({ queryable: db, sessionId: currentSessionId });
+    let revoked = false;
+    const accessToken = getBearerTokenFromRequest(req);
+    if (accessToken) {
+      try {
+        revoked = await revokeLogoutSessionFromAccessToken(accessToken);
+      } catch (err) {
+        console.warn('auth.logout access-token revoke skipped', err);
+      }
     }
-    return res.json({ ok: true, message: 'Logged out' });
+
+    if (!revoked) {
+      const refreshToken = String(req.body?.refresh_token || '').trim();
+      if (refreshToken) {
+        try {
+          revoked = await revokeLogoutSessionFromRefreshToken(refreshToken);
+        } catch (err) {
+          console.warn('auth.logout refresh-token revoke skipped', err);
+        }
+      }
+    }
+    return res.json({ ok: true, revoked, message: 'Logged out' });
   } catch (err) {
     console.error('auth.logout error', err);
     return res.status(500).json({ ok: false, error: 'Ошибка сервера' });
