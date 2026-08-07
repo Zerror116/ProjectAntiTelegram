@@ -328,6 +328,37 @@ function testSocketRecoveryAlwaysReauthenticatesTenantScope() {
   );
 }
 
+function testFlutterSocketReconnectsWithFreshAuthToken() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/main.dart"),
+    "utf8",
+  );
+  assert.match(source, /String\? _socketBoundTokenFingerprint/);
+  assert.match(source, /String _socketTokenFingerprint\(String token\)/);
+  assert.match(source, /sha256\.convert\(utf8\.encode\(normalized\)\)/);
+  assert.match(source, /bool _socketAuthRefreshInProgress = false/);
+  assert.match(source, /Future<void> _refreshSocketAuthAndReconnect\(\) async/);
+  assert.match(
+    source,
+    /authService\.refreshSession\(\s*allowBootstrap:\s*true,\s*\)/,
+  );
+  assert.match(
+    source,
+    /final tokenFingerprint = _socketTokenFingerprint\(token\)/,
+  );
+  assert.match(
+    source,
+    /_socketBoundTokenFingerprint \?\? ''\) == tokenFingerprint/,
+  );
+  assert.match(source, /_socketBoundTokenFingerprint = tokenFingerprint/);
+  assert.match(source, /_socketBoundTokenFingerprint = null/);
+  assert.match(source, /bool _isSocketAuthConnectError\(Object\? error\)/);
+  assert.match(
+    source,
+    /socket\?\.on\('connect_error'[\s\S]{0,900}_refreshSocketAuthAndReconnect\(\)/,
+  );
+}
+
 function testNotificationInboxDedupeIsAtomic() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../src/utils/notifications.js"),
@@ -1172,6 +1203,7 @@ testLegacyBootstrapScansTenantSessionScopes();
 testRefreshHydratesLegacyTenantNullUsers();
 testAuthMiddlewareHydratesLegacyTenantNullUsers();
 testSocketRecoveryAlwaysReauthenticatesTenantScope();
+testFlutterSocketReconnectsWithFreshAuthToken();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testProductDescriptionOptionalProjectWide();

@@ -1,7 +1,9 @@
 // lib/main.dart
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -120,9 +122,11 @@ final AudioContext _appUiSoundAudioContext = AudioContext(
 );
 bool _appSoundPlayerPrepared = false;
 bool _socketInitInProgress = false;
+bool _socketAuthRefreshInProgress = false;
 String? _socketBoundUserId;
 String? _socketBoundViewRole;
 String? _socketBoundTenantCode;
+String? _socketBoundTokenFingerprint;
 String _lastConnectivityHint = '';
 bool _keyboardAssertRecoveredRecently = false;
 Timer? _webPushBadgeSyncTimer;
@@ -353,6 +357,35 @@ Map<String, dynamic> runtimeSocketDiagnosticsSnapshot() {
     'last_disconnect_reason': _lastSocketDisconnectReason,
     'last_connect_error': _lastSocketConnectError,
   };
+}
+
+String _socketTokenFingerprint(String token) {
+  final normalized = token.trim();
+  if (normalized.isEmpty) return '';
+  return sha256.convert(utf8.encode(normalized)).toString();
+}
+
+bool _isSocketAuthConnectError(Object? error) {
+  final text = '$error'.toLowerCase();
+  return text.contains('unauthorized') ||
+      text.contains('invalid token') ||
+      text.contains('jwt') ||
+      text.contains('revoked') ||
+      text.contains('сессия');
+}
+
+Future<void> _refreshSocketAuthAndReconnect() async {
+  if (_socketAuthRefreshInProgress) return;
+  _socketAuthRefreshInProgress = true;
+  try {
+    final refreshed = await authService.refreshSession(allowBootstrap: true);
+    if (!refreshed) return;
+    await _initSocket();
+  } catch (e, st) {
+    debugPrint('socket auth refresh failed: $e\n$st');
+  } finally {
+    _socketAuthRefreshInProgress = false;
+  }
 }
 
 enum AppNoticeTone { info, success, warning, error }
@@ -1591,9 +1624,7 @@ bool _shouldShowPhoneAccessPendingForUser(User? user) {
 }
 
 @visibleForTesting
-bool debugShouldShowPhoneAccessPendingForTesting(
-  Map<String, dynamic> userMap,
-) {
+bool debugShouldShowPhoneAccessPendingForTesting(Map<String, dynamic> userMap) {
   return _shouldShowPhoneAccessPendingForUser(User.fromMap(userMap));
 }
 
@@ -5056,6 +5087,7 @@ Future<void> disconnectSocket() async {
     _socketBoundUserId = null;
     _socketBoundViewRole = null;
     _socketBoundTenantCode = null;
+    _socketBoundTokenFingerprint = null;
     _lastSocketDisconnectedAt = DateTime.now();
     if (_lastSocketDisconnectReason.trim().isEmpty) {
       _lastSocketDisconnectReason = 'io client disconnect';
@@ -5630,31 +5662,6 @@ Future<void> _initSocket() async {
     return;
   }
 
-  final currentRole = authService.currentUser?.role.toLowerCase().trim() ?? '';
-  final viewRole = currentRole == 'creator'
-      ? authService.viewRole?.trim()
-      : null;
-  final creatorTenantCode = currentRole == 'creator'
-      ? await authService.getCreatorTenantScopeCode()
-      : null;
-
-  final sameBinding =
-      _socketBoundUserId == userId &&
-      (_socketBoundViewRole ?? '') == (viewRole ?? '') &&
-      (_socketBoundTenantCode ?? '') == (creatorTenantCode ?? '');
-  if (socket != null && sameBinding) {
-    final alreadyActive = socket!.connected || socket!.active;
-    if (alreadyActive) {
-      debugPrint('✅ _initSocket skipped: socket already active/connecting');
-      if (!socket!.connected) {
-        try {
-          socket!.connect();
-        } catch (_) {}
-      }
-      return;
-    }
-  }
-
   _socketInitInProgress = true;
   try {
     debugPrint('🚀 Initializing socket...');
@@ -5672,6 +5679,40 @@ Future<void> _initSocket() async {
     if (token == null || token.trim().isEmpty) {
       debugPrint('⏭️ _initSocket skipped: empty auth token');
       return;
+    }
+
+    final currentUserId = authService.currentUser?.id.trim();
+    if (currentUserId == null || currentUserId.isEmpty) {
+      debugPrint('⏭️ _initSocket skipped: no authenticated user after refresh');
+      return;
+    }
+
+    final currentRole =
+        authService.currentUser?.role.toLowerCase().trim() ?? '';
+    final viewRole = currentRole == 'creator'
+        ? authService.viewRole?.trim()
+        : null;
+    final creatorTenantCode = currentRole == 'creator'
+        ? await authService.getCreatorTenantScopeCode()
+        : null;
+    final tokenFingerprint = _socketTokenFingerprint(token);
+
+    final sameBinding =
+        _socketBoundUserId == currentUserId &&
+        (_socketBoundViewRole ?? '') == (viewRole ?? '') &&
+        (_socketBoundTenantCode ?? '') == (creatorTenantCode ?? '') &&
+        (_socketBoundTokenFingerprint ?? '') == tokenFingerprint;
+    if (socket != null && sameBinding) {
+      final alreadyActive = socket!.connected || socket!.active;
+      if (alreadyActive) {
+        debugPrint('✅ _initSocket skipped: socket already active/connecting');
+        if (!socket!.connected) {
+          try {
+            socket!.connect();
+          } catch (_) {}
+        }
+        return;
+      }
     }
 
     await disconnectSocket();
@@ -5707,9 +5748,10 @@ Future<void> _initSocket() async {
           .setQuery(socketQuery)
           .build(),
     );
-    _socketBoundUserId = userId;
+    _socketBoundUserId = currentUserId;
     _socketBoundViewRole = viewRole ?? '';
     _socketBoundTenantCode = creatorTenantCode ?? '';
+    _socketBoundTokenFingerprint = tokenFingerprint;
 
     socket?.on('connect', (_) {
       debugPrint('✅ Socket connected: ${socket?.id}');
@@ -5759,6 +5801,9 @@ Future<void> _initSocket() async {
           details: runtimeSocketDiagnosticsSnapshot(),
         ),
       );
+      if (_isSocketAuthConnectError(err)) {
+        unawaited(_refreshSocketAuthAndReconnect());
+      }
     });
 
     // Chat created -> notify listeners to reload chats
