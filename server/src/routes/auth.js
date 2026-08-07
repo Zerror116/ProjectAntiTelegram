@@ -791,6 +791,24 @@ async function resolveTenantByAccessKey(accessKey) {
   return tenantRes.rowCount > 0 ? tenantRes.rows[0] : null;
 }
 
+function allowLegacyNullTenantRowsForTenant(tenantRow) {
+  return (
+    db.isIsolatedTenantRow(tenantRow) || db.isSchemaIsolatedTenantRow(tenantRow)
+  );
+}
+
+function tenantScopedUserFilterSql(
+  alias,
+  allowLegacyNullTenantRows,
+  tenantPlaceholder = '$2',
+) {
+  const column = `${alias}.tenant_id`;
+  if (allowLegacyNullTenantRows) {
+    return `(${column} = ${tenantPlaceholder}::uuid OR ${column} IS NULL)`;
+  }
+  return `${column} = ${tenantPlaceholder}::uuid`;
+}
+
 async function resolveTenantByUserEmail(email) {
   const normalizedEmail = String(email || '').trim().toLowerCase();
   if (!normalizedEmail) return null;
@@ -890,8 +908,7 @@ async function resolveTenantByUserEmail(email) {
     const tenantId = String(tenantRow?.id || '').trim();
     if (!tenantId) continue;
     const allowLegacyNullTenantRows =
-      db.isIsolatedTenantRow(tenantRow) ||
-      db.isSchemaIsolatedTenantRow(tenantRow);
+      allowLegacyNullTenantRowsForTenant(tenantRow);
     try {
       const hasUser = await db.runWithTenantRow(tenantRow, async () => {
         const tenantFilter = allowLegacyNullTenantRows
@@ -1533,7 +1550,7 @@ async function claimAuthEmailToken(queryable, { token, kind, req }) {
      )
      SELECT c.id AS token_id,
             c.user_id,
-            c.tenant_id,
+            c.tenant_id AS token_tenant_id,
             c.email,
             c.kind,
             c.expires_at,
@@ -1544,6 +1561,7 @@ async function claimAuthEmailToken(queryable, { token, kind, req }) {
             u.is_active,
             u.block_reason,
             u.tenant_id AS user_tenant_id,
+            COALESCE(u.tenant_id, c.tenant_id) AS effective_tenant_id,
             u.two_factor_enabled,
             t.code AS tenant_code,
             t.name AS tenant_name,
@@ -1551,7 +1569,7 @@ async function claimAuthEmailToken(queryable, { token, kind, req }) {
             t.subscription_expires_at
      FROM claimed c
      JOIN users u ON u.id = c.user_id
-     LEFT JOIN tenants t ON t.id = u.tenant_id
+     LEFT JOIN tenants t ON t.id = COALESCE(u.tenant_id, c.tenant_id)
      LIMIT 1`,
     [
       tokenHash,
@@ -1634,6 +1652,7 @@ async function resolveTenantForEmailAuthRequest(req, normalizedEmail) {
   const tenantCodeHint = extractTenantCodeHint(req);
   if (tenantCodeHint) {
     tenant = await db.resolveTenantByCode(tenantCodeHint);
+    return { tenant, isPlatformCreator: false };
   }
   if (!tenant) {
     tenant = await resolveTenantByUserEmail(normalizedEmail);
@@ -1653,6 +1672,24 @@ async function findUserForEmailAuthRequest(req, normalizedEmail) {
   const user = await db.runWithTenantRow(
     isPlatformCreator ? null : tenant,
     async () => {
+      const tenantId =
+        !isPlatformCreator && tenant?.id ? String(tenant.id).trim() : '';
+      const shouldFilterTenant = tenantId.length > 0;
+      const allowLegacyNullTenantRows =
+        shouldFilterTenant && allowLegacyNullTenantRowsForTenant(tenant);
+      const tenantFilter = shouldFilterTenant
+        ? `AND ${tenantScopedUserFilterSql(
+            'u',
+            allowLegacyNullTenantRows,
+            '$2',
+          )}`
+        : '';
+      const tenantPriority = shouldFilterTenant
+        ? 'CASE WHEN u.tenant_id = $2::uuid THEN 0 ELSE 1 END,'
+        : '';
+      const userParams = shouldFilterTenant
+        ? [normalizedEmail, tenantId]
+        : [normalizedEmail];
       const q = await db.query(
         `SELECT u.id,
                 u.email,
@@ -1671,10 +1708,21 @@ async function findUserForEmailAuthRequest(req, normalizedEmail) {
          LEFT JOIN tenants t ON t.id = u.tenant_id
          LEFT JOIN phones p ON p.user_id = u.id
          WHERE lower(u.email) = $1
+           ${tenantFilter}
+         ORDER BY
+           CASE WHEN u.is_active = true THEN 0 ELSE 1 END,
+           ${tenantPriority}
+           u.updated_at DESC NULLS LAST,
+           u.created_at DESC NULLS LAST,
+           u.id DESC
          LIMIT 1`,
-        [normalizedEmail],
+        userParams,
       );
-      return q.rows[0] || null;
+      const found = q.rows[0] || null;
+      if (!isPlatformCreator && found) {
+        return await attachTenantScopeToLegacyAuthUser(db, found, tenant);
+      }
+      return found;
     },
   );
 
@@ -2273,12 +2321,25 @@ router.post('/check_email', async (req, res) => {
     const normalizedLower = normalizedEmail.toLowerCase();
     const tenantCodeHint = extractTenantCodeHint(req);
     if (tenantCodeHint) {
-      const existing = await db.runWithTenantCode(
-        tenantCodeHint,
-        () =>
-          db.query('SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1', [
-            normalizedLower,
-          ]),
+      const tenantRow = await db.resolveTenantByCode(tenantCodeHint);
+      if (!tenantRow) {
+        return res.status(404).json({ exists: false, error: 'Арендатор не найден' });
+      }
+      const allowLegacyNullTenantRows =
+        allowLegacyNullTenantRowsForTenant(tenantRow);
+      const existing = await db.runWithTenantRow(tenantRow, () =>
+        db.query(
+          `SELECT 1
+           FROM users u
+           WHERE lower(u.email) = $1
+             AND ${tenantScopedUserFilterSql(
+               'u',
+               allowLegacyNullTenantRows,
+               '$2',
+             )}
+           LIMIT 1`,
+          [normalizedLower, tenantRow.id],
+        ),
       );
       return res.json({ exists: existing.rowCount > 0 });
     }
@@ -2355,12 +2416,25 @@ router.post('/register/email-code/request', async (req, res) => {
     const tenantCodeHint = extractTenantCodeHint(req);
     let emailAlreadyExists = false;
     if (tenantCodeHint) {
-      const existing = await db.runWithTenantCode(
-        tenantCodeHint,
-        () =>
-          db.query('SELECT 1 FROM users WHERE lower(email) = $1 LIMIT 1', [
-            normalizedLower,
-          ]),
+      const tenantRow = await db.resolveTenantByCode(tenantCodeHint);
+      if (!tenantRow) {
+        return res.status(404).json({ error: 'Арендатор не найден' });
+      }
+      const allowLegacyNullTenantRows =
+        allowLegacyNullTenantRowsForTenant(tenantRow);
+      const existing = await db.runWithTenantRow(tenantRow, () =>
+        db.query(
+          `SELECT 1
+           FROM users u
+           WHERE lower(u.email) = $1
+             AND ${tenantScopedUserFilterSql(
+               'u',
+               allowLegacyNullTenantRows,
+               '$2',
+             )}
+           LIMIT 1`,
+          [normalizedLower, tenantRow.id],
+        ),
       );
       emailAlreadyExists = existing.rowCount > 0;
     } else {
@@ -4179,9 +4253,14 @@ router.post('/magic-link/consume', async (req, res) => {
       String(claimed.user_email || claimed.email || '').trim().toLowerCase() ===
       CREATOR_EMAIL.toLowerCase();
     const userRole = String(claimed.role || '').toLowerCase().trim();
-    let claimedTenant = claimed.user_tenant_id
+    const claimedTenantId =
+      claimed.user_tenant_id ||
+      claimed.token_tenant_id ||
+      claimed.effective_tenant_id ||
+      null;
+    let claimedTenant = claimedTenantId
       ? {
-          id: claimed.user_tenant_id,
+          id: claimedTenantId,
           code: claimed.tenant_code || null,
           name: claimed.tenant_name || null,
           status: claimed.tenant_status || null,
@@ -4192,7 +4271,7 @@ router.post('/magic-link/consume', async (req, res) => {
       try {
         claimedTenant = await resolveFreshTenantForAuth(
           {
-            tenant_id: claimed.user_tenant_id || null,
+            tenant_id: claimedTenantId || null,
             tenant_code: claimed.tenant_code || null,
           },
           claimedTenant,
@@ -4200,6 +4279,29 @@ router.post('/magic-link/consume', async (req, res) => {
       } catch (err) {
         console.error('auth.magicLogin freshTenant error', err);
       }
+    }
+    if (!isPlatformCreator && !claimed.user_tenant_id && claimedTenant?.id) {
+      const hydrated = await attachTenantScopeToLegacyAuthUser(
+        client,
+        {
+          id: claimed.id,
+          tenant_id: claimed.user_tenant_id || null,
+          tenant_code: claimed.tenant_code || null,
+          tenant_name: claimed.tenant_name || null,
+          tenant_status: claimed.tenant_status || null,
+          subscription_expires_at: claimed.subscription_expires_at || null,
+        },
+        claimedTenant,
+      );
+      claimed.user_tenant_id = hydrated?.tenant_id || claimedTenant.id || null;
+      claimed.tenant_code = hydrated?.tenant_code || claimed.tenant_code || null;
+      claimed.tenant_name = hydrated?.tenant_name || claimed.tenant_name || null;
+      claimed.tenant_status =
+        hydrated?.tenant_status || claimed.tenant_status || null;
+      claimed.subscription_expires_at =
+        hydrated?.subscription_expires_at ||
+        claimed.subscription_expires_at ||
+        null;
     }
     const shouldEnforceTenantSubscription =
       !isPlatformCreator &&
@@ -4223,7 +4325,7 @@ router.post('/magic-link/consume', async (req, res) => {
       id: claimed.id,
       email: claimed.user_email || claimed.email,
       role: claimed.role,
-      tenant_id: claimed.user_tenant_id || null,
+      tenant_id: claimed.user_tenant_id || claimedTenant?.id || null,
       tenant_code: claimedTenant?.code || claimed.tenant_code || null,
       tenant_name: claimedTenant?.name || claimed.tenant_name || null,
       tenant_status: claimedTenant?.status || claimed.tenant_status || null,
@@ -4327,6 +4429,59 @@ router.post('/password-reset/confirm', async (req, res) => {
           });
         }
 
+        const isPlatformCreator =
+          String(claimed.user_email || claimed.email || '')
+            .trim()
+            .toLowerCase() === CREATOR_EMAIL.toLowerCase();
+        const claimedTenantId =
+          claimed.user_tenant_id ||
+          claimed.token_tenant_id ||
+          claimed.effective_tenant_id ||
+          null;
+        let claimedTenant = claimedTenantId
+          ? {
+              id: claimedTenantId,
+              code: claimed.tenant_code || null,
+              name: claimed.tenant_name || null,
+              status: claimed.tenant_status || null,
+              subscription_expires_at: claimed.subscription_expires_at || null,
+            }
+          : null;
+        if (!isPlatformCreator && claimedTenant) {
+          claimedTenant = await resolveFreshTenantForAuth(
+            {
+              tenant_id: claimedTenantId || null,
+              tenant_code: claimed.tenant_code || null,
+            },
+            claimedTenant,
+          );
+        }
+        if (!isPlatformCreator && !claimed.user_tenant_id && claimedTenant?.id) {
+          const hydrated = await attachTenantScopeToLegacyAuthUser(
+            client,
+            {
+              id: claimed.id,
+              tenant_id: claimed.user_tenant_id || null,
+              tenant_code: claimed.tenant_code || null,
+              tenant_name: claimed.tenant_name || null,
+              tenant_status: claimed.tenant_status || null,
+              subscription_expires_at: claimed.subscription_expires_at || null,
+            },
+            claimedTenant,
+          );
+          claimed.user_tenant_id = hydrated?.tenant_id || claimedTenant.id || null;
+          claimed.tenant_code =
+            hydrated?.tenant_code || claimed.tenant_code || null;
+          claimed.tenant_name =
+            hydrated?.tenant_name || claimed.tenant_name || null;
+          claimed.tenant_status =
+            hydrated?.tenant_status || claimed.tenant_status || null;
+          claimed.subscription_expires_at =
+            hydrated?.subscription_expires_at ||
+            claimed.subscription_expires_at ||
+            null;
+        }
+
         const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
         await client.query(
           `UPDATE users
@@ -4349,7 +4504,7 @@ router.post('/password-reset/confirm', async (req, res) => {
           user: {
             id: claimed.id,
             role: claimed.role,
-            tenant_id: claimed.user_tenant_id || null,
+            tenant_id: claimed.user_tenant_id || claimedTenant?.id || null,
           },
           title: 'Пароль был сброшен',
           body: 'Пароль вашего аккаунта успешно обновлён. Если это были не вы, сразу обратитесь к администратору.',
@@ -4365,6 +4520,21 @@ router.post('/password-reset/confirm', async (req, res) => {
         return res.json({
           ok: true,
           message: 'Пароль обновлён. Теперь войдите с новым паролем.',
+          tenant_code: isPlatformCreator
+            ? null
+            : claimedTenant?.code || claimed.tenant_code || null,
+          tenant: isPlatformCreator || !claimedTenant
+            ? null
+            : {
+                id: claimedTenant.id || null,
+                code: claimedTenant.code || claimed.tenant_code || null,
+                name: claimedTenant.name || claimed.tenant_name || null,
+                status: claimedTenant.status || claimed.tenant_status || null,
+                subscription_expires_at:
+                  claimedTenant.subscription_expires_at ||
+                  claimed.subscription_expires_at ||
+                  null,
+              },
         });
       } catch (err) {
         try {

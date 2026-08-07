@@ -1755,6 +1755,10 @@ class AuthService {
   }
 
   /// Применить ответ логина/регистрации (если вызывается извне)
+  Future<void> applyAuthResponse(Response resp) async {
+    await _processAuthResponse(resp);
+  }
+
   Future<void> applyLoginResponse(
     String token,
     Map<String, dynamic>? userMap,

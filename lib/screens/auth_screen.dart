@@ -918,11 +918,15 @@ class _AuthScreenState extends State<AuthScreen> {
     });
 
     try {
+      final tenantCode = await _currentTenantCodeForAuthRequest();
       final resp = await _authService.dio.post(
         magicLink
             ? '/api/auth/magic-link/request'
             : '/api/auth/password-reset/request',
-        data: {'email': email},
+        data: {
+          'email': email,
+          if (tenantCode.isNotEmpty) 'tenant_code': tenantCode,
+        },
       );
       _emailController.text = email;
       if (!mounted) return;
@@ -1061,6 +1065,20 @@ class _AuthScreenState extends State<AuthScreen> {
           '/api/auth/password-reset/confirm',
           data: {'token': token, 'new_password': newPassword},
         );
+        final data = resp.data is Map
+            ? Map<String, dynamic>.from(resp.data as Map)
+            : const <String, dynamic>{};
+        final tenantFromResponse = _normalizeTenantCode(
+          (data['tenant_code'] ??
+                  ((data['tenant'] is Map)
+                      ? (data['tenant'] as Map)['code']
+                      : ''))
+              .toString(),
+        );
+        if (tenantFromResponse.isNotEmpty) {
+          await _authService.setTenantCode(tenantFromResponse);
+          _tenantCodeFromLink = tenantFromResponse;
+        }
         if (!mounted) return;
         showAppNotice(
           context,
@@ -1116,17 +1134,7 @@ class _AuthScreenState extends State<AuthScreen> {
             'device_fingerprint': fingerprint.trim(),
         },
       );
-      final payload = resp.data is Map<String, dynamic>
-          ? resp.data as Map<String, dynamic>
-          : Map<String, dynamic>.from(resp.data as Map);
-      final nextToken = (payload['token'] ?? '').toString().trim();
-      final userMap = payload['user'] is Map
-          ? Map<String, dynamic>.from(payload['user'] as Map)
-          : null;
-      if (nextToken.isEmpty || userMap == null) {
-        throw Exception('Сервер не вернул данные входа');
-      }
-      await _authService.applyLoginResponse(nextToken, userMap);
+      await _authService.applyAuthResponse(resp);
       if (!mounted) return;
       showAppNotice(
         context,

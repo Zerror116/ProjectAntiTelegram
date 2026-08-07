@@ -175,6 +175,62 @@ function testAuthRecoveryUsesScopedEmailTokens() {
   assert.match(source, /db\.runWithTenantRow\(scopedTenant/);
 }
 
+function testAuthRecoveryAndEmailPreflightAreTenantScoped() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  const authScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/auth_screen.dart"),
+    "utf8",
+  );
+  const authService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/auth_service.dart"),
+    "utf8",
+  );
+
+  assert.match(authRoute, /function tenantScopedUserFilterSql/);
+  assert.match(
+    authRoute,
+    /router\.post\('\/check_email'[\s\S]*db\.resolveTenantByCode\(tenantCodeHint\)[\s\S]*tenantScopedUserFilterSql/,
+  );
+  assert.match(
+    authRoute,
+    /router\.post\('\/register\/email-code\/request'[\s\S]*tenantScopedUserFilterSql/,
+  );
+  assert.match(
+    authRoute,
+    /async function resolveTenantForEmailAuthRequest[\s\S]*if \(tenantCodeHint\)[\s\S]*return \{ tenant, isPlatformCreator: false \}/,
+  );
+  assert.match(
+    authRoute,
+    /async function findUserForEmailAuthRequest[\s\S]*tenantScopedUserFilterSql\([\s\S]*attachTenantScopeToLegacyAuthUser\(db, found, tenant\)/,
+  );
+  assert.match(authRoute, /c\.tenant_id AS token_tenant_id/);
+  assert.match(
+    authRoute,
+    /COALESCE\(u\.tenant_id, c\.tenant_id\) AS effective_tenant_id/,
+  );
+  assert.match(
+    authRoute,
+    /LEFT JOIN tenants t ON t\.id = COALESCE\(u\.tenant_id, c\.tenant_id\)/,
+  );
+  assert.match(
+    authRoute,
+    /router\.post\('\/magic-link\/consume'[\s\S]*attachTenantScopeToLegacyAuthUser\([\s\S]*client[\s\S]*claimedTenant/,
+  );
+  assert.match(
+    authRoute,
+    /router\.post\('\/password-reset\/confirm'[\s\S]*tenant_code: isPlatformCreator/,
+  );
+  assert.match(
+    authScreen,
+    /Future<void> _requestEmailAction[\s\S]*_currentTenantCodeForAuthRequest\(\)[\s\S]*'tenant_code': tenantCode/,
+  );
+  assert.match(authScreen, /await _authService\.applyAuthResponse\(resp\)/);
+  assert.match(authService, /Future<void> applyAuthResponse\(Response resp\)/);
+}
+
 function testLegacyBootstrapScansTenantSessionScopes() {
   const authRoute = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/auth.js"),
@@ -1078,6 +1134,7 @@ testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();
 testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
+testAuthRecoveryAndEmailPreflightAreTenantScoped();
 testLegacyBootstrapScansTenantSessionScopes();
 testRefreshHydratesLegacyTenantNullUsers();
 testAuthMiddlewareHydratesLegacyTenantNullUsers();
