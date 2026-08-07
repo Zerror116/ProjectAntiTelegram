@@ -1357,6 +1357,46 @@ function testWebServiceWorkerRegistrationUsesBuildVersion() {
     pushHelper,
     /existing\s*\|\|\s*\(await navigator\.serviceWorker\.register/,
   );
+
+  const webIndex = fs.readFileSync(
+    path.resolve(__dirname, "../../web/index.html"),
+    "utf8",
+  );
+  assert.match(webIndex, /function loadPushClientHelper\(versionToken\)/);
+  assert.match(
+    webIndex,
+    /script\.src = versionedAsset\('push_client_helper\.js', versionToken\)/,
+  );
+  const helperLoadIndex = webIndex.indexOf("await loadPushClientHelper(serverVersion)");
+  const flutterBootstrapIndex = webIndex.indexOf("appendFlutterBootstrap(serverVersion)");
+  assert.ok(helperLoadIndex > 0, "push helper must be loaded during bootstrap");
+  assert.ok(
+    flutterBootstrapIndex > helperLoadIndex,
+    "push helper must load before Flutter bootstrap starts",
+  );
+  assert.doesNotMatch(
+    webIndex,
+    /<script\s+src=["']push_client_helper\.js["']><\/script>/,
+  );
+}
+
+function testWebIndexInlineScriptsAreParseable() {
+  const webIndex = fs.readFileSync(
+    path.resolve(__dirname, "../../web/index.html"),
+    "utf8",
+  );
+  const scriptBlocks = [...webIndex.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/gi)];
+  assert.ok(scriptBlocks.length > 0, "web/index.html must contain bootstrap scripts");
+  for (const match of scriptBlocks) {
+    const attrs = String(match[1] || "");
+    if (/\ssrc\s*=/i.test(attrs)) continue;
+    const source = String(match[2] || "").trim();
+    if (!source) continue;
+    assert.doesNotThrow(
+      () => new Function(source),
+      "inline web/index.html script must parse",
+    );
+  }
 }
 
 function testAndroidReleaseUsesProductionDownloadsRoot() {
@@ -1482,6 +1522,7 @@ testPhoneAccessDoesNotExposeFirstOwnerIdentity();
 testAuthHydrationClearsMissingPhoneAccessState();
 testFullDeployStampsWebBuildVersion();
 testWebServiceWorkerRegistrationUsesBuildVersion();
+testWebIndexInlineScriptsAreParseable();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();

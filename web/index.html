@@ -161,7 +161,6 @@
     For more details:
     * https://docs.flutter.dev/platform-integration/web/initialization
   -->
-  <script src="push_client_helper.js"></script>
   <script>
     (function () {
       function toBase64Url(buffer) {
@@ -451,6 +450,25 @@
         }
       }
 
+      function loadPushClientHelper(versionToken) {
+        return new Promise(function (resolve) {
+          if (window.projectPhoenixPush) {
+            resolve(true);
+            return;
+          }
+          const script = document.createElement('script');
+          script.src = versionedAsset('push_client_helper.js', versionToken);
+          script.async = false;
+          script.onload = function () {
+            resolve(true);
+          };
+          script.onerror = function () {
+            resolve(false);
+          };
+          document.head.appendChild(script);
+        });
+      }
+
       function isSafariLikeBrowser() {
         const ua = String(window.navigator.userAgent || '');
         const hasSafari = /Safari\//.test(ua);
@@ -627,6 +645,8 @@
             localStorage.setItem(buildVersionKey, serverVersion);
           }
         } catch (_) {}
+
+        await loadPushClientHelper(serverVersion);
 
         setBootstrapStatus(
           'Загружаем интерфейс Феникс...',
