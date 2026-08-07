@@ -876,6 +876,32 @@ function testNightlyAuditChecksAuthIdentityProjectWide() {
   assert.match(source, /await checkAuthIdentityIntegrity\(\)/);
 }
 
+function testAuthIdentityCleanupRunsBeforeNightlyAudit() {
+  const cleanup = fs.readFileSync(
+    path.resolve(__dirname, "auth_identity_cleanup.js"),
+    "utf8",
+  );
+  assert.match(cleanup, /loadTenantProcessingTargets/);
+  assert.match(cleanup, /buildTenantProcessingScopes/);
+  assert.match(cleanup, /includePlatform:\s*true/);
+  assert.match(cleanup, /db\.runWithTenantRow\(scope \|\| null/);
+  assert.match(cleanup, /UPDATE user_sessions s[\s\S]{0,220}s\.is_active = true[\s\S]{0,220}COALESCE\(u\.is_active, true\) = false/);
+  assert.match(cleanup, /UPDATE notification_endpoints e[\s\S]{0,520}e\.is_active = true[\s\S]{0,220}COALESCE\(u\.is_active, true\) = false/);
+  assert.match(cleanup, /--dry-run/);
+
+  const packageJson = fs.readFileSync(
+    path.resolve(__dirname, "../package.json"),
+    "utf8",
+  );
+  assert.match(packageJson, /"auth:cleanup": "node scripts\/auth_identity_cleanup\.js"/);
+
+  const nightly = fs.readFileSync(
+    path.resolve(__dirname, "nightly_maintenance.sh"),
+    "utf8",
+  );
+  assert.match(nightly, /npm run auth:cleanup[\s\S]{0,120}npm run audit:self/);
+}
+
 function testNightlyAuditChecksAuthEmailTokensProjectWide() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -1563,6 +1589,7 @@ testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
 testNightlyAuditChecksAuthIdentityProjectWide();
+testAuthIdentityCleanupRunsBeforeNightlyAudit();
 testNightlyAuditChecksAuthEmailTokensProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();
 testUploadRecoveryScriptsAreTenantAware();

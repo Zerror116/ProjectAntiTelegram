@@ -30,6 +30,7 @@
     "message:backfill": "node scripts/message_encryption_backfill.js",
     "media:backfill": "node scripts/media_assets_backfill.js",
     "media:sanitize": "node scripts/media_assets_sanitize.js",
+    "auth:cleanup": "node scripts/auth_identity_cleanup.js",
     "perf:budget": "node scripts/perf_budget_smoke.js",
     "backup:nightly": "./scripts/nightly_backup.sh",
     "maintenance:nightly": "./scripts/nightly_maintenance.sh",

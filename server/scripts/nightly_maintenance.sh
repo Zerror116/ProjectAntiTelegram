@@ -8,6 +8,7 @@ PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://garphoenix.com}"
 export PUBLIC_BASE_URL
 
 npm run media:sanitize
+npm run auth:cleanup
 npm run migrate:tenants
 npm run perf:budget
 npm run audit:self
