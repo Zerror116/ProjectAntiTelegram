@@ -554,7 +554,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         data: {'identifier': identifier, 'password': password},
       );
       if (resp.statusCode == 200) {
-        await authService.clearToken();
+        await authService.logout();
         return;
       }
       if (!mounted) return;

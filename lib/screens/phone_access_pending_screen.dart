@@ -39,7 +39,7 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
 
   Future<void> _logout() async {
     try {
-      await authService.clearToken();
+      await authService.logout();
     } catch (_) {}
     if (!mounted) return;
     Navigator.of(context).pushNamedAndRemoveUntil('/auth', (route) => false);

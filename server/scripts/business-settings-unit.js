@@ -682,6 +682,41 @@ function testLogoutRevokesRefreshSessionWhenAccessExpired() {
   );
 }
 
+function testExplicitUserLogoutFlowsUseServerLogout() {
+  const phoneAccessScreen = fs.readFileSync(
+    path.resolve(
+      __dirname,
+      "../../lib/screens/phone_access_pending_screen.dart",
+    ),
+    "utf8",
+  );
+  const profileScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/profile_screen.dart"),
+    "utf8",
+  );
+  const settingsScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/settings_screen.dart"),
+    "utf8",
+  );
+
+  assert.match(
+    phoneAccessScreen,
+    /Future<void> _logout\(\) async \{[\s\S]{0,120}await authService\.logout\(\);/,
+  );
+  assert.doesNotMatch(phoneAccessScreen, /authService\.clearToken\(\)/);
+  for (const source of [profileScreen, settingsScreen]) {
+    assert.match(
+      source,
+      /Future<void> _logout\(\) async \{[\s\S]{0,80}await authService\.logout\(\);/,
+    );
+    assert.match(
+      source,
+      /if \(resp\.statusCode == 200\) \{[\s\S]{0,80}await authService\.logout\(\);/,
+    );
+    assert.doesNotMatch(source, /await authService\.clearToken\(\);/);
+  }
+}
+
 function testNightlyAuditChecksAuthSessionsProjectWide() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -1322,5 +1357,6 @@ testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();
 testLogoutRevokesRefreshSessionWhenAccessExpired();
+testExplicitUserLogoutFlowsUseServerLogout();
 
 console.log("business-settings-unit: ok");
