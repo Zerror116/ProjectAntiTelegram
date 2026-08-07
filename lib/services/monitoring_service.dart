@@ -93,8 +93,54 @@ class MonitoringService {
     String? source,
     Map<String, dynamic> details = const <String, dynamic>{},
   }) async {
-    if (!_enabled) return;
-    final user = authService.currentUser;
+    await _captureEvent(
+      subsystem: subsystem,
+      code: code,
+      message: message,
+      level: level,
+      scope: scope,
+      source: source,
+      details: details,
+      enabled: _enabled,
+    );
+  }
+
+  @visibleForTesting
+  static Future<void> debugCaptureEventForTests({
+    required String subsystem,
+    required String code,
+    required String message,
+    String level = 'warn',
+    String scope = 'client',
+    String? source,
+    Map<String, dynamic> details = const <String, dynamic>{},
+  }) async {
+    await _captureEvent(
+      subsystem: subsystem,
+      code: code,
+      message: message,
+      level: level,
+      scope: scope,
+      source: source,
+      details: details,
+      enabled: true,
+    );
+  }
+
+  static Future<void> _captureEvent({
+    required String subsystem,
+    required String code,
+    required String message,
+    required String level,
+    required String scope,
+    required String? source,
+    required Map<String, dynamic> details,
+    required bool enabled,
+  }) async {
+    if (!enabled) return;
+    final auth = initializedAuthServiceOrNull();
+    if (auth == null) return;
+    final user = auth.currentUser;
     if (user == null) return;
     if (_isMuted()) return;
     if (_shouldIgnoreKnownNoise(
@@ -113,7 +159,7 @@ class MonitoringService {
     try {
       final packageInfo = await PackageInfo.fromPlatform();
       final deviceKey = await generateDeviceFingerprint();
-      await authService.dio.post(
+      await auth.dio.post(
         '/api/admin/ops/monitoring/events',
         data: <String, dynamic>{
           'scope': scope,
@@ -127,9 +173,7 @@ class MonitoringService {
           'app_build': int.tryParse(packageInfo.buildNumber),
           'device_label': deviceKey,
           'release_channel': 'stable',
-          'session_state': authService.isSessionDegraded
-              ? 'degraded'
-              : 'normal',
+          'session_state': auth.isSessionDegraded ? 'degraded' : 'normal',
           'details': details,
         },
       );

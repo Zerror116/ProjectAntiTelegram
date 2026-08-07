@@ -668,6 +668,16 @@ bool _isAuthServiceInitialized() {
   }
 }
 
+AuthService? initializedAuthServiceOrNull() {
+  if (!_isAuthServiceInitialized()) return null;
+  return authService;
+}
+
+@visibleForTesting
+bool debugIsAuthServiceInitializedForTesting() {
+  return _isAuthServiceInitialized();
+}
+
 @visibleForTesting
 void debugEnsureAuthServiceForTesting() {
   if (_isAuthServiceInitialized()) return;

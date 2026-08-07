@@ -120,6 +120,21 @@ function testProductionBuildsEnableClientMonitoring() {
   }
 }
 
+function testMonitoringServiceDoesNotRequireInitializedAuthAtStartup() {
+  const mainSource = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/main.dart"),
+    "utf8",
+  );
+  const monitoringSource = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/monitoring_service.dart"),
+    "utf8",
+  );
+  assert.match(mainSource, /AuthService\? initializedAuthServiceOrNull\(\)/);
+  assert.match(monitoringSource, /initializedAuthServiceOrNull\(\)/);
+  assert.doesNotMatch(monitoringSource, /authService\.currentUser/);
+  assert.doesNotMatch(monitoringSource, /authService\.dio/);
+}
+
 function testWorkflowPayloadCompatibility() {
   const settings = normalizeTenantFeatureSettings({
     workflow_settings: {
@@ -1346,6 +1361,7 @@ testDefaults();
 testCityListPersistence();
 testTopLevelAndNestedFlags();
 testProductionBuildsEnableClientMonitoring();
+testMonitoringServiceDoesNotRequireInitializedAuthAtStartup();
 testWorkflowPayloadCompatibility();
 testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();
