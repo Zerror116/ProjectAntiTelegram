@@ -6264,6 +6264,17 @@ bool _shouldSilenceReleaseWebConsoleErrors() {
   return kReleaseMode && kIsWeb;
 }
 
+bool _shouldHandlePlatformDispatcherError({bool releaseMode = kReleaseMode}) {
+  return releaseMode;
+}
+
+@visibleForTesting
+bool debugShouldHandlePlatformDispatcherErrorForTesting({
+  required bool releaseMode,
+}) {
+  return _shouldHandlePlatformDispatcherError(releaseMode: releaseMode);
+}
+
 void _logClientRuntimeErrorToConsole(
   String label,
   Object error,
@@ -6346,7 +6357,7 @@ Future<void> main() async {
                 code: 'platform_dispatcher_error',
               ),
             );
-            return _shouldSilenceReleaseWebConsoleErrors();
+            return _shouldHandlePlatformDispatcherError();
           };
 
       ErrorWidget.builder = (FlutterErrorDetails details) {

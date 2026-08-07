@@ -3,6 +3,19 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:projectphoenix/main.dart' as app;
 
 void main() {
+  test('platform dispatcher errors are handled in release builds only', () {
+    expect(
+      app.debugShouldHandlePlatformDispatcherErrorForTesting(
+        releaseMode: false,
+      ),
+      isFalse,
+    );
+    expect(
+      app.debugShouldHandlePlatformDispatcherErrorForTesting(releaseMode: true),
+      isTrue,
+    );
+  });
+
   testWidgets('release error fallback hides exception and stack details', (
     tester,
   ) async {

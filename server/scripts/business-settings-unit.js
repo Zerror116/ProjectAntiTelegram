@@ -146,6 +146,24 @@ function testFlutterErrorFallbackHidesDetailsOutsideDebug() {
   assert.match(mainSource, /debugBuildFlutterErrorFallbackForTesting/);
 }
 
+function testPlatformDispatcherErrorsAreHandledInReleaseBuilds() {
+  const mainSource = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/main.dart"),
+    "utf8",
+  );
+  assert.match(mainSource, /bool _shouldHandlePlatformDispatcherError\(/);
+  assert.match(mainSource, /return releaseMode;/);
+  assert.match(mainSource, /return _shouldHandlePlatformDispatcherError\(\);/);
+  assert.match(
+    mainSource,
+    /debugShouldHandlePlatformDispatcherErrorForTesting/,
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /PlatformDispatcher\.instance\.onError[\s\S]{0,700}return _shouldSilenceReleaseWebConsoleErrors\(\);/,
+  );
+}
+
 function testWorkflowPayloadCompatibility() {
   const settings = normalizeTenantFeatureSettings({
     workflow_settings: {
@@ -1374,6 +1392,7 @@ testTopLevelAndNestedFlags();
 testProductionBuildsEnableClientMonitoring();
 testMonitoringServiceDoesNotRequireInitializedAuthAtStartup();
 testFlutterErrorFallbackHidesDetailsOutsideDebug();
+testPlatformDispatcherErrorsAreHandledInReleaseBuilds();
 testWorkflowPayloadCompatibility();
 testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();
