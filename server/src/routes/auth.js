@@ -253,7 +253,7 @@ function getBearerTokenFromRequest(req) {
 async function runWithRefreshScope(scopeKey, fn) {
   const normalizedScope = db.normalizeTenantCode(scopeKey);
   if (!normalizedScope || normalizedScope === 'platform') {
-    return db.runWithPlatform(fn);
+    return db.runWithPlatform(() => fn(null));
   }
   const tenantRow = await db.resolveTenantByCode(normalizedScope);
   if (!tenantRow) {
@@ -261,7 +261,7 @@ async function runWithRefreshScope(scopeKey, fn) {
     error.statusCode = 401;
     throw error;
   }
-  return db.runWithTenantRow(tenantRow, fn);
+  return db.runWithTenantRow(tenantRow, () => fn(tenantRow));
 }
 
 async function findLegacySessionTenantScope({ sessionId, userId }) {
@@ -1812,6 +1812,57 @@ async function fetchAuthUserWithTenant(queryable, userId) {
     [userId],
   );
   return result.rows[0] || null;
+}
+
+function buildAuthTenantSnapshot(user, fallbackTenant = null) {
+  const userTenantId = String(user?.tenant_id || '').trim();
+  const fallbackTenantId = String(fallbackTenant?.id || '').trim();
+  const canUseFallback =
+    fallbackTenantId && (!userTenantId || userTenantId === fallbackTenantId);
+  if (userTenantId) {
+    return {
+      id: userTenantId,
+      code: user.tenant_code || (canUseFallback ? fallbackTenant.code : null),
+      name: user.tenant_name || (canUseFallback ? fallbackTenant.name : null),
+      status:
+        user.tenant_status || (canUseFallback ? fallbackTenant.status : null),
+      subscription_expires_at:
+        user.subscription_expires_at ||
+        (canUseFallback ? fallbackTenant.subscription_expires_at : null),
+    };
+  }
+  if (!canUseFallback) return null;
+  return {
+    id: fallbackTenantId,
+    code: fallbackTenant.code || null,
+    name: fallbackTenant.name || null,
+    status: fallbackTenant.status || null,
+    subscription_expires_at: fallbackTenant.subscription_expires_at || null,
+  };
+}
+
+async function attachTenantScopeToLegacyAuthUser(queryable, user, tenantScope) {
+  if (!user || user.tenant_id || !tenantScope?.id) return user;
+  const tenantId = String(tenantScope.id || '').trim();
+  if (!tenantId) return user;
+  const patchedTenantRes = await queryable.query(
+    `UPDATE users
+     SET tenant_id = $1
+     WHERE id = $2
+       AND tenant_id IS NULL
+     RETURNING tenant_id`,
+    [tenantId, user.id],
+  );
+  if (patchedTenantRes.rowCount > 0) {
+    user.tenant_id = patchedTenantRes.rows[0]?.tenant_id || tenantId;
+  }
+  if (!user.tenant_code) user.tenant_code = tenantScope.code || null;
+  if (!user.tenant_name) user.tenant_name = tenantScope.name || null;
+  if (!user.tenant_status) user.tenant_status = tenantScope.status || null;
+  if (!user.subscription_expires_at) {
+    user.subscription_expires_at = tenantScope.subscription_expires_at || null;
+  }
+  return user;
 }
 
 async function resolveRequestedCreatorTenant(req) {
@@ -3772,7 +3823,7 @@ router.post('/refresh', async (req, res) => {
   }
 
   try {
-    return await runWithRefreshScope(scopeKey, async () => {
+    return await runWithRefreshScope(scopeKey, async (refreshTenantScope) => {
       const client = await db.pool.connect();
       try {
         await client.query('BEGIN');
@@ -3811,16 +3862,17 @@ router.post('/refresh', async (req, res) => {
         const isPlatformCreator =
           String(user.email || '').trim().toLowerCase() ===
           CREATOR_EMAIL.toLowerCase();
+        if (!isPlatformCreator) {
+          await attachTenantScopeToLegacyAuthUser(
+            client,
+            user,
+            refreshTenantScope,
+          );
+        }
 
-        const tenant = user.tenant_id
-          ? {
-              id: user.tenant_id,
-              code: user.tenant_code || null,
-              name: user.tenant_name || null,
-              status: user.tenant_status || null,
-              subscription_expires_at: user.subscription_expires_at || null,
-            }
-          : null;
+        const tenant = isPlatformCreator
+          ? null
+          : buildAuthTenantSnapshot(user, refreshTenantScope);
         const nextRefreshToken = buildRefreshToken(
           resolveRefreshScopeKey({
             user,
@@ -3931,25 +3983,12 @@ router.post('/refresh/bootstrap', async (req, res) => {
         const isPlatformCreator =
           String(user.email || '').trim().toLowerCase() ===
           CREATOR_EMAIL.toLowerCase();
-        let tenant = user.tenant_id
-          ? {
-              id: user.tenant_id,
-              code: user.tenant_code || null,
-              name: user.tenant_name || null,
-              status: user.tenant_status || null,
-              subscription_expires_at: user.subscription_expires_at || null,
-            }
-          : null;
-        if (!isPlatformCreator && !tenant && tenantScope) {
-          tenant = {
-            id: tenantScope.id,
-            code: tenantScope.code || null,
-            name: tenantScope.name || null,
-            status: tenantScope.status || null,
-            subscription_expires_at:
-              tenantScope.subscription_expires_at || null,
-          };
+        if (!isPlatformCreator) {
+          await attachTenantScopeToLegacyAuthUser(client, user, tenantScope);
         }
+        const tenant = isPlatformCreator
+          ? null
+          : buildAuthTenantSnapshot(user, tenantScope);
         const targetExpiry = buildSessionExpiry();
         const nextRefreshToken = buildRefreshToken(
           resolveRefreshScopeKey({

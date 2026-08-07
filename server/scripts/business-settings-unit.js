@@ -191,6 +191,33 @@ function testLegacyBootstrapScansTenantSessionScopes() {
   );
 }
 
+function testRefreshHydratesLegacyTenantNullUsers() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  assert.match(authRoute, /function buildAuthTenantSnapshot/);
+  assert.match(authRoute, /async function attachTenantScopeToLegacyAuthUser/);
+  assert.match(authRoute, /SET tenant_id = \$1[\s\S]{0,120}tenant_id IS NULL/);
+  assert.match(authRoute, /runWithRefreshScope\(scopeKey, async \(refreshTenantScope\)/);
+  assert.match(
+    authRoute,
+    /router\.post\('\/refresh'[\s\S]*attachTenantScopeToLegacyAuthUser\([\s\S]{0,180}refreshTenantScope/,
+  );
+  assert.match(
+    authRoute,
+    /router\.post\('\/refresh'[\s\S]*buildAuthTenantSnapshot\(user, refreshTenantScope\)/,
+  );
+  assert.match(
+    authRoute,
+    /router\.post\('\/refresh\/bootstrap'[\s\S]*attachTenantScopeToLegacyAuthUser\([\s\S]{0,180}tenantScope/,
+  );
+  assert.match(
+    authRoute,
+    /router\.post\('\/refresh\/bootstrap'[\s\S]*buildAuthTenantSnapshot\(user, tenantScope\)/,
+  );
+}
+
 function testNotificationInboxDedupeIsAtomic() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../src/utils/notifications.js"),
@@ -1031,6 +1058,7 @@ testInviteJoinUsesTenantScopedEmailLookup();
 testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
 testLegacyBootstrapScansTenantSessionScopes();
+testRefreshHydratesLegacyTenantNullUsers();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testProductDescriptionOptionalProjectWide();
