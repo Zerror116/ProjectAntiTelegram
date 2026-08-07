@@ -208,6 +208,8 @@ class AuthService {
   bool _preferSharedPrefsSecretStore = false;
   bool _loggedSharedPrefsSecretFallback = false;
   bool _postAuthSyncInProgress = false;
+  bool _postAuthSyncRequested = false;
+  String? _pendingPostAuthSyncUserId;
   bool _sessionDegraded = false;
   String? _sessionDegradedReason;
 
@@ -479,32 +481,38 @@ class AuthService {
   }
 
   void _schedulePostAuthSync() {
+    final scheduledUserId = _currentUser?.id;
+    _pendingPostAuthSyncUserId = scheduledUserId;
+    _postAuthSyncRequested = true;
     if (_postAuthSyncInProgress) return;
     _postAuthSyncInProgress = true;
     unawaited(() async {
       try {
-        final enabled =
-            await NotificationRuntimePreferenceService.isEnabledForUser(
-              _currentUser?.id,
-            );
-        if (!enabled) {
-          await NotificationCoordinatorService.clear(
-            dio,
-            userId: _currentUser?.id,
-          );
-          return;
-        }
-        final policy =
-            await NotificationRuntimePreferenceService.refreshServerPolicy(
+        while (_postAuthSyncRequested) {
+          final syncUserId = _pendingPostAuthSyncUserId;
+          _postAuthSyncRequested = false;
+          _pendingPostAuthSyncUserId = null;
+          if (syncUserId == null || syncUserId.trim().isEmpty) continue;
+          final enabled =
+              await NotificationRuntimePreferenceService.isEnabledForUser(
+                syncUserId,
+              );
+          if (!enabled) {
+            await NotificationCoordinatorService.clear(dio, userId: syncUserId);
+          } else {
+            final policy =
+                await NotificationRuntimePreferenceService.refreshServerPolicy(
+                  dio,
+                  userId: syncUserId,
+                );
+            await NotificationCoordinatorService.reconcile(
               dio,
-              userId: _currentUser?.id,
+              enabled: enabled,
+              userId: syncUserId,
+              runtimePolicySnapshot: policy.toJson(),
             );
-        await NotificationCoordinatorService.reconcile(
-          dio,
-          enabled: enabled,
-          userId: _currentUser?.id,
-          runtimePolicySnapshot: policy.toJson(),
-        );
+          }
+        }
       } finally {
         _postAuthSyncInProgress = false;
       }
@@ -1760,7 +1768,21 @@ class AuthService {
   User _hydrateUserFromMap(Map<String, dynamic> userMap) {
     final merged = Map<String, dynamic>.from(userMap);
     final current = _currentUser;
-    if (current != null) {
+    final hasPhoneAccessState =
+        merged.containsKey('phone_access_state') ||
+        merged.containsKey('phoneAccessState');
+    final nextPhoneAccessState =
+        (merged['phone_access_state'] ?? merged['phoneAccessState'] ?? '')
+            .toString()
+            .trim();
+    if (!hasPhoneAccessState || nextPhoneAccessState.isEmpty) {
+      merged['phone_access_state'] = 'none';
+    }
+    final canReuseIdentityFields =
+        current != null && _isSameHydrationIdentity(merged, current);
+    final canReuseScopedFields =
+        canReuseIdentityFields && _isSameHydrationTenantScope(merged, current);
+    if (current != null && canReuseIdentityFields) {
       final nextName = (merged['name'] ?? '').toString().trim();
       if (nextName.isEmpty && (current.name ?? '').trim().isNotEmpty) {
         merged['name'] = current.name;
@@ -1769,16 +1791,8 @@ class AuthService {
       if (nextPhone.isEmpty && (current.phone ?? '').trim().isNotEmpty) {
         merged['phone'] = current.phone;
       }
-      final nextPhoneAccessState =
-          (merged['phone_access_state'] ?? merged['phoneAccessState'] ?? '')
-              .toString()
-              .trim();
-      final hasPhoneAccessState =
-          merged.containsKey('phone_access_state') ||
-          merged.containsKey('phoneAccessState');
-      if (!hasPhoneAccessState || nextPhoneAccessState.isEmpty) {
-        merged['phone_access_state'] = 'none';
-      }
+    }
+    if (current != null && canReuseScopedFields) {
       final nextPermissions = merged['permissions'];
       if ((nextPermissions is! Map || nextPermissions.isEmpty) &&
           current.permissions.isNotEmpty) {
@@ -1822,6 +1836,57 @@ class AuthService {
       }
     }
     return user;
+  }
+
+  String _normalizeHydrationIdentityValue(Object? value) {
+    return (value ?? '').toString().trim();
+  }
+
+  bool _isSameHydrationIdentity(Map<String, dynamic> incoming, User current) {
+    var hasComparableIdentity = false;
+    final incomingId = _normalizeHydrationIdentityValue(incoming['id']);
+    final currentId = current.id.trim();
+    if (incomingId.isNotEmpty && currentId.isNotEmpty) {
+      if (incomingId != currentId) return false;
+      hasComparableIdentity = true;
+    }
+
+    final incomingEmail = _normalizeHydrationIdentityValue(
+      incoming['email'],
+    ).toLowerCase();
+    final currentEmail = current.email.trim().toLowerCase();
+    if (incomingEmail.isNotEmpty && currentEmail.isNotEmpty) {
+      if (incomingEmail != currentEmail) return false;
+      hasComparableIdentity = true;
+    }
+
+    return hasComparableIdentity;
+  }
+
+  bool _isSameHydrationTenantScope(
+    Map<String, dynamic> incoming,
+    User current,
+  ) {
+    var hasComparableScope = false;
+    final incomingTenantId = _normalizeHydrationIdentityValue(
+      incoming['tenant_id'] ?? incoming['tenantId'],
+    );
+    final currentTenantId = (current.tenantId ?? '').trim();
+    if (incomingTenantId.isNotEmpty && currentTenantId.isNotEmpty) {
+      if (incomingTenantId != currentTenantId) return false;
+      hasComparableScope = true;
+    }
+
+    final incomingTenantCode = _normalizeTenantCodeScope(
+      (incoming['tenant_code'] ?? incoming['tenantCode'])?.toString(),
+    );
+    final currentTenantCode = _normalizeTenantCodeScope(current.tenantCode);
+    if (incomingTenantCode.isNotEmpty && currentTenantCode.isNotEmpty) {
+      if (incomingTenantCode != currentTenantCode) return false;
+      hasComparableScope = true;
+    }
+
+    return hasComparableScope;
   }
 
   void updateCurrentUserFromMap(Map<String, dynamic> userMap) {
