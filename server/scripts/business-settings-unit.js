@@ -717,6 +717,29 @@ function testExplicitUserLogoutFlowsUseServerLogout() {
   }
 }
 
+function testAccountDeleteUsesBusinessCleanupProjectWide() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  assert.match(authRoute, /async function deleteOwnAccountWithBusinessCleanup/);
+  assert.match(authRoute, /markReservedMessageAccountDeleted/);
+  assert.match(authRoute, /restoreCatalogProductAfterAccountDelete/);
+  assert.match(authRoute, /DELETE FROM delivery_batch_items/);
+  assert.match(authRoute, /DELETE FROM delivery_batch_customers/);
+  assert.match(authRoute, /DELETE FROM reservations/);
+  assert.match(authRoute, /SET quantity = quantity \+ \$1/);
+  assert.match(authRoute, /DELETE FROM cart_items/);
+  assert.match(authRoute, /DELETE FROM users[\s\S]{0,120}RETURNING id::text AS user_id/);
+  assert.match(authRoute, /DELETE FROM tenant_user_index/);
+  assert.match(authRoute, /returned_units_count/);
+  assert.match(authRoute, /account_deleted/);
+  assert.doesNotMatch(
+    authRoute,
+    /db\.query\('DELETE FROM users WHERE id = \$1 RETURNING id'/,
+  );
+}
+
 function testNightlyAuditChecksAuthSessionsProjectWide() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -1358,5 +1381,6 @@ testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();
 testLogoutRevokesRefreshSessionWhenAccessExpired();
 testExplicitUserLogoutFlowsUseServerLogout();
+testAccountDeleteUsesBusinessCleanupProjectWide();
 
 console.log("business-settings-unit: ok");
