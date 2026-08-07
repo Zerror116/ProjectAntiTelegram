@@ -207,6 +207,66 @@ void main() {
     },
   );
 
+  test('full auth response stores refresh token and tenant session', () async {
+    final dio = Dio();
+    dio.httpClientAdapter = _FakeDioAdapter((options) {
+      if (_isNotificationEndpointLifecycleRequest(options)) {
+        return _jsonResponse(200, {'ok': true});
+      }
+      if (options.path == '/api/notifications/preferences') {
+        return _jsonResponse(200, {
+          'data': {
+            'message_preview_enabled': true,
+            'sound_enabled': true,
+            'show_when_active': false,
+          },
+        });
+      }
+      if (options.path == '/api/notifications/badge-count') {
+        return _jsonResponse(200, {
+          'data': {'count': 0},
+        });
+      }
+      return _jsonResponse(200, <String, dynamic>{});
+    });
+    final auth = AuthService(dio: dio);
+
+    final response = Response<Map<String, dynamic>>(
+      requestOptions: RequestOptions(path: '/api/auth/magic-link/consume'),
+      statusCode: 200,
+      data: {
+        'token': 'magic-access-token',
+        'refresh_token': 'tenant-refresh-token',
+        'access_expires_at': DateTime.now()
+            .toUtc()
+            .add(const Duration(hours: 1))
+            .toIso8601String(),
+        'user': _userMap(
+          id: 'magic-user',
+          email: 'magic@example.test',
+          tenantCode: 'tenant-a',
+          tenantName: 'Tenant A',
+        ),
+        'tenant': {'code': 'tenant-a', 'name': 'Tenant A'},
+      },
+    );
+
+    await auth.applyAuthResponse(response);
+
+    expect(await auth.getToken(), 'magic-access-token');
+    expect(await auth.getRefreshToken(), 'tenant-refresh-token');
+    expect(await auth.getTenantCode(), 'tenant-a');
+    expect(auth.currentUser?.email, 'magic@example.test');
+    expect(auth.currentUser?.tenantCode, 'tenant-a');
+
+    final sessions = await auth.listSavedTenantSessions();
+    final saved = sessions.singleWhere(
+      (row) => (row['id'] ?? '').toString() == 'magic@example.test::tenant-a',
+    );
+    expect(saved['token'], 'magic-access-token');
+    expect(saved['refresh_token'], 'tenant-refresh-token');
+  });
+
   test('failed saved tenant switch restores previous session', () async {
     final previousDebugPrint = debugPrint;
     final debugMessages = <String>[];

@@ -261,11 +261,7 @@ class _PhoneNameScreenState extends State<PhoneNameScreen> {
           return;
         }
 
-        // Сохраняем токен гибко (поддержка разных authService)
-        await authService.applyLoginResponse(
-          token as String,
-          respData['user'] as Map<String, dynamic>?,
-        );
+        await authService.applyAuthResponse(resp);
 
         // Очистим pending
         try {

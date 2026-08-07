@@ -188,6 +188,10 @@ function testAuthRecoveryAndEmailPreflightAreTenantScoped() {
     path.resolve(__dirname, "../../lib/services/auth_service.dart"),
     "utf8",
   );
+  const phoneNameScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/phone_name_screen.dart"),
+    "utf8",
+  );
 
   assert.match(authRoute, /function tenantScopedUserFilterSql/);
   assert.match(
@@ -229,6 +233,11 @@ function testAuthRecoveryAndEmailPreflightAreTenantScoped() {
   );
   assert.match(authScreen, /await _authService\.applyAuthResponse\(resp\)/);
   assert.match(authService, /Future<void> applyAuthResponse\(Response resp\)/);
+  assert.match(phoneNameScreen, /await authService\.applyAuthResponse\(resp\)/);
+  assert.doesNotMatch(
+    phoneNameScreen,
+    /applyLoginResponse\([\s\S]{0,160}respData\['user'\]/,
+  );
 }
 
 function testLegacyBootstrapScansTenantSessionScopes() {
