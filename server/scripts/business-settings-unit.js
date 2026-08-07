@@ -606,6 +606,35 @@ function testAuthSessionsArePersistentProjectWide() {
   assert.match(migration, /WHERE is_active = true/);
 }
 
+function testSavedTenantSwitchKeepsSessionsOnTransientFailure() {
+  const authService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/auth_service.dart"),
+    "utf8",
+  );
+  const authTests = fs.readFileSync(
+    path.resolve(__dirname, "../../test/auth_service_session_switch_test.dart"),
+    "utf8",
+  );
+  assert.match(authService, /bool get _isAuthRejectedSessionDegradation/);
+  assert.match(authService, /saved_tenant_switch_transient_error/);
+  assert.match(
+    authService,
+    /if \(_isAuthRejectedSessionDegradation\) \{\s*await removeSavedTenantSession\(id\);/,
+  );
+  assert.match(
+    authService,
+    /else if \(e\.response\?\.statusCode == 401\) \{\s*await removeSavedTenantSession\(id\);/,
+  );
+  assert.match(
+    authTests,
+    /transient saved tenant switch failure keeps target session saved/,
+  );
+  assert.match(
+    authTests,
+    /restricted saved tenant switch keeps target session saved/,
+  );
+}
+
 function testNightlyAuditChecksAuthSessionsProjectWide() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "nightly-self-audit.js"),
@@ -1244,5 +1273,6 @@ testAuthHydrationClearsMissingPhoneAccessState();
 testFullDeployStampsWebBuildVersion();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
+testSavedTenantSwitchKeepsSessionsOnTransientFailure();
 
 console.log("business-settings-unit: ok");

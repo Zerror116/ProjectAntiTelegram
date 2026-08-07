@@ -324,6 +324,102 @@ void main() {
   });
 
   test(
+    'transient saved tenant switch failure keeps target session saved',
+    () async {
+      final bootstrapAuthHeaders = <String>[];
+      final dio = Dio();
+      dio.httpClientAdapter = _FakeDioAdapter((options) {
+        if (_isNotificationEndpointLifecycleRequest(options)) {
+          return _jsonResponse(200, {
+            'ok': true,
+            'data': {'deactivated': true},
+          });
+        }
+        if (options.path == '/api/auth/refresh/bootstrap') {
+          bootstrapAuthHeaders.add(
+            (options.headers['Authorization'] ?? '').toString(),
+          );
+          return _jsonResponse(500, {'error': 'temporary'});
+        }
+        return _jsonResponse(500, {'error': 'unexpected'});
+      });
+      final auth = await seedTwoSavedSessions(dio);
+
+      final switched = await auth.switchToSavedTenantSession(
+        'target@example.test::target',
+      );
+
+      expect(switched, isFalse);
+      expect(bootstrapAuthHeaders, ['Bearer target-token']);
+      expect(await auth.getToken(), 'previous-token');
+      expect(await auth.getRefreshToken(), 'previous-refresh');
+      expect(auth.currentUser?.email, 'previous@example.test');
+      expect(auth.currentUser?.tenantCode, 'previous');
+      final sessions = await auth.listSavedTenantSessions();
+      expect(
+        sessions.any(
+          (row) =>
+              (row['id'] ?? '').toString() == 'target@example.test::target',
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test('restricted saved tenant switch keeps target session saved', () async {
+    final dio = Dio();
+    dio.httpClientAdapter = _FakeDioAdapter((options) {
+      if (_isNotificationEndpointLifecycleRequest(options)) {
+        return _jsonResponse(200, {
+          'ok': true,
+          'data': {'deactivated': true},
+        });
+      }
+      if (options.path == '/api/auth/refresh/bootstrap') {
+        return _jsonResponse(200, {
+          'token': 'target-token-fresh',
+          'refresh_token': 'target-refresh-new',
+          'access_expires_at': DateTime.now()
+              .toUtc()
+              .add(const Duration(hours: 1))
+              .toIso8601String(),
+          'user': _userMap(
+            id: 'target-user',
+            email: 'target@example.test',
+            tenantCode: 'target',
+            tenantName: 'Target',
+          ),
+        });
+      }
+      if (options.path == '/api/profile') {
+        return _jsonResponse(403, {
+          'error': 'Доступ ограничен',
+          'code': 'phone_access_pending',
+        });
+      }
+      return _jsonResponse(500, {'error': 'unexpected'});
+    });
+    final auth = await seedTwoSavedSessions(dio);
+
+    final switched = await auth.switchToSavedTenantSession(
+      'target@example.test::target',
+    );
+
+    expect(switched, isFalse);
+    expect(await auth.getToken(), 'previous-token');
+    expect(await auth.getRefreshToken(), 'previous-refresh');
+    expect(auth.currentUser?.email, 'previous@example.test');
+    expect(auth.currentUser?.tenantCode, 'previous');
+    final sessions = await auth.listSavedTenantSessions();
+    expect(
+      sessions.any(
+        (row) => (row['id'] ?? '').toString() == 'target@example.test::target',
+      ),
+      isTrue,
+    );
+  });
+
+  test(
     'fresh profile without phone access state clears stale local pending',
     () async {
       final dio = Dio();

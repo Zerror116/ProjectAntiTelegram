@@ -679,7 +679,9 @@ class AuthService {
         forceRefreshIfExpired: true,
       );
       if (!refreshed) {
-        await removeSavedTenantSession(id);
+        if (_isAuthRejectedSessionDegradation) {
+          await removeSavedTenantSession(id);
+        }
         await restorePreviousSession();
         return false;
       }
@@ -708,11 +710,23 @@ class AuthService {
         }
         return true;
       }
-      await removeSavedTenantSession(id);
+      if (_isAuthRejectedSessionDegradation) {
+        await removeSavedTenantSession(id);
+      }
+      await restorePreviousSession();
+      return false;
+    } on DioException catch (e) {
+      if (_isTransientNetworkOrServerError(e)) {
+        _setSessionDegraded(
+          true,
+          reason: 'saved_tenant_switch_transient_error',
+        );
+      } else if (e.response?.statusCode == 401) {
+        await removeSavedTenantSession(id);
+      }
       await restorePreviousSession();
       return false;
     } catch (_) {
-      await removeSavedTenantSession(id);
       await restorePreviousSession();
       return false;
     }
@@ -1898,7 +1912,15 @@ class AuthService {
     unawaited(_saveUserSnapshot(_currentUser));
   }
 
-  Future<bool> _bootstrapLegacySession() async {
+  bool get _isAuthRejectedSessionDegradation {
+    final reason = (_sessionDegradedReason ?? '').trim();
+    return _sessionDegraded && reason.contains('auth_rejected');
+  }
+
+  Future<bool> _bootstrapLegacySession({
+    bool markTransientDegraded = false,
+    bool markAuthRejected = false,
+  }) async {
     final token = await getToken();
     if (token == null || token.trim().isEmpty) return false;
     try {
@@ -1916,8 +1938,17 @@ class AuthService {
       }
     } on DioException catch (e) {
       final status = e.response?.statusCode;
-      if (status == 401 || status == 403) {
+      if (status == 401) {
+        if (markAuthRejected) {
+          _setSessionDegraded(true, reason: 'bootstrap_session_auth_rejected');
+        }
         return false;
+      }
+      if (status == 403) {
+        return false;
+      }
+      if (markTransientDegraded && _isTransientNetworkOrServerError(e)) {
+        _setSessionDegraded(true, reason: 'bootstrap_session_transient_error');
       }
       debugPrint('⚠️ bootstrap legacy session skipped: $e');
       return false;
@@ -1943,7 +1974,10 @@ class AuthService {
       final refreshToken = await getRefreshToken();
       if (refreshToken == null || refreshToken.trim().isEmpty) {
         if (allowBootstrap) {
-          final bootstrapped = await _bootstrapLegacySession();
+          final bootstrapped = await _bootstrapLegacySession(
+            markTransientDegraded: true,
+            markAuthRejected: true,
+          );
           completer.complete(bootstrapped);
           return bootstrapped;
         }
@@ -1968,7 +2002,10 @@ class AuthService {
       } on DioException catch (e) {
         final status = e.response?.statusCode;
         if (allowBootstrap && (status == 400 || status == 401)) {
-          final bootstrapped = await _bootstrapLegacySession();
+          final bootstrapped = await _bootstrapLegacySession(
+            markTransientDegraded: true,
+            markAuthRejected: true,
+          );
           if (bootstrapped) {
             completer.complete(true);
             return true;
