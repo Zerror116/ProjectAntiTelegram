@@ -218,6 +218,27 @@ function testRefreshHydratesLegacyTenantNullUsers() {
   );
 }
 
+function testAuthMiddlewareHydratesLegacyTenantNullUsers() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/auth.js"),
+    "utf8",
+  );
+  assert.match(source, /async function attachTenantScopeToLegacyAuthContextUser/);
+  assert.match(source, /SET tenant_id = \$1[\s\S]{0,120}tenant_id IS NULL/);
+  assert.match(
+    source,
+    /!isPlatformCreator && !row\.tenant_id && tenantScope[\s\S]{0,100}attachTenantScopeToLegacyAuthContextUser\(row, tenantScope\)/,
+  );
+  assert.match(
+    source,
+    /tenantCodeHint \|\| row\.tenant_code \|\| tenantScope\?\.code/,
+  );
+  assert.match(
+    source,
+    /const effectiveTenantId = String\(row\.tenant_id \|\| tenantScope\?\.id \|\| ''\)/,
+  );
+}
+
 function testNotificationInboxDedupeIsAtomic() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../src/utils/notifications.js"),
@@ -1059,6 +1080,7 @@ testAmbiguousLoginRequestsTenantSelection();
 testAuthRecoveryUsesScopedEmailTokens();
 testLegacyBootstrapScansTenantSessionScopes();
 testRefreshHydratesLegacyTenantNullUsers();
+testAuthMiddlewareHydratesLegacyTenantNullUsers();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
 testProductDescriptionOptionalProjectWide();

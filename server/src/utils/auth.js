@@ -292,6 +292,34 @@ async function ensureScopedAuthUserShadowRow(user, tenantScope) {
   );
 }
 
+async function attachTenantScopeToLegacyAuthContextUser(row, tenantScope) {
+  if (!row || row.tenant_id || !tenantScope?.id) return row;
+  const tenantId = String(tenantScope.id || '').trim();
+  if (!tenantId) return row;
+
+  await db.runWithTenantRow(tenantScope, async () => {
+    const patchedTenantRes = await db.query(
+      `UPDATE users
+       SET tenant_id = $1
+       WHERE id = $2
+         AND tenant_id IS NULL
+       RETURNING tenant_id`,
+      [tenantId, row.id],
+    );
+    if (patchedTenantRes.rowCount > 0) {
+      row.tenant_id = patchedTenantRes.rows[0]?.tenant_id || tenantId;
+    }
+  });
+
+  if (!row.tenant_code) row.tenant_code = tenantScope.code || null;
+  if (!row.tenant_name) row.tenant_name = tenantScope.name || null;
+  if (!row.tenant_status) row.tenant_status = tenantScope.status || null;
+  if (!row.subscription_expires_at) {
+    row.subscription_expires_at = tenantScope.subscription_expires_at || null;
+  }
+  return row;
+}
+
 async function resolveAuthContextFromToken(
   token,
   requestedViewRole = '',
@@ -393,15 +421,20 @@ async function resolveAuthContextFromToken(
 
   const baseRole = (row.role || 'client').toString().toLowerCase().trim() || 'client';
   const isPlatformCreator = baseRole === 'creator' && isPlatformCreatorEmail(row.email);
+  if (!isPlatformCreator && !row.tenant_id && tenantScope) {
+    await attachTenantScopeToLegacyAuthContextUser(row, tenantScope);
+  }
 
   let tenantRegistry = null;
   if (isPlatformCreator) {
     tenantRegistry = await resolveCreatorTenantScope(requestedTenantCode);
   } else {
     const effectiveTenantCode = db.normalizeTenantCode(
-      tenantCodeHint || row.tenant_code || '',
+      tenantCodeHint || row.tenant_code || tenantScope?.code || '',
     );
-    if (!row.tenant_id || !effectiveTenantCode) {
+    const effectiveTenantId = String(row.tenant_id || tenantScope?.id || '')
+      .trim();
+    if (!effectiveTenantId || !effectiveTenantCode) {
       return {
         ok: false,
         status: 403,
