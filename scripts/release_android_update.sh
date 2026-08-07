@@ -7,6 +7,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SERVER="${SERVER:-root@89.23.99.18}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/opt/fenix}"
 REMOTE_DOWNLOADS_DIR="${REMOTE_DOWNLOADS_DIR:-/opt/fenix-data/downloads}"
+APK_BUILD_ARGS="${APK_BUILD_ARGS:---release --dart-define=PHX_MONITORING_ENABLED=true}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://garphoenix.com}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 FLUTTER_BIN="${FLUTTER_BIN:-}"
@@ -261,8 +262,8 @@ build_release_apk_if_needed() {
   fi
 
   if [[ "$SKIP_BUILD" != "1" ]]; then
-    note "flutter build apk --release"
-    "$FLUTTER_BIN" build apk --release
+    note "flutter build apk $APK_BUILD_ARGS"
+    "$FLUTTER_BIN" build apk $APK_BUILD_ARGS
   else
     note "--skip-build: reusing existing local APK"
   fi

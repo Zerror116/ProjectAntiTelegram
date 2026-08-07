@@ -28,7 +28,7 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows release
-        run: flutter build windows --release --dart-define=FENIX_NATIVE_RELEASE_API_BASE_URL=https://garphoenix.com --dart-define=FENIX_API_BASE_URL=https://garphoenix.com
+        run: flutter build windows --release --dart-define=FENIX_NATIVE_RELEASE_API_BASE_URL=https://garphoenix.com --dart-define=FENIX_API_BASE_URL=https://garphoenix.com --dart-define=PHX_MONITORING_ENABLED=true
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -69,7 +69,7 @@ jobs:
         run: flutter pub get
 
       - name: Build macOS release
-        run: flutter build macos --release --dart-define=FENIX_NATIVE_RELEASE_API_BASE_URL=https://garphoenix.com --dart-define=FENIX_API_BASE_URL=https://garphoenix.com
+        run: flutter build macos --release --dart-define=FENIX_NATIVE_RELEASE_API_BASE_URL=https://garphoenix.com --dart-define=FENIX_API_BASE_URL=https://garphoenix.com --dart-define=PHX_MONITORING_ENABLED=true
 
       - name: Pack macOS app and dmg
         run: |

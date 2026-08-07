@@ -102,6 +102,24 @@ function testTopLevelAndNestedFlags() {
   assert.equal(settings.diagnostics.bootstrap_monitoring_enabled, false);
 }
 
+function testProductionBuildsEnableClientMonitoring() {
+  const requiredBuildFiles = [
+    path.resolve(__dirname, "../../scripts/deploy_full.sh"),
+    path.resolve(__dirname, "../../scripts/deploy_web.sh"),
+    path.resolve(__dirname, "../../scripts/release_android_update.sh"),
+    path.resolve(__dirname, "../../scripts/full_cluster_audit.sh"),
+    path.resolve(__dirname, "../../.github/workflows/desktop-release.yml"),
+  ];
+  for (const file of requiredBuildFiles) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.match(
+      source,
+      /--dart-define=PHX_MONITORING_ENABLED=true/,
+      `${path.relative(path.resolve(__dirname, "../.."), file)} must keep client monitoring enabled for release builds`,
+    );
+  }
+}
+
 function testWorkflowPayloadCompatibility() {
   const settings = normalizeTenantFeatureSettings({
     workflow_settings: {
@@ -1327,6 +1345,7 @@ function testNoHardcodedPlatformOwnerIdentity() {
 testDefaults();
 testCityListPersistence();
 testTopLevelAndNestedFlags();
+testProductionBuildsEnableClientMonitoring();
 testWorkflowPayloadCompatibility();
 testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();

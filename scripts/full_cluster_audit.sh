@@ -25,10 +25,10 @@ run_local_checks() {
 
   if [[ "$RUN_BUILDS" == "1" ]]; then
     print_section "Local Flutter Web Build"
-    flutter build web --release --no-wasm-dry-run
+    flutter build web --release --no-wasm-dry-run --dart-define=PHX_MONITORING_ENABLED=true
 
     print_section "Local Flutter APK Build"
-    flutter build apk --release
+    flutter build apk --release --dart-define=PHX_MONITORING_ENABLED=true
   else
     print_section "Builds Skipped"
     echo "RUN_BUILDS=0, skip flutter build web/apk"
