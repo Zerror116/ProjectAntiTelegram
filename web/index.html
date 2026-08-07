@@ -281,6 +281,10 @@
       const runtimeErrorReloadKey = 'projectphoenix-web-runtime-error-reload';
       const bootstrapTimeoutMs = 28000;
       const bootstrapExtendedTimeoutMs = 45000;
+      const versionFetchTimeoutMs = 4500;
+      const optionalBootstrapWorkTimeoutMs = 5000;
+      const pushHelperLoadTimeoutMs = 4500;
+      const shellRefreshTimeoutMs = 7000;
       let bootstrapTimeoutId = null;
       let bootstrapReady = false;
 
@@ -434,6 +438,56 @@
         return token ? `${path}?v=${encodeURIComponent(token)}` : path;
       }
 
+      function withTimeout(promise, timeoutMs, fallbackValue) {
+        return new Promise(function (resolve) {
+          let settled = false;
+          const timeoutId = window.setTimeout(function () {
+            finish(fallbackValue);
+          }, timeoutMs);
+
+          function finish(value) {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeoutId);
+            resolve(value);
+          }
+
+          Promise.resolve(promise).then(finish).catch(function () {
+            finish(fallbackValue);
+          });
+        });
+      }
+
+      function fetchWithTimeout(url, options, timeoutMs) {
+        if (typeof AbortController === 'undefined') {
+          return withTimeout(fetch(url, options), timeoutMs, null);
+        }
+        const controller = new AbortController();
+        const requestOptions = Object.assign({}, options || {}, {
+          signal: controller.signal,
+        });
+        return new Promise(function (resolve) {
+          let settled = false;
+          const timeoutId = window.setTimeout(function () {
+            try {
+              controller.abort();
+            } catch (_) {}
+            finish(null);
+          }, timeoutMs);
+
+          function finish(value) {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeoutId);
+            resolve(value);
+          }
+
+          fetch(url, requestOptions).then(finish).catch(function () {
+            finish(null);
+          });
+        });
+      }
+
       function applyVersionedShellAssets(versionToken) {
         const manifestLink = document.getElementById('app-manifest');
         const appleTouchIcon = document.getElementById('apple-touch-icon');
@@ -456,14 +510,26 @@
             resolve(true);
             return;
           }
+          let settled = false;
           const script = document.createElement('script');
+          const timeoutId = window.setTimeout(function () {
+            finish(false);
+          }, pushHelperLoadTimeoutMs);
+
+          function finish(value) {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeoutId);
+            resolve(value);
+          }
+
           script.src = versionedAsset('push_client_helper.js', versionToken);
           script.async = false;
           script.onload = function () {
-            resolve(true);
+            finish(true);
           };
           script.onerror = function () {
-            resolve(false);
+            finish(false);
           };
           document.head.appendChild(script);
         });
@@ -507,10 +573,12 @@
       }
 
       async function readServerBuildVersion() {
-        const resp = await fetch(`version.json?_ts=${Date.now()}`, {
-          cache: 'no-store',
-        });
-        if (!resp.ok) return '';
+        const resp = await fetchWithTimeout(
+          `version.json?_ts=${Date.now()}`,
+          { cache: 'no-store' },
+          versionFetchTimeoutMs,
+        );
+        if (!resp || !resp.ok) return '';
         const data = await resp.json();
         const version = (data && data.version ? String(data.version) : '').trim();
         const buildNumber =
@@ -576,7 +644,7 @@
       }
 
       async function hardRefreshToVersion(versionToken) {
-        await refreshWebShellOnly();
+        await withTimeout(refreshWebShellOnly(), shellRefreshTimeoutMs, false);
         navigateToFreshBuild(versionToken);
       }
 
@@ -626,7 +694,11 @@
           !alreadyReloaded;
 
         applyVersionedShellAssets(serverVersion);
-        await clearLegacyFlutterCaches();
+        await withTimeout(
+          clearLegacyFlutterCaches(),
+          optionalBootstrapWorkTimeoutMs,
+          false,
+        );
 
         if (shouldHardRefresh) {
           try {

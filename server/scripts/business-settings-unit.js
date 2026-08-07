@@ -1399,6 +1399,37 @@ function testWebIndexInlineScriptsAreParseable() {
   }
 }
 
+function testWebBootstrapStartupWorkIsBounded() {
+  const webIndex = fs.readFileSync(
+    path.resolve(__dirname, "../../web/index.html"),
+    "utf8",
+  );
+  assert.match(webIndex, /const versionFetchTimeoutMs = \d+/);
+  assert.match(webIndex, /const optionalBootstrapWorkTimeoutMs = \d+/);
+  assert.match(webIndex, /const pushHelperLoadTimeoutMs = \d+/);
+  assert.match(webIndex, /const shellRefreshTimeoutMs = \d+/);
+  assert.match(webIndex, /function withTimeout\(promise, timeoutMs, fallbackValue\)/);
+  assert.match(webIndex, /function fetchWithTimeout\(url, options, timeoutMs\)/);
+  assert.match(webIndex, /AbortController/);
+  assert.match(
+    webIndex,
+    /fetchWithTimeout\([\s\S]*version\.json\?_ts=\$\{Date\.now\(\)\}[\s\S]*versionFetchTimeoutMs/,
+  );
+  assert.match(webIndex, /if \(!resp \|\| !resp\.ok\) return '';/);
+  assert.match(
+    webIndex,
+    /window\.setTimeout\(function \(\) \{[\s\S]{0,80}finish\(false\);[\s\S]{0,80}\}, pushHelperLoadTimeoutMs\)/,
+  );
+  assert.match(
+    webIndex,
+    /withTimeout\([\s\S]{0,80}clearLegacyFlutterCaches\(\),[\s\S]{0,80}optionalBootstrapWorkTimeoutMs,[\s\S]{0,80}false,[\s\S]{0,80}\)/,
+  );
+  assert.match(
+    webIndex,
+    /withTimeout\(refreshWebShellOnly\(\), shellRefreshTimeoutMs, false\)/,
+  );
+}
+
 function testAndroidReleaseUsesProductionDownloadsRoot() {
   const files = [
     path.resolve(__dirname, "../../scripts/deploy_full.sh"),
@@ -1523,6 +1554,7 @@ testAuthHydrationClearsMissingPhoneAccessState();
 testFullDeployStampsWebBuildVersion();
 testWebServiceWorkerRegistrationUsesBuildVersion();
 testWebIndexInlineScriptsAreParseable();
+testWebBootstrapStartupWorkIsBounded();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();
