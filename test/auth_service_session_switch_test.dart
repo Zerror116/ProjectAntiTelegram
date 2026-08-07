@@ -306,6 +306,10 @@ void main() {
     expect(await auth.getRefreshToken(), 'previous-refresh');
     expect(auth.currentUser?.email, 'previous@example.test');
     expect(auth.currentUser?.tenantCode, 'previous');
+    expect(
+      auth.lastSavedTenantSwitchFailureReason,
+      'bootstrap_session_auth_rejected',
+    );
     final sessions = await auth.listSavedTenantSessions();
     expect(
       sessions.any(
@@ -355,6 +359,10 @@ void main() {
       expect(await auth.getRefreshToken(), 'previous-refresh');
       expect(auth.currentUser?.email, 'previous@example.test');
       expect(auth.currentUser?.tenantCode, 'previous');
+      expect(
+        auth.lastSavedTenantSwitchFailureReason,
+        'bootstrap_session_transient_error',
+      );
       final sessions = await auth.listSavedTenantSessions();
       expect(
         sessions.any(
@@ -410,6 +418,10 @@ void main() {
     expect(await auth.getRefreshToken(), 'previous-refresh');
     expect(auth.currentUser?.email, 'previous@example.test');
     expect(auth.currentUser?.tenantCode, 'previous');
+    expect(
+      auth.lastSavedTenantSwitchFailureReason,
+      'saved_tenant_switch_restricted',
+    );
     final sessions = await auth.listSavedTenantSessions();
     expect(
       sessions.any(

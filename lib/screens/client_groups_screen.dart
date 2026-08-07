@@ -83,6 +83,25 @@ class _ClientGroupsScreenState extends State<ClientGroupsScreen> {
     return 'Группа';
   }
 
+  String _switchFailureMessage() {
+    final reason = (authService.lastSavedTenantSwitchFailureReason ?? '')
+        .trim()
+        .toLowerCase();
+    if (reason.contains('transient')) {
+      return 'Сервер временно недоступен. Группа осталась в списке, попробуйте позже.';
+    }
+    if (reason.contains('restricted')) {
+      return 'Доступ к этой группе сейчас ограничен. Группа осталась в списке.';
+    }
+    if (reason.contains('auth_rejected')) {
+      return 'Сохранённый вход в эту группу истёк. Добавьте группу заново по приглашению.';
+    }
+    if (reason.contains('missing')) {
+      return 'Сохранённый вход в эту группу не найден. Добавьте группу заново.';
+    }
+    return 'Не удалось переключить группу. Группа осталась в списке, попробуйте ещё раз.';
+  }
+
   String _normalizeTenantCode(Object? value) =>
       value?.toString().trim().toLowerCase() ?? '';
 
@@ -355,8 +374,10 @@ class _ClientGroupsScreenState extends State<ClientGroupsScreen> {
       final ok = await authService.switchToSavedTenantSession(sessionId);
       if (!mounted) return;
       if (!ok) {
-        setState(() => _message = 'Не удалось переключить группу');
+        final message = _switchFailureMessage();
         await _loadSessions();
+        if (!mounted) return;
+        setState(() => _message = message);
         return;
       }
       activeShellSectionNotifier.value = 'groups';

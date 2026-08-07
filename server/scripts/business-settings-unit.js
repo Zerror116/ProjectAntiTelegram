@@ -611,10 +611,15 @@ function testSavedTenantSwitchKeepsSessionsOnTransientFailure() {
     path.resolve(__dirname, "../../lib/services/auth_service.dart"),
     "utf8",
   );
+  const clientGroupsScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/client_groups_screen.dart"),
+    "utf8",
+  );
   const authTests = fs.readFileSync(
     path.resolve(__dirname, "../../test/auth_service_session_switch_test.dart"),
     "utf8",
   );
+  assert.match(authService, /lastSavedTenantSwitchFailureReason/);
   assert.match(authService, /bool get _isAuthRejectedSessionDegradation/);
   assert.match(authService, /saved_tenant_switch_transient_error/);
   assert.match(
@@ -632,6 +637,16 @@ function testSavedTenantSwitchKeepsSessionsOnTransientFailure() {
   assert.match(
     authTests,
     /restricted saved tenant switch keeps target session saved/,
+  );
+  assert.match(authTests, /bootstrap_session_transient_error/);
+  assert.match(authTests, /saved_tenant_switch_restricted/);
+  assert.match(clientGroupsScreen, /_switchFailureMessage\(\)/);
+  assert.match(clientGroupsScreen, /lastSavedTenantSwitchFailureReason/);
+  assert.match(clientGroupsScreen, /Сервер временно недоступен/);
+  assert.match(clientGroupsScreen, /Сохранённый вход в эту группу истёк/);
+  assert.match(
+    clientGroupsScreen,
+    /final message = _switchFailureMessage\(\);[\s\S]{0,120}await _loadSessions\(\);[\s\S]{0,120}_message = message/,
   );
 }
 

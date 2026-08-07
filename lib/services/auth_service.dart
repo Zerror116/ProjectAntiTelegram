@@ -212,9 +212,12 @@ class AuthService {
   String? _pendingPostAuthSyncUserId;
   bool _sessionDegraded = false;
   String? _sessionDegradedReason;
+  String? _lastSavedTenantSwitchFailureReason;
 
   bool get isSessionDegraded => _sessionDegraded;
   String? get sessionDegradedReason => _sessionDegradedReason;
+  String? get lastSavedTenantSwitchFailureReason =>
+      _lastSavedTenantSwitchFailureReason;
 
   String _normalizeTenantCodeScope(String? value) {
     final normalized = (value ?? '').trim().toLowerCase();
@@ -604,14 +607,21 @@ class AuthService {
   }
 
   Future<bool> switchToSavedTenantSession(String sessionId) async {
+    _lastSavedTenantSwitchFailureReason = null;
     final id = sessionId.trim();
-    if (id.isEmpty) return false;
+    if (id.isEmpty) {
+      _lastSavedTenantSwitchFailureReason = 'saved_session_missing';
+      return false;
+    }
     final sessions = await listSavedTenantSessions();
     final found = sessions.firstWhere(
       (row) => (row['id'] ?? '').toString() == id,
       orElse: () => const <String, dynamic>{},
     );
-    if (found.isEmpty) return false;
+    if (found.isEmpty) {
+      _lastSavedTenantSwitchFailureReason = 'saved_session_missing';
+      return false;
+    }
 
     final token = (found['token'] ?? '').toString().trim();
     final refreshToken = (found['refresh_token'] ?? '').toString().trim();
@@ -621,7 +631,10 @@ class AuthService {
     final sessionExpiresAt = _parseStoredDateTime(
       (found['session_expires_at'] ?? '').toString(),
     );
-    if (token.isEmpty) return false;
+    if (token.isEmpty) {
+      _lastSavedTenantSwitchFailureReason = 'saved_session_token_missing';
+      return false;
+    }
 
     final previousToken = await getToken();
     final previousRefreshToken = await getRefreshToken();
@@ -679,6 +692,8 @@ class AuthService {
         forceRefreshIfExpired: true,
       );
       if (!refreshed) {
+        _lastSavedTenantSwitchFailureReason =
+            _sessionDegradedReason ?? 'saved_session_refresh_failed';
         if (_isAuthRejectedSessionDegradation) {
           await removeSavedTenantSession(id);
         }
@@ -713,6 +728,7 @@ class AuthService {
       if (_isAuthRejectedSessionDegradation) {
         await removeSavedTenantSession(id);
       }
+      _lastSavedTenantSwitchFailureReason = 'saved_session_profile_missing';
       await restorePreviousSession();
       return false;
     } on DioException catch (e) {
@@ -721,12 +737,21 @@ class AuthService {
           true,
           reason: 'saved_tenant_switch_transient_error',
         );
+        _lastSavedTenantSwitchFailureReason =
+            'saved_tenant_switch_transient_error';
       } else if (e.response?.statusCode == 401) {
         await removeSavedTenantSession(id);
+        _lastSavedTenantSwitchFailureReason =
+            'saved_tenant_switch_auth_rejected';
+      } else if (e.response?.statusCode == 403) {
+        _lastSavedTenantSwitchFailureReason = 'saved_tenant_switch_restricted';
+      } else {
+        _lastSavedTenantSwitchFailureReason = 'saved_tenant_switch_failed';
       }
       await restorePreviousSession();
       return false;
     } catch (_) {
+      _lastSavedTenantSwitchFailureReason = 'saved_tenant_switch_runtime_error';
       await restorePreviousSession();
       return false;
     }
