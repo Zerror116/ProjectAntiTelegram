@@ -6350,55 +6350,7 @@ Future<void> main() async {
           };
 
       ErrorWidget.builder = (FlutterErrorDetails details) {
-        final exception = details.exception;
-        final stack = details.stack;
-        final errorTheme = themeModeNotifier.value == ThemeMode.dark
-            ? _buildDarkTheme()
-            : _buildLightTheme();
-        return MaterialApp(
-          home: Scaffold(
-            body: Center(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.error_outline,
-                      color: errorTheme.colorScheme.error,
-                      size: 64,
-                    ),
-                    const SizedBox(height: 12),
-                    const Text(
-                      'Произошла ошибка',
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      exception.toString(),
-                      style: TextStyle(color: errorTheme.colorScheme.onSurface),
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      stack?.toString() ?? '',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: errorTheme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          debugShowCheckedModeBanner: false,
-          theme: _buildLightTheme(),
-          darkTheme: _buildDarkTheme(),
-          themeMode: themeModeNotifier.value,
-        );
+        return _buildFlutterErrorFallback(details);
       };
 
       runApp(const DiagnosticBootstrap());
@@ -6427,6 +6379,78 @@ Future<void> main() async {
       } catch (_) {}
     },
   );
+}
+
+Widget _buildFlutterErrorFallback(
+  FlutterErrorDetails details, {
+  bool showDetails = kDebugMode,
+}) {
+  final errorTheme = themeModeNotifier.value == ThemeMode.dark
+      ? _buildDarkTheme()
+      : _buildLightTheme();
+  return MaterialApp(
+    home: Scaffold(
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 520),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.error_outline_rounded,
+                  color: errorTheme.colorScheme.error,
+                  size: 56,
+                ),
+                const SizedBox(height: 14),
+                const Text(
+                  'Произошла ошибка',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Обновите страницу. Если ошибка повторится, сообщите администратору.',
+                  textAlign: TextAlign.center,
+                ),
+                if (showDetails) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    details.exception.toString(),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: errorTheme.colorScheme.onSurface),
+                  ),
+                  if ((details.stack?.toString() ?? '').trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      details.stack.toString(),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: errorTheme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+    debugShowCheckedModeBanner: false,
+    theme: _buildLightTheme(),
+    darkTheme: _buildDarkTheme(),
+    themeMode: themeModeNotifier.value,
+  );
+}
+
+@visibleForTesting
+Widget debugBuildFlutterErrorFallbackForTesting(
+  FlutterErrorDetails details, {
+  required bool showDetails,
+}) {
+  return _buildFlutterErrorFallback(details, showDetails: showDetails);
 }
 
 class _FatalStartupFallback extends StatelessWidget {

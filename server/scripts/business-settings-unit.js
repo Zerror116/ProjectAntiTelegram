@@ -135,6 +135,17 @@ function testMonitoringServiceDoesNotRequireInitializedAuthAtStartup() {
   assert.doesNotMatch(monitoringSource, /authService\.dio/);
 }
 
+function testFlutterErrorFallbackHidesDetailsOutsideDebug() {
+  const mainSource = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/main.dart"),
+    "utf8",
+  );
+  assert.match(mainSource, /Widget _buildFlutterErrorFallback\(/);
+  assert.match(mainSource, /bool showDetails = kDebugMode/);
+  assert.match(mainSource, /if \(showDetails\)/);
+  assert.match(mainSource, /debugBuildFlutterErrorFallbackForTesting/);
+}
+
 function testWorkflowPayloadCompatibility() {
   const settings = normalizeTenantFeatureSettings({
     workflow_settings: {
@@ -1362,6 +1373,7 @@ testCityListPersistence();
 testTopLevelAndNestedFlags();
 testProductionBuildsEnableClientMonitoring();
 testMonitoringServiceDoesNotRequireInitializedAuthAtStartup();
+testFlutterErrorFallbackHidesDetailsOutsideDebug();
 testWorkflowPayloadCompatibility();
 testTenantScopedEmailMigration();
 testInviteJoinUsesTenantScopedEmailLookup();
