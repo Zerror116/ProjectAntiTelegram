@@ -656,7 +656,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
           ),
           const SizedBox(height: 6),
           Text(
-            'Код группы: ${referral.inviteCode}${referral.tenantCode.trim().isNotEmpty ? ' • tenant ${referral.tenantCode.trim()}' : ''}',
+            'Код приглашения: ${referral.inviteCode}${referral.tenantCode.trim().isNotEmpty ? ' • группа ${referral.tenantCode.trim()}' : ''}',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
