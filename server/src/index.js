@@ -1158,11 +1158,14 @@ async function resolveChatActivityContext(user, chatId) {
               return;
             }
 
-            // ✅ ИСПРАВЛЕНИЕ: Сначала выйди из всех чатов, потом присоединись к новому
-            // Получи текущие комнаты сокета
+            const chatRoom = `chat:${chatId}`;
             const currentRooms = socket.rooms;
 
-            // Выйди из всех chat:* комнат
+            if (currentRooms.has(chatRoom)) {
+              realtimeDiagnostics.markJoinSuccess(Date.now() - joinStartedAt);
+              return;
+            }
+
             for (const room of currentRooms) {
               if (room.startsWith("chat:")) {
                 socket.leave(room);
@@ -1170,10 +1173,9 @@ async function resolveChatActivityContext(user, chatId) {
               }
             }
 
-            // Присоединись к новой комнате
-            socket.join(`chat:${chatId}`);
+            socket.join(chatRoom);
             realtimeDiagnostics.markJoinSuccess(Date.now() - joinStartedAt);
-            console.log(`Socket ${sid} joined chat:${chatId}`);
+            console.log(`Socket ${sid} joined ${chatRoom}`);
           });
         } catch (err) {
           realtimeDiagnostics.markJoinDenied();
@@ -1188,8 +1190,10 @@ async function resolveChatActivityContext(user, chatId) {
             console.warn(`Socket ${sid}: leave_chat called with empty chatId`);
             return;
           }
-          socket.leave(`chat:${chatId}`);
-          console.log(`Socket ${sid} left chat:${chatId}`);
+          const chatRoom = `chat:${chatId}`;
+          if (!socket.rooms.has(chatRoom)) return;
+          socket.leave(chatRoom);
+          console.log(`Socket ${sid} left ${chatRoom}`);
         } catch (err) {
           console.error(`Socket ${sid} leave_chat error:`, err);
         }

@@ -390,6 +390,41 @@ function testSocketRecoveryAlwaysReauthenticatesTenantScope() {
   );
 }
 
+function testSocketChatRoomJoinLeaveAreIdempotent() {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "../src/index.js"),
+    "utf8",
+  );
+  const joinStart = source.indexOf('socket.on("join_chat"');
+  const leaveStart = source.indexOf('socket.on("leave_chat"');
+  const relayStart = source.indexOf("const relayChatActivity");
+  assert.ok(joinStart > 0, "join_chat handler must exist");
+  assert.ok(leaveStart > joinStart, "leave_chat handler must follow join_chat");
+  assert.ok(relayStart > leaveStart, "relayChatActivity must follow leave_chat");
+
+  const joinHandler = source.slice(joinStart, leaveStart);
+  const leaveHandler = source.slice(leaveStart, relayStart);
+  assert.match(joinHandler, /const chatRoom = `chat:\$\{chatId\}`;/);
+  assert.match(
+    joinHandler,
+    /if \(currentRooms\.has\(chatRoom\)\) \{[\s\S]{0,220}realtimeDiagnostics\.markJoinSuccess/,
+  );
+  assert.ok(
+    joinHandler.indexOf("currentRooms.has(chatRoom)") <
+      joinHandler.indexOf("socket.join(chatRoom)"),
+    "repeat join_chat for the active chat must be a no-op before socket.join",
+  );
+  assert.doesNotMatch(joinHandler, /socket\.join\(`chat:\$\{chatId\}`\)/);
+
+  assert.match(leaveHandler, /const chatRoom = `chat:\$\{chatId\}`;/);
+  assert.match(leaveHandler, /if \(!socket\.rooms\.has\(chatRoom\)\) return;/);
+  assert.ok(
+    leaveHandler.indexOf("socket.rooms.has(chatRoom)") <
+      leaveHandler.indexOf("socket.leave(chatRoom)"),
+    "leave_chat must only leave rooms the socket currently joined",
+  );
+}
+
 function testFlutterSocketReconnectsWithFreshAuthToken() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../../lib/main.dart"),
@@ -1513,6 +1548,7 @@ testLegacyBootstrapScansTenantSessionScopes();
 testRefreshHydratesLegacyTenantNullUsers();
 testAuthMiddlewareHydratesLegacyTenantNullUsers();
 testSocketRecoveryAlwaysReauthenticatesTenantScope();
+testSocketChatRoomJoinLeaveAreIdempotent();
 testFlutterSocketReconnectsWithFreshAuthToken();
 testNotificationInboxDedupeIsAtomic();
 testManualRevisionUsesManualShelfKeys();
