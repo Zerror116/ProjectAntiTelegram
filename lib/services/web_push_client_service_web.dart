@@ -10,12 +10,17 @@ import 'package:flutter/foundation.dart';
 
 import 'web_notification_service.dart';
 import 'web_push_client_service.dart';
-
-const _rootWorkerUrl = '/flutter_service_worker.js';
+import 'web_service_worker_version.dart';
 
 void _logWebPush(String message) {
   if (!kDebugMode) return;
   print(message);
+}
+
+String _currentWorkerUrl() {
+  final buildVersion =
+      html.window.localStorage[phoenixWebBuildVersionStorageKey] ?? '';
+  return buildVersionedPhoenixServiceWorkerUrl(buildVersion);
 }
 
 bool isSupported() {
@@ -104,7 +109,7 @@ Future<dynamic> _callPushHelper(
 Future<bool> _serviceWorkerScriptAvailable() async {
   try {
     final request = await html.HttpRequest.request(
-      _rootWorkerUrl,
+      phoenixRootServiceWorkerUrl,
       method: 'HEAD',
       requestHeaders: const {'Cache-Control': 'no-cache'},
     ).timeout(const Duration(seconds: 2));
@@ -123,16 +128,18 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
     return null;
   }
 
+  final workerUrl = _currentWorkerUrl();
+  html.ServiceWorkerRegistration? existingRegistration;
   try {
     final dynamic existing = await sw.getRegistration();
     if (existing != null) {
-      final registration = existing as html.ServiceWorkerRegistration;
+      existingRegistration = existing as html.ServiceWorkerRegistration;
       _logWebPush(
-        '[web-push] _getRegistration: existing scope=${registration.scope}',
+        '[web-push] _getRegistration: existing scope=${existingRegistration.scope}',
       );
-      return _waitForRegistrationActivation(registration);
+    } else {
+      _logWebPush('[web-push] _getRegistration: existing=false');
     }
-    _logWebPush('[web-push] _getRegistration: existing=false');
   } catch (e) {
     _logWebPush('[web-push] _getRegistration: getRegistration error=$e');
   }
@@ -140,16 +147,18 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
   try {
     if (!await _serviceWorkerScriptAvailable()) {
       _logWebPush('[web-push] _getRegistration: worker script missing');
-      return null;
+      if (existingRegistration == null) return null;
+      return await _waitForRegistrationActivation(existingRegistration);
     }
-    final registration = await sw.register(_rootWorkerUrl);
+    final registration = await sw.register(workerUrl);
     _logWebPush(
       '[web-push] _getRegistration: registered scope=${registration.scope}',
     );
     return _waitForRegistrationActivation(registration);
   } catch (e) {
     _logWebPush('[web-push] _getRegistration: register error=$e');
-    return null;
+    if (existingRegistration == null) return null;
+    return await _waitForRegistrationActivation(existingRegistration);
   }
 }
 
@@ -179,7 +188,9 @@ Future<html.ServiceWorkerRegistration> _waitForRegistrationActivation(
 
   final worker = registration.installing ?? registration.waiting ?? active;
   final state = worker?.state ?? 'none';
-  _logWebPush('[web-push] _waitForRegistrationActivation: fallback state=$state');
+  _logWebPush(
+    '[web-push] _waitForRegistrationActivation: fallback state=$state',
+  );
   return registration;
 }
 

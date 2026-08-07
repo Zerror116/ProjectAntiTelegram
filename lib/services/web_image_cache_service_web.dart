@@ -5,7 +5,8 @@
 import 'dart:async';
 import 'dart:html' as html;
 
-const _rootWorkerUrl = '/flutter_service_worker.js';
+import 'web_service_worker_version.dart';
+
 const _maxRememberedPrimedUrls = 240;
 const _maxBatchSize = 12;
 const _flushDelay = Duration(milliseconds: 140);
@@ -16,10 +17,16 @@ final List<String> _rememberedPrimedOrder = <String>[];
 Timer? _flushTimer;
 bool _flushInFlight = false;
 
+String _currentWorkerUrl() {
+  final buildVersion =
+      html.window.localStorage[phoenixWebBuildVersionStorageKey] ?? '';
+  return buildVersionedPhoenixServiceWorkerUrl(buildVersion);
+}
+
 Future<bool> _serviceWorkerScriptAvailable() async {
   try {
     final request = await html.HttpRequest.request(
-      _rootWorkerUrl,
+      phoenixRootServiceWorkerUrl,
       method: 'HEAD',
       requestHeaders: const {'Cache-Control': 'no-cache'},
     ).timeout(const Duration(seconds: 2));
@@ -33,17 +40,21 @@ Future<bool> _serviceWorkerScriptAvailable() async {
 Future<html.ServiceWorkerRegistration?> _ensureImageWorkerRegistration() async {
   final sw = html.window.navigator.serviceWorker;
   if (sw == null) return null;
+  final workerUrl = _currentWorkerUrl();
+  html.ServiceWorkerRegistration? existingRegistration;
   try {
     final dynamic existing = await sw.getRegistration();
-    if (existing != null) return existing;
+    if (existing != null) {
+      existingRegistration = existing as html.ServiceWorkerRegistration;
+    }
   } catch (_) {
     // ignore
   }
   try {
-    if (!await _serviceWorkerScriptAvailable()) return null;
-    return await sw.register(_rootWorkerUrl);
+    if (!await _serviceWorkerScriptAvailable()) return existingRegistration;
+    return await sw.register(workerUrl);
   } catch (_) {
-    return null;
+    return existingRegistration;
   }
 }
 
@@ -91,7 +102,9 @@ Future<void> _flushQueuedImageUrls() async {
     }
 
     while (_queuedImageUrls.isNotEmpty) {
-      final batch = _queuedImageUrls.take(_maxBatchSize).toList(growable: false);
+      final batch = _queuedImageUrls
+          .take(_maxBatchSize)
+          .toList(growable: false);
       for (final url in batch) {
         _queuedImageUrls.remove(url);
       }

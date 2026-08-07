@@ -26,6 +26,17 @@
     return workerScriptAvailable;
   }
 
+  function currentWorkerUrl() {
+    let workerUrl = '/flutter_service_worker.js';
+    try {
+      const buildVersion = (localStorage.getItem('projectphoenix-web-build-version') || '').trim();
+      if (buildVersion) {
+        workerUrl = `${workerUrl}?v=${encodeURIComponent(buildVersion)}`;
+      }
+    } catch (_) {}
+    return workerUrl;
+  }
+
   async function ensureRegistration() {
     if (!('serviceWorker' in navigator)) {
       return null;
@@ -34,20 +45,21 @@
     if (!existing && !(await hasWorkerScript())) {
       return null;
     }
-    if (existing && typeof existing.update === 'function') {
-      await existing.update().catch(() => {});
-    }
-    let workerUrl = '/flutter_service_worker.js';
     try {
-      const buildVersion = (localStorage.getItem('projectphoenix-web-build-version') || '').trim();
-      if (buildVersion) {
-        workerUrl = `${workerUrl}?v=${encodeURIComponent(buildVersion)}`;
+      const registration = await navigator.serviceWorker.register(currentWorkerUrl(), { scope: '/' });
+      if (registration && typeof registration.update === 'function') {
+        await registration.update().catch(() => {});
       }
-    } catch (_) {}
-    const registration =
-      existing || (await navigator.serviceWorker.register(workerUrl, { scope: '/' }));
-    await navigator.serviceWorker.ready;
-    return registration;
+      await navigator.serviceWorker.ready;
+      return registration;
+    } catch (_) {
+      if (!existing) return null;
+      if (typeof existing.update === 'function') {
+        await existing.update().catch(() => {});
+      }
+      await navigator.serviceWorker.ready;
+      return existing;
+    }
   }
 
   async function getSubscriptionJson() {

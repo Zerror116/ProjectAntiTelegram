@@ -1320,6 +1320,45 @@ function testFullDeployStampsWebBuildVersion() {
   assert.match(deployFull, /WEB_DEPLOYED_AT/);
 }
 
+function testWebServiceWorkerRegistrationUsesBuildVersion() {
+  const versionHelper = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/web_service_worker_version.dart"),
+    "utf8",
+  );
+  assert.match(versionHelper, /projectphoenix-web-build-version/);
+  assert.match(versionHelper, /phoenixRootServiceWorkerUrl = '\/flutter_service_worker\.js'/);
+  assert.match(versionHelper, /Uri\.encodeComponent\(token\)/);
+
+  const webPushService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/web_push_client_service_web.dart"),
+    "utf8",
+  );
+  const webImageCacheService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/web_image_cache_service_web.dart"),
+    "utf8",
+  );
+  for (const source of [webPushService, webImageCacheService]) {
+    assert.match(source, /web_service_worker_version\.dart/);
+    assert.match(source, /html\.window\.localStorage\[phoenixWebBuildVersionStorageKey\]/);
+    assert.match(source, /buildVersionedPhoenixServiceWorkerUrl\(buildVersion\)/);
+    assert.match(source, /sw\.register\(workerUrl\)/);
+    assert.doesNotMatch(source, /const _rootWorkerUrl = '\/flutter_service_worker\.js'/);
+    assert.doesNotMatch(source, /sw\.register\(_rootWorkerUrl\)/);
+  }
+
+  const pushHelper = fs.readFileSync(
+    path.resolve(__dirname, "../../web/push_client_helper.js"),
+    "utf8",
+  );
+  assert.match(pushHelper, /function currentWorkerUrl\(\)/);
+  assert.match(pushHelper, /projectphoenix-web-build-version/);
+  assert.match(pushHelper, /navigator\.serviceWorker\.register\(currentWorkerUrl\(\), \{ scope: '\/' \}\)/);
+  assert.doesNotMatch(
+    pushHelper,
+    /existing\s*\|\|\s*\(await navigator\.serviceWorker\.register/,
+  );
+}
+
 function testAndroidReleaseUsesProductionDownloadsRoot() {
   const files = [
     path.resolve(__dirname, "../../scripts/deploy_full.sh"),
@@ -1442,6 +1481,7 @@ testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testPhoneAccessDoesNotExposeFirstOwnerIdentity();
 testAuthHydrationClearsMissingPhoneAccessState();
 testFullDeployStampsWebBuildVersion();
+testWebServiceWorkerRegistrationUsesBuildVersion();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();
