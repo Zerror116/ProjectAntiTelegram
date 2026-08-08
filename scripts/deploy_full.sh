@@ -13,6 +13,8 @@ REMOTE_SERVICE="${REMOTE_SERVICE:-auto}"
 BUILD_ARGS="${BUILD_ARGS:---release --no-wasm-dry-run --dart-define=PHX_MONITORING_ENABLED=true}"
 RUN_ANALYZE="${RUN_ANALYZE:-1}"
 RUN_HEALTH_CHECK="${RUN_HEALTH_CHECK:-1}"
+HEALTH_CHECK_ATTEMPTS="${HEALTH_CHECK_ATTEMPTS:-4}"
+HEALTH_CHECK_RETRY_DELAY_SECONDS="${HEALTH_CHECK_RETRY_DELAY_SECONDS:-5}"
 RUN_TENANT_MAINTENANCE="${RUN_TENANT_MAINTENANCE:-1}"
 HEALTH_DOMAIN="${HEALTH_DOMAIN:-garphoenix.com}"
 APK_DEFAULT_FILE_NAME="${APK_DEFAULT_FILE_NAME:-}"
@@ -47,6 +49,8 @@ Important env vars:
   BRANCH=master
   REMOTE_SERVICE=auto              # or explicit, e.g. fenix-api.service
   RUN_ANALYZE=1                    # set 0 to skip flutter analyze
+  HEALTH_CHECK_ATTEMPTS=4          # retry final production smoke after backend restart
+  HEALTH_CHECK_RETRY_DELAY_SECONDS=5
   RUN_TENANT_MAINTENANCE=1         # run tenant migrations and user-index sync
   UPLOAD_APK=1                     # set 0 to skip APK upload when APK did not change
   APK_DEFAULT_FILE_NAME=fenix-<app-version>.apk
@@ -126,6 +130,39 @@ report_remote_release_check() {
   details_base64="$(printf '%s' "$details_json" | base64 | tr -d '\n')"
   run_ssh "$SERVER" \
     "cd '$REMOTE_PROJECT_DIR' && node server/scripts/report_release_health.js --scope '$scope' --status '$status' --title '$title' --target '$target' --version '${APP_VERSION_NAME:-}' --build '${APP_BUILD_NUMBER:-}' --summary '$summary' --details-base64 '$details_base64'" >/dev/null 2>&1 || true
+}
+
+run_prod_health_check_with_retry() {
+  local attempts="$HEALTH_CHECK_ATTEMPTS"
+  local delay_seconds="$HEALTH_CHECK_RETRY_DELAY_SECONDS"
+  if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [[ "$attempts" -lt 1 ]]; then
+    attempts="1"
+  fi
+  if ! [[ "$delay_seconds" =~ ^[0-9]+$ ]]; then
+    delay_seconds="0"
+  fi
+
+  local attempt output status
+  HEALTH_OUTPUT=""
+  HEALTH_STATUS=1
+  for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+    echo "[deploy_full] health check attempt $attempt/$attempts"
+    if output="$(bash "$SCRIPT_DIR/prod_health_check.sh" "$HEALTH_DOMAIN" 2>&1)"; then
+      HEALTH_OUTPUT="$output"
+      HEALTH_STATUS=0
+      printf '%s\n' "$HEALTH_OUTPUT"
+      return 0
+    fi
+    status=$?
+    HEALTH_STATUS="$status"
+    HEALTH_OUTPUT="$output"
+    printf '%s\n' "$HEALTH_OUTPUT"
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      echo "[deploy_full] health check failed with $status, retrying in ${delay_seconds}s..."
+      sleep "$delay_seconds"
+    fi
+  done
+  return "$HEALTH_STATUS"
 }
 
 echo "[deploy_full] project: $PROJECT_ROOT"
@@ -500,8 +537,7 @@ REMOTE_SCRIPT
 echo "[deploy_full] done"
 if [[ "$RUN_HEALTH_CHECK" == "1" ]]; then
   echo "[deploy_full] running production health check for $HEALTH_DOMAIN"
-  if HEALTH_OUTPUT="$(bash "$SCRIPT_DIR/prod_health_check.sh" "$HEALTH_DOMAIN" 2>&1)"; then
-    printf '%s\n' "$HEALTH_OUTPUT"
+  if run_prod_health_check_with_retry; then
     report_remote_release_check \
       "after_deploy_smoke" \
       "pass" \
@@ -510,8 +546,6 @@ if [[ "$RUN_HEALTH_CHECK" == "1" ]]; then
       "deploy smoke ok" \
       "{\"domain\":\"$HEALTH_DOMAIN\",\"branch\":\"$BRANCH\",\"app_version\":\"${APP_VERSION_NAME:-}\",\"app_build\":\"${APP_BUILD_NUMBER:-}\",\"health_output\":$(printf '%s' "$HEALTH_OUTPUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
   else
-    HEALTH_STATUS=$?
-    printf '%s\n' "$HEALTH_OUTPUT"
     report_remote_release_check \
       "after_deploy_smoke" \
       "fail" \

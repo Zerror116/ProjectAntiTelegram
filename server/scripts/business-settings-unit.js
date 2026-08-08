@@ -1108,6 +1108,26 @@ function testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates() {
   );
 }
 
+function testDeployFullRetriesFinalHealthCheck() {
+  const deployFull = fs.readFileSync(
+    path.resolve(__dirname, "../../scripts/deploy_full.sh"),
+    "utf8",
+  );
+  assert.match(deployFull, /HEALTH_CHECK_ATTEMPTS="\$\{HEALTH_CHECK_ATTEMPTS:-4\}"/);
+  assert.match(
+    deployFull,
+    /HEALTH_CHECK_RETRY_DELAY_SECONDS="\$\{HEALTH_CHECK_RETRY_DELAY_SECONDS:-5\}"/,
+  );
+  assert.match(deployFull, /run_prod_health_check_with_retry\(\)/);
+  assert.match(deployFull, /for \(\(attempt = 1; attempt <= attempts; attempt \+= 1\)\)/);
+  assert.match(deployFull, /health check failed with \$status, retrying in/);
+  assert.match(deployFull, /if run_prod_health_check_with_retry; then/);
+  assert.doesNotMatch(
+    deployFull,
+    /if HEALTH_OUTPUT="\$\(bash "\$SCRIPT_DIR\/prod_health_check\.sh" "\$HEALTH_DOMAIN" 2>&1\)"; then/,
+  );
+}
+
 function testGithubActionsHealthCheckExplainsRunnerStartupFailures() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/github_actions_health_check.js"),
@@ -1623,6 +1643,7 @@ testNightlyAuditChecksProductCartIntegrityProjectWide();
 testNightlyAuditChecksPublicationPipelineProjectWide();
 testNightlyAuditChecksChatRecencyProjectWide();
 testReleaseAuditRunsBeforeDeployAndIncludesBusinessGates();
+testDeployFullRetriesFinalHealthCheck();
 testGithubActionsHealthCheckExplainsRunnerStartupFailures();
 testGithubCiRunsReleaseGuards();
 testGithubWorkflowSecretsAreCheckedInsideSteps();
