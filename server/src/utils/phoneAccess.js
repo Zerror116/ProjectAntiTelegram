@@ -179,6 +179,142 @@ async function createPhoneAccessRequest(
   return insertQ.rows[0] || null;
 }
 
+async function cancelPhoneAccessRequestsForRequester(
+  queryable,
+  {
+    tenantId = null,
+    requesterUserId = '',
+    exceptPhoneDigits = '',
+    note = 'cancelled: phone changed',
+  } = {},
+) {
+  const requesterId = String(requesterUserId || '').trim();
+  const normalizedPhone = normalizePhoneDigits(exceptPhoneDigits);
+  if (!requesterId) return 0;
+
+  const updateQ = await queryable.query(
+    `UPDATE phone_registration_requests
+     SET status = 'cancelled',
+         decided_at = COALESCE(decided_at, now()),
+         decided_by = NULL,
+         note = NULLIF(BTRIM($4::text), '')
+     WHERE requester_user_id = $1
+       AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
+       AND status IN ('pending', 'approved', 'rejected')
+       AND ($3::text = '' OR phone <> $3::text)`,
+    [
+      requesterId,
+      tenantId || null,
+      normalizedPhone.length >= 10 ? normalizedPhone : '',
+      String(note || '').slice(0, 500),
+    ],
+  );
+  return updateQ.rowCount || 0;
+}
+
+async function syncPhoneAccessAfterPhoneChange(
+  queryable,
+  {
+    tenantId = null,
+    requesterUserId = '',
+    phoneDigits = '',
+    approvalEnabled = false,
+  } = {},
+) {
+  const requesterId = String(requesterUserId || '').trim();
+  const normalizedPhone = normalizePhoneDigits(phoneDigits);
+  if (!tenantId || !requesterId || normalizedPhone.length < 10) {
+    return {
+      state: 'none',
+      request: null,
+      duplicateOwner: null,
+      cancelled: 0,
+    };
+  }
+
+  let cancelled = await cancelPhoneAccessRequestsForRequester(queryable, {
+    tenantId,
+    requesterUserId: requesterId,
+    exceptPhoneDigits: normalizedPhone,
+    note: 'cancelled: phone changed',
+  });
+
+  if (!approvalEnabled) {
+    cancelled += await cancelPhoneAccessRequestsForRequester(queryable, {
+      tenantId,
+      requesterUserId: requesterId,
+      note: 'cancelled: phone access disabled',
+    });
+    return {
+      state: 'none',
+      request: null,
+      duplicateOwner: null,
+      cancelled,
+    };
+  }
+
+  const duplicateOwner = await findOldestPhoneOwner(queryable, {
+    tenantId,
+    phoneDigits: normalizedPhone,
+    excludeUserId: requesterId,
+  });
+  if (!duplicateOwner) {
+    cancelled += await cancelPhoneAccessRequestsForRequester(queryable, {
+      tenantId,
+      requesterUserId: requesterId,
+      note: 'cancelled: no duplicate phone owner',
+    });
+    return {
+      state: 'none',
+      request: null,
+      duplicateOwner: null,
+      cancelled,
+    };
+  }
+
+  const approvedQ = await queryable.query(
+    `SELECT id,
+            tenant_id,
+            phone,
+            owner_user_id,
+            requester_user_id,
+            status,
+            requested_at,
+            decided_at,
+            decided_by
+     FROM phone_registration_requests
+     WHERE tenant_id = $1
+       AND owner_user_id = $2
+       AND requester_user_id = $3
+       AND phone = $4
+       AND status = 'approved'
+     ORDER BY decided_at DESC NULLS LAST, requested_at DESC
+     LIMIT 1`,
+    [tenantId, duplicateOwner.id, requesterId, normalizedPhone],
+  );
+  if (approvedQ.rowCount > 0) {
+    return {
+      state: 'approved',
+      request: approvedQ.rows[0],
+      duplicateOwner,
+      cancelled,
+    };
+  }
+
+  const request = await createPhoneAccessRequest(queryable, {
+    tenantId,
+    phoneDigits: normalizedPhone,
+    ownerUserId: duplicateOwner.id,
+    requesterUserId: requesterId,
+  });
+  return {
+    state: request?.status || 'none',
+    request,
+    duplicateOwner,
+    cancelled,
+  };
+}
+
 async function resolvePhoneAccessState(
   queryable,
   { requesterUserId = '', tenantId = null } = {},
@@ -189,7 +325,15 @@ async function resolvePhoneAccessState(
   }
 
   const stateQ = await queryable.query(
-    `SELECT r.id,
+    `WITH requester_phone AS (
+       SELECT regexp_replace(COALESCE(p.phone, ''), '[^0-9]', '', 'g') AS phone
+       FROM phones p
+       WHERE p.user_id = $1
+         AND NULLIF(BTRIM(p.phone), '') IS NOT NULL
+       ORDER BY p.created_at DESC
+       LIMIT 1
+     )
+     SELECT r.id,
             r.tenant_id,
             r.phone,
             r.owner_user_id,
@@ -200,15 +344,13 @@ async function resolvePhoneAccessState(
             r.decided_by,
             r.owner_user_id IS NOT NULL AS has_owner
      FROM phone_registration_requests r
+     JOIN requester_phone rp ON rp.phone = r.phone
      WHERE r.requester_user_id = $1
        AND ($2::uuid IS NULL OR r.tenant_id = $2::uuid)
-     ORDER BY CASE r.status
-                WHEN 'pending' THEN 0
-                WHEN 'approved' THEN 1
-                WHEN 'rejected' THEN 2
-                ELSE 3
-              END,
-              r.requested_at DESC
+       AND r.status <> 'cancelled'
+     ORDER BY CASE WHEN r.status = 'pending' THEN 0 ELSE 1 END,
+              r.requested_at DESC,
+              r.decided_at DESC NULLS LAST
      LIMIT 1`,
     [requesterId, tenantId || null],
   );
@@ -295,9 +437,13 @@ async function listPendingPhoneAccessRequestsForOwner(
             requester.email AS requester_email
      FROM phone_registration_requests r
      JOIN users requester ON requester.id = r.requester_user_id
+     JOIN phones requester_phone
+       ON requester_phone.user_id = requester.id
+      AND regexp_replace(COALESCE(requester_phone.phone, ''), '[^0-9]', '', 'g') = r.phone
      WHERE r.owner_user_id = $1
        AND r.status = 'pending'
        AND ($2::uuid IS NULL OR r.tenant_id = $2::uuid)
+       AND COALESCE(requester.is_active, true) = true
      ORDER BY r.requested_at DESC`,
     [ownerId, tenantId || null],
   );
@@ -378,6 +524,8 @@ module.exports = {
   normalizeDecision,
   findOldestPhoneOwner,
   createPhoneAccessRequest,
+  cancelPhoneAccessRequestsForRequester,
+  syncPhoneAccessAfterPhoneChange,
   rebalancePendingPhoneRequestOwners,
   resolvePhoneAccessState,
   resolveSharedCartOwnerId,

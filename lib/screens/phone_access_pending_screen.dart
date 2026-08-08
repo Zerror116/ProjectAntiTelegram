@@ -45,6 +45,10 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
     Navigator.of(context).pushNamedAndRemoveUntil('/auth', (route) => false);
   }
 
+  void _changePhone() {
+    Navigator.of(context).pushNamed('/phone_name');
+  }
+
   Future<void> _refreshStatus({bool silent = false}) async {
     if (_busy) return;
     _busy = true;
@@ -146,6 +150,15 @@ class _PhoneAccessPendingScreenState extends State<PhoneAccessPendingScreen> {
                       const LinearProgressIndicator(minHeight: 3),
                     ],
                     const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: _loading ? null : _changePhone,
+                        icon: const Icon(Icons.edit),
+                        label: const Text('Сменить номер'),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
                     Row(
                       children: [
                         Expanded(

@@ -4,94 +4,145 @@ const router = express.Router();
 const db = require('../db'); // pg client instance
 const bcrypt = require('bcryptjs');
 const { authMiddleware: requireAuth, requireAdmin } = require('../utils/auth');
+const { getTenantFeatureSettings } = require('../utils/tenantFeatureSettings');
+const {
+  normalizePhoneDigits,
+  syncPhoneAccessAfterPhoneChange,
+} = require('../utils/phoneAccess');
+
+async function isPhoneAccessApprovalEnabledForTenant(tenantId) {
+  const normalizedTenantId = String(tenantId || '').trim();
+  if (!normalizedTenantId) return false;
+  const settings = await getTenantFeatureSettings(normalizedTenantId);
+  return settings.phone_access_approval_enabled !== false &&
+    settings.client?.phone_access_approval_enabled !== false;
+}
+
+async function saveUserPhone(queryable, userId, normalizedPhone) {
+  const upd = await queryable.query(
+    `UPDATE phones
+     SET phone = $1, status = 'pending_verification', created_at = now()
+     WHERE user_id = $2
+     RETURNING id, phone, status`,
+    [normalizedPhone, userId],
+  );
+
+  if (upd.rowCount > 0) {
+    return {
+      row: upd.rows[0],
+      message: 'Phone updated as pending verification',
+    };
+  }
+
+  const insert = await queryable.query(
+    `INSERT INTO phones (user_id, phone, status, created_at)
+     VALUES ($1, $2, 'pending_verification', now())
+     RETURNING id, phone, status`,
+    [userId, normalizedPhone],
+  );
+
+  return {
+    row: insert.rows[0],
+    message: 'Phone saved as pending verification',
+  };
+}
+
+async function syncPhoneAccessForRequest(queryable, req, normalizedPhone) {
+  const tenantId = String(req.user?.tenant_id || '').trim();
+  if (!tenantId) {
+    return { state: 'none', request: null, cancelled: 0 };
+  }
+  const approvalEnabled = await isPhoneAccessApprovalEnabledForTenant(tenantId);
+  return await syncPhoneAccessAfterPhoneChange(queryable, {
+    tenantId,
+    requesterUserId: req.user?.id || null,
+    phoneDigits: normalizedPhone,
+    approvalEnabled,
+  });
+}
 
 // Клиент: отправляет номер после регистрации
 router.post('/request', requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
   try {
     const userId = req.user.id;
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone required' });
 
     // Нормализуем номер: оставляем только цифры
-    const normalized = String(phone).replace(/\D/g, '');
+    const normalized = normalizePhoneDigits(phone);
     if (normalized.length < 10) return res.status(400).json({ error: 'Invalid phone format' });
 
-    // Сначала пробуем обновить существующую запись
-    const upd = await db.query(
-      `UPDATE phones
-       SET phone = $1, status = 'pending_verification', created_at = now()
-       WHERE user_id = $2
-       RETURNING id, phone, status`,
-      [normalized, userId]
-    );
+    await client.query('BEGIN');
+    const saved = await saveUserPhone(client, userId, normalized);
+    const phoneAccess = await syncPhoneAccessForRequest(client, req, normalized);
+    await client.query('COMMIT');
 
-    if (upd.rowCount > 0) {
-      const phoneRow = upd.rows[0];
-      return res.json({ ok: true, message: 'Phone updated as pending verification', phone: phoneRow });
-    }
-
-    // Если не было обновления — вставляем новую запись
-    const insert = await db.query(
-      `INSERT INTO phones (user_id, phone, status, created_at)
-       VALUES ($1, $2, 'pending_verification', now())
-       RETURNING id, phone, status`,
-      [userId, normalized]
-    );
-
-    const phoneRow = insert.rows[0];
-    return res.json({ ok: true, message: 'Phone saved as pending verification', phone: phoneRow });
+    return res.json({
+      ok: true,
+      message: saved.message,
+      phone: saved.row,
+      phone_access_state: phoneAccess.state || 'none',
+      phone_access_request_id: phoneAccess.request?.id || null,
+    });
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
     console.error('phones.request error', err);
     return res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
 // Клиент: смена номера (требует подтверждения пароля)
 router.post('/change', requireAuth, async (req, res) => {
+  const client = await db.pool.connect();
   try {
     const userId = req.user.id;
     const { password, phone } = req.body;
     if (!password || !phone) return res.status(400).json({ error: 'password and phone required' });
 
     // Получаем хеш пароля пользователя
-    const userRes = await db.query('SELECT password_hash FROM users WHERE id=$1', [userId]);
+    const userRes = await client.query('SELECT password_hash FROM users WHERE id=$1', [userId]);
     if (!userRes.rowCount) return res.status(404).json({ error: 'User not found' });
-    const passwordHash = userRes.rows[0].password_hash;
+    const passwordHash = String(userRes.rows[0].password_hash || '');
 
-    const match = await bcrypt.compare(password, passwordHash);
+    let match = false;
+    if (passwordHash) {
+      try {
+        match = await bcrypt.compare(password, passwordHash);
+      } catch (_) {
+        match = false;
+      }
+    }
     if (!match) return res.status(403).json({ error: 'Invalid password' });
 
     // Нормализуем телефон
-    const normalized = String(phone).replace(/\D/g, '');
+    const normalized = normalizePhoneDigits(phone);
     if (normalized.length < 10) return res.status(400).json({ error: 'Invalid phone format' });
 
-    // Сначала пробуем обновить существующую запись
-    const upd = await db.query(
-      `UPDATE phones
-       SET phone = $1, status = 'pending_verification', created_at = now()
-       WHERE user_id = $2
-       RETURNING id, phone, status`,
-      [normalized, userId]
-    );
+    await client.query('BEGIN');
+    const saved = await saveUserPhone(client, userId, normalized);
+    const phoneAccess = await syncPhoneAccessForRequest(client, req, normalized);
+    await client.query('COMMIT');
 
-    if (upd.rowCount > 0) {
-      const phoneRow = upd.rows[0];
-      return res.json({ ok: true, message: 'Phone updated as pending verification', phone: phoneRow });
-    }
-
-    // Если не было обновления — вставляем новую запись
-    const insert = await db.query(
-      `INSERT INTO phones (user_id, phone, status, created_at)
-       VALUES ($1, $2, 'pending_verification', now())
-       RETURNING id, phone, status`,
-      [userId, normalized]
-    );
-
-    const phoneRow = insert.rows[0];
-    return res.json({ ok: true, message: 'Phone change requested', phone: phoneRow });
+    return res.json({
+      ok: true,
+      message: saved.message || 'Phone change requested',
+      phone: saved.row,
+      phone_access_state: phoneAccess.state || 'none',
+      phone_access_request_id: phoneAccess.request?.id || null,
+    });
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
     console.error('phones.change error', err);
     return res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 

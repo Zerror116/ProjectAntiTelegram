@@ -1422,6 +1422,44 @@ function testAuthHydrationClearsMissingPhoneAccessState() {
   );
 }
 
+function testPhoneAccessRestrictedUsersCanChangePhoneProjectWide() {
+  const authUtil = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/auth.js"),
+    "utf8",
+  );
+  const phonesRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/phones.js"),
+    "utf8",
+  );
+  const phoneAccessUtil = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/phoneAccess.js"),
+    "utf8",
+  );
+  const pendingScreen = fs.readFileSync(
+    path.resolve(
+      __dirname,
+      "../../lib/screens/phone_access_pending_screen.dart",
+    ),
+    "utf8",
+  );
+
+  assert.match(authUtil, /fullPath === '\/api\/phones\/request'/);
+  assert.match(authUtil, /fullPath === '\/api\/phones\/change'/);
+  assert.match(authUtil, /fullPath === '\/api\/profile\/update'/);
+  assert.match(phonesRoute, /syncPhoneAccessAfterPhoneChange/);
+  assert.match(phonesRoute, /phone_access_state: phoneAccess\.state \|\| 'none'/);
+  assert.match(phoneAccessUtil, /cancelPhoneAccessRequestsForRequester/);
+  assert.match(phoneAccessUtil, /JOIN requester_phone rp ON rp\.phone = r\.phone/);
+  assert.match(phoneAccessUtil, /r\.status <> 'cancelled'/);
+  assert.match(
+    phoneAccessUtil,
+    /JOIN phones requester_phone[\s\S]{0,180}requester_phone\.phone/,
+  );
+  assert.match(pendingScreen, /void _changePhone\(\)/);
+  assert.match(pendingScreen, /pushNamed\('\/phone_name'\)/);
+  assert.match(pendingScreen, /Сменить номер/);
+}
+
 function testFullDeployStampsWebBuildVersion() {
   const deployFull = fs.readFileSync(
     path.resolve(__dirname, "../../scripts/deploy_full.sh"),
@@ -1667,6 +1705,7 @@ testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
 testPhoneAccessDoesNotExposeFirstOwnerIdentity();
 testAuthHydrationClearsMissingPhoneAccessState();
+testPhoneAccessRestrictedUsersCanChangePhoneProjectWide();
 testFullDeployStampsWebBuildVersion();
 testWebServiceWorkerRegistrationUsesBuildVersion();
 testWebIndexInlineScriptsAreParseable();

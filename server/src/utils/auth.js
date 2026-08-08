@@ -126,6 +126,9 @@ function isPhoneAccessBypassRequest(req) {
     return true;
   }
   if (method === 'POST' && fullPath === '/api/auth/logout') return true;
+  if (method === 'POST' && fullPath === '/api/profile/update') return true;
+  if (method === 'POST' && fullPath === '/api/phones/request') return true;
+  if (method === 'POST' && fullPath === '/api/phones/change') return true;
   if (method === 'GET' && fullPath === '/api/auth/phone-access/status') {
     return true;
   }
