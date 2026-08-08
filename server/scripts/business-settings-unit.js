@@ -876,6 +876,30 @@ function testNightlyAuditChecksAuthIdentityProjectWide() {
   assert.match(source, /await checkAuthIdentityIntegrity\(\)/);
 }
 
+function testLoginExplainsMissingPasswordHashProjectWide() {
+  const authRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/auth.js"),
+    "utf8",
+  );
+  assert.match(authRoute, /function isPasswordHashMissing/);
+  assert.match(authRoute, /function hasValidPasswordHash/);
+  assert.match(authRoute, /reason: 'password_not_set'/);
+  assert.match(authRoute, /status: 409,[\s\S]{0,240}reason: 'password_not_set'/);
+  assert.match(authRoute, /passwordSetupRequired: true/);
+  assert.match(authRoute, /password_setup_required/);
+  assert.match(
+    authRoute,
+    /result\?\.reason === 'password_mismatch' \|\|\s*result\?\.reason === 'password_not_set'/,
+  );
+
+  const authScreen = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/auth_screen.dart"),
+    "utf8",
+  );
+  assert.match(authScreen, /password_setup_required/);
+  assert.match(authScreen, /Нажмите «Забыли пароль\?»/);
+}
+
 function testAuthIdentityCleanupRunsBeforeNightlyAudit() {
   const cleanup = fs.readFileSync(
     path.resolve(__dirname, "auth_identity_cleanup.js"),
@@ -1589,6 +1613,7 @@ testNightlyAuditChecksTenantUserIndexDrift();
 testAuthSessionsArePersistentProjectWide();
 testNightlyAuditChecksAuthSessionsProjectWide();
 testNightlyAuditChecksAuthIdentityProjectWide();
+testLoginExplainsMissingPasswordHashProjectWide();
 testAuthIdentityCleanupRunsBeforeNightlyAudit();
 testNightlyAuditChecksAuthEmailTokensProjectWide();
 testSessionBootstrapE2ECoversRefreshAndPersistentSessions();

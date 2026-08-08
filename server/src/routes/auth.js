@@ -111,6 +111,7 @@ const PASSKEY_CHALLENGE_TTL_MS = Math.max(
 );
 const PASSKEY_RP_NAME = String(process.env.AUTH_PASSKEY_RP_NAME || 'Проект Феникс').trim() || 'Проект Феникс';
 const passkeyChallenges = new Map();
+const BCRYPT_PASSWORD_HASH_RE = /^\$2[aby]\$[0-9]{2}\$.{53}$/;
 if (
   process.env.NODE_ENV === 'production' &&
   !CREATOR_SECRET &&
@@ -123,6 +124,14 @@ if (
 
 function signToken(payload) {
   return signJwt(payload, { expiresIn: ACCESS_TOKEN_TTL });
+}
+
+function hasValidPasswordHash(value) {
+  return BCRYPT_PASSWORD_HASH_RE.test(String(value || '').trim());
+}
+
+function isPasswordHashMissing(value) {
+  return String(value || '').trim().length === 0;
 }
 
 function parseDurationMs(raw, fallbackMs) {
@@ -4000,10 +4009,20 @@ router.post('/login', async (req, res) => {
 
         let user = null;
         let inactiveUserWithMatchingPassword = null;
+        let activeUserWithoutPassword = null;
         for (const candidate of userCandidates) {
+          if (isPasswordHashMissing(candidate.password_hash)) {
+            if (candidate.is_active !== false && !activeUserWithoutPassword) {
+              activeUserWithoutPassword = candidate;
+            }
+            continue;
+          }
+          if (!hasValidPasswordHash(candidate.password_hash)) {
+            continue;
+          }
           const ok = await bcrypt.compare(
             password,
-            String(candidate.password_hash || ''),
+            String(candidate.password_hash),
           );
           if (!ok) continue;
           if (candidate.is_active === false) {
@@ -4021,6 +4040,16 @@ router.post('/login', async (req, res) => {
         }
         if (!user) {
           await client.query('ROLLBACK');
+          if (activeUserWithoutPassword) {
+            return {
+              ok: false,
+              status: 409,
+              error:
+                'Для этого аккаунта пароль ещё не задан. Восстановите пароль через письмо и задайте новый.',
+              reason: 'password_not_set',
+              passwordSetupRequired: true,
+            };
+          }
           return {
             ok: false,
             status: 401,
@@ -4226,7 +4255,8 @@ router.post('/login', async (req, res) => {
       !isPlatformCreator &&
       !result?.ok &&
       (result?.reason === 'user_not_found' ||
-        result?.reason === 'password_mismatch')
+        result?.reason === 'password_mismatch' ||
+        result?.reason === 'password_not_set')
     ) {
       const currentTenantId = String(tenant?.id || '').trim();
       const passwordMatchedTenants = (
@@ -4271,6 +4301,9 @@ router.post('/login', async (req, res) => {
       };
       if (result?.twoFactorRequired) {
         payload.two_factor_required = true;
+      }
+      if (result?.passwordSetupRequired) {
+        payload.password_setup_required = true;
       }
       return res.status(result?.status || 500).json(payload);
     }

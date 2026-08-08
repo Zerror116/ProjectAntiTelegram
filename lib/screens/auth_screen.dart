@@ -1547,6 +1547,11 @@ class _AuthScreenState extends State<AuthScreen> {
         friendly =
             'Для этого аккаунта включена защита 2FA. Введите код из Google Authenticator или резервный код.';
       } else if (!_isRegister &&
+          (bodyMap?['password_setup_required'] == true ||
+              bodyMap?['passwordSetupRequired'] == true)) {
+        friendly =
+            'Для этого аккаунта пароль ещё не задан. Нажмите «Забыли пароль?» и задайте новый пароль через письмо.';
+      } else if (!_isRegister &&
           status == 409 &&
           bodyMap?['tenant_selection_required'] == true) {
         final handled = await _retryLoginWithTenantSelection(
