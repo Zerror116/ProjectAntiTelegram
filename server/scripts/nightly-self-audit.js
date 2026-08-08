@@ -1121,6 +1121,12 @@ async function checkAuthIdentityIntegrity() {
     active_email_groups_without_valid_password: 0,
     active_email_users_without_valid_password: 0,
     active_users_missing_password_hash: 0,
+    active_client_users_missing_password_hash: 0,
+    active_staff_users_missing_password_hash: 0,
+    active_missing_password_users_with_active_session: 0,
+    active_missing_password_users_with_active_endpoint: 0,
+    active_missing_password_users_indexed: 0,
+    active_missing_password_users_with_phone: 0,
     active_users_invalid_password_hash: 0,
     phone_rows_without_user: 0,
     active_sessions_for_inactive_users: 0,
@@ -1137,6 +1143,12 @@ async function checkAuthIdentityIntegrity() {
     "active_email_groups_without_valid_password",
     "active_email_users_without_valid_password",
     "active_users_missing_password_hash",
+    "active_client_users_missing_password_hash",
+    "active_staff_users_missing_password_hash",
+    "active_missing_password_users_with_active_session",
+    "active_missing_password_users_with_active_endpoint",
+    "active_missing_password_users_indexed",
+    "active_missing_password_users_with_phone",
     "active_users_invalid_password_hash",
     "phone_rows_without_user",
     "active_sessions_for_inactive_users",
@@ -1156,12 +1168,37 @@ async function checkAuthIdentityIntegrity() {
   async function readTargetStats() {
     return await db.query(
       `WITH active_users AS (
-         SELECT id,
-                COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) AS tenant_scope,
-                lower(NULLIF(BTRIM(email), '')) AS email_key,
-                COALESCE(password_hash, '') AS password_hash
-           FROM users
-          WHERE COALESCE(is_active, true) = true
+         SELECT u.id,
+                COALESCE(u.tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) AS tenant_scope,
+                lower(NULLIF(BTRIM(u.email), '')) AS email_key,
+                COALESCE(NULLIF(BTRIM(lower(u.role)), ''), 'client') AS role_key,
+                COALESCE(u.password_hash, '') AS password_hash,
+                EXISTS (
+                  SELECT 1
+                    FROM user_sessions s
+                   WHERE s.user_id = u.id
+                     AND s.is_active = true
+                ) AS has_active_session,
+                EXISTS (
+                  SELECT 1
+                    FROM notification_endpoints e
+                   WHERE e.user_id = u.id
+                     AND e.is_active = true
+                ) AS has_active_endpoint,
+                EXISTS (
+                  SELECT 1
+                    FROM tenant_user_index tui
+                   WHERE tui.user_id = u.id
+                     AND tui.is_active = true
+                ) AS indexed_active,
+                EXISTS (
+                  SELECT 1
+                    FROM phones p
+                   WHERE p.user_id = u.id
+                     AND NULLIF(BTRIM(p.phone), '') IS NOT NULL
+                ) AS has_phone
+           FROM users u
+          WHERE COALESCE(u.is_active, true) = true
        ),
        duplicate_email_groups AS (
          SELECT tenant_scope,
@@ -1219,6 +1256,48 @@ async function checkAuthIdentityIntegrity() {
          COALESCE((SELECT COUNT(*)::int FROM credential_email_groups WHERE valid_password_count = 0), 0)::int AS active_email_groups_without_valid_password,
          COALESCE((SELECT SUM(user_count)::int FROM credential_email_groups WHERE valid_password_count = 0), 0)::int AS active_email_users_without_valid_password,
          COALESCE((SELECT SUM(missing_password_count)::int FROM credential_email_groups), 0)::int AS active_users_missing_password_hash,
+         (
+           SELECT COUNT(*)::int
+             FROM active_users
+            WHERE email_key IS NOT NULL
+              AND NULLIF(BTRIM(password_hash), '') IS NULL
+              AND role_key = 'client'
+         ) AS active_client_users_missing_password_hash,
+         (
+           SELECT COUNT(*)::int
+             FROM active_users
+            WHERE email_key IS NOT NULL
+              AND NULLIF(BTRIM(password_hash), '') IS NULL
+              AND role_key IN ('worker', 'admin', 'tenant', 'creator')
+         ) AS active_staff_users_missing_password_hash,
+         (
+           SELECT COUNT(*)::int
+             FROM active_users
+            WHERE email_key IS NOT NULL
+              AND NULLIF(BTRIM(password_hash), '') IS NULL
+              AND has_active_session = true
+         ) AS active_missing_password_users_with_active_session,
+         (
+           SELECT COUNT(*)::int
+             FROM active_users
+            WHERE email_key IS NOT NULL
+              AND NULLIF(BTRIM(password_hash), '') IS NULL
+              AND has_active_endpoint = true
+         ) AS active_missing_password_users_with_active_endpoint,
+         (
+           SELECT COUNT(*)::int
+             FROM active_users
+            WHERE email_key IS NOT NULL
+              AND NULLIF(BTRIM(password_hash), '') IS NULL
+              AND indexed_active = true
+         ) AS active_missing_password_users_indexed,
+         (
+           SELECT COUNT(*)::int
+             FROM active_users
+            WHERE email_key IS NOT NULL
+              AND NULLIF(BTRIM(password_hash), '') IS NULL
+              AND has_phone = true
+         ) AS active_missing_password_users_with_phone,
          COALESCE((SELECT SUM(invalid_password_count)::int FROM credential_email_groups), 0)::int AS active_users_invalid_password_hash,
          COALESCE((SELECT COUNT(*)::int FROM phone_rows WHERE has_user = false), 0)::int AS phone_rows_without_user,
          (
@@ -1340,6 +1419,30 @@ async function checkAuthIdentityIntegrity() {
       "Auth identity hard references are healthy across database targets",
       totals,
     );
+    if (totals.active_users_missing_password_hash > 0) {
+      addFinding(
+        "info",
+        "auth_identity.credentials_recovery_needed",
+        "Some active email users have no password hash and must use password setup or recovery flow",
+        {
+          targets_checked: totals.targets_checked,
+          active_users_missing_password_hash:
+            totals.active_users_missing_password_hash,
+          active_client_users_missing_password_hash:
+            totals.active_client_users_missing_password_hash,
+          active_staff_users_missing_password_hash:
+            totals.active_staff_users_missing_password_hash,
+          active_missing_password_users_with_active_session:
+            totals.active_missing_password_users_with_active_session,
+          active_missing_password_users_with_active_endpoint:
+            totals.active_missing_password_users_with_active_endpoint,
+          active_missing_password_users_indexed:
+            totals.active_missing_password_users_indexed,
+          active_missing_password_users_with_phone:
+            totals.active_missing_password_users_with_phone,
+        },
+      );
+    }
   } catch (err) {
     addFinding(
       IS_PRODUCTION ? "critical" : "warn",

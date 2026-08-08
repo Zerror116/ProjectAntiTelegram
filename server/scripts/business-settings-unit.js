@@ -865,6 +865,13 @@ function testNightlyAuditChecksAuthIdentityProjectWide() {
   assert.match(source, /credential_email_groups/);
   assert.match(source, /active_email_groups_without_valid_password/);
   assert.match(source, /active_users_missing_password_hash/);
+  assert.match(source, /active_client_users_missing_password_hash/);
+  assert.match(source, /active_staff_users_missing_password_hash/);
+  assert.match(source, /active_missing_password_users_with_active_session/);
+  assert.match(source, /active_missing_password_users_with_active_endpoint/);
+  assert.match(source, /active_missing_password_users_indexed/);
+  assert.match(source, /active_missing_password_users_with_phone/);
+  assert.match(source, /auth_identity\.credentials_recovery_needed/);
   assert.match(source, /active_users_invalid_password_hash/);
   assert.match(source, /const hardDriftFields = \[/);
   assert.match(source, /"active_users_invalid_password_hash"/);
