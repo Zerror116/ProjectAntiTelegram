@@ -1407,8 +1407,8 @@ void _applyPerformanceRuntimeTuning(bool enabled) {
 
 Future<void> refreshUserPreferences() async {
   final prefs = await SharedPreferences.getInstance();
-  final notifications =
-      await NotificationRuntimePreferenceService.isEnabledForUser(
+  final notificationPolicy =
+      await NotificationRuntimePreferenceService.getCachedPolicyForUser(
         authService.currentUser?.id,
       );
   final scope = _settingsScopeUserId();
@@ -1424,7 +1424,7 @@ Future<void> refreshUserPreferences() async {
   final chatBackgroundEffect =
       prefs.getString('$_chatBackgroundEffectPrefPrefix$scope') ?? 'feathers';
 
-  notificationsEnabledNotifier.value = notifications;
+  notificationsEnabledNotifier.value = notificationPolicy.enabled;
   themeModeNotifier.value = darkMode ? ThemeMode.dark : ThemeMode.light;
   // Цветовая схема фиксирована: только светлая/тёмная тема без кастомных цветов.
   lightThemeSeedNotifier.value = const Color(0xFF2F6BFF);
@@ -1450,13 +1450,37 @@ Future<void> setNotificationsEnabled(bool value) async {
     authService.currentUser?.id,
     value,
   );
-  notificationsEnabledNotifier.value = value;
+  final policy =
+      await NotificationRuntimePreferenceService.getCachedPolicyForUser(
+        authService.currentUser?.id,
+      );
+  notificationsEnabledNotifier.value = policy.enabled;
   if (authService.currentUser == null || authService.isSessionDegraded) return;
   await NotificationRuntimePreferenceService.applyRuntimePreference(
     authService.dio,
-    enabled: value,
+    enabled: policy.enabled,
     userId: authService.currentUser?.id,
   );
+}
+
+Future<void> reconcileCurrentNotificationRuntime() async {
+  final user = authService.currentUser;
+  if (user == null || authService.isSessionDegraded) return;
+  try {
+    final policy =
+        await NotificationRuntimePreferenceService.refreshServerPolicy(
+          authService.dio,
+          userId: user.id,
+        );
+    notificationsEnabledNotifier.value = policy.enabled;
+    await NotificationRuntimePreferenceService.applyRuntimePreference(
+      authService.dio,
+      enabled: policy.enabled,
+      userId: user.id,
+    );
+  } catch (error) {
+    debugPrint('notification runtime reconcile skipped: $error');
+  }
 }
 
 Future<void> setDarkModeEnabled(bool value) async {
@@ -4779,6 +4803,10 @@ Future<void> _handleIncomingNotificationPayload(
       return;
     }
 
+    if (!runtimePolicy.shouldPresentInAppCategory(category)) {
+      return;
+    }
+
     if (!fromTap && appVisible && _isNotificationDestinationAlreadyOpen(map)) {
       return;
     }
@@ -4824,6 +4852,7 @@ Future<void> _handleIncomingNotificationPayload(
     return;
   }
 
+  if (!runtimePolicy.shouldPresentInAppCategory(category)) return;
   if (category == 'chat' || category == 'updates') return;
   if (kIsWeb && WebNotificationService.isDocumentHidden) return;
   if (appVisible && !runtimePolicy.showWhenActive) return;
@@ -4923,6 +4952,7 @@ Future<void> _maybePlayIncomingMessageSound(dynamic data) async {
   if (!notificationsEnabledNotifier.value) return;
   final runtimePolicy = await _notificationRuntimePolicy();
   if (!runtimePolicy.enabled) return;
+  if (!runtimePolicy.categoryEnabled('chat')) return;
   Map<String, dynamic>? message;
   if (data is Map) {
     final raw = data['message'] ?? data;
@@ -5001,6 +5031,7 @@ Future<void> _maybeShowIncomingBrowserNotification({
 }) async {
   if (!kIsWeb) return;
   if (!notificationsEnabledNotifier.value) return;
+  if (!policy.shouldUsePushCategory('chat')) return;
   if (!WebNotificationService.isSupported) return;
   if (!WebNotificationService.isDocumentHidden) return;
   if ((chatId?.isNotEmpty ?? false) && activeChatIdNotifier.value == chatId) {
@@ -6604,6 +6635,7 @@ class _DiagnosticBootstrapState extends State<DiagnosticBootstrap>
     super.didChangeAppLifecycleState(state);
     if (state != AppLifecycleState.resumed) return;
     if (authService.currentUser == null) return;
+    unawaited(reconcileCurrentNotificationRuntime());
     unawaited(refreshNotificationBadgeCount());
     unawaited(_queueLatestClientGroupInviteIfNeeded());
   }

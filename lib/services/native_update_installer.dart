@@ -177,6 +177,10 @@ class NativeUpdateInstaller {
     return impl.canPostNotifications();
   }
 
+  static Future<String> notificationPermissionState() {
+    return impl.notificationPermissionState();
+  }
+
   static Future<bool> requestNotificationPermission() {
     return impl.requestNotificationPermission();
   }

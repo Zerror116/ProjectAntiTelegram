@@ -7,6 +7,45 @@ function cleanString(value) {
   return String(value || "").trim();
 }
 
+function normalizeJsonMap(raw, fallback = {}) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return { ...raw };
+  }
+  return { ...fallback };
+}
+
+function hasOwnBooleanFlag(map, key) {
+  return Object.prototype.hasOwnProperty.call(map, key) && typeof map[key] === "boolean";
+}
+
+function payloadCategory(payload = {}) {
+  const nestedPayload = normalizeJsonMap(payload.payload);
+  return cleanString(payload.category || payload.type || nestedPayload.category)
+    .toLowerCase();
+}
+
+function endpointAllowsPushPayload(endpoint = {}, payload = {}) {
+  const runtimePolicy = normalizeJsonMap(endpoint.app_runtime_policy);
+  if (runtimePolicy.enabled === false) {
+    return { allowed: false, reason: "endpoint_runtime_disabled" };
+  }
+
+  const channels = normalizeJsonMap(runtimePolicy.channels);
+  if (hasOwnBooleanFlag(channels, "push") && channels.push !== true) {
+    return { allowed: false, reason: "endpoint_push_channel_disabled" };
+  }
+
+  const category = payloadCategory(payload);
+  if (category) {
+    const categories = normalizeJsonMap(runtimePolicy.categories);
+    if (hasOwnBooleanFlag(categories, category) && categories[category] !== true) {
+      return { allowed: false, reason: "endpoint_category_disabled" };
+    }
+  }
+
+  return { allowed: true, reason: "allowed" };
+}
+
 function getWebPushModule() {
   if (cachedWebPushModule !== undefined) {
     return cachedWebPushModule;
@@ -87,6 +126,7 @@ async function upsertWebPushSubscription({
   subscription,
   userAgent = "",
   tenantId = null,
+  appRuntimePolicy = null,
 }) {
   const normalized = normalizeWebPushSubscription(subscription);
   if (!normalized) {
@@ -120,6 +160,7 @@ async function upsertWebPushSubscription({
       tenantId,
       endpoint: normalized.endpoint,
       subscription: normalized,
+      appRuntimePolicy,
       userAgent,
     });
   } catch (err) {
@@ -160,6 +201,17 @@ async function deactivateWebPushSubscription(endpoint) {
         SET is_active = false,
             updated_at = now()
       WHERE endpoint = $1`,
+    [normalizedEndpoint],
+  );
+  await db.query(
+    `UPDATE notification_endpoints
+        SET is_active = false,
+            last_failure_at = now(),
+            last_failure_reason = 'webpush_endpoint_expired',
+            last_delivery_state = 'disabled',
+            updated_at = now()
+      WHERE transport = 'webpush'
+        AND endpoint = $1`,
     [normalizedEndpoint],
   );
 }
@@ -218,20 +270,42 @@ async function sendPayloadToUserSubscriptions(userId, payload) {
   const webPush = getWebPushModule();
   if (!webPush) return 0;
   const subscriptionsQ = await db.query(
-    `SELECT endpoint, subscription
+    `SELECT endpoint, subscription, app_runtime_policy
        FROM (
-         SELECT endpoint, subscription
-           FROM web_push_subscriptions
-          WHERE user_id = $1
-            AND is_active = true
+         SELECT endpoint, subscription, app_runtime_policy
+           FROM (
+             SELECT DISTINCT ON (wps.endpoint)
+                    wps.endpoint,
+                    wps.subscription,
+                    COALESCE(ne.app_runtime_policy, '{}'::jsonb) AS app_runtime_policy,
+                    ne.id AS registry_endpoint_id
+               FROM web_push_subscriptions wps
+               LEFT JOIN notification_endpoints ne
+                 ON ne.user_id = wps.user_id
+                AND ne.transport = 'webpush'
+                AND ne.endpoint = wps.endpoint
+              WHERE wps.user_id = $1
+                AND wps.is_active = true
+                AND (
+                  ne.id IS NULL OR (
+                    ne.is_active = true
+                    AND ne.permission_state = 'granted'
+                    AND COALESCE((ne.app_runtime_policy->>'enabled')::boolean, true) = true
+                  )
+                )
+              ORDER BY wps.endpoint, ne.updated_at DESC NULLS LAST, ne.created_at DESC NULLS LAST
+           ) legacy_targets
          UNION
-         SELECT endpoint, subscription
+         SELECT endpoint, subscription, app_runtime_policy
            FROM notification_endpoints
           WHERE user_id = $1
             AND is_active = true
             AND transport = 'webpush'
+            AND permission_state = 'granted'
             AND endpoint IS NOT NULL
             AND btrim(endpoint) <> ''
+            AND subscription IS NOT NULL
+            AND COALESCE((app_runtime_policy->>'enabled')::boolean, true) = true
        ) targets`,
     [userId],
   );
@@ -239,6 +313,8 @@ async function sendPayloadToUserSubscriptions(userId, payload) {
 
   let sent = 0;
   for (const row of subscriptionsQ.rows) {
+    const gate = endpointAllowsPushPayload(row, payload);
+    if (!gate.allowed) continue;
     try {
       await webPush.sendNotification(row.subscription, JSON.stringify(payload), {
         TTL: 60,
@@ -293,6 +369,16 @@ async function sendWebPushPayloadToEndpoint({ endpoint, payload }) {
       state: "skipped",
       providerMessageId: null,
       errorMessage: "webpush_endpoint_missing",
+      deactivateEndpoint: false,
+    };
+  }
+  const gate = endpointAllowsPushPayload(endpoint, payload);
+  if (!gate.allowed) {
+    return {
+      endpointId: endpoint?.id || null,
+      state: "skipped",
+      providerMessageId: null,
+      errorMessage: gate.reason,
       deactivateEndpoint: false,
     };
   }

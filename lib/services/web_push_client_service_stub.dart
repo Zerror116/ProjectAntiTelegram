@@ -4,7 +4,10 @@ import 'web_push_client_service.dart';
 
 bool isSupported() => false;
 
-Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
+Future<WebPushSyncResult> ensureSubscribed(
+  Dio dio, {
+  Map<String, dynamic>? runtimePolicySnapshot,
+}) async {
   return const WebPushSyncResult(
     supported: false,
     enabledOnServer: false,

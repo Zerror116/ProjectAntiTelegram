@@ -43,6 +43,7 @@ router.post("/subscriptions", authMiddleware, async (req, res) => {
         userId: req.user.id,
         tenantId: req.user?.tenant_id || null,
         subscription: req.body?.subscription || req.body,
+        appRuntimePolicy: req.body?.app_runtime_policy,
         userAgent: req.headers["user-agent"] || "",
       }),
     );

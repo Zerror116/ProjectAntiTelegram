@@ -28,6 +28,10 @@ Future<bool> canPostNotifications() async {
   return false;
 }
 
+Future<String> notificationPermissionState() async {
+  return 'unsupported';
+}
+
 Future<bool> requestNotificationPermission() async {
   return false;
 }

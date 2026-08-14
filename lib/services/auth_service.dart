@@ -496,21 +496,21 @@ class AuthService {
           _postAuthSyncRequested = false;
           _pendingPostAuthSyncUserId = null;
           if (syncUserId == null || syncUserId.trim().isEmpty) continue;
-          final enabled =
-              await NotificationRuntimePreferenceService.isEnabledForUser(
-                syncUserId,
+          final policy =
+              await NotificationRuntimePreferenceService.refreshServerPolicy(
+                dio,
+                userId: syncUserId,
               );
-          if (!enabled) {
-            await NotificationCoordinatorService.clear(dio, userId: syncUserId);
+          if (!policy.enabled) {
+            await NotificationCoordinatorService.clear(
+              dio,
+              userId: syncUserId,
+              runtimePolicySnapshot: policy.toJson(),
+            );
           } else {
-            final policy =
-                await NotificationRuntimePreferenceService.refreshServerPolicy(
-                  dio,
-                  userId: syncUserId,
-                );
             await NotificationCoordinatorService.reconcile(
               dio,
-              enabled: enabled,
+              enabled: policy.enabled,
               userId: syncUserId,
               runtimePolicySnapshot: policy.toJson(),
             );

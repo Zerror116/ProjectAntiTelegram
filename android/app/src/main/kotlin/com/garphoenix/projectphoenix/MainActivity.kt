@@ -34,6 +34,9 @@ class MainActivity : FlutterActivity() {
         private const val PASSKEY_CHANNEL_NAME =
             "com.garphoenix.projectphoenix/passkeys"
         private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 6104
+        private const val NATIVE_PREFS_NAME = "phoenix_native_runtime"
+        private const val PREF_NOTIFICATION_PERMISSION_REQUESTED =
+            "notification_permission_requested"
     }
 
     private var pendingNotificationPermissionResult: MethodChannel.Result? = null
@@ -141,12 +144,18 @@ class MainActivity : FlutterActivity() {
                     result.success(canPostNotifications())
                 }
 
+                "notificationPermissionState" -> {
+                    result.success(notificationPermissionState())
+                }
+
                 "requestNotificationPermission" -> {
                     if (canPostNotifications()) {
+                        rememberNotificationPermissionRequested()
                         result.success(true)
                         return@setMethodCallHandler
                     }
                     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                        rememberNotificationPermissionRequested()
                         result.success(true)
                         return@setMethodCallHandler
                     }
@@ -158,6 +167,7 @@ class MainActivity : FlutterActivity() {
                         )
                         return@setMethodCallHandler
                     }
+                    rememberNotificationPermissionRequested()
                     pendingNotificationPermissionResult = result
                     requestPermissions(
                         arrayOf(Manifest.permission.POST_NOTIFICATIONS),
@@ -273,6 +283,25 @@ class MainActivity : FlutterActivity() {
             this,
             Manifest.permission.POST_NOTIFICATIONS,
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun rememberNotificationPermissionRequested() {
+        getSharedPreferences(NATIVE_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_NOTIFICATION_PERMISSION_REQUESTED, true)
+            .apply()
+    }
+
+    private fun notificationPermissionState(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return "granted"
+        }
+        if (canPostNotifications()) {
+            return "granted"
+        }
+        val requested = getSharedPreferences(NATIVE_PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(PREF_NOTIFICATION_PERMISSION_REQUESTED, false)
+        return if (requested) "denied" else "default"
     }
 
     override fun onRequestPermissionsResult(

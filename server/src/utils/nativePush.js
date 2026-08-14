@@ -6,6 +6,39 @@ function cleanString(value) {
   return String(value || "").trim();
 }
 
+function normalizeJsonMap(raw, fallback = {}) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return { ...raw };
+  }
+  return { ...fallback };
+}
+
+function hasOwnBooleanFlag(map, key) {
+  return Object.prototype.hasOwnProperty.call(map, key) && typeof map[key] === "boolean";
+}
+
+function endpointAllowsPushPayload(endpoint = {}, payload = {}) {
+  const runtimePolicy = normalizeJsonMap(endpoint.app_runtime_policy);
+  if (runtimePolicy.enabled === false) {
+    return { allowed: false, reason: "endpoint_runtime_disabled" };
+  }
+
+  const channels = normalizeJsonMap(runtimePolicy.channels);
+  if (hasOwnBooleanFlag(channels, "push") && channels.push !== true) {
+    return { allowed: false, reason: "endpoint_push_channel_disabled" };
+  }
+
+  const category = normalizeCategory(payload.category);
+  if (category) {
+    const categories = normalizeJsonMap(runtimePolicy.categories);
+    if (hasOwnBooleanFlag(categories, category) && categories[category] !== true) {
+      return { allowed: false, reason: "endpoint_category_disabled" };
+    }
+  }
+
+  return { allowed: true, reason: "allowed" };
+}
+
 function parseServiceAccount() {
   const inlineJson = cleanString(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   if (inlineJson) {
@@ -346,6 +379,16 @@ async function sendFcmPayloadToEndpoints({ endpoints = [], payload = {} }) {
   for (const endpoint of endpoints) {
     const token = cleanString(endpoint?.push_token);
     if (!token) continue;
+    const gate = endpointAllowsPushPayload(endpoint, payload);
+    if (!gate.allowed) {
+      results.push({
+        endpointId: endpoint.id || null,
+        state: "skipped",
+        providerMessageId: null,
+        errorMessage: gate.reason,
+      });
+      continue;
+    }
     try {
       const message = buildMessageForEndpoint(endpoint, payload);
       const providerMessageId = await messaging.send(message, false);

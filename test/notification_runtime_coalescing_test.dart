@@ -134,6 +134,88 @@ void main() {
   );
 
   test(
+    'server notification categories disable runtime endpoint sync',
+    () async {
+      final dio = Dio();
+
+      dio.httpClientAdapter = _FakeDioAdapter((options) async {
+        if (options.path == '/api/notifications/preferences') {
+          return _jsonResponse(200, {
+            'data': {
+              'categories': {
+                'chat': false,
+                'support': false,
+                'reserved': false,
+                'delivery': false,
+                'promo': false,
+                'updates': false,
+                'security': false,
+              },
+              'channels': {'push': true, 'in_app': true, 'email': false},
+              'message_preview_enabled': true,
+              'sound_enabled': true,
+              'show_when_active': false,
+            },
+          });
+        }
+        return _jsonResponse(200, const <String, dynamic>{});
+      });
+
+      final policy =
+          await NotificationRuntimePreferenceService.refreshServerPolicy(
+            dio,
+            userId: 'policy-user-a',
+          );
+      expect(policy.enabled, isFalse);
+      expect(policy.shouldUsePushCategory('chat'), isFalse);
+      expect(policy.shouldPresentInAppCategory('support'), isFalse);
+
+      final cached =
+          await NotificationRuntimePreferenceService.getCachedPolicyForUser(
+            'policy-user-a',
+          );
+      expect(cached.enabled, isFalse);
+    },
+  );
+
+  test('staff work categories keep runtime endpoint sync enabled', () async {
+    final dio = Dio();
+
+    dio.httpClientAdapter = _FakeDioAdapter((options) async {
+      if (options.path == '/api/notifications/preferences') {
+        return _jsonResponse(200, {
+          'data': {
+            'categories': {
+              'chat': false,
+              'support': false,
+              'reserved': true,
+              'delivery': true,
+              'promo': false,
+              'updates': true,
+              'security': true,
+            },
+            'channels': {'push': true, 'in_app': true, 'email': false},
+            'message_preview_enabled': true,
+            'sound_enabled': true,
+            'show_when_active': false,
+          },
+        });
+      }
+      return _jsonResponse(200, const <String, dynamic>{});
+    });
+
+    final policy =
+        await NotificationRuntimePreferenceService.refreshServerPolicy(
+          dio,
+          userId: 'policy-user-a',
+        );
+    expect(policy.enabled, isTrue);
+    expect(policy.shouldUsePushCategory('delivery'), isTrue);
+    expect(policy.shouldPresentInAppCategory('security'), isTrue);
+    expect(policy.shouldUsePushCategory('chat'), isFalse);
+  });
+
+  test(
     'device endpoint sync retries with latest pending runtime payload',
     () async {
       final dio = Dio();
@@ -141,6 +223,8 @@ void main() {
       final releaseFirstRequest = Completer<void>();
       final profiles = <String>[];
       final enabledValues = <bool>[];
+      final categoryValues = <Map<String, dynamic>>[];
+      final channelValues = <Map<String, dynamic>>[];
 
       dio.httpClientAdapter = _FakeDioAdapter((options) async {
         if (options.path == '/api/notifications/endpoints/refresh') {
@@ -149,7 +233,15 @@ void main() {
           final policy = data['app_runtime_policy'] is Map
               ? Map<String, dynamic>.from(data['app_runtime_policy'] as Map)
               : const <String, dynamic>{};
+          final categories = policy['categories'] is Map
+              ? Map<String, dynamic>.from(policy['categories'] as Map)
+              : const <String, dynamic>{};
+          final channels = policy['channels'] is Map
+              ? Map<String, dynamic>.from(policy['channels'] as Map)
+              : const <String, dynamic>{};
           enabledValues.add(policy['enabled'] == true);
+          categoryValues.add(categories);
+          channelValues.add(channels);
           if (profiles.length == 1) {
             firstRequestStarted.complete();
             await releaseFirstRequest.future;
@@ -169,7 +261,11 @@ void main() {
       final second = NotificationDeviceService.syncCurrentEndpoint(
         dio,
         userId: 'endpoint-user-b',
-        runtimePolicySnapshot: const {'enabled': false},
+        runtimePolicySnapshot: const {
+          'enabled': false,
+          'categories': {'chat': false, 'delivery': true},
+          'channels': {'push': false, 'in_app': true},
+        },
         deviceProfile: 'second-profile',
       );
 
@@ -177,6 +273,12 @@ void main() {
       await Future.wait([first, second]);
       expect(profiles, ['first-profile', 'second-profile']);
       expect(enabledValues, [true, false]);
+      expect(categoryValues[0], isEmpty);
+      expect(channelValues[0], isEmpty);
+      expect(categoryValues[1]['chat'], isFalse);
+      expect(categoryValues[1]['delivery'], isTrue);
+      expect(channelValues[1]['push'], isFalse);
+      expect(channelValues[1]['in_app'], isTrue);
     },
   );
 

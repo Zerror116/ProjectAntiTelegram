@@ -142,6 +142,11 @@ function normalizeJsonMap(raw, fallback = {}) {
   return { ...fallback };
 }
 
+function booleanMapHasEnabled(raw, keys) {
+  const source = normalizeJsonMap(raw);
+  return keys.some((key) => source[key] === true);
+}
+
 function normalizeBooleanMap(raw, allowedKeys, defaults = {}) {
   const source = normalizeJsonMap(raw, defaults);
   const next = {};
@@ -361,18 +366,7 @@ function normalizePreferencesForRole(user, rawPreferences) {
   }
 
   if (isClientRole(role)) {
-    const masterEnabled =
-      normalized.channels.push === true ||
-      normalized.channels.in_app === true ||
-      normalized.channels.email === true ||
-      normalized.categories.chat === true ||
-      normalized.categories.support === true ||
-      normalized.categories.promo === true ||
-      normalized.categories.delivery === true ||
-      normalized.categories.updates === true ||
-      normalized.categories.security === true ||
-      normalized.promo_opt_in === true ||
-      normalized.updates_opt_in === true;
+    const masterEnabled = clientNotificationMasterEnabled(normalized);
 
     normalized.categories = {
       ...normalized.categories,
@@ -415,6 +409,26 @@ function normalizePreferencesForRole(user, rawPreferences) {
   }
 
   return normalized;
+}
+
+function clientNotificationMasterEnabled(preferences = {}) {
+  return (
+    booleanMapHasEnabled(preferences.categories, ["chat", "support", "promo"]) ||
+    preferences.promo_opt_in === true
+  );
+}
+
+function notificationCategoryEnabledForBadge(preferences = {}, category) {
+  const normalizedCategory = normalizeCategory(category, "support");
+  const categories = normalizeJsonMap(preferences.categories);
+  if (categories[normalizedCategory] === false) return false;
+  if (normalizedCategory === "promo" && preferences.promo_opt_in !== true) {
+    return false;
+  }
+  if (normalizedCategory === "updates" && preferences.updates_opt_in === false) {
+    return false;
+  }
+  return true;
 }
 
 function sanitizePreferencesPatchForRole(user, patch = {}, current) {
@@ -988,15 +1002,22 @@ async function markEndpointDeliveryState(endpointId, state, { errorMessage = "" 
   );
 }
 
-async function countNonUrgentEventsForToday(userId, category) {
+async function countNonUrgentEventsForToday(userId, category, { beforeOrAt = null } = {}) {
   const normalizedCategory = normalizeCategory(category, "promo");
+  const params = [userId, normalizedCategory];
+  let cutoffSql = "";
+  if (beforeOrAt) {
+    params.push(beforeOrAt);
+    cutoffSql = ` AND created_at <= $${params.length}::timestamptz`;
+  }
   const q = await db.query(
     `SELECT COUNT(*)::int AS count
        FROM notification_inbox_items
       WHERE user_id = $1
         AND category = $2
-        AND created_at >= date_trunc('day', now())`,
-    [userId, normalizedCategory],
+        AND created_at >= date_trunc('day', now())
+        ${cutoffSql}`,
+    params,
   );
   return Number(q.rows?.[0]?.count || 0) || 0;
 }
@@ -1051,6 +1072,43 @@ async function computeChatUnreadCount(userId) {
           c.type <> 'channel'
           OR COALESCE((c.settings->>'hidden_in_chat_list')::boolean, false) = false
         )
+        AND (
+          c.type <> 'channel'
+          OR (
+            NOT (
+              COALESCE(c.settings->'blacklisted_user_ids', '[]'::jsonb) ? $2::text
+            )
+            AND (
+              COALESCE(c.settings->>'visibility', 'public') = 'public'
+              OR EXISTS (
+                SELECT 1 FROM chat_members channel_member
+                 WHERE channel_member.chat_id = c.id
+                   AND channel_member.user_id = $1
+              )
+            )
+          )
+        )
+        AND (
+          c.type <> 'private'
+          OR COALESCE(c.settings->>'direct_request_status', '') <> 'declined'
+        )
+        AND (
+          NOT (
+            COALESCE(c.settings->>'kind', '') = 'support_ticket'
+            OR COALESCE((c.settings->>'support_ticket')::boolean, false) = true
+          )
+          OR (
+            (
+              st.customer_id = $1
+              OR st.assignee_id = $1
+            )
+            AND (
+              COALESCE(st.status, 'open') <> 'archived'
+              OR st.archived_at IS NULL
+              OR st.archived_at > now() - interval '5 seconds'
+            )
+          )
+        )
         AND NOT (
           c.type = 'private'
           AND (
@@ -1077,11 +1135,14 @@ async function computeNotificationBadgeCount(userId) {
   const badgePrefs = preferences.badge_preferences;
   if (
     isClientRole(user.role) &&
-    Object.values(preferences.channels).every((value) => value != true)
+    !clientNotificationMasterEnabled(preferences)
   ) {
     return 0;
   }
-  const chatUnread = badgePrefs.count_chat ? await computeChatUnreadCount(userId) : 0;
+  const shouldCountChat =
+    badgePrefs.count_chat === true &&
+    notificationCategoryEnabledForBadge(preferences, "chat");
+  const chatUnread = shouldCountChat ? await computeChatUnreadCount(userId) : 0;
   const inboxCount = await computeNotificationInboxBadgeCount(userId, {
     user,
     preferences,
@@ -1100,16 +1161,24 @@ async function computeNotificationBadgeSnapshot(userId) {
   }
   const preferences = await getNotificationPreferencesForUser(user);
   const badgePrefs = preferences.badge_preferences;
-  const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId, {
-    user,
-    preferences,
-  });
-  const chatUnreadCount = await computeChatUnreadCount(userId);
-  const unreadCount =
-    isClientRole(user.role) &&
-    Object.values(preferences.channels).every((value) => value != true)
-      ? 0
-      : (badgePrefs.count_chat ? chatUnreadCount : 0) + inboxUnreadCount;
+  const clientNotificationsDisabled =
+    isClientRole(user.role) && !clientNotificationMasterEnabled(preferences);
+  const inboxUnreadCount = clientNotificationsDisabled
+    ? 0
+    : await computeNotificationInboxBadgeCount(userId, {
+        user,
+        preferences,
+      });
+  const shouldCountChat =
+    !clientNotificationsDisabled &&
+    badgePrefs.count_chat === true &&
+    notificationCategoryEnabledForBadge(preferences, "chat");
+  const chatUnreadCount = shouldCountChat
+    ? await computeChatUnreadCount(userId)
+    : 0;
+  const unreadCount = clientNotificationsDisabled
+    ? 0
+    : chatUnreadCount + inboxUnreadCount;
   return {
     unread_count: unreadCount,
     inbox_unread_count: inboxUnreadCount,
@@ -1141,6 +1210,7 @@ async function computeNotificationInboxBadgeCount(
   for (const row of inboxQ.rows) {
     const category = normalizeCategory(row.category, "support");
     const count = Number(row.count || 0) || 0;
+    if (!notificationCategoryEnabledForBadge(preferences, category)) continue;
     if (category === "support" && badgePrefs.count_support) inboxCount += count;
     if (category === "reserved" && badgePrefs.count_reserved) inboxCount += count;
     if (category === "delivery" && badgePrefs.count_delivery) inboxCount += count;
@@ -1382,6 +1452,7 @@ async function maybeSendNativePushForItem(user, item, preferences) {
         AND push_token IS NOT NULL
         AND btrim(push_token) <> ''
         AND permission_state IN ('granted', 'provisional')
+        AND COALESCE((app_runtime_policy->>'enabled')::boolean, true) = true
       ORDER BY updated_at DESC NULLS LAST, created_at DESC`,
     [user.id],
   );
@@ -1617,19 +1688,14 @@ async function createNotificationInboxItem({
   if (emit && inAppAllowed) {
     const io = global.__projectPhoenixSocketIo;
     if (io) {
-      const badgeCount = await computeNotificationBadgeCount(user.id);
-      const inboxUnreadCount = await computeNotificationInboxBadgeCount(
-        user.id,
-        { user },
-      );
-      const chatUnreadCount = await computeChatUnreadCount(user.id);
+      const badgeSnapshot = await computeNotificationBadgeSnapshot(user.id);
       const socketPayload = buildSocketPayload(
         row,
-        badgeCount,
-        inboxUnreadCount,
+        badgeSnapshot.unread_count,
+        badgeSnapshot.inbox_unread_count,
         preferences,
       );
-      socketPayload.chat_unread_count = chatUnreadCount;
+      socketPayload.chat_unread_count = badgeSnapshot.chat_unread_count;
       emitToUser(
         io,
         user.id,
@@ -1637,9 +1703,9 @@ async function createNotificationInboxItem({
         socketPayload,
       );
       emitToUser(io, user.id, "notification:badge", {
-        unread_count: badgeCount,
-        inbox_unread_count: inboxUnreadCount,
-        chat_unread_count: chatUnreadCount,
+        unread_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
       });
     }
   }
@@ -1678,21 +1744,19 @@ async function markNotificationInboxItemRead({ userId, itemId }) {
   );
   const row = q.rows[0] || null;
   if (row) {
-    const badgeCount = await computeNotificationBadgeCount(userId);
-    const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
-    const chatUnreadCount = await computeChatUnreadCount(userId);
+    const badgeSnapshot = await computeNotificationBadgeSnapshot(userId);
     const io = global.__projectPhoenixSocketIo;
     if (io) {
       emitToUser(io, userId, "notification:read", {
         id: itemId,
-        unread_count: badgeCount,
-        inbox_unread_count: inboxUnreadCount,
-        chat_unread_count: chatUnreadCount,
+        unread_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
       });
       emitToUser(io, userId, "notification:badge", {
-        unread_count: badgeCount,
-        inbox_unread_count: inboxUnreadCount,
-        chat_unread_count: chatUnreadCount,
+        unread_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
       });
     }
   }
@@ -1747,21 +1811,19 @@ async function markNotificationInboxItemOpened({ userId, itemId }) {
     });
   }
 
-  const badgeCount = await computeNotificationBadgeCount(userId);
-  const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
-  const chatUnreadCount = await computeChatUnreadCount(userId);
+  const badgeSnapshot = await computeNotificationBadgeSnapshot(userId);
   const io = global.__projectPhoenixSocketIo;
   if (io) {
     emitToUser(io, userId, "notification:read", {
       id: itemId,
-      unread_count: badgeCount,
-      inbox_unread_count: inboxUnreadCount,
-      chat_unread_count: chatUnreadCount,
+      unread_count: badgeSnapshot.unread_count,
+      inbox_unread_count: badgeSnapshot.inbox_unread_count,
+      chat_unread_count: badgeSnapshot.chat_unread_count,
     });
     emitToUser(io, userId, "notification:badge", {
-      unread_count: badgeCount,
-      inbox_unread_count: inboxUnreadCount,
-      chat_unread_count: chatUnreadCount,
+      unread_count: badgeSnapshot.unread_count,
+      inbox_unread_count: badgeSnapshot.inbox_unread_count,
+      chat_unread_count: badgeSnapshot.chat_unread_count,
     });
   }
   return row;
@@ -1778,18 +1840,16 @@ async function markAllNotificationInboxItemsRead({ userId }) {
         AND COALESCE(inbox_visibility, 'default') = 'default'`,
     [userId],
   );
-  const badgeCount = await computeNotificationBadgeCount(userId);
-  const inboxUnreadCount = await computeNotificationInboxBadgeCount(userId);
-  const chatUnreadCount = await computeChatUnreadCount(userId);
+  const badgeSnapshot = await computeNotificationBadgeSnapshot(userId);
   const io = global.__projectPhoenixSocketIo;
   if (io) {
     emitToUser(io, userId, "notification:badge", {
-      unread_count: badgeCount,
-      inbox_unread_count: inboxUnreadCount,
-      chat_unread_count: chatUnreadCount,
+      unread_count: badgeSnapshot.unread_count,
+      inbox_unread_count: badgeSnapshot.inbox_unread_count,
+      chat_unread_count: badgeSnapshot.chat_unread_count,
     });
   }
-  return badgeCount;
+  return badgeSnapshot.unread_count;
 }
 
 async function markChatInboxItemsRead({ userId, chatId }) {
@@ -1812,8 +1872,23 @@ async function markChatInboxItemsRead({ userId, chatId }) {
   return q.rowCount || 0;
 }
 
-async function syncLegacyWebPushEndpoint({ userId, tenantId = null, endpoint, subscription, userAgent = "" }) {
+async function syncLegacyWebPushEndpoint({
+  userId,
+  tenantId = null,
+  endpoint,
+  subscription,
+  appRuntimePolicy = null,
+  userAgent = "",
+}) {
   const pseudoUser = { id: userId, tenant_id: tenantId, role: "client" };
+  const runtimePolicy = normalizeJsonMap(appRuntimePolicy, {
+    enabled: true,
+    message_preview_enabled: true,
+    sound_enabled: true,
+    show_when_active: false,
+  });
+  const runtimeCategories = normalizeJsonMap(runtimePolicy.categories);
+  const runtimeChannels = normalizeJsonMap(runtimePolicy.channels);
   return upsertNotificationEndpoint({
     user: pseudoUser,
     platform: "web",
@@ -1829,10 +1904,12 @@ async function syncLegacyWebPushEndpoint({ userId, tenantId = null, endpoint, su
       media_rich: true,
     },
     appRuntimePolicy: {
-      enabled: true,
-      message_preview_enabled: true,
-      sound_enabled: true,
-      show_when_active: false,
+      enabled: runtimePolicy.enabled !== false,
+      message_preview_enabled: runtimePolicy.message_preview_enabled !== false,
+      sound_enabled: runtimePolicy.sound_enabled !== false,
+      show_when_active: runtimePolicy.show_when_active === true,
+      categories: runtimeCategories,
+      channels: runtimeChannels,
     },
     deviceProfile: "constrained",
     userAgent,
@@ -2346,6 +2423,7 @@ module.exports = {
   computeNotificationInboxBadgeCount,
   buildSocketPayload,
   evaluatePushEligibility,
+  countNonUrgentEventsForToday,
   createNotificationDelivery,
   createNotificationInboxItem,
   listNotificationInbox,

@@ -90,7 +90,10 @@ class NotificationCoordinatorService {
     if (enabled) {
       if (kIsWeb) {
         try {
-          await WebPushClientService.ensureSubscribed(dio);
+          await WebPushClientService.ensureSubscribed(
+            dio,
+            runtimePolicySnapshot: runtimePolicySnapshot,
+          );
         } catch (_) {}
       }
       try {

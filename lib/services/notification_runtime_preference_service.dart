@@ -14,19 +14,25 @@ class NotificationRuntimePolicy {
   final bool messagePreviewEnabled;
   final bool soundEnabled;
   final bool showWhenActive;
+  final Map<String, bool> categories;
+  final Map<String, bool> channels;
 
   const NotificationRuntimePolicy({
     required this.enabled,
     required this.messagePreviewEnabled,
     required this.soundEnabled,
     required this.showWhenActive,
+    this.categories = const <String, bool>{},
+    this.channels = const <String, bool>{},
   });
 
   const NotificationRuntimePolicy.defaults()
     : enabled = true,
       messagePreviewEnabled = true,
       soundEnabled = true,
-      showWhenActive = false;
+      showWhenActive = false,
+      categories = const <String, bool>{},
+      channels = const <String, bool>{};
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
@@ -34,6 +40,8 @@ class NotificationRuntimePolicy {
       'message_preview_enabled': messagePreviewEnabled,
       'sound_enabled': soundEnabled,
       'show_when_active': showWhenActive,
+      'categories': categories,
+      'channels': channels,
     };
   }
 
@@ -42,6 +50,8 @@ class NotificationRuntimePolicy {
     bool? messagePreviewEnabled,
     bool? soundEnabled,
     bool? showWhenActive,
+    Map<String, bool>? categories,
+    Map<String, bool>? channels,
   }) {
     return NotificationRuntimePolicy(
       enabled: enabled ?? this.enabled,
@@ -49,6 +59,8 @@ class NotificationRuntimePolicy {
           messagePreviewEnabled ?? this.messagePreviewEnabled,
       soundEnabled: soundEnabled ?? this.soundEnabled,
       showWhenActive: showWhenActive ?? this.showWhenActive,
+      categories: categories ?? this.categories,
+      channels: channels ?? this.channels,
     );
   }
 
@@ -59,19 +71,65 @@ class NotificationRuntimePolicy {
       messagePreviewEnabled: source['message_preview_enabled'] != false,
       soundEnabled: source['sound_enabled'] != false,
       showWhenActive: source['show_when_active'] == true,
+      categories: _boolMap(source['categories']),
+      channels: _boolMap(source['channels']),
     );
+  }
+
+  static Map<String, bool> _boolMap(dynamic raw) {
+    if (raw is! Map) return const <String, bool>{};
+    final source = Map<dynamic, dynamic>.from(raw);
+    final result = <String, bool>{};
+    for (final entry in source.entries) {
+      final key = entry.key.toString().trim().toLowerCase();
+      if (key.isEmpty) continue;
+      result[key] = entry.value == true;
+    }
+    return result;
   }
 
   static NotificationRuntimePolicy fromServerPreferences(
     Map<String, dynamic> data, {
     required bool enabled,
   }) {
+    final categories = _boolMap(data['categories']);
+    final channels = _boolMap(data['channels']);
     return NotificationRuntimePolicy(
       enabled: enabled,
       messagePreviewEnabled: data['message_preview_enabled'] != false,
       soundEnabled: data['sound_enabled'] != false,
       showWhenActive: data['show_when_active'] == true,
+      categories: categories,
+      channels: channels,
     );
+  }
+
+  bool get serverAllowsRuntime {
+    if (categories.isEmpty) return true;
+    final hasCategory = categories.values.any((value) => value == true);
+    if (!hasCategory) return false;
+    if (channels.isEmpty) return true;
+    return channels['push'] == true || channels['in_app'] == true;
+  }
+
+  bool channelEnabled(String rawChannel) {
+    if (channels.isEmpty) return true;
+    final channel = rawChannel.trim().toLowerCase();
+    return channels[channel] != false;
+  }
+
+  bool categoryEnabled(String rawCategory) {
+    if (categories.isEmpty) return true;
+    final category = rawCategory.trim().toLowerCase();
+    return categories[category] != false;
+  }
+
+  bool shouldPresentInAppCategory(String rawCategory) {
+    return enabled && channelEnabled('in_app') && categoryEnabled(rawCategory);
+  }
+
+  bool shouldUsePushCategory(String rawCategory) {
+    return enabled && channelEnabled('push') && categoryEnabled(rawCategory);
   }
 }
 
@@ -124,14 +182,14 @@ class NotificationRuntimePreferenceService {
     try {
       final decoded = jsonDecode(raw);
       if (decoded is Map<String, dynamic>) {
-        return NotificationRuntimePolicy.fromJson(
-          decoded,
-        ).copyWith(enabled: enabled);
+        final policy = NotificationRuntimePolicy.fromJson(decoded);
+        return policy.copyWith(enabled: enabled && policy.serverAllowsRuntime);
       }
       if (decoded is Map) {
-        return NotificationRuntimePolicy.fromJson(
+        final policy = NotificationRuntimePolicy.fromJson(
           Map<String, dynamic>.from(decoded),
-        ).copyWith(enabled: enabled);
+        );
+        return policy.copyWith(enabled: enabled && policy.serverAllowsRuntime);
       }
     } catch (_) {}
     return const NotificationRuntimePolicy.defaults().copyWith(
@@ -148,16 +206,14 @@ class NotificationRuntimePreferenceService {
   }
 
   static bool deriveEnabledFromServerPreferences(Map<String, dynamic> data) {
-    final categories = data['categories'] is Map
-        ? Map<String, dynamic>.from(data['categories'] as Map)
-        : const <String, dynamic>{};
-    final channels = data['channels'] is Map
-        ? Map<String, dynamic>.from(data['channels'] as Map)
-        : const <String, dynamic>{};
-    return channels.values.any((value) => value == true) ||
-        categories.values.any((value) => value == true) ||
-        data['promo_opt_in'] == true ||
-        data['updates_opt_in'] != false;
+    final categories = NotificationRuntimePolicy._boolMap(data['categories']);
+    if (categories.isEmpty) return true;
+    if (categories.values.any((value) => value == true)) {
+      final channels = NotificationRuntimePolicy._boolMap(data['channels']);
+      if (channels.isEmpty) return true;
+      return channels['push'] == true || channels['in_app'] == true;
+    }
+    return false;
   }
 
   static Future<NotificationRuntimePolicy> refreshServerPolicy(
@@ -174,10 +230,11 @@ class NotificationRuntimePreferenceService {
         final data = root is Map && root['data'] is Map
             ? Map<String, dynamic>.from(root['data'])
             : const <String, dynamic>{};
-        final enabled = await isEnabledForUser(userId);
+        final localEnabled = await isEnabledForUser(userId);
+        final serverEnabled = deriveEnabledFromServerPreferences(data);
         final policy = NotificationRuntimePolicy.fromServerPreferences(
           data,
-          enabled: enabled,
+          enabled: localEnabled && serverEnabled,
         );
         await persistPolicyForUser(userId, policy);
         return policy;
@@ -225,11 +282,12 @@ class NotificationRuntimePreferenceService {
     String? userId,
   }) async {
     final policy = await getCachedPolicyForUser(userId);
+    final effectivePolicy = policy.copyWith(enabled: enabled && policy.enabled);
     await NotificationCoordinatorService.reconcile(
       dio,
-      enabled: enabled,
+      enabled: effectivePolicy.enabled,
       userId: userId,
-      runtimePolicySnapshot: policy.toJson(),
+      runtimePolicySnapshot: effectivePolicy.toJson(),
     );
   }
 

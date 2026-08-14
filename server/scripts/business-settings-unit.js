@@ -470,6 +470,207 @@ function testNotificationInboxDedupeIsAtomic() {
   );
 }
 
+function testNotificationQueuePushDeliveryInvariants() {
+  const queueSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/notificationQueue.js"),
+    "utf8",
+  );
+  const notificationsSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/notifications.js"),
+    "utf8",
+  );
+  const webPushSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/webPush.js"),
+    "utf8",
+  );
+  const webPushRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/webPush.js"),
+    "utf8",
+  );
+  const nativePushSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/nativePush.js"),
+    "utf8",
+  );
+  const webPushClient = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/web_push_client_service_web.dart"),
+    "utf8",
+  );
+  const webPushFacade = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/web_push_client_service.dart"),
+    "utf8",
+  );
+  const notificationCoordinator = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/notification_coordinator_service.dart"),
+    "utf8",
+  );
+  const mainSource = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/main.dart"),
+    "utf8",
+  );
+
+  assert.match(queueSource, /function upsertSkippedPushDelivery/);
+  assert.match(queueSource, /function dailyFrequencyCapForPushPolicy/);
+  assert.match(queueSource, /function shouldSkipForDailyFrequencyCap/);
+  assert.match(queueSource, /countNonUrgentEventsForToday/);
+  assert.match(queueSource, /beforeOrAt: item\.created_at \|\| null/);
+  assert.match(queueSource, /reason: "frequency_cap"/);
+  assert.match(queueSource, /AND subscription IS NOT NULL/);
+  assert.match(queueSource, /web_updates_disabled/);
+  assert.match(queueSource, /SUCCESS_DELIVERY_STATES/);
+  assert.match(queueSource, /if \(SUCCESS_DELIVERY_STATES\.has\(resultState\)\)/);
+  assert.match(queueSource, /e\.user_id AS endpoint_user_id/);
+  assert.match(queueSource, /cleanString\(context\.endpoint_user_id\) !== cleanString\(context\.user_id\)/);
+  assert.match(queueSource, /endpoint_missing_inactive_or_reassigned/);
+  assert.match(queueSource, /const endpointRuntimeEnabled = runtimePolicy\.enabled !== false/);
+  assert.match(queueSource, /function endpointRuntimePushGate/);
+  assert.match(queueSource, /endpoint_push_channel_disabled/);
+  assert.match(queueSource, /endpoint_category_disabled/);
+  assert.match(queueSource, /notifications\.normalizeCategory\(context\.category, "support"\)/);
+  assert.match(queueSource, /endpoint_permission_not_granted/);
+  assert.match(queueSource, /endpoint_push_target_missing/);
+  assert.doesNotMatch(
+    queueSource,
+    /markEndpointSuccess\(context\.endpoint_id,\s*cleanString\(normalizedResult\.state\)[\s\S]{0,80}\|\|\s*"skipped"/,
+  );
+  assert.match(notificationsSource, /const shouldCountChat =/);
+  assert.match(
+    notificationsSource,
+    /const chatUnreadCount = shouldCountChat\s*\?\s*await computeChatUnreadCount\(userId\)\s*:\s*0/,
+  );
+  assert.match(notificationsSource, /function clientNotificationMasterEnabled/);
+  assert.match(notificationsSource, /booleanMapHasEnabled\(preferences\.categories, \["chat", "support", "promo"\]\)/);
+  assert.doesNotMatch(notificationsSource, /function clientNotificationMasterEnabled[\s\S]{0,220}preferences\.channels/);
+  assert.doesNotMatch(notificationsSource, /function clientNotificationMasterEnabled[\s\S]{0,220}updates_opt_in/);
+  assert.match(notificationsSource, /function notificationCategoryEnabledForBadge/);
+  assert.match(notificationsSource, /isClientRole\(user\.role\) && !clientNotificationMasterEnabled\(preferences\)/);
+  assert.match(notificationsSource, /const inboxUnreadCount = clientNotificationsDisabled[\s\S]{0,120}\? 0/);
+  assert.match(notificationsSource, /notificationCategoryEnabledForBadge\(preferences, "chat"\)/);
+  assert.match(notificationsSource, /countNonUrgentEventsForToday\(userId, category, \{ beforeOrAt = null \} = \{\}\)/);
+  assert.match(notificationsSource, /countNonUrgentEventsForToday,/);
+  assert.match(notificationsSource, /COALESCE\(c\.settings->>'direct_request_status', ''\) <> 'declined'/);
+  assert.match(notificationsSource, /COALESCE\(c\.settings->'blacklisted_user_ids', '\[\]'::jsonb\) \? \$2::text/);
+  assert.match(notificationsSource, /COALESCE\(\(app_runtime_policy->>'enabled'\)::boolean, true\) = true/);
+  assert.match(webPushSource, /permission_state = 'granted'/);
+  assert.match(webPushSource, /COALESCE\(\(app_runtime_policy->>'enabled'\)::boolean, true\) = true/);
+  assert.match(webPushSource, /LEFT JOIN notification_endpoints ne/);
+  assert.match(webPushSource, /ne\.is_active = true/);
+  assert.match(webPushSource, /function endpointAllowsPushPayload/);
+  assert.match(webPushSource, /endpoint_push_channel_disabled/);
+  assert.match(webPushSource, /endpoint_category_disabled/);
+  assert.match(webPushSource, /const gate = endpointAllowsPushPayload\(row, payload\)/);
+  assert.match(webPushSource, /const gate = endpointAllowsPushPayload\(endpoint, payload\)/);
+  assert.match(webPushSource, /UPDATE notification_endpoints[\s\S]{0,260}transport = 'webpush'/);
+  assert.match(webPushRoute, /appRuntimePolicy: req\.body\?\.app_runtime_policy/);
+  assert.match(nativePushSource, /function endpointAllowsPushPayload/);
+  assert.match(nativePushSource, /endpoint_push_channel_disabled/);
+  assert.match(nativePushSource, /endpoint_category_disabled/);
+  assert.match(nativePushSource, /const gate = endpointAllowsPushPayload\(endpoint, payload\)/);
+  assert.match(webPushSource, /appRuntimePolicy = null/);
+  assert.match(webPushSource, /syncLegacyWebPushEndpoint\({[\s\S]{0,220}appRuntimePolicy/);
+  assert.match(notificationsSource, /async function syncLegacyWebPushEndpoint\({[\s\S]{0,160}appRuntimePolicy = null/);
+  assert.match(notificationsSource, /enabled: runtimePolicy\.enabled !== false/);
+  assert.match(notificationsSource, /const runtimeCategories = normalizeJsonMap\(runtimePolicy\.categories\)/);
+  assert.match(notificationsSource, /const runtimeChannels = normalizeJsonMap\(runtimePolicy\.channels\)/);
+  assert.match(notificationsSource, /categories: runtimeCategories/);
+  assert.match(notificationsSource, /channels: runtimeChannels/);
+  assert.match(webPushFacade, /runtimePolicySnapshot/);
+  assert.match(webPushFacade, /_ensureSubscribedInFlightKey/);
+  assert.match(webPushFacade, /while \(true\)/);
+  assert.match(webPushFacade, /await inFlight/);
+  assert.match(webPushFacade, /jsonEncode\(Map<String, dynamic>\.fromEntries\(sortedEntries\)\)/);
+  assert.match(webPushFacade, /then\(\(_\) => impl\.unsubscribe\(dio\)\)/);
+  assert.match(webPushClient, /runtimePolicySnapshot/);
+  assert.match(webPushClient, /'app_runtime_policy': \?runtimePolicySnapshot/);
+  assert.match(webPushClient, /permission_not_granted/);
+  assert.match(webPushClient, /await unsubscribe\(dio\)/);
+  assert.match(webPushClient, /payload == null[\s\S]{0,80}_syncWindowBadge\(0\)/);
+  assert.match(notificationCoordinator, /ensureSubscribed\([\s\S]{0,120}runtimePolicySnapshot: runtimePolicySnapshot/);
+  assert.match(mainSource, /Future<void> reconcileCurrentNotificationRuntime\(\)/);
+  assert.match(mainSource, /unawaited\(reconcileCurrentNotificationRuntime\(\)\)/);
+}
+
+function testAndroidNotificationPermissionStateIsTracked() {
+  const mainActivity = fs.readFileSync(
+    path.resolve(
+      __dirname,
+      "../../android/app/src/main/kotlin/com/garphoenix/projectphoenix/MainActivity.kt",
+    ),
+    "utf8",
+  );
+  const updateInstaller = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/native_update_installer.dart"),
+    "utf8",
+  );
+  const updateInstallerIo = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/native_update_installer_io.dart"),
+    "utf8",
+  );
+  const nativePush = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/native_push_service.dart"),
+    "utf8",
+  );
+  const deviceService = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/services/notification_device_service.dart"),
+    "utf8",
+  );
+  const mainShell = fs.readFileSync(
+    path.resolve(__dirname, "../../lib/screens/main_shell.dart"),
+    "utf8",
+  );
+
+  assert.match(mainActivity, /PREF_NOTIFICATION_PERMISSION_REQUESTED/);
+  assert.match(mainActivity, /"notificationPermissionState"/);
+  assert.match(mainActivity, /return if \(requested\) "denied" else "default"/);
+  assert.match(updateInstaller, /static Future<String> notificationPermissionState\(\)/);
+  assert.match(updateInstallerIo, /invokeMethod<String>\(\s*'notificationPermissionState'/);
+  assert.match(nativePush, /static Future<String> permissionState\(\)/);
+  assert.match(nativePush, /return NativeUpdateInstaller\.notificationPermissionState\(\)/);
+  assert.match(nativePush, /static Map<String, dynamic> _runtimePolicyMap/);
+  assert.match(nativePush, /'categories': _runtimePolicyMap\(source\['categories'\]\)/);
+  assert.match(nativePush, /'channels': _runtimePolicyMap\(source\['channels'\]\)/);
+  assert.match(nativePush, /rememberBackgroundMessagePayload\(RemoteMessage message\)/);
+  assert.match(
+    nativePush,
+    /nativePushBackgroundMessageHandler[\s\S]{0,220}rememberBackgroundMessagePayload\(message\)/,
+  );
+  assert.doesNotMatch(
+    nativePush,
+    /nativePushBackgroundMessageHandler[\s\S]{0,220}showForegroundNotificationFromMessage\(message\)/,
+  );
+  assert.match(deviceService, /return NativeUpdateInstaller\.notificationPermissionState\(\)/);
+  assert.match(deviceService, /static Map<String, dynamic> _runtimePolicyMap/);
+  assert.match(deviceService, /'categories': _runtimePolicyMap\(source\['categories'\]\)/);
+  assert.match(deviceService, /'channels': _runtimePolicyMap\(source\['channels'\]\)/);
+  assert.match(mainShell, /final state = await NativePushService\.permissionState\(\)/);
+  assert.match(mainShell, /String\? _webNotificationFirstPromptedUserId/);
+  assert.doesNotMatch(
+    mainShell,
+    /prefs\.getBool\(seenKey\) == true[\s\S]{0,240}showDialog<bool>/,
+  );
+  assert.doesNotMatch(
+    mainShell,
+    /prefs\.getBool\(seenKey\) == true[\s\S]{0,240}NativePushService\.ensurePermissionInContext/,
+  );
+}
+
+function testChatDeleteMaintainsUnreadAnchors() {
+  const chatsSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/chats.js"),
+    "utf8",
+  );
+
+  assert.match(chatsSource, /async function retargetChatStateBeforeMessageDelete/);
+  assert.match(chatsSource, /last_read_message_id = CASE[\s\S]{0,120}last_read_message_id = \$2/);
+  assert.match(chatsSource, /last_seen_message_id = CASE[\s\S]{0,120}last_seen_message_id = \$2/);
+  assert.match(chatsSource, /scroll_anchor_message_id = CASE[\s\S]{0,120}scroll_anchor_message_id = \$2/);
+  assert.match(chatsSource, /async function emitChatBadgeSnapshots/);
+  assert.match(chatsSource, /computeNotificationBadgeSnapshot\(userId\)/);
+  assert.match(chatsSource, /emitToUser\(io, userId, "notification:badge"/);
+  assert.match(chatsSource, /await emitChatBadgeSnapshots\(req\.app\.get\("io"\), chatId, \[userId\]\)/);
+  assert.match(chatsSource, /await retargetChatStateBeforeMessageDelete\([\s\S]{0,120}message\.created_at/);
+  assert.match(chatsSource, /await emitChatBadgeSnapshots\(io, chatId\)/);
+}
+
 function testManualRevisionUsesManualShelfKeys() {
   const source = fs.readFileSync(
     path.resolve(__dirname, "../src/routes/worker.js"),
@@ -1666,6 +1867,9 @@ testSocketRecoveryAlwaysReauthenticatesTenantScope();
 testSocketChatRoomJoinLeaveAreIdempotent();
 testFlutterSocketReconnectsWithFreshAuthToken();
 testNotificationInboxDedupeIsAtomic();
+testNotificationQueuePushDeliveryInvariants();
+testAndroidNotificationPermissionStateIsTracked();
+testChatDeleteMaintainsUnreadAnchors();
 testManualRevisionUsesManualShelfKeys();
 testProductDescriptionOptionalProjectWide();
 testClientCancelAnytimeHandlesDeliveryBatchLinks();

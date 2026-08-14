@@ -61,8 +61,7 @@ class NotificationDeviceService {
     }
 
     if (defaultTargetPlatform == TargetPlatform.android) {
-      final allowed = await NativeUpdateInstaller.canPostNotifications();
-      return allowed ? 'granted' : 'denied';
+      return NativeUpdateInstaller.notificationPermissionState();
     }
 
     return 'unknown';
@@ -107,7 +106,15 @@ class NotificationDeviceService {
       'message_preview_enabled': source['message_preview_enabled'] != false,
       'sound_enabled': source['sound_enabled'] != false,
       'show_when_active': source['show_when_active'] == true,
+      'categories': _runtimePolicyMap(source['categories']),
+      'channels': _runtimePolicyMap(source['channels']),
     };
+  }
+
+  static Map<String, dynamic> _runtimePolicyMap(dynamic raw) {
+    if (raw is Map<String, dynamic>) return Map<String, dynamic>.from(raw);
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return const <String, dynamic>{};
   }
 
   static Future<void> _syncCurrentEndpointNow(

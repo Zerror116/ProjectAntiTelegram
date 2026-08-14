@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:dio/dio.dart';
 
 import 'web_push_client_service_stub.dart'
@@ -24,16 +26,45 @@ class WebPushClientService {
   static bool get isSupported => impl.isSupported();
 
   static Future<WebPushSyncResult>? _ensureSubscribedInFlight;
+  static String? _ensureSubscribedInFlightKey;
   static Future<void>? _syncUnreadBadgeInFlight;
 
-  static Future<WebPushSyncResult> ensureSubscribed(Dio dio) {
-    final inFlight = _ensureSubscribedInFlight;
-    if (inFlight != null) return inFlight;
-    final future = impl.ensureSubscribed(dio);
+  static String _runtimePolicySnapshotKey(
+    Map<String, dynamic>? runtimePolicySnapshot,
+  ) {
+    if (runtimePolicySnapshot == null) return '';
+    final sortedEntries = runtimePolicySnapshot.entries.toList()
+      ..sort((left, right) => left.key.compareTo(right.key));
+    return jsonEncode(Map<String, dynamic>.fromEntries(sortedEntries));
+  }
+
+  static Future<WebPushSyncResult> ensureSubscribed(
+    Dio dio, {
+    Map<String, dynamic>? runtimePolicySnapshot,
+  }) async {
+    final key = _runtimePolicySnapshotKey(runtimePolicySnapshot);
+    while (true) {
+      final inFlight = _ensureSubscribedInFlight;
+      if (inFlight == null) break;
+      if (_ensureSubscribedInFlightKey == key) {
+        return inFlight;
+      }
+      try {
+        await inFlight;
+      } catch (_) {
+        // The next call below will retry with the latest runtime policy.
+      }
+    }
+    final future = impl.ensureSubscribed(
+      dio,
+      runtimePolicySnapshot: runtimePolicySnapshot,
+    );
     _ensureSubscribedInFlight = future;
+    _ensureSubscribedInFlightKey = key;
     future.whenComplete(() {
       if (identical(_ensureSubscribedInFlight, future)) {
         _ensureSubscribedInFlight = null;
+        _ensureSubscribedInFlightKey = null;
       }
     });
     return future;
@@ -57,6 +88,19 @@ class WebPushClientService {
   }
 
   static Future<void> unsubscribe(Dio dio) {
+    final inFlight = _ensureSubscribedInFlight;
+    if (inFlight != null) {
+      return inFlight
+          .catchError(
+            (_) => const WebPushSyncResult(
+              supported: false,
+              enabledOnServer: false,
+              subscribed: false,
+              reason: 'ignored',
+            ),
+          )
+          .then((_) => impl.unsubscribe(dio));
+    }
     return impl.unsubscribe(dio);
   }
 

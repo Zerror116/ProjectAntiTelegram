@@ -3470,6 +3470,83 @@ async function getChatUnreadCount(chatId, userId) {
   return Number(result.rows[0]?.unread_count || 0);
 }
 
+async function retargetChatStateBeforeMessageDelete(chatId, messageId, createdAt) {
+  const previousQ = await db.query(
+    `SELECT id
+       FROM messages
+      WHERE chat_id = $1
+        AND id <> $2
+        AND (
+          created_at < $3::timestamptz
+          OR (created_at = $3::timestamptz AND id < $2::uuid)
+        )
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    [chatId, messageId, createdAt],
+  );
+  const previousMessageId = previousQ.rows[0]?.id || null;
+  const updatedQ = await db.query(
+    `UPDATE user_chat_state
+        SET last_read_message_id = CASE
+              WHEN last_read_message_id = $2 THEN $3::uuid
+              ELSE last_read_message_id
+            END,
+            last_seen_message_id = CASE
+              WHEN last_seen_message_id = $2 THEN $3::uuid
+              ELSE last_seen_message_id
+            END,
+            scroll_anchor_message_id = CASE
+              WHEN scroll_anchor_message_id = $2 THEN $3::uuid
+              ELSE scroll_anchor_message_id
+            END,
+            updated_at = now()
+      WHERE chat_id = $1
+        AND (
+          last_read_message_id = $2
+          OR last_seen_message_id = $2
+          OR scroll_anchor_message_id = $2
+        )
+      RETURNING user_id::text AS user_id`,
+    [chatId, messageId, previousMessageId],
+  );
+  return updatedQ.rows.map((row) => String(row.user_id || "").trim()).filter(Boolean);
+}
+
+async function emitChatBadgeSnapshots(io, chatId, userIds = null) {
+  if (!io) return;
+  const explicitUserIds = Array.isArray(userIds)
+    ? Array.from(new Set(userIds.map((value) => String(value || "").trim()).filter(Boolean)))
+    : [];
+  const rows = explicitUserIds.length > 0
+    ? explicitUserIds.map((userId) => ({ user_id: userId }))
+    : (
+        await db.query(
+          `SELECT DISTINCT user_id::text AS user_id
+             FROM chat_members
+            WHERE chat_id = $1`,
+          [chatId],
+        )
+      ).rows;
+  for (const row of rows) {
+    const userId = String(row.user_id || "").trim();
+    if (!userId) continue;
+    try {
+      const badgeSnapshot = await computeNotificationBadgeSnapshot(userId);
+      emitToUser(io, userId, "notification:badge", {
+        unread_count: badgeSnapshot.unread_count,
+        inbox_unread_count: badgeSnapshot.inbox_unread_count,
+        chat_unread_count: badgeSnapshot.chat_unread_count,
+      });
+    } catch (err) {
+      console.warn("chat badge snapshot after delete skipped", {
+        chat_id: chatId,
+        user_id: userId,
+        message: err?.message || String(err),
+      });
+    }
+  }
+}
+
 async function loadPlatformDiscussionsChatForList(req) {
   const userId = String(req.user?.id || "").trim();
   const role = String(req.user?.base_role || req.user?.role || "")
@@ -7399,6 +7476,7 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
          WHERE id = $1`,
         [messageId, String(userId)],
       );
+      await emitChatBadgeSnapshots(req.app.get("io"), chatId, [userId]);
       return res.json({
         ok: true,
         data: {
@@ -7439,6 +7517,11 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
       });
     }
 
+    await retargetChatStateBeforeMessageDelete(
+      chatId,
+      messageId,
+      message.created_at,
+    );
     const deleted = await db.query(
       `DELETE FROM messages
        WHERE id = $1 AND chat_id = $2
@@ -7465,6 +7548,7 @@ router.delete("/:chatId/messages/:messageId", requireAuth, async (req, res) => {
         messageId,
       });
       emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      await emitChatBadgeSnapshots(io, chatId);
     }
 
     return res.json({
@@ -7544,6 +7628,7 @@ router.delete("/:chatId/messages", requireAuth, async (req, res) => {
     if (io) {
       io.to(`chat:${chatId}`).emit("chat:cleared", { chatId });
       emitToTenant(io, req.user?.tenant_id || null, "chat:updated", { chatId });
+      await emitChatBadgeSnapshots(io, chatId);
     }
 
     return res.json({

@@ -129,7 +129,7 @@ const _androidSecuritySilentChannel = AndroidNotificationChannel(
 @pragma('vm:entry-point')
 Future<void> nativePushBackgroundMessageHandler(RemoteMessage message) async {
   await NativePushService.ensureInitializedForBackground();
-  await NativePushService.showForegroundNotificationFromMessage(message);
+  NativePushService.rememberBackgroundMessagePayload(message);
 }
 
 @pragma('vm:entry-point')
@@ -297,12 +297,10 @@ class NativePushService {
       if (!accepted) return false;
       final granted =
           await NativeUpdateInstaller.requestNotificationPermission();
-      if (granted) {
-        final localDio = _dio;
-        if (localDio != null) {
-          if (_endpointSyncEnabled) {
-            await syncCurrentEndpoint(localDio);
-          }
+      final localDio = _dio;
+      if (localDio != null) {
+        if (_endpointSyncEnabled) {
+          await syncCurrentEndpoint(localDio);
         }
       }
       return granted;
@@ -367,6 +365,12 @@ class NativePushService {
     return granted;
   }
 
+  static Future<String> permissionState() async {
+    if (!isSupported) return 'unsupported';
+    await _ensureFirebaseInitialized();
+    return _permissionState();
+  }
+
   static String _defaultDeviceProfile() {
     if (kIsWeb) return 'constrained';
     switch (defaultTargetPlatform) {
@@ -393,7 +397,15 @@ class NativePushService {
       'message_preview_enabled': source['message_preview_enabled'] != false,
       'sound_enabled': source['sound_enabled'] != false,
       'show_when_active': source['show_when_active'] == true,
+      'categories': _runtimePolicyMap(source['categories']),
+      'channels': _runtimePolicyMap(source['channels']),
     };
+  }
+
+  static Map<String, dynamic> _runtimePolicyMap(dynamic raw) {
+    if (raw is Map<String, dynamic>) return Map<String, dynamic>.from(raw);
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return const <String, dynamic>{};
   }
 
   static Future<void> syncCurrentEndpoint(
@@ -502,6 +514,13 @@ class NativePushService {
     if (decoded == null) return;
     _pendingTapPayload = decoded;
     _pendingTapPayloadIsColdStart = coldStart;
+  }
+
+  static void rememberBackgroundMessagePayload(RemoteMessage message) {
+    final payload = _normalizeRemoteMessage(message);
+    if (payload == null) return;
+    _pendingTapPayload = payload;
+    _pendingTapPayloadIsColdStart = false;
   }
 
   static Future<void> showForegroundNotificationFromMessage(
@@ -644,8 +663,7 @@ class NativePushService {
 
   static Future<String> _permissionState() async {
     if (defaultTargetPlatform == TargetPlatform.android) {
-      final allowed = await NativeUpdateInstaller.canPostNotifications();
-      return allowed ? 'granted' : 'denied';
+      return NativeUpdateInstaller.notificationPermissionState();
     }
     if (!_firebaseReady) {
       return 'unknown';

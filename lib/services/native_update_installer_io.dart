@@ -121,6 +121,25 @@ Future<bool> canPostNotifications() async {
   return allowed ?? false;
 }
 
+Future<String> notificationPermissionState() async {
+  if (!Platform.isAndroid) return 'unsupported';
+  final state = await _androidUpdateInstallerChannel.invokeMethod<String>(
+    'notificationPermissionState',
+  );
+  final normalized = (state ?? '').trim().toLowerCase();
+  if (const <String>{
+    'default',
+    'denied',
+    'granted',
+    'provisional',
+    'unsupported',
+  }.contains(normalized)) {
+    return normalized;
+  }
+  final allowed = await canPostNotifications();
+  return allowed ? 'granted' : 'unknown';
+}
+
 Future<bool> requestNotificationPermission() async {
   if (!Platform.isAndroid) return false;
   final allowed = await _androidUpdateInstallerChannel.invokeMethod<bool>(

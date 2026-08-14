@@ -52,8 +52,6 @@ class _MainShellState extends State<MainShell> {
   static const String _iosHomeHintShownKey = 'web_ios_add_to_home_hint_seen_v2';
   static const String _webNotificationsBannerDismissedKey =
       'web_notifications_banner_dismissed_v1';
-  static const String _firstNotificationPromptSeenPrefix =
-      'first_notification_permission_prompt_seen_v1';
   int _index = 0;
   StreamSubscription<User?>? _authSub;
   String _lastEffectiveRole = '';
@@ -66,6 +64,7 @@ class _MainShellState extends State<MainShell> {
   bool _webNotificationBannerDismissed = false;
   bool _webNotificationRequestInProgress = false;
   bool _webNotificationFirstPromptInFlight = false;
+  String? _webNotificationFirstPromptedUserId;
   bool _nativeNotificationPromptInFlight = false;
   String? _nativeNotificationPromptedUserId;
   Timer? _supportQueueRefreshTimer;
@@ -108,6 +107,7 @@ class _MainShellState extends State<MainShell> {
       if (currentUser == null) {
         notificationBadgeCountNotifier.value = 0;
         chatUnreadBadgeCountNotifier.value = 0;
+        _webNotificationFirstPromptedUserId = null;
         _nativeNotificationPromptedUserId = null;
       } else {
         unawaited(_maybeShowFirstWebNotificationPrompt());
@@ -321,16 +321,14 @@ class _MainShellState extends State<MainShell> {
   Future<void> _syncNotificationRuntime() async {
     if (authService.currentUser == null) return;
     if (authService.isSessionDegraded) return;
-    await NotificationRuntimePreferenceService.refreshServerPolicy(
-      dio,
-      userId: authService.currentUser?.id,
-    );
-    final enabled = await NotificationRuntimePreferenceService.isEnabledForUser(
-      authService.currentUser?.id,
-    );
+    final policy =
+        await NotificationRuntimePreferenceService.refreshServerPolicy(
+          dio,
+          userId: authService.currentUser?.id,
+        );
     await NotificationRuntimePreferenceService.applyRuntimePreference(
       dio,
-      enabled: enabled,
+      enabled: policy.enabled,
       userId: authService.currentUser?.id,
     );
     await refreshNotificationBadgeCount();
@@ -453,30 +451,65 @@ class _MainShellState extends State<MainShell> {
           isStandalone: WebNotificationService.isStandaloneDisplayMode,
         );
       } else if (current == WebNotificationPermissionState.granted) {
-        await WebPushClientService.ensureSubscribed(dio);
-        final sent = await WebPushClientService.sendServerTestPush(dio);
-        if (sent <= 0) {
-          await WebNotificationService.showSystemNotification(
-            title: 'Проект Феникс',
-            body: 'Системные уведомления уже включены.',
-            tag: 'settings-test-notification',
+        final enabled =
+            await NotificationRuntimePreferenceService.isEnabledForUser(
+              authService.currentUser?.id,
+            );
+        if (!enabled) {
+          await WebPushClientService.unsubscribe(dio);
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            'Системное разрешение есть. Включите уведомления Феникса в настройках, чтобы получать push.',
+            tone: AppNoticeTone.info,
+          );
+        } else {
+          final policy =
+              await NotificationRuntimePreferenceService.getCachedPolicyForUser(
+                authService.currentUser?.id,
+              );
+          await WebPushClientService.ensureSubscribed(
+            dio,
+            runtimePolicySnapshot: policy.toJson(),
+          );
+          final sent = await WebPushClientService.sendServerTestPush(dio);
+          if (sent <= 0) {
+            await WebNotificationService.showSystemNotification(
+              title: 'Проект Феникс',
+              body: 'Системные уведомления уже включены.',
+              tag: 'settings-test-notification',
+            );
+          }
+          if (!mounted) return;
+          showAppNotice(
+            context,
+            sent > 0
+                ? 'Тестовый push отправлен с сервера'
+                : 'Тестовое уведомление отправлено',
+            tone: AppNoticeTone.success,
           );
         }
-        if (!mounted) return;
-        showAppNotice(
-          context,
-          sent > 0
-              ? 'Тестовый push отправлен с сервера'
-              : 'Тестовое уведомление отправлено',
-          tone: AppNoticeTone.success,
-        );
       } else {
         next = await WebNotificationService.requestPermission();
         if (!mounted) return;
         if (next == WebNotificationPermissionState.granted) {
-          await WebPushClientService.ensureSubscribed(dio);
-          final sent = await WebPushClientService.sendServerTestPush(dio);
-          if (sent <= 0) {
+          final enabled =
+              await NotificationRuntimePreferenceService.isEnabledForUser(
+                authService.currentUser?.id,
+              );
+          var sent = 0;
+          if (enabled) {
+            final policy =
+                await NotificationRuntimePreferenceService.getCachedPolicyForUser(
+                  authService.currentUser?.id,
+                );
+            await WebPushClientService.ensureSubscribed(
+              dio,
+              runtimePolicySnapshot: policy.toJson(),
+            );
+            sent = await WebPushClientService.sendServerTestPush(dio);
+          }
+          if (enabled && sent <= 0) {
             await WebNotificationService.showSystemNotification(
               title: 'Проект Феникс',
               body:
@@ -489,8 +522,10 @@ class _MainShellState extends State<MainShell> {
             context,
             sent > 0
                 ? 'Системные уведомления включены, тестовый push отправлен'
-                : 'Системные уведомления включены',
-            tone: AppNoticeTone.success,
+                : enabled
+                ? 'Системные уведомления включены'
+                : 'Системное разрешение включено. Уведомления Феникса можно включить в настройках.',
+            tone: enabled ? AppNoticeTone.success : AppNoticeTone.info,
           );
         } else {
           await showWebNotificationHelpSheet(
@@ -536,10 +571,6 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
-  String _firstNotificationPromptSeenKey(String userId) {
-    return '$_firstNotificationPromptSeenPrefix:$userId';
-  }
-
   Future<void> _maybeShowFirstWebNotificationPrompt() async {
     if (!kIsWeb) return;
     if (_webNotificationFirstPromptInFlight) return;
@@ -548,14 +579,12 @@ class _MainShellState extends State<MainShell> {
       if (_webNotificationRequestInProgress) return;
       final user = authService.currentUser;
       if (user == null || user.id.trim().isEmpty) return;
+      if (_webNotificationFirstPromptedUserId == user.id) return;
       final permission = await WebNotificationService.getPermissionState();
       if (permission != WebNotificationPermissionState.defaultState) return;
-      final prefs = await SharedPreferences.getInstance();
-      final seenKey = _firstNotificationPromptSeenKey(user.id);
-      if (prefs.getBool(seenKey) == true) return;
       if (!mounted) return;
 
-      await prefs.setBool(seenKey, true);
+      _webNotificationFirstPromptedUserId = user.id;
       if (!mounted) return;
       final accepted =
           await showDialog<bool>(
@@ -602,10 +631,11 @@ class _MainShellState extends State<MainShell> {
     _nativeNotificationPromptInFlight = true;
     _nativeNotificationPromptedUserId = user.id;
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final seenKey = _firstNotificationPromptSeenKey(user.id);
-      if (prefs.getBool(seenKey) == true) return;
-      await prefs.setBool(seenKey, true);
+      final state = await NativePushService.permissionState();
+      if (state == 'granted' || state == 'provisional') {
+        await _syncNotificationRuntime();
+        return;
+      }
       if (!mounted) return;
       final granted = await NativePushService.ensurePermissionInContext(
         context,

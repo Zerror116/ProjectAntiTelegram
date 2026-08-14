@@ -232,7 +232,10 @@ Future<void> _postBadgeSyncToWorker(int unreadCount) async {
   worker?.postMessage({'type': 'badge-sync', 'count': unreadCount});
 }
 
-Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
+Future<WebPushSyncResult> ensureSubscribed(
+  Dio dio, {
+  Map<String, dynamic>? runtimePolicySnapshot,
+}) async {
   _logWebPush('[web-push] ensureSubscribed: start');
   if (!isSupported()) {
     _logWebPush('[web-push] ensureSubscribed: unsupported');
@@ -247,6 +250,7 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
   final permission = await WebNotificationService.getPermissionState();
   _logWebPush('[web-push] ensureSubscribed: permission=$permission');
   if (permission != WebNotificationPermissionState.granted) {
+    await unsubscribe(dio);
     return const WebPushSyncResult(
       supported: true,
       enabledOnServer: false,
@@ -317,7 +321,10 @@ Future<WebPushSyncResult> ensureSubscribed(Dio dio) async {
   try {
     await dio.post(
       '/api/web-push/subscriptions',
-      data: {'subscription': payload},
+      data: {
+        'subscription': payload,
+        'app_runtime_policy': ?runtimePolicySnapshot,
+      },
     );
   } catch (e) {
     _logWebPush('[web-push] ensureSubscribed: sync_failed error=$e');
@@ -371,7 +378,7 @@ Future<void> unsubscribe(Dio dio) async {
   try {
     final payload = await _getPushSubscriptionPayload();
     if (payload == null) {
-      await _postBadgeSyncToWorker(0);
+      await _syncWindowBadge(0);
       return;
     }
     final endpoint = (payload['endpoint'] ?? '').toString().trim();

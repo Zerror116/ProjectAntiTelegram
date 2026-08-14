@@ -2,6 +2,12 @@ const db = require("../db");
 
 const MAX_DELIVERY_ATTEMPTS = 6;
 const STALE_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
+const SUCCESS_DELIVERY_STATES = new Set([
+  "provider_accepted",
+  "sent",
+  "delivered",
+  "opened",
+]);
 
 function cleanString(rawValue) {
   return String(rawValue || "").trim();
@@ -12,6 +18,71 @@ function normalizeJsonMap(raw, fallback = {}) {
     return { ...raw };
   }
   return { ...fallback };
+}
+
+function hasOwnBooleanFlag(map, key) {
+  return Object.prototype.hasOwnProperty.call(map, key) && typeof map[key] === "boolean";
+}
+
+function endpointRuntimePushGate(runtimePolicy = {}, category = "") {
+  const channels = normalizeJsonMap(runtimePolicy.channels);
+  if (hasOwnBooleanFlag(channels, "push") && channels.push !== true) {
+    return { allowed: false, reason: "endpoint_push_channel_disabled" };
+  }
+
+  const normalizedCategory = cleanString(category).toLowerCase();
+  if (normalizedCategory) {
+    const categories = normalizeJsonMap(runtimePolicy.categories);
+    if (
+      hasOwnBooleanFlag(categories, normalizedCategory) &&
+      categories[normalizedCategory] !== true
+    ) {
+      return { allowed: false, reason: "endpoint_category_disabled" };
+    }
+  }
+
+  return { allowed: true, reason: "allowed" };
+}
+
+function dailyFrequencyCapForPushPolicy(pushPolicy = {}, preferences = {}) {
+  const category = cleanString(pushPolicy.category).toLowerCase();
+  const priority = cleanString(pushPolicy.priority).toLowerCase();
+  if (pushPolicy.isDigestSummary === true) return null;
+  if (category === "promo") {
+    return preferences.frequency_caps?.promo_per_day;
+  }
+  if (category === "updates") {
+    return preferences.frequency_caps?.updates_per_day;
+  }
+  if (priority === "low") {
+    return preferences.frequency_caps?.low_priority_per_day;
+  }
+  return null;
+}
+
+async function shouldSkipForDailyFrequencyCap({
+  item,
+  user,
+  preferences,
+  pushPolicy,
+}) {
+  const payloadMeta = normalizeJsonMap(item?.payload);
+  if (pushPolicy?.category === "promo" && payloadMeta.test_only === true) {
+    return false;
+  }
+
+  const cap = dailyFrequencyCapForPushPolicy(pushPolicy, preferences);
+  if (cap === null || cap === undefined) return false;
+  const normalizedCap = Number(cap);
+  if (!Number.isFinite(normalizedCap) || normalizedCap < 0) return false;
+
+  const notifications = require("./notifications");
+  const todayCount = await notifications.countNonUrgentEventsForToday(
+    user.id,
+    pushPolicy.category,
+    { beforeOrAt: item.created_at || null },
+  );
+  return todayCount > normalizedCap;
 }
 
 function computeRetryDelayMs(attemptCount) {
@@ -35,6 +106,7 @@ async function listQueueableEndpointsForUser(userId) {
             transport = 'webpush'
             AND endpoint IS NOT NULL
             AND btrim(endpoint) <> ''
+            AND subscription IS NOT NULL
             AND permission_state = 'granted'
           )
           OR
@@ -137,6 +209,91 @@ async function upsertQueuedPushDelivery({
   return result.rows[0] || null;
 }
 
+async function upsertSkippedPushDelivery({
+  inboxItemId,
+  userId,
+  endpoint,
+  reason,
+  metadata = {},
+}) {
+  const endpointId = endpoint?.id || null;
+  if (!endpointId) return null;
+  const provider = cleanString(endpoint?.transport).toLowerCase() === "webpush"
+    ? "webpush"
+    : "fcm";
+  const transport = cleanString(endpoint?.transport).toLowerCase() || provider;
+  const deliveryKey = `push:${inboxItemId}:${endpointId}`;
+  const result = await db.query(
+    `INSERT INTO notification_deliveries (
+       inbox_item_id,
+       user_id,
+       endpoint_id,
+       channel,
+       provider,
+       transport,
+       delivery_key,
+       queue_name,
+       state,
+       error_message,
+       metadata,
+       attempt_count,
+       next_attempt_at,
+       updated_at
+     )
+     VALUES (
+       $1, $2, $3, 'push', $4, $5, $6, 'push', 'skipped', NULLIF($7, ''),
+       $8::jsonb, 0, NULL, now()
+     )
+     ON CONFLICT (inbox_item_id, endpoint_id, channel) WHERE endpoint_id IS NOT NULL
+     DO UPDATE
+       SET provider = EXCLUDED.provider,
+           transport = EXCLUDED.transport,
+           delivery_key = EXCLUDED.delivery_key,
+           state = CASE
+             WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
+               THEN notification_deliveries.state
+             ELSE 'skipped'
+           END,
+           error_message = CASE
+             WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
+               THEN notification_deliveries.error_message
+             ELSE EXCLUDED.error_message
+           END,
+           metadata = COALESCE(notification_deliveries.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+           next_attempt_at = CASE
+             WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
+               THEN notification_deliveries.next_attempt_at
+             ELSE NULL
+           END,
+           processing_started_at = CASE
+             WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
+               THEN notification_deliveries.processing_started_at
+             ELSE NULL
+           END,
+           worker_id = CASE
+             WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
+               THEN notification_deliveries.worker_id
+             ELSE NULL
+           END,
+           updated_at = now()
+     RETURNING *`,
+    [
+      inboxItemId,
+      userId,
+      endpointId,
+      provider,
+      transport,
+      deliveryKey,
+      cleanString(reason),
+      JSON.stringify({
+        reason: cleanString(reason),
+        ...normalizeJsonMap(metadata),
+      }),
+    ],
+  );
+  return result.rows[0] || null;
+}
+
 async function queuePushDeliveriesForItem({ item, user, preferences }) {
   const notifications = require("./notifications");
   const pushPolicy = notifications.evaluatePushEligibility(item, preferences);
@@ -151,6 +308,26 @@ async function queuePushDeliveriesForItem({ item, user, preferences }) {
       metadata: pushPolicy,
     });
     return { queued: 0, skipped: pushPolicy.reason || "push_disabled" };
+  }
+
+  if (
+    await shouldSkipForDailyFrequencyCap({
+      item,
+      user,
+      preferences,
+      pushPolicy,
+    })
+  ) {
+    await notifications.createNotificationDelivery({
+      inboxItemId: item.id,
+      userId: user.id,
+      channel: "push",
+      provider: null,
+      state: "skipped",
+      errorMessage: "",
+      metadata: { ...pushPolicy, reason: "frequency_cap" },
+    });
+    return { queued: 0, skipped: "frequency_cap" };
   }
 
   const endpoints = await listQueueableEndpointsForUser(user.id);
@@ -168,7 +345,26 @@ async function queuePushDeliveriesForItem({ item, user, preferences }) {
   }
 
   let queued = 0;
+  let skipped = 0;
+  const category = cleanString(item.category).toLowerCase();
   for (const endpoint of endpoints) {
+    const endpointTransport = cleanString(endpoint.transport).toLowerCase();
+    if (category === "updates" && endpointTransport === "webpush") {
+      await upsertSkippedPushDelivery({
+        inboxItemId: item.id,
+        userId: user.id,
+        endpoint,
+        reason: "web_updates_disabled",
+        metadata: {
+          category,
+          priority: cleanString(item.priority).toLowerCase(),
+          endpoint_transport: endpointTransport,
+          endpoint_platform: cleanString(endpoint.platform).toLowerCase(),
+        },
+      });
+      skipped += 1;
+      continue;
+    }
     await upsertQueuedPushDelivery({
       inboxItemId: item.id,
       userId: user.id,
@@ -182,7 +378,7 @@ async function queuePushDeliveriesForItem({ item, user, preferences }) {
     });
     queued += 1;
   }
-  return { queued, skipped: null };
+  return { queued, skipped: queued > 0 ? null : "no_queueable_push_endpoints", skipped_endpoints: skipped };
 }
 
 async function appendDeliveryAttempt({
@@ -430,6 +626,7 @@ async function loadDeliveryContext(deliveryId) {
             u.tenant_id AS user_tenant_id,
             e.platform,
             e.transport AS endpoint_transport,
+            e.user_id AS endpoint_user_id,
             e.device_key,
             e.push_token,
             e.endpoint,
@@ -475,18 +672,65 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
     });
   }
 
-  if (!context.endpoint_id || context.endpoint_is_active !== true) {
+  if (
+    !context.endpoint_id ||
+    context.endpoint_is_active !== true ||
+    cleanString(context.endpoint_user_id) !== cleanString(context.user_id)
+  ) {
     await appendDeliveryAttempt({
       delivery: context,
       provider,
       workerId,
       state: "disabled",
-      metadata: { reason: "endpoint_missing_or_inactive" },
+      metadata: { reason: "endpoint_missing_inactive_or_reassigned" },
     });
     return updateDeliveryTerminalState(context.id, {
       state: "skipped",
       provider,
-      metadata: { reason: "endpoint_missing_or_inactive" },
+      metadata: { reason: "endpoint_missing_inactive_or_reassigned" },
+    });
+  }
+
+  const endpointTransport = cleanString(context.endpoint_transport).toLowerCase();
+  const permissionState = cleanString(context.permission_state).toLowerCase();
+  const runtimePolicy = normalizeJsonMap(context.app_runtime_policy);
+  const endpointRuntimeEnabled = runtimePolicy.enabled !== false;
+  const endpointPermissionAllowed =
+    endpointTransport === "webpush"
+      ? permissionState === "granted"
+      : new Set(["granted", "provisional"]).has(permissionState);
+  const endpointHasPushTarget =
+    endpointTransport === "webpush"
+      ? cleanString(context.endpoint) && context.subscription
+      : cleanString(context.push_token);
+  const endpointRuntimePush = endpointRuntimePushGate(
+    runtimePolicy,
+    notifications.normalizeCategory(context.category, "support"),
+  );
+  if (
+    !endpointRuntimeEnabled ||
+    !endpointPermissionAllowed ||
+    !endpointHasPushTarget ||
+    !endpointRuntimePush.allowed
+  ) {
+    const reason = !endpointRuntimeEnabled
+      ? "endpoint_runtime_disabled"
+      : !endpointPermissionAllowed
+        ? "endpoint_permission_not_granted"
+        : !endpointHasPushTarget
+          ? "endpoint_push_target_missing"
+          : endpointRuntimePush.reason;
+    await appendDeliveryAttempt({
+      delivery: context,
+      provider,
+      workerId,
+      state: "skipped",
+      metadata: { reason },
+    });
+    return updateDeliveryTerminalState(context.id, {
+      state: "skipped",
+      provider,
+      metadata: { reason },
     });
   }
 
@@ -511,6 +755,29 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
       state: pushPolicy.state,
       provider,
       metadata: pushPolicy,
+    });
+  }
+
+  if (
+    await shouldSkipForDailyFrequencyCap({
+      item: context,
+      user,
+      preferences,
+      pushPolicy,
+    })
+  ) {
+    const frequencyCapMetadata = { ...pushPolicy, reason: "frequency_cap" };
+    await appendDeliveryAttempt({
+      delivery: context,
+      provider,
+      workerId,
+      state: "skipped",
+      metadata: frequencyCapMetadata,
+    });
+    return updateDeliveryTerminalState(context.id, {
+      state: "skipped",
+      provider,
+      metadata: frequencyCapMetadata,
     });
   }
 
@@ -578,12 +845,13 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
   }
 
   const normalizedResult = result && typeof result === "object" ? result : {};
+  const resultState = cleanString(normalizedResult.state).toLowerCase() || "skipped";
   const nextAttemptCount = Number(context.attempt_count || 0) + 1;
-  const transientFailure = cleanString(normalizedResult.state).toLowerCase() === "failed" &&
+  const transientFailure = resultState === "failed" &&
     !isPermanentDeliveryError(normalizedResult) &&
     nextAttemptCount < MAX_DELIVERY_ATTEMPTS;
 
-  if (cleanString(normalizedResult.state).toLowerCase() === "provider_accepted") {
+  if (resultState === "provider_accepted") {
     await appendDeliveryReceipt({
       deliveryId: context.id,
       inboxItemId: context.inbox_item_id,
@@ -598,12 +866,12 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
     delivery: context,
     provider,
     workerId,
-    state: cleanString(normalizedResult.state).toLowerCase() || "failed",
+    state: resultState,
     errorMessage: cleanString(normalizedResult.errorMessage),
     metadata: normalizedResult,
   });
 
-  if (cleanString(normalizedResult.state).toLowerCase() === "provider_accepted") {
+  if (resultState === "provider_accepted") {
     await markEndpointSuccess(context.endpoint_id, "provider_accepted");
     return updateDeliveryTerminalState(context.id, {
       state: "provider_accepted",
@@ -613,7 +881,7 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
     });
   }
 
-  if (cleanString(normalizedResult.state).toLowerCase() === "sent") {
+  if (resultState === "sent") {
     await markEndpointSuccess(context.endpoint_id, "sent");
     return updateDeliveryTerminalState(context.id, {
       state: "sent",
@@ -636,7 +904,7 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
     });
   }
 
-  if (cleanString(normalizedResult.state).toLowerCase() === "failed") {
+  if (resultState === "failed") {
     await markEndpointFailure(context.endpoint_id, normalizedResult.errorMessage, {
       deactivate: normalizedResult.deactivateEndpoint === true,
     });
@@ -648,9 +916,11 @@ async function processQueuedNotificationDelivery(delivery, { workerId = "" } = {
     });
   }
 
-  await markEndpointSuccess(context.endpoint_id, cleanString(normalizedResult.state).toLowerCase() || "skipped");
+  if (SUCCESS_DELIVERY_STATES.has(resultState)) {
+    await markEndpointSuccess(context.endpoint_id, resultState);
+  }
   return updateDeliveryTerminalState(context.id, {
-    state: cleanString(normalizedResult.state).toLowerCase() || "skipped",
+    state: resultState,
     provider,
     errorMessage: cleanString(normalizedResult.errorMessage),
     metadata: normalizedResult,
