@@ -37,6 +37,7 @@ import '../services/web_media_capture_permission_service.dart';
 import '../services/web_video_note_capture_service.dart';
 import '../src/utils/chat_api.dart';
 import '../src/utils/chat_image_preprocessor.dart';
+import '../src/utils/image_file_picker.dart';
 import '../src/utils/media_url.dart';
 import '../src/utils/messenger_ui_helpers.dart';
 import '../utils/date_time_utils.dart';
@@ -62,16 +63,83 @@ Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
   final path = (file.path ?? '').trim();
   if (path.isNotEmpty && !kIsWeb) {
     try {
-      return await File(path).readAsBytes();
+      return await File(
+        path,
+      ).readAsBytes().timeout(const Duration(seconds: 30));
     } catch (_) {
       return null;
     }
   }
   try {
-    return await file.readAsBytes();
+    return await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
   } catch (_) {
     return null;
   }
+}
+
+Future<Uint8List?> _readWebBlobBytesSafely(String blobUrl) async {
+  if (!kIsWeb) return null;
+  final url = blobUrl.trim();
+  if (url.isEmpty) return null;
+  const retryDelays = <Duration>[
+    Duration.zero,
+    Duration(milliseconds: 60),
+    Duration(milliseconds: 160),
+    Duration(milliseconds: 320),
+  ];
+  final blobDio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 2),
+      sendTimeout: const Duration(seconds: 2),
+      receiveTimeout: const Duration(seconds: 6),
+    ),
+  );
+  for (var attempt = 0; attempt < retryDelays.length; attempt++) {
+    final delay = retryDelays[attempt];
+    if (delay > Duration.zero) {
+      await Future<void>.delayed(delay);
+    }
+    try {
+      final bytes = await XFile(
+        url,
+      ).readAsBytes().timeout(const Duration(seconds: 6));
+      if (bytes.isNotEmpty) {
+        return bytes;
+      }
+    } catch (e) {
+      debugPrint('readWebBlobBytes XFile attempt ${attempt + 1} error: $e');
+    }
+    try {
+      final resp = await blobDio
+          .get<List<int>>(
+            url,
+            options: Options(responseType: ResponseType.bytes),
+          )
+          .timeout(const Duration(seconds: 8));
+      final data = resp.data;
+      if (data != null && data.isNotEmpty) {
+        return Uint8List.fromList(data);
+      }
+    } catch (e) {
+      debugPrint('readWebBlobBytes Dio attempt ${attempt + 1} error: $e');
+    }
+  }
+  return null;
+}
+
+Future<Uint8List?> _readXFileBytesSafely(XFile file) async {
+  try {
+    final bytes = await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
+    if (bytes.isNotEmpty) return bytes;
+  } catch (e) {
+    debugPrint('readXFileBytes error: $e');
+  }
+  if (!kIsWeb) return null;
+  return _readWebBlobBytesSafely(file.path);
 }
 
 class _ChatUploadFile {
@@ -212,6 +280,8 @@ class _ChatScreenState extends State<ChatScreen>
   bool _pinLoading = false;
   bool _hasDraftText = false;
   bool _offlineSyncBusy = false;
+  Future<void>? _offlineQueueCountRefreshInFlight;
+  bool _offlineQueueCountRefreshPending = false;
   bool _persistentOutboxFlushInFlight = false;
   bool _persistentOutboxFlushPending = false;
   bool _persistentOutboxPendingIncludeErrored = false;
@@ -4867,7 +4937,31 @@ class _ChatScreenState extends State<ChatScreen>
     return 'В этом чате отправка сообщений недоступна';
   }
 
-  Future<void> _refreshOfflineQueueCount() async {
+  Future<void> _refreshOfflineQueueCount() {
+    final inFlight = _offlineQueueCountRefreshInFlight;
+    if (inFlight != null) {
+      _offlineQueueCountRefreshPending = true;
+      return inFlight;
+    }
+
+    late final Future<void> future;
+    future = _runOfflineQueueCountRefreshLoop().whenComplete(() {
+      if (identical(_offlineQueueCountRefreshInFlight, future)) {
+        _offlineQueueCountRefreshInFlight = null;
+      }
+    });
+    _offlineQueueCountRefreshInFlight = future;
+    return future;
+  }
+
+  Future<void> _runOfflineQueueCountRefreshLoop() async {
+    do {
+      _offlineQueueCountRefreshPending = false;
+      await _refreshOfflineQueueCountOnce();
+    } while (_offlineQueueCountRefreshPending);
+  }
+
+  Future<void> _refreshOfflineQueueCountOnce() async {
     if (!mounted) return;
     if (!_isClientRole()) {
       if (_offlineQueuedCount != 0) {
@@ -4883,6 +4977,13 @@ class _ChatScreenState extends State<ChatScreen>
         tenantCode: authService.currentUser?.tenantCode,
       );
       if (!mounted) return;
+      final activeUserId = authService.currentUser?.id.trim() ?? '';
+      if (activeUserId != userId) {
+        if (activeUserId.isNotEmpty) {
+          _offlineQueueCountRefreshPending = true;
+        }
+        return;
+      }
       if (nextCount != _offlineQueuedCount) {
         setState(() => _offlineQueuedCount = nextCount);
       }
@@ -6044,8 +6145,8 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Future<_ChatUploadFile?> _chatUploadFromPickedImage(XFile picked) async {
-    final bytes = await picked.readAsBytes();
-    if (bytes.isEmpty) return null;
+    final bytes = await _readXFileBytesSafely(picked);
+    if (bytes == null || bytes.isEmpty) return null;
     final filename = picked.name.trim().isNotEmpty
         ? picked.name.trim()
         : picked.path.split('/').last;
@@ -6067,7 +6168,7 @@ class _ChatScreenState extends State<ChatScreen>
       return _chatUploadFromPickedImage(picked);
     }
 
-    final picked = await FilePicker.pickFile(type: FileType.image);
+    final picked = await pickSingleImageFile();
     if (picked == null) return null;
     final bytes = await _readPickedPlatformFileBytes(picked);
     if (bytes == null || bytes.isEmpty) return null;
@@ -6191,7 +6292,7 @@ class _ChatScreenState extends State<ChatScreen>
     if ((bytes == null || bytes.isEmpty) &&
         !kIsWeb &&
         (rawUpload.path ?? '').trim().isNotEmpty) {
-      bytes = Uint8List.fromList(await XFile(rawUpload.path!).readAsBytes());
+      bytes = await _readXFileBytesSafely(XFile(rawUpload.path!));
     }
     if (bytes == null || bytes.isEmpty) return null;
 
@@ -6238,7 +6339,7 @@ class _ChatScreenState extends State<ChatScreen>
 
     final picked = await _imagePicker.pickVideo(source: source);
     if (picked == null) return null;
-    final bytes = kIsWeb ? await picked.readAsBytes() : null;
+    final bytes = kIsWeb ? await _readXFileBytesSafely(picked) : null;
     return _ChatUploadFile(
       filename: picked.name.isNotEmpty
           ? picked.name
@@ -6264,11 +6365,11 @@ class _ChatScreenState extends State<ChatScreen>
     if (path.isEmpty) {
       throw Exception('Не удалось прочитать файл для отправки');
     }
-    final read = await XFile(path).readAsBytes();
-    if (read.isEmpty) {
+    final read = await _readXFileBytesSafely(XFile(path));
+    if (read == null || read.isEmpty) {
       throw Exception('Файл пустой');
     }
-    return Uint8List.fromList(read);
+    return read;
   }
 
   String _sha256Hex(Uint8List bytes) {
@@ -6694,8 +6795,8 @@ class _ChatScreenState extends State<ChatScreen>
         if (pickedImages.isEmpty) return const <_AttachmentPickedUpload>[];
         final uploads = <_AttachmentPickedUpload>[];
         for (final picked in pickedImages) {
-          final bytes = await picked.readAsBytes();
-          if (bytes.isEmpty) continue;
+          final bytes = await _readXFileBytesSafely(picked);
+          if (bytes == null || bytes.isEmpty) continue;
           final filename = picked.name.trim().isNotEmpty
               ? picked.name.trim()
               : picked.path.split('/').last.trim();
@@ -6719,14 +6820,19 @@ class _ChatScreenState extends State<ChatScreen>
             ),
           );
         }
+        if (uploads.isEmpty) {
+          throw StateError('Selected image files are unreadable');
+        }
         return uploads;
       } catch (e) {
         debugPrint('pick attachment images with ImagePicker failed: $e');
+        if (e.toString().contains('Selected image files are unreadable')) {
+          rethrow;
+        }
       }
     }
 
-    final result = await FilePicker.pickFiles(type: FileType.image);
-    final files = result?.files ?? const <PlatformFile>[];
+    final files = await pickImageFiles();
     final uploads = <_AttachmentPickedUpload>[];
     for (final picked in files) {
       final path = (picked.path ?? '').trim();
@@ -6753,6 +6859,9 @@ class _ChatScreenState extends State<ChatScreen>
           previewBytes: bytes,
         ),
       );
+    }
+    if (files.isNotEmpty && uploads.isEmpty) {
+      throw StateError('Selected image files are unreadable');
     }
     return uploads;
   }
@@ -6841,7 +6950,7 @@ class _ChatScreenState extends State<ChatScreen>
     final filename = xfile.name.trim().isNotEmpty
         ? xfile.name.trim()
         : 'camera-${DateTime.now().millisecondsSinceEpoch}.jpg';
-    final bytes = kIsWeb ? await xfile.readAsBytes() : null;
+    final bytes = kIsWeb ? await _readXFileBytesSafely(xfile) : null;
     return _AttachmentPickedUpload(
       id: 'camera-photo-${DateTime.now().microsecondsSinceEpoch}',
       kind: 'image',
@@ -6904,11 +7013,7 @@ class _ChatScreenState extends State<ChatScreen>
           .difference(startedAt ?? DateTime.now())
           .inMilliseconds;
       final mimeType = (xfile.mimeType ?? '').trim();
-      Uint8List? bytes;
-      if (kIsWeb) {
-        bytes =
-            await _readWebBlobBytes(xfile.path) ?? await xfile.readAsBytes();
-      }
+      final bytes = kIsWeb ? await _readXFileBytesSafely(xfile) : null;
       final filename = xfile.name.trim().isNotEmpty
           ? xfile.name.trim()
           : 'camera-video-${DateTime.now().millisecondsSinceEpoch}.${_videoExtensionForMime(mimeType)}';
@@ -7002,7 +7107,7 @@ class _ChatScreenState extends State<ChatScreen>
       builder: (sheetContext) => _ChatAttachmentGallerySheet(
         title: 'Недавние',
         desktopMode: _preferFilePickerForImages,
-        autoStartCamera: !kIsWeb,
+        autoStartCamera: false,
         nativeMacCameraMode:
             NativeVideoNoteCaptureService.shouldUseNativeCapture,
         loadRecent: _loadAttachmentRecentGallery,
@@ -7505,42 +7610,7 @@ class _ChatScreenState extends State<ChatScreen>
   }
 
   Future<Uint8List?> _readWebBlobBytes(String blobUrl) async {
-    if (!kIsWeb) return null;
-    final url = blobUrl.trim();
-    if (url.isEmpty) return null;
-    const retryDelays = <Duration>[
-      Duration.zero,
-      Duration(milliseconds: 60),
-      Duration(milliseconds: 160),
-      Duration(milliseconds: 320),
-    ];
-    for (var attempt = 0; attempt < retryDelays.length; attempt++) {
-      final delay = retryDelays[attempt];
-      if (delay > Duration.zero) {
-        await Future<void>.delayed(delay);
-      }
-      try {
-        final bytes = await XFile(url).readAsBytes();
-        if (bytes.isNotEmpty) {
-          return bytes;
-        }
-      } catch (e) {
-        debugPrint('readWebBlobBytes XFile attempt ${attempt + 1} error: $e');
-      }
-      try {
-        final resp = await Dio().get<List<int>>(
-          url,
-          options: Options(responseType: ResponseType.bytes),
-        );
-        final data = resp.data;
-        if (data != null && data.isNotEmpty) {
-          return Uint8List.fromList(data);
-        }
-      } catch (e) {
-        debugPrint('readWebBlobBytes Dio attempt ${attempt + 1} error: $e');
-      }
-    }
-    return null;
+    return _readWebBlobBytesSafely(blobUrl);
   }
 
   cam.CameraDescription? _preferredFrontCamera() {
@@ -8001,9 +8071,8 @@ class _ChatScreenState extends State<ChatScreen>
       }
       if (kIsWeb) {
         final mimeType = xfile.mimeType?.trim();
-        final bytes =
-            await _readWebBlobBytes(xfile.path) ?? await xfile.readAsBytes();
-        if (bytes.isEmpty) {
+        final bytes = await _readXFileBytesSafely(xfile);
+        if (bytes == null || bytes.isEmpty) {
           if (!mounted) return;
           showAppNotice(
             context,
@@ -10455,10 +10524,17 @@ class _ChatScreenState extends State<ChatScreen>
       _serverSearchLoading = true;
     }
     try {
-      final resp = await authService.dio.get(
-        '/api/chats/${widget.chatId}/search',
-        queryParameters: {'q': query},
-      );
+      final resp = await authService.dio
+          .get(
+            '/api/chats/${widget.chatId}/search',
+            queryParameters: {'q': query},
+            options: Options(
+              connectTimeout: const Duration(seconds: 8),
+              sendTimeout: const Duration(seconds: 8),
+              receiveTimeout: const Duration(seconds: 12),
+            ),
+          )
+          .timeout(const Duration(seconds: 14));
       final data = resp.data;
       final results =
           (data is Map && data['ok'] == true && data['data'] is List)
@@ -18089,7 +18165,7 @@ class _ChatAttachmentGallerySheetState
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        'Запускается сразу при открытии скрепки.',
+                        'Включается только по нажатию.',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                           fontWeight: FontWeight.w700,
@@ -18113,7 +18189,7 @@ class _ChatAttachmentGallerySheetState
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Запускается сразу при открытии скрепки.',
+                  'Включается только по нажатию.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                     fontWeight: FontWeight.w700,
@@ -18953,11 +19029,12 @@ class _DiscussionChatSettingsSheetState
         if (mounted) setState(() => _saving = false);
         return;
       }
+      final pickedBytes = kIsWeb ? await _readXFileBytesSafely(picked) : null;
+      if (kIsWeb && (pickedBytes == null || pickedBytes.isEmpty)) {
+        throw Exception('Браузер не отдал данные фото');
+      }
       final multipart = kIsWeb
-          ? MultipartFile.fromBytes(
-              await picked.readAsBytes(),
-              filename: picked.name,
-            )
+          ? MultipartFile.fromBytes(pickedBytes!, filename: picked.name)
           : await MultipartFile.fromFile(picked.path, filename: picked.name);
       final response = await authService.dio.post(
         '/api/chats/${widget.chatId}/discussion-settings/avatar',

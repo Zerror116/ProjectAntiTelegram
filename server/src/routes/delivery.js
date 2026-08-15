@@ -2320,7 +2320,13 @@ async function collectEligibleCustomers(queryable, tenantId = null) {
      FROM cart_items c
      JOIN products p ON p.id = c.product_id
      JOIN users u ON u.id = c.user_id
-     LEFT JOIN phones ph ON ph.user_id = c.user_id
+     LEFT JOIN LATERAL (
+       SELECT phone
+       FROM phones ph
+       WHERE ph.user_id = c.user_id
+       ORDER BY ph.verified_at DESC NULLS LAST, ph.created_at DESC NULLS LAST
+       LIMIT 1
+     ) ph ON true
      LEFT JOIN user_shelves us ON us.user_id = c.user_id
      LEFT JOIN LATERAL (
        SELECT a.id, a.address_text, a.lat, a.lng,
@@ -4049,7 +4055,13 @@ router.post(
            FROM cart_items c
            JOIN products p ON p.id = c.product_id
            JOIN users u ON u.id = c.user_id
-           LEFT JOIN phones ph ON ph.user_id = c.user_id
+           LEFT JOIN LATERAL (
+             SELECT phone
+             FROM phones ph
+             WHERE ph.user_id = c.user_id
+             ORDER BY ph.verified_at DESC NULLS LAST, ph.created_at DESC NULLS LAST
+             LIMIT 1
+           ) ph ON true
            LEFT JOIN user_shelves us ON us.user_id = c.user_id
            LEFT JOIN delivery_batch_items dbi ON dbi.cart_item_id = c.id
            LEFT JOIN delivery_batches dbt ON dbt.id = dbi.batch_id

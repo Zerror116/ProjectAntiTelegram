@@ -43,7 +43,9 @@ Future<html.ServiceWorkerRegistration?> _ensureImageWorkerRegistration() async {
   final workerUrl = _currentWorkerUrl();
   html.ServiceWorkerRegistration? existingRegistration;
   try {
-    final dynamic existing = await sw.getRegistration();
+    final dynamic existing = await sw.getRegistration().timeout(
+      const Duration(seconds: 3),
+    );
     if (existing != null) {
       existingRegistration = existing as html.ServiceWorkerRegistration;
     }
@@ -52,7 +54,7 @@ Future<html.ServiceWorkerRegistration?> _ensureImageWorkerRegistration() async {
   }
   try {
     if (!await _serviceWorkerScriptAvailable()) return existingRegistration;
-    return await sw.register(workerUrl);
+    return await sw.register(workerUrl).timeout(const Duration(seconds: 5));
   } catch (_) {
     return existingRegistration;
   }

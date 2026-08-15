@@ -10,12 +10,33 @@ import 'adaptive_network_image.dart';
 
 final Map<String, Size> _chatMessageImageSizeCache = <String, Size>{};
 final Set<String> _chatMessageImageRenderedUrls = <String>{};
+const int _chatMessageImageCacheLimit = 600;
+const Duration _chatMessageImageResolveTimeout = Duration(seconds: 12);
 
 String _resolvedChatImageUrl(String imageUrl) =>
     resolveMediaUrl(imageUrl, apiBaseUrl: dio.options.baseUrl) ?? imageUrl;
 
 Size? cachedChatMessageImageSize(String imageUrl) {
   return _chatMessageImageSizeCache[_resolvedChatImageUrl(imageUrl)];
+}
+
+void _rememberChatMessageImageSize(String resolvedUrl, Size size) {
+  if (_chatMessageImageSizeCache.containsKey(resolvedUrl)) {
+    _chatMessageImageSizeCache.remove(resolvedUrl);
+  } else if (_chatMessageImageSizeCache.length >= _chatMessageImageCacheLimit) {
+    _chatMessageImageSizeCache.remove(_chatMessageImageSizeCache.keys.first);
+  }
+  _chatMessageImageSizeCache[resolvedUrl] = size;
+}
+
+void _rememberChatMessageImageRendered(String resolvedUrl) {
+  if (_chatMessageImageRenderedUrls.contains(resolvedUrl)) {
+    _chatMessageImageRenderedUrls.remove(resolvedUrl);
+  } else if (_chatMessageImageRenderedUrls.length >=
+      _chatMessageImageCacheLimit) {
+    _chatMessageImageRenderedUrls.remove(_chatMessageImageRenderedUrls.first);
+  }
+  _chatMessageImageRenderedUrls.add(resolvedUrl);
 }
 
 Future<Size?> warmUpChatMessageImageSize(String imageUrl) async {
@@ -25,28 +46,49 @@ Future<Size?> warmUpChatMessageImageSize(String imageUrl) async {
 
   final completer = Completer<Size?>();
   final imageProvider = NetworkImage(resolvedUrl);
-  final stream = imageProvider.resolve(const ImageConfiguration());
+  ImageStream? stream;
   late final ImageStreamListener listener;
+  Timer? timeoutTimer;
+  var detached = false;
+
+  void detachListener() {
+    if (detached) return;
+    detached = true;
+    timeoutTimer?.cancel();
+    final activeStream = stream;
+    if (activeStream == null) return;
+    try {
+      activeStream.removeListener(listener);
+    } catch (_) {}
+  }
+
   listener = ImageStreamListener(
     (info, _) {
       final size = Size(
         info.image.width.toDouble(),
         info.image.height.toDouble(),
       );
-      _chatMessageImageSizeCache[resolvedUrl] = size;
+      _rememberChatMessageImageSize(resolvedUrl, size);
       if (!completer.isCompleted) completer.complete(size);
-      try {
-        stream.removeListener(listener);
-      } catch (_) {}
+      detachListener();
     },
     onError: (error, stackTrace) {
       if (!completer.isCompleted) completer.complete(null);
-      try {
-        stream.removeListener(listener);
-      } catch (_) {}
+      detachListener();
     },
   );
-  stream.addListener(listener);
+  try {
+    final resolvedStream = imageProvider.resolve(const ImageConfiguration());
+    stream = resolvedStream;
+    resolvedStream.addListener(listener);
+    timeoutTimer = Timer(_chatMessageImageResolveTimeout, () {
+      if (!completer.isCompleted) completer.complete(null);
+      detachListener();
+    });
+  } catch (_) {
+    if (!completer.isCompleted) completer.complete(null);
+    detachListener();
+  }
   return completer.future;
 }
 
@@ -85,6 +127,7 @@ class ChatMessageImage extends StatefulWidget {
 class _ChatMessageImageState extends State<ChatMessageImage> {
   ImageStream? _imageStream;
   ImageStreamListener? _imageStreamListener;
+  Timer? _imageResolveTimeoutTimer;
   Size? _intrinsicSize;
   bool _hasRenderedImage = false;
 
@@ -147,6 +190,8 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
         _imageStream = null;
         _imageStreamListener = null;
       }
+      _imageResolveTimeoutTimer?.cancel();
+      _imageResolveTimeoutTimer = null;
       try {
         stream.removeListener(listener);
       } catch (_) {}
@@ -158,7 +203,7 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
           info.image.width.toDouble(),
           info.image.height.toDouble(),
         );
-        _chatMessageImageSizeCache[resolvedUrl] = size;
+        _rememberChatMessageImageSize(resolvedUrl, size);
         detachCurrentListener();
         if (!mounted) return;
         setState(() => _intrinsicSize = size);
@@ -170,9 +215,15 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
     _imageStream = stream;
     _imageStreamListener = listener;
     stream.addListener(listener);
+    _imageResolveTimeoutTimer = Timer(
+      _chatMessageImageResolveTimeout,
+      detachCurrentListener,
+    );
   }
 
   void _removeImageStreamListener() {
+    _imageResolveTimeoutTimer?.cancel();
+    _imageResolveTimeoutTimer = null;
     final stream = _imageStream;
     final listener = _imageStreamListener;
     if (stream != null && listener != null) {
@@ -186,7 +237,7 @@ class _ChatMessageImageState extends State<ChatMessageImage> {
 
   void _markImageRendered() {
     final resolvedUrl = _resolvedChatImageUrl(widget.imageUrl);
-    _chatMessageImageRenderedUrls.add(resolvedUrl);
+    _rememberChatMessageImageRendered(resolvedUrl);
     if (_hasRenderedImage) {
       widget.onFramePainted?.call();
       return;

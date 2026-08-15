@@ -47,16 +47,42 @@
   <script>
     (async function resetPhoenixCache() {
       const status = document.getElementById('status');
+      const operationTimeoutMs = 2500;
       const setStatus = function (text) {
         if (status) status.textContent = text;
+      };
+      const withTimeout = function (promise, fallbackValue) {
+        return new Promise(function (resolve) {
+          let settled = false;
+          const timeoutId = window.setTimeout(function () {
+            finish(fallbackValue);
+          }, operationTimeoutMs);
+
+          function finish(value) {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timeoutId);
+            resolve(value);
+          }
+
+          Promise.resolve(promise).then(finish).catch(function () {
+            finish(fallbackValue);
+          });
+        });
       };
 
       try {
         if ('serviceWorker' in navigator) {
-          const registrations = await navigator.serviceWorker.getRegistrations();
-          await Promise.all(registrations.map(function (registration) {
-            return registration.unregister();
-          }));
+          const registrations = await withTimeout(
+            navigator.serviceWorker.getRegistrations(),
+            [],
+          );
+          await withTimeout(
+            Promise.all(registrations.map(function (registration) {
+              return registration.unregister();
+            })),
+            false,
+          );
         }
 
         setStatus('Готово. Открываем свежую сборку без удаления данных входа...');

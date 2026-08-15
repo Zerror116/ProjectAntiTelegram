@@ -17,26 +17,31 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../main.dart';
 import '../services/sticker_print_service.dart';
-import 'admin_promotion_center_screen.dart';
-import 'chat_screen.dart';
+import '../src/utils/image_file_picker.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/adaptive_network_image.dart';
 import '../widgets/delivery_address_picker_dialog.dart';
 import '../widgets/input_language_badge.dart';
+import 'admin_promotion_center_screen.dart';
+import 'chat_screen.dart';
 
 Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
   final path = (file.path ?? '').trim();
   if (path.isNotEmpty && !kIsWeb) {
     try {
-      return await File(path).readAsBytes();
+      return await File(
+        path,
+      ).readAsBytes().timeout(const Duration(seconds: 30));
     } catch (_) {
       return null;
     }
   }
   try {
-    return await file.readAsBytes();
+    return await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
   } catch (_) {
     return null;
   }
@@ -150,6 +155,8 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
   bool _dispatchingOrders = false;
   bool _avatarUpdating = false;
   bool _deliveryLoading = false;
+  bool _deliveryDashboardLoadInFlight = false;
+  bool _deliveryDashboardLoadQueued = false;
   bool _deliverySaving = false;
   bool _deliveryManualPhonesBusy = false;
   bool _supportLoading = false;
@@ -814,7 +821,9 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     required Offset offset,
     required double zoom,
   }) async {
-    final bytes = await File(sourcePath).readAsBytes();
+    final bytes = await File(
+      sourcePath,
+    ).readAsBytes().timeout(const Duration(seconds: 30));
     final decoded = img.decodeImage(bytes);
     if (decoded == null) {
       throw Exception('Не удалось прочитать изображение');
@@ -4415,6 +4424,11 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
       }
       return;
     }
+    if (_deliveryDashboardLoadInFlight) {
+      _deliveryDashboardLoadQueued = true;
+      return;
+    }
+    _deliveryDashboardLoadInFlight = true;
     if (mounted) {
       setState(() {
         _deliveryLoading = true;
@@ -4475,8 +4489,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
         setState(() => _message = 'Ошибка доставки: ${_extractDioError(e)}');
       }
     } finally {
+      _deliveryDashboardLoadInFlight = false;
       if (mounted) {
         setState(() => _deliveryLoading = false);
+      } else {
+        _deliveryLoading = false;
+      }
+      if (_deliveryDashboardLoadQueued) {
+        _deliveryDashboardLoadQueued = false;
+        if (mounted) {
+          unawaited(_loadDeliveryDashboard());
+        }
       }
     }
   }
@@ -7443,7 +7466,17 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     bool keepOriginalFile = false,
   }) async {
     final imageFile = File(filePath);
-    final sourceBytes = await imageFile.readAsBytes();
+    final Uint8List sourceBytes;
+    try {
+      sourceBytes = await imageFile.readAsBytes().timeout(
+        const Duration(seconds: 30),
+      );
+    } catch (_) {
+      if (mounted) {
+        setState(() => _message = 'Не удалось прочитать изображение');
+      }
+      return null;
+    }
     final source = img.decodeImage(sourceBytes);
     if (source == null) {
       if (mounted) {
@@ -7778,7 +7811,7 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     final systemKey = (settings['system_key'] ?? '').toString().trim();
     final isSystemChannel = systemKey.isNotEmpty;
 
-    final pickedFile = await FilePicker.pickFile(type: FileType.image);
+    final pickedFile = await pickSingleImageFile();
     if (pickedFile == null) return;
 
     if (kIsWeb) {

@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../main.dart';
+import '../src/utils/image_file_picker.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../widgets/adaptive_network_image.dart';
@@ -16,13 +17,17 @@ Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
   final path = (file.path ?? '').trim();
   if (path.isNotEmpty && !kIsWeb) {
     try {
-      return await File(path).readAsBytes();
+      return await File(
+        path,
+      ).readAsBytes().timeout(const Duration(seconds: 30));
     } catch (_) {
       return null;
     }
   }
   try {
-    return await file.readAsBytes();
+    return await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
   } catch (_) {
     return null;
   }
@@ -229,7 +234,7 @@ class _AdminPromotionCenterScreenState
 
   Future<void> _pickAndUploadPromotionImage() async {
     if (_imageUploading) return;
-    final pickedFile = await FilePicker.pickFile(type: FileType.image);
+    final pickedFile = await pickSingleImageFile();
     if (pickedFile == null) return;
 
     setState(() {

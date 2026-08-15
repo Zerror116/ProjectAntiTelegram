@@ -1047,19 +1047,16 @@ async function computeChatUnreadCount(userId) {
             )
             AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
             AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+            AND COALESCE(c.last_seq, 0) >
+                COALESCE(NULLIF(ucs.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
             AND (
               (
-                last_read_msg.id IS NOT NULL
-                AND (
-                  m.created_at > last_read_msg.created_at
-                  OR (
-                    m.created_at = last_read_msg.created_at
-                    AND m.id > last_read_msg.id
-                  )
-                )
+                COALESCE(NULLIF(ucs.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) > 0
+                AND m.chat_seq >
+                    COALESCE(NULLIF(ucs.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
               )
               OR (
-                last_read_msg.id IS NULL
+                COALESCE(NULLIF(ucs.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) = 0
                 AND cm.joined_at IS NOT NULL
                 AND m.created_at >= cm.joined_at
               )

@@ -1,6 +1,8 @@
 // ignore_for_file: deprecated_member_use, avoid_web_libraries_in_flutter
 
 import 'dart:html' as html;
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 
 bool isSupported() => html.Notification.supported;
 
@@ -51,6 +53,9 @@ Future<bool> showSystemNotification({
   if (permission != 'granted') return false;
 
   try {
+    if (silent) {
+      return _showSilentBrowserNotification(title: title, body: body, tag: tag);
+    }
     final notification = html.Notification(
       title,
       body: body ?? '',
@@ -64,4 +69,49 @@ Future<bool> showSystemNotification({
   } catch (_) {
     return false;
   }
+}
+
+bool _showSilentBrowserNotification({
+  required String title,
+  String? body,
+  String? tag,
+}) {
+  final constructor = globalContext.getProperty<JSFunction?>(
+    'Notification'.toJS,
+  );
+  if (constructor == null) {
+    final fallback = html.Notification(
+      title,
+      body: body ?? '',
+      tag: tag,
+      icon: 'icons/Icon-192.png',
+    );
+    fallback.onClick.listen((_) {
+      fallback.close();
+    });
+    return true;
+  }
+
+  final options = <String, JSAny?>{
+    'body': (body ?? '').toJS,
+    if ((tag ?? '').trim().isNotEmpty) 'tag': tag!.trim().toJS,
+    'icon': 'icons/Icon-192.png'.toJS,
+    'silent': true.toJS,
+  }.jsify()!;
+  final notification = constructor.callAsConstructor<JSObject>(
+    title.toJS,
+    options,
+  );
+  try {
+    notification.callMethod<JSAny?>(
+      'addEventListener'.toJS,
+      'click'.toJS,
+      ((JSAny? _) {
+        try {
+          notification.callMethod<JSAny?>('close'.toJS);
+        } catch (_) {}
+      }).toJS,
+    );
+  } catch (_) {}
+  return true;
 }

@@ -3,7 +3,6 @@
 const fs = require("fs");
 const path = require("path");
 const { execFileSync, execSync } = require("child_process");
-const { Pool } = require("pg");
 const db = require("../src/db");
 const {
   buildSecretKeyring,
@@ -1755,7 +1754,11 @@ async function checkTenantMigrationDrift() {
           totals.unavailable_targets += 1;
           continue;
         }
-        const pool = new Pool({ connectionString: dbUrl });
+        const pool = db.createPool(dbUrl, {
+          maintenance: true,
+          max: 1,
+          label: "nightly-audit-tenant",
+        });
         try {
           await inspectTarget({ pool, schemaName: "public", mode });
         } finally {

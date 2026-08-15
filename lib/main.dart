@@ -70,6 +70,8 @@ final ValueNotifier<int> notificationBadgeCountNotifier = ValueNotifier<int>(0);
 final ValueNotifier<int> chatUnreadBadgeCountNotifier = ValueNotifier<int>(0);
 final ValueNotifier<int> notificationInboxBadgeCountNotifier =
     ValueNotifier<int>(0);
+Future<void>? _notificationRuntimeReconcileInFlight;
+bool _notificationRuntimeReconcilePending = false;
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(
   ThemeMode.light,
 );
@@ -130,6 +132,8 @@ String? _socketBoundTokenFingerprint;
 String _lastConnectivityHint = '';
 bool _keyboardAssertRecoveredRecently = false;
 Timer? _webPushBadgeSyncTimer;
+Future<void>? _notificationBadgeRefreshInFlight;
+bool _notificationBadgeRefreshPending = false;
 DateTime? _lastSocketConnectedAt;
 DateTime? _lastSocketDisconnectedAt;
 String _lastSocketDisconnectReason = '';
@@ -871,6 +875,8 @@ final ValueNotifier<Set<String>> _supportQueueClaimBusyNotifier =
     ValueNotifier<Set<String>>(<String>{});
 final ValueNotifier<Set<String>> _supportQueueDismissedNotifier =
     ValueNotifier<Set<String>>(<String>{});
+Future<void>? _supportQueueRefreshInFlight;
+bool _supportQueueRefreshPending = false;
 final ValueNotifier<String> activeShellSectionNotifier = ValueNotifier<String>(
   '',
 );
@@ -1111,11 +1117,44 @@ Future<void> _openSupportQueueNoticeChat(
   unawaited(_refreshSupportQueueNotices());
 }
 
-Future<void> _refreshSupportQueueNotices() async {
+String _supportQueueRefreshScope() {
+  final userId = authService.currentUser?.id.trim() ?? '';
+  final role = authService.effectiveRole.trim().toLowerCase();
+  final tenantId = (authService.currentUser?.tenantId ?? '').trim();
+  final creatorScope = (authService.creatorTenantScopeCode ?? '').trim();
+  return '$userId|$role|$tenantId|$creatorScope';
+}
+
+Future<void> _refreshSupportQueueNotices() {
+  final inFlight = _supportQueueRefreshInFlight;
+  if (inFlight != null) {
+    _supportQueueRefreshPending = true;
+    return inFlight;
+  }
+
+  late final Future<void> future;
+  future = _runSupportQueueRefreshLoop().whenComplete(() {
+    if (identical(_supportQueueRefreshInFlight, future)) {
+      _supportQueueRefreshInFlight = null;
+    }
+  });
+  _supportQueueRefreshInFlight = future;
+  return future;
+}
+
+Future<void> _runSupportQueueRefreshLoop() async {
+  do {
+    _supportQueueRefreshPending = false;
+    await _refreshSupportQueueNoticesOnce();
+  } while (_supportQueueRefreshPending);
+}
+
+Future<void> _refreshSupportQueueNoticesOnce() async {
   if (!_canCurrentUserObserveSupportQueueAlerts()) {
     _clearSupportQueueNotices();
     return;
   }
+  final refreshScope = _supportQueueRefreshScope();
   try {
     final nextById = <String, _SupportQueueNoticePayload>{};
     final canClaim = _canCurrentUserClaimSupportQueueAlerts();
@@ -1169,8 +1208,16 @@ Future<void> _refreshSupportQueueNotices() async {
         if (claimableOrder != 0) return claimableOrder;
         return a.ticketId.compareTo(b.ticketId);
       });
+    if (_supportQueueRefreshScope() != refreshScope) {
+      _supportQueueRefreshPending = true;
+      return;
+    }
     _supportQueueNoticeNotifier.value = next;
   } on DioException catch (e) {
+    if (_supportQueueRefreshScope() != refreshScope) {
+      _supportQueueRefreshPending = true;
+      return;
+    }
     if (e.response?.statusCode == 403 || e.response?.statusCode == 401) {
       _clearSupportQueueNotices();
       return;
@@ -1446,37 +1493,71 @@ Future<void> refreshUserPreferences() async {
 }
 
 Future<void> setNotificationsEnabled(bool value) async {
+  final userId = authService.currentUser?.id.trim();
   await NotificationRuntimePreferenceService.persistEnabledForUser(
-    authService.currentUser?.id,
+    userId,
     value,
   );
   final policy =
-      await NotificationRuntimePreferenceService.getCachedPolicyForUser(
-        authService.currentUser?.id,
-      );
+      await NotificationRuntimePreferenceService.getCachedPolicyForUser(userId);
+  final activeUserId = authService.currentUser?.id.trim() ?? '';
+  if (activeUserId != (userId ?? '')) return;
   notificationsEnabledNotifier.value = policy.enabled;
-  if (authService.currentUser == null || authService.isSessionDegraded) return;
+  if (authService.isSessionDegraded) return;
   await NotificationRuntimePreferenceService.applyRuntimePreference(
     authService.dio,
     enabled: policy.enabled,
-    userId: authService.currentUser?.id,
+    userId: userId,
   );
 }
 
-Future<void> reconcileCurrentNotificationRuntime() async {
+Future<void> reconcileCurrentNotificationRuntime() {
+  final inFlight = _notificationRuntimeReconcileInFlight;
+  if (inFlight != null) {
+    _notificationRuntimeReconcilePending = true;
+    return inFlight;
+  }
+
+  late final Future<void> future;
+  future = _runNotificationRuntimeReconcileLoop().whenComplete(() {
+    if (identical(_notificationRuntimeReconcileInFlight, future)) {
+      _notificationRuntimeReconcileInFlight = null;
+    }
+  });
+  _notificationRuntimeReconcileInFlight = future;
+  return future;
+}
+
+Future<void> _runNotificationRuntimeReconcileLoop() async {
+  do {
+    _notificationRuntimeReconcilePending = false;
+    await _reconcileCurrentNotificationRuntimeOnce();
+  } while (_notificationRuntimeReconcilePending);
+}
+
+Future<void> _reconcileCurrentNotificationRuntimeOnce() async {
   final user = authService.currentUser;
   if (user == null || authService.isSessionDegraded) return;
+  final userId = user.id.trim();
+  if (userId.isEmpty) return;
   try {
     final policy =
         await NotificationRuntimePreferenceService.refreshServerPolicy(
           authService.dio,
-          userId: user.id,
+          userId: userId,
         );
+    final activeUserId = authService.currentUser?.id.trim() ?? '';
+    if (authService.isSessionDegraded || activeUserId != userId) {
+      if (activeUserId.isNotEmpty) {
+        _notificationRuntimeReconcilePending = true;
+      }
+      return;
+    }
     notificationsEnabledNotifier.value = policy.enabled;
     await NotificationRuntimePreferenceService.applyRuntimePreference(
       authService.dio,
       enabled: policy.enabled,
-      userId: user.id,
+      userId: userId,
     );
   } catch (error) {
     debugPrint('notification runtime reconcile skipped: $error');
@@ -2186,6 +2267,7 @@ Future<bool> _downloadAndInstallAndroidUpdate({
     const ManagedAndroidUpdateState.idle(),
   );
   Timer? poller;
+  var statusPollInFlight = false;
   var pendingInstallAfterPermission = false;
   var browserFallbackTriggeredByManagedFailure = false;
   var lastReportedStateKey = '';
@@ -2286,6 +2368,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
       ),
     );
     poller = Timer.periodic(const Duration(milliseconds: 750), (_) async {
+      if (statusPollInFlight) return;
+      statusPollInFlight = true;
       try {
         final state = await NativeUpdateInstaller.getManagedUpdateStatus();
         statusNotifier.value = state;
@@ -2341,6 +2425,8 @@ Future<bool> _downloadAndInstallAndroidUpdate({
         }
       } catch (_) {
         // ignore: polling should not crash update dialog
+      } finally {
+        statusPollInFlight = false;
       }
     });
 
@@ -4293,8 +4379,33 @@ void _setChatUnreadBadgeCount(int count) {
   chatUnreadBadgeCountNotifier.value = normalized;
 }
 
-Future<void> refreshNotificationBadgeCount() async {
-  if (authService.currentUser == null) {
+Future<void> refreshNotificationBadgeCount() {
+  final inFlight = _notificationBadgeRefreshInFlight;
+  if (inFlight != null) {
+    _notificationBadgeRefreshPending = true;
+    return inFlight;
+  }
+
+  late final Future<void> future;
+  future = _runNotificationBadgeRefreshLoop().whenComplete(() {
+    if (identical(_notificationBadgeRefreshInFlight, future)) {
+      _notificationBadgeRefreshInFlight = null;
+    }
+  });
+  _notificationBadgeRefreshInFlight = future;
+  return future;
+}
+
+Future<void> _runNotificationBadgeRefreshLoop() async {
+  do {
+    _notificationBadgeRefreshPending = false;
+    await _refreshNotificationBadgeCountOnce();
+  } while (_notificationBadgeRefreshPending);
+}
+
+Future<void> _refreshNotificationBadgeCountOnce() async {
+  final userId = authService.currentUser?.id.trim() ?? '';
+  if (userId.isEmpty) {
     _setNotificationBadgeCount(0);
     _setChatUnreadBadgeCount(0);
     _setNotificationInboxBadgeCount(0);
@@ -4302,6 +4413,13 @@ Future<void> refreshNotificationBadgeCount() async {
   }
   try {
     final response = await dio.get('/api/notifications/badge-count');
+    final activeUserId = authService.currentUser?.id.trim() ?? '';
+    if (activeUserId != userId) {
+      if (activeUserId.isNotEmpty) {
+        _notificationBadgeRefreshPending = true;
+      }
+      return;
+    }
     final root = response.data;
     final data = root is Map && root['data'] is Map
         ? Map<String, dynamic>.from(root['data'])
@@ -6215,9 +6333,6 @@ bool _restoredUserNeedsProfileCompletion(User? restoredUser) {
 
 Future<Widget> determineInitialScreen(bool dbReady) async {
   debugPrint('determineInitialScreen: dbReady=$dbReady');
-  if (kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
-    return const AuthScreen();
-  }
   if (_hasIncomingAuthActionFromUri()) {
     debugPrint('determineInitialScreen: incoming auth action -> AuthScreen');
     return const AuthScreen();

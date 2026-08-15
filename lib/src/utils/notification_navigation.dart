@@ -133,7 +133,24 @@ Future<Map<String, dynamic>?> _loadChatMeta(String chatId) async {
   } catch (_) {}
 
   try {
-    final response = await authService.dio.get('/api/chats');
+    final response = await authService.dio
+        .get(
+          '/api/chats',
+          queryParameters: kIsWeb
+              ? {'_ts': DateTime.now().millisecondsSinceEpoch}
+              : null,
+          options: Options(
+            headers: const {
+              'Cache-Control': 'no-cache, no-store, must-revalidate',
+              'Pragma': 'no-cache',
+              'Accept': 'application/json',
+            },
+            connectTimeout: const Duration(seconds: 8),
+            sendTimeout: const Duration(seconds: 8),
+            receiveTimeout: const Duration(seconds: 12),
+          ),
+        )
+        .timeout(const Duration(seconds: 14));
     final root = response.data;
     if (root is List) {
       for (final raw in root) {

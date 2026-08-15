@@ -12,6 +12,7 @@ import 'package:image_picker/image_picker.dart';
 
 import '../main.dart';
 import '../services/web_media_capture_permission_service.dart';
+import '../src/utils/image_file_picker.dart';
 import '../src/utils/media_url.dart';
 import '../utils/date_time_utils.dart';
 import '../utils/phone_utils.dart';
@@ -29,16 +30,83 @@ Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
   final path = (file.path ?? '').trim();
   if (path.isNotEmpty && !kIsWeb) {
     try {
-      return await File(path).readAsBytes();
+      return await File(
+        path,
+      ).readAsBytes().timeout(const Duration(seconds: 30));
     } catch (_) {
       return null;
     }
   }
   try {
-    return await file.readAsBytes();
+    return await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
   } catch (_) {
     return null;
   }
+}
+
+Future<Uint8List?> _readWebBlobBytesSafely(String blobUrl) async {
+  if (!kIsWeb) return null;
+  final url = blobUrl.trim();
+  if (url.isEmpty) return null;
+  const retryDelays = <Duration>[
+    Duration.zero,
+    Duration(milliseconds: 60),
+    Duration(milliseconds: 160),
+    Duration(milliseconds: 320),
+  ];
+  final blobDio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 2),
+      sendTimeout: const Duration(seconds: 2),
+      receiveTimeout: const Duration(seconds: 6),
+    ),
+  );
+  for (var attempt = 0; attempt < retryDelays.length; attempt++) {
+    final delay = retryDelays[attempt];
+    if (delay > Duration.zero) {
+      await Future<void>.delayed(delay);
+    }
+    try {
+      final bytes = await XFile(
+        url,
+      ).readAsBytes().timeout(const Duration(seconds: 6));
+      if (bytes.isNotEmpty) {
+        return bytes;
+      }
+    } catch (e) {
+      debugPrint('worker.readWebBlobBytes XFile attempt ${attempt + 1}: $e');
+    }
+    try {
+      final resp = await blobDio
+          .get<List<int>>(
+            url,
+            options: Options(responseType: ResponseType.bytes),
+          )
+          .timeout(const Duration(seconds: 8));
+      final data = resp.data;
+      if (data != null && data.isNotEmpty) {
+        return Uint8List.fromList(data);
+      }
+    } catch (e) {
+      debugPrint('worker.readWebBlobBytes Dio attempt ${attempt + 1}: $e');
+    }
+  }
+  return null;
+}
+
+Future<Uint8List?> _readXFileBytesSafely(XFile file) async {
+  try {
+    final bytes = await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
+    if (bytes.isNotEmpty) return bytes;
+  } catch (e) {
+    debugPrint('worker.readXFileBytes error: $e');
+  }
+  if (!kIsWeb) return null;
+  return _readWebBlobBytesSafely(file.path);
 }
 
 class WorkerPanel extends StatefulWidget {
@@ -126,6 +194,9 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool _loadingRevisionShelves = false;
   bool _loadingRevisionPosts = false;
   bool _loadingDeliveryDashboard = false;
+  bool _deliveryDashboardLoadInFlight = false;
+  bool _deliveryDashboardLoadQueued = false;
+  bool _deliveryDashboardQueuedSilent = true;
   bool _deliverySaving = false;
   bool _runningRevision = false;
   bool _autoHideOldRevisionPosts = true;
@@ -1057,11 +1128,7 @@ class _WorkerPanelState extends State<WorkerPanel>
     final picked = _pickedImage;
     Uint8List? sourceBytes = _pickedImageBytes;
     if ((sourceBytes == null || sourceBytes.isEmpty) && picked != null) {
-      try {
-        sourceBytes = await picked.readAsBytes();
-      } catch (_) {
-        sourceBytes = null;
-      }
+      sourceBytes = await _readXFileBytesSafely(picked);
     }
     if (sourceBytes == null || sourceBytes.isEmpty) {
       if (!mounted) return;
@@ -1127,7 +1194,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           );
         } catch (_) {}
         if (picked == null) {
-          final selected = await FilePicker.pickFile(type: FileType.image);
+          final selected = await pickSingleImageFile();
           final bytes = selected == null
               ? null
               : await _readPickedPlatformFileBytes(selected);
@@ -1141,7 +1208,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           _preferFilePickerForGallery) {
         if (kIsWeb) {
           // Web: read bytes directly from FilePicker to avoid revoked Blob URLs.
-          final selected = await FilePicker.pickFile(type: FileType.image);
+          final selected = await pickSingleImageFile();
           final bytes = selected == null
               ? null
               : await _readPickedPlatformFileBytes(selected);
@@ -1164,7 +1231,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
           try {
             if (picked == null) {
-              final selected = await FilePicker.pickFile(type: FileType.image);
+              final selected = await pickSingleImageFile();
               final path = selected?.path;
               if (path != null && path.isNotEmpty) {
                 picked = XFile(path, name: selected?.name ?? '');
@@ -1200,13 +1267,13 @@ class _WorkerPanelState extends State<WorkerPanel>
       if (preloadedBytes != null && preloadedBytes.isNotEmpty) {
         pickedBytes = preloadedBytes;
       } else {
-        try {
-          pickedBytes = await picked!.readAsBytes();
-        } catch (e) {
+        final readBytes = await _readXFileBytesSafely(picked!);
+        if (readBytes == null || readBytes.isEmpty) {
           if (!mounted) return;
-          setState(() => _message = 'Не удалось прочитать фото: $e');
+          setState(() => _message = 'Не удалось прочитать фото');
           return;
         }
+        pickedBytes = readBytes;
       }
       if (pickedBytes.isEmpty) {
         if (!mounted) return;
@@ -1289,8 +1356,8 @@ class _WorkerPanelState extends State<WorkerPanel>
     if (picked == null) return null;
 
     if (kIsWeb) {
-      final bytes = await picked.readAsBytes();
-      if (bytes.isEmpty) return null;
+      final bytes = await _readXFileBytesSafely(picked);
+      if (bytes == null || bytes.isEmpty) return null;
       return MultipartFile.fromBytes(bytes, filename: fileName);
     }
 
@@ -1336,7 +1403,7 @@ class _WorkerPanelState extends State<WorkerPanel>
           );
         } catch (_) {}
         if (picked == null) {
-          final selected = await FilePicker.pickFile(type: FileType.image);
+          final selected = await pickSingleImageFile();
           final bytes = selected == null
               ? null
               : await _readPickedPlatformFileBytes(selected);
@@ -1349,7 +1416,7 @@ class _WorkerPanelState extends State<WorkerPanel>
       } else if (effectiveSource == ImageSource.gallery &&
           _preferFilePickerForGallery) {
         if (kIsWeb) {
-          final selected = await FilePicker.pickFile(type: FileType.image);
+          final selected = await pickSingleImageFile();
           final bytes = selected == null
               ? null
               : await _readPickedPlatformFileBytes(selected);
@@ -1363,7 +1430,7 @@ class _WorkerPanelState extends State<WorkerPanel>
             picked = await _imagePicker.pickImage(source: ImageSource.gallery);
           } catch (_) {}
           if (picked == null) {
-            final selected = await FilePicker.pickFile(type: FileType.image);
+            final selected = await pickSingleImageFile();
             final path = selected?.path;
             if (path != null && path.isNotEmpty) {
               picked = XFile(path, name: selected?.name ?? '');
@@ -1385,7 +1452,7 @@ class _WorkerPanelState extends State<WorkerPanel>
 
       Uint8List? pickedBytes = preloadedBytes;
       if ((pickedBytes == null || pickedBytes.isEmpty) && picked != null) {
-        pickedBytes = await picked.readAsBytes();
+        pickedBytes = await _readXFileBytesSafely(picked);
       }
       if (pickedBytes == null || pickedBytes.isEmpty) {
         return null;
@@ -4383,6 +4450,12 @@ class _WorkerPanelState extends State<WorkerPanel>
       }
       return;
     }
+    if (_deliveryDashboardLoadInFlight) {
+      _deliveryDashboardLoadQueued = true;
+      _deliveryDashboardQueuedSilent = _deliveryDashboardQueuedSilent && silent;
+      return;
+    }
+    _deliveryDashboardLoadInFlight = true;
     if (mounted) {
       setState(() => _loadingDeliveryDashboard = true);
     }
@@ -4407,10 +4480,19 @@ class _WorkerPanelState extends State<WorkerPanel>
         );
       }
     } finally {
+      _deliveryDashboardLoadInFlight = false;
       if (mounted) {
         setState(() => _loadingDeliveryDashboard = false);
       } else {
         _loadingDeliveryDashboard = false;
+      }
+      if (_deliveryDashboardLoadQueued) {
+        final queuedSilent = _deliveryDashboardQueuedSilent;
+        _deliveryDashboardLoadQueued = false;
+        _deliveryDashboardQueuedSilent = true;
+        if (mounted) {
+          unawaited(_loadDeliveryDashboard(silent: queuedSilent));
+        }
       }
     }
   }

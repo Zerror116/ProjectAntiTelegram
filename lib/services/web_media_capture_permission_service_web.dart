@@ -78,7 +78,8 @@ String _currentStoredState() {
   final persistent = _normalizeStoredState(
     _readStorageValue(html.window.localStorage, _grantedStorageKey),
   );
-  if (persistent == 'granted_audio_video' || persistent == 'granted_audio_only') {
+  if (persistent == 'granted_audio_video' ||
+      persistent == 'granted_audio_only') {
     return persistent;
   }
 
@@ -92,8 +93,16 @@ String _currentStoredState() {
 }
 
 void _persistGrantedState(String grantedState) {
-  _writeStorageValue(html.window.localStorage, _grantedStorageKey, grantedState);
-  _writeStorageValue(html.window.sessionStorage, _sessionStorageKey, grantedState);
+  _writeStorageValue(
+    html.window.localStorage,
+    _grantedStorageKey,
+    grantedState,
+  );
+  _writeStorageValue(
+    html.window.sessionStorage,
+    _sessionStorageKey,
+    grantedState,
+  );
 }
 
 void _persistDeniedState() {
@@ -121,9 +130,7 @@ bool _looksLikeMissingDeviceError(Object error) {
       text.contains('overconstrained');
 }
 
-Future<String> _requestUserMedia({
-  required bool includeVideo,
-}) async {
+Future<String> _requestUserMedia({required bool includeVideo}) async {
   final navigator = js.context['navigator'];
   if (navigator == null) return 'unsupported';
   final mediaDevices = navigator['mediaDevices'];
@@ -142,7 +149,7 @@ Future<String> _requestUserMedia({
 
   final stream = await _jsPromiseToFuture(
     _asJsObject(mediaDevices).callMethod('getUserMedia', [constraints]),
-  );
+  ).timeout(const Duration(seconds: 12));
   try {
     final tracks = _asJsObject(stream).callMethod('getTracks') as js.JsArray;
     for (final track in tracks) {

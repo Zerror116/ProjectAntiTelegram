@@ -173,6 +173,16 @@ function parseBooleanEnv(rawValue, fallback = false) {
   return ["1", "true", "yes", "on", "y"].includes(normalized);
 }
 
+function parsePositiveIntegerEnv(name, fallback, { min = 0, max = 600000 } = {}) {
+  const rawValue = process.env[name];
+  const parsed =
+    rawValue === undefined || rawValue === null || rawValue === ""
+      ? Number(fallback)
+      : Number(rawValue);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
 const TRUST_PROXY_HOPS = Math.max(
   0,
   Number(
@@ -199,6 +209,26 @@ const APK_DOWNLOAD_ANDROID_ONLY = parseBooleanEnv(
 const REQUEST_LOGGING_ENABLED = parseBooleanEnv(
   process.env.REQUEST_LOGGING,
   !IS_PRODUCTION,
+);
+const HTTP_REQUEST_TIMEOUT_MS = parsePositiveIntegerEnv(
+  "HTTP_REQUEST_TIMEOUT_MS",
+  300000,
+  { min: 15000, max: 900000 },
+);
+const HTTP_HEADERS_TIMEOUT_MS = parsePositiveIntegerEnv(
+  "HTTP_HEADERS_TIMEOUT_MS",
+  65000,
+  { min: 5000, max: 120000 },
+);
+const HTTP_KEEP_ALIVE_TIMEOUT_MS = parsePositiveIntegerEnv(
+  "HTTP_KEEP_ALIVE_TIMEOUT_MS",
+  10000,
+  { min: 1000, max: 120000 },
+);
+const API_RESPONSE_TIMEOUT_MS = parsePositiveIntegerEnv(
+  "API_RESPONSE_TIMEOUT_MS",
+  IS_PRODUCTION ? 120000 : 0,
+  { min: 0, max: 600000 },
 );
 const MESSAGE_ENCRYPTION_STARTUP_BACKFILL_ENABLED = parseBooleanEnv(
   process.env.MESSAGE_ENCRYPTION_STARTUP_BACKFILL_ENABLED,
@@ -297,6 +327,21 @@ function sanitizeRequestPathForLog(req) {
   const pathOnly = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
   if (!method) return pathOnly || "/";
   return `${method} ${pathOnly || "/"}`;
+}
+
+function configureHttpServerTimeouts(server) {
+  const requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
+  const keepAliveTimeout = Math.min(
+    HTTP_KEEP_ALIVE_TIMEOUT_MS,
+    Math.max(1000, requestTimeout - 2000),
+  );
+  const headersTimeout = Math.max(
+    keepAliveTimeout + 1000,
+    Math.min(HTTP_HEADERS_TIMEOUT_MS, requestTimeout),
+  );
+  server.requestTimeout = requestTimeout;
+  server.keepAliveTimeout = keepAliveTimeout;
+  server.headersTimeout = headersTimeout;
 }
 
 const corsOptions = {
@@ -473,8 +518,50 @@ app.use(
 
 app.use((req, res, next) => {
   const originalJson = res.json.bind(res);
-  res.json = (payload) =>
-    originalJson(rewriteSignedUploadsInPayload(payload, { req }));
+  res.json = (payload) => {
+    if (res.headersSent || res.writableEnded) return res;
+    return originalJson(rewriteSignedUploadsInPayload(payload, { req }));
+  };
+  next();
+});
+
+app.use((req, res, next) => {
+  if (API_RESPONSE_TIMEOUT_MS <= 0) return next();
+  if (!String(req.path || "").startsWith("/api")) return next();
+  res.setTimeout(API_RESPONSE_TIMEOUT_MS, () => {
+    const requestLabel = sanitizeRequestPathForLog(req);
+    console.warn(
+      `SERVER REQ TIMEOUT ${requestLabel} after ${API_RESPONSE_TIMEOUT_MS}ms`,
+    );
+    void logMonitoringEvent({
+      queryable: db,
+      tenantId: req.user?.tenant_id || null,
+      userId: req.user?.id || null,
+      scope: "http",
+      subsystem: "api",
+      level: "error",
+      code: "api_response_timeout",
+      source: requestLabel,
+      message: `API request timed out after ${API_RESPONSE_TIMEOUT_MS}ms`,
+      details: {
+        method: req.method,
+        path: req.path,
+        timeout_ms: API_RESPONSE_TIMEOUT_MS,
+      },
+      userRole: req.user?.role || null,
+      tenantCode: req.user?.tenant_code || null,
+    });
+    if (!res.headersSent) {
+      res.status(503).json({
+        ok: false,
+        error: "Request timed out",
+      });
+      return;
+    }
+    if (!res.writableEnded) {
+      res.end();
+    }
+  });
   next();
 });
 
@@ -973,6 +1060,32 @@ async function resolveChatActivityContext(user, chatId) {
 // SERVER STARTUP
 // ===================================
 
+let embeddedNotificationDigestSweepInFlight = false;
+let embeddedNotificationDigestTimer = null;
+let httpServer = null;
+let shutdownInProgress = false;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.GRACEFUL_SHUTDOWN_TIMEOUT_MS || 10_000),
+);
+
+async function runEmbeddedNotificationDigestSweep(label) {
+  if (embeddedNotificationDigestSweepInFlight) {
+    console.warn(
+      `[notifications] digest sweep skipped; previous ${label} sweep still running`,
+    );
+    return;
+  }
+  embeddedNotificationDigestSweepInFlight = true;
+  try {
+    await runNotificationDigestSweep();
+  } catch (err) {
+    console.error(`notification digest ${label} sweep error:`, err);
+  } finally {
+    embeddedNotificationDigestSweepInFlight = false;
+  }
+}
+
 /**
  * Запуск сервера в async IIFE
  */
@@ -992,6 +1105,8 @@ async function resolveChatActivityContext(user, chatId) {
 
     // Создаём HTTP сервер
     const server = http.createServer(app);
+    httpServer = server;
+    configureHttpServerTimeouts(server);
 
     // Инициализируем Socket.io
     const io = new Server(server, {
@@ -1360,14 +1475,13 @@ async function resolveChatActivityContext(user, chatId) {
         console.log("[message-encryption] startup backfill disabled");
       }
       if (embeddedNotificationDigestEnabled) {
-        setInterval(() => {
-          void runNotificationDigestSweep().catch((err) => {
-            console.error("notification digest sweep error:", err);
-          });
+        embeddedNotificationDigestTimer = setInterval(() => {
+          void runEmbeddedNotificationDigestSweep("periodic");
         }, 5 * 60 * 1000);
-        void runNotificationDigestSweep().catch((err) => {
-          console.error("notification digest startup sweep error:", err);
-        });
+        if (typeof embeddedNotificationDigestTimer.unref === "function") {
+          embeddedNotificationDigestTimer.unref();
+        }
+        void runEmbeddedNotificationDigestSweep("startup");
       }
       console.log("\n");
     });
@@ -1378,12 +1492,37 @@ async function resolveChatActivityContext(user, chatId) {
 })();
 
 // Graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received, shutting down gracefully...");
-  process.exit(0);
-});
+function shutdownGracefully(signal) {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  console.log(`${signal} received, shutting down gracefully...`);
+  if (embeddedNotificationDigestTimer) {
+    clearInterval(embeddedNotificationDigestTimer);
+    embeddedNotificationDigestTimer = null;
+  }
+  const shutdownTimeout = setTimeout(() => {
+    console.warn("Graceful shutdown timed out; exiting");
+    process.exit(0);
+  }, GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+  if (typeof shutdownTimeout.unref === "function") {
+    shutdownTimeout.unref();
+  }
+  if (!httpServer) {
+    clearTimeout(shutdownTimeout);
+    process.exit(0);
+    return;
+  }
+  httpServer.close((err) => {
+    clearTimeout(shutdownTimeout);
+    if (err) {
+      console.error("HTTP server shutdown error:", err);
+      process.exit(1);
+      return;
+    }
+    process.exit(0);
+  });
+}
 
-process.on("SIGINT", () => {
-  console.log("SIGINT received, shutting down gracefully...");
-  process.exit(0);
-});
+process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
+
+process.on("SIGINT", () => shutdownGracefully("SIGINT"));

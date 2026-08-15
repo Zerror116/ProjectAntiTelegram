@@ -1494,7 +1494,7 @@ function publishDemoPostsSequentially({
           });
         }
       } catch (err) {
-        await client.query("ROLLBACK");
+        await client.query("ROLLBACK").catch(() => {});
         console.error("admin.test.publishDemoPostsSequentially error", err);
       } finally {
         client.release();

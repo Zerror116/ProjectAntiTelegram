@@ -67,6 +67,8 @@ class _MainShellState extends State<MainShell> {
   String? _webNotificationFirstPromptedUserId;
   bool _nativeNotificationPromptInFlight = false;
   String? _nativeNotificationPromptedUserId;
+  Future<void>? _notificationRuntimeSyncInFlight;
+  bool _notificationRuntimeSyncPending = false;
   Timer? _supportQueueRefreshTimer;
   VoidCallback? _activeSectionListener;
   bool _initialNotificationDeepLinkHandled = false;
@@ -75,7 +77,6 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
-    if (_isAndroidWeb()) return;
     _activeSectionListener = _handleExternalShellSectionRequest;
     activeShellSectionNotifier.addListener(_activeSectionListener!);
     _lastEffectiveRole = authService.effectiveRole;
@@ -318,24 +319,65 @@ class _MainShellState extends State<MainShell> {
     return kIsWeb && defaultTargetPlatform == TargetPlatform.android;
   }
 
-  Future<void> _syncNotificationRuntime() async {
-    if (authService.currentUser == null) return;
+  Future<void> _syncNotificationRuntime() {
+    final inFlight = _notificationRuntimeSyncInFlight;
+    if (inFlight != null) {
+      _notificationRuntimeSyncPending = true;
+      return inFlight;
+    }
+
+    late final Future<void> future;
+    future = _runNotificationRuntimeSyncLoop().whenComplete(() {
+      if (identical(_notificationRuntimeSyncInFlight, future)) {
+        _notificationRuntimeSyncInFlight = null;
+      }
+    });
+    _notificationRuntimeSyncInFlight = future;
+    return future;
+  }
+
+  Future<void> _runNotificationRuntimeSyncLoop() async {
+    do {
+      _notificationRuntimeSyncPending = false;
+      await _runNotificationRuntimeSyncOnce();
+    } while (_notificationRuntimeSyncPending);
+  }
+
+  Future<void> _runNotificationRuntimeSyncOnce() async {
+    final user = authService.currentUser;
+    if (user == null) return;
     if (authService.isSessionDegraded) return;
+    final userId = user.id.trim();
+    if (userId.isEmpty) return;
+
     final policy =
         await NotificationRuntimePreferenceService.refreshServerPolicy(
           dio,
-          userId: authService.currentUser?.id,
+          userId: userId,
         );
+    if (!_notificationRuntimeStillMatches(userId)) return;
+
     await NotificationRuntimePreferenceService.applyRuntimePreference(
       dio,
       enabled: policy.enabled,
-      userId: authService.currentUser?.id,
+      userId: userId,
     );
+    if (!_notificationRuntimeStillMatches(userId)) return;
+
     await refreshNotificationBadgeCount();
   }
 
+  bool _notificationRuntimeStillMatches(String userId) {
+    if (authService.isSessionDegraded) return false;
+    if (authService.currentUser?.id == userId) return true;
+    if (authService.currentUser != null) {
+      _notificationRuntimeSyncPending = true;
+    }
+    return false;
+  }
+
   void _handleExternalShellSectionRequest() {
-    if (!mounted || _isAndroidWeb()) return;
+    if (!mounted) return;
     final requestedId = activeShellSectionNotifier.value.trim();
     if (requestedId.isEmpty) return;
     final destinations = _buildDestinations(
@@ -423,7 +465,8 @@ class _MainShellState extends State<MainShell> {
     }
     if (!mounted) return;
     setState(() {
-      _webNotificationBannerDismissed = true;
+      _webNotificationBannerDismissed =
+          permission == WebNotificationPermissionState.granted;
       _webNotificationPermissionState = permission;
     });
   }
@@ -1060,9 +1103,6 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isAndroidWeb()) {
-      return const AuthScreen();
-    }
     return StreamBuilder<User?>(
       stream: authService.authStream,
       initialData: authService.currentUser,

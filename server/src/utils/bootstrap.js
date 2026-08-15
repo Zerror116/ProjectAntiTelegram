@@ -1,6 +1,5 @@
 const fs = require("fs");
 const path = require("path");
-const { Pool } = require("pg");
 
 const db = require("../db");
 const { ensureSystemChannels } = require("./systemChannels");
@@ -28,7 +27,11 @@ function quoteIdentifier(identifier) {
 async function ensureDatabaseExists(dbUrl) {
   const { adminUrl, targetUrl, targetDbName } = parseDatabaseUrl(dbUrl);
 
-  const targetPool = new Pool({ connectionString: targetUrl });
+  const targetPool = db.createPool(targetUrl, {
+    maintenance: true,
+    max: 1,
+    label: "bootstrap-target",
+  });
   try {
     await targetPool.query("SELECT 1");
     await targetPool.end();
@@ -36,7 +39,11 @@ async function ensureDatabaseExists(dbUrl) {
   } catch (_) {
     await targetPool.end();
 
-    const adminPool = new Pool({ connectionString: adminUrl });
+    const adminPool = db.createPool(adminUrl, {
+      maintenance: true,
+      max: 1,
+      label: "bootstrap-admin",
+    });
     try {
       const existsRes = await adminPool.query(
         "SELECT 1 FROM pg_database WHERE datname = $1",
@@ -69,7 +76,13 @@ async function applyMigrationsToTarget(dbUrl, migrationsDir, options = {}) {
   const schemaSearchPath = schemaName
     ? `${quoteIdentifier(schemaName)}, public`
     : "";
-  const pool = new Pool({ connectionString: dbUrl });
+  const migrationLockKey = `projectphoenix:schema_migrations:${schemaName || "public"}`;
+  const pool = db.createPool(dbUrl, {
+    maintenance: true,
+    max: 1,
+    label: "migration-target",
+  });
+  let migrationLockAcquired = false;
   try {
     if (!fs.existsSync(migrationsDir)) {
       throw new Error(`Migrations folder not found: ${migrationsDir}`);
@@ -94,6 +107,10 @@ async function applyMigrationsToTarget(dbUrl, migrationsDir, options = {}) {
     }
 
     await ensureSchemaMigrationsTable(pool);
+    await pool.query("SELECT pg_advisory_lock(hashtext($1))", [
+      migrationLockKey,
+    ]);
+    migrationLockAcquired = true;
     const appliedRes = await pool.query("SELECT filename FROM schema_migrations");
     const alreadyApplied = new Set(appliedRes.rows.map((r) => r.filename));
 
@@ -112,12 +129,16 @@ async function applyMigrationsToTarget(dbUrl, migrationsDir, options = {}) {
           ]);
         }
         await pool.query(sql);
-        await pool.query(
-          "INSERT INTO schema_migrations (filename, applied_at) VALUES ($1, now())",
+        const insertedMigration = await pool.query(
+          `INSERT INTO schema_migrations (filename, applied_at)
+           VALUES ($1, now())
+           ON CONFLICT (filename) DO NOTHING`,
           [file],
         );
         await pool.query("COMMIT");
-        appliedNow.push(file);
+        if (insertedMigration.rowCount > 0) {
+          appliedNow.push(file);
+        }
       } catch (err) {
         await pool.query("ROLLBACK");
         throw err;
@@ -131,6 +152,16 @@ async function applyMigrationsToTarget(dbUrl, migrationsDir, options = {}) {
         : "No pending migrations",
     };
   } finally {
+    if (migrationLockAcquired) {
+      try {
+        await pool.query("SELECT pg_advisory_unlock(hashtext($1))", [
+          migrationLockKey,
+        ]);
+      } catch (_) {
+        // The connection is about to close; failing to unlock explicitly should
+        // not hide the original migration result.
+      }
+    }
     await pool.end();
   }
 }

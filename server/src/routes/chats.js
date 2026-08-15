@@ -3113,11 +3113,33 @@ function parseOptionalNumber(raw) {
   return value;
 }
 
+function parseNonNegativeInteger(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.trunc(value);
+}
+
+async function getMessageChatSeq(chatId, messageId) {
+  const normalizedMessageId = String(messageId || "").trim();
+  if (!uuidValidate(normalizedMessageId)) return null;
+  const seqQ = await db.query(
+    `SELECT chat_seq
+       FROM messages
+      WHERE id = $1
+        AND chat_id = $2
+      LIMIT 1`,
+    [normalizedMessageId, chatId],
+  );
+  return parseNonNegativeInteger(seqQ.rows[0]?.chat_seq);
+}
+
 async function getUserChatState(userId, chatId) {
   const stateQ = await db.query(
     `SELECT user_id,
             chat_id,
             last_read_message_id,
+            last_read_chat_seq,
             last_seen_message_id,
             draft_text,
             draft_updated_at,
@@ -3139,6 +3161,9 @@ async function upsertUserChatState(userId, chatId, patch = {}) {
   const values = [];
   const updates = [];
   let index = 3;
+  let lastReadMessageIdForSeq = null;
+  let lastReadMessageIdWasPatched = false;
+  let lastReadChatSeqWasPatched = false;
 
   const assign = (column, value) => {
     columns.push(column);
@@ -3152,6 +3177,23 @@ async function upsertUserChatState(userId, chatId, patch = {}) {
     const normalized = normalizeUuidPatchField(patch.last_read_message_id);
     if (normalized.accepted) {
       assign("last_read_message_id", normalized.value);
+      lastReadMessageIdWasPatched = true;
+      lastReadMessageIdForSeq = normalized.value;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "last_read_chat_seq")) {
+    const normalized = parseNonNegativeInteger(patch.last_read_chat_seq);
+    if (normalized !== null) {
+      assign("last_read_chat_seq", normalized);
+      lastReadChatSeqWasPatched = true;
+    }
+  }
+  if (lastReadMessageIdWasPatched && !lastReadChatSeqWasPatched) {
+    const resolvedSeq = lastReadMessageIdForSeq
+      ? await getMessageChatSeq(chatId, lastReadMessageIdForSeq)
+      : 0;
+    if (resolvedSeq !== null) {
+      assign("last_read_chat_seq", resolvedSeq);
     }
   }
   if (Object.prototype.hasOwnProperty.call(patch, "last_seen_message_id")) {
@@ -3192,6 +3234,7 @@ async function upsertUserChatState(userId, chatId, patch = {}) {
      RETURNING user_id,
                chat_id,
                last_read_message_id,
+               last_read_chat_seq,
                last_seen_message_id,
                draft_text,
                draft_updated_at,
@@ -3209,7 +3252,8 @@ async function getVisibleMessageAnchor(chatId, userId, messageId) {
   if (!trimmedMessageId) return null;
   const anchorQ = await db.query(
     `SELECT m.id,
-            m.created_at
+            m.created_at,
+            m.chat_seq
      FROM messages m
      WHERE m.chat_id = $1
        AND m.id = $2
@@ -3227,10 +3271,12 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
     : null;
 
   const result = await db.query(
-    `WITH read_state AS (
+     `WITH read_state AS (
        SELECT lr.id AS last_read_message_id,
               lr.created_at AS last_read_created_at,
-              cm.joined_at
+              COALESCE(NULLIF(ucs.last_read_chat_seq, 0), lr.chat_seq, 0) AS last_read_chat_seq,
+              cm.joined_at,
+              c.last_seq
        FROM chats c
        LEFT JOIN user_chat_state ucs
          ON ucs.chat_id = c.id
@@ -3245,7 +3291,7 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
        LIMIT 1
      ),
      unread AS (
-       SELECT m.id, m.sender_id, m.created_at
+       SELECT m.id, m.sender_id, m.created_at, m.chat_seq
        FROM messages m
        CROSS JOIN read_state rs
        WHERE m.chat_id = $1
@@ -3255,19 +3301,14 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
          )
          AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
          AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+         AND COALESCE(rs.last_seq, 0) > COALESCE(rs.last_read_chat_seq, 0)
          AND (
            (
-             rs.last_read_message_id IS NOT NULL
-             AND (
-               m.created_at > rs.last_read_created_at
-               OR (
-                 m.created_at = rs.last_read_created_at
-                 AND m.id > rs.last_read_message_id
-               )
-             )
+             COALESCE(rs.last_read_chat_seq, 0) > 0
+            AND m.chat_seq > rs.last_read_chat_seq
            )
            OR (
-             rs.last_read_message_id IS NULL
+             COALESCE(rs.last_read_chat_seq, 0) = 0
              AND (
                rs.joined_at IS NULL
                OR m.created_at >= rs.joined_at
@@ -3282,8 +3323,17 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
          )
          AND (
            $3::uuid IS NULL
-           OR m.created_at < $4::timestamptz
-           OR (m.created_at = $4::timestamptz AND m.id <= $3::uuid)
+           OR (
+             COALESCE($5::bigint, 0) > 0
+             AND COALESCE(m.chat_seq, 0) <= $5::bigint
+           )
+           OR (
+             COALESCE($5::bigint, 0) = 0
+             AND (
+               m.created_at < $4::timestamptz
+               OR (m.created_at = $4::timestamptz AND m.id <= $3::uuid)
+             )
+           )
          )
      ),
      inserted AS (
@@ -3294,7 +3344,8 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
        RETURNING message_id
      )
      SELECT unread.id::text AS message_id,
-            unread.sender_id::text AS sender_id
+            unread.sender_id::text AS sender_id,
+            unread.chat_seq::text AS chat_seq
      FROM inserted i
      JOIN unread ON unread.id = i.message_id
      ORDER BY unread.created_at ASC, unread.id ASC`,
@@ -3303,15 +3354,21 @@ async function markChatMessagesRead(chatId, userId, visibleUntilMessageId = null
       userId,
       visibleAnchor?.id || null,
       visibleAnchor?.created_at || null,
+      visibleAnchor?.chat_seq || null,
     ],
   );
   const lastReadMessageId =
     visibleAnchor?.id ||
     result.rows[result.rows.length - 1]?.message_id ||
     null;
+  const lastReadChatSeq =
+    parseNonNegativeInteger(visibleAnchor?.chat_seq) ||
+    parseNonNegativeInteger(result.rows[result.rows.length - 1]?.chat_seq) ||
+    null;
   if (lastReadMessageId) {
     await upsertUserChatState(userId, chatId, {
       last_read_message_id: lastReadMessageId,
+      ...(lastReadChatSeq !== null ? { last_read_chat_seq: lastReadChatSeq } : {}),
       last_seen_message_id: lastReadMessageId,
     });
   }
@@ -3368,10 +3425,12 @@ async function getActivePinForUser(req, chatId, userId) {
 
 async function getFirstUnreadMessageId(chatId, userId) {
   const result = await db.query(
-    `WITH read_state AS (
+     `WITH read_state AS (
        SELECT lr.id AS last_read_message_id,
               lr.created_at AS last_read_created_at,
-              cm.joined_at
+              COALESCE(NULLIF(ucs.last_read_chat_seq, 0), lr.chat_seq, 0) AS last_read_chat_seq,
+              cm.joined_at,
+              c.last_seq
        FROM chats c
        LEFT JOIN user_chat_state ucs
          ON ucs.chat_id = c.id
@@ -3395,19 +3454,14 @@ async function getFirstUnreadMessageId(chatId, userId) {
        )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND COALESCE(rs.last_seq, 0) > COALESCE(rs.last_read_chat_seq, 0)
        AND (
          (
-           rs.last_read_message_id IS NOT NULL
-           AND (
-             m.created_at > rs.last_read_created_at
-             OR (
-               m.created_at = rs.last_read_created_at
-               AND m.id > rs.last_read_message_id
-             )
-           )
+           COALESCE(rs.last_read_chat_seq, 0) > 0
+           AND m.chat_seq > rs.last_read_chat_seq
          )
          OR (
-           rs.last_read_message_id IS NULL
+           COALESCE(rs.last_read_chat_seq, 0) = 0
            AND rs.joined_at IS NOT NULL
            AND m.created_at >= rs.joined_at
          )
@@ -3421,10 +3475,12 @@ async function getFirstUnreadMessageId(chatId, userId) {
 
 async function getChatUnreadCount(chatId, userId) {
   const result = await db.query(
-    `WITH read_state AS (
+     `WITH read_state AS (
        SELECT lr.id AS last_read_message_id,
               lr.created_at AS last_read_created_at,
-              cm.joined_at
+              COALESCE(NULLIF(ucs.last_read_chat_seq, 0), lr.chat_seq, 0) AS last_read_chat_seq,
+              cm.joined_at,
+              c.last_seq
        FROM chats c
        LEFT JOIN user_chat_state ucs
          ON ucs.chat_id = c.id
@@ -3448,19 +3504,14 @@ async function getChatUnreadCount(chatId, userId) {
        )
        AND NOT (COALESCE(m.meta->'hidden_for', '[]'::jsonb) ? $2::text)
        AND COALESCE((m.meta->>'hidden_for_all')::boolean, false) = false
+       AND COALESCE(rs.last_seq, 0) > COALESCE(rs.last_read_chat_seq, 0)
        AND (
          (
-           rs.last_read_message_id IS NOT NULL
-           AND (
-             m.created_at > rs.last_read_created_at
-             OR (
-               m.created_at = rs.last_read_created_at
-               AND m.id > rs.last_read_message_id
-             )
-           )
+           COALESCE(rs.last_read_chat_seq, 0) > 0
+           AND m.chat_seq > rs.last_read_chat_seq
          )
          OR (
-           rs.last_read_message_id IS NULL
+           COALESCE(rs.last_read_chat_seq, 0) = 0
            AND rs.joined_at IS NOT NULL
            AND m.created_at >= rs.joined_at
          )
@@ -3472,7 +3523,7 @@ async function getChatUnreadCount(chatId, userId) {
 
 async function retargetChatStateBeforeMessageDelete(chatId, messageId, createdAt) {
   const previousQ = await db.query(
-    `SELECT id
+    `SELECT id, chat_seq
        FROM messages
       WHERE chat_id = $1
         AND id <> $2
@@ -3485,11 +3536,16 @@ async function retargetChatStateBeforeMessageDelete(chatId, messageId, createdAt
     [chatId, messageId, createdAt],
   );
   const previousMessageId = previousQ.rows[0]?.id || null;
+  const previousChatSeq = parseNonNegativeInteger(previousQ.rows[0]?.chat_seq) || 0;
   const updatedQ = await db.query(
     `UPDATE user_chat_state
         SET last_read_message_id = CASE
               WHEN last_read_message_id = $2 THEN $3::uuid
               ELSE last_read_message_id
+            END,
+            last_read_chat_seq = CASE
+              WHEN last_read_message_id = $2 THEN $4::bigint
+              ELSE last_read_chat_seq
             END,
             last_seen_message_id = CASE
               WHEN last_seen_message_id = $2 THEN $3::uuid
@@ -3507,7 +3563,7 @@ async function retargetChatStateBeforeMessageDelete(chatId, messageId, createdAt
           OR scroll_anchor_message_id = $2
         )
       RETURNING user_id::text AS user_id`,
-    [chatId, messageId, previousMessageId],
+    [chatId, messageId, previousMessageId, previousChatSeq],
   );
   return updatedQ.rows.map((row) => String(row.user_id || "").trim()).filter(Boolean);
 }
@@ -3619,19 +3675,16 @@ async function loadPlatformDiscussionsChatForList(req) {
          AND um.sender_id <> $1
          AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
          AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
+         AND COALESCE(c.last_seq, 0) >
+             COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
          AND (
            (
-             last_read_msg.id IS NOT NULL
-             AND (
-               um.created_at > last_read_msg.created_at
-               OR (
-                 um.created_at = last_read_msg.created_at
-                 AND um.id > last_read_msg.id
-               )
-             )
+             COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) > 0
+             AND um.chat_seq >
+                 COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
            )
            OR (
-             last_read_msg.id IS NULL
+             COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) = 0
              AND self_member.joined_at IS NOT NULL
              AND um.created_at >= self_member.joined_at
            )
@@ -3957,21 +4010,18 @@ async function listChatsHandler(req, res) {
 	             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
 	             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
 	           )
-	           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
-	           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
-	           AND (
+		           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $4::text)
+		           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
+		           AND COALESCE(c.last_seq, 0) >
+		               COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
+		           AND (
 	             (
-	               last_read_msg.id IS NOT NULL
-	               AND (
-	                 um.created_at > last_read_msg.created_at
-	                 OR (
-	                   um.created_at = last_read_msg.created_at
-	                   AND um.id > last_read_msg.id
-	                 )
-	               )
+	               COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) > 0
+	               AND um.chat_seq >
+	                   COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
 	             )
 	             OR (
-	               last_read_msg.id IS NULL
+	               COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) = 0
 	               AND self_member.joined_at IS NOT NULL
 	               AND um.created_at >= self_member.joined_at
 	             )
@@ -4159,21 +4209,18 @@ async function listChatsHandler(req, res) {
 	             (um.sender_id IS NOT NULL AND um.sender_id <> $1)
 	             OR COALESCE(um.meta->>'kind', '') = 'reserved_order_item'
 	           )
-	           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
-	           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
-	           AND (
+		           AND NOT (COALESCE(um.meta->'hidden_for', '[]'::jsonb) ? $2::text)
+		           AND COALESCE((um.meta->>'hidden_for_all')::boolean, false) = false
+		           AND COALESCE(c.last_seq, 0) >
+		               COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
+		           AND (
 	             (
-	               last_read_msg.id IS NOT NULL
-	               AND (
-	                 um.created_at > last_read_msg.created_at
-	                 OR (
-	                   um.created_at = last_read_msg.created_at
-	                   AND um.id > last_read_msg.id
-	                 )
-	               )
+	               COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) > 0
+	               AND um.chat_seq >
+	                   COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0)
 	             )
 	             OR (
-	               last_read_msg.id IS NULL
+	               COALESCE(NULLIF(chat_state.last_read_chat_seq, 0), last_read_msg.chat_seq, 0) = 0
 	               AND cm.joined_at IS NOT NULL
 	               AND um.created_at >= cm.joined_at
 	             )
@@ -4403,6 +4450,7 @@ router.get("/:chatId/state", requireAuth, async (req, res) => {
       data: {
         chat_id: chatId,
         last_read_message_id: state?.last_read_message_id || null,
+        last_read_chat_seq: parseNonNegativeInteger(state?.last_read_chat_seq) || 0,
         last_seen_message_id: state?.last_seen_message_id || null,
         draft_text: state?.draft_text || "",
         draft_updated_at: state?.draft_updated_at || null,
@@ -5176,6 +5224,7 @@ router.get("/:chatId/messages", requireAuth, async (req, res) => {
       },
       state: {
         last_read_message_id: state?.last_read_message_id || null,
+        last_read_chat_seq: parseNonNegativeInteger(state?.last_read_chat_seq) || 0,
         last_seen_message_id: state?.last_seen_message_id || null,
         first_unread_message_id: firstUnreadMessageId,
         unread_count: unreadCount,

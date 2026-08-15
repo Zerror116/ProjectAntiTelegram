@@ -7,8 +7,144 @@ const DEFAULT_DATABASE_URL =
   process.env.DATABASE_URL ||
   'postgresql://projectphoenix:projectphoenix@localhost:5432/projectphoenix';
 
-const platformPool = new Pool({
-  connectionString: DEFAULT_DATABASE_URL,
+const NODE_ENV = String(process.env.NODE_ENV || 'development')
+  .toLowerCase()
+  .trim();
+const IS_PRODUCTION = NODE_ENV === 'production';
+
+function parsePositiveIntegerEnv(name, fallback, { min = 0, max = 600000 } = {}) {
+  const rawValue = process.env[name];
+  const parsed =
+    rawValue === undefined || rawValue === null || rawValue === ''
+      ? Number(fallback)
+      : Number(rawValue);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+const DATABASE_PLATFORM_POOL_MAX = parsePositiveIntegerEnv(
+  'DATABASE_PLATFORM_POOL_MAX',
+  IS_PRODUCTION ? 12 : 10,
+  { min: 1, max: 100 },
+);
+const DATABASE_TENANT_POOL_MAX = parsePositiveIntegerEnv(
+  'DATABASE_TENANT_POOL_MAX',
+  IS_PRODUCTION ? 4 : 4,
+  { min: 1, max: 50 },
+);
+const DATABASE_CONNECTION_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_CONNECTION_TIMEOUT_MS',
+  IS_PRODUCTION ? 5000 : 10000,
+  { min: 0, max: 60000 },
+);
+const DATABASE_IDLE_CLIENT_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_IDLE_CLIENT_TIMEOUT_MS',
+  30000,
+  { min: 1000, max: 600000 },
+);
+const DATABASE_STATEMENT_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_STATEMENT_TIMEOUT_MS',
+  IS_PRODUCTION ? 60000 : 0,
+);
+const DATABASE_QUERY_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_QUERY_TIMEOUT_MS',
+  IS_PRODUCTION ? 65000 : 0,
+  { min: 0, max: 650000 },
+);
+const DATABASE_LOCK_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_LOCK_TIMEOUT_MS',
+  IS_PRODUCTION ? 10000 : 0,
+  { min: 0, max: 120000 },
+);
+const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS',
+  IS_PRODUCTION ? 60000 : 0,
+);
+const DATABASE_MAINTENANCE_STATEMENT_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_MAINTENANCE_STATEMENT_TIMEOUT_MS',
+  IS_PRODUCTION ? 300000 : 0,
+  { min: 0, max: 3600000 },
+);
+const DATABASE_MAINTENANCE_QUERY_TIMEOUT_MS = parsePositiveIntegerEnv(
+  'DATABASE_MAINTENANCE_QUERY_TIMEOUT_MS',
+  IS_PRODUCTION ? 310000 : 0,
+  { min: 0, max: 3610000 },
+);
+const DATABASE_TENANT_POOL_TTL_MS = parsePositiveIntegerEnv(
+  'DATABASE_TENANT_POOL_TTL_MS',
+  IS_PRODUCTION ? 10 * 60 * 1000 : 30 * 60 * 1000,
+  { min: 60 * 1000, max: 24 * 60 * 60 * 1000 },
+);
+
+function addPositivePoolOption(config, name, value) {
+  if (Number.isFinite(value) && value > 0) {
+    config[name] = value;
+  }
+}
+
+function normalizePoolMax(rawValue, fallback) {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(100, Math.floor(parsed)));
+}
+
+function buildPoolConfig(connectionString, options = {}) {
+  const maintenance = options.maintenance === true;
+  const platformMax = options.tenant === true
+    ? DATABASE_TENANT_POOL_MAX
+    : DATABASE_PLATFORM_POOL_MAX;
+  const config = {
+    connectionString,
+    max: normalizePoolMax(options.max, platformMax),
+    idleTimeoutMillis: DATABASE_IDLE_CLIENT_TIMEOUT_MS,
+    connectionTimeoutMillis: DATABASE_CONNECTION_TIMEOUT_MS,
+  };
+
+  addPositivePoolOption(
+    config,
+    'statement_timeout',
+    maintenance
+      ? DATABASE_MAINTENANCE_STATEMENT_TIMEOUT_MS
+      : DATABASE_STATEMENT_TIMEOUT_MS,
+  );
+  addPositivePoolOption(
+    config,
+    'query_timeout',
+    maintenance
+      ? DATABASE_MAINTENANCE_QUERY_TIMEOUT_MS
+      : DATABASE_QUERY_TIMEOUT_MS,
+  );
+  addPositivePoolOption(config, 'lock_timeout', DATABASE_LOCK_TIMEOUT_MS);
+  addPositivePoolOption(
+    config,
+    'idle_in_transaction_session_timeout',
+    DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+  );
+
+  return config;
+}
+
+function attachPoolHandlers(pool, label = 'pool') {
+  if (!pool || pool.__projectPhoenixPoolHandlersAttached === true) return pool;
+  pool.on('error', (err) => {
+    console.error(`[db] idle pool error (${label}):`, err);
+  });
+  Object.defineProperty(pool, '__projectPhoenixPoolHandlersAttached', {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return pool;
+}
+
+function createPool(connectionString, options = {}) {
+  const pool = new Pool(buildPoolConfig(connectionString, options));
+  return attachPoolHandlers(pool, options.label || 'pool');
+}
+
+const platformPool = createPool(DEFAULT_DATABASE_URL, {
+  label: 'platform',
 });
 
 const contextStorage = new AsyncLocalStorage();
@@ -126,14 +262,63 @@ async function getOrCreateTenantPool(tenantRow) {
     return platformPool;
   }
 
+  pruneIdleTenantPools();
+
   const dbUrl = String(tenantRow.db_url || '').trim();
   const cached = tenantPoolCache.get(dbUrl);
-  if (cached) return cached;
+  if (cached?.pool) {
+    cached.lastUsedAt = Date.now();
+    return cached.pool;
+  }
+  if (cached?.promise) {
+    cached.lastUsedAt = Date.now();
+    return cached.promise;
+  }
 
-  const pool = new Pool({ connectionString: dbUrl });
-  await pool.query('SELECT 1');
-  tenantPoolCache.set(dbUrl, pool);
-  return pool;
+  const entry = {
+    pool: null,
+    lastUsedAt: Date.now(),
+    promise: null,
+  };
+  entry.promise = (async () => {
+    const pool = createPool(dbUrl, {
+      tenant: true,
+      label: `tenant:${tenantRow.code || tenantRow.id || 'isolated'}`,
+    });
+    try {
+      await pool.query('SELECT 1');
+      entry.pool = pool;
+      entry.lastUsedAt = Date.now();
+      return pool;
+    } catch (err) {
+      tenantPoolCache.delete(dbUrl);
+      await pool.end().catch(() => {});
+      throw err;
+    } finally {
+      entry.promise = null;
+    }
+  })();
+  tenantPoolCache.set(dbUrl, entry);
+  return entry.promise;
+}
+
+function pruneIdleTenantPools(now = Date.now()) {
+  for (const [dbUrl, entry] of tenantPoolCache.entries()) {
+    const pool = entry?.pool || null;
+    if (!pool) {
+      if (!entry?.promise) tenantPoolCache.delete(dbUrl);
+      continue;
+    }
+    if (now - Number(entry.lastUsedAt || 0) < DATABASE_TENANT_POOL_TTL_MS) {
+      continue;
+    }
+    const activeCount = Math.max(0, pool.totalCount - pool.idleCount);
+    if (activeCount > 0 || pool.waitingCount > 0) continue;
+    tenantPoolCache.delete(dbUrl);
+    pool.end().catch((err) => {
+      console.error(`[db] tenant pool cleanup failed (${dbUrl}):`, err);
+    });
+  }
 }
 
 async function runWithDbContext(context, fn) {
@@ -270,9 +455,16 @@ function platformConnect() {
 }
 
 async function closeAllPools() {
-  const tenantPools = [...tenantPoolCache.values()];
+  const tenantEntries = [...tenantPoolCache.values()];
   tenantPoolCache.clear();
-  await Promise.allSettled(tenantPools.map((pool) => pool.end()));
+  await Promise.allSettled(
+    tenantEntries.map(async (entry) => {
+      const pool =
+        entry?.pool ||
+        (entry?.promise ? await entry.promise.catch(() => null) : null);
+      if (pool) await pool.end();
+    }),
+  );
   await platformPool.end();
 }
 
@@ -308,6 +500,9 @@ module.exports = {
   platformConnect,
   closeAllPools,
   applyClientContext,
+  buildPoolConfig,
+  createPool,
+  pruneIdleTenantPools,
 
   // Tenant helpers
   normalizeTenantCode,

@@ -18,6 +18,9 @@ Completer<Map<String, dynamic>?>? _stopCompleter;
 final List<html.Blob> _chunks = <html.Blob>[];
 const String _previewViewType = 'project-fenix-video-note-preview';
 bool _previewViewRegistered = false;
+const Duration _recordingStopTimeout = Duration(seconds: 12);
+const Duration _recordingCancelTimeout = Duration(seconds: 4);
+const Duration _blobReadTimeout = Duration(seconds: 12);
 
 bool isSupported() {
   try {
@@ -77,10 +80,12 @@ Future<void> start() async {
     throw UnsupportedError('mediaDevices is not available');
   }
 
-  final stream = await mediaDevices.getUserMedia(<String, dynamic>{
-    'audio': true,
-    'video': _videoConstraints(),
-  });
+  final stream = await mediaDevices
+      .getUserMedia(<String, dynamic>{
+        'audio': true,
+        'video': _videoConstraints(),
+      })
+      .timeout(const Duration(seconds: 12));
   _attachPreviewElement(stream);
 
   final mimeType = _bestMimeType();
@@ -122,7 +127,13 @@ Future<Map<String, dynamic>> stop() async {
     // Some browsers throw if data is already being flushed.
   }
   recorder.stop();
-  final result = await completer.future.timeout(const Duration(seconds: 12));
+  final result = await completer.future.timeout(
+    _recordingStopTimeout,
+    onTimeout: () {
+      _cleanup();
+      throw TimeoutException('Video note recording stop timed out');
+    },
+  );
   if (result == null) {
     throw StateError('Video note recording was cancelled');
   }
@@ -140,7 +151,7 @@ Future<void> cancel() async {
   _stopCompleter = completer;
   try {
     recorder.stop();
-    await completer.future.timeout(const Duration(seconds: 4));
+    await completer.future.timeout(_recordingCancelTimeout);
   } catch (_) {
     _cleanup();
   }
@@ -210,6 +221,7 @@ void _handleStop(html.Event event) {
 
 void _handleError(html.Event event) {
   final completer = _stopCompleter;
+  _stopCompleter = null;
   if (completer != null && !completer.isCompleted) {
     completer.completeError(StateError('MediaRecorder error'));
   }
@@ -227,16 +239,20 @@ Future<void> _completeStop(Completer<Map<String, dynamic>?> completer) async {
         .difference(_startedAt ?? DateTime.now())
         .inMilliseconds;
     _cleanup();
-    completer.complete(<String, dynamic>{
-      'bytes': bytes,
-      'filename':
-          'video-note-${DateTime.now().millisecondsSinceEpoch}.${_extensionForMime(mimeType)}',
-      'duration_ms': durationMs,
-      'mime_type': mimeType.isNotEmpty ? mimeType : 'video/webm',
-    });
+    if (!completer.isCompleted) {
+      completer.complete(<String, dynamic>{
+        'bytes': bytes,
+        'filename':
+            'video-note-${DateTime.now().millisecondsSinceEpoch}.${_extensionForMime(mimeType)}',
+        'duration_ms': durationMs,
+        'mime_type': mimeType.isNotEmpty ? mimeType : 'video/webm',
+      });
+    }
   } catch (error) {
     _cleanup();
-    completer.completeError(error);
+    if (!completer.isCompleted) {
+      completer.completeError(error);
+    }
   }
 }
 
@@ -245,9 +261,15 @@ Future<Uint8List> _blobToBytes(html.Blob blob) {
   final completer = Completer<Uint8List>();
   late StreamSubscription<html.ProgressEvent> loadSub;
   late StreamSubscription<html.ProgressEvent> errorSub;
-  loadSub = reader.onLoad.listen((_) {
-    errorSub.cancel();
+  Timer? timeoutTimer;
+  void cleanupSubscriptions() {
+    timeoutTimer?.cancel();
     loadSub.cancel();
+    errorSub.cancel();
+  }
+
+  loadSub = reader.onLoad.listen((_) {
+    cleanupSubscriptions();
     final result = reader.result;
     if (result is Uint8List) {
       completer.complete(result);
@@ -260,9 +282,19 @@ Future<Uint8List> _blobToBytes(html.Blob blob) {
     completer.completeError(StateError('Unexpected blob reader result'));
   });
   errorSub = reader.onError.listen((_) {
-    loadSub.cancel();
-    errorSub.cancel();
+    cleanupSubscriptions();
     completer.completeError(reader.error ?? StateError('Blob read failed'));
+  });
+  timeoutTimer = Timer(_blobReadTimeout, () {
+    cleanupSubscriptions();
+    try {
+      reader.abort();
+    } catch (_) {
+      // ignore
+    }
+    if (!completer.isCompleted) {
+      completer.completeError(TimeoutException('Blob read timed out'));
+    }
   });
   reader.readAsArrayBuffer(blob);
   return completer.future;

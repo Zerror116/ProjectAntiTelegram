@@ -479,6 +479,10 @@ function testNotificationQueuePushDeliveryInvariants() {
     path.resolve(__dirname, "../src/utils/notifications.js"),
     "utf8",
   );
+  const workerSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/worker.js"),
+    "utf8",
+  );
   const webPushSource = fs.readFileSync(
     path.resolve(__dirname, "../src/utils/webPush.js"),
     "utf8",
@@ -1548,6 +1552,34 @@ function testInactiveClientAccountAutoDeleteDefaultsOff() {
   assert.match(envExample, /^CLIENT_INACTIVITY_ACCOUNT_AUTO_DELETE_ENABLED=false$/m);
 }
 
+function testDeliveryEligibleCustomersUseSinglePhoneRow() {
+  const deliveryRoute = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/delivery.js"),
+    "utf8",
+  );
+  assert.match(deliveryRoute, /async function collectEligibleCustomers/);
+  assert.match(deliveryRoute, /LEFT JOIN LATERAL \(\s*SELECT phone[\s\S]*?FROM phones ph[\s\S]*?ORDER BY ph\.verified_at DESC NULLS LAST, ph\.created_at DESC NULLS LAST[\s\S]*?LIMIT 1[\s\S]*?\) ph ON true/);
+  assert.doesNotMatch(
+    deliveryRoute,
+    /LEFT JOIN phones ph ON ph\.user_id = c\.user_id/,
+  );
+}
+
+function testRuntimeQueryIndexesCoverHotPaths() {
+  const migration = fs.readFileSync(
+    path.resolve(__dirname, "../migrations/081_runtime_query_indexes.sql"),
+    "utf8",
+  );
+  assert.match(migration, /idx_chat_members_user_chat_joined/);
+  assert.match(migration, /ON chat_members\(user_id, chat_id\)/);
+  assert.match(migration, /idx_notification_inbox_user_category_created/);
+  assert.match(migration, /idx_notification_inbox_default_user_created/);
+  assert.match(migration, /idx_notification_inbox_default_unread_user_category/);
+  assert.match(migration, /COALESCE\(inbox_visibility, 'default'\) = 'default'/);
+  assert.match(migration, /idx_cart_items_delivery_status_user_updated/);
+  assert.match(migration, /WHERE status IN \(/);
+}
+
 function testNoPersonalSubscriptionContactName() {
   const files = [
     path.resolve(__dirname, "../../lib/main.dart"),
@@ -1692,7 +1724,7 @@ function testWebServiceWorkerRegistrationUsesBuildVersion() {
     assert.match(source, /web_service_worker_version\.dart/);
     assert.match(source, /html\.window\.localStorage\[phoenixWebBuildVersionStorageKey\]/);
     assert.match(source, /buildVersionedPhoenixServiceWorkerUrl\(buildVersion\)/);
-    assert.match(source, /sw\.register\(workerUrl\)/);
+    assert.match(source, /\.register\(\s*workerUrl\s*\)/);
     assert.doesNotMatch(source, /const _rootWorkerUrl = '\/flutter_service_worker\.js'/);
     assert.doesNotMatch(source, /sw\.register\(_rootWorkerUrl\)/);
   }
@@ -1779,6 +1811,106 @@ function testWebBootstrapStartupWorkIsBounded() {
     webIndex,
     /withTimeout\(refreshWebShellOnly\(\), shellRefreshTimeoutMs, false\)/,
   );
+}
+
+function testServerRuntimeWorkIsBounded() {
+  const indexSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/index.js"),
+    "utf8",
+  );
+  const dbSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/db.js"),
+    "utf8",
+  );
+  const chatsRouteSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/routes/chats.js"),
+    "utf8",
+  );
+  const notificationsSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/utils/notifications.js"),
+    "utf8",
+  );
+  const workerSource = fs.readFileSync(
+    path.resolve(__dirname, "../src/worker.js"),
+    "utf8",
+  );
+  const chatSequenceMigration = fs.readFileSync(
+    path.resolve(__dirname, "../migrations/080_chat_local_sequence_unread_state.sql"),
+    "utf8",
+  );
+  const envExample = fs.readFileSync(
+    path.resolve(__dirname, "../.env.example"),
+    "utf8",
+  );
+  const maintenanceFiles = [
+    path.resolve(__dirname, "../src/utils/bootstrap.js"),
+    path.resolve(__dirname, "../src/utils/tenantDatabases.js"),
+    path.resolve(__dirname, "../src/utils/systemChannels.js"),
+    path.resolve(__dirname, "../scripts/nightly-self-audit.js"),
+  ];
+
+  assert.match(indexSource, /const HTTP_REQUEST_TIMEOUT_MS = parsePositiveIntegerEnv/);
+  assert.match(indexSource, /const API_RESPONSE_TIMEOUT_MS = parsePositiveIntegerEnv/);
+  assert.match(indexSource, /function configureHttpServerTimeouts\(server\)/);
+  assert.match(indexSource, /server\.requestTimeout = requestTimeout/);
+  assert.match(indexSource, /server\.keepAliveTimeout = keepAliveTimeout/);
+  assert.match(indexSource, /server\.headersTimeout = headersTimeout/);
+  assert.match(indexSource, /configureHttpServerTimeouts\(server\)/);
+  assert.match(indexSource, /res\.setTimeout\(API_RESPONSE_TIMEOUT_MS/);
+  assert.match(indexSource, /code: "api_response_timeout"/);
+  assert.match(indexSource, /if \(res\.headersSent \|\| res\.writableEnded\) return res;/);
+  assert.match(indexSource, /embeddedNotificationDigestSweepInFlight/);
+  assert.match(indexSource, /let embeddedNotificationDigestTimer = null/);
+  assert.match(indexSource, /let httpServer = null/);
+  assert.match(indexSource, /GRACEFUL_SHUTDOWN_TIMEOUT_MS/);
+  assert.match(indexSource, /function runEmbeddedNotificationDigestSweep\(label\)/);
+  assert.match(indexSource, /previous \$\{label\} sweep still running/);
+  assert.match(indexSource, /embeddedNotificationDigestTimer = setInterval/);
+  assert.match(indexSource, /embeddedNotificationDigestTimer\.unref\(\)/);
+  assert.match(indexSource, /function shutdownGracefully\(signal\)/);
+  assert.match(indexSource, /httpServer\.close/);
+  assert.doesNotMatch(indexSource, /process\.on\("SIGTERM", \(\) => \{\s*console\.log\("SIGTERM received, shutting down gracefully\.\.\."\);\s*process\.exit\(0\);\s*\}\);/);
+  assert.match(workerSource, /let digestSweepInFlight = false/);
+  assert.match(workerSource, /let endpointSweepInFlight = false/);
+  assert.match(workerSource, /async function runDigestSweepOnce\(reason\)/);
+  assert.match(workerSource, /async function runEndpointSweepOnce\(reason\)/);
+  assert.match(workerSource, /previous sweep still running/);
+  assert.match(workerSource, /void runDigestSweepOnce\('interval'\)/);
+  assert.match(workerSource, /void runEndpointSweepOnce\('interval'\)/);
+
+  assert.match(dbSource, /function buildPoolConfig\(connectionString, options = \{\}\)/);
+  assert.match(dbSource, /statement_timeout/);
+  assert.match(dbSource, /query_timeout/);
+  assert.match(dbSource, /lock_timeout/);
+  assert.match(dbSource, /idle_in_transaction_session_timeout/);
+  assert.match(dbSource, /DATABASE_TENANT_POOL_TTL_MS/);
+  assert.match(dbSource, /function pruneIdleTenantPools/);
+  assert.match(dbSource, /pool\.on\('error'/);
+  assert.match(dbSource, /function createPool\(connectionString, options = \{\}\)/);
+
+  assert.match(chatSequenceMigration, /idx_messages_chat_seq_unread_eligible_cover/);
+  assert.match(chatSequenceMigration, /idx_messages_chat_visible_created_desc/);
+  assert.match(chatsRouteSource, /COALESCE\(rs\.last_seq, 0\) > COALESCE\(rs\.last_read_chat_seq, 0\)/);
+  assert.match(
+    chatsRouteSource,
+    /COALESCE\(c\.last_seq, 0\) >\s+COALESCE\(NULLIF\(chat_state\.last_read_chat_seq, 0\), last_read_msg\.chat_seq, 0\)/,
+  );
+  assert.match(
+    notificationsSource,
+    /COALESCE\(c\.last_seq, 0\) >\s+COALESCE\(NULLIF\(ucs\.last_read_chat_seq, 0\), last_read_msg\.chat_seq, 0\)/,
+  );
+
+  assert.match(envExample, /^HTTP_REQUEST_TIMEOUT_MS=300000$/m);
+  assert.match(envExample, /^API_RESPONSE_TIMEOUT_MS=120000$/m);
+  assert.match(envExample, /^DATABASE_STATEMENT_TIMEOUT_MS=60000$/m);
+  assert.match(envExample, /^DATABASE_QUERY_TIMEOUT_MS=65000$/m);
+  assert.match(envExample, /^DATABASE_TENANT_POOL_TTL_MS=600000$/m);
+
+  for (const file of maintenanceFiles) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.doesNotMatch(source, /new Pool\(/, file);
+    assert.match(source, /db\.createPool\(/, file);
+  }
 }
 
 function testAndroidReleaseUsesProductionDownloadsRoot() {
@@ -1904,6 +2036,8 @@ testDeliveryLocalityNormalizerIsGeneric();
 testPublicAuthErrorsUseNeutralSupportWording();
 testUnreachableFirstCallAutoDeleteDefaultsOff();
 testInactiveClientAccountAutoDeleteDefaultsOff();
+testDeliveryEligibleCustomersUseSinglePhoneRow();
+testRuntimeQueryIndexesCoverHotPaths();
 testNoPersonalSubscriptionContactName();
 testPlatformCreatorFlagIsReturnedToClient();
 testPhoneAccessDefaultDoesNotRestrictMissingTenant();
@@ -1914,6 +2048,7 @@ testFullDeployStampsWebBuildVersion();
 testWebServiceWorkerRegistrationUsesBuildVersion();
 testWebIndexInlineScriptsAreParseable();
 testWebBootstrapStartupWorkIsBounded();
+testServerRuntimeWorkIsBounded();
 testAndroidReleaseUsesProductionDownloadsRoot();
 testNoHardcodedPlatformOwnerIdentity();
 testSavedTenantSwitchKeepsSessionsOnTransientFailure();

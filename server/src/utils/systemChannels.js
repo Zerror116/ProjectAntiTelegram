@@ -1,5 +1,5 @@
 const { v4: uuidv4 } = require("uuid");
-const { Pool } = require("pg");
+const db = require("../db");
 const { encryptMessageText, decryptMessageRow } = require("./messageCrypto");
 const { emitToTenant } = require("./socket");
 
@@ -982,7 +982,11 @@ async function syncPlatformDiscussionTenantUsers(queryable, roles = null) {
   );
 
   for (const tenant of tenantsQ.rows) {
-    const tenantPool = new Pool({ connectionString: String(tenant.db_url || "") });
+    const tenantPool = db.createPool(String(tenant.db_url || ""), {
+      maintenance: true,
+      max: 1,
+      label: "platform-discussion-tenant-sync",
+    });
     try {
       const tenantUsersQ = await tenantPool.query(
         `SELECT u.id,

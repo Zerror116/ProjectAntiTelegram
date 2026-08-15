@@ -1,5 +1,4 @@
 const path = require('path');
-const { Pool } = require('pg');
 
 const {
   ensureDatabaseExists,
@@ -7,6 +6,7 @@ const {
   sanitizeSchemaName,
   quoteIdentifier,
 } = require('./bootstrap');
+const db = require('../db');
 const { ensureSystemChannels } = require('./systemChannels');
 
 function sanitizeTenantDbNameFragment(raw) {
@@ -89,7 +89,11 @@ async function upsertTenantShadowRow({
   dbMode = 'isolated',
   dbSchema = null,
 }) {
-  const pool = new Pool({ connectionString: dbUrl });
+  const pool = db.createPool(dbUrl, {
+    maintenance: true,
+    max: 1,
+    label: 'tenant-shadow',
+  });
   try {
     if (dbSchema) {
       await setSessionSchemaSearchPath(pool, dbSchema);
@@ -231,7 +235,11 @@ async function syncTenantShadowTenantState(tenantRow) {
     };
   }
 
-  const pool = new Pool({ connectionString: target.dbUrl });
+  const pool = db.createPool(target.dbUrl, {
+    maintenance: true,
+    max: 1,
+    label: 'tenant-system-channels',
+  });
   const client = await pool.connect();
   try {
     if (target.dbSchema) {

@@ -285,6 +285,8 @@
       const optionalBootstrapWorkTimeoutMs = 5000;
       const pushHelperLoadTimeoutMs = 4500;
       const shellRefreshTimeoutMs = 7000;
+      const serviceWorkerCleanupTimeoutMs = 2500;
+      const cacheCleanupTimeoutMs = 2500;
       let bootstrapTimeoutId = null;
       let bootstrapReady = false;
 
@@ -596,9 +598,17 @@
       async function refreshWebShellOnly() {
         if ('serviceWorker' in navigator) {
           try {
-            const registrations = await navigator.serviceWorker.getRegistrations();
+            const registrations = await withTimeout(
+              navigator.serviceWorker.getRegistrations(),
+              serviceWorkerCleanupTimeoutMs,
+              [],
+            );
             for (const registration of registrations) {
-              await registration.unregister();
+              await withTimeout(
+                registration.unregister(),
+                serviceWorkerCleanupTimeoutMs,
+                false,
+              );
             }
           } catch (_) {}
         }
@@ -608,8 +618,12 @@
       async function clearLegacyFlutterCaches() {
         if (!('caches' in window)) return;
         try {
-          const cacheNames = await caches.keys();
-          await Promise.all(
+          const cacheNames = await withTimeout(
+            caches.keys(),
+            cacheCleanupTimeoutMs,
+            [],
+          );
+          await withTimeout(Promise.all(
             cacheNames
               .filter((cacheName) =>
                 cacheName === 'flutter-app-cache' ||
@@ -619,7 +633,7 @@
                 cacheName.startsWith('flutter-temp-cache-'),
               )
               .map((cacheName) => caches.delete(cacheName)),
-          );
+          ), cacheCleanupTimeoutMs, false);
         } catch (_) {}
       }
 

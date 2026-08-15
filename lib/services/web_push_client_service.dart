@@ -28,6 +28,8 @@ class WebPushClientService {
   static Future<WebPushSyncResult>? _ensureSubscribedInFlight;
   static String? _ensureSubscribedInFlightKey;
   static Future<void>? _syncUnreadBadgeInFlight;
+  static Future<void>? _syncUnreadBadgeCountInFlight;
+  static int? _pendingUnreadBadgeCount;
 
   static String _runtimePolicySnapshotKey(
     Map<String, dynamic>? runtimePolicySnapshot,
@@ -84,7 +86,26 @@ class WebPushClientService {
   }
 
   static Future<void> syncUnreadBadgeCount(int count) {
-    return impl.syncUnreadBadgeCount(count);
+    _pendingUnreadBadgeCount = count < 0 ? 0 : count;
+    final inFlight = _syncUnreadBadgeCountInFlight;
+    if (inFlight != null) return inFlight;
+
+    late final Future<void> future;
+    future =
+        (() async {
+          while (true) {
+            final nextCount = _pendingUnreadBadgeCount;
+            if (nextCount == null) return;
+            _pendingUnreadBadgeCount = null;
+            await impl.syncUnreadBadgeCount(nextCount);
+          }
+        })().whenComplete(() {
+          if (identical(_syncUnreadBadgeCountInFlight, future)) {
+            _syncUnreadBadgeCountInFlight = null;
+          }
+        });
+    _syncUnreadBadgeCountInFlight = future;
+    return future;
   }
 
   static Future<void> unsubscribe(Dio dio) {

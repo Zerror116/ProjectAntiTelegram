@@ -90,6 +90,7 @@ Map<String, dynamic>? _deserializeSubscriptionJson(String? rawJson) {
 Future<dynamic> _callPushHelper(
   String method, [
   List<dynamic> args = const [],
+  Duration timeout = const Duration(seconds: 6),
 ]) async {
   final helper = js.context['projectPhoenixPush'];
   if (helper == null) {
@@ -99,7 +100,7 @@ Future<dynamic> _callPushHelper(
   try {
     return await _jsPromiseToFuture(
       _asJsObject(helper).callMethod(method, args),
-    );
+    ).timeout(timeout);
   } catch (e) {
     _logWebPush('[web-push] helper call failed: method=$method error=$e');
     return null;
@@ -131,7 +132,9 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
   final workerUrl = _currentWorkerUrl();
   html.ServiceWorkerRegistration? existingRegistration;
   try {
-    final dynamic existing = await sw.getRegistration();
+    final dynamic existing = await sw.getRegistration().timeout(
+      const Duration(seconds: 3),
+    );
     if (existing != null) {
       existingRegistration = existing as html.ServiceWorkerRegistration;
       _logWebPush(
@@ -150,7 +153,9 @@ Future<html.ServiceWorkerRegistration?> _getRegistration() async {
       if (existingRegistration == null) return null;
       return await _waitForRegistrationActivation(existingRegistration);
     }
-    final registration = await sw.register(workerUrl);
+    final registration = await sw
+        .register(workerUrl)
+        .timeout(const Duration(seconds: 5));
     _logWebPush(
       '[web-push] _getRegistration: registered scope=${registration.scope}',
     );
@@ -195,12 +200,18 @@ Future<html.ServiceWorkerRegistration> _waitForRegistrationActivation(
 }
 
 Future<Map<String, dynamic>?> _getPushSubscriptionPayload() async {
-  final rawJson = await _callPushHelper('getSubscriptionJson');
+  final rawJson = await _callPushHelper(
+    'getSubscriptionJson',
+    const [],
+    const Duration(seconds: 5),
+  );
   return _deserializeSubscriptionJson(rawJson?.toString());
 }
 
 Future<Map<String, dynamic>?> _subscribeToPushPayload(String publicKey) async {
-  final rawJson = await _callPushHelper('subscribeJson', [publicKey]);
+  final rawJson = await _callPushHelper('subscribeJson', [
+    publicKey,
+  ], const Duration(seconds: 12));
   return _deserializeSubscriptionJson(rawJson?.toString());
 }
 
@@ -212,11 +223,15 @@ Future<void> _syncWindowBadge(int unreadCount) async {
       if (normalized > 0) {
         await _jsPromiseToFuture(
           navigator.callMethod('setAppBadge', [normalized]),
-        );
+        ).timeout(const Duration(seconds: 2));
       } else if (navigator.hasProperty('clearAppBadge')) {
-        await _jsPromiseToFuture(navigator.callMethod('clearAppBadge'));
+        await _jsPromiseToFuture(
+          navigator.callMethod('clearAppBadge'),
+        ).timeout(const Duration(seconds: 2));
       } else {
-        await _jsPromiseToFuture(navigator.callMethod('setAppBadge', [0]));
+        await _jsPromiseToFuture(
+          navigator.callMethod('setAppBadge', [0]),
+        ).timeout(const Duration(seconds: 2));
       }
     }
   } catch (e) {
@@ -261,7 +276,16 @@ Future<WebPushSyncResult> ensureSubscribed(
 
   late final Response<dynamic> configResp;
   try {
-    configResp = await dio.get('/api/web-push/config');
+    configResp = await dio
+        .get(
+          '/api/web-push/config',
+          options: Options(
+            connectTimeout: const Duration(seconds: 5),
+            sendTimeout: const Duration(seconds: 5),
+            receiveTimeout: const Duration(seconds: 8),
+          ),
+        )
+        .timeout(const Duration(seconds: 10));
   } catch (e) {
     _logWebPush('[web-push] ensureSubscribed: config_request_failed error=$e');
     return const WebPushSyncResult(
@@ -319,13 +343,20 @@ Future<WebPushSyncResult> ensureSubscribed(
 
   _logWebPush('[web-push] ensureSubscribed: serialized=true');
   try {
-    await dio.post(
-      '/api/web-push/subscriptions',
-      data: {
-        'subscription': payload,
-        'app_runtime_policy': ?runtimePolicySnapshot,
-      },
-    );
+    await dio
+        .post(
+          '/api/web-push/subscriptions',
+          data: {
+            'subscription': payload,
+            'app_runtime_policy': ?runtimePolicySnapshot,
+          },
+          options: Options(
+            connectTimeout: const Duration(seconds: 5),
+            sendTimeout: const Duration(seconds: 8),
+            receiveTimeout: const Duration(seconds: 8),
+          ),
+        )
+        .timeout(const Duration(seconds: 12));
   } catch (e) {
     _logWebPush('[web-push] ensureSubscribed: sync_failed error=$e');
     return const WebPushSyncResult(
@@ -350,7 +381,16 @@ Future<WebPushSyncResult> ensureSubscribed(
 Future<void> syncUnreadBadge(Dio dio) async {
   if (!isSupported()) return;
   try {
-    final resp = await dio.get('/api/web-push/badge-count');
+    final resp = await dio
+        .get(
+          '/api/web-push/badge-count',
+          options: Options(
+            connectTimeout: const Duration(seconds: 5),
+            sendTimeout: const Duration(seconds: 5),
+            receiveTimeout: const Duration(seconds: 8),
+          ),
+        )
+        .timeout(const Duration(seconds: 10));
     final root = resp.data;
     final count = root is Map
         ? (root['unread_count'] as num?)?.toInt() ?? 0
@@ -384,15 +424,26 @@ Future<void> unsubscribe(Dio dio) async {
     final endpoint = (payload['endpoint'] ?? '').toString().trim();
     if (endpoint.isNotEmpty) {
       try {
-        await dio.delete(
-          '/api/web-push/subscriptions',
-          data: {'endpoint': endpoint},
-        );
+        await dio
+            .delete(
+              '/api/web-push/subscriptions',
+              data: {'endpoint': endpoint},
+              options: Options(
+                connectTimeout: const Duration(seconds: 5),
+                sendTimeout: const Duration(seconds: 8),
+                receiveTimeout: const Duration(seconds: 8),
+              ),
+            )
+            .timeout(const Duration(seconds: 12));
       } catch (_) {
         // ignore
       }
     }
-    await _callPushHelper('unsubscribeCurrent');
+    await _callPushHelper(
+      'unsubscribeCurrent',
+      const [],
+      const Duration(seconds: 8),
+    );
     await _postBadgeSyncToWorker(0);
   } catch (e) {
     _logWebPush('[web-push] unsubscribe failed error=$e');

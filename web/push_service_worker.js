@@ -1,5 +1,8 @@
 const RUNTIME_CACHE_PREFIX = 'projectphoenix-runtime-';
 const IMAGE_PRECACHE_BATCH_SIZE = 12;
+const SERVICE_WORKER_OPERATION_TIMEOUT_MS = 2500;
+const MEDIA_PRECACHE_FETCH_TIMEOUT_MS = 7000;
+const CACHE_TRIM_DELETE_BATCH_SIZE = 24;
 const RUNTIME_IMAGE_CACHES = {
   avatars: {
     name: `${RUNTIME_CACHE_PREFIX}avatars-v2`,
@@ -30,16 +33,40 @@ self.addEventListener('install', (event) => {
   event.waitUntil(self.skipWaiting());
 });
 
+function withTimeout(promise, timeoutMs, fallbackValue) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      finish(fallbackValue);
+    }, timeoutMs);
+
+    function finish(value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(value);
+    }
+
+    Promise.resolve(promise).then(finish).catch(() => {
+      finish(fallbackValue);
+    });
+  });
+}
+
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(
+    const keys = await withTimeout(
+      caches.keys(),
+      SERVICE_WORKER_OPERATION_TIMEOUT_MS,
+      [],
+    );
+    await withTimeout(Promise.all(
       keys
         .filter((key) => key.startsWith(RUNTIME_CACHE_PREFIX) && !ACTIVE_RUNTIME_CACHES.has(key))
         .map((key) => caches.delete(key)),
-    );
-    await syncBadge(0);
-    await self.clients.claim();
+    ), SERVICE_WORKER_OPERATION_TIMEOUT_MS, false);
+    await withTimeout(syncBadge(0), SERVICE_WORKER_OPERATION_TIMEOUT_MS, false);
+    await withTimeout(self.clients.claim(), SERVICE_WORKER_OPERATION_TIMEOUT_MS, false);
   })());
 });
 
@@ -107,9 +134,10 @@ async function trimRuntimeCache(cacheName, limit) {
   const keys = await cache.keys();
   if (keys.length <= limit) return;
   const overflow = keys.length - limit;
-  for (let index = 0; index < overflow; index += 1) {
-    await cache.delete(keys[index]);
-  }
+  const deleteCount = Math.min(overflow, CACHE_TRIM_DELETE_BATCH_SIZE);
+  await withTimeout(Promise.all(
+    keys.slice(0, deleteCount).map((key) => cache.delete(key)),
+  ), SERVICE_WORKER_OPERATION_TIMEOUT_MS, false);
 }
 
 async function cacheRuntimeResponse(request, response, config) {
@@ -165,8 +193,17 @@ async function precacheImageBatch(urls) {
       const cache = await caches.open(config.name);
       const existing = await cache.match(request);
       if (existing) continue;
-      const response = await fetch(request);
-      await cacheRuntimeResponse(request, response, config);
+      const response = await withTimeout(
+        fetch(request),
+        MEDIA_PRECACHE_FETCH_TIMEOUT_MS,
+        null,
+      );
+      if (!response) continue;
+      await withTimeout(
+        cacheRuntimeResponse(request, response, config),
+        SERVICE_WORKER_OPERATION_TIMEOUT_MS,
+        null,
+      );
     } catch (_) {
       // ignore bad URLs and transient network errors
     }
@@ -249,10 +286,10 @@ self.addEventListener('push', (event) => {
   event.waitUntil((async () => {
     await syncBadge(badgeCount);
 
-    const windows = await self.clients.matchAll({
+    const windows = await withTimeout(self.clients.matchAll({
       type: 'window',
       includeUncontrolled: true,
-    });
+    }), SERVICE_WORKER_OPERATION_TIMEOUT_MS, []);
     const hasVisibleClient = windows.some((client) => {
       return client.visibilityState === 'visible' && client.focused;
     });
@@ -261,7 +298,7 @@ self.addEventListener('push', (event) => {
       return;
     }
 
-    await self.registration.showNotification(title, {
+    await withTimeout(self.registration.showNotification(title, {
       body,
       tag: payload.tag || 'projectphoenix-chat-message',
       icon: '/icons/Icon-192.png',
@@ -274,7 +311,7 @@ self.addEventListener('push', (event) => {
         chatId: payload.data && payload.data.chatId ? payload.data.chatId : null,
         payload: tapPayload,
       },
-    });
+    }), SERVICE_WORKER_OPERATION_TIMEOUT_MS, false);
   })());
 });
 
@@ -288,16 +325,24 @@ self.addEventListener('notificationclick', (event) => {
   );
 
   event.waitUntil((async () => {
-    const windows = await self.clients.matchAll({
+    const windows = await withTimeout(self.clients.matchAll({
       type: 'window',
       includeUncontrolled: true,
-    });
+    }), SERVICE_WORKER_OPERATION_TIMEOUT_MS, []);
     for (const client of windows) {
       if ('focus' in client) {
-        await client.focus();
+        await withTimeout(
+          client.focus(),
+          SERVICE_WORKER_OPERATION_TIMEOUT_MS,
+          null,
+        );
         if ('navigate' in client) {
           try {
-            await client.navigate(targetUrl);
+            await withTimeout(
+              client.navigate(targetUrl),
+              SERVICE_WORKER_OPERATION_TIMEOUT_MS,
+              null,
+            );
           } catch (_) {
             // ignore
           }
@@ -306,7 +351,11 @@ self.addEventListener('notificationclick', (event) => {
       }
     }
     if (self.clients.openWindow) {
-      await self.clients.openWindow(targetUrl);
+      await withTimeout(
+        self.clients.openWindow(targetUrl),
+        SERVICE_WORKER_OPERATION_TIMEOUT_MS,
+        null,
+      );
     }
   })());
 });

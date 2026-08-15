@@ -40,6 +40,8 @@ const ENDPOINT_SWEEP_INTERVAL_MS = Math.max(60_000, Number.parseInt(process.env.
 let stopping = false;
 let digestTimer = null;
 let endpointSweepTimer = null;
+let digestSweepInFlight = false;
+let endpointSweepInFlight = false;
 
 async function reportWorkerError(code, error, details = {}) {
   const message = String(error?.message || error || code);
@@ -82,6 +84,19 @@ async function runDigestSweep(reason) {
   console.log(`[worker] digest sweep completed (${reason}, scopes=${completed}/${scopes.length})`);
 }
 
+async function runDigestSweepOnce(reason) {
+  if (digestSweepInFlight) {
+    console.warn(`[worker] digest sweep skipped (${reason}): previous sweep still running`);
+    return;
+  }
+  digestSweepInFlight = true;
+  try {
+    await runDigestSweep(reason);
+  } finally {
+    digestSweepInFlight = false;
+  }
+}
+
 async function runEndpointSweep(reason) {
   const scopes = await loadTenantProcessingScopes();
   let disabled = 0;
@@ -104,6 +119,19 @@ async function runEndpointSweep(reason) {
     }
   } catch (error) {
     await reportWorkerError('notification_endpoint_sweep_error', error, { reason });
+  }
+}
+
+async function runEndpointSweepOnce(reason) {
+  if (endpointSweepInFlight) {
+    console.warn(`[worker] endpoint sweep skipped (${reason}): previous sweep still running`);
+    return;
+  }
+  endpointSweepInFlight = true;
+  try {
+    await runEndpointSweep(reason);
+  } finally {
+    endpointSweepInFlight = false;
   }
 }
 
@@ -173,13 +201,13 @@ process.on('uncaughtException', (error) => {
     const bootstrap = await bootstrapDatabase();
     console.log(`[worker] bootstrap applied=${bootstrap.applied.length}`);
     await refreshMediaAssetCache();
-    await runDigestSweep('startup');
-    await runEndpointSweep('startup');
+    await runDigestSweepOnce('startup');
+    await runEndpointSweepOnce('startup');
     digestTimer = setInterval(() => {
-      void runDigestSweep('interval');
+      void runDigestSweepOnce('interval');
     }, DIGEST_SWEEP_INTERVAL_MS);
     endpointSweepTimer = setInterval(() => {
-      void runEndpointSweep('interval');
+      void runEndpointSweepOnce('interval');
     }, ENDPOINT_SWEEP_INTERVAL_MS);
     await workerLoop();
   } catch (error) {

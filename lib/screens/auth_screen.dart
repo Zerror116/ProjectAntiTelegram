@@ -177,7 +177,7 @@ class _AuthScreenState extends State<AuthScreen> {
   }
 
   bool _isAndroidWebRestricted() {
-    return _isAndroidWeb();
+    return false;
   }
 
   Future<void> _loadPasskeyAvailability() async {

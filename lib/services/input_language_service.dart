@@ -19,6 +19,7 @@ class InputLanguageService {
   Timer? _retryTimer;
   bool _initialized = false;
   bool _nativeLookupAvailable = false;
+  bool _refreshInFlight = false;
 
   Future<void> initialize() async {
     if (_initialized) return;
@@ -41,6 +42,7 @@ class InputLanguageService {
     _retryTimer = null;
     _initialized = false;
     _nativeLookupAvailable = false;
+    _refreshInFlight = false;
   }
 
   Future<void> _bootstrapNativeLookup() async {
@@ -76,21 +78,26 @@ class InputLanguageService {
   }
 
   Future<void> _refreshFromPlatform() async {
-    if (!_nativeLookupAvailable) return;
-    final value = await _queryFromPlatform();
-    if (value == null) {
-      _nativeLookupAvailable = false;
-      _scheduleRetry();
-      return;
+    if (!_nativeLookupAvailable || _refreshInFlight) return;
+    _refreshInFlight = true;
+    try {
+      final value = await _queryFromPlatform();
+      if (value == null) {
+        _nativeLookupAvailable = false;
+        _scheduleRetry();
+        return;
+      }
+      _updateCode(value);
+    } finally {
+      _refreshInFlight = false;
     }
-    _updateCode(value);
   }
 
   Future<String?> _queryFromPlatform() async {
     try {
-      return await _macosMethodChannel.invokeMethod<String>(
-        'getCurrentLanguage',
-      );
+      return await _macosMethodChannel
+          .invokeMethod<String>('getCurrentLanguage')
+          .timeout(const Duration(milliseconds: 800), onTimeout: () => null);
     } on MissingPluginException {
       return null;
     } catch (_) {}

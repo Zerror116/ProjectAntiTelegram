@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../main.dart';
+import '../src/utils/image_file_picker.dart';
 import '../src/utils/media_url.dart';
 import '../utils/phone_utils.dart';
 import '../widgets/app_avatar.dart';
@@ -23,13 +24,17 @@ Future<Uint8List?> _readPickedPlatformFileBytes(PlatformFile file) async {
   final path = (file.path ?? '').trim();
   if (path.isNotEmpty && !kIsWeb) {
     try {
-      return await File(path).readAsBytes();
+      return await File(
+        path,
+      ).readAsBytes().timeout(const Duration(seconds: 30));
     } catch (_) {
       return null;
     }
   }
   try {
-    return await file.readAsBytes();
+    return await file.readAsBytes().timeout(
+      kIsWeb ? const Duration(seconds: 6) : const Duration(seconds: 30),
+    );
   } catch (_) {
     return null;
   }
@@ -370,7 +375,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Future<void> _pickAndUploadAvatar() async {
     if (_avatarBusy) return;
 
-    final pickedFile = await FilePicker.pickFile(type: FileType.image);
+    final pickedFile = await pickSingleImageFile();
     if (pickedFile == null) return;
 
     final sourceBytes = await _readPickedPlatformFileBytes(pickedFile);
