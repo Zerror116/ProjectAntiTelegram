@@ -532,6 +532,9 @@ function testNotificationQueuePushDeliveryInvariants() {
   assert.match(queueSource, /notifications\.normalizeCategory\(context\.category, "support"\)/);
   assert.match(queueSource, /endpoint_permission_not_granted/);
   assert.match(queueSource, /endpoint_push_target_missing/);
+  assert.match(queueSource, /\$8::jsonb,\s*0,\s*now\(\),\s*now\(\)/);
+  assert.match(queueSource, /ELSE EXCLUDED\.next_attempt_at/);
+  assert.doesNotMatch(queueSource, /\$8::jsonb,\s*0,\s*NULL,\s*now\(\)/);
   assert.doesNotMatch(
     queueSource,
     /markEndpointSuccess\(context\.endpoint_id,\s*cleanString\(normalizedResult\.state\)[\s\S]{0,80}\|\|\s*"skipped"/,

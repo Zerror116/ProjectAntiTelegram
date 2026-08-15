@@ -242,7 +242,7 @@ async function upsertSkippedPushDelivery({
      )
      VALUES (
        $1, $2, $3, 'push', $4, $5, $6, 'push', 'skipped', NULLIF($7, ''),
-       $8::jsonb, 0, NULL, now()
+       $8::jsonb, 0, now(), now()
      )
      ON CONFLICT (inbox_item_id, endpoint_id, channel) WHERE endpoint_id IS NOT NULL
      DO UPDATE
@@ -262,8 +262,8 @@ async function upsertSkippedPushDelivery({
            metadata = COALESCE(notification_deliveries.metadata, '{}'::jsonb) || EXCLUDED.metadata,
            next_attempt_at = CASE
              WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
-               THEN notification_deliveries.next_attempt_at
-             ELSE NULL
+               THEN COALESCE(notification_deliveries.next_attempt_at, now())
+             ELSE EXCLUDED.next_attempt_at
            END,
            processing_started_at = CASE
              WHEN notification_deliveries.state IN ('delivered', 'opened', 'dismissed')
