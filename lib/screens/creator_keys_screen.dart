@@ -27,6 +27,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   final _tenantAutoProcessingDelayCtrl = TextEditingController(text: '60');
   final _tenantCartRetentionDaysCtrl = TextEditingController(text: '30');
   final _tenantAutoPublishDelayCtrl = TextEditingController(text: '5');
+  final _tenantRevisionAutoDiscountCtrl = TextEditingController(text: '10');
   final _tenantShelfFieldLabelCtrl = TextEditingController(text: 'Полка');
   final _tenantFloorFieldLabelCtrl = TextEditingController(text: 'Этаж');
   final _tenantDeliveryMinAmountCtrl = TextEditingController(text: '1500');
@@ -45,6 +46,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
   bool _tenantDeliverySnapshotOnAdminApprove = false;
   bool _tenantClientCancelAnytimeEnabled = false;
   bool _tenantRevisionDeleteApprovalEnabled = false;
+  String _tenantRevisionGroupingMode = 'numeric_shelf';
+  bool _tenantRevisionAutoHideOldVersions = true;
+  bool _tenantRevisionExactProductSearch = true;
   bool _tenantDefectStatsEnabled = false;
   bool _tenantClientGroupSwitcherEnabled = true;
   bool _tenantQrExistingClientJoinEnabled = true;
@@ -91,6 +95,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantAutoProcessingDelayCtrl.dispose();
     _tenantCartRetentionDaysCtrl.dispose();
     _tenantAutoPublishDelayCtrl.dispose();
+    _tenantRevisionAutoDiscountCtrl.dispose();
     _tenantShelfFieldLabelCtrl.dispose();
     _tenantFloorFieldLabelCtrl.dispose();
     _tenantDeliveryMinAmountCtrl.dispose();
@@ -154,6 +159,25 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       return false;
     }
     return _toBoolValue(value);
+  }
+
+  String _normalizeRevisionGroupingMode(dynamic value) {
+    final normalized = (value ?? '').toString().trim().toLowerCase();
+    if (normalized == 'manual_shelf' || normalized == 'manual_place') {
+      return normalized;
+    }
+    return 'numeric_shelf';
+  }
+
+  String _revisionGroupingModeLabel(String mode) {
+    switch (_normalizeRevisionGroupingMode(mode)) {
+      case 'manual_shelf':
+        return 'По стеллажу';
+      case 'manual_place':
+        return 'По стеллажу и коробке';
+      default:
+        return 'Полки 01-10';
+    }
   }
 
   int _parseIntValue(
@@ -223,6 +247,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     required TextEditingController autoDelayCtrl,
     required TextEditingController cartRetentionDaysCtrl,
     required TextEditingController autoPublishDelayCtrl,
+    required TextEditingController revisionAutoDiscountCtrl,
     required TextEditingController minAmountCtrl,
     required TextEditingController citiesCtrl,
     required TextEditingController shelfFieldLabelCtrl,
@@ -237,6 +262,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     required bool deliverySnapshotOnAdminApprove,
     required bool clientCancelAnytimeEnabled,
     required bool revisionDeleteApprovalEnabled,
+    required String revisionGroupingMode,
+    required bool revisionAutoHideOldVersions,
+    required bool revisionExactProductSearch,
     required bool defectStatsEnabled,
     bool clientGroupSwitcherEnabled = true,
     bool qrExistingClientJoinEnabled = true,
@@ -270,6 +298,15 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       fallback: 5,
       min: 1,
       max: 1440,
+    );
+    final revisionAutoDiscountPercent = _parseIntValue(
+      revisionAutoDiscountCtrl.text,
+      fallback: 10,
+      min: 1,
+      max: 95,
+    );
+    final normalizedRevisionGroupingMode = _normalizeRevisionGroupingMode(
+      revisionGroupingMode,
     );
     final minAmount = _parseIntValue(
       minAmountCtrl.text,
@@ -308,6 +345,14 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
         'shelf_field_label': shelfFieldLabel,
         'floor_field_label': floorFieldLabel,
       },
+      'revision': {
+        'grouping_mode': normalizedRevisionGroupingMode,
+        'auto_discount_percent': revisionAutoDiscountPercent,
+        'auto_hide_old_versions': revisionAutoHideOldVersions,
+        'product_id_search_mode': revisionExactProductSearch
+            ? 'exact'
+            : 'partial',
+      },
       'channels': {
         'publication_interval_ms': publicationSeconds * 1000,
         'auto_publish_enabled': autoPublishEnabled,
@@ -343,6 +388,12 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       'dangerous_action_audit_enabled': dangerousActionAuditEnabled,
       'product_change_history_enabled': productChangeHistoryEnabled,
       'client_cancel_anytime_enabled': clientCancelAnytimeEnabled,
+      'revision_grouping_mode': normalizedRevisionGroupingMode,
+      'revision_auto_discount_percent': revisionAutoDiscountPercent,
+      'revision_auto_hide_old_versions': revisionAutoHideOldVersions,
+      'revision_product_id_search_mode': revisionExactProductSearch
+          ? 'exact'
+          : 'partial',
       'creator_notification_diagnostics_enabled':
           creatorNotificationDiagnosticsEnabled,
       'creator_bootstrap_monitoring_enabled': creatorBootstrapMonitoringEnabled,
@@ -355,6 +406,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       autoDelayCtrl: _tenantAutoProcessingDelayCtrl,
       cartRetentionDaysCtrl: _tenantCartRetentionDaysCtrl,
       autoPublishDelayCtrl: _tenantAutoPublishDelayCtrl,
+      revisionAutoDiscountCtrl: _tenantRevisionAutoDiscountCtrl,
       minAmountCtrl: _tenantDeliveryMinAmountCtrl,
       citiesCtrl: _tenantClientCitiesCtrl,
       shelfFieldLabelCtrl: _tenantShelfFieldLabelCtrl,
@@ -369,6 +421,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       deliverySnapshotOnAdminApprove: _tenantDeliverySnapshotOnAdminApprove,
       clientCancelAnytimeEnabled: _tenantClientCancelAnytimeEnabled,
       revisionDeleteApprovalEnabled: _tenantRevisionDeleteApprovalEnabled,
+      revisionGroupingMode: _tenantRevisionGroupingMode,
+      revisionAutoHideOldVersions: _tenantRevisionAutoHideOldVersions,
+      revisionExactProductSearch: _tenantRevisionExactProductSearch,
       defectStatsEnabled: _tenantDefectStatsEnabled,
       clientGroupSwitcherEnabled: _tenantClientGroupSwitcherEnabled,
       qrExistingClientJoinEnabled: _tenantQrExistingClientJoinEnabled,
@@ -387,6 +442,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantAutoProcessingDelayCtrl.text = '60';
     _tenantCartRetentionDaysCtrl.text = '30';
     _tenantAutoPublishDelayCtrl.text = '5';
+    _tenantRevisionAutoDiscountCtrl.text = '10';
     _tenantShelfFieldLabelCtrl.text = 'Полка';
     _tenantFloorFieldLabelCtrl.text = 'Этаж';
     _tenantDeliveryMinAmountCtrl.text = '1500';
@@ -401,6 +457,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     _tenantDeliverySnapshotOnAdminApprove = false;
     _tenantClientCancelAnytimeEnabled = false;
     _tenantRevisionDeleteApprovalEnabled = false;
+    _tenantRevisionGroupingMode = 'numeric_shelf';
+    _tenantRevisionAutoHideOldVersions = true;
+    _tenantRevisionExactProductSearch = true;
     _tenantDefectStatsEnabled = false;
     _tenantClientGroupSwitcherEnabled = true;
     _tenantQrExistingClientJoinEnabled = true;
@@ -872,6 +931,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
     final productProcessing = _asMap(initialSettings['product_processing']);
     final delivery = _asMap(initialSettings['delivery']);
     final worker = _asMap(initialSettings['worker']);
+    final revision = _asMap(initialSettings['revision']);
     final channels = _asMap(initialSettings['channels']);
     final registration = _asMap(initialSettings['registration']);
     final analytics = _asMap(initialSettings['analytics']);
@@ -910,6 +970,13 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           (channels['auto_publish_delay_minutes'] ??
                   initialSettings['auto_publish_delay_minutes'] ??
                   5)
+              .toString(),
+    );
+    final revisionAutoDiscountCtrl = TextEditingController(
+      text:
+          (revision['auto_discount_percent'] ??
+                  initialSettings['revision_auto_discount_percent'] ??
+                  10)
               .toString(),
     );
     final minAmountCtrl = TextEditingController(
@@ -984,6 +1051,22 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       worker['revision_delete_approval_enabled'] ??
           initialSettings['revision_delete_approval_enabled'],
     );
+    var revisionGroupingMode = _normalizeRevisionGroupingMode(
+      revision['grouping_mode'] ?? initialSettings['revision_grouping_mode'],
+    );
+    var revisionAutoHideOldVersions = _toBoolValueOr(
+      revision['auto_hide_old_versions'] ??
+          initialSettings['revision_auto_hide_old_versions'],
+      true,
+    );
+    var revisionExactProductSearch =
+        (revision['product_id_search_mode'] ??
+                initialSettings['revision_product_id_search_mode'] ??
+                'exact')
+            .toString()
+            .trim()
+            .toLowerCase() !=
+        'partial';
     var defectStatsEnabled = _toBoolValue(
       analytics['defect_stats_enabled'] ??
           initialSettings['defect_stats_enabled'],
@@ -1166,6 +1249,41 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                         () => revisionDeleteApprovalEnabled = value,
                       ),
                     ),
+                    _settingsSectionTitle('Ревизия'),
+                    _settingsDropdownField(
+                      value: revisionGroupingMode,
+                      labelText: 'Как группировать товары',
+                      values: const [
+                        'numeric_shelf',
+                        'manual_shelf',
+                        'manual_place',
+                      ],
+                      onChanged: (value) =>
+                          setDialogState(() => revisionGroupingMode = value),
+                    ),
+                    _settingsNumberField(
+                      controller: revisionAutoDiscountCtrl,
+                      labelText: 'Процент авто-ревизии',
+                      suffixText: '%',
+                      helperText: 'По умолчанию 10%.',
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Скрывать старые посты автоматически',
+                      subtitle:
+                          'При ревизии оставлять только новую версию товара.',
+                      value: revisionAutoHideOldVersions,
+                      onChanged: (value) => setDialogState(
+                        () => revisionAutoHideOldVersions = value,
+                      ),
+                    ),
+                    _settingsSwitchTile(
+                      title: 'Точный поиск по ID',
+                      subtitle: 'ID 328 не будет находить 1328.',
+                      value: revisionExactProductSearch,
+                      onChanged: (value) => setDialogState(
+                        () => revisionExactProductSearch = value,
+                      ),
+                    ),
                     _settingsSectionTitle('Регистрация'),
                     TextField(
                       controller: citiesCtrl,
@@ -1295,6 +1413,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       autoDelayCtrl: autoDelayCtrl,
                       cartRetentionDaysCtrl: cartRetentionDaysCtrl,
                       autoPublishDelayCtrl: autoPublishDelayCtrl,
+                      revisionAutoDiscountCtrl: revisionAutoDiscountCtrl,
                       minAmountCtrl: minAmountCtrl,
                       citiesCtrl: citiesCtrl,
                       shelfFieldLabelCtrl: shelfFieldLabelCtrl,
@@ -1312,6 +1431,9 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
                       clientCancelAnytimeEnabled: clientCancelAnytimeEnabled,
                       revisionDeleteApprovalEnabled:
                           revisionDeleteApprovalEnabled,
+                      revisionGroupingMode: revisionGroupingMode,
+                      revisionAutoHideOldVersions: revisionAutoHideOldVersions,
+                      revisionExactProductSearch: revisionExactProductSearch,
                       defectStatsEnabled: defectStatsEnabled,
                       clientGroupSwitcherEnabled: clientGroupSwitcherEnabled,
                       qrExistingClientJoinEnabled: qrExistingClientJoinEnabled,
@@ -1338,6 +1460,7 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
       autoDelayCtrl.dispose();
       cartRetentionDaysCtrl.dispose();
       autoPublishDelayCtrl.dispose();
+      revisionAutoDiscountCtrl.dispose();
       minAmountCtrl.dispose();
       citiesCtrl.dispose();
       shelfFieldLabelCtrl.dispose();
@@ -1374,6 +1497,37 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
           ),
           controller: controller,
         ),
+      ),
+    );
+  }
+
+  Widget _settingsDropdownField({
+    required String value,
+    required String labelText,
+    required List<String> values,
+    required ValueChanged<String> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: DropdownButtonFormField<String>(
+        initialValue: values.contains(value) ? value : values.first,
+        isExpanded: true,
+        decoration: InputDecoration(
+          labelText: labelText,
+          border: const OutlineInputBorder(),
+        ),
+        items: values
+            .map(
+              (mode) => DropdownMenuItem<String>(
+                value: mode,
+                child: Text(_revisionGroupingModeLabel(mode)),
+              ),
+            )
+            .toList(),
+        onChanged: (next) {
+          if (next == null) return;
+          onChanged(next);
+        },
       ),
     );
   }
@@ -1528,6 +1682,34 @@ class _CreatorKeysScreenState extends State<CreatorKeysScreen> {
             value: _tenantRevisionDeleteApprovalEnabled,
             onChanged: (value) =>
                 setState(() => _tenantRevisionDeleteApprovalEnabled = value),
+          ),
+          _settingsSectionTitle('Ревизия'),
+          _settingsDropdownField(
+            value: _tenantRevisionGroupingMode,
+            labelText: 'Как группировать товары',
+            values: const ['numeric_shelf', 'manual_shelf', 'manual_place'],
+            onChanged: (value) =>
+                setState(() => _tenantRevisionGroupingMode = value),
+          ),
+          _settingsNumberField(
+            controller: _tenantRevisionAutoDiscountCtrl,
+            labelText: 'Процент авто-ревизии',
+            suffixText: '%',
+            helperText: 'По умолчанию 10%.',
+          ),
+          _settingsSwitchTile(
+            title: 'Скрывать старые посты автоматически',
+            subtitle: 'При ревизии оставлять только новую версию товара.',
+            value: _tenantRevisionAutoHideOldVersions,
+            onChanged: (value) =>
+                setState(() => _tenantRevisionAutoHideOldVersions = value),
+          ),
+          _settingsSwitchTile(
+            title: 'Точный поиск по ID',
+            subtitle: 'ID 328 не будет находить 1328.',
+            value: _tenantRevisionExactProductSearch,
+            onChanged: (value) =>
+                setState(() => _tenantRevisionExactProductSearch = value),
           ),
           _settingsSectionTitle('Регистрация'),
           TextField(

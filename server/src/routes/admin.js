@@ -893,6 +893,7 @@ function buildTenantWorkflowSettingsPayload(body = {}) {
   }
   const deliverySource = isPlainObject(payload.delivery) ? payload.delivery : {};
   const workerSource = isPlainObject(payload.worker) ? payload.worker : {};
+  const revisionSource = isPlainObject(payload.revision) ? payload.revision : {};
   const channelsSource = isPlainObject(payload.channels) ? payload.channels : {};
   const rulesSource = isPlainObject(payload.rules) ? payload.rules : {};
   const directMap = [
@@ -938,6 +939,22 @@ function buildTenantWorkflowSettingsPayload(body = {}) {
       "diagnostics",
       "bootstrap_monitoring_enabled",
     ],
+    ["revision_grouping_mode", "revision", "grouping_mode"],
+    [
+      "revision_auto_discount_percent",
+      "revision",
+      "auto_discount_percent",
+    ],
+    [
+      "revision_auto_hide_old_versions",
+      "revision",
+      "auto_hide_old_versions",
+    ],
+    [
+      "revision_product_id_search_mode",
+      "revision",
+      "product_id_search_mode",
+    ],
   ];
   for (const [sourceKey, sectionKey, targetKey] of directMap) {
     if (!Object.prototype.hasOwnProperty.call(source, sourceKey)) continue;
@@ -949,6 +966,7 @@ function buildTenantWorkflowSettingsPayload(body = {}) {
   }
   if (Object.keys(deliverySource).length > 0) payload.delivery = { ...deliverySource, ...(payload.delivery || {}) };
   if (Object.keys(workerSource).length > 0) payload.worker = { ...workerSource, ...(payload.worker || {}) };
+  if (Object.keys(revisionSource).length > 0) payload.revision = { ...revisionSource, ...(payload.revision || {}) };
   if (Object.keys(channelsSource).length > 0) payload.channels = { ...channelsSource, ...(payload.channels || {}) };
   if (Object.keys(rulesSource).length > 0) payload.rules = { ...rulesSource, ...(payload.rules || {}) };
   return payload;

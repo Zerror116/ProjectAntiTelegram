@@ -315,6 +315,51 @@ class _WorkerPanelState extends State<WorkerPanel>
   bool get _revisionDeleteApprovalEnabled =>
       _toBoolValue(_tenantFeatureSettings['revision_delete_approval_enabled']);
 
+  Map<String, dynamic> get _revisionFeatureSettings =>
+      _asMap(_tenantFeatureSettings['revision']);
+
+  String get _revisionGroupingMode {
+    final value =
+        (_revisionFeatureSettings['grouping_mode'] ??
+                _tenantFeatureSettings['revision_grouping_mode'] ??
+                'numeric_shelf')
+            .toString()
+            .trim()
+            .toLowerCase();
+    if (value == 'manual_shelf' || value == 'manual_place') return value;
+    return 'numeric_shelf';
+  }
+
+  bool get _revisionUsesShelfKey =>
+      _manualShelfEnabled && _revisionGroupingMode != 'numeric_shelf';
+
+  int get _revisionConfiguredAutoDiscount {
+    final raw =
+        _revisionFeatureSettings['auto_discount_percent'] ??
+        _tenantFeatureSettings['revision_auto_discount_percent'];
+    final value = _toIntValue(raw, 10);
+    return value.clamp(1, 95).toInt();
+  }
+
+  bool get _revisionConfiguredHideOldVersions {
+    final raw =
+        _revisionFeatureSettings['auto_hide_old_versions'] ??
+        _tenantFeatureSettings['revision_auto_hide_old_versions'];
+    if (raw == null) return true;
+    return _toBoolValue(raw);
+  }
+
+  String get _revisionGroupingLabel {
+    switch (_revisionGroupingMode) {
+      case 'manual_shelf':
+        return _placementShelfDisplayLabel;
+      case 'manual_place':
+        return '$_placementShelfDisplayLabel и $_placementBoxDisplayLabel';
+      default:
+        return 'полкам 01-10';
+    }
+  }
+
   bool get _workerDeliveryAssemblyEnabled {
     final worker = _asMap(_tenantFeatureSettings['worker']);
     return _toBoolValue(
@@ -837,6 +882,12 @@ class _WorkerPanelState extends State<WorkerPanel>
         final nextSettings = Map<String, dynamic>.from(data['data'] as Map);
         setState(() {
           _tenantFeatureSettings = nextSettings;
+          final currentPercent = _revisionPercentCtrl.text.trim();
+          if (currentPercent.isEmpty || currentPercent == '10') {
+            _revisionPercentCtrl.text = _revisionConfiguredAutoDiscount
+                .toString();
+          }
+          _autoHideOldRevisionPosts = _revisionConfiguredHideOldVersions;
         });
         final changed = _rebuildVisibleTabs();
         if (changed) _loadActiveTabData();
@@ -1714,9 +1765,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       final resp = await authService.dio.get(
         '/api/worker/revision/posts',
         queryParameters: {
-          if (_manualShelfEnabled && selectedKey.isNotEmpty)
+          if (_revisionUsesShelfKey && selectedKey.isNotEmpty)
             'shelf_key': selectedKey,
-          if (!_manualShelfEnabled || selectedKey.isEmpty)
+          if (!_revisionUsesShelfKey || selectedKey.isEmpty)
             'shelf_number': selected,
           if (productSearch.isNotEmpty) 'product_id': productSearch,
         },
@@ -1977,9 +2028,9 @@ class _WorkerPanelState extends State<WorkerPanel>
       final resp = await authService.dio.post(
         '/api/worker/revision/auto',
         data: {
-          if (_manualShelfEnabled && selectedShelfKey.isNotEmpty)
+          if (_revisionUsesShelfKey && selectedShelfKey.isNotEmpty)
             'shelf_key': selectedShelfKey,
-          if (!_manualShelfEnabled || selectedShelfKey.isEmpty)
+          if (!_revisionUsesShelfKey || selectedShelfKey.isEmpty)
             'shelf_number': selectedShelf,
           'percent': percent,
           'hide_old_versions': _autoHideOldRevisionPosts,
@@ -4013,9 +4064,7 @@ class _WorkerPanelState extends State<WorkerPanel>
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  _manualShelfEnabled
-                      ? 'Выберите ручную полку. Ревизия покажет товары только с выбранной полки и не зависит от дат, выходных или воскресенья.'
-                      : 'Выберите нужную полку от 01 до 10. Ревизия покажет товары только с этой полки и не зависит от дат, выходных или воскресенья.',
+                  'Выберите группу ревизии по $_revisionGroupingLabel. Ревизия покажет товары только из выбранной группы и не зависит от дат, выходных или воскресенья.',
                 ),
               ],
             ),
@@ -4241,6 +4290,12 @@ class _WorkerPanelState extends State<WorkerPanel>
                     revisionShelfNumber,
                 manualShelfLabel: post['manual_shelf_label'],
               );
+              final productManualShelf = (post['manual_shelf_label'] ?? '')
+                  .toString()
+                  .trim();
+              final productShelfFloor = (post['shelf_floor'] ?? '')
+                  .toString()
+                  .trim();
               final createdAt = (post['created_at'] ?? '').toString();
               final createdAtShort = createdAt.length >= 16
                   ? createdAt.substring(0, 16).replaceFirst('T', ' ')
@@ -4310,6 +4365,14 @@ class _WorkerPanelState extends State<WorkerPanel>
                             children: [
                               _statChip('ID $productLabel'),
                               _statChip('Полка $revisionShelfDisplay'),
+                              if (productManualShelf.isNotEmpty)
+                                _statChip(
+                                  '$_placementShelfDisplayLabel $productManualShelf',
+                                ),
+                              if (productShelfFloor.isNotEmpty)
+                                _statChip(
+                                  '$_placementBoxDisplayLabel $productShelfFloor',
+                                ),
                               _statChip(
                                 '${_toDoubleValue(post['price']).toStringAsFixed(0)} ₽',
                               ),

@@ -11,6 +11,10 @@ const DEFAULT_TENANT_FEATURE_SETTINGS = Object.freeze({
   cart_retention_days: 30,
   client_cancel_anytime_enabled: true,
   revision_delete_approval_enabled: false,
+  revision_grouping_mode: "numeric_shelf",
+  revision_auto_discount_percent: 10,
+  revision_auto_hide_old_versions: true,
+  revision_product_id_search_mode: "exact",
   defect_stats_enabled: false,
   auto_publish_enabled: false,
   auto_publish_delay_minutes: 5,
@@ -48,6 +52,12 @@ const DEFAULT_TENANT_WORKFLOW_SETTINGS = Object.freeze({
     revision_delete_approval_enabled: false,
     shelf_field_label: "Полка",
     floor_field_label: "Этаж",
+  }),
+  revision: Object.freeze({
+    grouping_mode: "numeric_shelf",
+    auto_discount_percent: 10,
+    auto_hide_old_versions: true,
+    product_id_search_mode: "exact",
   }),
   channels: Object.freeze({
     publication_interval_ms: 2000,
@@ -145,6 +155,7 @@ function normalizeTenantFeatureSettings(raw = {}) {
   const productProcessingSource = sectionOf(source, "product_processing");
   const deliverySource = sectionOf(source, "delivery");
   const workerSource = sectionOf(source, "worker");
+  const revisionSource = sectionOf(source, "revision");
   const channelsSource = sectionOf(source, "channels");
   const registrationSource = sectionOf(source, "registration");
   const analyticsSource = sectionOf(source, "analytics");
@@ -256,6 +267,31 @@ function normalizeTenantFeatureSettings(raw = {}) {
       workerSource.floor_field_label ?? source.floor_field_label,
       40,
     ) || DEFAULT_TENANT_FEATURE_SETTINGS.floor_field_label;
+  const revisionGroupingMode = oneOf(
+    revisionSource.grouping_mode ?? source.revision_grouping_mode,
+    ["numeric_shelf", "manual_shelf", "manual_place"],
+    DEFAULT_TENANT_FEATURE_SETTINGS.revision_grouping_mode,
+  );
+  const revisionAutoDiscountPercent = Math.round(
+    clampNumber(
+      revisionSource.auto_discount_percent ??
+        source.revision_auto_discount_percent,
+      1,
+      95,
+      DEFAULT_TENANT_FEATURE_SETTINGS.revision_auto_discount_percent,
+    ),
+  );
+  const revisionAutoHideOldVersions = parseBoolean(
+    revisionSource.auto_hide_old_versions ??
+      source.revision_auto_hide_old_versions,
+    DEFAULT_TENANT_FEATURE_SETTINGS.revision_auto_hide_old_versions,
+  );
+  const revisionProductIdSearchMode = oneOf(
+    revisionSource.product_id_search_mode ??
+      source.revision_product_id_search_mode,
+    ["exact", "partial"],
+    DEFAULT_TENANT_FEATURE_SETTINGS.revision_product_id_search_mode,
+  );
   const groupRulesText = String(
     rulesSource.group_rules_text ?? source.group_rules_text ?? "",
   )
@@ -322,6 +358,14 @@ function normalizeTenantFeatureSettings(raw = {}) {
       DEFAULT_TENANT_FEATURE_SETTINGS.auto_publish_delay_minutes ||
     shelfFieldLabel !== DEFAULT_TENANT_FEATURE_SETTINGS.shelf_field_label ||
     floorFieldLabel !== DEFAULT_TENANT_FEATURE_SETTINGS.floor_field_label ||
+    revisionGroupingMode !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.revision_grouping_mode ||
+    revisionAutoDiscountPercent !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.revision_auto_discount_percent ||
+    revisionAutoHideOldVersions !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.revision_auto_hide_old_versions ||
+    revisionProductIdSearchMode !==
+      DEFAULT_TENANT_FEATURE_SETTINGS.revision_product_id_search_mode ||
     groupRulesText.length > 0 ||
     clientGroupSwitcherEnabled !==
       DEFAULT_TENANT_FEATURE_SETTINGS.client_group_switcher_enabled ||
@@ -359,6 +403,12 @@ function normalizeTenantFeatureSettings(raw = {}) {
       revision_delete_approval_enabled: revisionDeleteApprovalEnabled,
       shelf_field_label: shelfFieldLabel,
       floor_field_label: floorFieldLabel,
+    },
+    revision: {
+      grouping_mode: revisionGroupingMode,
+      auto_discount_percent: revisionAutoDiscountPercent,
+      auto_hide_old_versions: revisionAutoHideOldVersions,
+      product_id_search_mode: revisionProductIdSearchMode,
     },
     channels: {
       publication_interval_ms: publicationIntervalMs,
@@ -399,6 +449,10 @@ function normalizeTenantFeatureSettings(raw = {}) {
     cart_retention_days: cartRetentionDays,
     client_cancel_anytime_enabled: clientCancelAnytimeEnabled,
     revision_delete_approval_enabled: revisionDeleteApprovalEnabled,
+    revision_grouping_mode: revisionGroupingMode,
+    revision_auto_discount_percent: revisionAutoDiscountPercent,
+    revision_auto_hide_old_versions: revisionAutoHideOldVersions,
+    revision_product_id_search_mode: revisionProductIdSearchMode,
     defect_stats_enabled: defectStatsEnabled,
     client_city_options: clientCityOptions,
     auto_publish_enabled: autoPublishEnabled,

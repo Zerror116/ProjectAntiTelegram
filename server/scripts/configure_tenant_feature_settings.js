@@ -183,6 +183,18 @@ async function main() {
         process.env.REVISION_DELETE_APPROVAL_ENABLED,
         true,
       ),
+      revision_grouping_mode:
+        process.env.REVISION_GROUPING_MODE || "numeric_shelf",
+      revision_auto_discount_percent: parsePositiveInt(
+        process.env.REVISION_AUTO_DISCOUNT_PERCENT,
+        10,
+      ),
+      revision_auto_hide_old_versions: parseBoolean(
+        process.env.REVISION_AUTO_HIDE_OLD_VERSIONS,
+        true,
+      ),
+      revision_product_id_search_mode:
+        process.env.REVISION_PRODUCT_ID_SEARCH_MODE || "exact",
       defect_stats_enabled: parseBoolean(process.env.DEFECT_STATS_ENABLED, true),
       phone_access_approval_enabled: parseBoolean(
         process.env.PHONE_ACCESS_APPROVAL_ENABLED,

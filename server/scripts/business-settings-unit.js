@@ -40,6 +40,14 @@ function testDefaults() {
   assert.equal(settings.worker.delivery_assembly_enabled, false);
   assert.equal(settings.phone_access_approval_enabled, false);
   assert.equal(settings.client.phone_access_approval_enabled, false);
+  assert.equal(settings.revision_grouping_mode, "numeric_shelf");
+  assert.equal(settings.revision.grouping_mode, "numeric_shelf");
+  assert.equal(settings.revision_auto_discount_percent, 10);
+  assert.equal(settings.revision.auto_discount_percent, 10);
+  assert.equal(settings.revision_auto_hide_old_versions, true);
+  assert.equal(settings.revision.auto_hide_old_versions, true);
+  assert.equal(settings.revision_product_id_search_mode, "exact");
+  assert.equal(settings.revision.product_id_search_mode, "exact");
   assert.equal(settings.creator_notification_diagnostics_enabled, true);
   assert.equal(settings.creator_bootstrap_monitoring_enabled, true);
   assert.deepEqual(settings.client_city_options, []);
@@ -71,6 +79,12 @@ function testTopLevelAndNestedFlags() {
     worker: {
       delivery_assembly_enabled: "on",
     },
+    revision: {
+      grouping_mode: "manual_shelf",
+      auto_discount_percent: 25,
+      auto_hide_old_versions: "нет",
+      product_id_search_mode: "partial",
+    },
     delivery: {
       client_cancel_anytime_enabled: "да",
     },
@@ -96,6 +110,14 @@ function testTopLevelAndNestedFlags() {
   assert.equal(settings.delivery.client_cancel_anytime_enabled, true);
   assert.equal(settings.worker_delivery_assembly_enabled, true);
   assert.equal(settings.worker.delivery_assembly_enabled, true);
+  assert.equal(settings.revision_grouping_mode, "manual_shelf");
+  assert.equal(settings.revision.grouping_mode, "manual_shelf");
+  assert.equal(settings.revision_auto_discount_percent, 25);
+  assert.equal(settings.revision.auto_discount_percent, 25);
+  assert.equal(settings.revision_auto_hide_old_versions, false);
+  assert.equal(settings.revision.auto_hide_old_versions, false);
+  assert.equal(settings.revision_product_id_search_mode, "partial");
+  assert.equal(settings.revision.product_id_search_mode, "partial");
   assert.equal(settings.creator_notification_diagnostics_enabled, false);
   assert.equal(settings.diagnostics.notification_diagnostics_enabled, false);
   assert.equal(settings.creator_bootstrap_monitoring_enabled, false);
@@ -685,12 +707,18 @@ function testManualRevisionUsesManualShelfKeys() {
   );
   assert.match(source, /async function fetchRevisionShelves/);
   assert.match(source, /if \(options\.manualShelfEnabled === true\)/);
-  assert.match(source, /manualRevisionShelfLabelSql\('p'\)/);
+  assert.match(source, /manualRevisionShelfLabelSql\('p', revisionGroupingMode\)/);
   assert.match(source, /lower\(\$\{manualShelfSql\}\) AS shelf_key/);
   assert.match(source, /GROUP BY vc\.shelf_key/);
-  assert.match(source, /selectedShelfKey: manualShelfEnabled \? requestedShelfKey : ''/);
-  assert.match(source, /selectedShelfNumber: manualShelfEnabled \? null : selectedShelfNumber/);
-  assert.match(source, /manualShelfEnabled[\s\S]{0,300}normalizeRevisionShelfKey\(post\.revision_shelf_key\)/);
+  assert.match(source, /selectedShelfKey: revisionManualGroupingEnabled \? requestedShelfKey : ''/);
+  assert.match(
+    source,
+    /selectedShelfNumber: revisionManualGroupingEnabled \? null : selectedShelfNumber/,
+  );
+  assert.match(
+    source,
+    /revisionManualGroupingEnabled[\s\S]{0,300}normalizeRevisionShelfKey\(post\.revision_shelf_key\)/,
+  );
 
   const manualBranchStart = source.indexOf("if (options.manualShelfEnabled === true)");
   const fallbackBranchStart = source.indexOf(

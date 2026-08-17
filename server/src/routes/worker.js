@@ -361,13 +361,46 @@ function formatProductLabel(productCode, shelfNumber, manualShelfLabel = "") {
   return `${codePart}--${shelfPart}`;
 }
 
+function normalizeRevisionGroupingMode(value) {
+  const normalized = String(value || '').toLowerCase().trim();
+  return ['numeric_shelf', 'manual_shelf', 'manual_place'].includes(normalized)
+    ? normalized
+    : 'numeric_shelf';
+}
+
+function resolveRevisionGroupingMode(settings = {}) {
+  return normalizeRevisionGroupingMode(
+    settings.revision_grouping_mode ?? settings.revision?.grouping_mode,
+  );
+}
+
+function usesManualRevisionGrouping(settings = {}) {
+  return (
+    settings.manual_shelf_enabled === true &&
+    resolveRevisionGroupingMode(settings) !== 'numeric_shelf'
+  );
+}
+
 function formatShelfLabel(shelfNumber, fallback = '—') {
   const shelf = toShelfNumber(shelfNumber, 0);
   if (shelf <= 0) return fallback;
   return String(shelf).padStart(2, '0');
 }
 
-function manualRevisionShelfLabelSql(alias = 'p') {
+function manualRevisionShelfLabelSql(alias = 'p', groupingMode = 'manual_shelf') {
+  if (normalizeRevisionGroupingMode(groupingMode) === 'manual_place') {
+    const manualShelf = `NULLIF(BTRIM(${alias}.manual_shelf_label), '')`;
+    const shelfFloor = `NULLIF(BTRIM(${alias}.shelf_floor), '')`;
+    return `COALESCE(
+      NULLIF(CONCAT_WS(' / ', ${manualShelf}, ${shelfFloor}), ''),
+      ${manualShelf},
+      ${shelfFloor},
+      CASE
+        WHEN ${alias}.shelf_number IS NOT NULL THEN LPAD(${alias}.shelf_number::text, 2, '0')
+        ELSE '${REVISION_UNASSIGNED_SHELF_LABEL}'
+      END
+    )`;
+  }
   return `COALESCE(
     NULLIF(BTRIM(${alias}.manual_shelf_label), ''),
     CASE
@@ -381,9 +414,23 @@ function normalizeRevisionShelfKeyForCompare(value) {
   return normalizeRevisionShelfKey(value).toLocaleLowerCase('ru-RU');
 }
 
-function revisionShelfLabelFromValues({ manualShelfEnabled, manualShelfLabel, shelfNumber }) {
+function revisionShelfLabelFromValues({
+  manualShelfEnabled,
+  manualShelfLabel,
+  shelfFloor,
+  shelfNumber,
+  revisionGroupingMode = 'manual_shelf',
+}) {
   const manualShelf = normalizeFreeShelfText(manualShelfLabel);
-  if (manualShelfEnabled && manualShelf) return manualShelf;
+  const manualPlace = normalizeFreeShelfText(shelfFloor);
+  if (manualShelfEnabled) {
+    if (normalizeRevisionGroupingMode(revisionGroupingMode) === 'manual_place') {
+      const parts = [manualShelf, manualPlace].filter(Boolean);
+      if (parts.length > 0) return parts.join(' / ');
+    }
+    if (manualShelf) return manualShelf;
+    if (manualPlace) return manualPlace;
+  }
   const numeric = toPositiveShelfNumberOrNull(shelfNumber);
   if (numeric != null) return formatShelfLabel(numeric);
   return REVISION_UNASSIGNED_SHELF_LABEL;
@@ -827,12 +874,13 @@ async function sanitizeRevisionVisibleCatalogMessages(
     selectedShelfNumber = null,
     selectedShelfKey = '',
     manualShelfEnabled = false,
+    revisionGroupingMode = 'manual_shelf',
   } = {},
 ) {
   const dateFilter = Array.isArray(selectedDates) && selectedDates.length > 0 ? selectedDates : null;
   const shelfFilter = parseRevisionShelfNumber(selectedShelfNumber);
   const shelfKeyFilter = normalizeRevisionShelfKeyForCompare(selectedShelfKey);
-  const manualShelfSql = manualRevisionShelfLabelSql('p');
+  const manualShelfSql = manualRevisionShelfLabelSql('p', revisionGroupingMode);
   const q = await client.query(
     `SELECT m.id AS message_id,
             m.chat_id,
@@ -1015,6 +1063,8 @@ function buildRevisionQueuePayload({
   shelfFloor = '',
   imageUrl,
   selectedDates = [],
+  revisionGroupingMode = 'numeric_shelf',
+  hideOldVersions = true,
   sourceMessageIds = [],
   existingPayload = {},
   manual = false,
@@ -1038,7 +1088,9 @@ function buildRevisionQueuePayload({
     revisionShelfLabelFromValues({
       manualShelfEnabled: Boolean(resolvedManualShelfLabel),
       manualShelfLabel: resolvedManualShelfLabel,
+      shelfFloor,
       shelfNumber: resolvedRevisionShelfNumber,
+      revisionGroupingMode,
     });
   const resolvedRevisionShelfKey =
     normalizeRevisionShelfKey(revisionShelfKey) ||
@@ -1058,6 +1110,7 @@ function buildRevisionQueuePayload({
     revision_shelf_number: resolvedRevisionShelfNumber,
     revision_shelf_key: resolvedRevisionShelfKey,
     revision_shelf_label: resolvedRevisionShelfLabel,
+    revision_grouping_mode: normalizeRevisionGroupingMode(revisionGroupingMode),
     manual_shelf_label: resolvedManualShelfLabel || null,
     shelf_floor:
       normalizeFreeShelfText(shelfFloor) ||
@@ -1071,7 +1124,7 @@ function buildRevisionQueuePayload({
       String(post?.message_id || previous.source_message_id || '').trim() ||
       null,
     source_message_ids: mergedSourceMessageIds,
-    hide_old_versions: true,
+    hide_old_versions: hideOldVersions === true,
     source_revision_day:
       String(post?.day || previous.source_revision_day || '').trim() || null,
     revision_dates: uniqStrings(selectedDates),
@@ -1183,7 +1236,10 @@ async function fetchRevisionDays(client, channelId, limit = 2) {
 async function fetchRevisionShelves(client, channelId, options = {}) {
   if (options.manualShelfEnabled === true) {
     const includeHiddenMissingPhoto = options.includeHiddenMissingPhoto === true;
-    const manualShelfSql = manualRevisionShelfLabelSql('p');
+    const revisionGroupingMode = normalizeRevisionGroupingMode(
+      options.revisionGroupingMode || 'manual_shelf',
+    );
+    const manualShelfSql = manualRevisionShelfLabelSql('p', revisionGroupingMode);
     const q = await client.query(
       `WITH revision_catalog AS (
          SELECT m.id AS message_id,
@@ -1372,6 +1428,9 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
   );
   const manualShelfEnabled =
     !Array.isArray(selection) && selection.manualShelfEnabled === true;
+  const revisionGroupingMode = normalizeRevisionGroupingMode(
+    Array.isArray(selection) ? 'numeric_shelf' : selection.revisionGroupingMode,
+  );
   const shelfKeyFilter = normalizeRevisionShelfKeyForCompare(
     Array.isArray(selection) ? '' : selection.selectedShelfKey,
   );
@@ -1395,6 +1454,13 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
   const productCodeSearchLike = productCodeSearch
     ? `%${escapeLikePattern(productCodeSearch)}%`
     : productSearchLike;
+  const productSearchMode =
+    !Array.isArray(selection) &&
+    String(selection.productSearchMode || selection.productIdSearchMode || '')
+      .toLowerCase()
+      .trim() === 'partial'
+      ? 'partial'
+      : 'exact';
   const revisionDaySequence = manualShelfEnabled
     ? []
     : await fetchRevisionDaySequence(client, channelId);
@@ -1404,7 +1470,7 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       toShelfNumber(item.revision_shelf_number, 1),
     ]),
   );
-  const manualShelfSql = manualRevisionShelfLabelSql('p');
+  const manualShelfSql = manualRevisionShelfLabelSql('p', revisionGroupingMode);
   const rows = await client.query(
     `WITH visible_catalog AS (
        SELECT m.id AS message_id,
@@ -1455,8 +1521,13 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
            $7::text = ''
            OR lower(COALESCE(p.product_code::text, '')) = $8::text
            OR lower(COALESCE(m.meta->>'product_code', '')) = $8::text
-           OR lower(COALESCE(p.product_code::text, '')) LIKE $9::text ESCAPE '\\'
-           OR lower(COALESCE(m.meta->>'product_code', '')) LIKE $9::text ESCAPE '\\'
+           OR (
+             $13::boolean = true
+             AND (
+               lower(COALESCE(p.product_code::text, '')) LIKE $9::text ESCAPE '\\'
+               OR lower(COALESCE(m.meta->>'product_code', '')) LIKE $9::text ESCAPE '\\'
+             )
+           )
          )
      ),
      queue_state AS (
@@ -1530,6 +1601,7 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       includeHiddenMissingPhotoRows,
       manualShelfEnabled,
       shelfKeyFilter,
+      productSearchMode === 'partial',
     ]
   );
   const mapped = [];
@@ -1558,7 +1630,9 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
           manualShelfEnabled: true,
           manualShelfLabel:
             row.revision_shelf_label || manualShelfLabel || meta.revision_shelf_label,
+          shelfFloor,
           shelfNumber: sourceProductShelfNumber,
+          revisionGroupingMode,
         })
       : formatShelfLabel(revisionShelfNumber);
     const revisionShelfKey = manualShelfEnabled
@@ -1581,6 +1655,7 @@ async function fetchRevisionPosts(client, channelId, selection = {}) {
       shelf_key: revisionShelfKey,
       revision_shelf_label: revisionShelfLabel,
       shelf_label: revisionShelfLabel,
+      revision_grouping_mode: revisionGroupingMode,
       source_product_shelf_number: sourceProductShelfNumber,
       manual_shelf_label: manualShelfLabel || null,
       shelf_floor: shelfFloor || null,
@@ -2905,13 +2980,16 @@ router.get(
         req.user.tenant_id || null
       );
       const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
-      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
+      const revisionGroupingMode = resolveRevisionGroupingMode(tenantSettings);
+      const revisionManualGroupingEnabled = usesManualRevisionGrouping(tenantSettings);
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
-        manualShelfEnabled,
+        manualShelfEnabled: revisionManualGroupingEnabled,
+        revisionGroupingMode,
       });
       const shelves = await fetchRevisionShelves(client, mainChannel.id, {
-        manualShelfEnabled,
+        manualShelfEnabled: revisionManualGroupingEnabled,
+        revisionGroupingMode,
         includeHiddenMissingPhoto: canSeeMissingPhotoRevisionItems(req.user),
         includeHiddenMissingPhotoShelfNumber: canSeeMissingPhotoRevisionItems(req.user)
           ? CREATOR_MISSING_PHOTO_REVISION_SHELF
@@ -2978,24 +3056,27 @@ router.get(
         req.user.tenant_id || null
       );
       const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
-      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
+      const revisionGroupingMode = resolveRevisionGroupingMode(tenantSettings);
+      const revisionManualGroupingEnabled = usesManualRevisionGrouping(tenantSettings);
       const sanitation = await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
         selectedDates: requestedShelfNumber == null ? selectedDates : [],
-        selectedShelfNumber: manualShelfEnabled ? null : requestedShelfNumber,
-        selectedShelfKey: manualShelfEnabled ? requestedShelfKey : '',
-        manualShelfEnabled,
+        selectedShelfNumber: revisionManualGroupingEnabled ? null : requestedShelfNumber,
+        selectedShelfKey: revisionManualGroupingEnabled ? requestedShelfKey : '',
+        manualShelfEnabled: revisionManualGroupingEnabled,
+        revisionGroupingMode,
       });
       const creatorMissingPhotoShelfNumber = canSeeMissingPhotoRevisionItems(req.user)
         ? CREATOR_MISSING_PHOTO_REVISION_SHELF
         : null;
       const shelves = await fetchRevisionShelves(client, mainChannel.id, {
-        manualShelfEnabled,
+        manualShelfEnabled: revisionManualGroupingEnabled,
+        revisionGroupingMode,
         includeHiddenMissingPhoto: canSeeMissingPhotoRevisionItems(req.user),
         includeHiddenMissingPhotoShelfNumber: creatorMissingPhotoShelfNumber,
       });
       const selectedShelf =
-        manualShelfEnabled
+        revisionManualGroupingEnabled
           ? (
               (requestedShelfKey
                 ? shelves.find((item) => String(item.shelf_key || '') === requestedShelfKey)
@@ -3005,12 +3086,12 @@ router.get(
               null
             )
           : null;
-      const selectedShelfNumber = manualShelfEnabled
+      const selectedShelfNumber = revisionManualGroupingEnabled
         ? selectedShelf?.shelf_number ?? null
         : requestedShelfNumber ??
           shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
           1;
-      const selectedShelfKey = manualShelfEnabled
+      const selectedShelfKey = revisionManualGroupingEnabled
         ? String(selectedShelf?.shelf_key || requestedShelfKey || '').trim()
         : '';
       const fallbackDays =
@@ -3025,9 +3106,11 @@ router.get(
           : {
               selectedShelfNumber,
               selectedShelfKey,
-              manualShelfEnabled,
+              manualShelfEnabled: revisionManualGroupingEnabled,
+              revisionGroupingMode,
               includeHiddenMissingPhoto: canSeeMissingPhotoRevisionItems(req.user),
               productIdSearch,
+              productSearchMode: tenantSettings.revision_product_id_search_mode,
               includeHiddenMissingPhotoShelfNumber: creatorMissingPhotoShelfNumber,
             },
       );
@@ -3057,6 +3140,7 @@ router.get(
           shelf_number: selectedShelfNumber,
           shelf_key: selectedShelfKey,
           revision_shelf_key: selectedShelfKey,
+          revision_grouping_mode: revisionGroupingMode,
           shelves,
           posts: enrichedPosts,
           auto_revision_minimum_price: autoRevisionMinimumPrice,
@@ -3270,6 +3354,8 @@ router.post(
       );
       const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
       const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
+      const revisionGroupingMode = resolveRevisionGroupingMode(tenantSettings);
+      const revisionManualGroupingEnabled = usesManualRevisionGrouping(tenantSettings);
 
       const hiddenMessagesById = new Map();
       const queuedItems = [];
@@ -3340,17 +3426,19 @@ router.post(
                 targetMeta.shelf_floor,
             )
           : '';
-        const nextRevisionShelfLabel = manualShelfEnabled
+        const nextRevisionShelfLabel = revisionManualGroupingEnabled
           ? revisionShelfLabelFromValues({
               manualShelfEnabled: true,
               manualShelfLabel:
                 item.revision_shelf_label ||
                 nextManualShelfLabel ||
                 targetMeta.revision_shelf_label,
+              shelfFloor: nextShelfFloor,
               shelfNumber: nextProductShelfNumber,
+              revisionGroupingMode,
             })
           : formatShelfLabel(nextRevisionShelfNumber);
-        const nextRevisionShelfKey = manualShelfEnabled
+        const nextRevisionShelfKey = revisionManualGroupingEnabled
           ? normalizeRevisionShelfKey(item.revision_shelf_key) ||
             normalizeRevisionShelfKeyForCompare(nextRevisionShelfLabel)
           : String(nextRevisionShelfNumber);
@@ -3382,6 +3470,7 @@ router.post(
           shelfFloor: nextShelfFloor,
           imageUrl: nextImageUrl,
           selectedDates: [],
+          revisionGroupingMode,
           sourceMessageIds,
           existingPayload: existingPending?.payload || {},
           manual: true,
@@ -3549,19 +3638,22 @@ router.post(
         req.user.tenant_id || null
       );
       const tenantSettings = await getTenantFeatureSettings(req.user?.tenant_id || null);
-      const manualShelfEnabled = tenantSettings.manual_shelf_enabled === true;
+      const revisionGroupingMode = resolveRevisionGroupingMode(tenantSettings);
+      const revisionManualGroupingEnabled = usesManualRevisionGrouping(tenantSettings);
       await sanitizeRevisionVisibleCatalogMessages(client, mainChannel.id, {
         actorUserId,
         selectedDates: requestedShelfNumber == null ? dates : [],
-        selectedShelfNumber: manualShelfEnabled ? null : requestedShelfNumber,
-        selectedShelfKey: manualShelfEnabled ? requestedShelfKey : '',
-        manualShelfEnabled,
+        selectedShelfNumber: revisionManualGroupingEnabled ? null : requestedShelfNumber,
+        selectedShelfKey: revisionManualGroupingEnabled ? requestedShelfKey : '',
+        manualShelfEnabled: revisionManualGroupingEnabled,
+        revisionGroupingMode,
       });
       const shelves = await fetchRevisionShelves(client, mainChannel.id, {
-        manualShelfEnabled,
+        manualShelfEnabled: revisionManualGroupingEnabled,
+        revisionGroupingMode,
       });
       const selectedShelf =
-        manualShelfEnabled
+        revisionManualGroupingEnabled
           ? (
               (requestedShelfKey
                 ? shelves.find((item) => String(item.shelf_key || '') === requestedShelfKey)
@@ -3571,12 +3663,12 @@ router.post(
               null
             )
           : null;
-      const selectedShelfNumber = manualShelfEnabled
+      const selectedShelfNumber = revisionManualGroupingEnabled
         ? selectedShelf?.shelf_number ?? null
         : requestedShelfNumber ??
           shelves.find((item) => Number(item.posts || 0) > 0)?.shelf_number ??
           null;
-      const selectedShelfKey = manualShelfEnabled
+      const selectedShelfKey = revisionManualGroupingEnabled
         ? String(selectedShelf?.shelf_key || requestedShelfKey || '').trim()
         : '';
       const selectedDates =
@@ -3589,9 +3681,10 @@ router.post(
               selectedDates.length > 0
                 ? { selectedDates }
                 : {
-                    selectedShelfNumber: manualShelfEnabled ? null : selectedShelfNumber,
+                    selectedShelfNumber: revisionManualGroupingEnabled ? null : selectedShelfNumber,
                     selectedShelfKey,
-                    manualShelfEnabled,
+                    manualShelfEnabled: revisionManualGroupingEnabled,
+                    revisionGroupingMode,
                   },
             )
           : [];
@@ -3638,11 +3731,13 @@ router.post(
         const nextShelfFloor = normalizeFreeShelfText(post.shelf_floor);
         const nextRevisionShelfLabel = normalizeFreeShelfText(post.revision_shelf_label) ||
           revisionShelfLabelFromValues({
-            manualShelfEnabled,
+            manualShelfEnabled: revisionManualGroupingEnabled,
             manualShelfLabel: nextManualShelfLabel,
+            shelfFloor: nextShelfFloor,
             shelfNumber: nextProductShelfNumber,
+            revisionGroupingMode,
           });
-        const nextRevisionShelfKey = manualShelfEnabled
+        const nextRevisionShelfKey = revisionManualGroupingEnabled
           ? normalizeRevisionShelfKey(post.revision_shelf_key) ||
             normalizeRevisionShelfKeyForCompare(nextRevisionShelfLabel)
           : String(nextRevisionShelfNumber);
@@ -3676,6 +3771,8 @@ router.post(
           shelfFloor: nextShelfFloor,
           imageUrl,
           selectedDates,
+          revisionGroupingMode,
+          hideOldVersions,
           sourceMessageIds,
           existingPayload: existingPending?.payload || {},
           manual: false,
@@ -3721,14 +3818,16 @@ router.post(
           queueId = insertedQueue.rows[0].id;
         }
 
-        const hiddenMessages = await hideCatalogMessagesForRevision(
-          client,
-          mainChannel.id,
-          sourceMessageIds,
-          actorUserId,
-        );
-        for (const message of hiddenMessages) {
-          hiddenMessagesById.set(String(message.id), message);
+        if (hideOldVersions) {
+          const hiddenMessages = await hideCatalogMessagesForRevision(
+            client,
+            mainChannel.id,
+            sourceMessageIds,
+            actorUserId,
+          );
+          for (const message of hiddenMessages) {
+            hiddenMessagesById.set(String(message.id), message);
+          }
         }
 
         queuedItems.push({
@@ -3770,6 +3869,7 @@ router.post(
           shelf_number: selectedShelfNumber,
           shelf_key: selectedShelfKey,
           revision_shelf_key: selectedShelfKey,
+          revision_grouping_mode: revisionGroupingMode,
           percent: discountPercent,
           updated_count: queuedItems.length,
           hidden_old_count: hiddenMessagesById.size,
